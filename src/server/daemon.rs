@@ -1,0 +1,1312 @@
+//! Server daemon implementation.
+//!
+//! This module provides the Remux daemon process, Unix socket communication
+//! helpers, and the main server event loop.
+
+use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+
+use crate::config::Config;
+use crate::protocol;
+use crate::protocol::*;
+use crate::screen::Screen;
+use crate::server::compositor::{composite, StatusInfo};
+use crate::server::layout::{self, PaneId, Rect};
+use crate::server::pty::{self, Pty};
+use crate::server::session::ServerState;
+
+/// Type alias for the per-session previous-frame cache used for diff rendering.
+pub type PrevFrameCache = Arc<Mutex<HashMap<String, Vec<Vec<RenderCell>>>>>;
+
+/// Return the path to the Unix domain socket used for client-server
+/// communication.
+pub fn socket_path() -> PathBuf {
+    let runtime_dir = dirs::runtime_dir()
+        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    runtime_dir.join("remux.sock")
+}
+
+/// Write a length-prefixed JSON message to an async writer.
+pub async fn write_message<W, T>(writer: &mut W, msg: &T) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
+    let frame = protocol::encode_message(msg)?;
+    writer
+        .write_all(&frame)
+        .await
+        .context("writing message frame")?;
+    writer.flush().await.context("flushing writer")?;
+    Ok(())
+}
+
+/// Read a length-prefixed JSON message from an async reader.
+///
+/// Returns `Ok(None)` if the connection was closed (EOF on the length header).
+pub async fn read_message<T>(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e).context("reading message header"),
+    }
+
+    let len = protocol::decode_message_length(&header);
+    let mut payload = vec![0u8; len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .context("reading message payload")?;
+
+    let msg: T = serde_json::from_slice(&payload).context("deserializing message")?;
+    Ok(Some(msg))
+}
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+/// Data associated with a single pane: its PTY and screen buffer.
+struct PaneData {
+    pty: Pty,
+    screen: Screen,
+    /// Receiving end for PTY output from the background reader task.
+    pty_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+/// A connected client with metadata about which session it is attached to.
+struct ClientConnection {
+    session_name: Option<String>,
+    /// Sender to push `ServerMessage`s to this client's writer task.
+    tx: mpsc::UnboundedSender<ServerMessage>,
+    cols: u16,
+    rows: u16,
+    /// The client's current input mode (e.g. "INSERT", "NORMAL", "VISUAL").
+    mode: String,
+}
+
+/// The Remux server.
+pub struct RemuxServer {
+    state: Arc<Mutex<ServerState>>,
+    panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: Arc<Config>,
+    clients: Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    /// Monotonically increasing counter for stable client IDs.
+    next_client_id: Arc<AtomicU64>,
+    /// Previous composite frame per session, for diff computation.
+    prev_frames: Arc<Mutex<HashMap<String, Vec<Vec<RenderCell>>>>>,
+}
+
+// ---------------------------------------------------------------------------
+// Server implementation
+// ---------------------------------------------------------------------------
+
+impl RemuxServer {
+    /// Create a new server instance.
+    fn new(config: Config) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ServerState::new())),
+            panes: Arc::new(Mutex::new(HashMap::new())),
+            config: Arc::new(config),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            next_client_id: Arc::new(AtomicU64::new(0)),
+            prev_frames: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Start the server: bind socket, accept connections, run the event loop.
+    pub async fn run(config: Config) -> Result<()> {
+        let server = Self::new(config);
+
+        let path = socket_path();
+        // Create parent directory if needed.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("creating socket directory")?;
+        }
+        // Remove stale socket if present.
+        let _ = std::fs::remove_file(&path);
+
+        let listener = UnixListener::bind(&path).context("binding Unix listener")?;
+        log::info!("server listening on {}", path.display());
+
+        // Auto-save timer interval.
+        let auto_save_secs = server.config.general.auto_save_interval_secs;
+        let mut auto_save_interval =
+            tokio::time::interval(std::time::Duration::from_secs(auto_save_secs));
+
+        // Set up signal handlers for graceful shutdown.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("registering SIGTERM handler")?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("registering SIGINT handler")?;
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            server.handle_new_connection(stream).await;
+                        }
+                        Err(e) => {
+                            log::error!("accept error: {e}");
+                        }
+                    }
+                }
+                _ = auto_save_interval.tick() => {
+                    log::debug!("auto-save tick");
+                }
+                _ = sigterm.recv() => {
+                    log::info!("received SIGTERM, shutting down");
+                    break;
+                }
+                _ = sigint.recv() => {
+                    log::info!("received SIGINT, shutting down");
+                    break;
+                }
+            }
+        }
+
+        // Graceful shutdown: clean up resources.
+        server.shutdown(&path).await;
+        Ok(())
+    }
+
+    /// Perform graceful shutdown: save state, drop panes, remove socket.
+    async fn shutdown(&self, socket_path: &std::path::Path) {
+        log::info!("saving state before shutdown...");
+
+        // Save persistent state.
+        let state = self.state.lock().await;
+        let panes = self.panes.lock().await;
+
+        let mut pane_cwds = std::collections::HashMap::new();
+        for (&pane_id, pane_data) in panes.iter() {
+            if let Some(cwd) = crate::server::persistence::get_pane_cwd(pane_data.pty.child_pid) {
+                pane_cwds.insert(pane_id, cwd);
+            }
+        }
+
+        if let Ok(persisted) =
+            crate::server::persistence::PersistedState::from_server(&state, &pane_cwds)
+        {
+            if let Err(e) = crate::server::persistence::save_state(&persisted) {
+                log::error!("failed to save state on shutdown: {e}");
+            } else {
+                log::info!("state saved successfully");
+            }
+        }
+
+        // Drop locks before cleanup.
+        drop(state);
+        drop(panes);
+
+        // Remove socket file.
+        let _ = std::fs::remove_file(socket_path);
+        log::info!("shutdown complete");
+    }
+
+    /// Handle a newly accepted client connection.
+    async fn handle_new_connection(&self, stream: tokio::net::UnixStream) {
+        let (read_half, write_half) = stream.into_split();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        let client_id = {
+            let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+            let mut clients = self.clients.lock().await;
+            clients.insert(
+                id,
+                ClientConnection {
+                    session_name: None,
+                    tx,
+                    cols: 80,
+                    rows: 24,
+                    mode: "INSERT".to_string(),
+                },
+            );
+            id
+        };
+
+        // Spawn writer task.
+        let mut writer = write_half;
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Err(e) = write_message(&mut writer, &msg).await {
+                    log::debug!("client writer error: {e}");
+                    break;
+                }
+            }
+        });
+
+        // Spawn reader task.
+        let state = Arc::clone(&self.state);
+        let panes = Arc::clone(&self.panes);
+        let clients = Arc::clone(&self.clients);
+        let config = Arc::clone(&self.config);
+        let prev_frames = Arc::clone(&self.prev_frames);
+
+        tokio::spawn(async move {
+            let mut reader = read_half;
+            loop {
+                match read_message::<ClientMessage>(&mut reader).await {
+                    Ok(Some(msg)) => {
+                        if let Err(e) = handle_client_message(
+                            client_id,
+                            msg,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await
+                        {
+                            log::error!("error handling client message: {e}");
+                            let cls = clients.lock().await;
+                            if let Some(client) = cls.get(&client_id) {
+                                let _ = client.tx.send(ServerMessage::Error {
+                                    message: format!("{e}"),
+                                });
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        log::info!("client {client_id} disconnected");
+                        handle_client_disconnect(client_id, &clients).await;
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("error reading from client {client_id}: {e}");
+                        handle_client_disconnect(client_id, &clients).await;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message handling
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_message(
+    client_id: u64,
+    msg: ClientMessage,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    match msg {
+        ClientMessage::Attach { session_name } => {
+            handle_attach(
+                client_id,
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
+        }
+        ClientMessage::Detach => {
+            handle_detach(client_id, clients).await;
+            Ok(())
+        }
+        ClientMessage::Input { data } => {
+            handle_input(client_id, &data, state, panes, clients).await
+        }
+        ClientMessage::Resize { cols, rows } => {
+            handle_resize(
+                client_id,
+                cols,
+                rows,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
+        }
+        ClientMessage::Command(cmd) => {
+            handle_command(client_id, cmd, state, panes, clients, config, prev_frames).await
+        }
+        ClientMessage::CreateSession { name, folder } => {
+            handle_create_session(
+                client_id,
+                &name,
+                folder.as_deref(),
+                state,
+                panes,
+                clients,
+                config,
+            )
+            .await
+        }
+        ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
+        ClientMessage::KillSession { name } => {
+            handle_kill_session(&name, state, panes, clients).await
+        }
+        ClientMessage::ModeChanged { mode } => {
+            handle_mode_changed(client_id, &mode, state, panes, clients, config, prev_frames).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_attach(
+    client_id: u64,
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    {
+        let st = state.lock().await;
+        if !st.sessions.contains_key(session_name) {
+            let cls = clients.lock().await;
+            if let Some(client) = cls.get(&client_id) {
+                let _ = client.tx.send(ServerMessage::Error {
+                    message: format!("session '{}' not found", session_name),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    let (cols, rows) = {
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            client.session_name = Some(session_name.to_string());
+            (client.cols, client.rows)
+        } else {
+            return Ok(());
+        }
+    };
+
+    send_full_render_to_client(
+        client_id,
+        session_name,
+        cols,
+        rows,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+    )
+    .await;
+
+    start_pty_forwarding(session_name, state, panes, clients, config, prev_frames).await;
+    Ok(())
+}
+
+async fn handle_detach(client_id: u64, clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>) {
+    let mut cls = clients.lock().await;
+    if let Some(client) = cls.get_mut(&client_id) {
+        client.session_name = None;
+    }
+}
+
+async fn handle_input(
+    client_id: u64,
+    data: &[u8],
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Result<()> {
+    let session_name = {
+        let cls = clients.lock().await;
+        cls.get(&client_id).and_then(|c| c.session_name.clone())
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let active_pane = {
+        let st = state.lock().await;
+        let sess = match st.sessions.get(&session_name) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let tab = match sess.tabs.get(sess.active_tab) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        tab.focused_pane
+    };
+
+    let ps = panes.lock().await;
+    if let Some(pane_data) = ps.get(&active_pane) {
+        pane_data.pty.write_input(data)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_resize(
+    client_id: u64,
+    cols: u16,
+    rows: u16,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let session_name = {
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            client.cols = cols;
+            client.rows = rows;
+            client.session_name.clone()
+        } else {
+            None
+        }
+    };
+
+    if let Some(session_name) = session_name {
+        resize_session_panes(&session_name, cols, rows, state, panes).await?;
+        broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_command(
+    client_id: u64,
+    cmd: RemuxCommand,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let (session_name, cols, rows) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => (c.session_name.clone(), c.cols, c.rows),
+            None => return Ok(()),
+        }
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    match cmd {
+        RemuxCommand::TabNew => {
+            let pane_id = {
+                let mut st = state.lock().await;
+                st.create_tab(&session_name, "shell")?
+            };
+            spawn_pane(pane_id, cols, rows, None, panes, config).await?;
+            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::TabClose => {
+            let tab_idx = {
+                let st = state.lock().await;
+                match st.sessions.get(&session_name) {
+                    Some(s) => s.active_tab,
+                    None => return Ok(()),
+                }
+            };
+            let (pane_ids, _deleted) = {
+                let mut st = state.lock().await;
+                st.close_tab(&session_name, tab_idx)?
+            };
+            {
+                let mut ps = panes.lock().await;
+                for pid in pane_ids {
+                    ps.remove(&pid);
+                }
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::TabGoto(idx) => {
+            {
+                let mut st = state.lock().await;
+                st.goto_tab(&session_name, idx)?;
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::TabNext => {
+            {
+                let mut st = state.lock().await;
+                let next = {
+                    let sess = match st.sessions.get(&session_name) {
+                        Some(s) => s,
+                        None => return Ok(()),
+                    };
+                    (sess.active_tab + 1) % sess.tabs.len()
+                };
+                st.goto_tab(&session_name, next)?;
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::TabPrev => {
+            {
+                let mut st = state.lock().await;
+                let prev = {
+                    let sess = match st.sessions.get(&session_name) {
+                        Some(s) => s,
+                        None => return Ok(()),
+                    };
+                    if sess.active_tab == 0 {
+                        sess.tabs.len().saturating_sub(1)
+                    } else {
+                        sess.active_tab - 1
+                    }
+                };
+                st.goto_tab(&session_name, prev)?;
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::TabRename(name) => {
+            {
+                let mut st = state.lock().await;
+                let idx = {
+                    match st.sessions.get(&session_name) {
+                        Some(s) => s.active_tab,
+                        None => return Ok(()),
+                    }
+                };
+                st.rename_tab(&session_name, idx, &name)?;
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneSplitVertical => {
+            let new_pane_id = {
+                let mut st = state.lock().await;
+                let new_pane_id = st.next_pane_id();
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let focused = tab.focused_pane;
+                tab.layout.split_vertical(focused, new_pane_id);
+                tab.focused_pane = new_pane_id;
+                new_pane_id
+            };
+            spawn_pane(new_pane_id, cols / 2, rows, None, panes, config).await?;
+            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneSplitHorizontal => {
+            let new_pane_id = {
+                let mut st = state.lock().await;
+                let new_pane_id = st.next_pane_id();
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let focused = tab.focused_pane;
+                tab.layout.split_horizontal(focused, new_pane_id);
+                tab.focused_pane = new_pane_id;
+                new_pane_id
+            };
+            spawn_pane(new_pane_id, cols, rows / 2, None, panes, config).await?;
+            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneClose => {
+            let (closed_pane, new_focus) = {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let closed = tab.focused_pane;
+                let new_focus = tab.layout.close_pane(closed);
+                if let Some(nf) = new_focus {
+                    tab.focused_pane = nf;
+                }
+                (closed, new_focus)
+            };
+            {
+                let mut ps = panes.lock().await;
+                ps.remove(&closed_pane);
+            }
+            if new_focus.is_some() {
+                broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
+                    .await;
+            }
+        }
+        RemuxCommand::PaneFocusLeft
+        | RemuxCommand::PaneFocusRight
+        | RemuxCommand::PaneFocusUp
+        | RemuxCommand::PaneFocusDown => {
+            let direction = match cmd {
+                RemuxCommand::PaneFocusLeft => layout::FocusDirection::Left,
+                RemuxCommand::PaneFocusRight => layout::FocusDirection::Right,
+                RemuxCommand::PaneFocusUp => layout::FocusDirection::Up,
+                RemuxCommand::PaneFocusDown => layout::FocusDirection::Down,
+                _ => unreachable!(),
+            };
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: cols,
+                    height: rows.saturating_sub(1),
+                };
+                if let Some(neighbor) =
+                    layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction)
+                {
+                    tab.focused_pane = neighbor;
+                }
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneStackAdd => {
+            let new_pane_id = {
+                let mut st = state.lock().await;
+                let new_pane_id = st.next_pane_id();
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let focused = tab.focused_pane;
+                tab.layout.add_to_stack(focused, new_pane_id);
+                tab.focused_pane = new_pane_id;
+                new_pane_id
+            };
+            spawn_pane(new_pane_id, cols, rows, None, panes, config).await?;
+            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneStackNext => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                if let Some(next) = tab.layout.stack_next(tab.focused_pane) {
+                    tab.focused_pane = next;
+                }
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneStackPrev => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                if let Some(prev) = tab.layout.stack_prev(tab.focused_pane) {
+                    tab.focused_pane = prev;
+                }
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::ResizeLeft(amount)
+        | RemuxCommand::ResizeRight(amount)
+        | RemuxCommand::ResizeUp(amount)
+        | RemuxCommand::ResizeDown(amount) => {
+            let (direction, delta) = match &cmd {
+                RemuxCommand::ResizeLeft(_) => {
+                    (layout::Direction::Vertical, -(amount as f32) / 100.0)
+                }
+                RemuxCommand::ResizeRight(_) => {
+                    (layout::Direction::Vertical, amount as f32 / 100.0)
+                }
+                RemuxCommand::ResizeUp(_) => {
+                    (layout::Direction::Horizontal, -(amount as f32) / 100.0)
+                }
+                RemuxCommand::ResizeDown(_) => {
+                    (layout::Direction::Horizontal, amount as f32 / 100.0)
+                }
+                _ => unreachable!(),
+            };
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                tab.layout.resize(tab.focused_pane, direction, delta);
+            }
+            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::SessionDetach => {
+            handle_detach(client_id, clients).await;
+        }
+        RemuxCommand::SessionList => {
+            handle_list_sessions(client_id, state, clients).await?;
+        }
+        RemuxCommand::SessionRename(new_name) => {
+            {
+                let mut st = state.lock().await;
+                st.rename_session(&session_name, &new_name)?;
+            }
+            let mut cls = clients.lock().await;
+            for client in cls.values_mut() {
+                if client.session_name.as_deref() == Some(&session_name) {
+                    client.session_name = Some(new_name.clone());
+                }
+            }
+        }
+        _ => {
+            log::debug!("unhandled command: {cmd:?}");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_create_session(
+    client_id: u64,
+    name: &str,
+    folder: Option<&str>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) -> Result<()> {
+    let (cols, rows) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => (c.cols, c.rows),
+            None => (80, 24),
+        }
+    };
+    let pane_id = {
+        let mut st = state.lock().await;
+        st.create_session(name, folder)?
+    };
+    spawn_pane(pane_id, cols, rows, None, panes, config).await?;
+
+    let cls = clients.lock().await;
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client
+            .tx
+            .send(ServerMessage::Event(SessionEvent::SessionCreated(
+                name.to_string(),
+            )));
+    }
+    Ok(())
+}
+
+async fn handle_list_sessions(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Result<()> {
+    let st = state.lock().await;
+    let cls = clients.lock().await;
+    let entries: Vec<SessionListEntry> = st
+        .list_sessions()
+        .into_iter()
+        .map(|info| {
+            let client_count = cls
+                .values()
+                .filter(|c| c.session_name.as_deref() == Some(&info.name))
+                .count();
+            SessionListEntry {
+                name: info.name,
+                folder: info.folder,
+                tab_count: info.tab_count,
+                client_count,
+            }
+        })
+        .collect();
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client
+            .tx
+            .send(ServerMessage::SessionList { sessions: entries });
+    }
+    Ok(())
+}
+
+async fn handle_kill_session(
+    name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Result<()> {
+    let pane_ids = {
+        let mut st = state.lock().await;
+        st.delete_session(name)?
+    };
+    {
+        let mut ps = panes.lock().await;
+        for pid in pane_ids {
+            ps.remove(&pid);
+        }
+    }
+    let mut cls = clients.lock().await;
+    for client in cls.values_mut() {
+        if client.session_name.as_deref() == Some(name) {
+            client.session_name = None;
+            let _ = client
+                .tx
+                .send(ServerMessage::Event(SessionEvent::SessionDeleted(
+                    name.to_string(),
+                )));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_client_disconnect(
+    client_id: u64,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    let mut cls = clients.lock().await;
+    cls.remove(&client_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mode_changed(
+    client_id: u64,
+    mode: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let session_name = {
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            client.mode = mode.to_string();
+            client.session_name.clone()
+        } else {
+            None
+        }
+    };
+
+    if let Some(session_name) = session_name {
+        broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pane management helpers
+// ---------------------------------------------------------------------------
+
+async fn spawn_pane(
+    pane_id: PaneId,
+    cols: u16,
+    rows: u16,
+    command: Option<&str>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) -> Result<()> {
+    let cmd = command.or(config.general.default_shell.as_deref());
+    let pty_instance = Pty::spawn(cols, rows, cmd)?;
+    let raw_fd = pty_instance.master_fd.as_raw_fd();
+    let (_reader_handle, pty_rx) = pty::start_reader(raw_fd);
+    let screen = Screen::new(cols, rows, config.general.scrollback_lines);
+
+    let mut ps = panes.lock().await;
+    ps.insert(
+        pane_id,
+        PaneData {
+            pty: pty_instance,
+            screen,
+            pty_rx,
+        },
+    );
+    Ok(())
+}
+
+async fn resize_session_panes(
+    session_name: &str,
+    cols: u16,
+    rows: u16,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<()> {
+    let rects = {
+        let st = state.lock().await;
+        let sess = match st.sessions.get(session_name) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let tab = match sess.tabs.get(sess.active_tab) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let content_rows = rows.saturating_sub(1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: content_rows,
+        };
+        layout::compute_layout(&tab.layout, area)
+    };
+
+    let mut ps = panes.lock().await;
+    for (pane_id, rect) in rects {
+        if let Some(pane_data) = ps.get_mut(&pane_id) {
+            let inner_cols = rect.width.max(1);
+            let inner_rows = rect.height.max(1);
+            let _ = pane_data.pty.resize(inner_cols, inner_rows);
+            pane_data.screen.resize(inner_cols, inner_rows);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rendering helpers
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn send_full_render_to_client(
+    client_id: u64,
+    session_name: &str,
+    cols: u16,
+    rows: u16,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let mode = {
+        let cls = clients.lock().await;
+        cls.get(&client_id)
+            .map(|c| c.mode.clone())
+            .unwrap_or_else(|| "INSERT".to_string())
+    };
+    let (cells, cursor_x, cursor_y, cursor_visible) =
+        build_composite(session_name, cols, rows, &mode, state, panes, config).await;
+    {
+        let mut pf = prev_frames.lock().await;
+        pf.insert(session_name.to_string(), cells.clone());
+    }
+    let cls = clients.lock().await;
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client.tx.send(ServerMessage::FullRender {
+            cells,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+        });
+    }
+}
+
+async fn broadcast_full_render(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let (cols, rows, mode) = {
+        let cls = clients.lock().await;
+        let attached: Vec<_> = cls
+            .values()
+            .filter(|c| c.session_name.as_deref() == Some(session_name))
+            .collect();
+        if attached.is_empty() {
+            return;
+        }
+        let cols = attached.iter().map(|c| c.cols).min().unwrap_or(80);
+        let rows = attached.iter().map(|c| c.rows).min().unwrap_or(24);
+        // Use the mode from the first attached client.
+        let mode = attached
+            .first()
+            .map(|c| c.mode.clone())
+            .unwrap_or_else(|| "INSERT".to_string());
+        (cols, rows, mode)
+    };
+
+    let (cells, cursor_x, cursor_y, cursor_visible) =
+        build_composite(session_name, cols, rows, &mode, state, panes, config).await;
+
+    let msg = {
+        let prev_frames_map = prev_frames.lock().await;
+        let prev = prev_frames_map.get(session_name);
+        if let Some(prev_cells) = prev {
+            let changes = compute_diff(prev_cells, &cells);
+            if changes.len() > (cols as usize * rows as usize / 2) {
+                ServerMessage::FullRender {
+                    cells: cells.clone(),
+                    cursor_x,
+                    cursor_y,
+                    cursor_visible,
+                }
+            } else {
+                ServerMessage::RenderDiff {
+                    changes,
+                    cursor_x,
+                    cursor_y,
+                    cursor_visible,
+                }
+            }
+        } else {
+            ServerMessage::FullRender {
+                cells: cells.clone(),
+                cursor_x,
+                cursor_y,
+                cursor_visible,
+            }
+        }
+    };
+
+    {
+        let mut pf = prev_frames.lock().await;
+        pf.insert(session_name.to_string(), cells);
+    }
+
+    let cls = clients.lock().await;
+    for client in cls.values() {
+        if client.session_name.as_deref() == Some(session_name) {
+            let _ = client.tx.send(msg.clone());
+        }
+    }
+}
+
+async fn build_composite(
+    session_name: &str,
+    cols: u16,
+    rows: u16,
+    mode: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) -> (Vec<Vec<RenderCell>>, u16, u16, bool) {
+    let st = state.lock().await;
+    let sess = match st.sessions.get(session_name) {
+        Some(s) => s,
+        None => {
+            return (
+                vec![vec![RenderCell::default(); cols as usize]; rows as usize],
+                0,
+                0,
+                false,
+            );
+        }
+    };
+    let tab = match sess.tabs.get(sess.active_tab) {
+        Some(t) => t,
+        None => {
+            return (
+                vec![vec![RenderCell::default(); cols as usize]; rows as usize],
+                0,
+                0,
+                false,
+            );
+        }
+    };
+
+    let content_rows = rows.saturating_sub(1);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: content_rows,
+    };
+
+    let ps = panes.lock().await;
+    let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
+    let pane_rects = layout::compute_layout(&tab.layout, area);
+    for (pane_id, _rect) in &pane_rects {
+        if let Some(pane_data) = ps.get(pane_id) {
+            pane_screens.insert(*pane_id, &pane_data.screen);
+        }
+    }
+
+    let status_info = StatusInfo {
+        mode: mode.to_string(),
+        session_name: session_name.to_string(),
+        tabs: sess
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.clone(), i == sess.active_tab))
+            .collect(),
+    };
+
+    let cells = composite(
+        &tab.layout,
+        &pane_screens,
+        area,
+        &config.appearance.frame_style,
+        &status_info,
+        cols,
+        rows,
+    );
+
+    let (cursor_x, cursor_y, cursor_visible) = if let Some(pane_data) = ps.get(&tab.focused_pane) {
+        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == tab.focused_pane) {
+            (
+                rect.x + pane_data.screen.cursor_x,
+                rect.y + pane_data.screen.cursor_y,
+                true,
+            )
+        } else {
+            (0, 0, false)
+        }
+    } else {
+        (0, 0, false)
+    };
+
+    (cells, cursor_x, cursor_y, cursor_visible)
+}
+
+fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellChange> {
+    let mut changes = Vec::new();
+    for (y, row) in curr.iter().enumerate() {
+        let prev_row = prev.get(y);
+        for (x, cell) in row.iter().enumerate() {
+            let prev_cell = prev_row.and_then(|r| r.get(x));
+            if prev_cell != Some(cell) {
+                changes.push(CellChange {
+                    x: x as u16,
+                    y: y as u16,
+                    cell: cell.clone(),
+                });
+            }
+        }
+    }
+    changes
+}
+
+// ---------------------------------------------------------------------------
+// PTY forwarding
+// ---------------------------------------------------------------------------
+
+async fn start_pty_forwarding(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let pane_ids = {
+        let st = state.lock().await;
+        let sess = match st.sessions.get(session_name) {
+            Some(s) => s,
+            None => return,
+        };
+        let tab = match sess.tabs.get(sess.active_tab) {
+            Some(t) => t,
+            None => return,
+        };
+        layout::all_pane_ids(&tab.layout)
+    };
+
+    let session_name = session_name.to_string();
+
+    for pane_id in pane_ids {
+        let state = Arc::clone(state);
+        let panes = Arc::clone(panes);
+        let clients = Arc::clone(clients);
+        let config = Arc::clone(config);
+        let prev_frames = Arc::clone(prev_frames);
+        let session_name = session_name.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let data = {
+                    let mut ps = panes.lock().await;
+                    if let Some(pane_data) = ps.get_mut(&pane_id) {
+                        pane_data.pty_rx.try_recv().ok()
+                    } else {
+                        break;
+                    }
+                };
+
+                if let Some(data) = data {
+                    {
+                        let mut ps = panes.lock().await;
+                        if let Some(pane_data) = ps.get_mut(&pane_id) {
+                            pane_data.screen.process_output(&data);
+                        }
+                    }
+                    broadcast_full_render(
+                        &session_name,
+                        &state,
+                        &panes,
+                        &clients,
+                        &config,
+                        &prev_frames,
+                    )
+                    .await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let ps = panes.lock().await;
+                    if !ps.contains_key(&pane_id) {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
