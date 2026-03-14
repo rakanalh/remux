@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{KeyCode, KeyEventKind};
 use futures::StreamExt;
 
+use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{InputAction, InputHandler, Mode};
 use crate::client::renderer::Renderer;
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
@@ -286,6 +287,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();
     let theme = config.theme();
+    // Last known focused pane rect from the server, and cursor position.
+    let mut focused_pane_rect: Option<crate::protocol::PaneRect> = None;
+    let mut last_cursor_x: u16 = 0;
+    let mut last_cursor_y: u16 = 0;
 
     // Tell server our terminal size
     client.send(ClientMessage::Resize { cols, rows }).await?;
@@ -340,6 +345,41 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
+                                // When entering Visual mode, scope to the
+                                // focused pane's bounds instead of the full
+                                // terminal dimensions.
+                                if mode == Mode::Visual {
+                                    if let Some(ref mut vs) = input.visual_state {
+                                        if let Some(pr) = focused_pane_rect {
+                                            vs.visible_rows = pr.height as usize;
+                                            vs.visible_cols = pr.width as usize;
+                                            vs.pane_offset_x = pr.x;
+                                            vs.pane_offset_y = pr.y;
+                                            // Place cursor at the pane's actual
+                                            // cursor position (relative to pane).
+                                            vs.cursor_row = (last_cursor_y.saturating_sub(pr.y)) as usize;
+                                            vs.cursor_col = (last_cursor_x.saturating_sub(pr.x)) as usize;
+                                            // Clamp to pane bounds.
+                                            if vs.cursor_row >= vs.visible_rows {
+                                                vs.cursor_row = vs.visible_rows.saturating_sub(1);
+                                            }
+                                            if vs.cursor_col >= vs.visible_cols {
+                                                vs.cursor_col = vs.visible_cols.saturating_sub(1);
+                                            }
+                                        } else {
+                                            // Fallback: use full terminal dims.
+                                            let (tc, tr) = crossterm::terminal::size()?;
+                                            vs.visible_rows = tr as usize;
+                                            vs.visible_cols = tc as usize;
+                                            vs.cursor_row = vs.visible_rows.saturating_sub(1);
+                                        }
+                                        // total_lines is at least visible_rows
+                                        // (the front buffer is all we have).
+                                        if vs.total_lines < vs.visible_rows {
+                                            vs.total_lines = vs.visible_rows;
+                                        }
+                                    }
+                                }
                                 // When entering Rename mode, send an initial
                                 // empty update so the server clears the pane
                                 // name and stores the original for cancel.
@@ -382,8 +422,40 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     ))
                                     .await?;
                             }
-                            InputAction::YankToClipboard(_) | InputAction::SearchPrompt
-                            | InputAction::VisualScroll { .. }
+                            InputAction::YankToClipboard(_) => {
+                                // Extract selected text from the front buffer
+                                // using the visual state.
+                                if let Some(ref vs) = input.visual_state {
+                                    let text = renderer.extract_text(vs);
+                                    if !text.is_empty() {
+                                        if let Err(e) = copy_to_clipboard(&text) {
+                                            log::error!("Failed to copy to clipboard: {}", e);
+                                        }
+                                    }
+                                }
+                                // Exit visual mode after yanking.
+                                if let Some(vs) = input.visual_state.as_mut() {
+                                    vs.reset();
+                                }
+                                input.visual_state = None;
+                                input.mode = Mode::Normal;
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: "NORMAL".to_string(),
+                                    })
+                                    .await?;
+                                // Re-render to clear selection highlighting.
+                                renderer.clear_overlay(cols, rows)?;
+                            }
+                            InputAction::VisualScroll { .. } => {
+                                // Re-render visual overlay with updated cursor/selection.
+                                // First restore the base buffer, then overlay.
+                                renderer.clear_overlay(cols, rows)?;
+                                if let Some(ref vs) = input.visual_state {
+                                    renderer.render_visual_overlay(vs)?;
+                                }
+                            }
+                            InputAction::SearchPrompt
                             | InputAction::None => {}
                         }
                     }
@@ -401,16 +473,30 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
             // Server messages
             msg = client.recv() => {
                 match msg? {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect: fpr }) => {
+                        focused_pane_rect = fpr;
+                        last_cursor_x = cursor_x;
+                        last_cursor_y = cursor_y;
                         renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible)?;
+                        // Re-render visual overlay on top if in visual mode
+                        if let Some(ref vs) = input.visual_state {
+                            renderer.render_visual_overlay(vs)?;
+                        }
                         // Re-render popup on top if visible
                         if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
                             renderer.render_whichkey_overlay(&commands)?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, focused_pane_rect: fpr }) => {
+                        focused_pane_rect = fpr;
+                        last_cursor_x = cursor_x;
+                        last_cursor_y = cursor_y;
                         renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible)?;
+                        // Re-render visual overlay on top if in visual mode
+                        if let Some(ref vs) = input.visual_state {
+                            renderer.render_visual_overlay(vs)?;
+                        }
                         // Re-render popup on top if visible
                         if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);

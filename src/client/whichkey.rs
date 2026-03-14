@@ -67,7 +67,7 @@ impl WhichKeyPopup {
         let num_entries = self.entries.len();
         let rows_needed = num_entries.div_ceil(2);
         let col_width: u16 = 20; // each column is 20 chars wide
-        let popup_width = col_width * 2 + 3; // 2 columns + borders + separator
+        let popup_width = col_width * 2 + 2; // 2 columns + left/right borders
         let popup_height = rows_needed as u16 + 2; // entries + top/bottom border
 
         // Clamp to screen size.
@@ -85,7 +85,7 @@ impl WhichKeyPopup {
 
         // Top border.
         let top_border = format!(
-            "\u{250c}{}\u{2510}",
+            "\u{256D}{}\u{256E}",
             "\u{2500}".repeat((popup_width - 2) as usize)
         );
         commands.push(DrawCommand {
@@ -161,7 +161,7 @@ impl WhichKeyPopup {
 
         // Bottom border.
         let bottom_border = format!(
-            "\u{2514}{}\u{2518}",
+            "\u{2570}{}\u{256F}",
             "\u{2500}".repeat((popup_width - 2) as usize)
         );
         commands.push(DrawCommand {

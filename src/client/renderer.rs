@@ -12,6 +12,7 @@ use crossterm::style::{
 };
 use crossterm::{cursor, queue, terminal};
 
+use crate::client::input::{SelectionMode, VisualState};
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
 
@@ -225,6 +226,198 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render visual mode selection highlighting and cursor on top of the
+    /// current front buffer. All coordinates are offset by the pane's position
+    /// in the composited buffer (`pane_offset_x`, `pane_offset_y`) and clamped
+    /// to the pane bounds.
+    pub fn render_visual_overlay(&self, visual_state: &VisualState) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        queue!(stdout, cursor::Hide)?;
+
+        let pane_ox = visual_state.pane_offset_x;
+        let pane_oy = visual_state.pane_offset_y;
+        let pane_w = visual_state.visible_cols;
+        let pane_h = visual_state.visible_rows;
+
+        let selection_range = visual_state.selection_range();
+        let is_line_mode = visual_state.selection_mode == SelectionMode::Line;
+
+        // Determine which pane-relative rows are selected.
+        if let Some(((start_row, start_col), (end_row, end_col))) = selection_range {
+            let base = visual_state
+                .total_lines
+                .saturating_sub(visual_state.scroll_offset + pane_h);
+
+            for pane_y in 0..pane_h {
+                let scrollback_row = base + pane_y;
+                if scrollback_row < start_row || scrollback_row > end_row {
+                    continue;
+                }
+
+                // Map pane-relative row to screen row.
+                let screen_y = pane_oy as usize + pane_y;
+                if screen_y >= self.front.len() || screen_y >= self.rows as usize {
+                    continue;
+                }
+
+                let col_start = if is_line_mode || scrollback_row > start_row {
+                    0
+                } else {
+                    start_col
+                };
+                let col_end = if is_line_mode || scrollback_row < end_row {
+                    pane_w
+                } else {
+                    end_col + 1
+                };
+
+                for col in col_start..col_end.min(pane_w) {
+                    let screen_x = pane_ox as usize + col;
+                    if screen_x >= self.cols as usize {
+                        break;
+                    }
+                    let row = &self.front[screen_y];
+                    if screen_x >= row.len() {
+                        break;
+                    }
+                    let cell = &row[screen_x];
+
+                    let fg = if cell.bg == CellColor::Default {
+                        Color::Black
+                    } else {
+                        cell_color_to_crossterm(&cell.bg)
+                    };
+                    let bg = if cell.fg == CellColor::Default {
+                        Color::White
+                    } else {
+                        cell_color_to_crossterm(&cell.fg)
+                    };
+
+                    queue!(
+                        stdout,
+                        MoveTo(screen_x as u16, screen_y as u16),
+                        SetForegroundColor(fg),
+                        SetBackgroundColor(bg),
+                    )?;
+                    if cell.bold {
+                        queue!(stdout, SetAttribute(Attribute::Bold))?;
+                    }
+                    queue!(stdout, Print(cell.c), ResetColor)?;
+                }
+            }
+        }
+
+        // Render cursor as a block highlight at the cursor position (pane-relative).
+        let cursor_screen_col = pane_ox + visual_state.cursor_col as u16;
+        let cursor_screen_row = pane_oy + visual_state.cursor_row as u16;
+
+        if cursor_screen_row < self.rows && cursor_screen_col < self.cols {
+            let row_idx = cursor_screen_row as usize;
+            let col_idx = cursor_screen_col as usize;
+            if row_idx < self.front.len() && col_idx < self.front[row_idx].len() {
+                let cell = &self.front[row_idx][col_idx];
+                let is_in_selection = selection_range.is_some_and(|_| true);
+
+                if selection_range.is_none() || !is_in_selection {
+                    let fg = if cell.bg == CellColor::Default {
+                        Color::Black
+                    } else {
+                        cell_color_to_crossterm(&cell.bg)
+                    };
+                    let bg = if cell.fg == CellColor::Default {
+                        Color::White
+                    } else {
+                        cell_color_to_crossterm(&cell.fg)
+                    };
+                    queue!(
+                        stdout,
+                        MoveTo(cursor_screen_col, cursor_screen_row),
+                        SetForegroundColor(fg),
+                        SetBackgroundColor(bg),
+                        Print(cell.c),
+                        ResetColor,
+                    )?;
+                }
+            }
+        }
+
+        stdout.flush()?;
+        Ok(())
+    }
+
+    /// Extract text from the front buffer for the given visual selection.
+    ///
+    /// Selection coordinates are pane-relative. The front buffer is read at
+    /// `(pane_offset_x + col, pane_offset_y + row)` to map from pane-local
+    /// coordinates to the composited screen buffer.
+    pub fn extract_text(&self, visual_state: &VisualState) -> String {
+        let selection = match visual_state.selection_range() {
+            Some(range) => range,
+            None => return String::new(),
+        };
+        let ((start_row, start_col), (end_row, end_col)) = selection;
+        let is_line_mode = visual_state.selection_mode == SelectionMode::Line;
+
+        let pane_ox = visual_state.pane_offset_x as usize;
+        let pane_oy = visual_state.pane_offset_y as usize;
+        let pane_h = visual_state.visible_rows;
+        let pane_w = visual_state.visible_cols;
+
+        let base = visual_state
+            .total_lines
+            .saturating_sub(visual_state.scroll_offset + pane_h);
+
+        let mut result = String::new();
+
+        for pane_y in 0..pane_h {
+            let scrollback_row = base + pane_y;
+            if scrollback_row < start_row || scrollback_row > end_row {
+                continue;
+            }
+
+            let screen_y = pane_oy + pane_y;
+            if screen_y >= self.front.len() {
+                continue;
+            }
+            let row = &self.front[screen_y];
+
+            // Extract only the pane's columns from the composited row.
+            let pane_row_len = pane_w.min(row.len().saturating_sub(pane_ox));
+            let pane_row: Vec<&RenderCell> = (0..pane_row_len).map(|c| &row[pane_ox + c]).collect();
+
+            if is_line_mode {
+                let line: String = pane_row.iter().map(|c| c.c).collect();
+                result.push_str(line.trim_end());
+                result.push('\n');
+            } else if start_row == end_row {
+                let cs = start_col.min(pane_row.len());
+                let ce = (end_col + 1).min(pane_row.len());
+                let text: String = pane_row[cs..ce].iter().map(|c| c.c).collect();
+                result.push_str(text.trim_end());
+            } else if scrollback_row == start_row {
+                let cs = start_col.min(pane_row.len());
+                let text: String = pane_row[cs..].iter().map(|c| c.c).collect();
+                result.push_str(text.trim_end());
+                result.push('\n');
+            } else if scrollback_row == end_row {
+                let ce = (end_col + 1).min(pane_row.len());
+                let text: String = pane_row[..ce].iter().map(|c| c.c).collect();
+                result.push_str(text.trim_end());
+            } else {
+                let text: String = pane_row.iter().map(|c| c.c).collect();
+                result.push_str(text.trim_end());
+                result.push('\n');
+            }
+        }
+
+        result
+    }
+
+    /// Get a reference to the front buffer (for testing/inspection).
+    pub fn front_buffer(&self) -> &[Vec<RenderCell>] {
+        &self.front
+    }
+
     /// Clear the overlay by re-rendering the front buffer rows that might
     /// have been affected (bottom portion of screen).
     pub fn clear_overlay(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -305,5 +498,77 @@ mod tests {
                 b: 30
             }
         ));
+    }
+
+    /// Helper to create a renderer with text content in the front buffer.
+    fn renderer_with_text(lines: &[&str], cols: u16, rows: u16) -> Renderer {
+        let mut renderer = Renderer::new(cols, rows);
+        for (y, line) in lines.iter().enumerate() {
+            if y >= rows as usize {
+                break;
+            }
+            for (x, ch) in line.chars().enumerate() {
+                if x >= cols as usize {
+                    break;
+                }
+                renderer.front[y][x] = RenderCell {
+                    c: ch,
+                    ..RenderCell::default()
+                };
+            }
+        }
+        renderer
+    }
+
+    #[test]
+    fn test_extract_text_no_selection() {
+        let renderer = renderer_with_text(&["hello", "world"], 10, 5);
+        let vs = VisualState::new(5, 5);
+        // No selection active.
+        let text = renderer.extract_text(&vs);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_extract_text_char_single_line() {
+        let renderer = renderer_with_text(&["hello world"], 20, 5);
+        let mut vs = VisualState::with_cols(5, 5, 20);
+        // Position cursor at row 0, col 0.
+        vs.cursor_row = 0;
+        vs.cursor_col = 0;
+        vs.start_char_selection();
+        // Move cursor to col 4 (select "hello").
+        vs.cursor_col = 4;
+        let text = renderer.extract_text(&vs);
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn test_extract_text_line_mode() {
+        let renderer = renderer_with_text(&["line one", "line two", "line three"], 20, 5);
+        let mut vs = VisualState::with_cols(5, 5, 20);
+        // Position at row 0.
+        vs.cursor_row = 0;
+        vs.cursor_col = 0;
+        vs.start_line_selection();
+        // Move to row 1 to select 2 lines.
+        vs.cursor_row = 1;
+        let text = renderer.extract_text(&vs);
+        assert_eq!(text, "line one\nline two\n");
+    }
+
+    #[test]
+    fn test_extract_text_char_multi_line() {
+        let renderer = renderer_with_text(&["AAABBB", "CCCDDD", "EEEFFFGGG"], 10, 5);
+        let mut vs = VisualState::with_cols(5, 5, 10);
+        // Start at row 0, col 3.
+        vs.cursor_row = 0;
+        vs.cursor_col = 3;
+        vs.start_char_selection();
+        // End at row 1, col 2 (select "BBB\nCCC").
+        vs.cursor_row = 1;
+        vs.cursor_col = 2;
+        let text = renderer.extract_text(&vs);
+        assert_eq!(text, "BBB\nCCC");
     }
 }

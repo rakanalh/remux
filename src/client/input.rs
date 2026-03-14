@@ -58,11 +58,22 @@ pub struct VisualState {
     pub total_lines: usize,
     /// Number of visible rows in the pane (set by the caller).
     pub visible_rows: usize,
+    /// Number of visible columns in the pane (set by the caller).
+    pub visible_cols: usize,
+    /// The pane's x position in the composited screen buffer.
+    pub pane_offset_x: u16,
+    /// The pane's y position in the composited screen buffer.
+    pub pane_offset_y: u16,
 }
 
 impl VisualState {
     /// Create a new `VisualState` positioned at the bottom of the scrollback.
     pub fn new(visible_rows: usize, total_lines: usize) -> Self {
+        Self::with_cols(visible_rows, total_lines, 80)
+    }
+
+    /// Create a new `VisualState` with explicit column count.
+    pub fn with_cols(visible_rows: usize, total_lines: usize, visible_cols: usize) -> Self {
         Self {
             scroll_offset: 0,
             cursor_row: visible_rows.saturating_sub(1),
@@ -74,6 +85,9 @@ impl VisualState {
             current_match: 0,
             total_lines,
             visible_rows,
+            visible_cols,
+            pane_offset_x: 0,
+            pane_offset_y: 0,
         }
     }
 
@@ -171,13 +185,40 @@ impl VisualState {
         }
     }
 
+    /// Move the cursor left by one column.
+    pub fn cursor_left(&mut self) {
+        self.cursor_col = self.cursor_col.saturating_sub(1);
+    }
+
+    /// Move the cursor right by one column, clamped to the visible width.
+    pub fn cursor_right(&mut self, max_col: usize) {
+        if self.cursor_col < max_col.saturating_sub(1) {
+            self.cursor_col += 1;
+        }
+    }
+
     /// Get the cursor position in scrollback coordinates.
-    fn scrollback_cursor_pos(&self) -> (usize, usize) {
+    pub fn scrollback_cursor_pos(&self) -> (usize, usize) {
         let row = self
             .total_lines
             .saturating_sub(self.scroll_offset + self.visible_rows)
             + self.cursor_row;
         (row, self.cursor_col)
+    }
+
+    /// Return the selection range as `(start, end)` in scrollback coordinates,
+    /// ordered so that `start <= end`. Returns `None` if no selection is active.
+    pub fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let start = self.selection_start?;
+        if self.selection_mode == SelectionMode::None {
+            return None;
+        }
+        let end = self.scrollback_cursor_pos();
+        if start <= end {
+            Some((start, end))
+        } else {
+            Some((end, start))
+        }
     }
 
     /// Reset the visual state (selection and search).
@@ -330,8 +371,22 @@ impl InputHandler {
 
     /// Initialize visual mode with the given scrollback dimensions.
     pub fn enter_visual_mode(&mut self, visible_rows: usize, total_lines: usize) {
+        self.enter_visual_mode_with_cols(visible_rows, total_lines, 80);
+    }
+
+    /// Initialize visual mode with explicit column count.
+    pub fn enter_visual_mode_with_cols(
+        &mut self,
+        visible_rows: usize,
+        total_lines: usize,
+        visible_cols: usize,
+    ) {
         self.mode = Mode::Visual;
-        self.visual_state = Some(VisualState::new(visible_rows, total_lines));
+        self.visual_state = Some(VisualState::with_cols(
+            visible_rows,
+            total_lines,
+            visible_cols,
+        ));
         self.pending_g = false;
     }
 
@@ -400,7 +455,7 @@ impl InputHandler {
                         }
                         RemuxCommand::EnterVisualMode => {
                             self.mode = Mode::Visual;
-                            self.visual_state = Some(VisualState::new(24, 1000));
+                            self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
                             return InputAction::ModeChanged(Mode::Visual);
                         }
                         RemuxCommand::PaneRename(_) => {
@@ -494,6 +549,23 @@ impl InputHandler {
         }
 
         match ch {
+            'h' => {
+                if let Some(vs) = self.visual_state.as_mut() {
+                    vs.cursor_left();
+                    return InputAction::VisualScroll {
+                        offset: vs.scroll_offset,
+                    };
+                }
+            }
+            'l' => {
+                if let Some(vs) = self.visual_state.as_mut() {
+                    let max_col = vs.visible_cols;
+                    vs.cursor_right(max_col);
+                    return InputAction::VisualScroll {
+                        offset: vs.scroll_offset,
+                    };
+                }
+            }
             'j' => {
                 if let Some(vs) = self.visual_state.as_mut() {
                     vs.cursor_down();
@@ -525,12 +597,18 @@ impl InputHandler {
             'v' => {
                 if let Some(vs) = self.visual_state.as_mut() {
                     vs.start_char_selection();
+                    return InputAction::VisualScroll {
+                        offset: vs.scroll_offset,
+                    };
                 }
                 return InputAction::None;
             }
             'V' => {
                 if let Some(vs) = self.visual_state.as_mut() {
                     vs.start_line_selection();
+                    return InputAction::VisualScroll {
+                        offset: vs.scroll_offset,
+                    };
                 }
                 return InputAction::None;
             }
@@ -990,7 +1068,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn visual_mode_h_moves_cursor_left() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        // Move right first, then left.
+        handler.handle_key(char_key('l'));
+        handler.handle_key(char_key('l'));
+        let vs = handler.visual_state.as_ref().unwrap();
+        assert_eq!(vs.cursor_col, 2);
+
+        handler.handle_key(char_key('h'));
+        let vs = handler.visual_state.as_ref().unwrap();
+        assert_eq!(vs.cursor_col, 1);
+    }
+
+    #[test]
+    fn visual_mode_l_moves_cursor_right() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+
+        let action = handler.handle_key(char_key('l'));
+        assert!(matches!(action, InputAction::VisualScroll { .. }));
+        let vs = handler.visual_state.as_ref().unwrap();
+        assert_eq!(vs.cursor_col, 1);
+    }
+
+    #[test]
+    fn visual_mode_h_clamps_at_zero() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+
+        // Already at col 0, moving left should stay at 0.
+        handler.handle_key(char_key('h'));
+        let vs = handler.visual_state.as_ref().unwrap();
+        assert_eq!(vs.cursor_col, 0);
+    }
+
+    #[test]
+    fn visual_mode_v_returns_visual_scroll() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        let action = handler.handle_key(char_key('v'));
+        // Should return VisualScroll so the overlay gets redrawn.
+        assert!(matches!(action, InputAction::VisualScroll { .. }));
+    }
+
+    #[test]
+    fn visual_mode_big_v_returns_visual_scroll() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        let action = handler.handle_key(char_key('V'));
+        assert!(matches!(action, InputAction::VisualScroll { .. }));
+    }
+
     // -- VisualState unit tests ---------------------------------------------
+
+    #[test]
+    fn visual_state_cursor_left_clamps() {
+        let mut vs = VisualState::new(24, 100);
+        assert_eq!(vs.cursor_col, 0);
+        vs.cursor_left();
+        assert_eq!(vs.cursor_col, 0);
+    }
+
+    #[test]
+    fn visual_state_cursor_right_clamps() {
+        let mut vs = VisualState::with_cols(24, 100, 10);
+        for _ in 0..20 {
+            vs.cursor_right(vs.visible_cols);
+        }
+        assert_eq!(vs.cursor_col, 9); // max_col - 1
+    }
+
+    #[test]
+    fn visual_state_selection_range_char() {
+        let mut vs = VisualState::new(24, 24);
+        vs.start_char_selection();
+        // Cursor starts at bottom-right-ish position.
+        let start_pos = vs.scrollback_cursor_pos();
+        assert!(vs.selection_start.is_some());
+
+        // Move cursor down (should stay at bottom since we're already there).
+        vs.cursor_col = 5;
+        let range = vs.selection_range();
+        assert!(range.is_some());
+        let ((sr, sc), (er, ec)) = range.unwrap();
+        assert_eq!(sr, start_pos.0);
+        assert_eq!(sc, start_pos.1);
+        assert_eq!(er, start_pos.0); // same row
+        assert_eq!(ec, 5);
+    }
+
+    #[test]
+    fn visual_state_selection_range_none_when_no_selection() {
+        let vs = VisualState::new(24, 100);
+        assert!(vs.selection_range().is_none());
+    }
+
+    #[test]
+    fn visual_state_selection_range_orders_correctly() {
+        let mut vs = VisualState::new(24, 48);
+        // Move cursor to middle, start selection, then move up.
+        vs.cursor_row = 12;
+        vs.cursor_col = 5;
+        vs.start_char_selection();
+        let start_pos = vs.scrollback_cursor_pos();
+
+        // Move cursor up.
+        vs.cursor_row = 5;
+        vs.cursor_col = 2;
+        let end_pos = vs.scrollback_cursor_pos();
+
+        let range = vs.selection_range();
+        assert!(range.is_some());
+        let ((sr, sc), (er, ec)) = range.unwrap();
+        // Should be ordered: end_pos (row 5) < start_pos (row 12).
+        assert_eq!((sr, sc), (end_pos.0, end_pos.1));
+        assert_eq!((er, ec), (start_pos.0, start_pos.1));
+    }
 
     #[test]
     fn visual_state_scroll_up_clamps() {

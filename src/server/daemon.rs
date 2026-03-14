@@ -17,7 +17,7 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use crate::config::Config;
+use crate::config::{BorderStyle, Config};
 use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
@@ -701,24 +701,15 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
-                let effective_gap = if sess.gaps_enabled {
-                    config.appearance.gap_size
-                } else {
-                    0
-                };
                 let area = Rect {
                     x: 0,
                     y: 0,
                     width: cols,
                     height: rows.saturating_sub(1),
                 };
-                if let Some(neighbor) = layout::find_neighbor(
-                    &tab.layout,
-                    area,
-                    tab.focused_pane,
-                    direction,
-                    effective_gap,
-                ) {
+                if let Some(neighbor) =
+                    layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction, 0)
+                {
                     tab.focused_pane = neighbor;
                 }
             }
@@ -814,14 +805,17 @@ async fn handle_command(
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::ToggleGaps => {
+        RemuxCommand::ToggleStyle => {
             {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
                     Some(s) => s,
                     None => return Ok(()),
                 };
-                sess.gaps_enabled = !sess.gaps_enabled;
+                sess.border_style = match sess.border_style {
+                    BorderStyle::ZellijStyle => BorderStyle::TmuxStyle,
+                    BorderStyle::TmuxStyle => BorderStyle::ZellijStyle,
+                };
             }
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -928,8 +922,8 @@ async fn handle_create_session(
     };
     let pane_id = {
         let mut st = state.lock().await;
-        let gaps_enabled = config.appearance.gap_mode == crate::config::GapMode::ZellijStyle;
-        st.create_session(name, folder, gaps_enabled)?
+        let border_style = config.appearance.border_style.clone();
+        st.create_session(name, folder, border_style)?
     };
     spawn_pane(pane_id, cols, rows, None, panes, config).await?;
 
@@ -1075,7 +1069,7 @@ async fn resize_session_panes(
     rows: u16,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    config: &Arc<Config>,
+    _config: &Arc<Config>,
 ) -> Result<()> {
     let rects = {
         let st = state.lock().await;
@@ -1087,11 +1081,6 @@ async fn resize_session_panes(
             Some(t) => t,
             None => return Ok(()),
         };
-        let effective_gap = if sess.gaps_enabled {
-            config.appearance.gap_size
-        } else {
-            0
-        };
         let content_rows = rows.saturating_sub(1);
         let area = Rect {
             x: 0,
@@ -1099,7 +1088,7 @@ async fn resize_session_panes(
             width: cols,
             height: content_rows,
         };
-        layout::compute_layout(&tab.layout, area, effective_gap)
+        layout::compute_layout(&tab.layout, area, 0)
     };
 
     let mut ps = panes.lock().await;
@@ -1138,7 +1127,7 @@ async fn send_full_render_to_client(
     };
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
-    let (cells, cursor_x, cursor_y, cursor_visible) =
+    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect) =
         build_composite(session_name, cols, rows, &mode, state, panes, config).await;
     {
         let mut pf = prev_frames.lock().await;
@@ -1151,6 +1140,7 @@ async fn send_full_render_to_client(
             cursor_x,
             cursor_y,
             cursor_visible,
+            focused_pane_rect,
         });
     }
 }
@@ -1185,7 +1175,7 @@ async fn broadcast_full_render(
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
 
-    let (cells, cursor_x, cursor_y, cursor_visible) =
+    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect) =
         build_composite(session_name, cols, rows, &mode, state, panes, config).await;
 
     let msg = {
@@ -1199,6 +1189,7 @@ async fn broadcast_full_render(
                     cursor_x,
                     cursor_y,
                     cursor_visible,
+                    focused_pane_rect,
                 }
             } else {
                 ServerMessage::RenderDiff {
@@ -1206,6 +1197,7 @@ async fn broadcast_full_render(
                     cursor_x,
                     cursor_y,
                     cursor_visible,
+                    focused_pane_rect,
                 }
             }
         } else {
@@ -1214,6 +1206,7 @@ async fn broadcast_full_render(
                 cursor_x,
                 cursor_y,
                 cursor_visible,
+                focused_pane_rect,
             }
         }
     };
@@ -1278,8 +1271,8 @@ async fn build_composite(
     mode: &str,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    config: &Arc<Config>,
-) -> (Vec<Vec<RenderCell>>, u16, u16, bool) {
+    _config: &Arc<Config>,
+) -> (Vec<Vec<RenderCell>>, u16, u16, bool, Option<PaneRect>) {
     let st = state.lock().await;
     let sess = match st.sessions.get(session_name) {
         Some(s) => s,
@@ -1289,6 +1282,7 @@ async fn build_composite(
                 0,
                 0,
                 false,
+                None,
             );
         }
     };
@@ -1300,14 +1294,9 @@ async fn build_composite(
                 0,
                 0,
                 false,
+                None,
             );
         }
-    };
-
-    let effective_gap = if sess.gaps_enabled {
-        config.appearance.gap_size
-    } else {
-        0
     };
 
     let content_rows = rows.saturating_sub(1);
@@ -1320,7 +1309,7 @@ async fn build_composite(
 
     let ps = panes.lock().await;
     let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
-    let pane_rects = layout::compute_layout(&tab.layout, area, effective_gap);
+    let pane_rects = layout::compute_layout(&tab.layout, area, 0);
     for (pane_id, _rect) in &pane_rects {
         if let Some(pane_data) = ps.get(pane_id) {
             pane_screens.insert(*pane_id, &pane_data.screen);
@@ -1342,24 +1331,19 @@ async fn build_composite(
         &tab.layout,
         &pane_screens,
         area,
-        &config.appearance.gap_mode,
+        &sess.border_style,
         &status_info,
         cols,
         rows,
-        effective_gap,
+        0,
         tab.focused_pane,
     );
 
     // If there is an active rename, place the cursor in the pane's border
     // at the end of the typed text instead of inside the shell content.
     let rename_cursor = sess.rename_state.as_ref().and_then(|(rename_pane_id, _)| {
-        let effective_mode = if sess.gaps_enabled {
-            &config.appearance.gap_mode
-        } else {
-            &crate::config::GapMode::TmuxStyle
-        };
         // Only ZellijStyle has visible borders where we can position the cursor.
-        if !matches!(effective_mode, crate::config::GapMode::ZellijStyle) {
+        if !matches!(sess.border_style, BorderStyle::ZellijStyle) {
             return None;
         }
         pane_rects
@@ -1376,40 +1360,51 @@ async fn build_composite(
             })
     });
 
+    // Compute border offsets for the focused pane (shared by rect and cursor).
+    let focused_rect_and_offsets = pane_rects
+        .iter()
+        .find(|(id, _)| *id == tab.focused_pane)
+        .map(|(_, rect)| {
+            let (x_off, y_off, x_off_end, y_off_end) = match &sess.border_style {
+                BorderStyle::ZellijStyle => {
+                    if rect.width >= 3 && rect.height >= 3 {
+                        (1u16, 1u16, 1u16, 1u16) // 1-cell border on each side
+                    } else {
+                        (0, 0, 0, 0)
+                    }
+                }
+                BorderStyle::TmuxStyle => {
+                    let has_tab_bar =
+                        layout::find_stack_for_pane(&tab.layout, tab.focused_pane)
+                            .map(|panes| panes.len() > 1)
+                            .unwrap_or(false);
+                    if has_tab_bar {
+                        (0, 1, 0, 0) // tab bar takes 1 row at top
+                    } else {
+                        (0, 0, 0, 0)
+                    }
+                }
+            };
+            (rect, x_off, y_off, x_off_end, y_off_end)
+        });
+
+    // Build the focused pane rect for the client (content area, excluding borders).
+    let focused_pane_rect = focused_rect_and_offsets.map(|(rect, x_off, y_off, x_off_end, y_off_end)| {
+        PaneRect {
+            x: rect.x + x_off,
+            y: rect.y + y_off,
+            width: rect.width.saturating_sub(x_off + x_off_end),
+            height: rect.height.saturating_sub(y_off + y_off_end),
+        }
+    });
+
     let (cursor_x, cursor_y, cursor_visible) = if let Some(rc) = rename_cursor {
         rc
     } else if let Some(pane_data) = ps.get(&tab.focused_pane) {
-        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == tab.focused_pane) {
-            // Account for border/tab-bar offset depending on gap mode.
-            let effective_mode = if sess.gaps_enabled {
-                &config.appearance.gap_mode
-            } else {
-                &crate::config::GapMode::TmuxStyle
-            };
-            let (x_offset, y_offset) = match effective_mode {
-                crate::config::GapMode::ZellijStyle => {
-                    if rect.width >= 3 && rect.height >= 3 {
-                        (1u16, 1u16) // 1-cell border on each side
-                    } else {
-                        (0, 0)
-                    }
-                }
-                crate::config::GapMode::TmuxStyle => {
-                    // In TmuxStyle, multi-pane stacks have a tab bar that
-                    // shifts content down by 1 row.
-                    let has_tab_bar = layout::find_stack_for_pane(&tab.layout, tab.focused_pane)
-                        .map(|panes| panes.len() > 1)
-                        .unwrap_or(false);
-                    if has_tab_bar {
-                        (0, 1) // tab bar takes 1 row at top
-                    } else {
-                        (0, 0)
-                    }
-                }
-            };
+        if let Some((rect, x_off, y_off, _, _)) = focused_rect_and_offsets {
             (
-                rect.x + x_offset + pane_data.screen.cursor_x,
-                rect.y + y_offset + pane_data.screen.cursor_y,
+                rect.x + x_off + pane_data.screen.cursor_x,
+                rect.y + y_off + pane_data.screen.cursor_y,
                 true,
             )
         } else {
@@ -1419,7 +1414,7 @@ async fn build_composite(
         (0, 0, false)
     };
 
-    (cells, cursor_x, cursor_y, cursor_visible)
+    (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect)
 }
 
 fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellChange> {

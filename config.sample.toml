@@ -29,11 +29,8 @@ mode_switch_key = "Esc"
 # Where the status bar is placed: "top" or "bottom".
 status_bar_position = "bottom"
 
-# Pane rendering style: "zellij_style" (borders, pane names) or "tmux_style" (minimal dividers).
-gap_mode = "zellij_style"
-
-# Gap size in cells between panes (only applies when gap_mode = "zellij_style").
-gap_size = 0
+# Pane border rendering style: "zellij_style" (borders, pane names) or "tmux_style" (minimal dividers).
+border_style = "zellij_style"
 
 # -----------------------------------------------------------------------------
 # Modes
@@ -119,7 +116,7 @@ l = "ResizeRight 5"
 # Uncomment to override:
 # i = "EnterInsertMode"
 # v = "EnterVisualMode"
-# g = "ToggleGaps"
+# g = "ToggleStyle"
 
 # -----------------------------------------------------------------------------
 # Keybindings — Insert Mode
@@ -205,4 +202,4 @@ Alt-p = "TabPrev"
 #   EnterVisualMode                 — Switch to visual mode
 #
 # Layout commands:
-#   ToggleGaps                      — Toggle pane gap rendering on/off
+#   ToggleStyle                     — Toggle border style between zellij and tmux

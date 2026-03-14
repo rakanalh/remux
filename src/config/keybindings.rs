@@ -158,7 +158,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     root.insert('v', leaf("visual mode", "EnterVisualMode"));
 
     // Layout toggle bindings.
-    root.insert('g', leaf("toggle gaps", "ToggleGaps"));
+    root.insert('g', leaf("toggle style", "ToggleStyle"));
 
     root
 }
@@ -389,7 +389,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "FolderList" => Some(RemuxCommand::FolderList),
         "BufferEditInEditor" => Some(RemuxCommand::BufferEditInEditor),
         "BufferSearch" => Some(RemuxCommand::BufferSearch),
-        "ToggleGaps" => Some(RemuxCommand::ToggleGaps),
+        "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterInsertMode" => Some(RemuxCommand::EnterInsertMode),
         "EnterNormalMode" => Some(RemuxCommand::EnterNormalMode),
@@ -648,7 +648,10 @@ mod tests {
             parse_command("EnterVisualMode"),
             Some(RemuxCommand::EnterVisualMode)
         );
-        assert_eq!(parse_command("ToggleGaps"), Some(RemuxCommand::ToggleGaps));
+        assert_eq!(
+            parse_command("ToggleStyle"),
+            Some(RemuxCommand::ToggleStyle)
+        );
         assert_eq!(
             parse_command("PaneStackAdd"),
             Some(RemuxCommand::PaneStackAdd)
@@ -901,14 +904,14 @@ mod tests {
     }
 
     #[test]
-    fn default_tree_has_toggle_gaps() {
+    fn default_tree_has_toggle_style() {
         let tree = KeybindingTree::default();
         assert!(tree.root.contains_key(&'g'));
         let node = tree.lookup(&['g']).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
-                assert_eq!(action, "ToggleGaps");
-                assert_eq!(label, "toggle gaps");
+                assert_eq!(action, "ToggleStyle");
+                assert_eq!(label, "toggle style");
             }
             other => panic!("expected leaf for 'g', got {other:?}"),
         }
