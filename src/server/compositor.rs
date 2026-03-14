@@ -75,14 +75,30 @@ pub fn composite(
 
     let pane_rects = layout::compute_layout(layout, area, gap_size);
 
+    let mode = status_info.mode.as_str();
+
     match gap_mode {
         GapMode::ZellijStyle => {
-            draw_zellij_panes(&mut buffer, &pane_rects, pane_screens, layout, focused_pane);
+            draw_zellij_panes(
+                &mut buffer,
+                &pane_rects,
+                pane_screens,
+                layout,
+                focused_pane,
+                mode,
+            );
         }
         GapMode::TmuxStyle => {
             // TmuxStyle always uses gap_size=0, enforced at the caller level
             // (daemon.rs). Content is edge-to-edge with minimal dividers.
-            draw_tmux_panes(&mut buffer, &pane_rects, pane_screens, layout, focused_pane);
+            draw_tmux_panes(
+                &mut buffer,
+                &pane_rects,
+                pane_screens,
+                layout,
+                focused_pane,
+                mode,
+            );
         }
     }
 
@@ -107,6 +123,7 @@ fn draw_zellij_panes(
     pane_screens: &HashMap<PaneId, &Screen>,
     layout: &LayoutNode,
     focused_pane: PaneId,
+    mode: &str,
 ) {
     for &(pane_id, rect) in pane_rects {
         if rect.width == 0 || rect.height == 0 {
@@ -175,7 +192,9 @@ fn draw_zellij_panes(
 
         // Build the top border content (with pane name / tab labels).
         let stack_info = layout::find_stack_names(layout, pane_id);
-        let top_content = build_top_border_content(&stack_info, pane_id, &border_fg);
+        let available_width = w.saturating_sub(2); // inside the two corner chars
+        let top_content =
+            build_top_border_content(&stack_info, pane_id, &border_fg, mode, available_width);
 
         // Write the top border: fill between corners.
         let top_start = x + 1;
@@ -217,11 +236,13 @@ fn draw_zellij_panes(
 /// Build the render cells for the top border content (pane name or tab labels).
 ///
 /// For single-pane stacks: ` name ` (space-padded name).
-/// For multi-pane stacks: ` name1 | name2 | name3 ` with active tab highlighted.
+/// For multi-pane stacks: equal-width tabs with mode-based coloring.
 fn build_top_border_content(
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
     pane_id: PaneId,
     border_fg: &CellColor,
+    mode: &str,
+    max_width: usize,
 ) -> Vec<RenderCell> {
     let mut cells = Vec::new();
 
@@ -265,16 +286,16 @@ fn build_top_border_content(
             });
         }
     } else {
-        // Multi-pane stack: show all names as tabs.
-        // Leading space.
-        cells.push(RenderCell {
-            c: ' ',
-            fg: border_fg.clone(),
-            bg: CellColor::Default,
-            bold: false,
-            italic: false,
-            underline: false,
-        });
+        let _ = pane_id;
+        let n = names.len();
+        // Compute equal tab width: total width minus separators, divided among tabs.
+        let separator_total = (n - 1) * 3; // " | " between each pair
+        let tabs_space = max_width.saturating_sub(separator_total);
+        let tab_width = if n > 0 { tabs_space / n } else { 0 };
+        // Minimum tab width of 3 (1 char + padding).
+        let tab_width = tab_width.max(3);
+
+        let (active_fg, active_bg) = mode_tab_colors(mode);
 
         for (i, name) in names.iter().enumerate() {
             if i > 0 {
@@ -282,7 +303,7 @@ fn build_top_border_content(
                 for sep_ch in [' ', '|', ' '] {
                     cells.push(RenderCell {
                         c: sep_ch,
-                        fg: CellColor::Indexed(8), // dark grey separator
+                        fg: CellColor::Indexed(8),
                         bg: CellColor::Default,
                         bold: false,
                         italic: false,
@@ -298,40 +319,69 @@ fn build_top_border_content(
                 name.clone()
             };
 
-            let (tab_fg, tab_bold) = if is_this_active {
-                (CellColor::Indexed(15), true) // White, bold for active tab
+            let (tab_fg, tab_bg, tab_bold) = if is_this_active {
+                (active_fg.clone(), active_bg.clone(), true)
             } else {
-                (CellColor::Indexed(8), false) // Dark grey for inactive tabs
+                // Hidden: subdued grey on dark background
+                (CellColor::Indexed(7), CellColor::Indexed(237), false)
             };
 
-            // Highlight: also check if this is the pane we're currently rendering
-            // (in case of stacked panes, only the active pane is rendered)
-            let _ = pane_id; // pane_id is always the active one being rendered
+            // Center the name within tab_width, padding with spaces.
+            let name_len = display_name.chars().count();
+            let content_len = name_len.min(tab_width);
+            let pad_total = tab_width.saturating_sub(content_len);
+            let pad_left = pad_total / 2;
+            let pad_right = pad_total - pad_left;
 
-            for ch in display_name.chars() {
+            // Left padding.
+            for _ in 0..pad_left {
+                cells.push(RenderCell {
+                    c: ' ',
+                    fg: tab_fg.clone(),
+                    bg: tab_bg.clone(),
+                    bold: tab_bold,
+                    italic: false,
+                    underline: false,
+                });
+            }
+
+            // Tab name (truncated if needed).
+            for ch in display_name.chars().take(tab_width) {
                 cells.push(RenderCell {
                     c: ch,
                     fg: tab_fg.clone(),
-                    bg: CellColor::Default,
+                    bg: tab_bg.clone(),
+                    bold: tab_bold,
+                    italic: false,
+                    underline: false,
+                });
+            }
+
+            // Right padding.
+            for _ in 0..pad_right {
+                cells.push(RenderCell {
+                    c: ' ',
+                    fg: tab_fg.clone(),
+                    bg: tab_bg.clone(),
                     bold: tab_bold,
                     italic: false,
                     underline: false,
                 });
             }
         }
-
-        // Trailing space.
-        cells.push(RenderCell {
-            c: ' ',
-            fg: border_fg.clone(),
-            bg: CellColor::Default,
-            bold: false,
-            italic: false,
-            underline: false,
-        });
     }
 
     cells
+}
+
+/// Get foreground/background colors for the active tab based on current mode.
+fn mode_tab_colors(mode: &str) -> (CellColor, CellColor) {
+    match mode {
+        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(2)),  // Black on green
+        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(4)),  // Black on blue
+        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(5)),  // Black on magenta
+        _ => (CellColor::Indexed(0), CellColor::Indexed(8)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +398,7 @@ fn draw_tmux_panes(
     pane_screens: &HashMap<PaneId, &Screen>,
     layout: &LayoutNode,
     _focused_pane: PaneId,
+    mode: &str,
 ) {
     for &(pane_id, rect) in pane_rects {
         if rect.width == 0 || rect.height == 0 {
@@ -367,7 +418,7 @@ fn draw_tmux_panes(
 
         if is_multi && rect.height >= 2 {
             // Draw 1-row tab bar at the top, content below.
-            draw_tmux_tab_bar(buffer, rect, &stack_info);
+            draw_tmux_tab_bar(buffer, rect, &stack_info, mode);
 
             let content_rect = Rect {
                 x: rect.x,
@@ -393,10 +444,12 @@ fn draw_tmux_tab_bar(
     buffer: &mut [Vec<RenderCell>],
     rect: Rect,
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
+    mode: &str,
 ) {
     let y = rect.y as usize;
     let x_start = rect.x as usize;
     let x_end = (rect.x + rect.width) as usize;
+    let total_width = rect.width as usize;
 
     // Fill tab bar background.
     for col in x_start..x_end {
@@ -407,7 +460,7 @@ fn draw_tmux_tab_bar(
             RenderCell {
                 c: ' ',
                 fg: CellColor::Indexed(7),
-                bg: CellColor::Indexed(8), // Dark grey background
+                bg: CellColor::Indexed(236), // Very dark grey background
                 bold: false,
                 italic: false,
                 underline: false,
@@ -420,6 +473,13 @@ fn draw_tmux_tab_bar(
         None => return,
     };
 
+    let n = names.len();
+    let separator_total = (n - 1) * 3;
+    let tabs_space = total_width.saturating_sub(separator_total);
+    let tab_width = if n > 0 { tabs_space / n } else { 0 };
+    let tab_width = tab_width.max(3);
+
+    let (active_fg, active_bg) = mode_tab_colors(mode);
     let mut col = x_start;
 
     for (i, name) in names.iter().enumerate() {
@@ -437,8 +497,8 @@ fn draw_tmux_tab_bar(
                         col,
                         RenderCell {
                             c: sep_ch,
-                            fg: CellColor::Indexed(7),
-                            bg: CellColor::Indexed(8),
+                            fg: CellColor::Indexed(8),
+                            bg: CellColor::Indexed(236),
                             bold: false,
                             italic: false,
                             underline: false,
@@ -456,30 +516,51 @@ fn draw_tmux_tab_bar(
             name.clone()
         };
 
-        let (fg, bold) = if is_active {
-            (CellColor::Indexed(15), true) // White, bold for active
+        let (fg, bg, bold) = if is_active {
+            (active_fg.clone(), active_bg.clone(), true)
         } else {
-            (CellColor::Indexed(7), false) // Grey for inactive
+            (CellColor::Indexed(7), CellColor::Indexed(237), false)
         };
 
-        for ch in display_name.chars() {
+        // Center the name within tab_width.
+        let name_len = display_name.chars().count();
+        let content_len = name_len.min(tab_width);
+        let pad_total = tab_width.saturating_sub(content_len);
+        let pad_left = pad_total / 2;
+        let pad_right = pad_total - pad_left;
+
+        // Left padding.
+        for _ in 0..pad_left {
+            if col < x_end {
+                set_cell(buffer, y, col, RenderCell {
+                    c: ' ', fg: fg.clone(), bg: bg.clone(), bold,
+                    italic: false, underline: false,
+                });
+                col += 1;
+            }
+        }
+
+        // Tab name (truncated if needed).
+        for ch in display_name.chars().take(tab_width) {
             if col >= x_end {
                 break;
             }
-            set_cell(
-                buffer,
-                y,
-                col,
-                RenderCell {
-                    c: ch,
-                    fg: fg.clone(),
-                    bg: CellColor::Indexed(8),
-                    bold,
-                    italic: false,
-                    underline: false,
-                },
-            );
+            set_cell(buffer, y, col, RenderCell {
+                c: ch, fg: fg.clone(), bg: bg.clone(), bold,
+                italic: false, underline: false,
+            });
             col += 1;
+        }
+
+        // Right padding.
+        for _ in 0..pad_right {
+            if col < x_end {
+                set_cell(buffer, y, col, RenderCell {
+                    c: ' ', fg: fg.clone(), bg: bg.clone(), bold,
+                    italic: false, underline: false,
+                });
+                col += 1;
+            }
         }
     }
 }
