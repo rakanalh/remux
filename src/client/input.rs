@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::keybindings::{parse_action, KeyNode, KeybindingTree};
+use crate::config::keybindings::{parse_command, InsertBindings, KeyNode, KeybindingTree};
 use crate::protocol::RemuxCommand;
 
 // ---------------------------------------------------------------------------
@@ -278,6 +278,8 @@ pub struct InputHandler {
     keybinding_state: KeybindingState,
     /// The keybinding tree (owned clone from config).
     keybinding_tree: KeybindingTree,
+    /// Flat insert-mode bindings (modifier keys → commands).
+    insert_bindings: InsertBindings,
     /// State for Visual mode scrollback navigation.
     pub visual_state: Option<VisualState>,
     /// Pending 'g' key for gg motion in visual mode.
@@ -287,14 +289,19 @@ pub struct InputHandler {
 }
 
 impl InputHandler {
-    /// Create a new `InputHandler` with the given keybinding tree and
-    /// mode-switch key.
-    pub fn new(keybinding_tree: KeybindingTree, mode_switch_key: KeyCode) -> Self {
+    /// Create a new `InputHandler` with the given keybinding tree, insert
+    /// bindings, and mode-switch key.
+    pub fn new(
+        keybinding_tree: KeybindingTree,
+        insert_bindings: InsertBindings,
+        mode_switch_key: KeyCode,
+    ) -> Self {
         Self {
             mode: Mode::Insert,
             mode_switch_key,
             keybinding_state: KeybindingState::new(),
             keybinding_tree,
+            insert_bindings,
             visual_state: None,
             pending_g: false,
             rename_buffer: String::new(),
@@ -302,9 +309,13 @@ impl InputHandler {
     }
 
     /// Create a new `InputHandler` with defaults (Esc to switch modes, default
-    /// keybinding tree).
+    /// keybinding tree and insert bindings).
     pub fn with_defaults() -> Self {
-        Self::new(KeybindingTree::default(), KeyCode::Esc)
+        Self::new(
+            KeybindingTree::default(),
+            InsertBindings::default(),
+            KeyCode::Esc,
+        )
     }
 
     /// Process a key event and return the appropriate action.
@@ -336,6 +347,11 @@ impl InputHandler {
         if key.code == self.mode_switch_key && !key.modifiers.intersects(dominated) {
             self.mode = Mode::Normal;
             return InputAction::ModeChanged(Mode::Normal);
+        }
+
+        // Check insert mode bindings before forwarding to PTY.
+        if let Some(cmd) = self.insert_bindings.lookup(&key) {
+            return InputAction::Execute(cmd.clone());
         }
 
         // Convert the key event to bytes for the PTY.
@@ -375,7 +391,7 @@ impl InputHandler {
         match self.keybinding_tree.lookup(&path) {
             Some(KeyNode::Leaf { action, .. }) => {
                 self.keybinding_state.reset();
-                if let Some(cmd) = parse_action(action) {
+                if let Some(cmd) = parse_command(action) {
                     // Handle mode-switch commands.
                     match &cmd {
                         RemuxCommand::EnterInsertMode => {
@@ -1063,5 +1079,55 @@ mod tests {
         };
         let bytes = key_event_to_bytes(&key).unwrap();
         assert_eq!(bytes, "\u{00e9}".as_bytes());
+    }
+
+    // -- Insert mode bindings -----------------------------------------------
+
+    fn alt_key(c: char) -> KeyEvent {
+        make_key(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn insert_mode_alt_h_executes_pane_focus_left() {
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(handler.mode, Mode::Insert);
+        let action = handler.handle_key(alt_key('h'));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneFocusLeft));
+        // Remains in insert mode.
+        assert_eq!(handler.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn insert_mode_alt_l_executes_pane_focus_right() {
+        let mut handler = InputHandler::with_defaults();
+        let action = handler.handle_key(alt_key('l'));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneFocusRight));
+        assert_eq!(handler.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn insert_mode_alt_n_executes_tab_next() {
+        let mut handler = InputHandler::with_defaults();
+        let action = handler.handle_key(alt_key('n'));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::TabNext));
+        assert_eq!(handler.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn insert_mode_unbound_key_passes_to_pty() {
+        let mut handler = InputHandler::with_defaults();
+        // Alt-x is not bound by default.
+        let action = handler.handle_key(alt_key('x'));
+        // Should pass through to PTY as ESC + 'x'.
+        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'x']));
+        assert_eq!(handler.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn insert_mode_regular_char_passes_to_pty() {
+        let mut handler = InputHandler::with_defaults();
+        let action = handler.handle_key(char_key('a'));
+        assert_eq!(action, InputAction::SendToPty(b"a".to_vec()));
+        assert_eq!(handler.mode, Mode::Insert);
     }
 }

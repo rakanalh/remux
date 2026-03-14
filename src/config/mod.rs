@@ -15,6 +15,7 @@ pub struct Config {
     pub general: GeneralConfig,
     pub appearance: AppearanceConfig,
     pub modes: ModesConfig,
+    pub keybindings: KeybindingsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,16 +112,50 @@ impl Default for ModesConfig {
 pub struct NormalModeConfig {
     /// Timeout in milliseconds before the which-key popup appears.
     pub timeout_ms: u64,
-    /// Raw TOML value for keybinding definitions. Parsed separately by
-    /// [`keybindings::KeybindingTree::from_toml`].
-    pub keys: toml::Value,
 }
 
 impl Default for NormalModeConfig {
     fn default() -> Self {
+        Self { timeout_ms: 500 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keybindings
+// ---------------------------------------------------------------------------
+
+/// Per-mode keybinding configuration.
+///
+/// Example `config.toml`:
+/// ```toml
+/// [keybindings.normal.t]
+/// _label = "Tab"
+/// n = "TabNew"
+/// c = "TabClose"
+/// r = "TabRename"
+///
+/// [keybindings.insert]
+/// Alt-h = "PaneFocusLeft"
+/// Alt-l = "PaneFocusRight"
+/// Alt-n = "TabNext"
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct KeybindingsConfig {
+    /// Normal mode keybinding overrides (tree-based).
+    pub normal: toml::Value,
+    /// Visual mode keybinding overrides (tree-based).
+    pub visual: toml::Value,
+    /// Insert mode keybinding overrides (flat, modifier keys only).
+    pub insert: toml::Value,
+}
+
+impl Default for KeybindingsConfig {
+    fn default() -> Self {
         Self {
-            timeout_ms: 500,
-            keys: toml::Value::Table(toml::map::Map::new()),
+            normal: toml::Value::Table(toml::map::Map::new()),
+            visual: toml::Value::Table(toml::map::Map::new()),
+            insert: toml::Value::Table(toml::map::Map::new()),
         }
     }
 }
@@ -136,6 +171,7 @@ impl Default for Config {
             general: GeneralConfig::default(),
             appearance: AppearanceConfig::default(),
             modes: ModesConfig::default(),
+            keybindings: KeybindingsConfig::default(),
         }
     }
 }
@@ -178,10 +214,10 @@ impl Config {
         let mut tree = keybindings::KeybindingTree::default();
 
         // If the user provided keybinding overrides, parse and merge them.
-        if let Some(table) = self.modes.normal.keys.as_table() {
+        if let Some(table) = self.keybindings.normal.as_table() {
             if !table.is_empty() {
                 if let Some(user_tree) =
-                    keybindings::KeybindingTree::from_toml(&self.modes.normal.keys)
+                    keybindings::KeybindingTree::from_toml(&self.keybindings.normal)
                 {
                     tree.merge(&user_tree);
                 }
@@ -189,6 +225,20 @@ impl Config {
         }
 
         tree
+    }
+
+    /// Build the effective insert mode bindings by starting from defaults
+    /// and merging any user-defined overrides.
+    pub fn insert_bindings(&self) -> keybindings::InsertBindings {
+        let mut bindings = keybindings::InsertBindings::default();
+        if let Some(table) = self.keybindings.insert.as_table() {
+            if !table.is_empty() {
+                if let Some(user_bindings) = keybindings::InsertBindings::from_toml(table) {
+                    bindings.merge(&user_bindings);
+                }
+            }
+        }
+        bindings
     }
 }
 
@@ -241,9 +291,9 @@ mod tests {
             [modes.normal]
             timeout_ms = 300
 
-            [modes.normal.keys.t]
+            [keybindings.normal.t]
             _label = "Tab"
-            n = "tab:new"
+            n = "TabNew"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.default_shell, Some("/bin/zsh".to_string()));
@@ -258,9 +308,9 @@ mod tests {
     #[test]
     fn keybinding_tree_merges_user_overrides() {
         let toml_str = r#"
-            [modes.normal.keys.t]
+            [keybindings.normal.t]
             _label = "Tab"
-            x = "tab:extra"
+            x = "TabExtra"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let tree = config.keybinding_tree();
@@ -327,5 +377,43 @@ mod tests {
     fn load_returns_default_when_no_file() {
         let config = Config::load().unwrap();
         assert_eq!(config.general.scrollback_lines, 10_000);
+    }
+
+    #[test]
+    fn default_insert_bindings() {
+        let config = Config::default();
+        let bindings = config.insert_bindings();
+        // Default bindings should have at least one entry.
+        assert!(!bindings.bindings.is_empty());
+    }
+
+    #[test]
+    fn insert_bindings_merge_user_overrides() {
+        let toml_str = r#"
+            [keybindings.insert]
+            "Ctrl-x" = "TabNew"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let bindings = config.insert_bindings();
+        // User-added binding should be present.
+        let key = keybindings::parse_key_notation("Ctrl-x").unwrap();
+        assert!(bindings.bindings.contains_key(&key));
+        // Defaults should still be present.
+        assert!(!bindings.bindings.is_empty());
+    }
+
+    #[test]
+    fn insert_bindings_key_group_fails_gracefully() {
+        // A key group (sub-table) in insert mode should be ignored since
+        // insert bindings are flat modifier-key -> action mappings.
+        let toml_str = r#"
+            [keybindings.insert.nested]
+            a = "TabNew"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let bindings = config.insert_bindings();
+        // The from_toml returns None for tables, so defaults are used as-is.
+        // Defaults should still be intact.
+        assert!(!bindings.bindings.is_empty());
     }
 }

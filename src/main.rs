@@ -279,8 +279,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
 
     let mut event_stream = EventStream::new();
     let keybindings = config.keybinding_tree();
+    let insert_bindings = config.insert_bindings();
     let mode_switch_key = parse_mode_switch_key(&config.general.mode_switch_key);
-    let mut input = InputHandler::new(keybindings, mode_switch_key);
+    let mut input = InputHandler::new(keybindings, insert_bindings, mode_switch_key);
     let (cols, rows) = crossterm::terminal::size()?;
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();

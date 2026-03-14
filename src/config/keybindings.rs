@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
 use crate::protocol::RemuxCommand;
 
 // ---------------------------------------------------------------------------
@@ -7,7 +9,7 @@ use crate::protocol::RemuxCommand;
 // ---------------------------------------------------------------------------
 
 /// A node in the keybinding tree. Either a group of sub-keys or a leaf that
-/// maps to an action string (e.g. `"tab:new"`).
+/// maps to an action string (e.g. `"TabNew"`).
 #[derive(Debug, Clone)]
 pub enum KeyNode {
     /// An intermediate group that contains sub-keys.
@@ -18,7 +20,7 @@ pub enum KeyNode {
     /// A terminal binding that maps to an action string.
     Leaf {
         label: String,
-        /// Action descriptor, e.g. `"tab:new"`, `"resize:left 5"`.
+        /// Action descriptor, e.g. `"TabNew"`, `"ResizeLeft 5"`.
         action: String,
     },
 }
@@ -66,11 +68,11 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Tab",
             vec![
-                ('n', leaf("new", "tab:new")),
-                ('c', leaf("close", "tab:close")),
-                ('m', leaf("move", "tab:move")),
-                ('r', leaf("rename", "tab:rename")),
-                ('l', leaf("list", "tab:list")),
+                ('n', leaf("new", "TabNew")),
+                ('c', leaf("close", "TabClose")),
+                ('m', leaf("move", "TabMove")),
+                ('r', leaf("rename", "TabRename")),
+                ('l', leaf("list", "TabNext")),
             ],
         ),
     );
@@ -81,18 +83,18 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Pane",
             vec![
-                ('n', leaf("new", "pane:new")),
-                ('c', leaf("close", "pane:close")),
-                ('s', leaf("split vertical", "pane:split_vertical")),
-                ('S', leaf("split horizontal", "pane:split_horizontal")),
-                ('h', leaf("focus left", "pane:focus_left")),
-                ('j', leaf("focus down", "pane:focus_down")),
-                ('k', leaf("focus up", "pane:focus_up")),
-                ('l', leaf("focus right", "pane:focus_right")),
-                ('a', leaf("stack add", "pane:stack_add")),
-                (']', leaf("stack next", "pane:stack_next")),
-                ('[', leaf("stack prev", "pane:stack_prev")),
-                ('r', leaf("rename", "pane:rename")),
+                ('n', leaf("new", "PaneNew")),
+                ('c', leaf("close", "PaneClose")),
+                ('s', leaf("split vertical", "PaneSplitVertical")),
+                ('S', leaf("split horizontal", "PaneSplitHorizontal")),
+                ('h', leaf("focus left", "PaneFocusLeft")),
+                ('j', leaf("focus down", "PaneFocusDown")),
+                ('k', leaf("focus up", "PaneFocusUp")),
+                ('l', leaf("focus right", "PaneFocusRight")),
+                ('a', leaf("stack add", "PaneStackAdd")),
+                (']', leaf("stack next", "PaneStackNext")),
+                ('[', leaf("stack prev", "PaneStackPrev")),
+                ('r', leaf("rename", "PaneRename")),
             ],
         ),
     );
@@ -103,10 +105,10 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Session",
             vec![
-                ('n', leaf("new", "session:new")),
-                ('d', leaf("detach", "session:detach")),
-                ('r', leaf("rename", "session:rename")),
-                ('l', leaf("list", "session:list")),
+                ('n', leaf("new", "SessionNew")),
+                ('d', leaf("detach", "SessionDetach")),
+                ('r', leaf("rename", "SessionRename")),
+                ('l', leaf("list", "SessionList")),
             ],
         ),
     );
@@ -117,10 +119,10 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Folder",
             vec![
-                ('n', leaf("new", "folder:new")),
-                ('d', leaf("delete", "folder:delete")),
-                ('l', leaf("list", "folder:list")),
-                ('m', leaf("move session", "folder:move_session")),
+                ('n', leaf("new", "FolderNew")),
+                ('d', leaf("delete", "FolderDelete")),
+                ('l', leaf("list", "FolderList")),
+                ('m', leaf("move session", "FolderMoveSession")),
             ],
         ),
     );
@@ -131,8 +133,8 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Buffer",
             vec![
-                ('e', leaf("edit in editor", "buffer:edit_in_editor")),
-                ('/', leaf("search", "buffer:search")),
+                ('e', leaf("edit in editor", "BufferEditInEditor")),
+                ('/', leaf("search", "BufferSearch")),
             ],
         ),
     );
@@ -143,20 +145,20 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Resize",
             vec![
-                ('h', leaf("left", "resize:left 5")),
-                ('j', leaf("down", "resize:down 5")),
-                ('k', leaf("up", "resize:up 5")),
-                ('l', leaf("right", "resize:right 5")),
+                ('h', leaf("left", "ResizeLeft 5")),
+                ('j', leaf("down", "ResizeDown 5")),
+                ('k', leaf("up", "ResizeUp 5")),
+                ('l', leaf("right", "ResizeRight 5")),
             ],
         ),
     );
 
     // Direct mode-switch bindings at the root level.
-    root.insert('i', leaf("insert mode", "enter_insert_mode"));
-    root.insert('v', leaf("visual mode", "enter_visual_mode"));
+    root.insert('i', leaf("insert mode", "EnterInsertMode"));
+    root.insert('v', leaf("visual mode", "EnterVisualMode"));
 
     // Layout toggle bindings.
-    root.insert('g', leaf("toggle gaps", "toggle_gaps"));
+    root.insert('g', leaf("toggle gaps", "ToggleGaps"));
 
     root
 }
@@ -167,7 +169,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
 
 impl KeybindingTree {
     /// Look up the node at the given key path (e.g. `['t', 'n']` maps to the
-    /// `tab:new` leaf).
+    /// `TabNew` leaf).
     pub fn lookup(&self, path: &[char]) -> Option<&KeyNode> {
         if path.is_empty() {
             return None;
@@ -214,6 +216,7 @@ impl KeybindingTree {
 
     /// Merge another tree on top of this one. Keys in `overrides` replace keys
     /// in `self`. Groups are merged recursively; leaves are replaced outright.
+    /// A leaf with an empty action string removes that key from the base.
     pub fn merge(&mut self, overrides: &KeybindingTree) {
         merge_maps(&mut self.root, &overrides.root);
     }
@@ -221,6 +224,14 @@ impl KeybindingTree {
 
 fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNode>) {
     for (key, override_node) in overrides {
+        // If the override is a leaf with an empty action, remove the key.
+        if let KeyNode::Leaf { action, .. } = override_node {
+            if action.is_empty() {
+                base.remove(key);
+                continue;
+            }
+        }
+
         match base.get_mut(key) {
             Some(KeyNode::Group {
                 label: base_label,
@@ -252,7 +263,7 @@ fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNo
 // ---------------------------------------------------------------------------
 
 impl KeybindingTree {
-    /// Parse a keybinding tree from the `[modes.normal.keys]` section of the
+    /// Parse a keybinding tree from the `[keybindings.normal]` section of the
     /// TOML config. The `value` should be the table at that path.
     pub fn from_toml(value: &toml::Value) -> Option<Self> {
         let table = value.as_table()?;
@@ -303,124 +314,315 @@ fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char
 }
 
 // ---------------------------------------------------------------------------
-// Action string -> RemuxCommand parsing
+// Command string -> RemuxCommand parsing
 // ---------------------------------------------------------------------------
 
-/// Parse an action string (e.g. `"tab:new"`, `"resize:left 5"`) into a
-/// [`RemuxCommand`].
-///
-/// Returns `None` if the action string is not recognised.
-pub fn parse_action(action: &str) -> Option<RemuxCommand> {
-    // Split on ':' to get category and detail.
-    let (category, detail) = if let Some(idx) = action.find(':') {
-        (&action[..idx], action[idx + 1..].trim())
-    } else {
-        // Handle bare commands without a colon.
-        return match action.trim() {
-            "enter_insert_mode" => Some(RemuxCommand::EnterInsertMode),
-            "enter_normal_mode" => Some(RemuxCommand::EnterNormalMode),
-            "enter_visual_mode" => Some(RemuxCommand::EnterVisualMode),
-            "session_save" => Some(RemuxCommand::SessionSave),
-            "toggle_gaps" => Some(RemuxCommand::ToggleGaps),
-            _ => None,
-        };
-    };
+/// Parse a whitespace-separated token list from a command string, handling
+/// double-quoted arguments (for args containing spaces).
+fn tokenize_command(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
 
-    match category {
-        "tab" => match detail {
-            "new" => Some(RemuxCommand::TabNew),
-            "close" => Some(RemuxCommand::TabClose),
-            "next" => Some(RemuxCommand::TabNext),
-            "prev" => Some(RemuxCommand::TabPrev),
-            "list" => Some(RemuxCommand::TabNext), // list navigates tabs
-            _ if detail.starts_with("rename") => {
-                let name = detail.strip_prefix("rename")?.trim().to_string();
-                Some(RemuxCommand::TabRename(name))
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        if c == '"' {
+            // Consume the opening quote.
+            chars.next();
+            let mut token = String::new();
+            while let Some(&inner) = chars.peek() {
+                if inner == '"' {
+                    chars.next();
+                    break;
+                }
+                token.push(inner);
+                chars.next();
             }
-            _ if detail.starts_with("goto ") => {
-                let idx = detail.strip_prefix("goto ")?.trim().parse().ok()?;
-                Some(RemuxCommand::TabGoto(idx))
+            tokens.push(token);
+        } else {
+            let mut token = String::new();
+            while let Some(&inner) = chars.peek() {
+                if inner.is_whitespace() {
+                    break;
+                }
+                token.push(inner);
+                chars.next();
             }
-            _ if detail.starts_with("move ") => {
-                let idx = detail.strip_prefix("move ")?.trim().parse().ok()?;
-                Some(RemuxCommand::TabMove(idx))
-            }
-            // bare "move" without argument defaults to 0
-            "move" => Some(RemuxCommand::TabMove(0)),
-            _ => None,
-        },
-        "pane" => match detail {
-            "new" => Some(RemuxCommand::PaneNew),
-            "close" => Some(RemuxCommand::PaneClose),
-            "split_vertical" => Some(RemuxCommand::PaneSplitVertical),
-            "split_horizontal" => Some(RemuxCommand::PaneSplitHorizontal),
-            "focus_left" => Some(RemuxCommand::PaneFocusLeft),
-            "focus_right" => Some(RemuxCommand::PaneFocusRight),
-            "focus_up" => Some(RemuxCommand::PaneFocusUp),
-            "focus_down" => Some(RemuxCommand::PaneFocusDown),
-            "stack_add" => Some(RemuxCommand::PaneStackAdd),
-            "stack_next" => Some(RemuxCommand::PaneStackNext),
-            "stack_prev" => Some(RemuxCommand::PaneStackPrev),
-            "rename" => Some(RemuxCommand::PaneRename(String::new())),
-            _ => None,
-        },
-        "session" => match detail {
-            "new" => Some(RemuxCommand::SessionNew {
-                name: String::new(),
-                folder: None,
-            }),
-            "detach" => Some(RemuxCommand::SessionDetach),
-            "list" => Some(RemuxCommand::SessionList),
-            "save" => Some(RemuxCommand::SessionSave),
-            _ if detail.starts_with("rename") => {
-                let name = detail
-                    .strip_prefix("rename")
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                Some(RemuxCommand::SessionRename(name))
-            }
-            _ => None,
-        },
-        "folder" => match detail {
-            "list" => Some(RemuxCommand::FolderList),
-            _ if detail.starts_with("new") => {
-                let name = detail.strip_prefix("new").unwrap_or("").trim().to_string();
-                Some(RemuxCommand::FolderNew(name))
-            }
-            _ if detail.starts_with("delete") => {
-                let name = detail
-                    .strip_prefix("delete")
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                Some(RemuxCommand::FolderDelete(name))
-            }
-            "move_session" => Some(RemuxCommand::FolderMoveSession {
-                session: String::new(),
-                folder: None,
-            }),
-            _ => None,
-        },
-        "buffer" => match detail {
-            "edit_in_editor" => Some(RemuxCommand::BufferEditInEditor),
-            "search" => Some(RemuxCommand::BufferSearch),
-            _ => None,
-        },
-        "resize" => {
-            // Format: "left", "left 5", etc.
-            let parts: Vec<&str> = detail.splitn(2, ' ').collect();
-            let direction = parts[0];
-            let amount: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-            match direction {
-                "left" => Some(RemuxCommand::ResizeLeft(amount)),
-                "right" => Some(RemuxCommand::ResizeRight(amount)),
-                "up" => Some(RemuxCommand::ResizeUp(amount)),
-                "down" => Some(RemuxCommand::ResizeDown(amount)),
-                _ => None,
+            tokens.push(token);
+        }
+    }
+
+    tokens
+}
+
+/// Parse a PascalCase command string (e.g. `"TabNew"`, `"ResizeLeft 5"`) into
+/// a [`RemuxCommand`].
+///
+/// Returns `None` if the command string is not recognised.
+pub fn parse_command(input: &str) -> Option<RemuxCommand> {
+    let tokens = tokenize_command(input);
+    let name = tokens.first()?;
+    let args = &tokens[1..];
+
+    match name.as_str() {
+        // -- No-arg commands --------------------------------------------------
+        "TabNew" => Some(RemuxCommand::TabNew),
+        "TabClose" => Some(RemuxCommand::TabClose),
+        "TabNext" => Some(RemuxCommand::TabNext),
+        "TabPrev" => Some(RemuxCommand::TabPrev),
+        "PaneNew" => Some(RemuxCommand::PaneNew),
+        "PaneClose" => Some(RemuxCommand::PaneClose),
+        "PaneSplitVertical" => Some(RemuxCommand::PaneSplitVertical),
+        "PaneSplitHorizontal" => Some(RemuxCommand::PaneSplitHorizontal),
+        "PaneFocusLeft" => Some(RemuxCommand::PaneFocusLeft),
+        "PaneFocusRight" => Some(RemuxCommand::PaneFocusRight),
+        "PaneFocusUp" => Some(RemuxCommand::PaneFocusUp),
+        "PaneFocusDown" => Some(RemuxCommand::PaneFocusDown),
+        "PaneStackAdd" => Some(RemuxCommand::PaneStackAdd),
+        "PaneStackNext" => Some(RemuxCommand::PaneStackNext),
+        "PaneStackPrev" => Some(RemuxCommand::PaneStackPrev),
+        "SessionDetach" => Some(RemuxCommand::SessionDetach),
+        "SessionList" => Some(RemuxCommand::SessionList),
+        "FolderList" => Some(RemuxCommand::FolderList),
+        "BufferEditInEditor" => Some(RemuxCommand::BufferEditInEditor),
+        "BufferSearch" => Some(RemuxCommand::BufferSearch),
+        "ToggleGaps" => Some(RemuxCommand::ToggleGaps),
+        "SessionSave" => Some(RemuxCommand::SessionSave),
+        "EnterInsertMode" => Some(RemuxCommand::EnterInsertMode),
+        "EnterNormalMode" => Some(RemuxCommand::EnterNormalMode),
+        "EnterVisualMode" => Some(RemuxCommand::EnterVisualMode),
+
+        // -- String arg commands ----------------------------------------------
+        "TabRename" => {
+            let name = args.first().map(|s| s.to_string()).unwrap_or_default();
+            Some(RemuxCommand::TabRename(name))
+        }
+        "SessionRename" => {
+            let name = args.first().map(|s| s.to_string()).unwrap_or_default();
+            Some(RemuxCommand::SessionRename(name))
+        }
+        "FolderNew" => {
+            let name = args.first().map(|s| s.to_string()).unwrap_or_default();
+            Some(RemuxCommand::FolderNew(name))
+        }
+        "FolderDelete" => {
+            let name = args.first().map(|s| s.to_string()).unwrap_or_default();
+            Some(RemuxCommand::FolderDelete(name))
+        }
+        "PaneRename" => {
+            let name = args.first().map(|s| s.to_string()).unwrap_or_default();
+            Some(RemuxCommand::PaneRename(name))
+        }
+
+        // -- usize arg commands -----------------------------------------------
+        "TabGoto" => {
+            let idx = args.first()?.parse().ok()?;
+            Some(RemuxCommand::TabGoto(idx))
+        }
+        "TabMove" => {
+            let idx = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            Some(RemuxCommand::TabMove(idx))
+        }
+
+        // -- u16 arg commands (default 1) -------------------------------------
+        "ResizeLeft" => {
+            let amount = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+            Some(RemuxCommand::ResizeLeft(amount))
+        }
+        "ResizeRight" => {
+            let amount = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+            Some(RemuxCommand::ResizeRight(amount))
+        }
+        "ResizeUp" => {
+            let amount = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+            Some(RemuxCommand::ResizeUp(amount))
+        }
+        "ResizeDown" => {
+            let amount = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+            Some(RemuxCommand::ResizeDown(amount))
+        }
+
+        // -- Named-field commands ---------------------------------------------
+        "SessionNew" => {
+            let name = args.first().map(|s| s.to_string()).unwrap_or_default();
+            let folder = args.get(1).map(|s| s.to_string());
+            Some(RemuxCommand::SessionNew { name, folder })
+        }
+        "FolderMoveSession" => {
+            let session = args.first().map(|s| s.to_string()).unwrap_or_default();
+            let folder = args.get(1).map(|s| s.to_string());
+            Some(RemuxCommand::FolderMoveSession { session, folder })
+        }
+
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key notation parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a key notation string (e.g. `"Ctrl-b"`, `"Alt-n"`, `"Enter"`) into
+/// a [`KeyEvent`].
+///
+/// Returns `None` if the notation is not recognised.
+pub fn parse_key_notation(notation: &str) -> Option<KeyEvent> {
+    // Check for modifier prefixes.
+    if let Some(rest) = notation.strip_prefix("Ctrl-") {
+        let (code, mods) = parse_key_code(rest)?;
+        return Some(KeyEvent::new_with_kind_and_state(
+            code,
+            mods | KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        ));
+    }
+    if let Some(rest) = notation.strip_prefix("Alt-") {
+        let (code, mods) = parse_key_code(rest)?;
+        return Some(KeyEvent::new_with_kind_and_state(
+            code,
+            mods | KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        ));
+    }
+    if let Some(rest) = notation.strip_prefix("Shift-") {
+        // Shift-Tab is represented as BackTab in crossterm.
+        if rest == "Tab" {
+            return Some(KeyEvent::new_with_kind_and_state(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+                KeyEventState::NONE,
+            ));
+        }
+        let (code, mods) = parse_key_code(rest)?;
+        return Some(KeyEvent::new_with_kind_and_state(
+            code,
+            mods | KeyModifiers::SHIFT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        ));
+    }
+
+    // No modifier prefix: parse as bare key.
+    let (code, mods) = parse_key_code(notation)?;
+    Some(KeyEvent::new_with_kind_and_state(
+        code,
+        mods,
+        KeyEventKind::Press,
+        KeyEventState::NONE,
+    ))
+}
+
+/// Parse a key code string (without modifier prefix) into a `KeyCode` and any
+/// implicit modifiers (e.g. `BackTab` implies `SHIFT`).
+fn parse_key_code(s: &str) -> Option<(KeyCode, KeyModifiers)> {
+    // Special named keys.
+    match s {
+        "Enter" => return Some((KeyCode::Enter, KeyModifiers::NONE)),
+        "Esc" => return Some((KeyCode::Esc, KeyModifiers::NONE)),
+        "Tab" => return Some((KeyCode::Tab, KeyModifiers::NONE)),
+        "BackTab" => return Some((KeyCode::BackTab, KeyModifiers::SHIFT)),
+        "Space" => return Some((KeyCode::Char(' '), KeyModifiers::NONE)),
+        "Backspace" => return Some((KeyCode::Backspace, KeyModifiers::NONE)),
+        "Up" => return Some((KeyCode::Up, KeyModifiers::NONE)),
+        "Down" => return Some((KeyCode::Down, KeyModifiers::NONE)),
+        "Left" => return Some((KeyCode::Left, KeyModifiers::NONE)),
+        "Right" => return Some((KeyCode::Right, KeyModifiers::NONE)),
+        _ => {}
+    }
+
+    // Function keys: F1 through F12.
+    if let Some(num_str) = s.strip_prefix('F') {
+        let num: u8 = num_str.parse().ok()?;
+        if (1..=12).contains(&num) {
+            return Some((KeyCode::F(num), KeyModifiers::NONE));
+        }
+        return None;
+    }
+
+    // Single character.
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        // More than one character and not a recognised name.
+        return None;
+    }
+    Some((KeyCode::Char(c), KeyModifiers::NONE))
+}
+
+// ---------------------------------------------------------------------------
+// Insert-mode bindings
+// ---------------------------------------------------------------------------
+
+/// Flat keybinding map for insert mode (no key groups).
+#[derive(Debug, Clone)]
+pub struct InsertBindings {
+    pub bindings: HashMap<KeyEvent, RemuxCommand>,
+}
+
+impl Default for InsertBindings {
+    fn default() -> Self {
+        let mut bindings = HashMap::new();
+        // Default Alt-based bindings.
+        let defaults = [
+            ("Alt-h", RemuxCommand::PaneFocusLeft),
+            ("Alt-j", RemuxCommand::PaneFocusDown),
+            ("Alt-k", RemuxCommand::PaneFocusUp),
+            ("Alt-l", RemuxCommand::PaneFocusRight),
+            ("Alt-n", RemuxCommand::TabNext),
+            ("Alt-p", RemuxCommand::TabPrev),
+        ];
+        for (notation, cmd) in defaults {
+            if let Some(key) = parse_key_notation(notation) {
+                bindings.insert(key, cmd);
             }
         }
-        _ => None,
+        InsertBindings { bindings }
+    }
+}
+
+impl InsertBindings {
+    /// Build from a TOML table. All values must be strings (no nested tables).
+    /// Returns `None` if any value is a table (key groups not allowed in insert
+    /// mode).
+    pub fn from_toml(table: &toml::map::Map<String, toml::Value>) -> Option<Self> {
+        let mut bindings = HashMap::new();
+        for (key_str, value) in table {
+            if key_str.starts_with('_') {
+                continue;
+            }
+            match value {
+                toml::Value::String(cmd_str) => {
+                    if cmd_str.is_empty() {
+                        continue; // skip unbinds
+                    }
+                    let key_event = parse_key_notation(key_str)?;
+                    let cmd = parse_command(cmd_str)?;
+                    bindings.insert(key_event, cmd);
+                }
+                toml::Value::Table(_) => return None, // key groups not allowed
+                _ => continue,
+            }
+        }
+        Some(InsertBindings { bindings })
+    }
+
+    /// Merge user bindings on top of defaults. Empty string values remove the
+    /// binding.
+    pub fn merge(&mut self, overrides: &InsertBindings) {
+        for (key, cmd) in &overrides.bindings {
+            self.bindings.insert(*key, cmd.clone());
+        }
+    }
+
+    /// Look up a key event in the insert bindings.
+    pub fn lookup(&self, key: &KeyEvent) -> Option<&RemuxCommand> {
+        self.bindings.get(key)
     }
 }
 
@@ -431,6 +633,205 @@ pub fn parse_action(action: &str) -> Option<RemuxCommand> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- parse_command tests --------------------------------------------------
+
+    #[test]
+    fn parse_command_no_args() {
+        assert_eq!(parse_command("TabNew"), Some(RemuxCommand::TabNew));
+        assert_eq!(parse_command("PaneClose"), Some(RemuxCommand::PaneClose));
+        assert_eq!(
+            parse_command("EnterInsertMode"),
+            Some(RemuxCommand::EnterInsertMode)
+        );
+        assert_eq!(
+            parse_command("EnterVisualMode"),
+            Some(RemuxCommand::EnterVisualMode)
+        );
+        assert_eq!(parse_command("ToggleGaps"), Some(RemuxCommand::ToggleGaps));
+        assert_eq!(
+            parse_command("PaneStackAdd"),
+            Some(RemuxCommand::PaneStackAdd)
+        );
+    }
+
+    #[test]
+    fn parse_command_resize_with_amount() {
+        assert_eq!(
+            parse_command("ResizeLeft 5"),
+            Some(RemuxCommand::ResizeLeft(5))
+        );
+        assert_eq!(
+            parse_command("ResizeDown 10"),
+            Some(RemuxCommand::ResizeDown(10))
+        );
+    }
+
+    #[test]
+    fn parse_command_resize_default_amount() {
+        assert_eq!(parse_command("ResizeUp"), Some(RemuxCommand::ResizeUp(1)));
+        assert_eq!(
+            parse_command("ResizeRight"),
+            Some(RemuxCommand::ResizeRight(1))
+        );
+    }
+
+    #[test]
+    fn parse_command_string_arg() {
+        assert_eq!(
+            parse_command("TabRename work"),
+            Some(RemuxCommand::TabRename("work".into()))
+        );
+        assert_eq!(
+            parse_command("FolderNew projects"),
+            Some(RemuxCommand::FolderNew("projects".into()))
+        );
+    }
+
+    #[test]
+    fn parse_command_quoted_string_arg() {
+        assert_eq!(
+            parse_command(r#"TabRename "my tab""#),
+            Some(RemuxCommand::TabRename("my tab".into()))
+        );
+    }
+
+    #[test]
+    fn parse_command_session_new_multi_arg() {
+        assert_eq!(
+            parse_command(r#"SessionNew "dev server" "work""#),
+            Some(RemuxCommand::SessionNew {
+                name: "dev server".into(),
+                folder: Some("work".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_command_session_new_no_folder() {
+        assert_eq!(
+            parse_command("SessionNew myproject"),
+            Some(RemuxCommand::SessionNew {
+                name: "myproject".into(),
+                folder: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_command_folder_move_session() {
+        assert_eq!(
+            parse_command(r#"FolderMoveSession "my session" "target folder""#),
+            Some(RemuxCommand::FolderMoveSession {
+                session: "my session".into(),
+                folder: Some("target folder".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_command_pane_rename_no_arg() {
+        assert_eq!(
+            parse_command("PaneRename"),
+            Some(RemuxCommand::PaneRename(String::new()))
+        );
+    }
+
+    #[test]
+    fn parse_command_tab_goto() {
+        assert_eq!(parse_command("TabGoto 3"), Some(RemuxCommand::TabGoto(3)));
+    }
+
+    #[test]
+    fn parse_command_tab_goto_missing_arg() {
+        assert_eq!(parse_command("TabGoto"), None);
+    }
+
+    #[test]
+    fn parse_command_tab_move_default() {
+        assert_eq!(parse_command("TabMove"), Some(RemuxCommand::TabMove(0)));
+    }
+
+    #[test]
+    fn parse_command_unknown() {
+        assert_eq!(parse_command("NonexistentCommand"), None);
+    }
+
+    #[test]
+    fn parse_command_invalid_arg_type() {
+        assert_eq!(parse_command("TabGoto notanumber"), None);
+    }
+
+    // -- parse_key_notation tests ---------------------------------------------
+
+    #[test]
+    fn key_notation_single_char() {
+        let key = parse_key_notation("n").unwrap();
+        assert_eq!(key.code, KeyCode::Char('n'));
+        assert_eq!(key.modifiers, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn key_notation_ctrl() {
+        let key = parse_key_notation("Ctrl-b").unwrap();
+        assert_eq!(key.code, KeyCode::Char('b'));
+        assert_eq!(key.modifiers, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn key_notation_alt() {
+        let key = parse_key_notation("Alt-n").unwrap();
+        assert_eq!(key.code, KeyCode::Char('n'));
+        assert_eq!(key.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn key_notation_shift_tab() {
+        let key = parse_key_notation("Shift-Tab").unwrap();
+        assert_eq!(key.code, KeyCode::BackTab);
+        assert_eq!(key.modifiers, KeyModifiers::SHIFT);
+    }
+
+    #[test]
+    fn key_notation_special_keys() {
+        let enter = parse_key_notation("Enter").unwrap();
+        assert_eq!(enter.code, KeyCode::Enter);
+
+        let esc = parse_key_notation("Esc").unwrap();
+        assert_eq!(esc.code, KeyCode::Esc);
+
+        let tab = parse_key_notation("Tab").unwrap();
+        assert_eq!(tab.code, KeyCode::Tab);
+
+        let space = parse_key_notation("Space").unwrap();
+        assert_eq!(space.code, KeyCode::Char(' '));
+
+        let backspace = parse_key_notation("Backspace").unwrap();
+        assert_eq!(backspace.code, KeyCode::Backspace);
+    }
+
+    #[test]
+    fn key_notation_arrow_keys() {
+        assert_eq!(parse_key_notation("Up").unwrap().code, KeyCode::Up);
+        assert_eq!(parse_key_notation("Down").unwrap().code, KeyCode::Down);
+        assert_eq!(parse_key_notation("Left").unwrap().code, KeyCode::Left);
+        assert_eq!(parse_key_notation("Right").unwrap().code, KeyCode::Right);
+    }
+
+    #[test]
+    fn key_notation_function_keys() {
+        assert_eq!(parse_key_notation("F1").unwrap().code, KeyCode::F(1));
+        assert_eq!(parse_key_notation("F12").unwrap().code, KeyCode::F(12));
+    }
+
+    #[test]
+    fn key_notation_invalid() {
+        assert!(parse_key_notation("F0").is_none());
+        assert!(parse_key_notation("F13").is_none());
+        assert!(parse_key_notation("InvalidKey").is_none());
+    }
+
+    // -- Default tree tests ---------------------------------------------------
 
     #[test]
     fn default_tree_has_expected_groups() {
@@ -451,7 +852,7 @@ mod tests {
         let tree = KeybindingTree::default();
         let node = tree.lookup(&['t', 'n']).unwrap();
         match node {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "tab:new"),
+            KeyNode::Leaf { action, .. } => assert_eq!(action, "TabNew"),
             other => panic!("expected leaf, got {other:?}"),
         }
     }
@@ -500,41 +901,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_action_tab_new() {
-        assert_eq!(parse_action("tab:new"), Some(RemuxCommand::TabNew));
-    }
-
-    #[test]
-    fn parse_action_resize_with_amount() {
-        assert_eq!(
-            parse_action("resize:left 5"),
-            Some(RemuxCommand::ResizeLeft(5))
-        );
-    }
-
-    #[test]
-    fn parse_action_resize_default_amount() {
-        assert_eq!(parse_action("resize:up"), Some(RemuxCommand::ResizeUp(1)));
-    }
-
-    #[test]
-    fn parse_action_bare_mode() {
-        assert_eq!(
-            parse_action("enter_insert_mode"),
-            Some(RemuxCommand::EnterInsertMode)
-        );
-        assert_eq!(
-            parse_action("enter_visual_mode"),
-            Some(RemuxCommand::EnterVisualMode)
-        );
-    }
-
-    #[test]
-    fn parse_action_stack_add() {
-        assert_eq!(
-            parse_action("pane:stack_add"),
-            Some(RemuxCommand::PaneStackAdd)
-        );
+    fn default_tree_has_toggle_gaps() {
+        let tree = KeybindingTree::default();
+        assert!(tree.root.contains_key(&'g'));
+        let node = tree.lookup(&['g']).unwrap();
+        match node {
+            KeyNode::Leaf { action, label, .. } => {
+                assert_eq!(action, "ToggleGaps");
+                assert_eq!(label, "toggle gaps");
+            }
+            other => panic!("expected leaf for 'g', got {other:?}"),
+        }
     }
 
     #[test]
@@ -550,47 +927,69 @@ mod tests {
     }
 
     #[test]
-    fn default_tree_has_toggle_gaps() {
-        let tree = KeybindingTree::default();
-        assert!(tree.root.contains_key(&'g'));
-        let node = tree.lookup(&['g']).unwrap();
-        match node {
-            KeyNode::Leaf { action, label, .. } => {
-                assert_eq!(action, "toggle_gaps");
-                assert_eq!(label, "toggle gaps");
-            }
-            other => panic!("expected leaf for 'g', got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_action_toggle_gaps() {
-        assert_eq!(parse_action("toggle_gaps"), Some(RemuxCommand::ToggleGaps));
-    }
-
-    #[test]
     fn pane_group_has_rename_leaf() {
         let tree = KeybindingTree::default();
         let node = tree.lookup(&['p', 'r']).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
-                assert_eq!(action, "pane:rename");
+                assert_eq!(action, "PaneRename");
                 assert_eq!(label, "rename");
             }
             other => panic!("expected leaf for 'p' -> 'r', got {other:?}"),
         }
     }
 
+    // -- Unbind via empty string test -----------------------------------------
+
     #[test]
-    fn parse_action_pane_rename() {
-        let result = parse_action("pane:rename");
-        assert_eq!(result, Some(RemuxCommand::PaneRename(String::new())));
+    fn merge_unbinds_with_empty_action() {
+        let mut base = KeybindingTree::default();
+        assert!(base.root.contains_key(&'i'));
+        let overrides = KeybindingTree {
+            root: HashMap::from([(
+                'i',
+                KeyNode::Leaf {
+                    label: String::new(),
+                    action: String::new(),
+                },
+            )]),
+        };
+        base.merge(&overrides);
+        assert!(
+            !base.root.contains_key(&'i'),
+            "'i' key should have been removed by empty-action override"
+        );
     }
 
     #[test]
-    fn parse_action_unknown() {
-        assert_eq!(parse_action("nonexistent:thing"), None);
+    fn merge_unbinds_within_group() {
+        let mut base = KeybindingTree::default();
+        // Verify 'n' exists in Tab group.
+        assert!(base.lookup(&['t', 'n']).is_some());
+
+        let overrides = KeybindingTree {
+            root: HashMap::from([(
+                't',
+                KeyNode::Group {
+                    label: "Tab".into(),
+                    children: HashMap::from([(
+                        'n',
+                        KeyNode::Leaf {
+                            label: String::new(),
+                            action: String::new(),
+                        },
+                    )]),
+                },
+            )]),
+        };
+        base.merge(&overrides);
+        // 'n' should be removed from the Tab group.
+        assert!(base.lookup(&['t', 'n']).is_none());
+        // Other Tab children should still exist.
+        assert!(base.lookup(&['t', 'c']).is_some());
     }
+
+    // -- Merge tests ----------------------------------------------------------
 
     #[test]
     fn merge_adds_new_keys() {
@@ -600,7 +999,7 @@ mod tests {
                 'x',
                 KeyNode::Leaf {
                     label: "custom".into(),
-                    action: "custom:action".into(),
+                    action: "TabNew".into(),
                 },
             )]),
         };
@@ -616,13 +1015,13 @@ mod tests {
                 'i',
                 KeyNode::Leaf {
                     label: "custom insert".into(),
-                    action: "custom:insert".into(),
+                    action: "SessionDetach".into(),
                 },
             )]),
         };
         base.merge(&overrides);
         match &base.root[&'i'] {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "custom:insert"),
+            KeyNode::Leaf { action, .. } => assert_eq!(action, "SessionDetach"),
             other => panic!("expected leaf, got {other:?}"),
         }
     }
@@ -639,7 +1038,7 @@ mod tests {
                         'x',
                         KeyNode::Leaf {
                             label: "extra".into(),
-                            action: "tab:extra".into(),
+                            action: "TabNew".into(),
                         },
                     )]),
                 },
@@ -652,19 +1051,21 @@ mod tests {
         assert!(base.lookup(&['t', 'x']).is_some());
     }
 
+    // -- TOML parsing tests ---------------------------------------------------
+
     #[test]
     fn from_toml_basic() {
         let toml_str = r#"
             [t]
             _label = "Tab"
-            n = "tab:new"
-            c = "tab:close"
+            n = "TabNew"
+            c = "TabClose"
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let tree = KeybindingTree::from_toml(&value).unwrap();
         let node = tree.lookup(&['t', 'n']).unwrap();
         match node {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "tab:new"),
+            KeyNode::Leaf { action, .. } => assert_eq!(action, "TabNew"),
             other => panic!("expected leaf, got {other:?}"),
         }
     }
@@ -674,17 +1075,82 @@ mod tests {
         let toml_str = r#"
             [t]
             _label = "Tab"
-            n = "tab:new"
+            n = "TabNew"
             [t.s]
             _label = "Sub"
-            a = "tab:sub_a"
+            a = "TabClose"
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let tree = KeybindingTree::from_toml(&value).unwrap();
         let node = tree.lookup(&['t', 's', 'a']).unwrap();
         match node {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "tab:sub_a"),
+            KeyNode::Leaf { action, .. } => assert_eq!(action, "TabClose"),
             other => panic!("expected leaf, got {other:?}"),
         }
+    }
+
+    // -- InsertBindings tests -------------------------------------------------
+
+    #[test]
+    fn insert_bindings_default_has_alt_h() {
+        let bindings = InsertBindings::default();
+        let key = parse_key_notation("Alt-h").unwrap();
+        assert_eq!(bindings.lookup(&key), Some(&RemuxCommand::PaneFocusLeft));
+    }
+
+    #[test]
+    fn insert_bindings_default_has_all_defaults() {
+        let bindings = InsertBindings::default();
+        assert_eq!(bindings.bindings.len(), 6);
+    }
+
+    #[test]
+    fn insert_bindings_from_toml() {
+        let toml_str = r#"
+            Ctrl-b = "TabNew"
+            Alt-n = "TabNext"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let table = value.as_table().unwrap();
+        let bindings = InsertBindings::from_toml(table).unwrap();
+        let key = parse_key_notation("Ctrl-b").unwrap();
+        assert_eq!(bindings.lookup(&key), Some(&RemuxCommand::TabNew));
+    }
+
+    #[test]
+    fn insert_bindings_from_toml_rejects_tables() {
+        let toml_str = r#"
+            [nested]
+            a = "TabNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let table = value.as_table().unwrap();
+        assert!(InsertBindings::from_toml(table).is_none());
+    }
+
+    #[test]
+    fn insert_bindings_merge() {
+        let mut base = InsertBindings::default();
+        let mut overrides_map = HashMap::new();
+        let key = parse_key_notation("Alt-h").unwrap();
+        overrides_map.insert(key, RemuxCommand::TabNew);
+        let overrides = InsertBindings {
+            bindings: overrides_map,
+        };
+        base.merge(&overrides);
+        assert_eq!(base.lookup(&key), Some(&RemuxCommand::TabNew));
+    }
+
+    #[test]
+    fn insert_bindings_from_toml_skips_empty_string() {
+        let toml_str = r#"
+            Alt-h = ""
+            Alt-j = "PaneFocusDown"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let table = value.as_table().unwrap();
+        let bindings = InsertBindings::from_toml(table).unwrap();
+        // Empty string skipped, so only one binding.
+        assert_eq!(bindings.bindings.len(), 1);
     }
 }
