@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::GapMode;
+use crate::config::BorderStyle;
 use crate::protocol::{CellColor, RenderCell};
 use crate::screen::{Cell, Color, Screen};
 use crate::server::layout::{self, LayoutNode, PaneId, Rect};
@@ -64,7 +64,7 @@ pub fn composite(
     layout: &LayoutNode,
     pane_screens: &HashMap<PaneId, &Screen>,
     area: Rect,
-    gap_mode: &GapMode,
+    border_style: &BorderStyle,
     status_info: &StatusInfo,
     total_cols: u16,
     total_rows: u16,
@@ -77,8 +77,8 @@ pub fn composite(
 
     let mode = status_info.mode.as_str();
 
-    match gap_mode {
-        GapMode::ZellijStyle => {
+    match border_style {
+        BorderStyle::ZellijStyle => {
             draw_zellij_panes(
                 &mut buffer,
                 &pane_rects,
@@ -88,7 +88,7 @@ pub fn composite(
                 mode,
             );
         }
-        GapMode::TmuxStyle => {
+        BorderStyle::TmuxStyle => {
             // TmuxStyle always uses gap_size=0, enforced at the caller level
             // (daemon.rs). Content is edge-to-edge with minimal dividers.
             draw_tmux_panes(
@@ -287,17 +287,39 @@ fn build_top_border_content(
         }
     } else {
         let _ = pane_id;
-        let n = names.len();
-        // Compute equal tab width: total width minus separators, divided among tabs.
-        let separator_total = (n - 1) * 3; // " | " between each pair
-        let tabs_space = max_width.saturating_sub(separator_total);
-        let tab_width = if n > 0 { tabs_space / n } else { 0 };
-        // Minimum tab width of 3 (1 char + padding).
-        let tab_width = tab_width.max(3);
+        // Build display names and find the longest one.
+        let display_names: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if name.is_empty() {
+                    format!("{}", pane_ids[i])
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        let max_name_len = display_names
+            .iter()
+            .map(|n| n.chars().count())
+            .max()
+            .unwrap_or(0);
+        // Fixed tab width: longest name + 2 (1 space padding each side), capped to fit.
+        let tab_width = (max_name_len + 2).min(max_width);
 
         let (active_fg, active_bg) = mode_tab_colors(mode);
 
-        for (i, name) in names.iter().enumerate() {
+        // Leading space before first tab.
+        cells.push(RenderCell {
+            c: ' ',
+            fg: border_fg.clone(),
+            bg: CellColor::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+        });
+
+        for (i, display_name) in display_names.iter().enumerate() {
             if i > 0 {
                 // Separator: " | "
                 for sep_ch in [' ', '|', ' '] {
@@ -313,27 +335,19 @@ fn build_top_border_content(
             }
 
             let is_this_active = i == active_idx;
-            let display_name = if name.is_empty() {
-                format!("{}", pane_ids[i])
-            } else {
-                name.clone()
-            };
-
             let (tab_fg, tab_bg, tab_bold) = if is_this_active {
                 (active_fg.clone(), active_bg.clone(), true)
             } else {
-                // Hidden: subdued grey on dark background
-                (CellColor::Indexed(7), CellColor::Indexed(237), false)
+                (CellColor::Indexed(245), CellColor::Indexed(237), false)
             };
 
-            // Center the name within tab_width, padding with spaces.
+            // Center the name within tab_width.
             let name_len = display_name.chars().count();
             let content_len = name_len.min(tab_width);
             let pad_total = tab_width.saturating_sub(content_len);
             let pad_left = pad_total / 2;
             let pad_right = pad_total - pad_left;
 
-            // Left padding.
             for _ in 0..pad_left {
                 cells.push(RenderCell {
                     c: ' ',
@@ -344,8 +358,6 @@ fn build_top_border_content(
                     underline: false,
                 });
             }
-
-            // Tab name (truncated if needed).
             for ch in display_name.chars().take(tab_width) {
                 cells.push(RenderCell {
                     c: ch,
@@ -356,8 +368,6 @@ fn build_top_border_content(
                     underline: false,
                 });
             }
-
-            // Right padding.
             for _ in 0..pad_right {
                 cells.push(RenderCell {
                     c: ' ',
@@ -369,6 +379,16 @@ fn build_top_border_content(
                 });
             }
         }
+
+        // Trailing space.
+        cells.push(RenderCell {
+            c: ' ',
+            fg: border_fg.clone(),
+            bg: CellColor::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+        });
     }
 
     cells
@@ -377,10 +397,10 @@ fn build_top_border_content(
 /// Get foreground/background colors for the active tab based on current mode.
 fn mode_tab_colors(mode: &str) -> (CellColor, CellColor) {
     match mode {
-        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(2)),  // Black on green
-        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(4)),  // Black on blue
-        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(5)),  // Black on magenta
-        _ => (CellColor::Indexed(0), CellColor::Indexed(8)),
+        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
+        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(12)), // Black on bright blue
+        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)), // Black on bright magenta
+        _ => (CellColor::Indexed(0), CellColor::Indexed(238)),
     }
 }
 
@@ -459,8 +479,8 @@ fn draw_tmux_tab_bar(
             col,
             RenderCell {
                 c: ' ',
-                fg: CellColor::Indexed(7),
-                bg: CellColor::Indexed(236), // Very dark grey background
+                fg: CellColor::Indexed(243),
+                bg: CellColor::Indexed(235), // Very dark grey background
                 bold: false,
                 italic: false,
                 underline: false,
@@ -473,16 +493,30 @@ fn draw_tmux_tab_bar(
         None => return,
     };
 
-    let n = names.len();
-    let separator_total = (n - 1) * 3;
-    let tabs_space = total_width.saturating_sub(separator_total);
-    let tab_width = if n > 0 { tabs_space / n } else { 0 };
-    let tab_width = tab_width.max(3);
+    // Build display names and find the longest one.
+    let display_names: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if name.is_empty() {
+                format!("{}", pane_ids[i])
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    let max_name_len = display_names
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Fixed tab width: longest name + 2 (1 space padding each side), capped to fit.
+    let tab_width = (max_name_len + 2).min(total_width);
 
     let (active_fg, active_bg) = mode_tab_colors(mode);
     let mut col = x_start;
 
-    for (i, name) in names.iter().enumerate() {
+    for (i, display_name) in display_names.iter().enumerate() {
         if col >= x_end {
             break;
         }
@@ -497,8 +531,8 @@ fn draw_tmux_tab_bar(
                         col,
                         RenderCell {
                             c: sep_ch,
-                            fg: CellColor::Indexed(8),
-                            bg: CellColor::Indexed(236),
+                            fg: CellColor::Indexed(240),
+                            bg: CellColor::Indexed(235),
                             bold: false,
                             italic: false,
                             underline: false,
@@ -510,16 +544,10 @@ fn draw_tmux_tab_bar(
         }
 
         let is_active = i == active_idx;
-        let display_name = if name.is_empty() {
-            format!("{}", pane_ids[i])
-        } else {
-            name.clone()
-        };
-
         let (fg, bg, bold) = if is_active {
             (active_fg.clone(), active_bg.clone(), true)
         } else {
-            (CellColor::Indexed(7), CellColor::Indexed(237), false)
+            (CellColor::Indexed(245), CellColor::Indexed(237), false)
         };
 
         // Center the name within tab_width.
@@ -529,36 +557,58 @@ fn draw_tmux_tab_bar(
         let pad_left = pad_total / 2;
         let pad_right = pad_total - pad_left;
 
-        // Left padding.
         for _ in 0..pad_left {
             if col < x_end {
-                set_cell(buffer, y, col, RenderCell {
-                    c: ' ', fg: fg.clone(), bg: bg.clone(), bold,
-                    italic: false, underline: false,
-                });
+                set_cell(
+                    buffer,
+                    y,
+                    col,
+                    RenderCell {
+                        c: ' ',
+                        fg: fg.clone(),
+                        bg: bg.clone(),
+                        bold,
+                        italic: false,
+                        underline: false,
+                    },
+                );
                 col += 1;
             }
         }
-
-        // Tab name (truncated if needed).
         for ch in display_name.chars().take(tab_width) {
             if col >= x_end {
                 break;
             }
-            set_cell(buffer, y, col, RenderCell {
-                c: ch, fg: fg.clone(), bg: bg.clone(), bold,
-                italic: false, underline: false,
-            });
+            set_cell(
+                buffer,
+                y,
+                col,
+                RenderCell {
+                    c: ch,
+                    fg: fg.clone(),
+                    bg: bg.clone(),
+                    bold,
+                    italic: false,
+                    underline: false,
+                },
+            );
             col += 1;
         }
-
-        // Right padding.
         for _ in 0..pad_right {
             if col < x_end {
-                set_cell(buffer, y, col, RenderCell {
-                    c: ' ', fg: fg.clone(), bg: bg.clone(), bold,
-                    italic: false, underline: false,
-                });
+                set_cell(
+                    buffer,
+                    y,
+                    col,
+                    RenderCell {
+                        c: ' ',
+                        fg: fg.clone(),
+                        bg: bg.clone(),
+                        bold,
+                        italic: false,
+                        underline: false,
+                    },
+                );
                 col += 1;
             }
         }
@@ -660,8 +710,8 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
         if col < buffer[bar_row].len() {
             buffer[bar_row][col] = RenderCell {
                 c: ' ',
-                fg: CellColor::Indexed(15), // White
-                bg: CellColor::Indexed(8),  // Dark grey
+                fg: CellColor::Indexed(243), // Soft grey
+                bg: CellColor::Indexed(235), // Very dark grey
                 bold: false,
                 italic: false,
                 underline: false,
@@ -672,10 +722,10 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
     // Mode indicator.
     let mode_str = format!(" [{}] ", info.mode);
     let (mode_fg, mode_bg) = match info.mode.as_str() {
-        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(2)), // Black on green
-        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(4)), // Black on blue
-        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(5)), // Black on magenta
-        _ => (CellColor::Indexed(15), CellColor::Indexed(8)),
+        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
+        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(12)), // Black on bright blue
+        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)), // Black on bright magenta
+        _ => (CellColor::Indexed(15), CellColor::Indexed(238)),
     };
 
     let mut x = 0;
@@ -699,8 +749,8 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
         if x < cols && x < buffer[bar_row].len() {
             buffer[bar_row][x] = RenderCell {
                 c: ch,
-                fg: CellColor::Indexed(15),
-                bg: CellColor::Indexed(8),
+                fg: CellColor::Indexed(6),
+                bg: CellColor::Indexed(235),
                 bold: false,
                 italic: false,
                 underline: false,
@@ -713,8 +763,8 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
     if x < cols && x < buffer[bar_row].len() {
         buffer[bar_row][x] = RenderCell {
             c: '\u{2502}',
-            fg: CellColor::Indexed(7),
-            bg: CellColor::Indexed(8),
+            fg: CellColor::Indexed(240),
+            bg: CellColor::Indexed(235),
             bold: false,
             italic: false,
             underline: false,
@@ -731,8 +781,8 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
                 if x < cols && x < buffer[bar_row].len() {
                     buffer[bar_row][x] = RenderCell {
                         c: ch,
-                        fg: CellColor::Indexed(7),
-                        bg: CellColor::Indexed(8),
+                        fg: CellColor::Indexed(240),
+                        bg: CellColor::Indexed(235),
                         bold: false,
                         italic: false,
                         underline: false,
@@ -749,9 +799,9 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
         };
 
         let (tab_fg, tab_bg, tab_bold) = if *is_active {
-            (CellColor::Indexed(0), CellColor::Indexed(15), true)
+            (CellColor::Indexed(0), CellColor::Indexed(6), true)
         } else {
-            (CellColor::Indexed(7), CellColor::Indexed(8), false)
+            (CellColor::Indexed(245), CellColor::Indexed(235), false)
         };
 
         for ch in tab_str.chars() {
@@ -801,7 +851,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             10,
             5,
@@ -846,7 +896,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             20,
             5,
@@ -889,7 +939,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             20,
             9,
@@ -941,7 +991,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::ZellijStyle,
+            &BorderStyle::ZellijStyle,
             &status,
             20,
             11,
@@ -986,7 +1036,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::ZellijStyle,
+            &BorderStyle::ZellijStyle,
             &status,
             20,
             11,
@@ -1033,7 +1083,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::ZellijStyle,
+            &BorderStyle::ZellijStyle,
             &status,
             20,
             11,
@@ -1076,7 +1126,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             20,
             11,
@@ -1117,7 +1167,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             20,
             11,
@@ -1125,8 +1175,8 @@ mod tests {
             2,
         );
 
-        // First row should be the tab bar with dark grey background.
-        assert_eq!(result[0][0].bg, CellColor::Indexed(8));
+        // First row should be the tab bar (inactive tab uses 237 background).
+        assert_eq!(result[0][0].bg, CellColor::Indexed(237));
     }
 
     #[test]
@@ -1154,7 +1204,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::ZellijStyle,
+            &BorderStyle::ZellijStyle,
             &status,
             20,
             11,
@@ -1198,7 +1248,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::ZellijStyle,
+            &BorderStyle::ZellijStyle,
             &status,
             30,
             11,
@@ -1241,7 +1291,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             20,
             11,
@@ -1294,7 +1344,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             40,
             11,
@@ -1345,7 +1395,7 @@ mod tests {
             &layout,
             &pane_screens,
             area,
-            &GapMode::TmuxStyle,
+            &BorderStyle::TmuxStyle,
             &status,
             20,
             11,

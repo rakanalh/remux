@@ -2,7 +2,7 @@ pub mod keybindings;
 pub mod theme;
 pub mod watcher;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Config root
@@ -56,24 +56,22 @@ impl Default for GeneralConfig {
 #[serde(default)]
 pub struct AppearanceConfig {
     pub status_bar_position: StatusBarPosition,
-    pub gap_mode: GapMode,
-    pub gap_size: u16,
+    pub border_style: BorderStyle,
 }
 
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
             status_bar_position: StatusBarPosition::Bottom,
-            gap_mode: GapMode::ZellijStyle,
-            gap_size: 0,
+            border_style: BorderStyle::ZellijStyle,
         }
     }
 }
 
-/// Whether panes have visual gaps between them.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+/// Border rendering style for pane frames.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum GapMode {
+pub enum BorderStyle {
     ZellijStyle,
     TmuxStyle,
 }
@@ -328,49 +326,40 @@ mod tests {
     }
 
     #[test]
-    fn default_gap_settings() {
+    fn default_border_style_settings() {
         let config = Config::default();
-        assert_eq!(config.appearance.gap_mode, GapMode::ZellijStyle);
-        assert_eq!(config.appearance.gap_size, 0);
+        assert_eq!(config.appearance.border_style, BorderStyle::ZellijStyle);
     }
 
     #[test]
-    fn deserialize_gap_settings_zellij_style() {
+    fn deserialize_border_style_zellij_style() {
         let toml_str = r#"
             [appearance]
-            gap_mode = "zellij_style"
-            gap_size = 2
+            border_style = "zellij_style"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.appearance.gap_mode, GapMode::ZellijStyle);
-        assert_eq!(config.appearance.gap_size, 2);
+        assert_eq!(config.appearance.border_style, BorderStyle::ZellijStyle);
     }
 
     #[test]
-    fn deserialize_gap_settings_tmux_style() {
+    fn deserialize_border_style_tmux_style() {
         let toml_str = r#"
             [appearance]
-            gap_mode = "tmux_style"
+            border_style = "tmux_style"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.appearance.gap_mode, GapMode::TmuxStyle);
-        assert_eq!(config.appearance.gap_size, 0); // default
+        assert_eq!(config.appearance.border_style, BorderStyle::TmuxStyle);
     }
 
     #[test]
-    fn default_appearance_has_zellij_style_and_no_frame_style() {
+    fn default_appearance_has_zellij_style() {
         let appearance = AppearanceConfig::default();
-        assert_eq!(appearance.gap_mode, GapMode::ZellijStyle);
-        // There should be no `frame_style` field at all -- the struct
-        // only has `status_bar_position`, `gap_mode`, and `gap_size`.
-        // If someone re-adds a `frame_style` field, this test's compile
-        // would still pass but the exhaustive match below would fail.
+        assert_eq!(appearance.border_style, BorderStyle::ZellijStyle);
         let AppearanceConfig {
             status_bar_position: _,
-            gap_mode,
-            gap_size: _,
+            border_style,
         } = &appearance;
-        assert_eq!(*gap_mode, GapMode::ZellijStyle);
+        assert_eq!(*border_style, BorderStyle::ZellijStyle);
     }
 
     #[test]

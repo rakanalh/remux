@@ -62,9 +62,9 @@ impl Default for Theme {
             tab_inactive_fg: Color::Grey,
 
             // Which-key popup
-            whichkey_fg: Color::White,
-            whichkey_bg: Color::DarkGrey,
-            whichkey_key_fg: Color::Yellow,
+            whichkey_fg: Color::AnsiValue(252), // Light grey text
+            whichkey_bg: Color::AnsiValue(235), // Very dark grey (matches status bar)
+            whichkey_key_fg: Color::AnsiValue(10), // Bright green keys
         }
     }
 }

@@ -49,6 +49,8 @@ pub enum ServerMessage {
         cursor_x: u16,
         cursor_y: u16,
         cursor_visible: bool,
+        /// The focused pane's rectangle in the composited buffer.
+        focused_pane_rect: Option<PaneRect>,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -56,6 +58,8 @@ pub enum ServerMessage {
         cursor_x: u16,
         cursor_y: u16,
         cursor_visible: bool,
+        /// The focused pane's rectangle in the composited buffer.
+        focused_pane_rect: Option<PaneRect>,
     },
     /// Response to a `ListSessions` request.
     SessionList { sessions: Vec<SessionListEntry> },
@@ -63,6 +67,21 @@ pub enum ServerMessage {
     Error { message: String },
     /// Asynchronous session event notification.
     Event(SessionEvent),
+}
+
+// ---------------------------------------------------------------------------
+// Pane geometry (sent from server to client for scoped visual mode)
+// ---------------------------------------------------------------------------
+
+/// Rectangle describing a focused pane's position and size in the composited
+/// screen buffer. Sent alongside render messages so the client can scope
+/// visual-mode selection to the active pane.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +206,7 @@ pub enum RemuxCommand {
     BufferSearch,
 
     // -- Layout commands ------------------------------------------------------
-    ToggleGaps,
+    ToggleStyle,
 
     // -- System / mode commands ---------------------------------------------
     SessionSave,

@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use super::layout::{self, LayoutNode, PaneId};
+use crate::config::BorderStyle;
 
 /// Unique identifier for a session (its name).
 pub type SessionId = String;
@@ -58,10 +59,10 @@ pub struct Session {
     pub folder: Option<FolderId>,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
-    /// Whether pane gaps are enabled for this session. Initialized from
-    /// `config.appearance.gap_mode` and toggled at runtime.
-    #[serde(default)]
-    pub gaps_enabled: bool,
+    /// Border rendering style for this session. Initialized from
+    /// `config.appearance.border_style` and toggled at runtime.
+    #[serde(default = "default_border_style")]
+    pub border_style: BorderStyle,
     /// Tracks an in-progress pane rename: (pane_id, original_name).
     /// Present only while a client is actively typing a new name.
     #[serde(skip)]
@@ -75,6 +76,10 @@ pub struct Tab {
     pub name: String,
     pub layout: LayoutNode,
     pub focused_pane: PaneId,
+}
+
+fn default_border_style() -> BorderStyle {
+    BorderStyle::ZellijStyle
 }
 
 impl ServerState {
@@ -116,7 +121,7 @@ impl ServerState {
         &mut self,
         name: &str,
         folder: Option<&str>,
-        gaps_enabled: bool,
+        border_style: BorderStyle,
     ) -> Result<PaneId> {
         if self.sessions.contains_key(name) {
             bail!("session '{}' already exists", name);
@@ -158,7 +163,7 @@ impl ServerState {
             folder: folder_id,
             tabs: vec![tab],
             active_tab: 0,
-            gaps_enabled,
+            border_style,
             rename_state: None,
         };
 
@@ -509,7 +514,9 @@ mod tests {
     #[test]
     fn test_create_session() {
         let mut state = ServerState::new();
-        let pane_id = state.create_session("test", None, false).unwrap();
+        let pane_id = state
+            .create_session("test", None, BorderStyle::ZellijStyle)
+            .unwrap();
         assert_eq!(pane_id, 1);
 
         let sess = state.sessions.get("test").unwrap();
@@ -522,7 +529,9 @@ mod tests {
     #[test]
     fn test_create_session_with_folder() {
         let mut state = ServerState::new();
-        state.create_session("test", Some("work"), false).unwrap();
+        state
+            .create_session("test", Some("work"), BorderStyle::ZellijStyle)
+            .unwrap();
 
         assert!(state.folders.contains_key("work"));
         let folder = state.folders.get("work").unwrap();
@@ -535,15 +544,19 @@ mod tests {
     #[test]
     fn test_create_session_duplicate_name() {
         let mut state = ServerState::new();
-        state.create_session("test", None, false).unwrap();
-        let result = state.create_session("test", None, false);
+        state
+            .create_session("test", None, BorderStyle::ZellijStyle)
+            .unwrap();
+        let result = state.create_session("test", None, BorderStyle::ZellijStyle);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rename_session() {
         let mut state = ServerState::new();
-        state.create_session("old", Some("folder"), false).unwrap();
+        state
+            .create_session("old", Some("folder"), BorderStyle::ZellijStyle)
+            .unwrap();
         state.rename_session("old", "new").unwrap();
 
         assert!(!state.sessions.contains_key("old"));
@@ -557,8 +570,12 @@ mod tests {
     #[test]
     fn test_rename_session_duplicate() {
         let mut state = ServerState::new();
-        state.create_session("a", None, false).unwrap();
-        state.create_session("b", None, false).unwrap();
+        state
+            .create_session("a", None, BorderStyle::ZellijStyle)
+            .unwrap();
+        state
+            .create_session("b", None, BorderStyle::ZellijStyle)
+            .unwrap();
 
         let result = state.rename_session("a", "b");
         assert!(result.is_err());
@@ -567,14 +584,18 @@ mod tests {
     #[test]
     fn test_rename_session_same_name() {
         let mut state = ServerState::new();
-        state.create_session("a", None, false).unwrap();
+        state
+            .create_session("a", None, BorderStyle::ZellijStyle)
+            .unwrap();
         state.rename_session("a", "a").unwrap();
     }
 
     #[test]
     fn test_delete_session() {
         let mut state = ServerState::new();
-        state.create_session("test", Some("folder"), false).unwrap();
+        state
+            .create_session("test", Some("folder"), BorderStyle::ZellijStyle)
+            .unwrap();
         let pane_ids = state.delete_session("test").unwrap();
 
         assert_eq!(pane_ids, vec![1]);
@@ -593,8 +614,12 @@ mod tests {
     #[test]
     fn test_list_sessions() {
         let mut state = ServerState::new();
-        state.create_session("b", None, false).unwrap();
-        state.create_session("a", Some("f"), false).unwrap();
+        state
+            .create_session("b", None, BorderStyle::ZellijStyle)
+            .unwrap();
+        state
+            .create_session("a", Some("f"), BorderStyle::ZellijStyle)
+            .unwrap();
 
         let list = state.list_sessions();
         assert_eq!(list.len(), 2);
@@ -622,7 +647,9 @@ mod tests {
     fn test_rename_folder() {
         let mut state = ServerState::new();
         state.create_folder("old").unwrap();
-        state.create_session("s", Some("old"), false).unwrap();
+        state
+            .create_session("s", Some("old"), BorderStyle::ZellijStyle)
+            .unwrap();
         state.rename_folder("old", "new").unwrap();
 
         assert!(!state.folders.contains_key("old"));
@@ -643,7 +670,9 @@ mod tests {
     #[test]
     fn test_delete_folder_not_empty() {
         let mut state = ServerState::new();
-        state.create_session("s", Some("work"), false).unwrap();
+        state
+            .create_session("s", Some("work"), BorderStyle::ZellijStyle)
+            .unwrap();
         assert!(state.delete_folder("work").is_err());
     }
 
@@ -662,7 +691,9 @@ mod tests {
     #[test]
     fn test_create_tab() {
         let mut state = ServerState::new();
-        state.create_session("s", None, false).unwrap();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle)
+            .unwrap();
         let pane_id = state.create_tab("s", "new-tab").unwrap();
 
         let sess = state.sessions.get("s").unwrap();
@@ -675,7 +706,9 @@ mod tests {
     #[test]
     fn test_close_tab() {
         let mut state = ServerState::new();
-        state.create_session("s", None, false).unwrap();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle)
+            .unwrap();
         state.create_tab("s", "tab2").unwrap();
 
         let (pane_ids, deleted) = state.close_tab("s", 0).unwrap();
@@ -690,7 +723,9 @@ mod tests {
     #[test]
     fn test_close_last_tab_deletes_session() {
         let mut state = ServerState::new();
-        state.create_session("s", Some("f"), false).unwrap();
+        state
+            .create_session("s", Some("f"), BorderStyle::ZellijStyle)
+            .unwrap();
 
         let (pane_ids, deleted) = state.close_tab("s", 0).unwrap();
         assert!(deleted);
@@ -705,7 +740,9 @@ mod tests {
     #[test]
     fn test_rename_tab() {
         let mut state = ServerState::new();
-        state.create_session("s", None, false).unwrap();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle)
+            .unwrap();
         state.rename_tab("s", 0, "renamed").unwrap();
 
         let sess = state.sessions.get("s").unwrap();
@@ -715,7 +752,9 @@ mod tests {
     #[test]
     fn test_goto_tab() {
         let mut state = ServerState::new();
-        state.create_session("s", None, false).unwrap();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle)
+            .unwrap();
         state.create_tab("s", "tab2").unwrap();
         state.goto_tab("s", 0).unwrap();
 
@@ -726,14 +765,18 @@ mod tests {
     #[test]
     fn test_goto_tab_out_of_range() {
         let mut state = ServerState::new();
-        state.create_session("s", None, false).unwrap();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle)
+            .unwrap();
         assert!(state.goto_tab("s", 5).is_err());
     }
 
     #[test]
     fn test_move_session_to_folder() {
         let mut state = ServerState::new();
-        state.create_session("s", None, false).unwrap();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle)
+            .unwrap();
         state.move_session("s", Some("new-folder")).unwrap();
 
         let sess = state.sessions.get("s").unwrap();
@@ -746,7 +789,9 @@ mod tests {
     #[test]
     fn test_move_session_between_folders() {
         let mut state = ServerState::new();
-        state.create_session("s", Some("old"), false).unwrap();
+        state
+            .create_session("s", Some("old"), BorderStyle::ZellijStyle)
+            .unwrap();
         state.move_session("s", Some("new")).unwrap();
 
         let old_folder = state.folders.get("old").unwrap();
@@ -759,7 +804,9 @@ mod tests {
     #[test]
     fn test_move_session_to_top_level() {
         let mut state = ServerState::new();
-        state.create_session("s", Some("folder"), false).unwrap();
+        state
+            .create_session("s", Some("folder"), BorderStyle::ZellijStyle)
+            .unwrap();
         state.move_session("s", None).unwrap();
 
         let sess = state.sessions.get("s").unwrap();
@@ -772,9 +819,13 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() {
         let mut state = ServerState::new();
-        state.create_session("s1", Some("work"), false).unwrap();
+        state
+            .create_session("s1", Some("work"), BorderStyle::ZellijStyle)
+            .unwrap();
         state.create_tab("s1", "tab2").unwrap();
-        state.create_session("s2", None, false).unwrap();
+        state
+            .create_session("s2", None, BorderStyle::ZellijStyle)
+            .unwrap();
 
         let json = serde_json::to_string(&state).expect("serialize");
         let deserialized: ServerState = serde_json::from_str(&json).expect("deserialize");
