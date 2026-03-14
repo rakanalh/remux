@@ -13,6 +13,7 @@ pub enum Mode {
     Insert,
     Normal,
     Visual,
+    Rename,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +215,8 @@ pub enum InputAction {
     SearchPrompt,
     /// Update the visual mode scroll offset.
     VisualScroll { offset: usize },
+    /// The rename buffer was updated (for status bar display).
+    RenameUpdate(String),
     /// No action to take.
     None,
 }
@@ -279,6 +282,8 @@ pub struct InputHandler {
     pub visual_state: Option<VisualState>,
     /// Pending 'g' key for gg motion in visual mode.
     pending_g: bool,
+    /// Buffer for the rename input mode.
+    pub rename_buffer: String,
 }
 
 impl InputHandler {
@@ -292,6 +297,7 @@ impl InputHandler {
             keybinding_tree,
             visual_state: None,
             pending_g: false,
+            rename_buffer: String::new(),
         }
     }
 
@@ -307,6 +313,7 @@ impl InputHandler {
             Mode::Insert => self.handle_insert_key(key),
             Mode::Normal => self.handle_normal_key(key),
             Mode::Visual => self.handle_visual_key(key),
+            Mode::Rename => self.handle_rename_key(key),
         }
     }
 
@@ -379,6 +386,11 @@ impl InputHandler {
                             self.mode = Mode::Visual;
                             self.visual_state = Some(VisualState::new(24, 1000));
                             return InputAction::ModeChanged(Mode::Visual);
+                        }
+                        RemuxCommand::PaneRename(_) => {
+                            self.mode = Mode::Rename;
+                            self.rename_buffer.clear();
+                            return InputAction::ModeChanged(Mode::Rename);
                         }
                         _ => {}
                     }
@@ -534,6 +546,37 @@ impl InputHandler {
         }
 
         InputAction::None
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename mode
+    // -----------------------------------------------------------------------
+
+    fn handle_rename_key(&mut self, key: KeyEvent) -> InputAction {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel rename, return to Normal mode.
+                self.rename_buffer.clear();
+                self.mode = Mode::Normal;
+                InputAction::Execute(RemuxCommand::PaneRenameCancel)
+            }
+            KeyCode::Enter => {
+                // Confirm rename: send the command with the buffer contents.
+                let name = self.rename_buffer.clone();
+                self.rename_buffer.clear();
+                self.mode = Mode::Normal;
+                InputAction::Execute(RemuxCommand::PaneRename(name))
+            }
+            KeyCode::Backspace => {
+                self.rename_buffer.pop();
+                InputAction::RenameUpdate(self.rename_buffer.clone())
+            }
+            KeyCode::Char(c) => {
+                self.rename_buffer.push(c);
+                InputAction::RenameUpdate(self.rename_buffer.clone())
+            }
+            _ => InputAction::None,
+        }
     }
 }
 

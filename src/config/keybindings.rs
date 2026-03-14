@@ -92,6 +92,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('a', leaf("stack add", "pane:stack_add")),
                 (']', leaf("stack next", "pane:stack_next")),
                 ('[', leaf("stack prev", "pane:stack_prev")),
+                ('r', leaf("rename", "pane:rename")),
             ],
         ),
     );
@@ -153,6 +154,9 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     // Direct mode-switch bindings at the root level.
     root.insert('i', leaf("insert mode", "enter_insert_mode"));
     root.insert('v', leaf("visual mode", "enter_visual_mode"));
+
+    // Layout toggle bindings.
+    root.insert('g', leaf("toggle gaps", "toggle_gaps"));
 
     root
 }
@@ -317,6 +321,7 @@ pub fn parse_action(action: &str) -> Option<RemuxCommand> {
             "enter_normal_mode" => Some(RemuxCommand::EnterNormalMode),
             "enter_visual_mode" => Some(RemuxCommand::EnterVisualMode),
             "session_save" => Some(RemuxCommand::SessionSave),
+            "toggle_gaps" => Some(RemuxCommand::ToggleGaps),
             _ => None,
         };
     };
@@ -356,6 +361,7 @@ pub fn parse_action(action: &str) -> Option<RemuxCommand> {
             "stack_add" => Some(RemuxCommand::PaneStackAdd),
             "stack_next" => Some(RemuxCommand::PaneStackNext),
             "stack_prev" => Some(RemuxCommand::PaneStackPrev),
+            "rename" => Some(RemuxCommand::PaneRename(String::new())),
             _ => None,
         },
         "session" => match detail {
@@ -437,6 +443,7 @@ mod tests {
         assert!(tree.root.contains_key(&'r'));
         assert!(tree.root.contains_key(&'i'));
         assert!(tree.root.contains_key(&'v'));
+        assert!(tree.root.contains_key(&'g'));
     }
 
     #[test]
@@ -540,6 +547,44 @@ mod tests {
                 .any(|(k, label)| *k == 'a' && label == "stack add"),
             "expected 'a' -> 'stack add' in Pane group, got: {children:?}"
         );
+    }
+
+    #[test]
+    fn default_tree_has_toggle_gaps() {
+        let tree = KeybindingTree::default();
+        assert!(tree.root.contains_key(&'g'));
+        let node = tree.lookup(&['g']).unwrap();
+        match node {
+            KeyNode::Leaf { action, label, .. } => {
+                assert_eq!(action, "toggle_gaps");
+                assert_eq!(label, "toggle gaps");
+            }
+            other => panic!("expected leaf for 'g', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_action_toggle_gaps() {
+        assert_eq!(parse_action("toggle_gaps"), Some(RemuxCommand::ToggleGaps));
+    }
+
+    #[test]
+    fn pane_group_has_rename_leaf() {
+        let tree = KeybindingTree::default();
+        let node = tree.lookup(&['p', 'r']).unwrap();
+        match node {
+            KeyNode::Leaf { action, label, .. } => {
+                assert_eq!(action, "pane:rename");
+                assert_eq!(label, "rename");
+            }
+            other => panic!("expected leaf for 'p' -> 'r', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_action_pane_rename() {
+        let result = parse_action("pane:rename");
+        assert_eq!(result, Some(RemuxCommand::PaneRename(String::new())));
     }
 
     #[test]
