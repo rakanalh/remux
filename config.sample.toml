@@ -1,0 +1,208 @@
+# =============================================================================
+# Remux Configuration
+# =============================================================================
+# Place this file at ~/.config/remux/config.toml
+# All values below show their defaults. Uncomment and modify as needed.
+
+# -----------------------------------------------------------------------------
+# General
+# -----------------------------------------------------------------------------
+
+[general]
+# Override the default login shell. Uses $SHELL if not set.
+# default_shell = "/bin/zsh"
+
+# Maximum number of scrollback lines per pane.
+scrollback_lines = 10000
+
+# Interval in seconds between automatic session saves.
+auto_save_interval_secs = 30
+
+# Key used to switch from Insert to Normal mode.
+mode_switch_key = "Esc"
+
+# -----------------------------------------------------------------------------
+# Appearance
+# -----------------------------------------------------------------------------
+
+[appearance]
+# Where the status bar is placed: "top" or "bottom".
+status_bar_position = "bottom"
+
+# Pane rendering style: "zellij_style" (borders, pane names) or "tmux_style" (minimal dividers).
+gap_mode = "zellij_style"
+
+# Gap size in cells between panes (only applies when gap_mode = "zellij_style").
+gap_size = 0
+
+# -----------------------------------------------------------------------------
+# Modes
+# -----------------------------------------------------------------------------
+
+[modes.normal]
+# Timeout in milliseconds before the which-key popup appears.
+timeout_ms = 500
+
+# -----------------------------------------------------------------------------
+# Keybindings — Normal Mode
+# -----------------------------------------------------------------------------
+# Normal mode uses a tree-based key system. Press a group key (e.g. "t") to
+# see available sub-keys in the which-key popup, then press a sub-key to
+# execute the command.
+#
+# To override a default binding, redefine it here. User bindings merge on top
+# of defaults — only the keys you specify are changed.
+#
+# To remove a default binding, set it to an empty string:
+#   i = ""
+#
+# Commands use PascalCase names matching RemuxCommand variants.
+# Arguments are space-separated. Quote strings with spaces: "SessionNew \"my project\""
+
+# --- Tab (t) ---
+[keybindings.normal.t]
+_label = "Tab"
+n = "TabNew"
+c = "TabClose"
+m = "TabMove"
+r = "TabRename"
+l = "TabNext"                       # list / cycle tabs
+
+# --- Pane (p) ---
+[keybindings.normal.p]
+_label = "Pane"
+n = "PaneNew"
+c = "PaneClose"
+s = "PaneSplitVertical"
+S = "PaneSplitHorizontal"
+h = "PaneFocusLeft"
+j = "PaneFocusDown"
+k = "PaneFocusUp"
+l = "PaneFocusRight"
+a = "PaneStackAdd"
+"]" = "PaneStackNext"
+"[" = "PaneStackPrev"
+r = "PaneRename"
+
+# --- Session (s) ---
+[keybindings.normal.s]
+_label = "Session"
+n = "SessionNew"
+d = "SessionDetach"
+r = "SessionRename"
+l = "SessionList"
+
+# --- Folder (f) ---
+[keybindings.normal.f]
+_label = "Folder"
+n = "FolderNew"
+d = "FolderDelete"
+l = "FolderList"
+m = "FolderMoveSession"
+
+# --- Buffer (b) ---
+[keybindings.normal.b]
+_label = "Buffer"
+e = "BufferEditInEditor"
+"/" = "BufferSearch"
+
+# --- Resize (r) ---
+[keybindings.normal.r]
+_label = "Resize"
+h = "ResizeLeft 5"
+j = "ResizeDown 5"
+k = "ResizeUp 5"
+l = "ResizeRight 5"
+
+# --- Direct bindings (root level) ---
+# These are top-level keys, not inside a group.
+# Uncomment to override:
+# i = "EnterInsertMode"
+# v = "EnterVisualMode"
+# g = "ToggleGaps"
+
+# -----------------------------------------------------------------------------
+# Keybindings — Insert Mode
+# -----------------------------------------------------------------------------
+# Insert mode bindings are flat (no key groups). Keys are checked before being
+# forwarded to the PTY. If a key matches a binding, the command executes and
+# the key is consumed. You remain in insert mode.
+#
+# Key notation: "Alt-h", "Ctrl-b", "Shift-Tab", "F1", "Enter", "Space", etc.
+# Only single-modifier keys are supported (no Ctrl-Alt combinations).
+
+[keybindings.insert]
+Alt-h = "PaneFocusLeft"
+Alt-j = "PaneFocusDown"
+Alt-k = "PaneFocusUp"
+Alt-l = "PaneFocusRight"
+Alt-n = "TabNext"
+Alt-p = "TabPrev"
+
+# -----------------------------------------------------------------------------
+# Keybindings — Visual Mode
+# -----------------------------------------------------------------------------
+# Visual mode overrides (tree-based, same format as normal mode).
+# Visual mode has built-in keys for scrollback navigation (j/k, gg, G, Ctrl-d/u,
+# v/V for selection, y to yank, / to search, e to open editor).
+# Add overrides here if needed.
+
+# [keybindings.visual]
+
+# =============================================================================
+# Available Commands Reference
+# =============================================================================
+#
+# Tab commands:
+#   TabNew                          — Create a new tab
+#   TabClose                        — Close the active tab
+#   TabGoto <index>                 — Jump to tab by index (1-based)
+#   TabNext                         — Focus next tab
+#   TabPrev                         — Focus previous tab
+#   TabMove <index>                 — Move tab to position (1-based)
+#   TabRename <name>                — Rename the active tab
+#
+# Pane commands:
+#   PaneNew                         — Create a new pane
+#   PaneClose                       — Close the focused pane
+#   PaneSplitVertical               — Split focused pane vertically
+#   PaneSplitHorizontal             — Split focused pane horizontally
+#   PaneFocusLeft                   — Focus pane to the left
+#   PaneFocusRight                  — Focus pane to the right
+#   PaneFocusUp                     — Focus pane above
+#   PaneFocusDown                   — Focus pane below
+#   PaneStackAdd                    — Add focused pane to a stack
+#   PaneStackNext                   — Focus next pane in stack
+#   PaneStackPrev                   — Focus previous pane in stack
+#   PaneRename <name>               — Rename the focused pane
+#
+# Session commands:
+#   SessionNew <name> [folder]      — Create a new session
+#   SessionDetach                   — Detach from current session
+#   SessionRename <name>            — Rename current session
+#   SessionList                     — List all sessions
+#   SessionSave                     — Save session state
+#
+# Folder commands:
+#   FolderNew <name>                — Create a new folder
+#   FolderDelete <name>             — Delete a folder
+#   FolderList                      — List all folders
+#   FolderMoveSession <sess> [dir]  — Move a session to a folder
+#
+# Buffer commands:
+#   BufferEditInEditor              — Open scrollback in external editor
+#   BufferSearch                    — Search scrollback buffer
+#
+# Resize commands:
+#   ResizeLeft [amount]             — Resize pane left (default: 1)
+#   ResizeRight [amount]            — Resize pane right (default: 1)
+#   ResizeUp [amount]               — Resize pane up (default: 1)
+#   ResizeDown [amount]             — Resize pane down (default: 1)
+#
+# Mode commands:
+#   EnterInsertMode                 — Switch to insert mode
+#   EnterNormalMode                 — Switch to normal mode
+#   EnterVisualMode                 — Switch to visual mode
+#
+# Layout commands:
+#   ToggleGaps                      — Toggle pane gap rendering on/off
