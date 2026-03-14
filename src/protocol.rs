@@ -154,6 +154,9 @@ pub enum RemuxCommand {
     PaneStackAdd,
     PaneStackNext,
     PaneStackPrev,
+    PaneRename(String),
+    PaneRenameUpdate(String),
+    PaneRenameCancel,
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -182,6 +185,9 @@ pub enum RemuxCommand {
     // -- Buffer commands ----------------------------------------------------
     BufferEditInEditor,
     BufferSearch,
+
+    // -- Layout commands ------------------------------------------------------
+    ToggleGaps,
 
     // -- System / mode commands ---------------------------------------------
     SessionSave,

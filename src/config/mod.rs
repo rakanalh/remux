@@ -54,25 +54,27 @@ impl Default for GeneralConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct AppearanceConfig {
-    pub frame_style: FrameStyle,
     pub status_bar_position: StatusBarPosition,
+    pub gap_mode: GapMode,
+    pub gap_size: u16,
 }
 
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            frame_style: FrameStyle::Framed,
             status_bar_position: StatusBarPosition::Bottom,
+            gap_mode: GapMode::ZellijStyle,
+            gap_size: 0,
         }
     }
 }
 
-/// How pane borders are drawn.
+/// Whether panes have visual gaps between them.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum FrameStyle {
-    Framed,
-    Minimal,
+pub enum GapMode {
+    ZellijStyle,
+    TmuxStyle,
 }
 
 /// Where the status bar is placed.
@@ -205,7 +207,6 @@ mod tests {
         assert_eq!(config.general.auto_save_interval_secs, 30);
         assert_eq!(config.general.mode_switch_key, "Esc");
         assert_eq!(config.modes.normal.timeout_ms, 500);
-        assert_eq!(config.appearance.frame_style, FrameStyle::Framed);
         assert_eq!(
             config.appearance.status_bar_position,
             StatusBarPosition::Bottom
@@ -235,7 +236,6 @@ mod tests {
             mode_switch_key = "Esc"
 
             [appearance]
-            frame_style = "minimal"
             status_bar_position = "top"
 
             [modes.normal]
@@ -248,7 +248,6 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.default_shell, Some("/bin/zsh".to_string()));
         assert_eq!(config.general.scrollback_lines, 20_000);
-        assert_eq!(config.appearance.frame_style, FrameStyle::Minimal);
         assert_eq!(
             config.appearance.status_bar_position,
             StatusBarPosition::Top
@@ -276,6 +275,52 @@ mod tests {
         let config = Config::default();
         let tree = config.keybinding_tree();
         assert!(tree.lookup(&['t', 'n']).is_some());
+    }
+
+    #[test]
+    fn default_gap_settings() {
+        let config = Config::default();
+        assert_eq!(config.appearance.gap_mode, GapMode::ZellijStyle);
+        assert_eq!(config.appearance.gap_size, 0);
+    }
+
+    #[test]
+    fn deserialize_gap_settings_zellij_style() {
+        let toml_str = r#"
+            [appearance]
+            gap_mode = "zellij_style"
+            gap_size = 2
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.appearance.gap_mode, GapMode::ZellijStyle);
+        assert_eq!(config.appearance.gap_size, 2);
+    }
+
+    #[test]
+    fn deserialize_gap_settings_tmux_style() {
+        let toml_str = r#"
+            [appearance]
+            gap_mode = "tmux_style"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.appearance.gap_mode, GapMode::TmuxStyle);
+        assert_eq!(config.appearance.gap_size, 0); // default
+    }
+
+    #[test]
+    fn default_appearance_has_zellij_style_and_no_frame_style() {
+        let appearance = AppearanceConfig::default();
+        assert_eq!(appearance.gap_mode, GapMode::ZellijStyle);
+        // There should be no `frame_style` field at all -- the struct
+        // only has `status_bar_position`, `gap_mode`, and `gap_size`.
+        // If someone re-adds a `frame_style` field, this test's compile
+        // would still pass but the exhaustive match below would fail.
+        let AppearanceConfig {
+            status_bar_position: _,
+            gap_mode,
+            gap_size: _,
+        } = &appearance;
+        assert_eq!(*gap_mode, GapMode::ZellijStyle);
     }
 
     #[test]

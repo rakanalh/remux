@@ -303,22 +303,52 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 client.send(ClientMessage::Input { data }).await?;
                             }
                             InputAction::Execute(cmd) => {
+                                // Hide which-key popup when executing a command
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
                                     return Ok(());
                                 }
+                                let is_rename_finish = matches!(
+                                    cmd,
+                                    RemuxCommand::PaneRename(_) | RemuxCommand::PaneRenameCancel
+                                );
                                 client.send(ClientMessage::Command(cmd)).await?;
+                                // After rename confirm/cancel, the client has
+                                // already switched to Normal mode -- tell the
+                                // server so the status bar and cursor update.
+                                if is_rename_finish {
+                                    client
+                                        .send(ClientMessage::ModeChanged {
+                                            mode: "NORMAL".to_string(),
+                                        })
+                                        .await?;
+                                }
                             }
                             InputAction::ModeChanged(mode) => {
                                 let mode_str = match mode {
                                     Mode::Insert => "INSERT",
                                     Mode::Normal => "NORMAL",
                                     Mode::Visual => "VISUAL",
+                                    Mode::Rename => "RENAME",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
+                                // When entering Rename mode, send an initial
+                                // empty update so the server clears the pane
+                                // name and stores the original for cancel.
+                                if mode == Mode::Rename {
+                                    client
+                                        .send(ClientMessage::Command(
+                                            RemuxCommand::PaneRenameUpdate(String::new()),
+                                        ))
+                                        .await?;
+                                }
                                 // Hide which-key when mode changes
                                 if whichkey.visible {
                                     whichkey.hide();
@@ -344,8 +374,16 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.resize(cols, rows);
                                 client.send(ClientMessage::Resize { cols, rows }).await?;
                             }
+                            InputAction::RenameUpdate(text) => {
+                                client
+                                    .send(ClientMessage::Command(
+                                        RemuxCommand::PaneRenameUpdate(text),
+                                    ))
+                                    .await?;
+                            }
                             InputAction::YankToClipboard(_) | InputAction::SearchPrompt
-                            | InputAction::VisualScroll { .. } | InputAction::None => {}
+                            | InputAction::VisualScroll { .. }
+                            | InputAction::None => {}
                         }
                     }
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
@@ -364,9 +402,19 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                 match msg? {
                     Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible }) => {
                         renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible)?;
+                        // Re-render popup on top if visible
+                        if whichkey.visible {
+                            let commands = whichkey.render(cols, rows, &theme);
+                            renderer.render_whichkey_overlay(&commands)?;
+                        }
                     }
                     Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible }) => {
                         renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible)?;
+                        // Re-render popup on top if visible
+                        if whichkey.visible {
+                            let commands = whichkey.render(cols, rows, &theme);
+                            renderer.render_whichkey_overlay(&commands)?;
+                        }
                     }
                     Some(ServerMessage::SessionList { sessions }) => {
                         log::debug!("received session list with {} sessions", sessions.len());

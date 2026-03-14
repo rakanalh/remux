@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn test_persisted_state_roundtrip() {
         let mut state = ServerState::new();
-        state.create_session("test", None).unwrap();
+        state.create_session("test", None, false).unwrap();
 
         let mut cwds = HashMap::new();
         cwds.insert(1u64, "/home/user".to_string());
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn test_persisted_state_from_server_clones_state() {
         let mut state = ServerState::new();
-        state.create_session("s1", Some("work")).unwrap();
+        state.create_session("s1", Some("work"), false).unwrap();
         state.create_tab("s1", "tab2").unwrap();
 
         let cwds = HashMap::new();
@@ -164,7 +164,7 @@ mod tests {
         let state_path = dir.path().join("state.json");
 
         let mut state = ServerState::new();
-        state.create_session("persist-test", None).unwrap();
+        state.create_session("persist-test", None, false).unwrap();
 
         let mut cwds = HashMap::new();
         cwds.insert(1u64, "/tmp".to_string());

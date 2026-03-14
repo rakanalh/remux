@@ -44,6 +44,14 @@ pub enum LayoutNode {
     /// A stack holds one or more panes in a tabbed arrangement.
     Stack {
         panes: Vec<PaneId>,
+        /// Display names for each pane, parallel to `panes`.
+        #[serde(default)]
+        names: Vec<String>,
+        /// Custom names set by the user, parallel to `panes`.
+        /// `Some(name)` means the user set a custom name; `None` means
+        /// auto-detect from the running process.
+        #[serde(default)]
+        custom_names: Vec<Option<String>>,
         /// Index into `panes` for the currently visible pane.
         active: usize,
     },
@@ -72,6 +80,8 @@ impl LayoutNode {
     pub fn new_stack(pane_id: PaneId) -> Self {
         LayoutNode::Stack {
             panes: vec![pane_id],
+            names: vec![String::new()],
+            custom_names: vec![None],
             active: 0,
         }
     }
@@ -187,9 +197,20 @@ impl LayoutNode {
     /// is now empty.
     pub fn close_pane(&mut self, pane_id: PaneId) -> Option<PaneId> {
         match self {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack {
+                panes,
+                names,
+                custom_names,
+                active,
+            } => {
                 let pos = panes.iter().position(|&p| p == pane_id)?;
                 panes.remove(pos);
+                if pos < names.len() {
+                    names.remove(pos);
+                }
+                if pos < custom_names.len() {
+                    custom_names.remove(pos);
+                }
                 if panes.is_empty() {
                     return None;
                 }
@@ -236,9 +257,16 @@ impl LayoutNode {
     /// Returns `true` if the target stack was found and the pane was added.
     pub fn add_to_stack(&mut self, target_pane: PaneId, new_pane: PaneId) -> bool {
         match self {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack {
+                panes,
+                names,
+                custom_names,
+                active,
+            } => {
                 if panes.contains(&target_pane) {
                     panes.push(new_pane);
+                    names.push(String::new());
+                    custom_names.push(None);
                     *active = panes.len() - 1;
                     true
                 } else {
@@ -259,7 +287,7 @@ impl LayoutNode {
     /// Returns the new active pane ID, or `None` if the pane was not found.
     pub fn stack_next(&mut self, current_pane: PaneId) -> Option<PaneId> {
         match self {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack { panes, active, .. } => {
                 let pos = panes.iter().position(|&p| p == current_pane)?;
                 if panes.len() <= 1 {
                     return Some(current_pane);
@@ -278,7 +306,7 @@ impl LayoutNode {
     /// Returns the new active pane ID, or `None` if the pane was not found.
     pub fn stack_prev(&mut self, current_pane: PaneId) -> Option<PaneId> {
         match self {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack { panes, active, .. } => {
                 let pos = panes.iter().position(|&p| p == current_pane)?;
                 if panes.len() <= 1 {
                     return Some(current_pane);
@@ -295,7 +323,7 @@ impl LayoutNode {
     /// Get the active pane ID of the first (leftmost/topmost) stack.
     pub fn active_pane(&self) -> Option<PaneId> {
         match self {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack { panes, active, .. } => {
                 if panes.is_empty() {
                     None
                 } else {
@@ -303,6 +331,103 @@ impl LayoutNode {
                 }
             }
             LayoutNode::Split { first, .. } => first.active_pane(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pane naming helpers
+// ---------------------------------------------------------------------------
+
+/// Set the display name for a pane in the layout tree.
+///
+/// Returns `true` if the pane was found and its name was set.
+pub fn set_pane_name(node: &mut LayoutNode, pane_id: PaneId, name: &str) -> bool {
+    match node {
+        LayoutNode::Stack { panes, names, .. } => {
+            if let Some(pos) = panes.iter().position(|&p| p == pane_id) {
+                // Ensure names vec is long enough.
+                while names.len() <= pos {
+                    names.push(String::new());
+                }
+                names[pos] = name.to_string();
+                true
+            } else {
+                false
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            if set_pane_name(first, pane_id, name) {
+                return true;
+            }
+            set_pane_name(second, pane_id, name)
+        }
+    }
+}
+
+/// Set a custom (user-assigned) name for a pane. When a custom name is set,
+/// the daemon will use it instead of auto-detecting from the process.
+///
+/// Returns `true` if the pane was found and its custom name was set.
+pub fn set_pane_custom_name(node: &mut LayoutNode, pane_id: PaneId, name: &str) -> bool {
+    match node {
+        LayoutNode::Stack {
+            panes,
+            custom_names,
+            ..
+        } => {
+            if let Some(pos) = panes.iter().position(|&p| p == pane_id) {
+                // Ensure custom_names vec is long enough.
+                while custom_names.len() <= pos {
+                    custom_names.push(None);
+                }
+                custom_names[pos] = Some(name.to_string());
+                true
+            } else {
+                false
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            if set_pane_custom_name(first, pane_id, name) {
+                return true;
+            }
+            set_pane_custom_name(second, pane_id, name)
+        }
+    }
+}
+
+/// Get the custom name for a pane, if any.
+///
+/// Returns `Some(Some(name))` if the pane has a user-set custom name,
+/// `Some(None)` if the pane exists but has no custom name (auto-detect),
+/// or `None` if the pane was not found.
+pub fn get_pane_custom_name(node: &LayoutNode, pane_id: PaneId) -> Option<Option<String>> {
+    match node {
+        LayoutNode::Stack {
+            panes,
+            custom_names,
+            ..
+        } => panes
+            .iter()
+            .position(|&p| p == pane_id)
+            .map(|pos| custom_names.get(pos).cloned().unwrap_or(None)),
+        LayoutNode::Split { first, second, .. } => {
+            get_pane_custom_name(first, pane_id).or_else(|| get_pane_custom_name(second, pane_id))
+        }
+    }
+}
+
+/// Get the display name for a pane.
+///
+/// Returns `Some(name)` if the pane was found, `None` otherwise.
+pub fn get_pane_name(node: &LayoutNode, pane_id: PaneId) -> Option<String> {
+    match node {
+        LayoutNode::Stack { panes, names, .. } => panes
+            .iter()
+            .position(|&p| p == pane_id)
+            .map(|pos| names.get(pos).cloned().unwrap_or_default()),
+        LayoutNode::Split { first, second, .. } => {
+            get_pane_name(first, pane_id).or_else(|| get_pane_name(second, pane_id))
         }
     }
 }
@@ -332,15 +457,20 @@ fn contains_pane(node: &LayoutNode, pane_id: PaneId) -> bool {
 /// pane, fixed-size status bars), the cassowary crate can be integrated here.
 /// The current implementation uses straightforward ratio-based division with
 /// min-size clamping.
-pub fn compute_layout(node: &LayoutNode, area: Rect) -> Vec<(PaneId, Rect)> {
+pub fn compute_layout(node: &LayoutNode, area: Rect, gap_size: u16) -> Vec<(PaneId, Rect)> {
     let mut result = Vec::new();
-    compute_layout_inner(node, area, &mut result);
+    compute_layout_inner(node, area, gap_size, &mut result);
     result
 }
 
-fn compute_layout_inner(node: &LayoutNode, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
+fn compute_layout_inner(
+    node: &LayoutNode,
+    area: Rect,
+    gap_size: u16,
+    out: &mut Vec<(PaneId, Rect)>,
+) {
     match node {
-        LayoutNode::Stack { panes, active } => {
+        LayoutNode::Stack { panes, active, .. } => {
             if let Some(&pane_id) = panes.get(*active) {
                 out.push((pane_id, area));
             }
@@ -351,21 +481,24 @@ fn compute_layout_inner(node: &LayoutNode, area: Rect, out: &mut Vec<(PaneId, Re
             first,
             second,
         } => {
-            let (first_area, second_area) = split_rect(area, direction, *ratio);
-            compute_layout_inner(first, first_area, out);
-            compute_layout_inner(second, second_area, out);
+            let (first_area, second_area) = split_rect(area, direction, *ratio, gap_size);
+            compute_layout_inner(first, first_area, gap_size, out);
+            compute_layout_inner(second, second_area, gap_size, out);
         }
     }
 }
 
 /// Divide a rectangle according to a direction and ratio, enforcing minimum
-/// pane sizes.
-fn split_rect(area: Rect, direction: &Direction, ratio: f32) -> (Rect, Rect) {
+/// pane sizes. When `gap_size > 0`, the gap is subtracted from the available
+/// space before dividing. The first child ends before the gap and the second
+/// child starts after it.
+fn split_rect(area: Rect, direction: &Direction, ratio: f32, gap_size: u16) -> (Rect, Rect) {
     match direction {
         Direction::Vertical => {
             let total = area.width;
-            let first_width = compute_split_size(total, ratio);
-            let second_width = total.saturating_sub(first_width);
+            let usable = total.saturating_sub(gap_size);
+            let first_width = compute_split_size(usable, ratio);
+            let second_width = usable.saturating_sub(first_width);
 
             let first = Rect {
                 x: area.x,
@@ -374,7 +507,7 @@ fn split_rect(area: Rect, direction: &Direction, ratio: f32) -> (Rect, Rect) {
                 height: area.height,
             };
             let second = Rect {
-                x: area.x.saturating_add(first_width),
+                x: area.x.saturating_add(first_width).saturating_add(gap_size),
                 y: area.y,
                 width: second_width,
                 height: area.height,
@@ -383,8 +516,9 @@ fn split_rect(area: Rect, direction: &Direction, ratio: f32) -> (Rect, Rect) {
         }
         Direction::Horizontal => {
             let total = area.height;
-            let first_height = compute_split_size(total, ratio);
-            let second_height = total.saturating_sub(first_height);
+            let usable = total.saturating_sub(gap_size);
+            let first_height = compute_split_size(usable, ratio);
+            let second_height = usable.saturating_sub(first_height);
 
             let first = Rect {
                 x: area.x,
@@ -394,7 +528,7 @@ fn split_rect(area: Rect, direction: &Direction, ratio: f32) -> (Rect, Rect) {
             };
             let second = Rect {
                 x: area.x,
-                y: area.y.saturating_add(first_height),
+                y: area.y.saturating_add(first_height).saturating_add(gap_size),
                 width: area.width,
                 height: second_height,
             };
@@ -446,7 +580,7 @@ pub fn active_pane_ids(node: &LayoutNode) -> Vec<PaneId> {
 
 fn collect_active_pane_ids(node: &LayoutNode, out: &mut Vec<PaneId>) {
     match node {
-        LayoutNode::Stack { panes, active } => {
+        LayoutNode::Stack { panes, active, .. } => {
             if let Some(&pane_id) = panes.get(*active) {
                 out.push(pane_id);
             }
@@ -474,6 +608,48 @@ pub fn find_stack_for_pane(node: &LayoutNode, pane_id: PaneId) -> Option<Vec<Pan
     }
 }
 
+/// Find the display name for a given pane by walking the layout tree.
+///
+/// Returns the name from the `names` vector at the same index as the pane in
+/// its stack, or a default empty string if not found.
+pub fn find_pane_name(node: &LayoutNode, pane_id: PaneId) -> Option<String> {
+    match node {
+        LayoutNode::Stack { panes, names, .. } => {
+            let idx = panes.iter().position(|&p| p == pane_id)?;
+            Some(names.get(idx).cloned().unwrap_or_default())
+        }
+        LayoutNode::Split { first, second, .. } => {
+            find_pane_name(first, pane_id).or_else(|| find_pane_name(second, pane_id))
+        }
+    }
+}
+
+/// Find the stack info for a given pane: (names, pane_ids, active_index).
+///
+/// Returns `None` if the pane is not found in any stack.
+pub fn find_stack_names(
+    node: &LayoutNode,
+    pane_id: PaneId,
+) -> Option<(Vec<String>, Vec<PaneId>, usize)> {
+    match node {
+        LayoutNode::Stack {
+            panes,
+            names,
+            active,
+            ..
+        } => {
+            if panes.contains(&pane_id) {
+                Some((names.clone(), panes.clone(), *active))
+            } else {
+                None
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            find_stack_names(first, pane_id).or_else(|| find_stack_names(second, pane_id))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Directional focus navigation
 // ---------------------------------------------------------------------------
@@ -487,8 +663,9 @@ pub fn find_neighbor(
     area: Rect,
     current_pane: PaneId,
     direction: FocusDirection,
+    gap_size: u16,
 ) -> Option<PaneId> {
-    let rects = compute_layout(layout, area);
+    let rects = compute_layout(layout, area, gap_size);
 
     let current_rect = rects.iter().find(|(id, _)| *id == current_pane)?.1;
     let (cx, cy) = rect_center(current_rect);
@@ -543,8 +720,14 @@ mod tests {
     fn test_new_stack() {
         let node = LayoutNode::new_stack(1);
         match &node {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack {
+                panes,
+                names,
+                active,
+                ..
+            } => {
                 assert_eq!(panes, &[1]);
+                assert_eq!(names, &[""]);
                 assert_eq!(*active, 0);
             }
             _ => panic!("expected Stack"),
@@ -615,7 +798,7 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let rects = compute_layout(&node, area);
+        let rects = compute_layout(&node, area, 0);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0], (1, area));
     }
@@ -630,7 +813,7 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let rects = compute_layout(&node, area);
+        let rects = compute_layout(&node, area, 0);
         assert_eq!(rects.len(), 2);
 
         let (id1, r1) = rects[0];
@@ -655,7 +838,7 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let rects = compute_layout(&node, area);
+        let rects = compute_layout(&node, area, 0);
         assert_eq!(rects.len(), 2);
 
         let (_, r1) = rects[0];
@@ -680,7 +863,7 @@ mod tests {
             width: 10,
             height: 10,
         };
-        let rects = compute_layout(&node, area);
+        let rects = compute_layout(&node, area, 0);
         assert!(rects[0].1.width >= MIN_PANE_SIZE);
         assert!(rects[1].1.width >= MIN_PANE_SIZE);
     }
@@ -771,7 +954,7 @@ mod tests {
         assert_eq!(next, Some(2));
 
         match &node {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack { panes, active, .. } => {
                 assert_eq!(panes, &[2]);
                 assert_eq!(*active, 0);
             }
@@ -808,8 +991,14 @@ mod tests {
         assert!(node.add_to_stack(1, 2));
 
         match &node {
-            LayoutNode::Stack { panes, active } => {
+            LayoutNode::Stack {
+                panes,
+                names,
+                active,
+                ..
+            } => {
                 assert_eq!(panes, &[1, 2]);
+                assert_eq!(names, &["", ""]);
                 assert_eq!(*active, 1);
             }
             _ => panic!("expected Stack"),
@@ -861,12 +1050,18 @@ mod tests {
         };
 
         assert_eq!(
-            find_neighbor(&node, area, 1, FocusDirection::Right),
+            find_neighbor(&node, area, 1, FocusDirection::Right, 0),
             Some(2)
         );
-        assert_eq!(find_neighbor(&node, area, 2, FocusDirection::Left), Some(1));
-        assert_eq!(find_neighbor(&node, area, 1, FocusDirection::Left), None);
-        assert_eq!(find_neighbor(&node, area, 2, FocusDirection::Right), None);
+        assert_eq!(
+            find_neighbor(&node, area, 2, FocusDirection::Left, 0),
+            Some(1)
+        );
+        assert_eq!(find_neighbor(&node, area, 1, FocusDirection::Left, 0), None);
+        assert_eq!(
+            find_neighbor(&node, area, 2, FocusDirection::Right, 0),
+            None
+        );
     }
 
     #[test]
@@ -880,8 +1075,188 @@ mod tests {
             height: 24,
         };
 
-        assert_eq!(find_neighbor(&node, area, 1, FocusDirection::Down), Some(2));
-        assert_eq!(find_neighbor(&node, area, 2, FocusDirection::Up), Some(1));
+        assert_eq!(
+            find_neighbor(&node, area, 1, FocusDirection::Down, 0),
+            Some(2)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 2, FocusDirection::Up, 0),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_compute_layout_vertical_split_with_gaps() {
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let rects = compute_layout(&node, area, 2);
+        assert_eq!(rects.len(), 2);
+
+        let (id1, r1) = rects[0];
+        let (id2, r2) = rects[1];
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        // 80 - 2 gap = 78 usable, split 50/50 = 39 each
+        assert_eq!(r1.width, 39);
+        assert_eq!(r2.width, 39);
+        // First pane starts at 0, second starts at 39 + 2 gap = 41
+        assert_eq!(r1.x, 0);
+        assert_eq!(r2.x, 41);
+    }
+
+    #[test]
+    fn test_compute_layout_horizontal_split_with_gaps() {
+        let mut node = LayoutNode::new_stack(1);
+        node.split_horizontal(1, 2);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let rects = compute_layout(&node, area, 2);
+        assert_eq!(rects.len(), 2);
+
+        let (_, r1) = rects[0];
+        let (_, r2) = rects[1];
+        // 24 - 2 gap = 22 usable, split 50/50 = 11 each
+        assert_eq!(r1.height, 11);
+        assert_eq!(r2.height, 11);
+        assert_eq!(r1.y, 0);
+        assert_eq!(r2.y, 13); // 11 + 2 gap
+    }
+
+    #[test]
+    fn test_compute_layout_nested_splits_with_gaps() {
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.split_horizontal(2, 3);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let rects = compute_layout(&node, area, 1);
+        assert_eq!(rects.len(), 3);
+        // All rects should have positive dimensions
+        for (_, r) in &rects {
+            assert!(r.width > 0);
+            assert!(r.height > 0);
+        }
+    }
+
+    #[test]
+    fn test_single_pane_no_gaps_applied() {
+        let node = LayoutNode::new_stack(1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        // Even with gap_size > 0, a single pane should occupy the full area
+        let rects = compute_layout(&node, area, 5);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0], (1, area));
+    }
+
+    #[test]
+    fn test_gap_with_min_size_enforcement() {
+        // Very small area with a large gap -- min pane sizes should be enforced
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 10,
+        };
+        let rects = compute_layout(&node, area, 2);
+        assert_eq!(rects.len(), 2);
+        // Both panes should still meet minimum size
+        assert!(rects[0].1.width >= MIN_PANE_SIZE);
+        assert!(rects[1].1.width >= MIN_PANE_SIZE);
+    }
+
+    #[test]
+    fn test_set_pane_name() {
+        let mut node = LayoutNode::new_stack(1);
+        node.add_to_stack(1, 2);
+
+        assert!(set_pane_name(&mut node, 1, "bash"));
+        assert_eq!(get_pane_name(&node, 1), Some("bash".to_string()));
+        // Pane 2 should still have default empty name.
+        assert_eq!(get_pane_name(&node, 2), Some(String::new()));
+    }
+
+    #[test]
+    fn test_set_pane_custom_name() {
+        let mut node = LayoutNode::new_stack(1);
+        assert!(set_pane_custom_name(&mut node, 1, "my-custom-name"));
+        assert_eq!(
+            get_pane_custom_name(&node, 1),
+            Some(Some("my-custom-name".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_name_sync_on_add_to_stack() {
+        let mut node = LayoutNode::new_stack(1);
+        set_pane_name(&mut node, 1, "first");
+        node.add_to_stack(1, 2);
+
+        match &node {
+            LayoutNode::Stack {
+                panes,
+                names,
+                custom_names,
+                ..
+            } => {
+                assert_eq!(panes.len(), 2);
+                assert_eq!(names.len(), 2);
+                assert_eq!(custom_names.len(), 2);
+                assert_eq!(names[0], "first");
+                assert_eq!(names[1], ""); // newly added pane gets empty name
+            }
+            _ => panic!("expected Stack"),
+        }
+    }
+
+    #[test]
+    fn test_name_sync_on_close_pane() {
+        let mut node = LayoutNode::new_stack(1);
+        node.add_to_stack(1, 2);
+        node.add_to_stack(2, 3);
+        set_pane_name(&mut node, 1, "first");
+        set_pane_name(&mut node, 2, "second");
+        set_pane_name(&mut node, 3, "third");
+
+        // Close the middle pane.
+        let next = node.close_pane(2);
+        assert!(next.is_some());
+
+        match &node {
+            LayoutNode::Stack {
+                panes,
+                names,
+                custom_names,
+                ..
+            } => {
+                assert_eq!(panes.len(), 2);
+                assert_eq!(names.len(), 2);
+                assert_eq!(custom_names.len(), 2);
+                assert_eq!(panes, &[1, 3]);
+                assert_eq!(names, &["first", "third"]);
+            }
+            _ => panic!("expected Stack"),
+        }
     }
 
     #[test]

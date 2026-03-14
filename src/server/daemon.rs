@@ -29,6 +29,15 @@ use crate::server::session::ServerState;
 /// Type alias for the per-session previous-frame cache used for diff rendering.
 pub type PrevFrameCache = Arc<Mutex<HashMap<String, Vec<Vec<RenderCell>>>>>;
 
+/// Read the process name from `/proc/<pid>/comm`.
+///
+/// Falls back to `"shell"` if the file is unreadable.
+fn get_process_name(pid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "shell".to_string())
+}
+
 /// Return the path to the Unix domain socket used for client-server
 /// communication.
 pub fn socket_path() -> PathBuf {
@@ -490,7 +499,7 @@ async fn handle_resize(
     };
 
     if let Some(session_name) = session_name {
-        resize_session_panes(&session_name, cols, rows, state, panes).await?;
+        resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
         broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
     }
     Ok(())
@@ -619,7 +628,7 @@ async fn handle_command(
             };
             spawn_pane(new_pane_id, cols / 2, rows, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
-            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneSplitHorizontal => {
@@ -641,7 +650,7 @@ async fn handle_command(
             };
             spawn_pane(new_pane_id, cols, rows / 2, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
-            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneClose => {
@@ -692,15 +701,24 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                let effective_gap = if sess.gaps_enabled {
+                    config.appearance.gap_size
+                } else {
+                    0
+                };
                 let area = Rect {
                     x: 0,
                     y: 0,
                     width: cols,
                     height: rows.saturating_sub(1),
                 };
-                if let Some(neighbor) =
-                    layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction)
-                {
+                if let Some(neighbor) = layout::find_neighbor(
+                    &tab.layout,
+                    area,
+                    tab.focused_pane,
+                    direction,
+                    effective_gap,
+                ) {
                     tab.focused_pane = neighbor;
                 }
             }
@@ -725,7 +743,7 @@ async fn handle_command(
             };
             spawn_pane(new_pane_id, cols, rows, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
-            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackNext => {
@@ -793,7 +811,19 @@ async fn handle_command(
                 };
                 tab.layout.resize(tab.focused_pane, direction, delta);
             }
-            resize_session_panes(&session_name, cols, rows, state, panes).await?;
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::ToggleGaps => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                sess.gaps_enabled = !sess.gaps_enabled;
+            }
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionDetach => {
@@ -813,6 +843,64 @@ async fn handle_command(
                     client.session_name = Some(new_name.clone());
                 }
             }
+        }
+        RemuxCommand::PaneRename(name) => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                // Clear rename state now that the rename is committed.
+                sess.rename_state = None;
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                layout::set_pane_custom_name(&mut tab.layout, tab.focused_pane, &name);
+                layout::set_pane_name(&mut tab.layout, tab.focused_pane, &name);
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneRenameUpdate(text) => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let focused = tab.focused_pane;
+                // On the first update (empty text), save the original name.
+                if sess.rename_state.is_none() {
+                    let original = layout::get_pane_name(&tab.layout, focused).unwrap_or_default();
+                    sess.rename_state = Some((focused, original));
+                }
+                // Update the displayed pane name to the in-progress text.
+                layout::set_pane_name(&mut tab.layout, focused, &text);
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneRenameCancel => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                if let Some((pane_id, original_name)) = sess.rename_state.take() {
+                    let tab = match sess.tabs.get_mut(sess.active_tab) {
+                        Some(t) => t,
+                        None => return Ok(()),
+                    };
+                    // Restore the original pane name.
+                    layout::set_pane_name(&mut tab.layout, pane_id, &original_name);
+                }
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         _ => {
             log::debug!("unhandled command: {cmd:?}");
@@ -840,7 +928,8 @@ async fn handle_create_session(
     };
     let pane_id = {
         let mut st = state.lock().await;
-        st.create_session(name, folder)?
+        let gaps_enabled = config.appearance.gap_mode == crate::config::GapMode::ZellijStyle;
+        st.create_session(name, folder, gaps_enabled)?
     };
     spawn_pane(pane_id, cols, rows, None, panes, config).await?;
 
@@ -986,6 +1075,7 @@ async fn resize_session_panes(
     rows: u16,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
 ) -> Result<()> {
     let rects = {
         let st = state.lock().await;
@@ -997,6 +1087,11 @@ async fn resize_session_panes(
             Some(t) => t,
             None => return Ok(()),
         };
+        let effective_gap = if sess.gaps_enabled {
+            config.appearance.gap_size
+        } else {
+            0
+        };
         let content_rows = rows.saturating_sub(1);
         let area = Rect {
             x: 0,
@@ -1004,7 +1099,7 @@ async fn resize_session_panes(
             width: cols,
             height: content_rows,
         };
-        layout::compute_layout(&tab.layout, area)
+        layout::compute_layout(&tab.layout, area, effective_gap)
     };
 
     let mut ps = panes.lock().await;
@@ -1041,6 +1136,8 @@ async fn send_full_render_to_client(
             .map(|c| c.mode.clone())
             .unwrap_or_else(|| "INSERT".to_string())
     };
+    // Update auto-detected pane names before rendering.
+    update_auto_pane_names(session_name, state, panes).await;
     let (cells, cursor_x, cursor_y, cursor_visible) =
         build_composite(session_name, cols, rows, &mode, state, panes, config).await;
     {
@@ -1084,6 +1181,9 @@ async fn broadcast_full_render(
             .unwrap_or_else(|| "INSERT".to_string());
         (cols, rows, mode)
     };
+
+    // Update auto-detected pane names before rendering.
+    update_auto_pane_names(session_name, state, panes).await;
 
     let (cells, cursor_x, cursor_y, cursor_visible) =
         build_composite(session_name, cols, rows, &mode, state, panes, config).await;
@@ -1131,6 +1231,46 @@ async fn broadcast_full_render(
     }
 }
 
+/// Update display names for panes that don't have a custom name by
+/// reading the process name from `/proc/<pid>/comm`.
+async fn update_auto_pane_names(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) {
+    let mut st = state.lock().await;
+    let sess = match st.sessions.get_mut(session_name) {
+        Some(s) => s,
+        None => return,
+    };
+    let tab = match sess.tabs.get_mut(sess.active_tab) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Collect pane IDs that need auto-detected names.
+    let pane_ids = layout::all_pane_ids(&tab.layout);
+    let ps = panes.lock().await;
+
+    // Skip the pane being actively renamed -- its name is managed by the rename flow.
+    let renaming_pane = sess.rename_state.as_ref().map(|(pid, _)| *pid);
+
+    for pane_id in pane_ids {
+        if renaming_pane == Some(pane_id) {
+            continue;
+        }
+        // Only update if there's no custom name set.
+        let custom = layout::get_pane_custom_name(&tab.layout, pane_id);
+        if custom == Some(None) || custom.is_none() {
+            // No custom name -- auto-detect from process.
+            if let Some(pane_data) = ps.get(&pane_id) {
+                let name = get_process_name(pane_data.pty.child_pid.as_raw());
+                layout::set_pane_name(&mut tab.layout, pane_id, &name);
+            }
+        }
+    }
+}
+
 async fn build_composite(
     session_name: &str,
     cols: u16,
@@ -1164,6 +1304,12 @@ async fn build_composite(
         }
     };
 
+    let effective_gap = if sess.gaps_enabled {
+        config.appearance.gap_size
+    } else {
+        0
+    };
+
     let content_rows = rows.saturating_sub(1);
     let area = Rect {
         x: 0,
@@ -1174,7 +1320,7 @@ async fn build_composite(
 
     let ps = panes.lock().await;
     let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
-    let pane_rects = layout::compute_layout(&tab.layout, area);
+    let pane_rects = layout::compute_layout(&tab.layout, area, effective_gap);
     for (pane_id, _rect) in &pane_rects {
         if let Some(pane_data) = ps.get(pane_id) {
             pane_screens.insert(*pane_id, &pane_data.screen);
@@ -1196,17 +1342,74 @@ async fn build_composite(
         &tab.layout,
         &pane_screens,
         area,
-        &config.appearance.frame_style,
+        &config.appearance.gap_mode,
         &status_info,
         cols,
         rows,
+        effective_gap,
+        tab.focused_pane,
     );
 
-    let (cursor_x, cursor_y, cursor_visible) = if let Some(pane_data) = ps.get(&tab.focused_pane) {
+    // If there is an active rename, place the cursor in the pane's border
+    // at the end of the typed text instead of inside the shell content.
+    let rename_cursor = sess.rename_state.as_ref().and_then(|(rename_pane_id, _)| {
+        let effective_mode = if sess.gaps_enabled {
+            &config.appearance.gap_mode
+        } else {
+            &crate::config::GapMode::TmuxStyle
+        };
+        // Only ZellijStyle has visible borders where we can position the cursor.
+        if !matches!(effective_mode, crate::config::GapMode::ZellijStyle) {
+            return None;
+        }
+        pane_rects
+            .iter()
+            .find(|(id, _)| id == rename_pane_id)
+            .map(|(_, rect)| {
+                let name_len = layout::get_pane_name(&tab.layout, *rename_pane_id)
+                    .unwrap_or_default()
+                    .len() as u16;
+                // Cursor goes after "╭ " + name text = x + 1 (corner) + 1 (space) + name_len
+                let cx = rect.x + 2 + name_len;
+                let cy = rect.y;
+                (cx, cy, true)
+            })
+    });
+
+    let (cursor_x, cursor_y, cursor_visible) = if let Some(rc) = rename_cursor {
+        rc
+    } else if let Some(pane_data) = ps.get(&tab.focused_pane) {
         if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == tab.focused_pane) {
+            // Account for border/tab-bar offset depending on gap mode.
+            let effective_mode = if sess.gaps_enabled {
+                &config.appearance.gap_mode
+            } else {
+                &crate::config::GapMode::TmuxStyle
+            };
+            let (x_offset, y_offset) = match effective_mode {
+                crate::config::GapMode::ZellijStyle => {
+                    if rect.width >= 3 && rect.height >= 3 {
+                        (1u16, 1u16) // 1-cell border on each side
+                    } else {
+                        (0, 0)
+                    }
+                }
+                crate::config::GapMode::TmuxStyle => {
+                    // In TmuxStyle, multi-pane stacks have a tab bar that
+                    // shifts content down by 1 row.
+                    let has_tab_bar = layout::find_stack_for_pane(&tab.layout, tab.focused_pane)
+                        .map(|panes| panes.len() > 1)
+                        .unwrap_or(false);
+                    if has_tab_bar {
+                        (0, 1) // tab bar takes 1 row at top
+                    } else {
+                        (0, 0)
+                    }
+                }
+            };
             (
-                rect.x + pane_data.screen.cursor_x,
-                rect.y + pane_data.screen.cursor_y,
+                rect.x + x_offset + pane_data.screen.cursor_x,
+                rect.y + y_offset + pane_data.screen.cursor_y,
                 true,
             )
         } else {
