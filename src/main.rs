@@ -8,11 +8,11 @@ mod protocol;
 mod screen;
 mod server;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use crossterm::event::{KeyCode, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
@@ -292,6 +292,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     let mut last_cursor_x: u16 = 0;
     let mut last_cursor_y: u16 = 0;
 
+    // Mouse drag state for coalescing drag events (~60fps throttle).
+    let mut drag_start: Option<(u16, u16)> = None;
+    let mut last_drag_send: Instant = Instant::now();
+    /// Minimum interval between drag event sends (~16ms = ~60fps).
+    const DRAG_THROTTLE: Duration = Duration::from_millis(16);
+
     // Tell server our terminal size
     client.send(ClientMessage::Resize { cols, rows }).await?;
 
@@ -459,6 +465,55 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             | InputAction::None => {}
                         }
                     }
+                    Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                drag_start = Some((mouse.column, mouse.row));
+                                // Send click immediately.
+                                client
+                                    .send(ClientMessage::MouseClick {
+                                        x: mouse.column,
+                                        y: mouse.row,
+                                    })
+                                    .await?;
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                // Throttle drag events to ~60fps.
+                                let now = Instant::now();
+                                if now.duration_since(last_drag_send) >= DRAG_THROTTLE {
+                                    if let Some((sx, sy)) = drag_start {
+                                        client
+                                            .send(ClientMessage::MouseDrag {
+                                                start_x: sx,
+                                                start_y: sy,
+                                                end_x: mouse.column,
+                                                end_y: mouse.row,
+                                                is_final: false,
+                                            })
+                                            .await?;
+                                        last_drag_send = now;
+                                    }
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                // Send final drag on release.
+                                if let Some((sx, sy)) = drag_start.take() {
+                                    if sx != mouse.column || sy != mouse.row {
+                                        client
+                                            .send(ClientMessage::MouseDrag {
+                                                start_x: sx,
+                                                start_y: sy,
+                                                end_x: mouse.column,
+                                                end_y: mouse.row,
+                                                is_final: true,
+                                            })
+                                            .await?;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
                         renderer.resize(new_cols, new_rows);
                         client.send(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
@@ -508,6 +563,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     }
                     Some(ServerMessage::Error { message }) => {
                         log::error!("Server error: {}", message);
+                    }
+                    Some(ServerMessage::CopyToClipboard { data }) => {
+                        if let Err(e) = copy_to_clipboard(&data) {
+                            log::error!("Failed to copy to clipboard: {}", e);
+                        }
                     }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: {:?}", event);

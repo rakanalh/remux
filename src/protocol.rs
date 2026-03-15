@@ -34,6 +34,17 @@ pub enum ClientMessage {
     KillSession { name: String },
     /// Notify the server that the client's input mode changed.
     ModeChanged { mode: String },
+    /// A mouse click at the given screen coordinates.
+    MouseClick { x: u16, y: u16 },
+    /// A mouse drag selection from start to end screen coordinates.
+    MouseDrag {
+        start_x: u16,
+        start_y: u16,
+        end_x: u16,
+        end_y: u16,
+        /// `true` when the mouse button was released (final drag event).
+        is_final: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +78,8 @@ pub enum ServerMessage {
     Error { message: String },
     /// Asynchronous session event notification.
     Event(SessionEvent),
+    /// Request the client to copy data to the system clipboard via OSC 52.
+    CopyToClipboard { data: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -310,5 +323,66 @@ mod tests {
         assert_eq!(cell.c, ' ');
         assert_eq!(cell.fg, CellColor::Default);
         assert!(!cell.bold);
+    }
+
+    #[test]
+    fn round_trip_mouse_click() {
+        let msg = ClientMessage::MouseClick { x: 42, y: 10 };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ClientMessage::MouseClick { x, y } => {
+                assert_eq!(x, 42);
+                assert_eq!(y, 10);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_mouse_drag() {
+        let msg = ClientMessage::MouseDrag {
+            start_x: 5,
+            start_y: 3,
+            end_x: 20,
+            end_y: 7,
+            is_final: false,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ClientMessage::MouseDrag {
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                is_final,
+            } => {
+                assert_eq!(start_x, 5);
+                assert_eq!(start_y, 3);
+                assert_eq!(end_x, 20);
+                assert_eq!(end_y, 7);
+                assert!(!is_final);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_copy_to_clipboard() {
+        let msg = ServerMessage::CopyToClipboard {
+            data: "hello world".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ServerMessage::CopyToClipboard { data } => {
+                assert_eq!(data, "hello world");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

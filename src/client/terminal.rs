@@ -22,6 +22,7 @@ pub fn setup_terminal() -> Result<()> {
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture,
         crossterm::cursor::Hide,
     )
     .context("setting up alternate screen")?;
@@ -33,6 +34,7 @@ pub fn restore_terminal() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
         crossterm::cursor::Show,
+        crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen,
     )
