@@ -10,6 +10,283 @@ use serde::{Deserialize, Serialize};
 /// Unique identifier for a pane.
 pub type PaneId = u64;
 
+/// Trait for layout algorithms that arrange panes automatically.
+pub trait LayoutAlgorithm: Send + Sync {
+    /// Human-readable name for this layout mode.
+    fn name(&self) -> &str;
+    /// Build a layout tree from the given pane list.
+    /// `active_pane` is the currently focused pane.
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode;
+}
+
+// ---------------------------------------------------------------------------
+// Layout algorithm implementations
+// ---------------------------------------------------------------------------
+
+/// BSP (Binary Space Partitioning) layout.
+///
+/// Each pane splits the previous pane's area, alternating between vertical
+/// and horizontal directions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BspLayout;
+
+impl LayoutAlgorithm for BspLayout {
+    fn name(&self) -> &str {
+        "bsp"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        if panes.is_empty() {
+            return LayoutNode::new_stack(active_pane);
+        }
+        if panes.len() == 1 {
+            return LayoutNode::new_stack(panes[0]);
+        }
+        // Build from the last pane backwards, wrapping each step in a split.
+        let mut node = LayoutNode::new_stack(panes[panes.len() - 1]);
+        for i in (0..panes.len() - 1).rev() {
+            let direction = if i % 2 == 0 {
+                Direction::Vertical
+            } else {
+                Direction::Horizontal
+            };
+            node = LayoutNode::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::new_stack(panes[i])),
+                second: Box::new(node),
+            };
+        }
+        node
+    }
+}
+
+/// Master layout: one master pane in the center with secondary panes
+/// in left/right columns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MasterLayout {
+    pub master_idx: usize,
+    pub master_ratio: f32,
+}
+
+impl Default for MasterLayout {
+    fn default() -> Self {
+        Self {
+            master_idx: 0,
+            master_ratio: 0.6,
+        }
+    }
+}
+
+impl LayoutAlgorithm for MasterLayout {
+    fn name(&self) -> &str {
+        "master"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], _active_pane: PaneId) -> LayoutNode {
+        if panes.is_empty() {
+            return LayoutNode::new_stack(_active_pane);
+        }
+        if panes.len() == 1 {
+            return LayoutNode::new_stack(panes[0]);
+        }
+
+        let master_idx = self.master_idx.min(panes.len() - 1);
+        let master_ratio = self.master_ratio;
+        let master_pane = panes[master_idx];
+        let others: Vec<PaneId> = panes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != master_idx)
+            .map(|(_, &p)| p)
+            .collect();
+
+        if others.len() == 1 {
+            // 2 panes: simple vertical split, master on left.
+            return LayoutNode::Split {
+                direction: Direction::Vertical,
+                ratio: master_ratio,
+                first: Box::new(LayoutNode::new_stack(master_pane)),
+                second: Box::new(LayoutNode::new_stack(others[0])),
+            };
+        }
+
+        // Helper closure to build a vertical column of panes with equal-height
+        // horizontal splits.
+        let build_col = |col_panes: &[PaneId]| -> LayoutNode {
+            assert!(!col_panes.is_empty());
+            if col_panes.len() == 1 {
+                return LayoutNode::new_stack(col_panes[0]);
+            }
+            let mut node = LayoutNode::new_stack(col_panes[col_panes.len() - 1]);
+            for i in (0..col_panes.len() - 1).rev() {
+                let remaining = col_panes.len() - i;
+                node = LayoutNode::Split {
+                    direction: Direction::Horizontal,
+                    ratio: 1.0 / remaining as f32,
+                    first: Box::new(LayoutNode::new_stack(col_panes[i])),
+                    second: Box::new(node),
+                };
+            }
+            node
+        };
+
+        // 3+ panes: three-column layout.
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for (i, &p) in others.iter().enumerate() {
+            if i % 2 == 0 {
+                left.push(p);
+            } else {
+                right.push(p);
+            }
+        }
+
+        let master_node = LayoutNode::new_stack(master_pane);
+        let side_share = (1.0 - master_ratio) / 2.0;
+
+        match (left.is_empty(), right.is_empty()) {
+            (true, true) => master_node,
+            (true, false) => LayoutNode::Split {
+                direction: Direction::Vertical,
+                ratio: master_ratio,
+                first: Box::new(master_node),
+                second: Box::new(build_col(&right)),
+            },
+            (false, true) => LayoutNode::Split {
+                direction: Direction::Vertical,
+                ratio: side_share,
+                first: Box::new(build_col(&left)),
+                second: Box::new(master_node),
+            },
+            (false, false) => {
+                let outer_ratio = side_share;
+                let inner_ratio = master_ratio / (master_ratio + side_share);
+                LayoutNode::Split {
+                    direction: Direction::Vertical,
+                    ratio: outer_ratio,
+                    first: Box::new(build_col(&left)),
+                    second: Box::new(LayoutNode::Split {
+                        direction: Direction::Vertical,
+                        ratio: inner_ratio,
+                        first: Box::new(master_node),
+                        second: Box::new(build_col(&right)),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// Monocle layout: all panes in a single full-screen stack.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MonocleLayout;
+
+impl LayoutAlgorithm for MonocleLayout {
+    fn name(&self) -> &str {
+        "monocle"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        if panes.is_empty() {
+            return LayoutNode::new_stack(active_pane);
+        }
+        let active = panes.iter().position(|&p| p == active_pane).unwrap_or(0);
+        LayoutNode::Stack {
+            panes: panes.to_vec(),
+            names: vec![String::new(); panes.len()],
+            custom_names: vec![None; panes.len()],
+            active,
+        }
+    }
+}
+
+/// Custom layout: the user has manually arranged splits; no automatic rebuild.
+///
+/// The `build_tree` method is a fallback that delegates to BSP. In normal
+/// usage, the daemon uses the existing `tab.layout` directly for Custom mode.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CustomLayout;
+
+impl LayoutAlgorithm for CustomLayout {
+    fn name(&self) -> &str {
+        "custom"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        // Custom mode doesn't rebuild -- this is a fallback that shouldn't
+        // normally be called. Delegate to BSP for a reasonable default.
+        BspLayout.build_tree(panes, active_pane)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LayoutMode enum
+// ---------------------------------------------------------------------------
+
+/// Automatic layout mode for a tab.
+///
+/// When set to anything other than `Custom`, the layout tree is rebuilt
+/// automatically from `pane_order` whenever panes are added or removed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum LayoutMode {
+    /// Binary Space Partitioning: alternates V/H splits, always splitting
+    /// the last-added pane's slot.
+    Bsp(BspLayout),
+    /// Master layout: one master pane in the center with secondary panes
+    /// in left/right columns.
+    Master(MasterLayout),
+    /// Monocle: all panes in a single full-screen stack.
+    Monocle(MonocleLayout),
+    /// Custom: the user has manually arranged splits; no automatic rebuild.
+    Custom(CustomLayout),
+}
+
+impl LayoutMode {
+    /// Build a layout tree from the given pane list using the current mode's
+    /// algorithm.
+    pub fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        match self {
+            LayoutMode::Bsp(l) => l.build_tree(panes, active_pane),
+            LayoutMode::Master(l) => l.build_tree(panes, active_pane),
+            LayoutMode::Monocle(l) => l.build_tree(panes, active_pane),
+            LayoutMode::Custom(l) => l.build_tree(panes, active_pane),
+        }
+    }
+
+    /// Human-readable name for this layout mode.
+    pub fn name(&self) -> &str {
+        match self {
+            LayoutMode::Bsp(l) => l.name(),
+            LayoutMode::Master(l) => l.name(),
+            LayoutMode::Monocle(l) => l.name(),
+            LayoutMode::Custom(l) => l.name(),
+        }
+    }
+
+    /// Cycle to the next automatic layout mode.
+    /// Order: Bsp -> Master -> Monocle -> Bsp (Custom also goes to Bsp).
+    pub fn next(&self) -> LayoutMode {
+        match self {
+            LayoutMode::Bsp(_) => LayoutMode::Master(MasterLayout::default()),
+            LayoutMode::Master(_) => LayoutMode::Monocle(MonocleLayout),
+            LayoutMode::Monocle(_) => LayoutMode::Bsp(BspLayout),
+            LayoutMode::Custom(_) => LayoutMode::Bsp(BspLayout),
+        }
+    }
+
+    /// Returns `true` if this mode automatically rebuilds the layout tree.
+    pub fn is_automatic(&self) -> bool {
+        !matches!(self, LayoutMode::Custom(_))
+    }
+}
+
+impl Default for LayoutMode {
+    fn default() -> Self {
+        LayoutMode::Bsp(BspLayout)
+    }
+}
+
 /// Direction of a split: Horizontal divides top/bottom, Vertical divides left/right.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
@@ -709,6 +986,8 @@ fn rect_center(r: Rect) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
+// Automatic layout builders
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1271,5 +1550,307 @@ mod tests {
         let original_ids = all_pane_ids(&node);
         let deser_ids = all_pane_ids(&deserialized);
         assert_eq!(original_ids, deser_ids);
+    }
+
+    // -----------------------------------------------------------------------
+    // LayoutAlgorithm / LayoutMode tests
+    // -----------------------------------------------------------------------
+
+    // BSP tests
+
+    #[test]
+    fn test_bsp_single_pane() {
+        let tree = BspLayout.build_tree(&[1], 1);
+        assert!(matches!(tree, LayoutNode::Stack { ref panes, .. } if panes == &[1]));
+    }
+
+    #[test]
+    fn test_bsp_two_panes() {
+        let tree = BspLayout.build_tree(&[1, 2], 1);
+        match &tree {
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(*direction, Direction::Vertical);
+                assert!((ratio - 0.5).abs() < f32::EPSILON);
+                assert!(matches!(first.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[1]));
+                assert!(
+                    matches!(second.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[2])
+                );
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_bsp_three_panes() {
+        let tree = BspLayout.build_tree(&[1, 2, 3], 1);
+        // Should be: Split(V, Stack(1), Split(H, Stack(2), Stack(3)))
+        match &tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(*direction, Direction::Vertical);
+                assert!(matches!(first.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[1]));
+                match second.as_ref() {
+                    LayoutNode::Split {
+                        direction: d2,
+                        first: f2,
+                        second: s2,
+                        ..
+                    } => {
+                        assert_eq!(*d2, Direction::Horizontal);
+                        assert!(
+                            matches!(f2.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[2])
+                        );
+                        assert!(
+                            matches!(s2.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[3])
+                        );
+                    }
+                    _ => panic!("expected inner Split"),
+                }
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_bsp_five_panes() {
+        let tree = BspLayout.build_tree(&[1, 2, 3, 4, 5], 1);
+        let all = all_pane_ids(&tree);
+        assert_eq!(all.len(), 5);
+        for id in 1..=5 {
+            assert!(all.contains(&id));
+        }
+    }
+
+    // Master tests
+
+    #[test]
+    fn test_master_single_pane() {
+        let tree = MasterLayout::default().build_tree(&[1], 1);
+        assert!(matches!(tree, LayoutNode::Stack { ref panes, .. } if panes == &[1]));
+    }
+
+    #[test]
+    fn test_master_two_panes() {
+        let layout = MasterLayout::default();
+        let tree = layout.build_tree(&[1, 2], 1);
+        match &tree {
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(*direction, Direction::Vertical);
+                assert!((ratio - 0.6).abs() < f32::EPSILON);
+                assert!(matches!(first.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[1]));
+                assert!(
+                    matches!(second.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[2])
+                );
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_master_three_panes() {
+        let layout = MasterLayout::default();
+        let tree = layout.build_tree(&[1, 2, 3], 1);
+        // Should be: Split(V, left_col(2), Split(V, master(1), right_col(3)))
+        let all = all_pane_ids(&tree);
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&1));
+        assert!(all.contains(&2));
+        assert!(all.contains(&3));
+    }
+
+    #[test]
+    fn test_master_five_panes() {
+        let layout = MasterLayout::default();
+        let tree = layout.build_tree(&[1, 2, 3, 4, 5], 1);
+        let all = all_pane_ids(&tree);
+        assert_eq!(all.len(), 5);
+        for id in 1..=5 {
+            assert!(all.contains(&id));
+        }
+    }
+
+    // Monocle tests
+
+    #[test]
+    fn test_monocle_all_panes_in_single_stack() {
+        let tree = MonocleLayout.build_tree(&[1, 2, 3], 2);
+        match &tree {
+            LayoutNode::Stack { panes, active, .. } => {
+                assert_eq!(panes, &[1, 2, 3]);
+                assert_eq!(*active, 1); // pane 2 is at index 1
+            }
+            _ => panic!("expected Stack"),
+        }
+    }
+
+    #[test]
+    fn test_monocle_active_pane_not_found_defaults_to_zero() {
+        let tree = MonocleLayout.build_tree(&[1, 2, 3], 99);
+        match &tree {
+            LayoutNode::Stack { active, .. } => {
+                assert_eq!(*active, 0);
+            }
+            _ => panic!("expected Stack"),
+        }
+    }
+
+    // Mode cycling tests
+
+    #[test]
+    fn test_layout_mode_cycling() {
+        let mode = LayoutMode::default();
+        assert!(matches!(mode, LayoutMode::Bsp(_)));
+
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Master(_)));
+
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Monocle(_)));
+
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Bsp(_)));
+    }
+
+    #[test]
+    fn test_layout_mode_custom_cycles_to_bsp() {
+        let mode = LayoutMode::Custom(CustomLayout);
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Bsp(_)));
+    }
+
+    #[test]
+    fn test_layout_mode_is_automatic() {
+        assert!(LayoutMode::Bsp(BspLayout).is_automatic());
+        assert!(LayoutMode::Master(MasterLayout::default()).is_automatic());
+        assert!(LayoutMode::Monocle(MonocleLayout).is_automatic());
+        assert!(!LayoutMode::Custom(CustomLayout).is_automatic());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2.7: Stacks treated as atomic in BSP and Master
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bsp_stacks_are_atomic() {
+        // Each PaneId in the input becomes exactly one Stack leaf
+        let panes = vec![10, 20, 30];
+        let tree = BspLayout.build_tree(&panes, 10);
+        // Verify we get exactly 3 active pane IDs (one per input)
+        let active = active_pane_ids(&tree);
+        assert_eq!(active.len(), 3);
+        assert!(active.contains(&10));
+        assert!(active.contains(&20));
+        assert!(active.contains(&30));
+        // Verify total pane count equals active count (no hidden panes — each is a single-pane stack)
+        let all = all_pane_ids(&tree);
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_master_stacks_are_atomic() {
+        let panes = vec![10, 20, 30, 40];
+        let layout = MasterLayout {
+            master_idx: 0,
+            master_ratio: 0.6,
+        };
+        let tree = layout.build_tree(&panes, 10);
+        let active = active_pane_ids(&tree);
+        assert_eq!(active.len(), 4);
+        let all = all_pane_ids(&tree);
+        assert_eq!(all.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4.2: Tests for PaneNew in each layout mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bsp_incremental_pane_add() {
+        // Simulate adding panes one by one via PaneNew
+        let mut pane_order = vec![1];
+        let tree1 = BspLayout.build_tree(&pane_order, 1);
+        assert_eq!(active_pane_ids(&tree1), vec![1]);
+
+        pane_order.push(2);
+        let tree2 = BspLayout.build_tree(&pane_order, 2);
+        let active2 = active_pane_ids(&tree2);
+        assert_eq!(active2.len(), 2);
+
+        pane_order.push(3);
+        let tree3 = BspLayout.build_tree(&pane_order, 3);
+        let active3 = active_pane_ids(&tree3);
+        assert_eq!(active3.len(), 3);
+    }
+
+    #[test]
+    fn test_master_incremental_pane_add() {
+        let layout = MasterLayout {
+            master_idx: 0,
+            master_ratio: 0.6,
+        };
+        let mut pane_order = vec![1];
+
+        // 1 pane: single stack
+        let tree1 = layout.build_tree(&pane_order, 1);
+        assert_eq!(active_pane_ids(&tree1), vec![1]);
+
+        // 2 panes: vertical split
+        pane_order.push(2);
+        let tree2 = layout.build_tree(&pane_order, 2);
+        assert_eq!(active_pane_ids(&tree2).len(), 2);
+
+        // 3 panes: three columns
+        pane_order.push(3);
+        let tree3 = layout.build_tree(&pane_order, 3);
+        assert_eq!(active_pane_ids(&tree3).len(), 3);
+
+        // 4 panes: still three columns, one side has 2
+        pane_order.push(4);
+        let tree4 = layout.build_tree(&pane_order, 4);
+        assert_eq!(active_pane_ids(&tree4).len(), 4);
+    }
+
+    #[test]
+    fn test_monocle_incremental_pane_add() {
+        let mut pane_order = vec![1];
+        let tree1 = MonocleLayout.build_tree(&pane_order, 1);
+        // Monocle: all panes in one stack, only active is visible
+        assert_eq!(active_pane_ids(&tree1), vec![1]);
+        assert_eq!(all_pane_ids(&tree1), vec![1]);
+
+        pane_order.push(2);
+        let tree2 = MonocleLayout.build_tree(&pane_order, 1);
+        // Only 1 active (the focused one), but 2 total
+        assert_eq!(active_pane_ids(&tree2).len(), 1);
+        assert_eq!(all_pane_ids(&tree2).len(), 2);
+
+        pane_order.push(3);
+        let tree3 = MonocleLayout.build_tree(&pane_order, 2);
+        assert_eq!(active_pane_ids(&tree3).len(), 1);
+        assert_eq!(all_pane_ids(&tree3).len(), 3);
+    }
+
+    #[test]
+    fn test_custom_build_tree_fallback() {
+        // Custom mode's build_tree delegates to BSP as a fallback
+        let panes = vec![1, 2, 3];
+        let custom_tree = CustomLayout.build_tree(&panes, 1);
+        let bsp_tree = BspLayout.build_tree(&panes, 1);
+        // Both should produce the same active pane set
+        assert_eq!(active_pane_ids(&custom_tree), active_pane_ids(&bsp_tree));
     }
 }

@@ -99,10 +99,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ),
                 (
                     'S',
-                    leaf_chain(
-                        "split horizontal",
-                        &["PaneSplitHorizontal", "EnterNormal"],
-                    ),
+                    leaf_chain("split horizontal", &["PaneSplitHorizontal", "EnterNormal"]),
                 ),
                 (
                     'h',
@@ -112,10 +109,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     'j',
                     leaf_chain("focus down", &["PaneFocusDown", "EnterNormal"]),
                 ),
-                (
-                    'k',
-                    leaf_chain("focus up", &["PaneFocusUp", "EnterNormal"]),
-                ),
+                ('k', leaf_chain("focus up", &["PaneFocusUp", "EnterNormal"])),
                 (
                     'l',
                     leaf_chain("focus right", &["PaneFocusRight", "EnterNormal"]),
@@ -199,6 +193,13 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         'g',
         leaf_chain("toggle style", &["ToggleStyle", "EnterNormal"]),
     );
+
+    // Layout mode bindings.
+    root.insert(
+        ' ',
+        leaf_chain("layout next", &["LayoutNext", "EnterNormal"]),
+    );
+    root.insert('m', leaf_chain("set master", &["SetMaster", "EnterNormal"]));
 
     root
 }
@@ -438,6 +439,8 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "BufferEditInEditor" => Some(RemuxCommand::BufferEditInEditor),
         "BufferSearch" => Some(RemuxCommand::BufferSearch),
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
+        "LayoutNext" => Some(RemuxCommand::LayoutNext),
+        "SetMaster" => Some(RemuxCommand::SetMaster),
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterNormal" => Some(RemuxCommand::EnterNormal),
         "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),

@@ -115,7 +115,12 @@ mod tests {
     fn test_persisted_state_roundtrip() {
         let mut state = ServerState::new();
         state
-            .create_session("test", None, crate::config::BorderStyle::ZellijStyle)
+            .create_session(
+                "test",
+                None,
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
             .unwrap();
 
         let mut cwds = HashMap::new();
@@ -134,9 +139,14 @@ mod tests {
     fn test_persisted_state_from_server_clones_state() {
         let mut state = ServerState::new();
         state
-            .create_session("s1", Some("work"), crate::config::BorderStyle::ZellijStyle)
+            .create_session(
+                "s1",
+                Some("work"),
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
             .unwrap();
-        state.create_tab("s1", "tab2").unwrap();
+        state.create_tab("s1", "tab2", Default::default()).unwrap();
 
         let cwds = HashMap::new();
         let persisted = PersistedState::from_server(&state, &cwds).unwrap();
@@ -173,6 +183,7 @@ mod tests {
                 "persist-test",
                 None,
                 crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
             )
             .unwrap();
 

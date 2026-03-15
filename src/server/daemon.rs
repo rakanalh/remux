@@ -24,7 +24,7 @@ use crate::screen::Screen;
 use crate::server::compositor::{
     composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
 };
-use crate::server::layout::{self, PaneId, Rect};
+use crate::server::layout::{self, CustomLayout, LayoutMode, PaneId, Rect};
 use crate::server::pty::{self, Pty};
 use crate::server::session::ServerState;
 
@@ -563,7 +563,7 @@ async fn handle_command(
         RemuxCommand::TabNew => {
             let pane_id = {
                 let mut st = state.lock().await;
-                st.create_tab(&session_name, "shell")?
+                st.create_tab(&session_name, "shell", LayoutMode::default())?
             };
             spawn_pane(pane_id, cols, rows, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
@@ -653,9 +653,14 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                // Eject to Custom mode on manual split
+                if tab.layout_mode.is_automatic() {
+                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                }
                 let focused = tab.focused_pane;
                 tab.layout.split_vertical(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
+                tab.pane_order.push(new_pane_id);
                 new_pane_id
             };
             spawn_pane(new_pane_id, cols / 2, rows, None, panes, config).await?;
@@ -675,9 +680,14 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                // Eject to Custom mode on manual split
+                if tab.layout_mode.is_automatic() {
+                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                }
                 let focused = tab.focused_pane;
                 tab.layout.split_horizontal(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
+                tab.pane_order.push(new_pane_id);
                 new_pane_id
             };
             spawn_pane(new_pane_id, cols, rows / 2, None, panes, config).await?;
@@ -698,8 +708,13 @@ async fn handle_command(
                 };
                 let closed = tab.focused_pane;
                 let new_focus = tab.layout.close_pane(closed);
+                tab.pane_order.retain(|&id| id != closed);
                 if let Some(nf) = new_focus {
                     tab.focused_pane = nf;
+                    // If in automatic mode, rebuild the tree
+                    if tab.layout_mode.is_automatic() {
+                        tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
+                    }
                 }
                 (closed, new_focus)
             };
@@ -762,6 +777,7 @@ async fn handle_command(
                 let focused = tab.focused_pane;
                 tab.layout.add_to_stack(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
+                tab.pane_order.push(new_pane_id);
                 new_pane_id
             };
             spawn_pane(new_pane_id, cols, rows, None, panes, config).await?;
@@ -832,6 +848,10 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                // Eject to Custom mode on manual resize
+                if tab.layout_mode.is_automatic() {
+                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                }
                 tab.layout.resize(tab.focused_pane, direction, delta);
             }
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
@@ -909,6 +929,82 @@ async fn handle_command(
                 }
             }
         }
+        RemuxCommand::PaneNew => {
+            let new_pane_id = {
+                let mut st = state.lock().await;
+                let new_pane_id = st.next_pane_id();
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                tab.pane_order.push(new_pane_id);
+                if tab.layout_mode.is_automatic() {
+                    // Rebuild tree from layout mode
+                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_pane_id);
+                    tab.focused_pane = new_pane_id;
+                } else {
+                    // Custom mode: split at focused pane (default vertical)
+                    let focused = tab.focused_pane;
+                    tab.layout.split_vertical(focused, new_pane_id);
+                    tab.focused_pane = new_pane_id;
+                }
+                new_pane_id
+            };
+            spawn_pane(new_pane_id, cols, rows, None, panes, config).await?;
+            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::LayoutNext => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                tab.layout_mode = tab.layout_mode.next();
+                if tab.layout_mode.is_automatic() {
+                    tab.layout = tab
+                        .layout_mode
+                        .build_tree(&tab.pane_order, tab.focused_pane);
+                }
+            }
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::SetMaster => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                if let LayoutMode::Master(ref mut master_layout) = tab.layout_mode {
+                    if let Some(idx) = tab.pane_order.iter().position(|&id| id == tab.focused_pane)
+                    {
+                        master_layout.master_idx = idx;
+                        tab.layout = tab
+                            .layout_mode
+                            .build_tree(&tab.pane_order, tab.focused_pane);
+                    }
+                }
+                // No-op if not in Master mode
+            }
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
         _ => {
             log::debug!("unhandled command: {cmd:?}");
         }
@@ -936,7 +1032,8 @@ async fn handle_create_session(
     let pane_id = {
         let mut st = state.lock().await;
         let border_style = config.appearance.border_style.clone();
-        st.create_session(name, folder, border_style)?
+        let layout_mode = config.appearance.default_layout.to_layout_mode();
+        st.create_session(name, folder, border_style, layout_mode)?
     };
     spawn_pane(pane_id, cols, rows, None, panes, config).await?;
 
@@ -1646,6 +1743,7 @@ async fn build_composite(
             .enumerate()
             .map(|(i, t)| (t.name.clone(), i == sess.active_tab))
             .collect(),
+        layout_mode: tab.layout_mode.name().to_string(),
     };
 
     let (cells, hit_regions) = composite(
