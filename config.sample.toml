@@ -18,9 +18,6 @@ scrollback_lines = 10000
 # Interval in seconds between automatic session saves.
 auto_save_interval_secs = 30
 
-# Key used to switch from Insert to Normal mode.
-mode_switch_key = "Esc"
-
 # When true (default), mouse text selection auto-copies to clipboard on release
 # and clears the selection. When false, selection stays visible for keyboard
 # adjustment in Visual mode.
@@ -41,53 +38,68 @@ border_style = "zellij_style"
 # Modes
 # -----------------------------------------------------------------------------
 
-[modes.normal]
+[modes.command]
 # Timeout in milliseconds before the which-key popup appears.
 timeout_ms = 500
 
 # -----------------------------------------------------------------------------
-# Keybindings — Normal Mode
+# Keybindings — Command Mode
 # -----------------------------------------------------------------------------
-# Normal mode uses a tree-based key system. Press a group key (e.g. "t") to
-# see available sub-keys in the which-key popup, then press a sub-key to
-# execute the command.
+# Remux uses a leader key (default: Ctrl-a) to enter Command mode. In Command
+# mode, keys navigate a tree of bindings. Press a group key (e.g. "t") to see
+# available sub-keys in the which-key popup, then press a sub-key to execute.
+#
+# All other keys pass through to the inner terminal application (Normal).
+# Press Escape in Command mode to return to Normal.
+#
+# Action chains: Use semicolons to chain multiple actions on a single binding.
+# If the chain includes "EnterNormal", you return to Normal after
+# execution. Otherwise, you stay in Command mode for further commands.
+#
+# Examples:
+#   n = "TabNew; EnterNormal"     — Create tab and return to normal
+#   n = "PaneNew"                      — Create pane and stay in command mode
+#   n = "PaneNew; ResizeRight 10"      — Create pane, resize, stay in command mode
 #
 # To override a default binding, redefine it here. User bindings merge on top
 # of defaults — only the keys you specify are changed.
 #
 # To remove a default binding, set it to an empty string:
-#   i = ""
+#   v = ""
 #
 # Commands use PascalCase names matching RemuxCommand variants.
 # Arguments are space-separated. Quote strings with spaces: "SessionNew \"my project\""
 
+# Leader key (default: Ctrl-a). Double-tap sends the raw key to the terminal.
+leader = "Ctrl-a"
+
 # --- Tab (t) ---
-[keybindings.normal.t]
+[keybindings.command.t]
 _label = "Tab"
-n = "TabNew"
-c = "TabClose"
+n = "TabNew; EnterNormal"
+c = "TabClose; EnterNormal"
 m = "TabMove"
 r = "TabRename"
 l = "TabNext"                       # list / cycle tabs
 
 # --- Pane (p) ---
-[keybindings.normal.p]
+[keybindings.command.p]
 _label = "Pane"
-n = "PaneNew"
-c = "PaneClose"
-s = "PaneSplitVertical"
-S = "PaneSplitHorizontal"
-h = "PaneFocusLeft"
-j = "PaneFocusDown"
-k = "PaneFocusUp"
-l = "PaneFocusRight"
+n = "PaneNew; EnterNormal"
+c = "PaneClose; EnterNormal"
+s = "PaneSplitVertical; EnterNormal"
+S = "PaneSplitHorizontal; EnterNormal"
+h = "PaneFocusLeft; EnterNormal"
+j = "PaneFocusDown; EnterNormal"
+k = "PaneFocusUp; EnterNormal"
+l = "PaneFocusRight; EnterNormal"
 a = "PaneStackAdd"
 "]" = "PaneStackNext"
 "[" = "PaneStackPrev"
 r = "PaneRename"
 
 # --- Session (s) ---
-[keybindings.normal.s]
+[keybindings.command.s]
 _label = "Session"
 n = "SessionNew"
 d = "SessionDetach"
@@ -95,7 +107,7 @@ r = "SessionRename"
 l = "SessionList"
 
 # --- Folder (f) ---
-[keybindings.normal.f]
+[keybindings.command.f]
 _label = "Folder"
 n = "FolderNew"
 d = "FolderDelete"
@@ -103,13 +115,13 @@ l = "FolderList"
 m = "FolderMoveSession"
 
 # --- Buffer (b) ---
-[keybindings.normal.b]
+[keybindings.command.b]
 _label = "Buffer"
 e = "BufferEditInEditor"
 "/" = "BufferSearch"
 
 # --- Resize (r) ---
-[keybindings.normal.r]
+[keybindings.command.r]
 _label = "Resize"
 h = "ResizeLeft 5"
 j = "ResizeDown 5"
@@ -119,34 +131,16 @@ l = "ResizeRight 5"
 # --- Direct bindings (root level) ---
 # These are top-level keys, not inside a group.
 # Uncomment to override:
-# i = "EnterInsertMode"
 # v = "EnterVisualMode"
 # g = "ToggleStyle"
 
 # -----------------------------------------------------------------------------
-# Keybindings — Insert Mode
-# -----------------------------------------------------------------------------
-# Insert mode bindings are flat (no key groups). Keys are checked before being
-# forwarded to the PTY. If a key matches a binding, the command executes and
-# the key is consumed. You remain in insert mode.
-#
-# Key notation: "Alt-h", "Ctrl-b", "Shift-Tab", "F1", "Enter", "Space", etc.
-# Only single-modifier keys are supported (no Ctrl-Alt combinations).
-
-[keybindings.insert]
-Alt-h = "PaneFocusLeft"
-Alt-j = "PaneFocusDown"
-Alt-k = "PaneFocusUp"
-Alt-l = "PaneFocusRight"
-Alt-n = "TabNext"
-Alt-p = "TabPrev"
-
-# -----------------------------------------------------------------------------
 # Keybindings — Visual Mode
 # -----------------------------------------------------------------------------
-# Visual mode overrides (tree-based, same format as normal mode).
+# Visual mode overrides (tree-based, same format as command mode).
 # Visual mode has built-in keys for scrollback navigation (j/k, gg, G, Ctrl-d/u,
 # v/V for selection, y to yank, / to search, e to open editor).
+# Press Escape to return to Normal.
 # Add overrides here if needed.
 
 # [keybindings.visual]
@@ -202,9 +196,10 @@ Alt-p = "TabPrev"
 #   ResizeDown [amount]             — Resize pane down (default: 1)
 #
 # Mode commands:
-#   EnterInsertMode                 — Switch to insert mode
-#   EnterNormalMode                 — Switch to normal mode
-#   EnterVisualMode                 — Switch to visual mode
+#   EnterNormal                — Return to normal (keys go to terminal)
+#   EnterCommandMode                — Enter command mode (navigate keybindings)
+#   EnterVisualMode                 — Enter visual mode (scrollback selection)
+#   SendKey <bytes>                 — Send raw key bytes to the active PTY
 #
 # Layout commands:
 #   ToggleStyle                     — Toggle border style between zellij and tmux

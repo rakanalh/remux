@@ -108,7 +108,7 @@ pub fn hit_test(
 
 /// Information needed to render the status bar.
 pub struct StatusInfo {
-    /// Current mode name (e.g. "INSERT", "NORMAL", "VISUAL").
+    /// Current mode name (e.g. "NORMAL", "COMMAND", "VISUAL").
     pub mode: String,
     /// Session name or path.
     pub session_name: String,
@@ -613,9 +613,9 @@ fn build_top_border_content(
 /// Get foreground/background colors for the active tab based on current mode.
 fn mode_tab_colors(mode: &str) -> (CellColor, CellColor) {
     match mode {
-        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
-        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(12)), // Black on bright blue
-        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)), // Black on bright magenta
+        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
+        "COMMAND" => (CellColor::Indexed(0), CellColor::Indexed(12)),     // Black on bright blue
+        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)),      // Black on bright magenta
         _ => (CellColor::Indexed(0), CellColor::Indexed(238)),
     }
 }
@@ -956,9 +956,9 @@ fn draw_status_bar(
     // Mode indicator.
     let mode_str = format!(" [{}] ", info.mode);
     let (mode_fg, mode_bg) = match info.mode.as_str() {
-        "INSERT" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
-        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(12)), // Black on bright blue
-        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)), // Black on bright magenta
+        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
+        "COMMAND" => (CellColor::Indexed(0), CellColor::Indexed(12)),     // Black on bright blue
+        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)),      // Black on bright magenta
         _ => (CellColor::Indexed(15), CellColor::Indexed(238)),
     };
 
@@ -1083,7 +1083,7 @@ mod tests {
             height: 4,
         };
         let status = StatusInfo {
-            mode: "INSERT".to_string(),
+            mode: "NORMAL".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1129,7 +1129,7 @@ mod tests {
             height: 4,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "main".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1150,7 +1150,7 @@ mod tests {
         // The last row should have the mode indicator.
         let last_row = &result[4];
         let text: String = last_row.iter().map(|c| c.c).collect();
-        assert!(text.contains("NORMAL"));
+        assert!(text.contains("COMMAND"));
     }
 
     #[test]
@@ -1172,7 +1172,7 @@ mod tests {
             height: 8,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1226,7 +1226,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1272,7 +1272,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1320,7 +1320,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1364,7 +1364,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1405,7 +1405,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1444,7 +1444,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1489,7 +1489,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1533,7 +1533,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1587,7 +1587,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1639,7 +1639,7 @@ mod tests {
             height: 10,
         };
         let status = StatusInfo {
-            mode: "NORMAL".to_string(),
+            mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
         };
@@ -1940,7 +1940,7 @@ mod tests {
             height: 23,
         };
         let status = StatusInfo {
-            mode: "INSERT".to_string(),
+            mode: "NORMAL".to_string(),
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true), ("tab-2".to_string(), false)],
         };

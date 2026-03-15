@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use crossterm::event::{KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
 use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
-use crate::client::input::{InputAction, InputHandler, Mode};
+use crate::client::input::{InputAction, InputHandler, Mode, RenameTarget};
 use crate::client::renderer::Renderer;
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
 use crate::client::whichkey::WhichKeyPopup;
@@ -280,9 +280,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
 
     let mut event_stream = EventStream::new();
     let keybindings = config.keybinding_tree();
-    let insert_bindings = config.insert_bindings();
-    let mode_switch_key = parse_mode_switch_key(&config.general.mode_switch_key);
-    let mut input = InputHandler::new(keybindings, insert_bindings, mode_switch_key);
+    let leader_key = config.leader_key();
+    let mut input = InputHandler::new(keybindings, leader_key);
     let (cols, rows) = crossterm::terminal::size()?;
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();
@@ -323,28 +322,57 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
                                     return Ok(());
                                 }
-                                let is_rename_finish = matches!(
-                                    cmd,
-                                    RemuxCommand::PaneRename(_) | RemuxCommand::PaneRenameCancel
-                                );
-                                client.send(ClientMessage::Command(cmd)).await?;
-                                // After rename confirm/cancel, the client has
-                                // already switched to Normal mode -- tell the
-                                // server so the status bar and cursor update.
-                                if is_rename_finish {
-                                    client
-                                        .send(ClientMessage::ModeChanged {
-                                            mode: "NORMAL".to_string(),
-                                        })
-                                        .await?;
+                                // Handle SendKey: forward raw bytes to PTY.
+                                if let RemuxCommand::SendKey(ref bytes) = cmd {
+                                    client.send(ClientMessage::Input { data: bytes.clone() }).await?;
+                                } else {
+                                    client.send(ClientMessage::Command(cmd)).await?;
                                 }
+                                // Notify server of current mode if it changed.
+                                let mode_str = match input.mode {
+                                    Mode::Normal => "NORMAL",
+                                    Mode::Command => "COMMAND",
+                                    Mode::Visual => "VISUAL",
+                                };
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: mode_str.to_string(),
+                                    })
+                                    .await?;
+                            }
+                            InputAction::ExecuteChain(cmds) => {
+                                // Hide which-key popup when executing commands
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                for cmd in cmds {
+                                    if matches!(cmd, RemuxCommand::SessionDetach) {
+                                        return Ok(());
+                                    }
+                                    if let RemuxCommand::SendKey(ref bytes) = cmd {
+                                        client.send(ClientMessage::Input { data: bytes.clone() }).await?;
+                                    } else {
+                                        client.send(ClientMessage::Command(cmd)).await?;
+                                    }
+                                }
+                                // Notify server of current mode.
+                                let mode_str = match input.mode {
+                                    Mode::Normal => "NORMAL",
+                                    Mode::Command => "COMMAND",
+                                    Mode::Visual => "VISUAL",
+                                };
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: mode_str.to_string(),
+                                    })
+                                    .await?;
                             }
                             InputAction::ModeChanged(mode) => {
                                 let mode_str = match mode {
-                                    Mode::Insert => "INSERT",
                                     Mode::Normal => "NORMAL",
+                                    Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
-                                    Mode::Rename => "RENAME",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -386,21 +414,24 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         }
                                     }
                                 }
-                                // When entering Rename mode, send an initial
-                                // empty update so the server clears the pane
-                                // name and stores the original for cancel.
-                                if mode == Mode::Rename {
-                                    client
-                                        .send(ClientMessage::Command(
-                                            RemuxCommand::PaneRenameUpdate(String::new()),
-                                        ))
-                                        .await?;
-                                }
                                 // Hide which-key when mode changes
                                 if whichkey.visible {
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
+                            }
+                            InputAction::ActivateRenameOverlay => {
+                                // Hide which-key when rename overlay activates
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // Notify server we're in a rename state
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: "COMMAND".to_string(),
+                                    })
+                                    .await?;
                             }
                             InputAction::ShowWhichKey(label, entries) => {
                                 whichkey.show(label, entries);
@@ -422,10 +453,16 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 client.send(ClientMessage::Resize { cols, rows }).await?;
                             }
                             InputAction::RenameUpdate(text) => {
+                                // Determine the rename target from the overlay.
+                                let target = input.rename_overlay.as_ref()
+                                    .map(|o| o.target.clone())
+                                    .unwrap_or(RenameTarget::Pane);
+                                let cmd = match target {
+                                    RenameTarget::Pane => RemuxCommand::PaneRename(text),
+                                    RenameTarget::Tab => RemuxCommand::TabRename(text),
+                                };
                                 client
-                                    .send(ClientMessage::Command(
-                                        RemuxCommand::PaneRenameUpdate(text),
-                                    ))
+                                    .send(ClientMessage::Command(cmd))
                                     .await?;
                             }
                             InputAction::YankToClipboard(_) => {
@@ -582,15 +619,4 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     }
 
     Ok(())
-}
-
-/// Parse the mode switch key string from config into a crossterm KeyCode.
-fn parse_mode_switch_key(key: &str) -> KeyCode {
-    match key.to_lowercase().as_str() {
-        "esc" | "escape" => KeyCode::Esc,
-        "tab" => KeyCode::Tab,
-        "enter" => KeyCode::Enter,
-        s if s.len() == 1 => KeyCode::Char(s.chars().next().unwrap_or(' ')),
-        _ => KeyCode::Esc,
-    }
 }

@@ -1,7 +1,7 @@
 //! Which-key style key hint popup.
 //!
 //! This module renders a popup showing available keybindings when the user
-//! is partway through a multi-key sequence in Normal mode.
+//! is partway through a multi-key sequence in Command mode.
 
 use crossterm::style::Color;
 

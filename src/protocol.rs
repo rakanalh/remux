@@ -187,8 +187,6 @@ pub enum RemuxCommand {
     PaneStackNext,
     PaneStackPrev,
     PaneRename(String),
-    PaneRenameUpdate(String),
-    PaneRenameCancel,
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -223,9 +221,11 @@ pub enum RemuxCommand {
 
     // -- System / mode commands ---------------------------------------------
     SessionSave,
-    EnterInsertMode,
-    EnterNormalMode,
+    EnterNormal,
+    EnterCommandMode,
     EnterVisualMode,
+    /// Send raw key bytes to the active pane's PTY (used for leader-leader normal mode).
+    SendKey(Vec<u8>),
 }
 
 // ---------------------------------------------------------------------------

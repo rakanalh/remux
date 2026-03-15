@@ -1,19 +1,23 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::keybindings::{parse_command, InsertBindings, KeyNode, KeybindingTree};
+use crate::config::keybindings::{parse_command, KeyNode, KeybindingTree};
 use crate::protocol::RemuxCommand;
 
 // ---------------------------------------------------------------------------
 // Mode
 // ---------------------------------------------------------------------------
 
-/// The current input mode (vim-style modal editing).
+/// The current input mode.
+///
+/// - **Normal** (default): all keys are forwarded to the PTY except the
+///   leader key, which transitions to Command mode.
+/// - **Command**: keybinding tree navigation (which-key).
+/// - **Visual**: scrollback navigation and text selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Insert,
     Normal,
+    Command,
     Visual,
-    Rename,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,10 +242,12 @@ impl VisualState {
 /// The result of processing a single key event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputAction {
-    /// Send raw bytes to the active pane's PTY (Insert mode).
+    /// Send raw bytes to the active pane's PTY (Normal mode).
     SendToPty(Vec<u8>),
-    /// Execute a Remux command (Normal/Visual mode).
+    /// Execute one or more Remux commands (Command/Visual mode).
     Execute(RemuxCommand),
+    /// Execute an action chain (multiple commands in sequence).
+    ExecuteChain(Vec<RemuxCommand>),
     /// The input mode changed.
     ModeChanged(Mode),
     /// Show the which-key popup for a group.
@@ -256,7 +262,9 @@ pub enum InputAction {
     SearchPrompt,
     /// Update the visual mode scroll offset.
     VisualScroll { offset: usize },
-    /// The rename buffer was updated (for status bar display).
+    /// Activate the rename overlay for pane or tab renaming.
+    ActivateRenameOverlay,
+    /// The rename overlay buffer was updated (for status bar display).
     RenameUpdate(String),
     /// No action to take.
     None,
@@ -313,59 +321,79 @@ impl Default for KeybindingState {
 pub struct InputHandler {
     /// Current input mode.
     pub mode: Mode,
-    /// The key that switches from Insert to Normal mode.
-    mode_switch_key: KeyCode,
-    /// State for multi-key Normal-mode sequences.
+    /// The leader key that transitions from Normal to Command mode.
+    leader_key: KeyEvent,
+    /// State for multi-key Command-mode sequences.
     keybinding_state: KeybindingState,
     /// The keybinding tree (owned clone from config).
     keybinding_tree: KeybindingTree,
-    /// Flat insert-mode bindings (modifier keys → commands).
-    insert_bindings: InsertBindings,
     /// State for Visual mode scrollback navigation.
     pub visual_state: Option<VisualState>,
     /// Pending 'g' key for gg motion in visual mode.
     pending_g: bool,
-    /// Buffer for the rename input mode.
-    pub rename_buffer: String,
+    /// Rename overlay state. When `Some`, keystrokes are captured for inline
+    /// text input rather than being dispatched to the normal mode handler.
+    pub rename_overlay: Option<RenameOverlay>,
+}
+
+/// Inline text input overlay state used for rename operations.
+/// This is not a separate mode -- it sits on top of the current mode.
+#[derive(Debug, Clone)]
+pub struct RenameOverlay {
+    /// The text buffer being edited.
+    pub buffer: String,
+    /// Cursor position within the buffer.
+    pub cursor: usize,
+    /// The command to execute when the user confirms (Enter).
+    /// `PaneRename` or `TabRename`.
+    pub target: RenameTarget,
+}
+
+/// What entity the rename overlay is targeting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RenameTarget {
+    Pane,
+    Tab,
 }
 
 impl InputHandler {
-    /// Create a new `InputHandler` with the given keybinding tree, insert
-    /// bindings, and mode-switch key.
-    pub fn new(
-        keybinding_tree: KeybindingTree,
-        insert_bindings: InsertBindings,
-        mode_switch_key: KeyCode,
-    ) -> Self {
+    /// Create a new `InputHandler` with the given keybinding tree and leader key.
+    pub fn new(keybinding_tree: KeybindingTree, leader_key: KeyEvent) -> Self {
         Self {
-            mode: Mode::Insert,
-            mode_switch_key,
+            mode: Mode::Normal,
+            leader_key,
             keybinding_state: KeybindingState::new(),
             keybinding_tree,
-            insert_bindings,
             visual_state: None,
             pending_g: false,
-            rename_buffer: String::new(),
+            rename_overlay: None,
         }
     }
 
-    /// Create a new `InputHandler` with defaults (Esc to switch modes, default
-    /// keybinding tree and insert bindings).
+    /// Create a new `InputHandler` with defaults (Ctrl-a as leader, default
+    /// keybinding tree).
     pub fn with_defaults() -> Self {
-        Self::new(
-            KeybindingTree::default(),
-            InsertBindings::default(),
-            KeyCode::Esc,
-        )
+        use crossterm::event::{KeyEventKind, KeyEventState};
+        let leader = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        Self::new(KeybindingTree::default(), leader)
     }
 
     /// Process a key event and return the appropriate action.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        // If the rename overlay is active, capture keystrokes for it.
+        if self.rename_overlay.is_some() {
+            return self.handle_rename_overlay_key(key);
+        }
+
         match self.mode {
-            Mode::Insert => self.handle_insert_key(key),
             Mode::Normal => self.handle_normal_key(key),
+            Mode::Command => self.handle_command_key(key),
             Mode::Visual => self.handle_visual_key(key),
-            Mode::Rename => self.handle_rename_key(key),
         }
     }
 
@@ -391,88 +419,84 @@ impl InputHandler {
     }
 
     // -----------------------------------------------------------------------
-    // Insert mode
+    // Normal mode
     // -----------------------------------------------------------------------
 
-    fn handle_insert_key(&mut self, key: KeyEvent) -> InputAction {
-        // Check for mode switch key first.
-        // Only require that no Ctrl/Alt/Shift modifiers are held; ignore
-        // SUPER/HYPER/META which some terminals may report spuriously.
-        let dominated = KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT;
-        if key.code == self.mode_switch_key && !key.modifiers.intersects(dominated) {
-            self.mode = Mode::Normal;
-            return InputAction::ModeChanged(Mode::Normal);
+    fn handle_normal_key(&mut self, key: KeyEvent) -> InputAction {
+        // Check for leader key -- enter Command mode.
+        if self.is_leader_key(&key) {
+            self.mode = Mode::Command;
+            return InputAction::ModeChanged(Mode::Command);
         }
 
-        // Check insert mode bindings before forwarding to PTY.
-        if let Some(cmd) = self.insert_bindings.lookup(&key) {
-            return InputAction::Execute(cmd.clone());
-        }
-
-        // Convert the key event to bytes for the PTY.
+        // All other keys are forwarded to the PTY.
         match key_event_to_bytes(&key) {
             Some(bytes) => InputAction::SendToPty(bytes),
             Option::None => InputAction::None,
         }
     }
 
+    /// Check if a key event matches the configured leader key.
+    fn is_leader_key(&self, key: &KeyEvent) -> bool {
+        key.code == self.leader_key.code && key.modifiers == self.leader_key.modifiers
+    }
+
     // -----------------------------------------------------------------------
-    // Normal mode
+    // Command mode
     // -----------------------------------------------------------------------
 
-    fn handle_normal_key(&mut self, key: KeyEvent) -> InputAction {
-        // Escape cancels any partial sequence and hides which-key.
+    fn handle_command_key(&mut self, key: KeyEvent) -> InputAction {
+        // Escape always returns to Normal from any tree depth.
         if key.code == KeyCode::Esc {
-            if !self.keybinding_state.is_at_root() {
-                self.keybinding_state.reset();
-                return InputAction::HideWhichKey;
-            }
-            return InputAction::None;
+            self.keybinding_state.reset();
+            self.mode = Mode::Normal;
+            return InputAction::ModeChanged(Mode::Normal);
         }
 
-        // We only handle character keys and Enter in normal mode.
+        // We only handle character keys in command mode.
         let ch = match key.code {
-            KeyCode::Char(c) => c,
-            KeyCode::Enter => {
-                self.mode = Mode::Insert;
-                return InputAction::ModeChanged(Mode::Insert);
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                c
             }
-            _ => return InputAction::None,
+            _ => {
+                // Check if this is the leader key at root (leader-leader normal mode).
+                if self.keybinding_state.is_at_root() && self.is_leader_key(&key) {
+                    // Look up leader-leader binding in tree.
+                    // The tree should have a binding for the leader character.
+                    // Fall through to the tree lookup below if it's a char key.
+                    if let KeyCode::Char(c) = key.code {
+                        // Let it go through normal tree lookup path with modifiers stripped
+                        // But leader-leader is handled via the tree binding
+                        self.keybinding_state.push(c);
+                        let path = self.keybinding_state.path().to_vec();
+                        return self.resolve_tree_path(&path);
+                    }
+                }
+                return InputAction::None;
+            }
         };
 
         self.keybinding_state.push(ch);
         let path = self.keybinding_state.path().to_vec();
 
-        match self.keybinding_tree.lookup(&path) {
+        self.resolve_tree_path(&path)
+    }
+
+    /// Resolve a keybinding tree path and return the appropriate action.
+    fn resolve_tree_path(&mut self, path: &[char]) -> InputAction {
+        match self.keybinding_tree.lookup(path) {
             Some(KeyNode::Leaf { action, .. }) => {
+                let actions = action.clone();
                 self.keybinding_state.reset();
-                if let Some(cmd) = parse_command(action) {
-                    // Handle mode-switch commands.
-                    match &cmd {
-                        RemuxCommand::EnterInsertMode => {
-                            self.mode = Mode::Insert;
-                            return InputAction::ModeChanged(Mode::Insert);
-                        }
-                        RemuxCommand::EnterVisualMode => {
-                            self.mode = Mode::Visual;
-                            self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
-                            return InputAction::ModeChanged(Mode::Visual);
-                        }
-                        RemuxCommand::PaneRename(_) => {
-                            self.mode = Mode::Rename;
-                            self.rename_buffer.clear();
-                            return InputAction::ModeChanged(Mode::Rename);
-                        }
-                        _ => {}
-                    }
-                    InputAction::Execute(cmd)
-                } else {
-                    InputAction::None
-                }
+                self.execute_action_chain(&actions)
             }
             Some(KeyNode::Group { label, .. }) => {
                 // We have entered a group -- show which-key popup.
-                if let Some(children) = self.keybinding_tree.children_at(&path) {
+                if let Some(children) = self.keybinding_tree.children_at(path) {
                     InputAction::ShowWhichKey(label.clone(), children)
                 } else {
                     InputAction::None
@@ -483,6 +507,93 @@ impl InputHandler {
                 self.keybinding_state.reset();
                 InputAction::HideWhichKey
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Action chain execution
+    // -----------------------------------------------------------------------
+
+    /// Execute an action chain. Parses each action string, handles mode
+    /// transitions, and returns the appropriate InputAction.
+    fn execute_action_chain(&mut self, actions: &[String]) -> InputAction {
+        if actions.is_empty() {
+            return InputAction::None;
+        }
+
+        let mut commands: Vec<RemuxCommand> = Vec::new();
+        let mut final_action: Option<InputAction> = None;
+
+        for action_str in actions {
+            match parse_command(action_str) {
+                Some(cmd) => {
+                    match &cmd {
+                        RemuxCommand::EnterNormal => {
+                            self.mode = Mode::Normal;
+                            final_action = Some(InputAction::ModeChanged(Mode::Normal));
+                        }
+                        RemuxCommand::EnterCommandMode => {
+                            self.mode = Mode::Command;
+                            // No ModeChanged emitted -- we're already conceptually in command
+                        }
+                        RemuxCommand::EnterVisualMode => {
+                            self.mode = Mode::Visual;
+                            self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
+                            final_action = Some(InputAction::ModeChanged(Mode::Visual));
+                        }
+                        RemuxCommand::PaneRename(_) => {
+                            // Activate rename overlay instead of executing directly.
+                            self.rename_overlay = Some(RenameOverlay {
+                                buffer: String::new(),
+                                cursor: 0,
+                                target: RenameTarget::Pane,
+                            });
+                            return InputAction::ActivateRenameOverlay;
+                        }
+                        RemuxCommand::TabRename(_) => {
+                            // Activate rename overlay instead of executing directly.
+                            self.rename_overlay = Some(RenameOverlay {
+                                buffer: String::new(),
+                                cursor: 0,
+                                target: RenameTarget::Tab,
+                            });
+                            return InputAction::ActivateRenameOverlay;
+                        }
+                        _ => {
+                            commands.push(cmd);
+                        }
+                    }
+                }
+                None => {
+                    log::error!("Failed to parse action: {}", action_str);
+                }
+            }
+        }
+
+        // After chain completion, if no EnterNormal was in the chain,
+        // stay in Command mode but reset tree to root.
+        // (keybinding_state was already reset above)
+
+        // If we have a mode-change as final action and commands to execute,
+        // we need to return the chain.
+        if let Some(mode_action) = final_action {
+            if commands.is_empty() {
+                return mode_action;
+            }
+            // Add the mode transition to the command list for the caller to handle.
+            // Return ExecuteChain with all commands, the caller handles mode change
+            // by checking the last ModeChanged we set on self.mode.
+            // Actually, we return the chain and the caller sees self.mode changed.
+            if commands.len() == 1 {
+                return InputAction::Execute(commands.remove(0));
+            }
+            return InputAction::ExecuteChain(commands);
+        }
+
+        match commands.len() {
+            0 => InputAction::None,
+            1 => InputAction::Execute(commands.remove(0)),
+            _ => InputAction::ExecuteChain(commands),
         }
     }
 
@@ -643,31 +754,46 @@ impl InputHandler {
     }
 
     // -----------------------------------------------------------------------
-    // Rename mode
+    // Rename overlay
     // -----------------------------------------------------------------------
 
-    fn handle_rename_key(&mut self, key: KeyEvent) -> InputAction {
+    fn handle_rename_overlay_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.rename_overlay.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+
         match key.code {
             KeyCode::Esc => {
-                // Cancel rename, return to Normal mode.
-                self.rename_buffer.clear();
+                // Cancel rename, close overlay.
+                self.rename_overlay = None;
+                // Return to Normal after cancelling.
                 self.mode = Mode::Normal;
-                InputAction::Execute(RemuxCommand::PaneRenameCancel)
+                InputAction::ModeChanged(Mode::Normal)
             }
             KeyCode::Enter => {
-                // Confirm rename: send the command with the buffer contents.
-                let name = self.rename_buffer.clone();
-                self.rename_buffer.clear();
+                // Confirm rename: send the appropriate command.
+                let name = overlay.buffer.clone();
+                let target = overlay.target.clone();
+                self.rename_overlay = None;
                 self.mode = Mode::Normal;
-                InputAction::Execute(RemuxCommand::PaneRename(name))
+                let cmd = match target {
+                    RenameTarget::Pane => RemuxCommand::PaneRename(name),
+                    RenameTarget::Tab => RemuxCommand::TabRename(name),
+                };
+                InputAction::Execute(cmd)
             }
             KeyCode::Backspace => {
-                self.rename_buffer.pop();
-                InputAction::RenameUpdate(self.rename_buffer.clone())
+                overlay.buffer.pop();
+                if overlay.cursor > 0 {
+                    overlay.cursor -= 1;
+                }
+                InputAction::RenameUpdate(overlay.buffer.clone())
             }
             KeyCode::Char(c) => {
-                self.rename_buffer.push(c);
-                InputAction::RenameUpdate(self.rename_buffer.clone())
+                overlay.buffer.push(c);
+                overlay.cursor += 1;
+                InputAction::RenameUpdate(overlay.buffer.clone())
             }
             _ => InputAction::None,
         }
@@ -799,9 +925,20 @@ mod tests {
     // -- Mode transitions ---------------------------------------------------
 
     #[test]
-    fn insert_to_normal_on_esc() {
+    fn normal_to_command_on_leader() {
         let mut handler = InputHandler::with_defaults();
-        assert_eq!(handler.mode, Mode::Insert);
+        assert_eq!(handler.mode, Mode::Normal);
+
+        // Default leader is Ctrl-a.
+        let action = handler.handle_key(ctrl_key('a'));
+        assert_eq!(handler.mode, Mode::Command);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Command));
+    }
+
+    #[test]
+    fn command_to_normal_on_esc() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
 
         let action = handler.handle_key(esc_key());
         assert_eq!(handler.mode, Mode::Normal);
@@ -809,29 +946,9 @@ mod tests {
     }
 
     #[test]
-    fn normal_to_insert_on_i() {
+    fn command_to_visual_on_v() {
         let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
-
-        let action = handler.handle_key(char_key('i'));
-        assert_eq!(handler.mode, Mode::Insert);
-        assert_eq!(action, InputAction::ModeChanged(Mode::Insert));
-    }
-
-    #[test]
-    fn normal_to_insert_on_enter() {
-        let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
-
-        let action = handler.handle_key(enter_key());
-        assert_eq!(handler.mode, Mode::Insert);
-        assert_eq!(action, InputAction::ModeChanged(Mode::Insert));
-    }
-
-    #[test]
-    fn normal_to_visual_on_v() {
-        let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
+        handler.mode = Mode::Command;
 
         let action = handler.handle_key(char_key('v'));
         assert_eq!(handler.mode, Mode::Visual);
@@ -849,24 +966,24 @@ mod tests {
         assert!(handler.visual_state.is_none());
     }
 
-    // -- Insert mode --------------------------------------------------------
+    // -- Normal mode --------------------------------------------------------
 
     #[test]
-    fn insert_mode_sends_char_to_pty() {
+    fn normal_sends_char_to_pty() {
         let mut handler = InputHandler::with_defaults();
         let action = handler.handle_key(char_key('a'));
         assert_eq!(action, InputAction::SendToPty(b"a".to_vec()));
     }
 
     #[test]
-    fn insert_mode_sends_enter_to_pty() {
+    fn normal_sends_enter_to_pty() {
         let mut handler = InputHandler::with_defaults();
         let action = handler.handle_key(enter_key());
         assert_eq!(action, InputAction::SendToPty(vec![b'\r']));
     }
 
     #[test]
-    fn insert_mode_sends_ctrl_c_to_pty() {
+    fn normal_sends_ctrl_c_to_pty() {
         let mut handler = InputHandler::with_defaults();
         let key = make_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = handler.handle_key(key);
@@ -874,18 +991,37 @@ mod tests {
     }
 
     #[test]
-    fn insert_mode_sends_arrow_keys() {
+    fn normal_sends_arrow_keys() {
         let mut handler = InputHandler::with_defaults();
         let action = handler.handle_key(make_key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'[', b'A']));
     }
 
-    // -- Normal mode keybinding sequences -----------------------------------
+    #[test]
+    fn normal_leader_enters_command() {
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(handler.mode, Mode::Normal);
+        // Ctrl-a is the default leader.
+        let action = handler.handle_key(ctrl_key('a'));
+        assert_eq!(handler.mode, Mode::Command);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Command));
+    }
 
     #[test]
-    fn normal_mode_group_shows_which_key() {
+    fn normal_non_leader_ctrl_passes_to_pty() {
         let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
+        // Ctrl-b is not the leader, should pass through.
+        let action = handler.handle_key(ctrl_key('b'));
+        assert_eq!(action, InputAction::SendToPty(vec![0x02]));
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    // -- Command mode keybinding sequences ----------------------------------
+
+    #[test]
+    fn command_mode_group_shows_which_key() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
 
         let action = handler.handle_key(char_key('t'));
         match action {
@@ -898,34 +1034,37 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_full_sequence_executes() {
+    fn command_mode_full_sequence_executes() {
         let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
+        handler.mode = Mode::Command;
 
         // Press 't' to enter tab group.
         let _ = handler.handle_key(char_key('t'));
-        // Press 'n' to execute tab:new.
+        // Press 'n' to execute tab:new. Default is action chain ["TabNew", "EnterNormal"].
         let action = handler.handle_key(char_key('n'));
+        // The chain should execute TabNew and transition to Normal.
         assert_eq!(action, InputAction::Execute(RemuxCommand::TabNew));
+        assert_eq!(handler.mode, Mode::Normal);
     }
 
     #[test]
-    fn normal_mode_esc_cancels_partial_sequence() {
+    fn command_mode_esc_cancels_partial_sequence() {
         let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
+        handler.mode = Mode::Command;
 
         // Enter a group.
         let _ = handler.handle_key(char_key('t'));
-        // Press Esc to cancel.
+        // Press Esc to cancel and return to Normal.
         let action = handler.handle_key(esc_key());
-        assert_eq!(action, InputAction::HideWhichKey);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
         assert!(handler.keybinding_state.is_at_root());
+        assert_eq!(handler.mode, Mode::Normal);
     }
 
     #[test]
-    fn normal_mode_unknown_key_resets() {
+    fn command_mode_unknown_key_resets() {
         let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
+        handler.mode = Mode::Command;
 
         let action = handler.handle_key(char_key('z'));
         assert_eq!(action, InputAction::HideWhichKey);
@@ -933,12 +1072,79 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_esc_at_root_is_none() {
+    fn command_mode_esc_at_root_returns_to_normal() {
         let mut handler = InputHandler::with_defaults();
-        handler.mode = Mode::Normal;
+        handler.mode = Mode::Command;
 
         let action = handler.handle_key(esc_key());
-        assert_eq!(action, InputAction::None);
+        assert_eq!(handler.mode, Mode::Normal);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+    }
+
+    #[test]
+    fn command_mode_esc_at_any_depth_returns_to_normal() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+
+        // Enter a group.
+        let _ = handler.handle_key(char_key('t'));
+        // Esc should return to Normal even from inside a group.
+        let action = handler.handle_key(esc_key());
+        assert_eq!(handler.mode, Mode::Normal);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert!(handler.keybinding_state.is_at_root());
+    }
+
+    // -- Action chain tests -------------------------------------------------
+
+    #[test]
+    fn action_chain_single_command() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+
+        // Session detach is a single action (no EnterNormal in chain).
+        let _ = handler.handle_key(char_key('s'));
+        let action = handler.handle_key(char_key('d'));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::SessionDetach));
+        // Should stay in Command mode since no EnterNormal in chain.
+        assert_eq!(handler.mode, Mode::Command);
+    }
+
+    #[test]
+    fn action_chain_with_enter_normal() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+
+        // Tab new has chain ["TabNew", "EnterNormal"].
+        let _ = handler.handle_key(char_key('t'));
+        let action = handler.handle_key(char_key('n'));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::TabNew));
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn leader_leader_sends_raw_key() {
+        let mut handler = InputHandler::with_defaults();
+        // Manually add leader-leader binding (Ctrl-a = 'a' with ctrl).
+        // In the default tree, we need to insert the leader-leader binding.
+        handler.keybinding_tree.root.insert(
+            'a',
+            crate::config::keybindings::KeyNode::Leaf {
+                label: "send leader".to_string(),
+                action: vec!["SendKey Ctrl-a".to_string(), "EnterNormal".to_string()],
+            },
+        );
+        handler.mode = Mode::Command;
+
+        // Press 'a' (the leader char without modifiers, which is how it's
+        // looked up in the tree).
+        let action = handler.handle_key(char_key('a'));
+        // Should send the raw Ctrl-a byte (0x01) and switch to normal.
+        assert_eq!(
+            action,
+            InputAction::Execute(RemuxCommand::SendKey(vec![0x01]))
+        );
+        assert_eq!(handler.mode, Mode::Normal);
     }
 
     // -- Visual mode --------------------------------------------------------
@@ -1277,53 +1483,131 @@ mod tests {
         assert_eq!(bytes, "\u{00e9}".as_bytes());
     }
 
-    // -- Insert mode bindings -----------------------------------------------
+    // -- Normal mode passes all non-leader keys -------------------------
 
     fn alt_key(c: char) -> KeyEvent {
         make_key(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     #[test]
-    fn insert_mode_alt_h_executes_pane_focus_left() {
+    fn normal_alt_keys_pass_to_pty() {
         let mut handler = InputHandler::with_defaults();
-        assert_eq!(handler.mode, Mode::Insert);
+        assert_eq!(handler.mode, Mode::Normal);
+        // Alt-h passes through to PTY (no insert bindings anymore).
         let action = handler.handle_key(alt_key('h'));
-        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneFocusLeft));
-        // Remains in insert mode.
-        assert_eq!(handler.mode, Mode::Insert);
+        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'h']));
+        assert_eq!(handler.mode, Mode::Normal);
     }
 
     #[test]
-    fn insert_mode_alt_l_executes_pane_focus_right() {
+    fn normal_esc_passes_to_pty() {
         let mut handler = InputHandler::with_defaults();
-        let action = handler.handle_key(alt_key('l'));
-        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneFocusRight));
-        assert_eq!(handler.mode, Mode::Insert);
+        assert_eq!(handler.mode, Mode::Normal);
+        // Esc is not the leader, should pass through.
+        let action = handler.handle_key(esc_key());
+        assert_eq!(action, InputAction::SendToPty(vec![0x1b]));
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    // -- Rename overlay tests -----------------------------------------------
+
+    #[test]
+    fn rename_overlay_enter_confirms() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        // Simulate activating rename overlay for pane.
+        handler.rename_overlay = Some(RenameOverlay {
+            buffer: String::new(),
+            cursor: 0,
+            target: RenameTarget::Pane,
+        });
+        // Type some text.
+        handler.handle_key(char_key('t'));
+        handler.handle_key(char_key('e'));
+        handler.handle_key(char_key('s'));
+        handler.handle_key(char_key('t'));
+        // Press Enter to confirm.
+        let action = handler.handle_key(enter_key());
+        assert_eq!(
+            action,
+            InputAction::Execute(RemuxCommand::PaneRename("test".to_string()))
+        );
+        assert!(handler.rename_overlay.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
     }
 
     #[test]
-    fn insert_mode_alt_n_executes_tab_next() {
+    fn rename_overlay_esc_cancels() {
         let mut handler = InputHandler::with_defaults();
-        let action = handler.handle_key(alt_key('n'));
-        assert_eq!(action, InputAction::Execute(RemuxCommand::TabNext));
-        assert_eq!(handler.mode, Mode::Insert);
+        handler.rename_overlay = Some(RenameOverlay {
+            buffer: "partial".to_string(),
+            cursor: 7,
+            target: RenameTarget::Tab,
+        });
+        let action = handler.handle_key(esc_key());
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert!(handler.rename_overlay.is_none());
     }
 
     #[test]
-    fn insert_mode_unbound_key_passes_to_pty() {
+    fn rename_overlay_backspace_removes_char() {
         let mut handler = InputHandler::with_defaults();
-        // Alt-x is not bound by default.
-        let action = handler.handle_key(alt_key('x'));
-        // Should pass through to PTY as ESC + 'x'.
-        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'x']));
-        assert_eq!(handler.mode, Mode::Insert);
+        handler.rename_overlay = Some(RenameOverlay {
+            buffer: "ab".to_string(),
+            cursor: 2,
+            target: RenameTarget::Pane,
+        });
+        let action = handler.handle_key(make_key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::RenameUpdate("a".to_string()));
+        assert_eq!(handler.rename_overlay.as_ref().unwrap().buffer, "a");
+    }
+
+    // -- Protocol round-trip tests for new commands -------------------------
+
+    #[test]
+    fn round_trip_send_key() {
+        use crate::protocol::decode_message_length;
+        use crate::protocol::encode_message;
+        let msg = crate::protocol::ClientMessage::Command(RemuxCommand::SendKey(vec![0x01]));
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: crate::protocol::ClientMessage =
+            serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            crate::protocol::ClientMessage::Command(RemuxCommand::SendKey(bytes)) => {
+                assert_eq!(bytes, vec![0x01]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]
-    fn insert_mode_regular_char_passes_to_pty() {
-        let mut handler = InputHandler::with_defaults();
-        let action = handler.handle_key(char_key('a'));
-        assert_eq!(action, InputAction::SendToPty(b"a".to_vec()));
-        assert_eq!(handler.mode, Mode::Insert);
+    fn round_trip_enter_normal() {
+        use crate::protocol::decode_message_length;
+        use crate::protocol::encode_message;
+        let msg = crate::protocol::ClientMessage::Command(RemuxCommand::EnterNormal);
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: crate::protocol::ClientMessage =
+            serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            crate::protocol::ClientMessage::Command(RemuxCommand::EnterNormal) => {}
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_enter_command_mode() {
+        use crate::protocol::decode_message_length;
+        use crate::protocol::encode_message;
+        let msg = crate::protocol::ClientMessage::Command(RemuxCommand::EnterCommandMode);
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: crate::protocol::ClientMessage =
+            serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            crate::protocol::ClientMessage::Command(RemuxCommand::EnterCommandMode) => {}
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }
