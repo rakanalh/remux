@@ -5,10 +5,10 @@ use crossterm::style::Color;
 #[derive(Debug, Clone)]
 pub struct Theme {
     // Mode indicator colors
-    pub mode_insert_fg: Color,
-    pub mode_insert_bg: Color,
     pub mode_normal_fg: Color,
     pub mode_normal_bg: Color,
+    pub mode_command_fg: Color,
+    pub mode_command_bg: Color,
     pub mode_visual_fg: Color,
     pub mode_visual_bg: Color,
 
@@ -35,13 +35,13 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Insert mode: green tones
-            mode_insert_fg: Color::Black,
-            mode_insert_bg: Color::Green,
-
-            // Normal mode: blue tones
+            // Normal mode: green tones
             mode_normal_fg: Color::Black,
-            mode_normal_bg: Color::Blue,
+            mode_normal_bg: Color::Green,
+
+            // Command mode: blue tones
+            mode_command_fg: Color::Black,
+            mode_command_bg: Color::Blue,
 
             // Visual mode: magenta tones
             mode_visual_fg: Color::Black,
@@ -78,11 +78,11 @@ mod tests {
         let theme = Theme::default();
         // Sanity check that distinct modes have distinct background colors.
         assert_ne!(
-            format!("{:?}", theme.mode_insert_bg),
-            format!("{:?}", theme.mode_normal_bg)
+            format!("{:?}", theme.mode_normal_bg),
+            format!("{:?}", theme.mode_command_bg)
         );
         assert_ne!(
-            format!("{:?}", theme.mode_normal_bg),
+            format!("{:?}", theme.mode_command_bg),
             format!("{:?}", theme.mode_visual_bg)
         );
     }

@@ -888,45 +888,26 @@ async fn handle_command(
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::PaneRenameUpdate(text) => {
-            {
-                let mut st = state.lock().await;
-                let sess = match st.sessions.get_mut(&session_name) {
+        RemuxCommand::SendKey(bytes) => {
+            // Forward raw key bytes to the active pane's PTY.
+            let pane_id = {
+                let st = state.lock().await;
+                let sess = match st.sessions.get(&session_name) {
                     Some(s) => s,
                     None => return Ok(()),
                 };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                let tab = match sess.tabs.get(sess.active_tab) {
                     Some(t) => t,
                     None => return Ok(()),
                 };
-                let focused = tab.focused_pane;
-                // On the first update (empty text), save the original name.
-                if sess.rename_state.is_none() {
-                    let original = layout::get_pane_name(&tab.layout, focused).unwrap_or_default();
-                    sess.rename_state = Some((focused, original));
-                }
-                // Update the displayed pane name to the in-progress text.
-                layout::set_pane_name(&mut tab.layout, focused, &text);
-            }
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
-        }
-        RemuxCommand::PaneRenameCancel => {
-            {
-                let mut st = state.lock().await;
-                let sess = match st.sessions.get_mut(&session_name) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                if let Some((pane_id, original_name)) = sess.rename_state.take() {
-                    let tab = match sess.tabs.get_mut(sess.active_tab) {
-                        Some(t) => t,
-                        None => return Ok(()),
-                    };
-                    // Restore the original pane name.
-                    layout::set_pane_name(&mut tab.layout, pane_id, &original_name);
+                tab.focused_pane
+            };
+            let panes_lock = panes.lock().await;
+            if let Some(pane) = panes_lock.get(&pane_id) {
+                if let Err(e) = pane.pty.write_input(&bytes) {
+                    log::error!("failed to write SendKey to pane {pane_id}: {e}");
                 }
             }
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         _ => {
             log::debug!("unhandled command: {cmd:?}");

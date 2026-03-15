@@ -32,8 +32,6 @@ pub struct GeneralConfig {
     pub scrollback_lines: usize,
     /// Interval in seconds between automatic session saves.
     pub auto_save_interval_secs: u64,
-    /// Key used to switch from Insert to Normal mode (e.g. `"Esc"`).
-    pub mode_switch_key: String,
     /// When true (default), mouse text selection auto-copies to clipboard on
     /// release and clears the selection. When false, the selection stays visible
     /// for keyboard adjustment in Visual mode.
@@ -46,7 +44,6 @@ impl Default for GeneralConfig {
             default_shell: None,
             scrollback_lines: 10_000,
             auto_save_interval_secs: 30,
-            mode_switch_key: "Esc".to_string(),
             mouse_auto_yank: true,
         }
     }
@@ -97,27 +94,27 @@ pub enum StatusBarPosition {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ModesConfig {
-    pub normal: NormalModeConfig,
+    pub command: CommandModeConfig,
 }
 
 #[allow(clippy::derivable_impls)]
 impl Default for ModesConfig {
     fn default() -> Self {
         Self {
-            normal: NormalModeConfig::default(),
+            command: CommandModeConfig::default(),
         }
     }
 }
 
-/// Configuration specific to Normal mode.
+/// Configuration specific to Command mode.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
-pub struct NormalModeConfig {
+pub struct CommandModeConfig {
     /// Timeout in milliseconds before the which-key popup appears.
     pub timeout_ms: u64,
 }
 
-impl Default for NormalModeConfig {
+impl Default for CommandModeConfig {
     fn default() -> Self {
         Self { timeout_ms: 500 }
     }
@@ -131,34 +128,32 @@ impl Default for NormalModeConfig {
 ///
 /// Example `config.toml`:
 /// ```toml
-/// [keybindings.normal.t]
-/// _label = "Tab"
-/// n = "TabNew"
-/// c = "TabClose"
-/// r = "TabRename"
+/// [keybindings.command]
+/// leader = "Ctrl-a"
 ///
-/// [keybindings.insert]
-/// Alt-h = "PaneFocusLeft"
-/// Alt-l = "PaneFocusRight"
-/// Alt-n = "TabNext"
+/// [keybindings.command.t]
+/// _label = "Tab"
+/// n = "TabNew; EnterNormal"
+/// c = "TabClose; EnterNormal"
+/// r = "TabRename"
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct KeybindingsConfig {
-    /// Normal mode keybinding overrides (tree-based).
-    pub normal: toml::Value,
+    /// Command mode keybinding overrides (tree-based).
+    pub command: toml::Value,
     /// Visual mode keybinding overrides (tree-based).
     pub visual: toml::Value,
-    /// Insert mode keybinding overrides (flat, modifier keys only).
-    pub insert: toml::Value,
+    /// Deprecated: `[keybindings.normal]` is accepted as an alias for `command`.
+    pub normal: toml::Value,
 }
 
 impl Default for KeybindingsConfig {
     fn default() -> Self {
         Self {
-            normal: toml::Value::Table(toml::map::Map::new()),
+            command: toml::Value::Table(toml::map::Map::new()),
             visual: toml::Value::Table(toml::map::Map::new()),
-            insert: toml::Value::Table(toml::map::Map::new()),
+            normal: toml::Value::Table(toml::map::Map::new()),
         }
     }
 }
@@ -213,14 +208,29 @@ impl Config {
 
     /// Build the effective keybinding tree by starting from defaults and
     /// merging any user-defined overrides from the config file.
+    ///
+    /// Supports both `[keybindings.command]` and the deprecated
+    /// `[keybindings.normal]` section (with a warning).
     pub fn keybinding_tree(&self) -> keybindings::KeybindingTree {
         let mut tree = keybindings::KeybindingTree::default();
 
-        // If the user provided keybinding overrides, parse and merge them.
+        // Check for deprecated [keybindings.normal] first.
         if let Some(table) = self.keybindings.normal.as_table() {
             if !table.is_empty() {
+                log::warn!("[keybindings.normal] is deprecated; use [keybindings.command] instead");
                 if let Some(user_tree) =
                     keybindings::KeybindingTree::from_toml(&self.keybindings.normal)
+                {
+                    tree.merge(&user_tree);
+                }
+            }
+        }
+
+        // Then merge [keybindings.command] on top (takes priority).
+        if let Some(table) = self.keybindings.command.as_table() {
+            if !table.is_empty() {
+                if let Some(user_tree) =
+                    keybindings::KeybindingTree::from_toml(&self.keybindings.command)
                 {
                     tree.merge(&user_tree);
                 }
@@ -230,18 +240,24 @@ impl Config {
         tree
     }
 
-    /// Build the effective insert mode bindings by starting from defaults
-    /// and merging any user-defined overrides.
-    pub fn insert_bindings(&self) -> keybindings::InsertBindings {
-        let mut bindings = keybindings::InsertBindings::default();
-        if let Some(table) = self.keybindings.insert.as_table() {
-            if !table.is_empty() {
-                if let Some(user_bindings) = keybindings::InsertBindings::from_toml(table) {
-                    bindings.merge(&user_bindings);
-                }
+    /// Parse the leader key from the config.
+    ///
+    /// Looks in `[keybindings.command]` for a `leader` key. Falls back to
+    /// `[keybindings.normal]` for backward compatibility. Defaults to Ctrl-a.
+    pub fn leader_key(&self) -> crossterm::event::KeyEvent {
+        // Check [keybindings.command] first.
+        if let Some(table) = self.keybindings.command.as_table() {
+            if table.contains_key("leader") {
+                return keybindings::parse_leader_key(table);
             }
         }
-        bindings
+        // Fall back to deprecated [keybindings.normal].
+        if let Some(table) = self.keybindings.normal.as_table() {
+            if table.contains_key("leader") {
+                return keybindings::parse_leader_key(table);
+            }
+        }
+        keybindings::default_leader_key()
     }
 }
 
@@ -258,8 +274,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.general.scrollback_lines, 10_000);
         assert_eq!(config.general.auto_save_interval_secs, 30);
-        assert_eq!(config.general.mode_switch_key, "Esc");
-        assert_eq!(config.modes.normal.timeout_ms, 500);
+        assert_eq!(config.modes.command.timeout_ms, 500);
         assert_eq!(
             config.appearance.status_bar_position,
             StatusBarPosition::Bottom
@@ -286,17 +301,16 @@ mod tests {
             default_shell = "/bin/zsh"
             scrollback_lines = 20000
             auto_save_interval_secs = 60
-            mode_switch_key = "Esc"
 
             [appearance]
             status_bar_position = "top"
 
-            [modes.normal]
+            [modes.command]
             timeout_ms = 300
 
-            [keybindings.normal.t]
+            [keybindings.command.t]
             _label = "Tab"
-            n = "TabNew"
+            n = "TabNew; EnterNormal"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.default_shell, Some("/bin/zsh".to_string()));
@@ -305,13 +319,13 @@ mod tests {
             config.appearance.status_bar_position,
             StatusBarPosition::Top
         );
-        assert_eq!(config.modes.normal.timeout_ms, 300);
+        assert_eq!(config.modes.command.timeout_ms, 300);
     }
 
     #[test]
     fn keybinding_tree_merges_user_overrides() {
         let toml_str = r#"
-            [keybindings.normal.t]
+            [keybindings.command.t]
             _label = "Tab"
             x = "TabExtra"
         "#;
@@ -320,6 +334,19 @@ mod tests {
         // Default 'n' for tab should still exist.
         assert!(tree.lookup(&['t', 'n']).is_some());
         // User-added 'x' should also exist.
+        assert!(tree.lookup(&['t', 'x']).is_some());
+    }
+
+    #[test]
+    fn keybinding_tree_deprecated_normal_still_works() {
+        let toml_str = r#"
+            [keybindings.normal.t]
+            _label = "Tab"
+            x = "TabExtra"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let tree = config.keybinding_tree();
+        // User-added 'x' via deprecated [keybindings.normal] should work.
         assert!(tree.lookup(&['t', 'x']).is_some());
     }
 
@@ -374,40 +401,22 @@ mod tests {
     }
 
     #[test]
-    fn default_insert_bindings() {
+    fn leader_key_default() {
         let config = Config::default();
-        let bindings = config.insert_bindings();
-        // Default bindings should have at least one entry.
-        assert!(!bindings.bindings.is_empty());
+        let leader = config.leader_key();
+        assert_eq!(leader.code, crossterm::event::KeyCode::Char('a'));
+        assert_eq!(leader.modifiers, crossterm::event::KeyModifiers::CONTROL);
     }
 
     #[test]
-    fn insert_bindings_merge_user_overrides() {
+    fn leader_key_from_command_section() {
         let toml_str = r#"
-            [keybindings.insert]
-            "Ctrl-x" = "TabNew"
+            [keybindings.command]
+            leader = "Ctrl-b"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        let bindings = config.insert_bindings();
-        // User-added binding should be present.
-        let key = keybindings::parse_key_notation("Ctrl-x").unwrap();
-        assert!(bindings.bindings.contains_key(&key));
-        // Defaults should still be present.
-        assert!(!bindings.bindings.is_empty());
-    }
-
-    #[test]
-    fn insert_bindings_key_group_fails_gracefully() {
-        // A key group (sub-table) in insert mode should be ignored since
-        // insert bindings are flat modifier-key -> action mappings.
-        let toml_str = r#"
-            [keybindings.insert.nested]
-            a = "TabNew"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let bindings = config.insert_bindings();
-        // The from_toml returns None for tables, so defaults are used as-is.
-        // Defaults should still be intact.
-        assert!(!bindings.bindings.is_empty());
+        let leader = config.leader_key();
+        assert_eq!(leader.code, crossterm::event::KeyCode::Char('b'));
+        assert_eq!(leader.modifiers, crossterm::event::KeyModifiers::CONTROL);
     }
 }

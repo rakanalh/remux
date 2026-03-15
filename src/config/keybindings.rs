@@ -9,7 +9,7 @@ use crate::protocol::RemuxCommand;
 // ---------------------------------------------------------------------------
 
 /// A node in the keybinding tree. Either a group of sub-keys or a leaf that
-/// maps to an action string (e.g. `"TabNew"`).
+/// maps to one or more action strings (an action chain).
 #[derive(Debug, Clone)]
 pub enum KeyNode {
     /// An intermediate group that contains sub-keys.
@@ -17,11 +17,11 @@ pub enum KeyNode {
         label: String,
         children: HashMap<char, KeyNode>,
     },
-    /// A terminal binding that maps to an action string.
+    /// A terminal binding that maps to an action chain.
     Leaf {
         label: String,
-        /// Action descriptor, e.g. `"TabNew"`, `"ResizeLeft 5"`.
-        action: String,
+        /// Action chain, e.g. `["TabNew", "EnterNormal"]`.
+        action: Vec<String>,
     },
 }
 
@@ -43,11 +43,19 @@ impl Default for KeybindingTree {
     }
 }
 
-/// Helper to build a leaf node.
+/// Helper to build a leaf node with a single action.
 fn leaf(label: &str, action: &str) -> KeyNode {
     KeyNode::Leaf {
         label: label.to_string(),
-        action: action.to_string(),
+        action: vec![action.to_string()],
+    }
+}
+
+/// Helper to build a leaf node with an action chain.
+pub fn leaf_chain(label: &str, actions: &[&str]) -> KeyNode {
+    KeyNode::Leaf {
+        label: label.to_string(),
+        action: actions.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -68,11 +76,11 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Tab",
             vec![
-                ('n', leaf("new", "TabNew")),
-                ('c', leaf("close", "TabClose")),
+                ('n', leaf_chain("new", &["TabNew", "EnterNormal"])),
+                ('c', leaf_chain("close", &["TabClose", "EnterNormal"])),
                 ('m', leaf("move", "TabMove")),
                 ('r', leaf("rename", "TabRename")),
-                ('l', leaf("list", "TabNext")),
+                ('l', leaf_chain("list", &["TabNext", "EnterNormal"])),
             ],
         ),
     );
@@ -83,17 +91,47 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         group(
             "Pane",
             vec![
-                ('n', leaf("new", "PaneNew")),
-                ('c', leaf("close", "PaneClose")),
-                ('s', leaf("split vertical", "PaneSplitVertical")),
-                ('S', leaf("split horizontal", "PaneSplitHorizontal")),
-                ('h', leaf("focus left", "PaneFocusLeft")),
-                ('j', leaf("focus down", "PaneFocusDown")),
-                ('k', leaf("focus up", "PaneFocusUp")),
-                ('l', leaf("focus right", "PaneFocusRight")),
-                ('a', leaf("stack add", "PaneStackAdd")),
-                (']', leaf("stack next", "PaneStackNext")),
-                ('[', leaf("stack prev", "PaneStackPrev")),
+                ('n', leaf_chain("new", &["PaneNew", "EnterNormal"])),
+                ('c', leaf_chain("close", &["PaneClose", "EnterNormal"])),
+                (
+                    's',
+                    leaf_chain("split vertical", &["PaneSplitVertical", "EnterNormal"]),
+                ),
+                (
+                    'S',
+                    leaf_chain(
+                        "split horizontal",
+                        &["PaneSplitHorizontal", "EnterNormal"],
+                    ),
+                ),
+                (
+                    'h',
+                    leaf_chain("focus left", &["PaneFocusLeft", "EnterNormal"]),
+                ),
+                (
+                    'j',
+                    leaf_chain("focus down", &["PaneFocusDown", "EnterNormal"]),
+                ),
+                (
+                    'k',
+                    leaf_chain("focus up", &["PaneFocusUp", "EnterNormal"]),
+                ),
+                (
+                    'l',
+                    leaf_chain("focus right", &["PaneFocusRight", "EnterNormal"]),
+                ),
+                (
+                    'a',
+                    leaf_chain("stack add", &["PaneStackAdd", "EnterNormal"]),
+                ),
+                (
+                    ']',
+                    leaf_chain("stack next", &["PaneStackNext", "EnterNormal"]),
+                ),
+                (
+                    '[',
+                    leaf_chain("stack prev", &["PaneStackPrev", "EnterNormal"]),
+                ),
                 ('r', leaf("rename", "PaneRename")),
             ],
         ),
@@ -153,12 +191,14 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         ),
     );
 
-    // Direct mode-switch bindings at the root level.
-    root.insert('i', leaf("insert mode", "EnterInsertMode"));
+    // Visual mode binding.
     root.insert('v', leaf("visual mode", "EnterVisualMode"));
 
     // Layout toggle bindings.
-    root.insert('g', leaf("toggle style", "ToggleStyle"));
+    root.insert(
+        'g',
+        leaf_chain("toggle style", &["ToggleStyle", "EnterNormal"]),
+    );
 
     root
 }
@@ -224,9 +264,9 @@ impl KeybindingTree {
 
 fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNode>) {
     for (key, override_node) in overrides {
-        // If the override is a leaf with an empty action, remove the key.
+        // If the override is a leaf with an empty action chain, remove the key.
         if let KeyNode::Leaf { action, .. } = override_node {
-            if action.is_empty() {
+            if action.is_empty() || (action.len() == 1 && action[0].is_empty()) {
                 base.remove(key);
                 continue;
             }
@@ -263,7 +303,7 @@ fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNo
 // ---------------------------------------------------------------------------
 
 impl KeybindingTree {
-    /// Parse a keybinding tree from the `[keybindings.normal]` section of the
+    /// Parse a keybinding tree from the `[keybindings.command]` section of the
     /// TOML config. The `value` should be the table at that path.
     pub fn from_toml(value: &toml::Value) -> Option<Self> {
         let table = value.as_table()?;
@@ -288,10 +328,18 @@ fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char
         };
 
         let node = match value {
-            toml::Value::String(action) => KeyNode::Leaf {
-                label: action.clone(),
-                action: action.clone(),
-            },
+            toml::Value::String(action_str) => {
+                // Split on semicolons to support action chains in TOML.
+                let actions: Vec<String> = action_str
+                    .split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                KeyNode::Leaf {
+                    label: action_str.clone(),
+                    action: actions,
+                }
+            }
             toml::Value::Table(sub) => {
                 let sub_label = sub
                     .get("_label")
@@ -391,9 +439,38 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "BufferSearch" => Some(RemuxCommand::BufferSearch),
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "SessionSave" => Some(RemuxCommand::SessionSave),
-        "EnterInsertMode" => Some(RemuxCommand::EnterInsertMode),
-        "EnterNormalMode" => Some(RemuxCommand::EnterNormalMode),
+        "EnterNormal" => Some(RemuxCommand::EnterNormal),
+        "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),
         "EnterVisualMode" => Some(RemuxCommand::EnterVisualMode),
+        "SendKey" => {
+            // SendKey takes a key notation argument and converts to bytes.
+            let key_notation = args.first().map(|s| s.as_str()).unwrap_or("");
+            if let Some(key_event) = parse_key_notation(key_notation) {
+                // Convert key event to raw bytes for the PTY.
+                let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+                let bytes = if ctrl {
+                    if let KeyCode::Char(c) = key_event.code {
+                        let byte = c.to_ascii_lowercase();
+                        if byte.is_ascii_lowercase() {
+                            vec![byte as u8 - b'a' + 1]
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    }
+                } else if let KeyCode::Char(c) = key_event.code {
+                    let mut buf = [0u8; 4];
+                    c.encode_utf8(&mut buf);
+                    buf[..c.len_utf8()].to_vec()
+                } else {
+                    vec![]
+                };
+                Some(RemuxCommand::SendKey(bytes))
+            } else {
+                None
+            }
+        }
 
         // -- String arg commands ----------------------------------------------
         "TabRename" => {
@@ -556,73 +633,28 @@ fn parse_key_code(s: &str) -> Option<(KeyCode, KeyModifiers)> {
 }
 
 // ---------------------------------------------------------------------------
-// Insert-mode bindings
+// Leader key configuration
 // ---------------------------------------------------------------------------
 
-/// Flat keybinding map for insert mode (no key groups).
-#[derive(Debug, Clone)]
-pub struct InsertBindings {
-    pub bindings: HashMap<KeyEvent, RemuxCommand>,
+/// The default leader key: Ctrl-a.
+pub fn default_leader_key() -> KeyEvent {
+    KeyEvent::new_with_kind_and_state(
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Press,
+        KeyEventState::NONE,
+    )
 }
 
-impl Default for InsertBindings {
-    fn default() -> Self {
-        let mut bindings = HashMap::new();
-        // Default Alt-based bindings.
-        let defaults = [
-            ("Alt-h", RemuxCommand::PaneFocusLeft),
-            ("Alt-j", RemuxCommand::PaneFocusDown),
-            ("Alt-k", RemuxCommand::PaneFocusUp),
-            ("Alt-l", RemuxCommand::PaneFocusRight),
-            ("Alt-n", RemuxCommand::TabNext),
-            ("Alt-p", RemuxCommand::TabPrev),
-        ];
-        for (notation, cmd) in defaults {
-            if let Some(key) = parse_key_notation(notation) {
-                bindings.insert(key, cmd);
-            }
-        }
-        InsertBindings { bindings }
-    }
-}
-
-impl InsertBindings {
-    /// Build from a TOML table. All values must be strings (no nested tables).
-    /// Returns `None` if any value is a table (key groups not allowed in insert
-    /// mode).
-    pub fn from_toml(table: &toml::map::Map<String, toml::Value>) -> Option<Self> {
-        let mut bindings = HashMap::new();
-        for (key_str, value) in table {
-            if key_str.starts_with('_') {
-                continue;
-            }
-            match value {
-                toml::Value::String(cmd_str) => {
-                    if cmd_str.is_empty() {
-                        continue; // skip unbinds
-                    }
-                    let key_event = parse_key_notation(key_str)?;
-                    let cmd = parse_command(cmd_str)?;
-                    bindings.insert(key_event, cmd);
-                }
-                toml::Value::Table(_) => return None, // key groups not allowed
-                _ => continue,
-            }
-        }
-        Some(InsertBindings { bindings })
-    }
-
-    /// Merge user bindings on top of defaults. Empty string values remove the
-    /// binding.
-    pub fn merge(&mut self, overrides: &InsertBindings) {
-        for (key, cmd) in &overrides.bindings {
-            self.bindings.insert(*key, cmd.clone());
-        }
-    }
-
-    /// Look up a key event in the insert bindings.
-    pub fn lookup(&self, key: &KeyEvent) -> Option<&RemuxCommand> {
-        self.bindings.get(key)
+/// Parse the leader key from a TOML keybindings.command table.
+///
+/// Looks for a `leader` key in the table. If found, parses it via
+/// `parse_key_notation`. Returns the default leader key if not found.
+pub fn parse_leader_key(table: &toml::map::Map<String, toml::Value>) -> KeyEvent {
+    if let Some(toml::Value::String(notation)) = table.get("leader") {
+        parse_key_notation(notation).unwrap_or_else(default_leader_key)
+    } else {
+        default_leader_key()
     }
 }
 
@@ -641,8 +673,12 @@ mod tests {
         assert_eq!(parse_command("TabNew"), Some(RemuxCommand::TabNew));
         assert_eq!(parse_command("PaneClose"), Some(RemuxCommand::PaneClose));
         assert_eq!(
-            parse_command("EnterInsertMode"),
-            Some(RemuxCommand::EnterInsertMode)
+            parse_command("EnterNormal"),
+            Some(RemuxCommand::EnterNormal)
+        );
+        assert_eq!(
+            parse_command("EnterCommandMode"),
+            Some(RemuxCommand::EnterCommandMode)
         );
         assert_eq!(
             parse_command("EnterVisualMode"),
@@ -845,9 +881,10 @@ mod tests {
         assert!(tree.root.contains_key(&'f'));
         assert!(tree.root.contains_key(&'b'));
         assert!(tree.root.contains_key(&'r'));
-        assert!(tree.root.contains_key(&'i'));
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
+        // 'i' (EnterInsertMode) was removed in the leader-key-modes refactor.
+        assert!(!tree.root.contains_key(&'i'));
     }
 
     #[test]
@@ -855,7 +892,9 @@ mod tests {
         let tree = KeybindingTree::default();
         let node = tree.lookup(&['t', 'n']).unwrap();
         match node {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "TabNew"),
+            KeyNode::Leaf { action, .. } => {
+                assert!(action.contains(&"TabNew".to_string()));
+            }
             other => panic!("expected leaf, got {other:?}"),
         }
     }
@@ -885,7 +924,7 @@ mod tests {
         let tree = KeybindingTree::default();
         let children = tree.children_at(&[]).unwrap();
         assert!(!children.is_empty());
-        assert!(children.iter().any(|(k, _)| *k == 'i'));
+        assert!(children.iter().any(|(k, _)| *k == 'v'));
     }
 
     #[test]
@@ -910,7 +949,7 @@ mod tests {
         let node = tree.lookup(&['g']).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
-                assert_eq!(action, "ToggleStyle");
+                assert!(action.contains(&"ToggleStyle".to_string()));
                 assert_eq!(label, "toggle style");
             }
             other => panic!("expected leaf for 'g', got {other:?}"),
@@ -935,7 +974,7 @@ mod tests {
         let node = tree.lookup(&['p', 'r']).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
-                assert_eq!(action, "PaneRename");
+                assert_eq!(action, &vec!["PaneRename".to_string()]);
                 assert_eq!(label, "rename");
             }
             other => panic!("expected leaf for 'p' -> 'r', got {other:?}"),
@@ -947,20 +986,20 @@ mod tests {
     #[test]
     fn merge_unbinds_with_empty_action() {
         let mut base = KeybindingTree::default();
-        assert!(base.root.contains_key(&'i'));
+        assert!(base.root.contains_key(&'v'));
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                'i',
+                'v',
                 KeyNode::Leaf {
                     label: String::new(),
-                    action: String::new(),
+                    action: vec![String::new()],
                 },
             )]),
         };
         base.merge(&overrides);
         assert!(
-            !base.root.contains_key(&'i'),
-            "'i' key should have been removed by empty-action override"
+            !base.root.contains_key(&'v'),
+            "'v' key should have been removed by empty-action override"
         );
     }
 
@@ -979,7 +1018,7 @@ mod tests {
                         'n',
                         KeyNode::Leaf {
                             label: String::new(),
-                            action: String::new(),
+                            action: vec![String::new()],
                         },
                     )]),
                 },
@@ -1002,7 +1041,7 @@ mod tests {
                 'x',
                 KeyNode::Leaf {
                     label: "custom".into(),
-                    action: "TabNew".into(),
+                    action: vec!["TabNew".into()],
                 },
             )]),
         };
@@ -1015,16 +1054,16 @@ mod tests {
         let mut base = KeybindingTree::default();
         let overrides = KeybindingTree {
             root: HashMap::from([(
-                'i',
+                'v',
                 KeyNode::Leaf {
-                    label: "custom insert".into(),
-                    action: "SessionDetach".into(),
+                    label: "custom".into(),
+                    action: vec!["SessionDetach".into()],
                 },
             )]),
         };
         base.merge(&overrides);
-        match &base.root[&'i'] {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "SessionDetach"),
+        match &base.root[&'v'] {
+            KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["SessionDetach".to_string()]),
             other => panic!("expected leaf, got {other:?}"),
         }
     }
@@ -1041,7 +1080,7 @@ mod tests {
                         'x',
                         KeyNode::Leaf {
                             label: "extra".into(),
-                            action: "TabNew".into(),
+                            action: vec!["TabNew".into()],
                         },
                     )]),
                 },
@@ -1068,7 +1107,26 @@ mod tests {
         let tree = KeybindingTree::from_toml(&value).unwrap();
         let node = tree.lookup(&['t', 'n']).unwrap();
         match node {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "TabNew"),
+            KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["TabNew".to_string()]),
+            other => panic!("expected leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_action_chain() {
+        let toml_str = r#"
+            n = "TabNew; EnterNormal"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let tree = KeybindingTree::from_toml(&value).unwrap();
+        let node = tree.lookup(&['n']).unwrap();
+        match node {
+            KeyNode::Leaf { action, .. } => {
+                assert_eq!(
+                    action,
+                    &vec!["TabNew".to_string(), "EnterNormal".to_string()]
+                );
+            }
             other => panic!("expected leaf, got {other:?}"),
         }
     }
@@ -1087,73 +1145,48 @@ mod tests {
         let tree = KeybindingTree::from_toml(&value).unwrap();
         let node = tree.lookup(&['t', 's', 'a']).unwrap();
         match node {
-            KeyNode::Leaf { action, .. } => assert_eq!(action, "TabClose"),
+            KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["TabClose".to_string()]),
             other => panic!("expected leaf, got {other:?}"),
         }
     }
 
-    // -- InsertBindings tests -------------------------------------------------
+    // -- Leader key tests -----------------------------------------------------
 
     #[test]
-    fn insert_bindings_default_has_alt_h() {
-        let bindings = InsertBindings::default();
-        let key = parse_key_notation("Alt-h").unwrap();
-        assert_eq!(bindings.lookup(&key), Some(&RemuxCommand::PaneFocusLeft));
+    fn default_leader_key_is_ctrl_a() {
+        let leader = default_leader_key();
+        assert_eq!(leader.code, KeyCode::Char('a'));
+        assert_eq!(leader.modifiers, KeyModifiers::CONTROL);
     }
 
     #[test]
-    fn insert_bindings_default_has_all_defaults() {
-        let bindings = InsertBindings::default();
-        assert_eq!(bindings.bindings.len(), 6);
+    fn parse_leader_key_from_toml() {
+        let mut table = toml::map::Map::new();
+        table.insert("leader".to_string(), toml::Value::String("Ctrl-b".into()));
+        let leader = parse_leader_key(&table);
+        assert_eq!(leader.code, KeyCode::Char('b'));
+        assert_eq!(leader.modifiers, KeyModifiers::CONTROL);
     }
 
     #[test]
-    fn insert_bindings_from_toml() {
-        let toml_str = r#"
-            Ctrl-b = "TabNew"
-            Alt-n = "TabNext"
-        "#;
-        let value: toml::Value = toml_str.parse().unwrap();
-        let table = value.as_table().unwrap();
-        let bindings = InsertBindings::from_toml(table).unwrap();
-        let key = parse_key_notation("Ctrl-b").unwrap();
-        assert_eq!(bindings.lookup(&key), Some(&RemuxCommand::TabNew));
+    fn parse_leader_key_fallback() {
+        let table = toml::map::Map::new();
+        let leader = parse_leader_key(&table);
+        // Should fall back to default (Ctrl-a).
+        assert_eq!(leader.code, KeyCode::Char('a'));
+        assert_eq!(leader.modifiers, KeyModifiers::CONTROL);
+    }
+
+    // -- SendKey command parsing ----------------------------------------------
+
+    #[test]
+    fn parse_command_send_key_ctrl_a() {
+        let cmd = parse_command("SendKey Ctrl-a").unwrap();
+        assert_eq!(cmd, RemuxCommand::SendKey(vec![0x01]));
     }
 
     #[test]
-    fn insert_bindings_from_toml_rejects_tables() {
-        let toml_str = r#"
-            [nested]
-            a = "TabNew"
-        "#;
-        let value: toml::Value = toml_str.parse().unwrap();
-        let table = value.as_table().unwrap();
-        assert!(InsertBindings::from_toml(table).is_none());
-    }
-
-    #[test]
-    fn insert_bindings_merge() {
-        let mut base = InsertBindings::default();
-        let mut overrides_map = HashMap::new();
-        let key = parse_key_notation("Alt-h").unwrap();
-        overrides_map.insert(key, RemuxCommand::TabNew);
-        let overrides = InsertBindings {
-            bindings: overrides_map,
-        };
-        base.merge(&overrides);
-        assert_eq!(base.lookup(&key), Some(&RemuxCommand::TabNew));
-    }
-
-    #[test]
-    fn insert_bindings_from_toml_skips_empty_string() {
-        let toml_str = r#"
-            Alt-h = ""
-            Alt-j = "PaneFocusDown"
-        "#;
-        let value: toml::Value = toml_str.parse().unwrap();
-        let table = value.as_table().unwrap();
-        let bindings = InsertBindings::from_toml(table).unwrap();
-        // Empty string skipped, so only one binding.
-        assert_eq!(bindings.bindings.len(), 1);
+    fn parse_command_send_key_invalid() {
+        assert!(parse_command("SendKey").is_none());
     }
 }
