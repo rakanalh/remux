@@ -21,7 +21,9 @@ use crate::config::{BorderStyle, Config};
 use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
-use crate::server::compositor::{composite, StatusInfo};
+use crate::server::compositor::{
+    composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
+};
 use crate::server::layout::{self, PaneId, Rect};
 use crate::server::pty::{self, Pty};
 use crate::server::session::ServerState;
@@ -99,6 +101,8 @@ struct PaneData {
     pty_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
+// MouseSelection is imported from compositor.
+
 /// A connected client with metadata about which session it is attached to.
 struct ClientConnection {
     session_name: Option<String>,
@@ -108,6 +112,8 @@ struct ClientConnection {
     rows: u16,
     /// The client's current input mode (e.g. "INSERT", "NORMAL", "VISUAL").
     mode: String,
+    /// Active mouse selection, if any.
+    mouse_selection: Option<MouseSelection>,
 }
 
 /// The Remux server.
@@ -247,6 +253,7 @@ impl RemuxServer {
                     cols: 80,
                     rows: 24,
                     mode: "INSERT".to_string(),
+                    mouse_selection: None,
                 },
             );
             id
@@ -379,6 +386,31 @@ async fn handle_client_message(
         }
         ClientMessage::ModeChanged { mode } => {
             handle_mode_changed(client_id, &mode, state, panes, clients, config, prev_frames).await
+        }
+        ClientMessage::MouseClick { x, y } => {
+            handle_mouse_click(client_id, x, y, state, panes, clients, config, prev_frames).await
+        }
+        ClientMessage::MouseDrag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            is_final,
+        } => {
+            handle_mouse_drag(
+                client_id,
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                is_final,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
         }
     }
 }
@@ -1034,6 +1066,276 @@ async fn handle_mode_changed(
 }
 
 // ---------------------------------------------------------------------------
+// Mouse handling
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mouse_click(
+    client_id: u64,
+    x: u16,
+    y: u16,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let (session_name, cols, rows, mode) = {
+        let mut cls = clients.lock().await;
+        let client = match cls.get_mut(&client_id) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        // Clear any active selection on click.
+        client.mouse_selection = None;
+        (
+            client.session_name.clone(),
+            client.cols,
+            client.rows,
+            client.mode.clone(),
+        )
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Build composite to get hit regions and pane rects.
+    update_auto_pane_names(&session_name, state, panes).await;
+    let (_cells, _cx, _cy, _cv, _fpr, hit_regions, pane_rects) =
+        build_composite(&session_name, cols, rows, &mode, state, panes, config, None).await;
+
+    let target = hit_test(x, y, &hit_regions, &pane_rects);
+
+    match target {
+        ClickTarget::Pane(pane_id) => {
+            let mut st = state.lock().await;
+            let sess = match st.sessions.get_mut(&session_name) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let tab = match sess.tabs.get_mut(sess.active_tab) {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            if tab.focused_pane != pane_id {
+                tab.focused_pane = pane_id;
+                drop(st);
+                broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
+                    .await;
+            }
+        }
+        ClickTarget::Tab(tab_index) => {
+            {
+                let mut st = state.lock().await;
+                let _ = st.goto_tab(&session_name, tab_index);
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        ClickTarget::StackLabel(pane_id) => {
+            // Activate the stacked pane.
+            let mut st = state.lock().await;
+            let sess = match st.sessions.get_mut(&session_name) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let tab = match sess.tabs.get_mut(sess.active_tab) {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            // Walk layout to find the stack containing pane_id and set it active.
+            activate_pane_in_stack(&mut tab.layout, pane_id);
+            tab.focused_pane = pane_id;
+            drop(st);
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        ClickTarget::None => {}
+    }
+
+    Ok(())
+}
+
+/// Activate a specific pane within its stack in the layout tree.
+fn activate_pane_in_stack(node: &mut layout::LayoutNode, pane_id: PaneId) {
+    match node {
+        layout::LayoutNode::Stack { panes, active, .. } => {
+            if let Some(pos) = panes.iter().position(|&p| p == pane_id) {
+                *active = pos;
+            }
+        }
+        layout::LayoutNode::Split { first, second, .. } => {
+            activate_pane_in_stack(first, pane_id);
+            activate_pane_in_stack(second, pane_id);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mouse_drag(
+    client_id: u64,
+    start_x: u16,
+    start_y: u16,
+    end_x: u16,
+    end_y: u16,
+    is_final: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let (session_name, cols, rows, mode) = {
+        let cls = clients.lock().await;
+        let client = match cls.get(&client_id) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        (
+            client.session_name.clone(),
+            client.cols,
+            client.rows,
+            client.mode.clone(),
+        )
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Build composite to get pane rects for coordinate mapping.
+    update_auto_pane_names(&session_name, state, panes).await;
+    let (_cells, _cx, _cy, _cv, _fpr, hit_regions, pane_rects) =
+        build_composite(&session_name, cols, rows, &mode, state, panes, config, None).await;
+
+    // Find which pane the drag started in.
+    let start_target = hit_test(start_x, start_y, &hit_regions, &pane_rects);
+    let target_pane = match start_target {
+        ClickTarget::Pane(id) => id,
+        _ => return Ok(()),
+    };
+
+    // Find the pane's rect for coordinate mapping.
+    let pane_rect = match pane_rects.iter().find(|(id, _)| *id == target_pane) {
+        Some((_, r)) => *r,
+        None => return Ok(()),
+    };
+
+    // Compute border offset based on style.
+    let border_offset: u16 = match config.appearance.border_style {
+        BorderStyle::ZellijStyle if pane_rect.width >= 3 && pane_rect.height >= 3 => 1,
+        _ => 0,
+    };
+    let content_width = pane_rect.width.saturating_sub(border_offset * 2);
+    let content_height = pane_rect.height.saturating_sub(border_offset * 2);
+
+    // Map screen coordinates to pane-local coordinates (relative to content area).
+    let local_start_x = start_x.saturating_sub(pane_rect.x + border_offset);
+    let local_start_y = start_y.saturating_sub(pane_rect.y + border_offset);
+    let local_end_x = end_x
+        .saturating_sub(pane_rect.x + border_offset)
+        .min(content_width.saturating_sub(1));
+    let local_end_y = end_y
+        .saturating_sub(pane_rect.y + border_offset)
+        .min(content_height.saturating_sub(1));
+
+    // Always update selection state so highlighting renders during drag.
+    {
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            client.mouse_selection = Some(MouseSelection {
+                pane_id: target_pane,
+                start: (local_start_x, local_start_y),
+                end: (local_end_x, local_end_y),
+            });
+        }
+    }
+
+    if is_final {
+        // Mouse button released -- decide based on mouse_auto_yank config.
+        if config.general.mouse_auto_yank {
+            // Extract text from the pane's screen.
+            let selected_text = {
+                let ps = panes.lock().await;
+                if let Some(pane_data) = ps.get(&target_pane) {
+                    extract_selection_text(
+                        &pane_data.screen,
+                        local_start_x,
+                        local_start_y,
+                        local_end_x,
+                        local_end_y,
+                    )
+                } else {
+                    String::new()
+                }
+            };
+
+            if !selected_text.is_empty() {
+                let cls = clients.lock().await;
+                if let Some(client) = cls.get(&client_id) {
+                    let _ = client.tx.send(ServerMessage::CopyToClipboard {
+                        data: selected_text,
+                    });
+                }
+            }
+
+            // Clear selection state after copying.
+            {
+                let mut cls = clients.lock().await;
+                if let Some(client) = cls.get_mut(&client_id) {
+                    client.mouse_selection = None;
+                }
+            }
+        }
+        // When mouse_auto_yank is false, selection stays visible for keyboard
+        // adjustment in visual mode. No copy, no clear.
+    }
+
+    // Trigger re-render to show/update/clear selection highlighting.
+    broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+
+    Ok(())
+}
+
+/// Extract text from a pane's screen buffer within the given pane-local
+/// coordinate range.
+fn extract_selection_text(
+    screen: &Screen,
+    start_x: u16,
+    start_y: u16,
+    end_x: u16,
+    end_y: u16,
+) -> String {
+    // Normalize so start <= end.
+    let (sy, sx, ey, ex) = if (start_y, start_x) <= (end_y, end_x) {
+        (start_y, start_x, end_y, end_x)
+    } else {
+        (end_y, end_x, start_y, start_x)
+    };
+
+    let mut result = String::new();
+    for row in sy..=ey {
+        let r = row as usize;
+        if r >= screen.grid.len() {
+            break;
+        }
+        let row_data = &screen.grid[r];
+        let col_start = if row == sy { sx as usize } else { 0 };
+        let col_end = if row == ey {
+            (ex as usize + 1).min(row_data.len())
+        } else {
+            row_data.len()
+        };
+
+        let text: String = row_data[col_start..col_end].iter().map(|c| c.c).collect();
+        if row > sy {
+            result.push('\n');
+        }
+        result.push_str(text.trim_end());
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Pane management helpers
 // ---------------------------------------------------------------------------
 
@@ -1119,16 +1421,29 @@ async fn send_full_render_to_client(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let mode = {
+    let (mode, selection) = {
         let cls = clients.lock().await;
-        cls.get(&client_id)
+        let client = cls.get(&client_id);
+        let mode = client
             .map(|c| c.mode.clone())
-            .unwrap_or_else(|| "INSERT".to_string())
+            .unwrap_or_else(|| "INSERT".to_string());
+        let selection = client.and_then(|c| c.mouse_selection.clone());
+        (mode, selection)
     };
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
-    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect) =
-        build_composite(session_name, cols, rows, &mode, state, panes, config).await;
+    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect, _hit_regions, _pane_rects) =
+        build_composite(
+            session_name,
+            cols,
+            rows,
+            &mode,
+            state,
+            panes,
+            config,
+            selection.as_ref(),
+        )
+        .await;
     {
         let mut pf = prev_frames.lock().await;
         pf.insert(session_name.to_string(), cells.clone());
@@ -1153,7 +1468,7 @@ async fn broadcast_full_render(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (cols, rows, mode) = {
+    let (cols, rows, mode, selection) = {
         let cls = clients.lock().await;
         let attached: Vec<_> = cls
             .values()
@@ -1164,19 +1479,30 @@ async fn broadcast_full_render(
         }
         let cols = attached.iter().map(|c| c.cols).min().unwrap_or(80);
         let rows = attached.iter().map(|c| c.rows).min().unwrap_or(24);
-        // Use the mode from the first attached client.
-        let mode = attached
-            .first()
+        // Use the mode and selection from the first attached client.
+        let first = attached.first();
+        let mode = first
             .map(|c| c.mode.clone())
             .unwrap_or_else(|| "INSERT".to_string());
-        (cols, rows, mode)
+        let selection = first.and_then(|c| c.mouse_selection.clone());
+        (cols, rows, mode, selection)
     };
 
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
 
-    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect) =
-        build_composite(session_name, cols, rows, &mode, state, panes, config).await;
+    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect, _hit_regions, _pane_rects) =
+        build_composite(
+            session_name,
+            cols,
+            rows,
+            &mode,
+            state,
+            panes,
+            config,
+            selection.as_ref(),
+        )
+        .await;
 
     let msg = {
         let prev_frames_map = prev_frames.lock().await;
@@ -1264,6 +1590,7 @@ async fn update_auto_pane_names(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_composite(
     session_name: &str,
     cols: u16,
@@ -1272,7 +1599,16 @@ async fn build_composite(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     _config: &Arc<Config>,
-) -> (Vec<Vec<RenderCell>>, u16, u16, bool, Option<PaneRect>) {
+    selection: Option<&MouseSelection>,
+) -> (
+    Vec<Vec<RenderCell>>,
+    u16,
+    u16,
+    bool,
+    Option<PaneRect>,
+    HitRegions,
+    Vec<(PaneId, Rect)>,
+) {
     let st = state.lock().await;
     let sess = match st.sessions.get(session_name) {
         Some(s) => s,
@@ -1283,6 +1619,8 @@ async fn build_composite(
                 0,
                 false,
                 None,
+                HitRegions::default(),
+                Vec::new(),
             );
         }
     };
@@ -1295,6 +1633,8 @@ async fn build_composite(
                 0,
                 false,
                 None,
+                HitRegions::default(),
+                Vec::new(),
             );
         }
     };
@@ -1327,7 +1667,7 @@ async fn build_composite(
             .collect(),
     };
 
-    let cells = composite(
+    let (cells, hit_regions) = composite(
         &tab.layout,
         &pane_screens,
         area,
@@ -1337,6 +1677,7 @@ async fn build_composite(
         rows,
         0,
         tab.focused_pane,
+        selection,
     );
 
     // If there is an active rename, place the cursor in the pane's border
@@ -1374,10 +1715,9 @@ async fn build_composite(
                     }
                 }
                 BorderStyle::TmuxStyle => {
-                    let has_tab_bar =
-                        layout::find_stack_for_pane(&tab.layout, tab.focused_pane)
-                            .map(|panes| panes.len() > 1)
-                            .unwrap_or(false);
+                    let has_tab_bar = layout::find_stack_for_pane(&tab.layout, tab.focused_pane)
+                        .map(|panes| panes.len() > 1)
+                        .unwrap_or(false);
                     if has_tab_bar {
                         (0, 1, 0, 0) // tab bar takes 1 row at top
                     } else {
@@ -1389,14 +1729,13 @@ async fn build_composite(
         });
 
     // Build the focused pane rect for the client (content area, excluding borders).
-    let focused_pane_rect = focused_rect_and_offsets.map(|(rect, x_off, y_off, x_off_end, y_off_end)| {
-        PaneRect {
+    let focused_pane_rect =
+        focused_rect_and_offsets.map(|(rect, x_off, y_off, x_off_end, y_off_end)| PaneRect {
             x: rect.x + x_off,
             y: rect.y + y_off,
             width: rect.width.saturating_sub(x_off + x_off_end),
             height: rect.height.saturating_sub(y_off + y_off_end),
-        }
-    });
+        });
 
     let (cursor_x, cursor_y, cursor_visible) = if let Some(rc) = rename_cursor {
         rc
@@ -1414,7 +1753,15 @@ async fn build_composite(
         (0, 0, false)
     };
 
-    (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect)
+    (
+        cells,
+        cursor_x,
+        cursor_y,
+        cursor_visible,
+        focused_pane_rect,
+        hit_regions,
+        pane_rects,
+    )
 }
 
 fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellChange> {

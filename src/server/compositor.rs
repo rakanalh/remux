@@ -11,6 +11,98 @@ use crate::screen::{Cell, Color, Screen};
 use crate::server::layout::{self, LayoutNode, PaneId, Rect};
 
 // ---------------------------------------------------------------------------
+// Mouse selection (shared with daemon)
+// ---------------------------------------------------------------------------
+
+/// Describes an active mouse text selection for a specific pane.
+///
+/// Coordinates are in pane-local space (relative to the pane's content area).
+#[derive(Debug, Clone)]
+pub struct MouseSelection {
+    /// The pane that owns this selection.
+    pub pane_id: PaneId,
+    /// Start position (col, row) in pane-local coordinates.
+    pub start: (u16, u16),
+    /// End position (col, row) in pane-local coordinates.
+    pub end: (u16, u16),
+}
+
+// ---------------------------------------------------------------------------
+// Hit testing
+// ---------------------------------------------------------------------------
+
+/// Result of a hit test at a given screen coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickTarget {
+    /// Click landed inside a pane's content area.
+    Pane(PaneId),
+    /// Click landed on a tab label in the status bar.
+    Tab(usize),
+    /// Click landed on a stack label (pane tab in a multi-pane stack header).
+    StackLabel(PaneId),
+    /// Click did not hit any interactive region.
+    None,
+}
+
+/// A tracked screen region for a tab label.
+#[derive(Debug, Clone)]
+pub struct TabRegion {
+    pub x_start: u16,
+    pub x_end: u16,
+    pub y: u16,
+    pub tab_index: usize,
+}
+
+/// A tracked screen region for a stack (pane tab) label.
+#[derive(Debug, Clone)]
+pub struct StackRegion {
+    pub x_start: u16,
+    pub x_end: u16,
+    pub y: u16,
+    pub pane_id: PaneId,
+}
+
+/// Regions collected during compositing for hit testing.
+#[derive(Debug, Clone, Default)]
+pub struct HitRegions {
+    pub tab_regions: Vec<TabRegion>,
+    pub stack_regions: Vec<StackRegion>,
+}
+
+/// Perform a hit test at the given screen coordinates.
+///
+/// Checks tab labels first, then stack labels, then pane content areas.
+pub fn hit_test(
+    x: u16,
+    y: u16,
+    regions: &HitRegions,
+    pane_rects: &[(PaneId, Rect)],
+) -> ClickTarget {
+    // Check tab labels first (status bar).
+    for region in &regions.tab_regions {
+        if y == region.y && x >= region.x_start && x < region.x_end {
+            return ClickTarget::Tab(region.tab_index);
+        }
+    }
+
+    // Check stack labels (pane tab headers).
+    for region in &regions.stack_regions {
+        if y == region.y && x >= region.x_start && x < region.x_end {
+            return ClickTarget::StackLabel(region.pane_id);
+        }
+    }
+
+    // Check pane content areas.
+    for &(pane_id, rect) in pane_rects {
+        if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            return ClickTarget::Pane(pane_id);
+        }
+    }
+
+    ClickTarget::None
+}
+
+// ---------------------------------------------------------------------------
 // Status info (passed from the daemon)
 // ---------------------------------------------------------------------------
 
@@ -70,8 +162,10 @@ pub fn composite(
     total_rows: u16,
     gap_size: u16,
     focused_pane: PaneId,
-) -> Vec<Vec<RenderCell>> {
+    selection: Option<&MouseSelection>,
+) -> (Vec<Vec<RenderCell>>, HitRegions) {
     let mut buffer = vec![vec![RenderCell::default(); total_cols as usize]; total_rows as usize];
+    let mut hit_regions = HitRegions::default();
 
     let pane_rects = layout::compute_layout(layout, area, gap_size);
 
@@ -86,6 +180,7 @@ pub fn composite(
                 layout,
                 focused_pane,
                 mode,
+                &mut hit_regions,
             );
         }
         BorderStyle::TmuxStyle => {
@@ -98,14 +193,98 @@ pub fn composite(
                 layout,
                 focused_pane,
                 mode,
+                &mut hit_regions,
             );
         }
     }
 
-    // Draw status bar on the last row.
-    draw_status_bar(&mut buffer, total_cols, total_rows, status_info);
+    // Apply selection highlighting (invert fg/bg for selected cells).
+    if let Some(sel) = selection {
+        if let Some((_, pane_rect)) = pane_rects.iter().find(|(id, _)| *id == sel.pane_id) {
+            apply_selection_highlight(&mut buffer, sel, pane_rect, border_style);
+        }
+    }
 
-    buffer
+    // Draw status bar on the last row.
+    draw_status_bar(
+        &mut buffer,
+        total_cols,
+        total_rows,
+        status_info,
+        &mut hit_regions,
+    );
+
+    (buffer, hit_regions)
+}
+
+/// Apply fg/bg inversion for cells within the mouse selection range.
+///
+/// Selection coordinates are in pane-local space; they are mapped to screen
+/// coordinates using the pane's rect and the border offsets.
+fn apply_selection_highlight(
+    buffer: &mut [Vec<RenderCell>],
+    sel: &MouseSelection,
+    pane_rect: &Rect,
+    border_style: &BorderStyle,
+) {
+    // Compute the content offset inside the pane rect (skip borders).
+    let (x_off, y_off) = match border_style {
+        BorderStyle::ZellijStyle => {
+            if pane_rect.width >= 3 && pane_rect.height >= 3 {
+                (1u16, 1u16)
+            } else {
+                (0, 0)
+            }
+        }
+        BorderStyle::TmuxStyle => (0, 0),
+    };
+
+    // Normalize selection so start <= end in reading order.
+    let (start, end) = normalize_selection(sel.start, sel.end);
+
+    let (start_col, start_row) = start;
+    let (end_col, end_row) = end;
+
+    for row in start_row..=end_row {
+        let screen_row = (pane_rect.y + y_off + row) as usize;
+        if screen_row >= buffer.len() {
+            continue;
+        }
+
+        let row_start_col = if row == start_row { start_col } else { 0 };
+        let row_end_col = if row == end_row {
+            end_col
+        } else {
+            pane_rect.width.saturating_sub(x_off * 2).saturating_sub(1)
+        };
+
+        for col in row_start_col..=row_end_col {
+            let screen_col = (pane_rect.x + x_off + col) as usize;
+            if screen_col >= buffer[screen_row].len() {
+                continue;
+            }
+            let cell = &mut buffer[screen_row][screen_col];
+            // Set light grey background for selection.
+            cell.bg = CellColor::Indexed(7);
+            // Ensure foreground contrasts with selection background.
+            match &cell.fg {
+                CellColor::Default | CellColor::Indexed(7) => {
+                    cell.fg = CellColor::Indexed(0); // Black text on light grey
+                }
+                _ => {} // Keep colored text as-is
+            }
+        }
+    }
+}
+
+/// Normalize a selection so that the start position comes before the end
+/// position in reading order (top-to-bottom, left-to-right).
+fn normalize_selection(start: (u16, u16), end: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if start.1 < end.1 || (start.1 == end.1 && start.0 <= end.0) {
+        (start, end)
+    } else {
+        (end, start)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +303,7 @@ fn draw_zellij_panes(
     layout: &LayoutNode,
     focused_pane: PaneId,
     mode: &str,
+    hit_regions: &mut HitRegions,
 ) {
     for &(pane_id, rect) in pane_rects {
         if rect.width == 0 || rect.height == 0 {
@@ -195,6 +375,42 @@ fn draw_zellij_panes(
         let available_width = w.saturating_sub(2); // inside the two corner chars
         let top_content =
             build_top_border_content(&stack_info, pane_id, &border_fg, mode, available_width);
+
+        // Track stack label regions for hit testing (multi-pane stacks).
+        if let Some((names, pane_ids, _active_idx)) = &stack_info {
+            if pane_ids.len() > 1 {
+                // Compute positions of each tab label in the top border.
+                // Layout: corner + space + [tab0] + " | " + [tab1] + ... + space + corner
+                let max_name_len = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        if n.is_empty() {
+                            format!("{}", pane_ids[i]).len()
+                        } else {
+                            n.chars().count()
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let tab_width = (max_name_len + 2).min(available_width);
+                // Start after corner (x) + 1 (space)
+                let mut label_x = (x + 1 + 1) as u16; // corner + leading space
+                for (i, pid) in pane_ids.iter().enumerate() {
+                    if i > 0 {
+                        label_x += 3; // " | " separator
+                    }
+                    let label_end = label_x + tab_width as u16;
+                    hit_regions.stack_regions.push(StackRegion {
+                        x_start: label_x,
+                        x_end: label_end,
+                        y: y as u16,
+                        pane_id: *pid,
+                    });
+                    label_x = label_end;
+                }
+            }
+        }
 
         // Write the top border: fill between corners.
         let top_start = x + 1;
@@ -419,6 +635,7 @@ fn draw_tmux_panes(
     layout: &LayoutNode,
     _focused_pane: PaneId,
     mode: &str,
+    hit_regions: &mut HitRegions,
 ) {
     for &(pane_id, rect) in pane_rects {
         if rect.width == 0 || rect.height == 0 {
@@ -438,7 +655,7 @@ fn draw_tmux_panes(
 
         if is_multi && rect.height >= 2 {
             // Draw 1-row tab bar at the top, content below.
-            draw_tmux_tab_bar(buffer, rect, &stack_info, mode);
+            draw_tmux_tab_bar(buffer, rect, &stack_info, mode, hit_regions);
 
             let content_rect = Rect {
                 x: rect.x,
@@ -465,6 +682,7 @@ fn draw_tmux_tab_bar(
     rect: Rect,
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
     mode: &str,
+    hit_regions: &mut HitRegions,
 ) {
     let y = rect.y as usize;
     let x_start = rect.x as usize;
@@ -542,6 +760,16 @@ fn draw_tmux_tab_bar(
                 }
             }
         }
+
+        // Track the stack label region for hit testing.
+        let label_start = col as u16;
+        let label_end = (col + tab_width).min(x_end) as u16;
+        hit_regions.stack_regions.push(StackRegion {
+            x_start: label_start,
+            x_end: label_end,
+            y: y as u16,
+            pane_id: pane_ids[i],
+        });
 
         let is_active = i == active_idx;
         let (fg, bg, bold) = if is_active {
@@ -697,7 +925,13 @@ fn set_cell(buffer: &mut [Vec<RenderCell>], row: usize, col: usize, cell: Render
 // ---------------------------------------------------------------------------
 
 /// Draw the status bar on the last row of the buffer.
-fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &StatusInfo) {
+fn draw_status_bar(
+    buffer: &mut [Vec<RenderCell>],
+    cols: u16,
+    rows: u16,
+    info: &StatusInfo,
+    hit_regions: &mut HitRegions,
+) {
     let bar_row = (rows as usize).saturating_sub(1);
     if bar_row >= buffer.len() {
         return;
@@ -804,6 +1038,7 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
             (CellColor::Indexed(245), CellColor::Indexed(235), false)
         };
 
+        let tab_x_start = x;
         for ch in tab_str.chars() {
             if x < cols && x < buffer[bar_row].len() {
                 buffer[bar_row][x] = RenderCell {
@@ -817,6 +1052,12 @@ fn draw_status_bar(buffer: &mut [Vec<RenderCell>], cols: u16, rows: u16, info: &
             }
             x += 1;
         }
+        hit_regions.tab_regions.push(TabRegion {
+            x_start: tab_x_start as u16,
+            x_end: x as u16,
+            y: bar_row as u16,
+            tab_index: i,
+        });
     }
 }
 
@@ -847,7 +1088,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -857,6 +1098,7 @@ mod tests {
             5,
             0,
             1,
+            None,
         );
 
         assert_eq!(result.len(), 5);
@@ -892,7 +1134,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -902,6 +1144,7 @@ mod tests {
             5,
             0,
             1,
+            None,
         );
 
         // The last row should have the mode indicator.
@@ -935,7 +1178,7 @@ mod tests {
         };
 
         let gap_size = 2;
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -945,6 +1188,7 @@ mod tests {
             9,
             gap_size,
             1,
+            None,
         );
 
         // Compute the pane rects to find where the gap is.
@@ -987,7 +1231,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -997,6 +1241,7 @@ mod tests {
             11,
             0,
             1,
+            None,
         );
 
         // Top-left corner should be ╭.
@@ -1032,7 +1277,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1042,6 +1287,7 @@ mod tests {
             11,
             0,
             1, // pane 1 is focused
+            None,
         );
 
         // Active pane (1) top-left corner should be green (Indexed(2)).
@@ -1079,7 +1325,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1089,6 +1335,7 @@ mod tests {
             11,
             0,
             1,
+            None,
         );
 
         // Both panes should have rounded corners.
@@ -1122,7 +1369,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1132,6 +1379,7 @@ mod tests {
             11,
             0,
             1,
+            None,
         );
 
         // First row should not have tab bar (dark grey background).
@@ -1163,7 +1411,7 @@ mod tests {
         };
 
         // Pane 2 is active (last added).
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1173,6 +1421,7 @@ mod tests {
             11,
             0,
             2,
+            None,
         );
 
         // First row should be the tab bar (inactive tab uses 237 background).
@@ -1200,7 +1449,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1210,6 +1459,7 @@ mod tests {
             11,
             0,
             1,
+            None,
         );
 
         // The top row should contain the pane name "myshell".
@@ -1244,7 +1494,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1254,6 +1504,7 @@ mod tests {
             11,
             0,
             2,
+            None,
         );
 
         // The top row should contain both stacked pane names.
@@ -1287,7 +1538,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1297,6 +1548,7 @@ mod tests {
             11,
             0,
             1,
+            None,
         );
 
         // No border characters should appear in the pane area.
@@ -1340,7 +1592,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1350,6 +1602,7 @@ mod tests {
             11,
             0,
             3,
+            None,
         );
 
         // First row should be a tab bar with all pane names.
@@ -1391,7 +1644,7 @@ mod tests {
             tabs: vec![("tab-1".to_string(), true)],
         };
 
-        let result = composite(
+        let (result, _hit_regions) = composite(
             &layout,
             &pane_screens,
             area,
@@ -1401,6 +1654,7 @@ mod tests {
             11,
             0,
             1,
+            None,
         );
 
         // There should be vertical divider characters between the two panes.
@@ -1409,5 +1663,306 @@ mod tests {
         let divider_col = (r1.x + r1.width - 1) as usize;
         let has_divider = (0..10).any(|row| result[row][divider_col].c == '\u{2502}');
         assert!(has_divider, "expected vertical divider between panes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hit testing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hit_test_pane_interior() {
+        let pane_rects = vec![
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 12,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 40,
+                    y: 0,
+                    width: 40,
+                    height: 12,
+                },
+            ),
+        ];
+        let regions = HitRegions::default();
+
+        assert_eq!(hit_test(5, 5, &regions, &pane_rects), ClickTarget::Pane(1));
+        assert_eq!(hit_test(50, 5, &regions, &pane_rects), ClickTarget::Pane(2));
+    }
+
+    #[test]
+    fn test_hit_test_tab_label() {
+        let pane_rects = vec![(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 23,
+            },
+        )];
+        let regions = HitRegions {
+            tab_regions: vec![
+                TabRegion {
+                    x_start: 20,
+                    x_end: 30,
+                    y: 23,
+                    tab_index: 0,
+                },
+                TabRegion {
+                    x_start: 33,
+                    x_end: 43,
+                    y: 23,
+                    tab_index: 1,
+                },
+            ],
+            stack_regions: vec![],
+        };
+
+        assert_eq!(hit_test(25, 23, &regions, &pane_rects), ClickTarget::Tab(0));
+        assert_eq!(hit_test(35, 23, &regions, &pane_rects), ClickTarget::Tab(1));
+    }
+
+    #[test]
+    fn test_hit_test_stack_label() {
+        let pane_rects = vec![(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 12,
+            },
+        )];
+        let regions = HitRegions {
+            tab_regions: vec![],
+            stack_regions: vec![
+                StackRegion {
+                    x_start: 2,
+                    x_end: 12,
+                    y: 0,
+                    pane_id: 1,
+                },
+                StackRegion {
+                    x_start: 15,
+                    x_end: 25,
+                    y: 0,
+                    pane_id: 2,
+                },
+            ],
+        };
+
+        assert_eq!(
+            hit_test(5, 0, &regions, &pane_rects),
+            ClickTarget::StackLabel(1)
+        );
+        assert_eq!(
+            hit_test(20, 0, &regions, &pane_rects),
+            ClickTarget::StackLabel(2)
+        );
+    }
+
+    #[test]
+    fn test_hit_test_border_gap() {
+        let pane_rects = vec![
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 39,
+                    height: 12,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 41,
+                    y: 0,
+                    width: 39,
+                    height: 12,
+                },
+            ),
+        ];
+        let regions = HitRegions::default();
+
+        // Click in the gap between panes.
+        assert_eq!(hit_test(40, 5, &regions, &pane_rects), ClickTarget::None);
+    }
+
+    #[test]
+    fn test_hit_test_outside() {
+        let pane_rects = vec![(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 23,
+            },
+        )];
+        let regions = HitRegions::default();
+
+        // Below all pane rects, no tab regions defined at this y.
+        assert_eq!(hit_test(5, 24, &regions, &pane_rects), ClickTarget::None);
+    }
+
+    #[test]
+    fn test_hit_test_priority_tab_over_pane() {
+        // Tab label at the same row as the last pane row -- tab should win.
+        let pane_rects = vec![(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+        )];
+        let regions = HitRegions {
+            tab_regions: vec![TabRegion {
+                x_start: 10,
+                x_end: 20,
+                y: 23,
+                tab_index: 0,
+            }],
+            stack_regions: vec![],
+        };
+
+        assert_eq!(hit_test(15, 23, &regions, &pane_rects), ClickTarget::Tab(0));
+    }
+
+    #[test]
+    fn test_hit_test_priority_stack_over_pane() {
+        // Stack label at the top border of a pane -- stack should win.
+        let pane_rects = vec![(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 12,
+            },
+        )];
+        let regions = HitRegions {
+            tab_regions: vec![],
+            stack_regions: vec![StackRegion {
+                x_start: 2,
+                x_end: 12,
+                y: 0,
+                pane_id: 3,
+            }],
+        };
+
+        assert_eq!(
+            hit_test(5, 0, &regions, &pane_rects),
+            ClickTarget::StackLabel(3)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coordinate mapping tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_screen_to_pane_local_mapping() {
+        // Pane at (10, 5) with size 30x10.
+        let pane_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 30,
+            height: 10,
+        };
+
+        // Screen coordinate (15, 8) should map to pane-local (5, 3).
+        let local_x = 15u16.saturating_sub(pane_rect.x);
+        let local_y = 8u16.saturating_sub(pane_rect.y);
+        assert_eq!(local_x, 5);
+        assert_eq!(local_y, 3);
+    }
+
+    #[test]
+    fn test_screen_to_pane_local_clamped() {
+        // Pane at (10, 5) with size 30x10.
+        let pane_rect = Rect {
+            x: 10,
+            y: 5,
+            width: 30,
+            height: 10,
+        };
+
+        // Screen coordinate beyond pane bounds should clamp.
+        let local_x = 50u16
+            .saturating_sub(pane_rect.x)
+            .min(pane_rect.width.saturating_sub(1));
+        let local_y = 20u16
+            .saturating_sub(pane_rect.y)
+            .min(pane_rect.height.saturating_sub(1));
+        assert_eq!(local_x, 29);
+        assert_eq!(local_y, 9);
+    }
+
+    #[test]
+    fn test_screen_to_pane_local_at_origin() {
+        // Pane at (0, 0) with size 80x24.
+        let pane_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+
+        let local_x = 10u16.saturating_sub(pane_rect.x);
+        let local_y = 5u16.saturating_sub(pane_rect.y);
+        assert_eq!(local_x, 10);
+        assert_eq!(local_y, 5);
+    }
+
+    #[test]
+    fn test_hit_regions_populated_by_composite() {
+        // Verify that compositing a layout with tabs produces tab regions.
+        let layout = LayoutNode::new_stack(1);
+        let screen = Screen::new(78, 23, 100);
+        let mut pane_screens = HashMap::new();
+        pane_screens.insert(1, &screen);
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 23,
+        };
+        let status = StatusInfo {
+            mode: "INSERT".to_string(),
+            session_name: "test".to_string(),
+            tabs: vec![("tab-1".to_string(), true), ("tab-2".to_string(), false)],
+        };
+
+        let (_result, hit_regions) = composite(
+            &layout,
+            &pane_screens,
+            area,
+            &BorderStyle::ZellijStyle,
+            &status,
+            80,
+            24,
+            0,
+            1,
+            None,
+        );
+
+        // Should have 2 tab regions (one per tab in status bar).
+        assert_eq!(hit_regions.tab_regions.len(), 2);
+        assert_eq!(hit_regions.tab_regions[0].tab_index, 0);
+        assert_eq!(hit_regions.tab_regions[1].tab_index, 1);
+        // Tab regions should be on the last row.
+        assert_eq!(hit_regions.tab_regions[0].y, 23);
     }
 }

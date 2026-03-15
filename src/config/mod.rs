@@ -34,6 +34,10 @@ pub struct GeneralConfig {
     pub auto_save_interval_secs: u64,
     /// Key used to switch from Insert to Normal mode (e.g. `"Esc"`).
     pub mode_switch_key: String,
+    /// When true (default), mouse text selection auto-copies to clipboard on
+    /// release and clears the selection. When false, the selection stays visible
+    /// for keyboard adjustment in Visual mode.
+    pub mouse_auto_yank: bool,
 }
 
 impl Default for GeneralConfig {
@@ -43,6 +47,7 @@ impl Default for GeneralConfig {
             scrollback_lines: 10_000,
             auto_save_interval_secs: 30,
             mode_switch_key: "Esc".to_string(),
+            mouse_auto_yank: true,
         }
     }
 }

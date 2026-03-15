@@ -21,6 +21,11 @@ auto_save_interval_secs = 30
 # Key used to switch from Insert to Normal mode.
 mode_switch_key = "Esc"
 
+# When true (default), mouse text selection auto-copies to clipboard on release
+# and clears the selection. When false, selection stays visible for keyboard
+# adjustment in Visual mode.
+mouse_auto_yank = true
+
 # -----------------------------------------------------------------------------
 # Appearance
 # -----------------------------------------------------------------------------
