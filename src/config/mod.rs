@@ -59,6 +59,7 @@ impl Default for GeneralConfig {
 pub struct AppearanceConfig {
     pub status_bar_position: StatusBarPosition,
     pub border_style: BorderStyle,
+    pub default_layout: DefaultLayout,
 }
 
 impl Default for AppearanceConfig {
@@ -66,6 +67,31 @@ impl Default for AppearanceConfig {
         Self {
             status_bar_position: StatusBarPosition::Bottom,
             border_style: BorderStyle::ZellijStyle,
+            default_layout: DefaultLayout::default(),
+        }
+    }
+}
+
+/// Default layout mode for new tabs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultLayout {
+    #[default]
+    Bsp,
+    Master,
+    Monocle,
+    Custom,
+}
+
+impl DefaultLayout {
+    /// Convert this config enum to the layout module's `LayoutMode`.
+    pub fn to_layout_mode(&self) -> crate::server::layout::LayoutMode {
+        use crate::server::layout::*;
+        match self {
+            DefaultLayout::Bsp => LayoutMode::Bsp(BspLayout),
+            DefaultLayout::Master => LayoutMode::Master(MasterLayout::default()),
+            DefaultLayout::Monocle => LayoutMode::Monocle(MonocleLayout),
+            DefaultLayout::Custom => LayoutMode::Custom(CustomLayout),
         }
     }
 }
@@ -390,6 +416,7 @@ mod tests {
         let AppearanceConfig {
             status_bar_position: _,
             border_style,
+            default_layout: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
     }

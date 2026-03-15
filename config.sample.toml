@@ -34,6 +34,9 @@ status_bar_position = "bottom"
 # Pane border rendering style: "zellij_style" (borders, pane names) or "tmux_style" (minimal dividers).
 border_style = "zellij_style"
 
+# Default layout mode for new tabs: "bsp", "master", "monocle", or "custom"
+# default_layout = "bsp"
+
 # -----------------------------------------------------------------------------
 # Modes
 # -----------------------------------------------------------------------------
@@ -133,6 +136,8 @@ l = "ResizeRight 5"
 # Uncomment to override:
 # v = "EnterVisualMode"
 # g = "ToggleStyle"
+# Space = "LayoutNext"
+# m = "SetMaster"
 
 # -----------------------------------------------------------------------------
 # Keybindings — Visual Mode
@@ -203,3 +208,5 @@ l = "ResizeRight 5"
 #
 # Layout commands:
 #   ToggleStyle                     — Toggle border style between zellij and tmux
+#   LayoutNext                      — Cycle through layout modes (BSP → Master → Monocle)
+#   SetMaster                       — Set the focused pane as the master pane

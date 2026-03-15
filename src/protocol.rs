@@ -218,6 +218,8 @@ pub enum RemuxCommand {
 
     // -- Layout commands ------------------------------------------------------
     ToggleStyle,
+    LayoutNext,
+    SetMaster,
 
     // -- System / mode commands ---------------------------------------------
     SessionSave,
