@@ -522,6 +522,10 @@ impl Default for ShortcutBindings {
         );
         bindings.insert(alt_key('p'), InterceptAction::GroupPrefix(vec!['p']));
         bindings.insert(alt_key('t'), InterceptAction::GroupPrefix(vec!['t']));
+        bindings.insert(
+            NormalizedKeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            InterceptAction::Command(vec!["OpenSessionManager".to_string()]),
+        );
 
         Self { bindings }
     }
@@ -666,6 +670,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "FolderList" => Some(RemuxCommand::FolderList),
         "BufferEditInEditor" => Some(RemuxCommand::BufferEditInEditor),
         "EnterSearchMode" => Some(RemuxCommand::EnterSearchMode),
+        "OpenSessionManager" => Some(RemuxCommand::OpenSessionManager),
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),

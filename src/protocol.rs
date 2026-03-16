@@ -49,6 +49,8 @@ pub enum ClientMessage {
     RequestScrollback,
     /// Send search match info to the server for status bar display.
     SearchInfo { current: usize, total: usize },
+    /// Request the full session tree (folders, sessions, tabs, panes).
+    ListSessionTree,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +90,11 @@ pub enum ServerMessage {
     CopyToClipboard { data: String },
     /// Response to a `RequestScrollback` request with the pane's text content.
     ScrollbackContent { lines: Vec<String> },
+    /// Response to a `ListSessionTree` request with the full hierarchy.
+    SessionTree {
+        folders: Vec<FolderTreeEntry>,
+        unfiled: Vec<SessionTreeEntry>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +157,42 @@ pub enum CellColor {
     Indexed(u8),
     /// True-color RGB value.
     Rgb(u8, u8, u8),
+}
+
+// ---------------------------------------------------------------------------
+// Session tree entries (for session manager)
+// ---------------------------------------------------------------------------
+
+/// A folder containing sessions in the session tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderTreeEntry {
+    pub name: String,
+    pub sessions: Vec<SessionTreeEntry>,
+}
+
+/// A session entry in the session tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTreeEntry {
+    pub name: String,
+    pub tabs: Vec<TabTreeEntry>,
+    pub client_count: usize,
+    pub is_current: bool,
+}
+
+/// A tab entry in the session tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabTreeEntry {
+    pub id: u64,
+    pub name: String,
+    pub panes: Vec<PaneTreeEntry>,
+}
+
+/// A pane entry in the session tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneTreeEntry {
+    pub id: u64,
+    pub name: String,
+    pub is_focused: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +280,24 @@ pub enum RemuxCommand {
     SendKey(Vec<u8>),
     /// Enter search mode (client-side mode transition).
     EnterSearchMode,
+    /// Open the session manager (client-side mode transition).
+    OpenSessionManager,
+    /// Switch to a specific tab in a specific session.
+    SessionSwitchTab {
+        session: String,
+        tab_index: usize,
+    },
+    /// Switch to a specific pane in a specific session and tab.
+    SessionSwitchPane {
+        session: String,
+        tab_index: usize,
+        pane_id: u64,
+    },
+    /// Close a tab by index in a specific session.
+    TabCloseByIndex {
+        session: String,
+        tab_index: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +342,7 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
         ("FolderList", None),
         ("FolderMoveSession", Some("<session> [folder]")),
         ("BufferEditInEditor", None),
-        ("BufferSearch", None),
+        ("OpenSessionManager", None),
         ("ToggleStyle", None),
         ("LayoutNext", None),
         ("SetMaster", None),
@@ -428,6 +489,100 @@ mod tests {
                 assert_eq!(end_x, 20);
                 assert_eq!(end_y, 7);
                 assert!(!is_final);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_list_session_tree() {
+        let msg = ClientMessage::ListSessionTree;
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        assert!(matches!(decoded, ClientMessage::ListSessionTree));
+    }
+
+    #[test]
+    fn round_trip_session_tree() {
+        let msg = ServerMessage::SessionTree {
+            folders: vec![FolderTreeEntry {
+                name: "work".to_string(),
+                sessions: vec![SessionTreeEntry {
+                    name: "proj".to_string(),
+                    tabs: vec![TabTreeEntry {
+                        id: 1,
+                        name: "tab-1".to_string(),
+                        panes: vec![PaneTreeEntry {
+                            id: 10,
+                            name: "zsh".to_string(),
+                            is_focused: true,
+                        }],
+                    }],
+                    client_count: 1,
+                    is_current: true,
+                }],
+            }],
+            unfiled: vec![SessionTreeEntry {
+                name: "scratch".to_string(),
+                tabs: vec![],
+                client_count: 0,
+                is_current: false,
+            }],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ServerMessage::SessionTree { folders, unfiled } => {
+                assert_eq!(folders.len(), 1);
+                assert_eq!(folders[0].name, "work");
+                assert_eq!(folders[0].sessions[0].name, "proj");
+                assert!(folders[0].sessions[0].is_current);
+                assert_eq!(unfiled.len(), 1);
+                assert_eq!(unfiled[0].name, "scratch");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_session_switch_tab() {
+        let msg = ClientMessage::Command(RemuxCommand::SessionSwitchTab {
+            session: "main".to_string(),
+            tab_index: 2,
+        });
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ClientMessage::Command(RemuxCommand::SessionSwitchTab { session, tab_index }) => {
+                assert_eq!(session, "main");
+                assert_eq!(tab_index, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_session_switch_pane() {
+        let msg = ClientMessage::Command(RemuxCommand::SessionSwitchPane {
+            session: "dev".to_string(),
+            tab_index: 0,
+            pane_id: 42,
+        });
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ClientMessage::Command(RemuxCommand::SessionSwitchPane {
+                session,
+                tab_index,
+                pane_id,
+            }) => {
+                assert_eq!(session, "dev");
+                assert_eq!(tab_index, 0);
+                assert_eq!(pane_id, 42);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
