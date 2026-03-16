@@ -493,6 +493,17 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render a command palette overlay on top of the current screen.
+    /// Reuses the same mechanism as `render_whichkey_overlay`.
+    pub fn render_command_palette_overlay(&self, commands: &[DrawCommand]) -> Result<()> {
+        self.render_whichkey_overlay(commands)
+    }
+
+    /// Clear the command palette overlay by re-rendering the front buffer.
+    pub fn clear_command_palette_overlay(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.clear_overlay(cols, rows)
+    }
+
     /// Get a reference to the front buffer (for testing/inspection).
     pub fn front_buffer(&self) -> &[Vec<RenderCell>] {
         &self.front

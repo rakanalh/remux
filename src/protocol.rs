@@ -231,6 +231,58 @@ pub enum RemuxCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Command name enumeration
+// ---------------------------------------------------------------------------
+
+/// Return the list of all recognised command names (PascalCase strings that
+/// [`crate::config::keybindings::parse_command`] accepts). Commands that
+/// take parameters include a hint suffix after a space.
+pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![
+        ("TabNew", None),
+        ("TabClose", None),
+        ("TabRename", Some("<name>")),
+        ("TabGoto", Some("<index>")),
+        ("TabNext", None),
+        ("TabPrev", None),
+        ("TabMove", Some("<index>")),
+        ("PaneNew", None),
+        ("PaneClose", None),
+        ("PaneSplitVertical", None),
+        ("PaneSplitHorizontal", None),
+        ("PaneFocusLeft", None),
+        ("PaneFocusRight", None),
+        ("PaneFocusUp", None),
+        ("PaneFocusDown", None),
+        ("PaneStackAdd", None),
+        ("PaneStackNext", None),
+        ("PaneStackPrev", None),
+        ("PaneRename", Some("<name>")),
+        ("ResizeLeft", Some("<amount>")),
+        ("ResizeRight", Some("<amount>")),
+        ("ResizeUp", Some("<amount>")),
+        ("ResizeDown", Some("<amount>")),
+        ("SessionNew", Some("<name> [folder]")),
+        ("SessionDetach", None),
+        ("SessionRename", Some("<name>")),
+        ("SessionList", None),
+        ("SessionSave", None),
+        ("FolderNew", Some("<name>")),
+        ("FolderDelete", Some("<name>")),
+        ("FolderList", None),
+        ("FolderMoveSession", Some("<session> [folder]")),
+        ("BufferEditInEditor", None),
+        ("BufferSearch", None),
+        ("ToggleStyle", None),
+        ("LayoutNext", None),
+        ("SetMaster", None),
+        ("EnterNormal", None),
+        ("EnterCommandMode", None),
+        ("EnterVisualMode", None),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // Session events
 // ---------------------------------------------------------------------------
 
