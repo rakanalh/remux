@@ -151,18 +151,40 @@ impl SessionManagerState {
 
     /// Update with new tree data from the server.
     pub fn update_tree(&mut self, folders: Vec<FolderTreeEntry>, unfiled: Vec<SessionTreeEntry>) {
-        // On first load, auto-expand everything.
-        if self.expanded.is_empty() {
-            for f in &folders {
-                self.expanded.insert(format!("folder:{}", f.name));
-                for s in &f.sessions {
-                    self.expanded.insert(format!("session:{}", s.name));
-                }
-            }
-            for s in &unfiled {
-                self.expanded.insert(format!("session:{}", s.name));
+        // Collect previously known keys so we can auto-expand only new entries.
+        let mut known_keys: HashSet<String> = HashSet::new();
+        for f in &self.folders {
+            known_keys.insert(format!("folder:{}", f.name));
+            for s in &f.sessions {
+                known_keys.insert(format!("session:{}", s.name));
             }
         }
+        for s in &self.unfiled {
+            known_keys.insert(format!("session:{}", s.name));
+        }
+
+        let is_first_load = self.expanded.is_empty();
+
+        // Auto-expand new entries (or all entries on first load).
+        for f in &folders {
+            let key = format!("folder:{}", f.name);
+            if is_first_load || !known_keys.contains(&key) {
+                self.expanded.insert(key);
+            }
+            for s in &f.sessions {
+                let key = format!("session:{}", s.name);
+                if is_first_load || !known_keys.contains(&key) {
+                    self.expanded.insert(key);
+                }
+            }
+        }
+        for s in &unfiled {
+            let key = format!("session:{}", s.name);
+            if is_first_load || !known_keys.contains(&key) {
+                self.expanded.insert(key);
+            }
+        }
+
         self.folders = folders;
         self.unfiled = unfiled;
         self.rebuild_rows();

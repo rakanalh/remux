@@ -576,6 +576,88 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render search match highlights on top of the current front buffer.
+    ///
+    /// Highlights all visible matches with a subtle background, and the
+    /// current match with a bright background. Match positions are in
+    /// scrollback coordinates; only those within the visible area of the
+    /// focused pane are drawn.
+    pub fn render_search_highlight(
+        &self,
+        matches: &[(usize, usize)],
+        current_match: usize,
+        query_len: usize,
+        scrollback_line_count: usize,
+        pane_rect: Option<&crate::protocol::PaneRect>,
+    ) -> Result<()> {
+        let pr = match pane_rect {
+            Some(pr) => pr,
+            None => return Ok(()),
+        };
+        if matches.is_empty() || query_len == 0 {
+            return Ok(());
+        }
+
+        let pane_h = pr.height as usize;
+        if pane_h == 0 {
+            return Ok(());
+        }
+
+        // The visible line range in scrollback coordinates.
+        let visible_start = scrollback_line_count.saturating_sub(pane_h);
+        let visible_end = scrollback_line_count;
+
+        let mut stdout = io::stdout().lock();
+        queue!(stdout, cursor::Hide)?;
+
+        for (idx, &(line, col)) in matches.iter().enumerate() {
+            if line < visible_start || line >= visible_end {
+                continue;
+            }
+
+            let screen_y = pr.y as usize + (line - visible_start);
+            let screen_x_start = pr.x as usize + col;
+
+            // Choose colors: bright yellow bg for current match, dark bg for others.
+            let (hl_fg, hl_bg) = if idx == current_match {
+                (Color::Black, Color::AnsiValue(11)) // Bright yellow
+            } else {
+                (Color::Black, Color::AnsiValue(3)) // Dark yellow
+            };
+
+            for offset in 0..query_len {
+                let screen_x = screen_x_start + offset;
+                if screen_x >= self.cols as usize || screen_y >= self.rows as usize {
+                    break;
+                }
+                // Also clamp to pane content area.
+                if screen_x >= (pr.x + pr.width) as usize || screen_y >= (pr.y + pr.height) as usize
+                {
+                    break;
+                }
+
+                let cell_char =
+                    if screen_y < self.front.len() && screen_x < self.front[screen_y].len() {
+                        self.front[screen_y][screen_x].c
+                    } else {
+                        ' '
+                    };
+
+                queue!(
+                    stdout,
+                    MoveTo(screen_x as u16, screen_y as u16),
+                    SetForegroundColor(hl_fg),
+                    SetBackgroundColor(hl_bg),
+                    Print(cell_char),
+                    ResetColor,
+                )?;
+            }
+        }
+
+        stdout.flush()?;
+        Ok(())
+    }
+
     /// Get a reference to the front buffer (for testing/inspection).
     pub fn front_buffer(&self) -> &[Vec<RenderCell>] {
         &self.front

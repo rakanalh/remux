@@ -267,6 +267,9 @@ pub struct SearchState {
     pub current_match: usize,
     /// Current search phase.
     pub phase: SearchPhase,
+    /// Total number of lines in the scrollback content (used to determine
+    /// which matches are visible on screen).
+    pub scrollback_line_count: usize,
 }
 
 impl SearchState {
@@ -278,6 +281,7 @@ impl SearchState {
             matches: Vec::new(),
             current_match: 0,
             phase: SearchPhase::Prompt,
+            scrollback_line_count: 0,
         }
     }
 
