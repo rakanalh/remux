@@ -18,6 +18,7 @@ use futures::StreamExt;
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{InputAction, InputHandler, Mode, RenameTarget};
 use crate::client::renderer::Renderer;
+use crate::client::session_manager::SessionManagerAction;
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::Config;
@@ -351,6 +352,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
                                     Mode::Search => "SEARCH",
+                                    Mode::SessionManager => "SESSION_MANAGER",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -381,6 +383,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
                                     Mode::Search => "SEARCH",
+                                    Mode::SessionManager => "SESSION_MANAGER",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -395,6 +398,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
                                     Mode::Search => "SEARCH",
+                                    Mode::SessionManager => "SESSION_MANAGER",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -580,6 +584,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
                                     Mode::Search => "SEARCH",
+                                    Mode::SessionManager => "SESSION_MANAGER",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -627,6 +632,122 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let query = ss.confirmed_query.as_deref().unwrap_or("");
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                                }
+                            }
+                            InputAction::SessionManagerOpen => {
+                                // Hide which-key when opening session manager.
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // Request session tree from server.
+                                client.send(ClientMessage::ListSessionTree).await?;
+                                // Notify server of mode change.
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: "SESSION_MANAGER".to_string(),
+                                    })
+                                    .await?;
+                            }
+                            InputAction::SessionManagerClose => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                // Notify server of mode change.
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: "NORMAL".to_string(),
+                                    })
+                                    .await?;
+                            }
+                            InputAction::SessionManagerUpdate => {
+                                // Re-render the session manager overlay.
+                                if let Some(ref sm) = input.session_manager {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = sm.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                }
+                            }
+                            InputAction::SessionManagerAction(ref sm_action) => {
+                                match sm_action {
+                                    SessionManagerAction::SwitchSession(name) => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        client.send(ClientMessage::Attach { session_name: name.clone() }).await?;
+                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    }
+                                    SessionManagerAction::SwitchTab { session, tab_index } => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        client.send(ClientMessage::Command(RemuxCommand::SessionSwitchTab {
+                                            session: session.clone(),
+                                            tab_index: *tab_index,
+                                        })).await?;
+                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    }
+                                    SessionManagerAction::SwitchPane { session, tab_index, pane_id } => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        client.send(ClientMessage::Command(RemuxCommand::SessionSwitchPane {
+                                            session: session.clone(),
+                                            tab_index: *tab_index,
+                                            pane_id: *pane_id,
+                                        })).await?;
+                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    }
+                                    SessionManagerAction::CreateFolder(name) => {
+                                        client.send(ClientMessage::Command(RemuxCommand::FolderNew(name.clone()))).await?;
+                                        // Refresh tree.
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::CreateSession { name, folder } => {
+                                        client.send(ClientMessage::CreateSession {
+                                            name: name.clone(),
+                                            folder: folder.clone(),
+                                        }).await?;
+                                        // Wait for creation event before refreshing tree.
+                                        // The refresh will happen when we receive SessionTree.
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::MoveSession { session, folder } => {
+                                        client.send(ClientMessage::Command(RemuxCommand::FolderMoveSession {
+                                            session: session.clone(),
+                                            folder: folder.clone(),
+                                        })).await?;
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::DeleteSession(name) => {
+                                        client.send(ClientMessage::KillSession { name: name.clone() }).await?;
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::DeleteFolder(name) => {
+                                        client.send(ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::CloseTab { session, tab_index } => {
+                                        client.send(ClientMessage::Command(RemuxCommand::TabCloseByIndex {
+                                            session: session.clone(),
+                                            tab_index: *tab_index,
+                                        })).await?;
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::RefreshTree => {
+                                        client.send(ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::Close => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    }
+                                    SessionManagerAction::None => {}
                                 }
                             }
                             InputAction::None => {}
@@ -734,6 +855,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
                         }
+                        // Re-render session manager on top if active
+                        else if let Some(ref sm) = input.session_manager {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = sm.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                        }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
@@ -770,6 +897,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                        }
+                        // Re-render session manager on top if active
+                        else if let Some(ref sm) = input.session_manager {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = sm.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
                         }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
@@ -811,10 +944,25 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             }
                         }
                     }
+                    Some(ServerMessage::SessionTree { folders, unfiled }) => {
+                        if let Some(ref mut sm) = input.session_manager {
+                            sm.update_tree(folders, unfiled);
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_overlay(c, r)?;
+                            let draw_cmds = sm.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                        }
+                    }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: {:?}", event);
                         if matches!(event, crate::protocol::SessionEvent::SessionDeleted(_)) {
-                            break;
+                            // If session manager is open, just refresh the tree
+                            // instead of breaking out of the event loop.
+                            if input.session_manager.is_some() {
+                                client.send(ClientMessage::ListSessionTree).await?;
+                            } else {
+                                break;
+                            }
                         }
                     }
                     None => {

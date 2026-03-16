@@ -401,6 +401,9 @@ async fn handle_client_message(
             save_if_enabled(state, panes, config).await;
             result
         }
+        ClientMessage::ListSessionTree => {
+            handle_list_session_tree(client_id, state, panes, clients).await
+        }
         ClientMessage::RequestScrollback => {
             handle_request_scrollback(client_id, state, panes, clients).await
         }
@@ -1021,6 +1024,94 @@ async fn handle_command(
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
+        RemuxCommand::SessionSwitchTab { session, tab_index } => {
+            // Attach the client to the specified session and switch to the tab.
+            {
+                let mut cls = clients.lock().await;
+                if let Some(client) = cls.get_mut(&client_id) {
+                    client.session_name = Some(session.clone());
+                }
+            }
+            {
+                let mut st = state.lock().await;
+                if let Err(e) = st.goto_tab(&session, tab_index) {
+                    log::error!("SessionSwitchTab: {e}");
+                    return Ok(());
+                }
+            }
+            start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
+            broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::SessionSwitchPane {
+            session,
+            tab_index,
+            pane_id,
+        } => {
+            // Attach to session, switch tab, and focus pane.
+            {
+                let mut cls = clients.lock().await;
+                if let Some(client) = cls.get_mut(&client_id) {
+                    client.session_name = Some(session.clone());
+                }
+            }
+            {
+                let mut st = state.lock().await;
+                if let Err(e) = st.goto_tab(&session, tab_index) {
+                    log::error!("SessionSwitchPane: goto_tab: {e}");
+                    return Ok(());
+                }
+                if let Some(sess) = st.sessions.get_mut(&session) {
+                    if let Some(tab) = sess.tabs.get_mut(sess.active_tab) {
+                        tab.focused_pane = pane_id;
+                    }
+                }
+            }
+            start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
+            broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::TabCloseByIndex {
+            session: target_session,
+            tab_index,
+        } => {
+            let close_result = {
+                let mut st = state.lock().await;
+                st.close_tab(&target_session, tab_index)
+            };
+            match close_result {
+                Ok((pane_ids, session_deleted)) => {
+                    {
+                        let mut ps = panes.lock().await;
+                        for pid in pane_ids {
+                            ps.remove(&pid);
+                        }
+                    }
+                    if session_deleted {
+                        let mut cls = clients.lock().await;
+                        for client in cls.values_mut() {
+                            if client.session_name.as_deref() == Some(&target_session) {
+                                client.session_name = None;
+                                let _ = client.tx.send(ServerMessage::Event(
+                                    SessionEvent::SessionDeleted(target_session.clone()),
+                                ));
+                            }
+                        }
+                    } else {
+                        broadcast_full_render(
+                            &target_session,
+                            state,
+                            panes,
+                            clients,
+                            config,
+                            prev_frames,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    log::error!("TabCloseByIndex: {e}");
+                }
+            }
+        }
         _ => {
             log::debug!("unhandled command: {cmd:?}");
         }
@@ -1095,6 +1186,47 @@ async fn handle_list_sessions(
         let _ = client
             .tx
             .send(ServerMessage::SessionList { sessions: entries });
+    }
+    Ok(())
+}
+
+async fn handle_list_session_tree(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Result<()> {
+    let current_session = {
+        let cls = clients.lock().await;
+        cls.get(&client_id).and_then(|c| c.session_name.clone())
+    };
+
+    let st = state.lock().await;
+    let cls = clients.lock().await;
+
+    // Compute client counts per session.
+    let mut client_counts: HashMap<String, usize> = HashMap::new();
+    for c in cls.values() {
+        if let Some(ref sn) = c.session_name {
+            *client_counts.entry(sn.clone()).or_insert(0) += 1;
+        }
+    }
+
+    // Compute pane names from PTY process names.
+    let mut pane_names: HashMap<PaneId, String> = HashMap::new();
+    let ps = panes.lock().await;
+    for (&pid, pane) in ps.iter() {
+        let name = get_process_name(pane.pty.child_pid.as_raw());
+        pane_names.insert(pid, name);
+    }
+
+    let (folders, unfiled) =
+        st.build_session_tree(current_session.as_deref(), &client_counts, &pane_names);
+
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client
+            .tx
+            .send(ServerMessage::SessionTree { folders, unfiled });
     }
     Ok(())
 }

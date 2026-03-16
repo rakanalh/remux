@@ -23,6 +23,7 @@ pub enum Mode {
     Visual,
     CommandPalette,
     Search,
+    SessionManager,
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +365,14 @@ pub enum InputAction {
     CommandPaletteExecute,
     /// The command palette was closed.
     CommandPaletteClose,
+    /// Open the session manager overlay.
+    SessionManagerOpen,
+    /// Close the session manager overlay.
+    SessionManagerClose,
+    /// An action from the session manager (switch, delete, create, etc.).
+    SessionManagerAction(crate::client::session_manager::SessionManagerAction),
+    /// Re-render the session manager overlay (after sub-mode state changes).
+    SessionManagerUpdate,
     /// No action to take.
     None,
 }
@@ -444,6 +453,8 @@ pub struct InputHandler {
     pub command_palette: Option<CommandPaletteState>,
     /// State for Search mode.
     pub search_state: Option<SearchState>,
+    /// State for Session Manager mode.
+    pub session_manager: Option<crate::client::session_manager::SessionManagerState>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -485,6 +496,7 @@ impl InputHandler {
             shortcut_bindings,
             command_palette: None,
             search_state: None,
+            session_manager: None,
         }
     }
 
@@ -518,6 +530,7 @@ impl InputHandler {
             Mode::Visual => self.handle_visual_key(key),
             Mode::CommandPalette => self.handle_command_palette_key(key),
             Mode::Search => self.handle_search_key(key),
+            Mode::SessionManager => self.handle_session_manager_key(key),
         }
     }
 
@@ -593,6 +606,15 @@ impl InputHandler {
     /// keeps the mode as Normal and doesn't interact with the keybinding tree
     /// state.
     fn execute_shortcut_commands(&mut self, actions: &[String]) -> InputAction {
+        // Intercept mode-changing shortcuts before parsing to RemuxCommand.
+        if actions.len() == 1 && actions[0] == "OpenSessionManager" {
+            self.mode = Mode::SessionManager;
+            self.session_manager = Some(crate::client::session_manager::SessionManagerState::new(
+                None,
+            ));
+            return InputAction::SessionManagerOpen;
+        }
+
         let mut commands: Vec<RemuxCommand> = Vec::new();
         for action_str in actions {
             match parse_command(action_str) {
@@ -723,6 +745,13 @@ impl InputHandler {
                             self.mode = Mode::Search;
                             self.search_state = Some(SearchState::new());
                             final_action = Some(InputAction::ModeChanged(Mode::Search));
+                        }
+                        RemuxCommand::OpenSessionManager => {
+                            self.mode = Mode::SessionManager;
+                            self.session_manager = Some(
+                                crate::client::session_manager::SessionManagerState::new(None),
+                            );
+                            return InputAction::SessionManagerOpen;
                         }
                         RemuxCommand::PaneRename(_) => {
                             // Activate rename overlay instead of executing directly.
@@ -1002,6 +1031,330 @@ impl InputHandler {
                     _ => InputAction::None,
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Session Manager mode
+    // -----------------------------------------------------------------------
+
+    fn handle_session_manager_key(&mut self, key: KeyEvent) -> InputAction {
+        use crate::client::session_manager::{SessionManagerAction, SubMode};
+
+        let sm = match self.session_manager.as_mut() {
+            Some(s) => s,
+            None => {
+                self.mode = Mode::Normal;
+                return InputAction::ModeChanged(Mode::Normal);
+            }
+        };
+
+        // Handle sub-modes first.
+        match &sm.sub_mode {
+            SubMode::ConfirmDelete(_) => {
+                return match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let action = sm.handle_confirm_delete(true);
+                        InputAction::SessionManagerAction(action)
+                    }
+                    _ => {
+                        let _ = sm.handle_confirm_delete(false);
+                        InputAction::SessionManagerUpdate
+                    }
+                };
+            }
+            SubMode::CreateFolder(_) => {
+                return match key.code {
+                    KeyCode::Esc => {
+                        sm.sub_mode = SubMode::Navigate;
+                        InputAction::SessionManagerUpdate
+                    }
+                    KeyCode::Enter => {
+                        if let SubMode::CreateFolder(name) = &sm.sub_mode {
+                            let name = name.clone();
+                            sm.sub_mode = SubMode::Navigate;
+                            if name.is_empty() {
+                                InputAction::SessionManagerUpdate
+                            } else {
+                                InputAction::SessionManagerAction(
+                                    SessionManagerAction::CreateFolder(name),
+                                )
+                            }
+                        } else {
+                            InputAction::None
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let SubMode::CreateFolder(ref mut buf) = sm.sub_mode {
+                            buf.pop();
+                        }
+                        InputAction::SessionManagerUpdate
+                    }
+                    KeyCode::Char(c) => {
+                        if let SubMode::CreateFolder(ref mut buf) = sm.sub_mode {
+                            buf.push(c);
+                        }
+                        InputAction::SessionManagerUpdate
+                    }
+                    _ => InputAction::None,
+                };
+            }
+            SubMode::CreateSession { .. } => {
+                return self.handle_session_manager_create_session_key(key);
+            }
+            SubMode::MoveSession { .. } => {
+                return self.handle_session_manager_move_key(key);
+            }
+            SubMode::Navigate => {} // Fall through to navigation keys.
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.session_manager = None;
+                self.mode = Mode::Normal;
+                InputAction::SessionManagerClose
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                sm.select_next();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                sm.select_prev();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                let action = sm.handle_enter();
+                match action {
+                    SessionManagerAction::None => InputAction::SessionManagerUpdate,
+                    _ => InputAction::SessionManagerAction(action),
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                sm.collapse_selected();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Char('+') => {
+                sm.expand_selected();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Char('-') => {
+                sm.collapse_selected();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Char('d') => {
+                let action = sm.handle_delete_key();
+                match action {
+                    SessionManagerAction::None => InputAction::SessionManagerUpdate,
+                    _ => InputAction::SessionManagerAction(action),
+                }
+            }
+            KeyCode::Char('c') => {
+                sm.handle_create_folder_key();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Char('n') => {
+                sm.handle_create_session_key();
+                InputAction::SessionManagerUpdate
+            }
+            KeyCode::Char('m') => {
+                sm.handle_move_key();
+                InputAction::SessionManagerUpdate
+            }
+            _ => InputAction::None,
+        }
+    }
+
+    fn handle_session_manager_create_session_key(&mut self, key: KeyEvent) -> InputAction {
+        use crate::client::session_manager::{CreatePhase, SessionManagerAction, SubMode};
+
+        let sm = match self.session_manager.as_mut() {
+            Some(s) => s,
+            None => return InputAction::None,
+        };
+
+        // Determine current phase and collect data before mutation.
+        let is_enter_name = matches!(
+            sm.sub_mode,
+            SubMode::CreateSession {
+                phase: CreatePhase::EnterName,
+                ..
+            }
+        );
+        let is_select_folder = matches!(
+            sm.sub_mode,
+            SubMode::CreateSession {
+                phase: CreatePhase::SelectFolder { .. },
+                ..
+            }
+        );
+
+        if is_enter_name {
+            match key.code {
+                KeyCode::Esc => {
+                    sm.sub_mode = SubMode::Navigate;
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Enter => {
+                    // Extract name and folder list before mutation.
+                    let current_name = if let SubMode::CreateSession { ref name, .. } = sm.sub_mode
+                    {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    if current_name.is_empty() {
+                        sm.sub_mode = SubMode::Navigate;
+                        InputAction::SessionManagerUpdate
+                    } else {
+                        let mut folders = sm.folder_names();
+                        folders.sort();
+                        folders.insert(0, "(none)".to_string());
+                        sm.sub_mode = SubMode::CreateSession {
+                            name: current_name,
+                            phase: CreatePhase::SelectFolder {
+                                folders,
+                                selected: 0,
+                            },
+                        };
+                        InputAction::SessionManagerUpdate
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let SubMode::CreateSession { ref mut name, .. } = sm.sub_mode {
+                        name.pop();
+                    }
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char(c) => {
+                    if let SubMode::CreateSession { ref mut name, .. } = sm.sub_mode {
+                        name.push(c);
+                    }
+                    InputAction::SessionManagerUpdate
+                }
+                _ => InputAction::None,
+            }
+        } else if is_select_folder {
+            match key.code {
+                KeyCode::Esc => {
+                    sm.sub_mode = SubMode::Navigate;
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let SubMode::CreateSession {
+                        phase:
+                            CreatePhase::SelectFolder {
+                                ref folders,
+                                ref mut selected,
+                            },
+                        ..
+                    } = sm.sub_mode
+                    {
+                        if !folders.is_empty() {
+                            *selected = (*selected + 1) % folders.len();
+                        }
+                    }
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let SubMode::CreateSession {
+                        phase:
+                            CreatePhase::SelectFolder {
+                                ref folders,
+                                ref mut selected,
+                            },
+                        ..
+                    } = sm.sub_mode
+                    {
+                        if !folders.is_empty() {
+                            if *selected == 0 {
+                                *selected = folders.len() - 1;
+                            } else {
+                                *selected -= 1;
+                            }
+                        }
+                    }
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Enter => {
+                    let (session_name, folder) = if let SubMode::CreateSession {
+                        ref name,
+                        phase:
+                            CreatePhase::SelectFolder {
+                                ref folders,
+                                selected,
+                            },
+                    } = sm.sub_mode
+                    {
+                        let folder_name = folders.get(selected).cloned();
+                        let folder =
+                            folder_name.and_then(|f| if f == "(none)" { None } else { Some(f) });
+                        (name.clone(), folder)
+                    } else {
+                        (String::new(), None)
+                    };
+                    sm.sub_mode = SubMode::Navigate;
+                    InputAction::SessionManagerAction(SessionManagerAction::CreateSession {
+                        name: session_name,
+                        folder,
+                    })
+                }
+                _ => InputAction::None,
+            }
+        } else {
+            InputAction::None
+        }
+    }
+
+    fn handle_session_manager_move_key(&mut self, key: KeyEvent) -> InputAction {
+        use crate::client::session_manager::{SessionManagerAction, SubMode};
+
+        let sm = match self.session_manager.as_mut() {
+            Some(s) => s,
+            None => return InputAction::None,
+        };
+
+        if let SubMode::MoveSession {
+            ref session,
+            ref folders,
+            ref mut selected,
+        } = sm.sub_mode
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    sm.sub_mode = SubMode::Navigate;
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !folders.is_empty() {
+                        *selected = (*selected + 1) % folders.len();
+                    }
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if !folders.is_empty() {
+                        if *selected == 0 {
+                            *selected = folders.len() - 1;
+                        } else {
+                            *selected -= 1;
+                        }
+                    }
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Enter => {
+                    let folder_name = folders.get(*selected).cloned();
+                    let folder =
+                        folder_name.and_then(|f| if f == "(none)" { None } else { Some(f) });
+                    let session_name = session.clone();
+                    sm.sub_mode = SubMode::Navigate;
+                    InputAction::SessionManagerAction(SessionManagerAction::MoveSession {
+                        session: session_name,
+                        folder,
+                    })
+                }
+                _ => InputAction::None,
+            }
+        } else {
+            InputAction::None
         }
     }
 

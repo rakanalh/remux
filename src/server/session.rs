@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::layout::{self, LayoutMode, LayoutNode, PaneId};
 use crate::config::BorderStyle;
+use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
 
 /// Unique identifier for a session (its name).
 pub type SessionId = String;
@@ -468,6 +469,86 @@ impl ServerState {
 
         sess.active_tab = tab_idx;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Session movement
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Session tree (for session manager)
+    // -----------------------------------------------------------------------
+
+    /// Build the full session tree hierarchy.
+    ///
+    /// Returns `(folders, unfiled)` where `folders` contains sessions grouped
+    /// by folder, and `unfiled` contains sessions not in any folder.
+    ///
+    /// `current_session` marks which session the requesting client is attached
+    /// to. `client_counts` maps session name to the number of clients attached.
+    /// `pane_names` maps pane IDs to display names (e.g. process name).
+    pub fn build_session_tree(
+        &self,
+        current_session: Option<&str>,
+        client_counts: &HashMap<String, usize>,
+        pane_names: &HashMap<PaneId, String>,
+    ) -> (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>) {
+        let build_entry = |session: &Session| -> SessionTreeEntry {
+            let tabs = session
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let panes = layout::all_pane_ids(&tab.layout)
+                        .into_iter()
+                        .map(|pid| PaneTreeEntry {
+                            id: pid,
+                            name: pane_names
+                                .get(&pid)
+                                .cloned()
+                                .unwrap_or_else(|| format!("pane-{}", pid)),
+                            is_focused: pid == tab.focused_pane,
+                        })
+                        .collect();
+                    TabTreeEntry {
+                        id: tab.id,
+                        name: tab.name.clone(),
+                        panes,
+                    }
+                })
+                .collect();
+            SessionTreeEntry {
+                name: session.name.clone(),
+                tabs,
+                client_count: client_counts.get(&session.name).copied().unwrap_or(0),
+                is_current: current_session == Some(&session.name),
+            }
+        };
+
+        let mut folders = Vec::new();
+        for folder in self.folders.values() {
+            let mut sessions = Vec::new();
+            for session_id in &folder.session_ids {
+                if let Some(session) = self.sessions.get(session_id) {
+                    sessions.push(build_entry(session));
+                }
+            }
+            sessions.sort_by(|a, b| a.name.cmp(&b.name));
+            folders.push(FolderTreeEntry {
+                name: folder.name.clone(),
+                sessions,
+            });
+        }
+        folders.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut unfiled = Vec::new();
+        for session in self.sessions.values() {
+            if session.folder.is_none() {
+                unfiled.push(build_entry(session));
+            }
+        }
+        unfiled.sort_by(|a, b| a.name.cmp(&b.name));
+
+        (folders, unfiled)
     }
 
     // -----------------------------------------------------------------------
@@ -948,5 +1029,75 @@ mod tests {
         assert!(deserialized.sessions.contains_key("s1"));
         assert!(deserialized.sessions.contains_key("s2"));
         assert!(deserialized.folders.contains_key("work"));
+    }
+
+    #[test]
+    fn test_build_session_tree_empty() {
+        let state = ServerState::new();
+        let counts = HashMap::new();
+        let pane_names = HashMap::new();
+        let (folders, unfiled) = state.build_session_tree(None, &counts, &pane_names);
+        assert!(folders.is_empty());
+        assert!(unfiled.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_tree_folders_and_unfiled() {
+        let mut state = ServerState::new();
+        state
+            .create_session(
+                "proj",
+                Some("work"),
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+            )
+            .unwrap();
+        state
+            .create_session(
+                "scratch",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+            )
+            .unwrap();
+
+        let mut counts = HashMap::new();
+        counts.insert("proj".to_string(), 2);
+        let pane_names = HashMap::new();
+
+        let (folders, unfiled) = state.build_session_tree(Some("proj"), &counts, &pane_names);
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name, "work");
+        assert_eq!(folders[0].sessions.len(), 1);
+        assert_eq!(folders[0].sessions[0].name, "proj");
+        assert!(folders[0].sessions[0].is_current);
+        assert_eq!(folders[0].sessions[0].client_count, 2);
+
+        assert_eq!(unfiled.len(), 1);
+        assert_eq!(unfiled[0].name, "scratch");
+        assert!(!unfiled[0].is_current);
+        assert_eq!(unfiled[0].client_count, 0);
+    }
+
+    #[test]
+    fn test_build_session_tree_with_tabs_and_panes() {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+        state
+            .create_tab("s", "tab2", LayoutMode::default())
+            .unwrap();
+
+        let counts = HashMap::new();
+        let mut pane_names = HashMap::new();
+        pane_names.insert(1, "zsh".to_string());
+        pane_names.insert(2, "vim".to_string());
+
+        let (_, unfiled) = state.build_session_tree(None, &counts, &pane_names);
+        assert_eq!(unfiled.len(), 1);
+        assert_eq!(unfiled[0].tabs.len(), 2);
+        // First tab should have pane with name "zsh"
+        assert_eq!(unfiled[0].tabs[0].panes[0].name, "zsh");
     }
 }
