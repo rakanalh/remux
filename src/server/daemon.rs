@@ -1875,7 +1875,20 @@ async fn close_pane(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let should_broadcast = {
+    /// What to do after closing a pane.
+    enum CloseAction {
+        /// Normal close -- broadcast a full render for the current session.
+        Broadcast,
+        /// Last pane/tab in the session was closed; switch clients to another
+        /// session.
+        SwitchSession(String),
+        /// Last session was removed; disconnect affected clients.
+        Disconnect,
+        /// Nothing to do (pane not found, etc.).
+        NoBroadcast,
+    }
+
+    let action = {
         let mut st = state.lock().await;
         let sess = match st.sessions.get_mut(session_name) {
             Some(s) => s,
@@ -1900,7 +1913,7 @@ async fn close_pane(
             if tab.layout_mode.is_automatic() {
                 tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
             }
-            true
+            CloseAction::Broadcast
         } else {
             // Last pane in the tab was closed. Close the tab.
             let tab_idx = sess.active_tab;
@@ -1909,11 +1922,18 @@ async fn close_pane(
                 if sess.active_tab >= sess.tabs.len() {
                     sess.active_tab = sess.tabs.len().saturating_sub(1);
                 }
-                true
+                CloseAction::Broadcast
             } else {
-                // Last tab in the session -- remove it too.
-                sess.tabs.remove(tab_idx);
-                true
+                // Last tab in the session -- remove the session entirely.
+                let session_name_owned = session_name.to_string();
+                st.sessions.remove(&session_name_owned);
+
+                // Find the next available session to switch to.
+                let next_session = st.sessions.keys().next().cloned();
+                match next_session {
+                    Some(next) => CloseAction::SwitchSession(next),
+                    None => CloseAction::Disconnect,
+                }
             }
         }
     };
@@ -1921,8 +1941,35 @@ async fn close_pane(
         let mut ps = panes.lock().await;
         ps.remove(&pane_id);
     }
-    if should_broadcast {
-        broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    match action {
+        CloseAction::Broadcast => {
+            broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+        }
+        CloseAction::SwitchSession(ref next) => {
+            // Switch all clients that were on this session to the next one.
+            {
+                let mut cls = clients.lock().await;
+                for c in cls.values_mut() {
+                    if c.session_name.as_deref() == Some(session_name) {
+                        c.session_name = Some(next.clone());
+                    }
+                }
+            }
+            broadcast_full_render(next, state, panes, clients, config, prev_frames).await;
+        }
+        CloseAction::Disconnect => {
+            // No sessions left -- notify affected clients so they disconnect.
+            let mut cls = clients.lock().await;
+            for c in cls.values_mut() {
+                if c.session_name.as_deref() == Some(session_name) {
+                    c.session_name = None;
+                    let _ = c.tx.send(ServerMessage::Event(SessionEvent::SessionDeleted(
+                        session_name.to_string(),
+                    )));
+                }
+            }
+        }
+        CloseAction::NoBroadcast => {}
     }
 }
 
