@@ -413,6 +413,86 @@ impl Renderer {
         result
     }
 
+    /// Render a rename popup overlay centered on the screen.
+    pub fn render_rename_popup(
+        &self,
+        text: &str,
+        target: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        use crossterm::style;
+
+        let mut stdout = io::stdout().lock();
+
+        // Calculate popup dimensions
+        let popup_width = 40u16.min(cols.saturating_sub(4));
+        let popup_height = 3u16;
+        let start_x = (cols.saturating_sub(popup_width)) / 2;
+        let start_y = (rows.saturating_sub(popup_height)) / 2;
+
+        // Title like "Rename Tab" or "Rename Pane"
+        let title = format!(" Rename {} ", target);
+
+        // Draw top border
+        queue!(stdout, MoveTo(start_x, start_y))?;
+        let title_len = title.len();
+        let border_fill = (popup_width as usize).saturating_sub(title_len + 2);
+        let half_left = border_fill / 2;
+        let half_right = border_fill - half_left;
+        let top_border = format!(
+            "\u{256d}{}\u{2500}{}\u{256e}",
+            "\u{2500}".repeat(half_left),
+            "\u{2500}".repeat(half_right),
+        );
+        // Build top border with title inserted
+        let top_with_title = format!(
+            "\u{256d}{}{}{}\u{256e}",
+            "\u{2500}".repeat(half_left),
+            title,
+            "\u{2500}".repeat(half_right),
+        );
+        let _ = top_border; // unused, we use top_with_title
+        queue!(stdout, style::SetAttribute(style::Attribute::Bold))?;
+        queue!(stdout, Print(&top_with_title))?;
+        queue!(stdout, style::SetAttribute(style::Attribute::Reset))?;
+
+        // Draw middle row with text input
+        queue!(stdout, MoveTo(start_x, start_y + 1))?;
+        let inner_width = popup_width.saturating_sub(4) as usize;
+        let display_text = if text.len() > inner_width {
+            &text[text.len() - inner_width..]
+        } else {
+            text
+        };
+        let padding = inner_width.saturating_sub(display_text.len());
+        queue!(
+            stdout,
+            Print(format!(
+                "\u{2502} {}{} \u{2502}",
+                display_text,
+                " ".repeat(padding)
+            ))
+        )?;
+
+        // Draw bottom border
+        queue!(stdout, MoveTo(start_x, start_y + 2))?;
+        queue!(
+            stdout,
+            Print(format!(
+                "\u{2570}{}\u{256f}",
+                "\u{2500}".repeat(popup_width.saturating_sub(2) as usize)
+            ))
+        )?;
+
+        // Position cursor at end of text
+        let cursor_x = start_x + 2 + display_text.len() as u16;
+        queue!(stdout, MoveTo(cursor_x, start_y + 1), cursor::Show)?;
+
+        stdout.flush()?;
+        Ok(())
+    }
+
     /// Get a reference to the front buffer (for testing/inspection).
     pub fn front_buffer(&self) -> &[Vec<RenderCell>] {
         &self.front

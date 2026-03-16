@@ -248,7 +248,9 @@ impl KeybindingTree {
                 let label = match node {
                     KeyNode::Group { label, .. } | KeyNode::Leaf { label, .. } => label.clone(),
                 };
-                (key, label)
+                // Show ␣ (U+2423) for the space key so it's visible in which-key.
+                let display_key = if key == ' ' { '␣' } else { key };
+                (display_key, label)
             })
             .collect();
         result.sort_by_key(|(k, _)| *k);
