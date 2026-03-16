@@ -76,6 +76,32 @@ timeout_ms = 500
 # Leader key (default: Ctrl-a). Double-tap sends the raw key to the terminal.
 leader = "Ctrl-a"
 
+# --- Modifier shortcuts (Normal mode) ---
+# These modifier-based shortcuts are checked in Normal mode before keys are
+# forwarded to the terminal. They provide quick access to common operations
+# without pressing the leader key first.
+#
+# Keys MUST include a modifier (Alt, Ctrl, etc.) — plain character keys go
+# through the leader key tree instead.
+#
+# Values can be:
+#   - A command string:       "Alt-h" = "PaneFocusLeft"
+#   - An action chain:        "Alt-x" = "PaneNew; PaneFocusRight"
+#   - A group prefix (@key):  "Alt-p" = "@p"  (opens the Pane which-key group)
+#
+# Group prefixes enter Command mode at the specified keybinding tree group,
+# showing the which-key popup for that group immediately.
+#
+# To remove a default shortcut, set it to an empty string:
+#   "Alt-h" = ""
+"Alt-h" = "PaneFocusLeft"
+"Alt-j" = "PaneFocusDown"
+"Alt-k" = "PaneFocusUp"
+"Alt-l" = "PaneFocusRight"
+"Alt-n" = "TabNext"
+"Alt-p" = "@p"                         # Open Pane group (which-key)
+"Alt-t" = "@t"                         # Open Tab group (which-key)
+
 # --- Tab (t) ---
 [keybindings.command.t]
 _label = "Tab"
@@ -149,6 +175,7 @@ l = "ResizeRight 5"
 # Add overrides here if needed.
 
 # [keybindings.visual]
+
 
 # =============================================================================
 # Available Commands Reference
