@@ -92,17 +92,6 @@ pub fn load_state() -> Result<Option<PersistedState>> {
     Ok(Some(state))
 }
 
-/// Returns the auto-save interval as a `Duration`, or `None` if auto-save is
-/// disabled (interval is 0).
-pub fn auto_save_interval(config: &crate::config::Config) -> Option<std::time::Duration> {
-    let secs = config.general.auto_save_interval_secs;
-    if secs == 0 {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(secs))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -155,20 +144,6 @@ mod tests {
         assert!(persisted.state.folders.contains_key("work"));
         let sess = persisted.state.sessions.get("s1").unwrap();
         assert_eq!(sess.tabs.len(), 2);
-    }
-
-    #[test]
-    fn test_auto_save_interval_disabled() {
-        let mut config = crate::config::Config::default();
-        config.general.auto_save_interval_secs = 0;
-        assert!(auto_save_interval(&config).is_none());
-    }
-
-    #[test]
-    fn test_auto_save_interval_enabled() {
-        let config = crate::config::Config::default();
-        let interval = auto_save_interval(&config).unwrap();
-        assert_eq!(interval, std::time::Duration::from_secs(30));
     }
 
     #[test]

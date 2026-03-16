@@ -32,10 +32,12 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Spawn a new PTY with the given dimensions and optional command.
+    /// Spawn a new PTY with the given dimensions, optional command, and
+    /// optional working directory.
     ///
     /// If `command` is `None`, the shell from `$SHELL` is used, falling back
-    /// to `/bin/sh`.
+    /// to `/bin/sh`. If `cwd` is `Some`, the child process starts in that
+    /// directory; otherwise it inherits the parent's working directory.
     ///
     /// # Safety
     ///
@@ -43,7 +45,12 @@ impl Pty {
     /// multi-threaded programs. It should be called early, before spawning
     /// other threads, or with careful consideration of the fork-safety
     /// implications.
-    pub fn spawn(cols: u16, rows: u16, command: Option<&str>) -> Result<Pty> {
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        command: Option<&str>,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Pty> {
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -83,6 +90,16 @@ impl Pty {
                 // Close the original slave fd if it is not one of 0/1/2.
                 if slave.as_raw_fd() > 2 {
                     drop(slave);
+                }
+
+                // Change to the requested working directory, falling back
+                // to $HOME if the directory does not exist.
+                if let Some(dir) = cwd {
+                    if std::env::set_current_dir(dir).is_err() {
+                        if let Ok(home) = std::env::var("HOME") {
+                            let _ = std::env::set_current_dir(home);
+                        }
+                    }
                 }
 
                 // Determine which shell/command to execute.
@@ -331,7 +348,7 @@ mod tests {
     #[test]
     fn spawn_and_exit() {
         // Spawn a shell that immediately exits.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh")).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
         pty.write_input(b"exit\n").expect("write_input failed");
 
         // Wait for the child to exit.
@@ -342,7 +359,7 @@ mod tests {
 
     #[test]
     fn resize_does_not_error() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh")).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
         pty.resize(120, 40).expect("resize should not fail");
         pty.write_input(b"exit\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -350,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_output_returns_data() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh")).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
         pty.write_input(b"echo hello\n").expect("write failed");
 
         // Give the shell a moment to produce output.
@@ -365,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_reader_receives_output() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh")).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
         let raw_fd = pty.master_fd.as_raw_fd();
 
         let (_handle, mut rx) = start_reader(raw_fd);

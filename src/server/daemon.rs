@@ -149,6 +149,24 @@ impl RemuxServer {
     pub async fn run(config: Config) -> Result<()> {
         let server = Self::new(config);
 
+        // Restore persisted state before accepting connections.
+        if server.config.general.automatic_restore {
+            match crate::server::persistence::load_state() {
+                Ok(Some(persisted)) => {
+                    log::info!("restoring persisted state");
+                    if let Err(e) = restore_state(&server, persisted).await {
+                        log::warn!("failed to restore state: {e}, starting fresh");
+                    }
+                }
+                Ok(None) => {
+                    log::info!("no persisted state found, starting fresh");
+                }
+                Err(e) => {
+                    log::warn!("failed to load persisted state: {e}, starting fresh");
+                }
+            }
+        }
+
         let path = socket_path();
         // Create parent directory if needed.
         if let Some(parent) = path.parent() {
@@ -159,11 +177,6 @@ impl RemuxServer {
 
         let listener = UnixListener::bind(&path).context("binding Unix listener")?;
         log::info!("server listening on {}", path.display());
-
-        // Auto-save timer interval.
-        let auto_save_secs = server.config.general.auto_save_interval_secs;
-        let mut auto_save_interval =
-            tokio::time::interval(std::time::Duration::from_secs(auto_save_secs));
 
         // Set up signal handlers for graceful shutdown.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -182,9 +195,6 @@ impl RemuxServer {
                             log::error!("accept error: {e}");
                         }
                     }
-                }
-                _ = auto_save_interval.tick() => {
-                    log::debug!("auto-save tick");
                 }
                 _ = sigterm.recv() => {
                     log::info!("received SIGTERM, shutting down");
@@ -369,7 +379,7 @@ async fn handle_client_message(
             handle_command(client_id, cmd, state, panes, clients, config, prev_frames).await
         }
         ClientMessage::CreateSession { name, folder } => {
-            handle_create_session(
+            let result = handle_create_session(
                 client_id,
                 &name,
                 folder.as_deref(),
@@ -378,11 +388,15 @@ async fn handle_client_message(
                 clients,
                 config,
             )
-            .await
+            .await;
+            save_if_enabled(state, panes, config).await;
+            result
         }
         ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
         ClientMessage::KillSession { name } => {
-            handle_kill_session(&name, state, panes, clients).await
+            let result = handle_kill_session(&name, state, panes, clients).await;
+            save_if_enabled(state, panes, config).await;
+            result
         }
         ClientMessage::ModeChanged { mode } => {
             handle_mode_changed(client_id, &mode, state, panes, clients, config, prev_frames).await
@@ -565,7 +579,7 @@ async fn handle_command(
                 let mut st = state.lock().await;
                 st.create_tab(&session_name, "shell", LayoutMode::default())?
             };
-            spawn_pane(pane_id, cols, rows, None, panes, config).await?;
+            spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -663,7 +677,7 @@ async fn handle_command(
                 tab.pane_order.push(new_pane_id);
                 new_pane_id
             };
-            spawn_pane(new_pane_id, cols / 2, rows, None, panes, config).await?;
+            spawn_pane(new_pane_id, cols / 2, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -690,7 +704,7 @@ async fn handle_command(
                 tab.pane_order.push(new_pane_id);
                 new_pane_id
             };
-            spawn_pane(new_pane_id, cols, rows / 2, None, panes, config).await?;
+            spawn_pane(new_pane_id, cols, rows / 2, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -772,7 +786,7 @@ async fn handle_command(
                 tab.pane_order.push(new_pane_id);
                 new_pane_id
             };
-            spawn_pane(new_pane_id, cols, rows, None, panes, config).await?;
+            spawn_pane(new_pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -946,7 +960,7 @@ async fn handle_command(
                 }
                 new_pane_id
             };
-            spawn_pane(new_pane_id, cols, rows, None, panes, config).await?;
+            spawn_pane(new_pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -1001,6 +1015,10 @@ async fn handle_command(
             log::debug!("unhandled command: {cmd:?}");
         }
     }
+
+    // Persist state after every command that may have changed structure.
+    save_if_enabled(state, panes, config).await;
+
     Ok(())
 }
 
@@ -1027,7 +1045,7 @@ async fn handle_create_session(
         let layout_mode = config.appearance.default_layout.to_layout_mode();
         st.create_session(name, folder, border_style, layout_mode)?
     };
-    spawn_pane(pane_id, cols, rows, None, panes, config).await?;
+    spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
 
     let cls = clients.lock().await;
     if let Some(client) = cls.get(&client_id) {
@@ -1434,11 +1452,12 @@ async fn spawn_pane(
     cols: u16,
     rows: u16,
     command: Option<&str>,
+    cwd: Option<&std::path::Path>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
 ) -> Result<()> {
     let cmd = command.or(config.general.default_shell.as_deref());
-    let pty_instance = Pty::spawn(cols, rows, cmd)?;
+    let pty_instance = Pty::spawn(cols, rows, cmd, cwd)?;
     let raw_fd = pty_instance.master_fd.as_raw_fd();
     let (_reader_handle, pty_rx) = pty::start_reader(raw_fd);
     let screen = Screen::new(cols, rows, config.general.scrollback_lines);
@@ -2117,6 +2136,7 @@ async fn start_pty_forwarding(
                             &prev_frames,
                         )
                         .await;
+                        save_if_enabled(&state, &panes, &config).await;
                         break;
                     }
                     None => {
@@ -2131,4 +2151,201 @@ async fn start_pty_forwarding(
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Event-driven save helper
+// ---------------------------------------------------------------------------
+
+/// Save the server state to disk if automatic_restore is enabled.
+///
+/// This captures the current working directory of every pane and writes
+/// the full server state to the persistence file. It is called after
+/// every structural change (session/tab/pane create/close/rename).
+async fn save_if_enabled(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) {
+    if !config.general.automatic_restore {
+        return;
+    }
+    let st = state.lock().await;
+    let ps = panes.lock().await;
+    let mut pane_cwds = HashMap::new();
+    for (&pane_id, pane_data) in ps.iter() {
+        if let Some(cwd) = crate::server::persistence::get_pane_cwd(pane_data.pty.child_pid) {
+            pane_cwds.insert(pane_id, cwd);
+        }
+    }
+    if let Ok(persisted) = crate::server::persistence::PersistedState::from_server(&st, &pane_cwds)
+    {
+        if let Err(e) = crate::server::persistence::save_state(&persisted) {
+            log::error!("failed to save state: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State restore on startup
+// ---------------------------------------------------------------------------
+
+/// Restore server state from a persisted snapshot.
+///
+/// Replaces the server's state with the deserialized state, spawns new PTYs
+/// for every pane (using saved CWDs), and starts PTY forwarding. Panes are
+/// initially sized 80x24; they will be resized when the first client attaches
+/// and sends a `Resize` message.
+async fn restore_state(
+    server: &RemuxServer,
+    persisted: crate::server::persistence::PersistedState,
+) -> Result<()> {
+    let mut restored_state = persisted.state;
+    restored_state.ensure_id_counters();
+
+    // Collect all (session_name, pane_id, cwd) triples for PTY spawning.
+    let mut pane_spawns: Vec<(String, PaneId, Option<String>)> = Vec::new();
+    for (session_name, session) in &restored_state.sessions {
+        for tab in &session.tabs {
+            let pane_ids = layout::all_pane_ids(&tab.layout);
+            for pane_id in pane_ids {
+                let cwd = persisted.pane_cwds.get(&pane_id).cloned();
+                pane_spawns.push((session_name.clone(), pane_id, cwd));
+            }
+        }
+    }
+
+    // Replace the server state.
+    {
+        let mut st = server.state.lock().await;
+        *st = restored_state;
+    }
+
+    // Spawn PTYs for all restored panes.
+    let default_cols: u16 = 80;
+    let default_rows: u16 = 24;
+
+    for (_session_name, pane_id, cwd) in &pane_spawns {
+        let cwd_path = cwd.as_deref().map(std::path::Path::new);
+        if let Err(e) = spawn_pane(
+            *pane_id,
+            default_cols,
+            default_rows,
+            None,
+            cwd_path,
+            &server.panes,
+            &server.config,
+        )
+        .await
+        {
+            log::warn!("failed to spawn PTY for restored pane {pane_id}: {e}");
+        }
+    }
+
+    // Start PTY forwarding for all sessions and all tabs.
+    let session_names: Vec<String> = {
+        let st = server.state.lock().await;
+        st.sessions.keys().cloned().collect()
+    };
+    for session_name in &session_names {
+        let all_pane_ids: Vec<PaneId> = {
+            let st = server.state.lock().await;
+            if let Some(sess) = st.sessions.get(session_name) {
+                sess.tabs
+                    .iter()
+                    .flat_map(|t| layout::all_pane_ids(&t.layout))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        let sn = session_name.clone();
+        for pane_id in all_pane_ids {
+            let state = Arc::clone(&server.state);
+            let panes = Arc::clone(&server.panes);
+            let clients = Arc::clone(&server.clients);
+            let config = Arc::clone(&server.config);
+            let prev_frames = Arc::clone(&server.prev_frames);
+            let session_name = sn.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    let recv_result = {
+                        let mut ps = panes.lock().await;
+                        if let Some(pane_data) = ps.get_mut(&pane_id) {
+                            match pane_data.pty_rx.try_recv() {
+                                Ok(data) => Some(Ok(data)),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    Some(Err(()))
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    };
+
+                    match recv_result {
+                        Some(Ok(data)) => {
+                            let responses = {
+                                let mut ps = panes.lock().await;
+                                if let Some(pane_data) = ps.get_mut(&pane_id) {
+                                    pane_data.screen.process_output(&data);
+                                    pane_data.screen.take_responses()
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            if !responses.is_empty() {
+                                let ps = panes.lock().await;
+                                if let Some(pane_data) = ps.get(&pane_id) {
+                                    for resp in &responses {
+                                        let _ = pane_data.pty.write_input(resp);
+                                    }
+                                }
+                            }
+                            broadcast_full_render(
+                                &session_name,
+                                &state,
+                                &panes,
+                                &clients,
+                                &config,
+                                &prev_frames,
+                            )
+                            .await;
+                        }
+                        Some(Err(())) => {
+                            close_pane(
+                                pane_id,
+                                &session_name,
+                                &state,
+                                &panes,
+                                &clients,
+                                &config,
+                                &prev_frames,
+                            )
+                            .await;
+                            save_if_enabled(&state, &panes, &config).await;
+                            break;
+                        }
+                        None => {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            let ps = panes.lock().await;
+                            if !ps.contains_key(&pane_id) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    log::info!(
+        "restored {} sessions with {} panes",
+        session_names.len(),
+        pane_spawns.len()
+    );
+    Ok(())
 }
