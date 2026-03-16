@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::keybindings::{parse_command, KeyNode, KeybindingTree};
+use crate::config::keybindings::{
+    parse_command, InterceptAction, KeyNode, KeybindingTree, ShortcutBindings,
+};
 use crate::protocol::RemuxCommand;
 
 // ---------------------------------------------------------------------------
@@ -303,6 +305,12 @@ impl KeybindingState {
     pub fn path(&self) -> &[char] {
         &self.current_path
     }
+
+    /// Initialize the state at a given tree path (for entering Command mode
+    /// at a non-root group via modifier shortcuts).
+    pub fn set_path(&mut self, path: &[char]) {
+        self.current_path = path.to_vec();
+    }
 }
 
 impl Default for KeybindingState {
@@ -334,6 +342,8 @@ pub struct InputHandler {
     /// Rename overlay state. When `Some`, keystrokes are captured for inline
     /// text input rather than being dispatched to the normal mode handler.
     pub rename_overlay: Option<RenameOverlay>,
+    /// Modifier shortcut bindings for Normal mode (e.g. Alt-h, Alt-p).
+    shortcut_bindings: ShortcutBindings,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -357,8 +367,13 @@ pub enum RenameTarget {
 }
 
 impl InputHandler {
-    /// Create a new `InputHandler` with the given keybinding tree and leader key.
-    pub fn new(keybinding_tree: KeybindingTree, leader_key: KeyEvent) -> Self {
+    /// Create a new `InputHandler` with the given keybinding tree, leader key,
+    /// and modifier shortcut bindings.
+    pub fn new(
+        keybinding_tree: KeybindingTree,
+        leader_key: KeyEvent,
+        shortcut_bindings: ShortcutBindings,
+    ) -> Self {
         Self {
             mode: Mode::Normal,
             leader_key,
@@ -367,6 +382,7 @@ impl InputHandler {
             visual_state: None,
             pending_g: false,
             rename_overlay: None,
+            shortcut_bindings,
         }
     }
 
@@ -380,7 +396,11 @@ impl InputHandler {
             KeyEventKind::Press,
             KeyEventState::NONE,
         );
-        Self::new(KeybindingTree::default(), leader)
+        Self::new(
+            KeybindingTree::default(),
+            leader,
+            ShortcutBindings::default(),
+        )
     }
 
     /// Process a key event and return the appropriate action.
@@ -423,6 +443,31 @@ impl InputHandler {
     // -----------------------------------------------------------------------
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> InputAction {
+        // Check modifier shortcut bindings first.
+        // Clone the action to release the immutable borrow on self before
+        // calling methods that require &mut self.
+        if let Some(action) = self.shortcut_bindings.lookup(&key).cloned() {
+            match action {
+                InterceptAction::Command(ref actions) => {
+                    // Execute command chain, staying in Normal mode.
+                    return self.execute_shortcut_commands(actions);
+                }
+                InterceptAction::GroupPrefix(ref path) => {
+                    // Enter Command mode at the specified group.
+                    self.mode = Mode::Command;
+                    self.keybinding_state.set_path(path);
+                    if let Some(children) = self.keybinding_tree.children_at(path) {
+                        let label = match self.keybinding_tree.lookup(path) {
+                            Some(KeyNode::Group { label, .. }) => label.clone(),
+                            _ => "Remux".to_string(),
+                        };
+                        return InputAction::ShowWhichKey(label, children);
+                    }
+                    return InputAction::ModeChanged(Mode::Command);
+                }
+            }
+        }
+
         // Check for leader key -- enter Command mode.
         if self.is_leader_key(&key) {
             self.mode = Mode::Command;
@@ -437,6 +482,24 @@ impl InputHandler {
         match key_event_to_bytes(&key) {
             Some(bytes) => InputAction::SendToPty(bytes),
             Option::None => InputAction::None,
+        }
+    }
+
+    /// Execute a shortcut command chain. Unlike `execute_action_chain`, this
+    /// keeps the mode as Normal and doesn't interact with the keybinding tree
+    /// state.
+    fn execute_shortcut_commands(&mut self, actions: &[String]) -> InputAction {
+        let mut commands: Vec<RemuxCommand> = Vec::new();
+        for action_str in actions {
+            match parse_command(action_str) {
+                Some(cmd) => commands.push(cmd),
+                None => log::error!("Failed to parse shortcut action: {}", action_str),
+            }
+        }
+        match commands.len() {
+            0 => InputAction::None,
+            1 => InputAction::Execute(commands.remove(0)),
+            _ => InputAction::ExecuteChain(commands),
         }
     }
 
@@ -1494,12 +1557,22 @@ mod tests {
     }
 
     #[test]
-    fn normal_alt_keys_pass_to_pty() {
+    fn normal_alt_keys_intercept_bindings() {
         let mut handler = InputHandler::with_defaults();
         assert_eq!(handler.mode, Mode::Normal);
-        // Alt-h passes through to PTY (no insert bindings anymore).
+        // Alt-h is intercepted by default shortcut bindings (PaneFocusLeft).
         let action = handler.handle_key(alt_key('h'));
-        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'h']));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneFocusLeft));
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn normal_alt_keys_unbound_pass_to_pty() {
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(handler.mode, Mode::Normal);
+        // Alt-z has no shortcut binding, so it passes through to PTY.
+        let action = handler.handle_key(alt_key('z'));
+        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'z']));
         assert_eq!(handler.mode, Mode::Normal);
     }
 
@@ -1613,5 +1686,93 @@ mod tests {
             crate::protocol::ClientMessage::Command(RemuxCommand::EnterCommandMode) => {}
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    // -- Shortcut group entry tests -----------------------------------------
+
+    #[test]
+    fn alt_p_enters_command_mode_at_pane_group() {
+        let mut handler = InputHandler::with_defaults();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        let action = handler.handle_key(key);
+        assert_eq!(handler.mode, Mode::Command);
+        match action {
+            InputAction::ShowWhichKey(label, children) => {
+                assert_eq!(label, "Pane");
+                let keys: Vec<char> = children.iter().map(|(k, _)| *k).collect();
+                assert!(keys.contains(&'n'));
+                assert!(keys.contains(&'h'));
+            }
+            other => panic!("expected ShowWhichKey for Pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_h_executes_command_stays_normal() {
+        let mut handler = InputHandler::with_defaults();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('h'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        let action = handler.handle_key(key);
+        assert_eq!(handler.mode, Mode::Normal);
+        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneFocusLeft));
+    }
+
+    #[test]
+    fn escape_from_group_shortcut_returns_to_normal() {
+        let mut handler = InputHandler::with_defaults();
+        // Enter command mode at Pane group via Alt-p
+        let alt_p = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        handler.handle_key(alt_p);
+        assert_eq!(handler.mode, Mode::Command);
+
+        // Escape returns to Normal
+        let esc = KeyEvent::new_with_kind_and_state(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        let action = handler.handle_key(esc);
+        assert_eq!(handler.mode, Mode::Normal);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+    }
+
+    #[test]
+    fn alt_p_then_n_creates_pane() {
+        let mut handler = InputHandler::with_defaults();
+        // Alt-p enters Pane group
+        let alt_p = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        handler.handle_key(alt_p);
+        assert_eq!(handler.mode, Mode::Command);
+
+        // 'n' creates a new pane (default: "PaneNew; EnterNormal")
+        let n = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        let action = handler.handle_key(n);
+        assert_eq!(action, InputAction::Execute(RemuxCommand::PaneNew));
+        assert_eq!(handler.mode, Mode::Normal);
     }
 }

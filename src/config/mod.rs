@@ -266,6 +266,30 @@ impl Config {
         tree
     }
 
+    /// Build the effective shortcut bindings by starting from defaults
+    /// and merging any user-defined overrides from `[keybindings.command]`.
+    pub fn shortcut_bindings(&self) -> keybindings::ShortcutBindings {
+        let mut bindings = keybindings::ShortcutBindings::default();
+        if let Some(table) = self.keybindings.command.as_table() {
+            if !table.is_empty() {
+                if let Some(user_bindings) =
+                    keybindings::ShortcutBindings::from_toml(&self.keybindings.command)
+                {
+                    bindings.merge(&user_bindings);
+                }
+            }
+        }
+        bindings
+    }
+
+    /// Validate cross-references between config sections.
+    /// Logs errors for invalid references. Returns true if valid.
+    pub fn validate(&self) -> bool {
+        let tree = self.keybinding_tree();
+        let shortcuts = self.shortcut_bindings();
+        shortcuts.validate_group_refs(&tree)
+    }
+
     /// Parse the leader key from the config.
     ///
     /// Looks in `[keybindings.command]` for a `leader` key. Falls back to

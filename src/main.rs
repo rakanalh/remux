@@ -278,10 +278,13 @@ async fn client_event_loop(client: &mut RemuxClient, config: &Config) -> Result<
 async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()> {
     use crossterm::event::EventStream;
 
+    config.validate();
+
     let mut event_stream = EventStream::new();
     let keybindings = config.keybinding_tree();
     let leader_key = config.leader_key();
-    let mut input = InputHandler::new(keybindings, leader_key);
+    let shortcut_bindings = config.shortcut_bindings();
+    let mut input = InputHandler::new(keybindings, leader_key, shortcut_bindings);
     let (cols, rows) = crossterm::terminal::size()?;
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();

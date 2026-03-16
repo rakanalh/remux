@@ -302,6 +302,229 @@ fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNo
 }
 
 // ---------------------------------------------------------------------------
+// NormalizedKeyEvent, InterceptAction, ShortcutBindings
+// ---------------------------------------------------------------------------
+
+/// A normalized key event for use as a HashMap key.
+/// Strips `kind` and `state` from `crossterm::KeyEvent` to ensure consistent
+/// matching across terminals.
+#[derive(Debug, Clone, Copy)]
+pub struct NormalizedKeyEvent {
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+}
+
+impl NormalizedKeyEvent {
+    pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+}
+
+impl From<&KeyEvent> for NormalizedKeyEvent {
+    fn from(event: &KeyEvent) -> Self {
+        Self {
+            code: event.code,
+            modifiers: event.modifiers,
+        }
+    }
+}
+
+impl From<KeyEvent> for NormalizedKeyEvent {
+    fn from(event: KeyEvent) -> Self {
+        Self {
+            code: event.code,
+            modifiers: event.modifiers,
+        }
+    }
+}
+
+impl PartialEq for NormalizedKeyEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.modifiers == other.modifiers
+    }
+}
+impl Eq for NormalizedKeyEvent {}
+
+impl std::hash::Hash for NormalizedKeyEvent {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Hash the discriminant and inner value of KeyCode.
+        std::mem::discriminant(&self.code).hash(state);
+        // For Char, hash the character. For F(n), hash the number.
+        match self.code {
+            KeyCode::Char(c) => c.hash(state),
+            KeyCode::F(n) => n.hash(state),
+            _ => {}
+        }
+        self.modifiers.bits().hash(state);
+    }
+}
+
+/// Action to perform when a modifier shortcut binding matches.
+#[derive(Debug, Clone)]
+pub enum InterceptAction {
+    /// Execute commands and stay in Normal mode.
+    Command(Vec<String>),
+    /// Enter Command mode at the given keybinding tree group path.
+    GroupPrefix(Vec<char>),
+}
+
+/// Modifier-based keybindings that are checked in Normal mode before
+/// forwarding keys to the PTY.
+#[derive(Debug, Clone)]
+pub struct ShortcutBindings {
+    bindings: HashMap<NormalizedKeyEvent, InterceptAction>,
+}
+
+impl ShortcutBindings {
+    /// Look up a key event in the shortcut bindings.
+    pub fn lookup(&self, key: &KeyEvent) -> Option<&InterceptAction> {
+        let normalized = NormalizedKeyEvent::from(key);
+        self.bindings.get(&normalized)
+    }
+
+    /// Merge another set of bindings on top of this one.
+    /// Empty command strings remove the binding (unbind).
+    pub fn merge(&mut self, overrides: &ShortcutBindings) {
+        for (key, action) in &overrides.bindings {
+            match action {
+                InterceptAction::Command(cmds)
+                    if cmds.is_empty() || (cmds.len() == 1 && cmds[0].is_empty()) =>
+                {
+                    self.bindings.remove(key);
+                }
+                _ => {
+                    self.bindings.insert(*key, action.clone());
+                }
+            }
+        }
+    }
+
+    /// Validate that all `@<key>` group prefix references resolve to actual
+    /// groups in the keybinding tree. Logs errors for invalid references.
+    /// Returns true if all references are valid.
+    pub fn validate_group_refs(&self, tree: &KeybindingTree) -> bool {
+        let mut valid = true;
+        for action in self.bindings.values() {
+            if let InterceptAction::GroupPrefix(path) = action {
+                match tree.lookup(path) {
+                    Some(KeyNode::Group { .. }) => {}
+                    _ => {
+                        let path_str: String = path.iter().collect();
+                        log::error!(
+                            "shortcut binding references invalid group '@{path_str}': \
+                             no such group in keybinding tree"
+                        );
+                        valid = false;
+                    }
+                }
+            }
+        }
+        valid
+    }
+
+    /// Parse shortcut bindings from a TOML table. Each key is a key notation
+    /// string (e.g. `"Alt-h"`) and each value is either a command string
+    /// (semicolon-separated action chain) or a `@`-prefixed group path
+    /// (e.g. `"@p"` to enter the pane group).
+    ///
+    /// Keys without modifiers are rejected (shortcut bindings must use a
+    /// modifier to avoid interfering with normal typing). Table values are
+    /// also skipped since shortcut bindings are flat.
+    pub fn from_toml(value: &toml::Value) -> Option<Self> {
+        let table = value.as_table()?;
+        let mut bindings = HashMap::new();
+
+        for (key_str, val) in table {
+            // Reject table values — shortcut bindings are flat.
+            if val.is_table() {
+                log::warn!(
+                    "shortcut binding '{key_str}': nested tables are not supported, skipping"
+                );
+                continue;
+            }
+
+            let action_str = match val.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Parse the key notation.
+            let key_event = match parse_key_notation(key_str) {
+                Some(ev) => ev,
+                None => {
+                    log::warn!("shortcut binding '{key_str}': unrecognised key notation, skipping");
+                    continue;
+                }
+            };
+
+            // Reject keys without modifiers (plain keys or Shift-only for chars).
+            let dominated_by_shift = key_event.modifiers == KeyModifiers::NONE
+                || (key_event.modifiers == KeyModifiers::SHIFT
+                    && matches!(key_event.code, KeyCode::Char(_)));
+            if dominated_by_shift {
+                log::warn!(
+                    "shortcut binding '{key_str}': modifier required (Alt, Ctrl, etc.), skipping"
+                );
+                continue;
+            }
+
+            let normalized = NormalizedKeyEvent::new(key_event.code, key_event.modifiers);
+
+            let action = if let Some(group_path) = action_str.strip_prefix('@') {
+                InterceptAction::GroupPrefix(group_path.chars().collect())
+            } else {
+                let cmds: Vec<String> = action_str
+                    .split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                InterceptAction::Command(cmds)
+            };
+
+            bindings.insert(normalized, action);
+        }
+
+        Some(ShortcutBindings { bindings })
+    }
+}
+
+/// Helper to create a `NormalizedKeyEvent` with the Alt modifier.
+fn alt_key(c: char) -> NormalizedKeyEvent {
+    NormalizedKeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+}
+
+impl Default for ShortcutBindings {
+    fn default() -> Self {
+        let mut bindings = HashMap::new();
+
+        bindings.insert(
+            alt_key('h'),
+            InterceptAction::Command(vec!["PaneFocusLeft".to_string()]),
+        );
+        bindings.insert(
+            alt_key('j'),
+            InterceptAction::Command(vec!["PaneFocusDown".to_string()]),
+        );
+        bindings.insert(
+            alt_key('k'),
+            InterceptAction::Command(vec!["PaneFocusUp".to_string()]),
+        );
+        bindings.insert(
+            alt_key('l'),
+            InterceptAction::Command(vec!["PaneFocusRight".to_string()]),
+        );
+        bindings.insert(
+            alt_key('n'),
+            InterceptAction::Command(vec!["TabNext".to_string()]),
+        );
+        bindings.insert(alt_key('p'), InterceptAction::GroupPrefix(vec!['p']));
+        bindings.insert(alt_key('t'), InterceptAction::GroupPrefix(vec!['t']));
+
+        Self { bindings }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TOML config parsing
 // ---------------------------------------------------------------------------
 
@@ -1193,5 +1416,185 @@ mod tests {
     #[test]
     fn parse_command_send_key_invalid() {
         assert!(parse_command("SendKey").is_none());
+    }
+
+    // -- ShortcutBindings tests -----------------------------------------------
+
+    #[test]
+    fn default_shortcuts_has_alt_h() {
+        let bindings = ShortcutBindings::default();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('h'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key).unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["PaneFocusLeft"]),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_shortcuts_has_alt_p_group() {
+        let bindings = ShortcutBindings::default();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('p'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key).unwrap() {
+            InterceptAction::GroupPrefix(path) => assert_eq!(path, &['p']),
+            other => panic!("expected GroupPrefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_shortcuts_unbound_returns_none() {
+        let bindings = ShortcutBindings::default();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('z'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        assert!(bindings.lookup(&key).is_none());
+    }
+
+    // -- ShortcutBindings TOML parsing tests ----------------------------------
+
+    #[test]
+    fn shortcuts_from_toml_command() {
+        let toml_str = r#"
+            "Alt-x" = "TabNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let bindings = ShortcutBindings::from_toml(&value).unwrap();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('x'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key).unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["TabNew"]),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shortcuts_from_toml_group_prefix() {
+        let toml_str = r#"
+            "Alt-s" = "@s"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let bindings = ShortcutBindings::from_toml(&value).unwrap();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('s'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key).unwrap() {
+            InterceptAction::GroupPrefix(path) => assert_eq!(path, &['s']),
+            other => panic!("expected GroupPrefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shortcuts_from_toml_action_chain() {
+        let toml_str = r#"
+            "Alt-x" = "PaneNew; PaneFocusRight"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let bindings = ShortcutBindings::from_toml(&value).unwrap();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('x'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key).unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["PaneNew", "PaneFocusRight"]),
+            other => panic!("expected Command chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shortcuts_from_toml_rejects_plain_key() {
+        let toml_str = r#"
+            "n" = "TabNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let bindings = ShortcutBindings::from_toml(&value).unwrap();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        assert!(bindings.lookup(&key).is_none());
+    }
+
+    #[test]
+    fn shortcuts_merge_override() {
+        let mut base = ShortcutBindings::default();
+        let toml_str = r#"
+            "Alt-h" = "TabPrev"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let overrides = ShortcutBindings::from_toml(&value).unwrap();
+        base.merge(&overrides);
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('h'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match base.lookup(&key).unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["TabPrev"]),
+            other => panic!("expected Command(TabPrev), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shortcuts_merge_unbind() {
+        let mut base = ShortcutBindings::default();
+        let toml_str = r#"
+            "Alt-h" = ""
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let overrides = ShortcutBindings::from_toml(&value).unwrap();
+        base.merge(&overrides);
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('h'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        assert!(
+            base.lookup(&key).is_none(),
+            "Alt-h should have been unbound"
+        );
+    }
+
+    // -- validate_group_refs tests --------------------------------------------
+
+    #[test]
+    fn validate_group_refs_valid() {
+        let bindings = ShortcutBindings::default();
+        let tree = KeybindingTree::default();
+        assert!(bindings.validate_group_refs(&tree));
+    }
+
+    #[test]
+    fn validate_group_refs_invalid() {
+        let mut bindings = ShortcutBindings::default();
+        bindings
+            .bindings
+            .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['z']));
+        let tree = KeybindingTree::default();
+        assert!(!bindings.validate_group_refs(&tree));
     }
 }
