@@ -114,6 +114,8 @@ struct ClientConnection {
     mode: String,
     /// Active mouse selection, if any.
     mouse_selection: Option<MouseSelection>,
+    /// Search match info: (current_match, total_matches).
+    search_info: Option<(usize, usize)>,
 }
 
 /// The Remux server.
@@ -264,6 +266,7 @@ impl RemuxServer {
                     rows: 24,
                     mode: "INSERT".to_string(),
                     mouse_selection: None,
+                    search_info: None,
                 },
             );
             id
@@ -397,6 +400,13 @@ async fn handle_client_message(
             let result = handle_kill_session(&name, state, panes, clients).await;
             save_if_enabled(state, panes, config).await;
             result
+        }
+        ClientMessage::RequestScrollback => {
+            handle_request_scrollback(client_id, state, panes, clients).await
+        }
+        ClientMessage::SearchInfo { current, total } => {
+            handle_search_info(client_id, current, total, clients).await;
+            Ok(())
         }
         ClientMessage::ModeChanged { mode } => {
             handle_mode_changed(client_id, &mode, state, panes, clients, config, prev_frames).await
@@ -1127,6 +1137,75 @@ async fn handle_client_disconnect(
     cls.remove(&client_id);
 }
 
+async fn handle_request_scrollback(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Result<()> {
+    let (session_name, _cols, _rows) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => (c.session_name.clone(), c.cols, c.rows),
+            None => return Ok(()),
+        }
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Find the active pane for this client's session.
+    let active_pane_id = {
+        let st = state.lock().await;
+        let sess = match st.sessions.get(&session_name) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let tab = match sess.tabs.get(sess.active_tab) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        tab.focused_pane
+    };
+
+    // Read scrollback content from the pane's screen.
+    let lines: Vec<String> = {
+        let ps = panes.lock().await;
+        match ps.get(&active_pane_id) {
+            Some(pane_data) => {
+                let content = pane_data.screen.scrollback_content();
+                content.lines().map(|l| l.to_string()).collect()
+            }
+            None => Vec::new(),
+        }
+    };
+
+    // Send back to client.
+    let cls = clients.lock().await;
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client.tx.send(ServerMessage::ScrollbackContent { lines });
+    }
+
+    Ok(())
+}
+
+async fn handle_search_info(
+    client_id: u64,
+    current: usize,
+    total: usize,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    let mut cls = clients.lock().await;
+    if let Some(client) = cls.get_mut(&client_id) {
+        if total == 0 {
+            client.search_info = None;
+        } else {
+            client.search_info = Some((current, total));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_mode_changed(
     client_id: u64,
@@ -1141,6 +1220,10 @@ async fn handle_mode_changed(
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
             client.mode = mode.to_string();
+            // Clear search info when leaving search mode.
+            if mode != "SEARCH" {
+                client.search_info = None;
+            }
             client.session_name.clone()
         } else {
             None
@@ -1198,6 +1281,7 @@ async fn handle_mouse_click(
         state,
         panes,
         config,
+        None,
         None,
         &config.compositor_theme(),
     )
@@ -1310,6 +1394,7 @@ async fn handle_mouse_drag(
         state,
         panes,
         config,
+        None,
         None,
         &config.compositor_theme(),
     )
@@ -1530,14 +1615,15 @@ async fn send_full_render_to_client(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (mode, selection) = {
+    let (mode, selection, client_search_info) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
         let mode = client
             .map(|c| c.mode.clone())
             .unwrap_or_else(|| "INSERT".to_string());
         let selection = client.and_then(|c| c.mouse_selection.clone());
-        (mode, selection)
+        let si = client.and_then(|c| c.search_info);
+        (mode, selection, si)
     };
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
@@ -1559,6 +1645,7 @@ async fn send_full_render_to_client(
         panes,
         config,
         selection.as_ref(),
+        client_search_info,
         &config.compositor_theme(),
     )
     .await;
@@ -1587,7 +1674,7 @@ async fn broadcast_full_render(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (cols, rows, mode, selection) = {
+    let (cols, rows, mode, selection, si) = {
         let cls = clients.lock().await;
         let attached: Vec<_> = cls
             .values()
@@ -1604,7 +1691,8 @@ async fn broadcast_full_render(
             .map(|c| c.mode.clone())
             .unwrap_or_else(|| "INSERT".to_string());
         let selection = first.and_then(|c| c.mouse_selection.clone());
-        (cols, rows, mode, selection)
+        let si = first.and_then(|c| c.search_info);
+        (cols, rows, mode, selection, si)
     };
 
     // Update auto-detected pane names before rendering.
@@ -1628,6 +1716,7 @@ async fn broadcast_full_render(
         panes,
         config,
         selection.as_ref(),
+        si,
         &config.compositor_theme(),
     )
     .await;
@@ -1731,6 +1820,7 @@ async fn build_composite(
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     _config: &Arc<Config>,
     selection: Option<&MouseSelection>,
+    search_info: Option<(usize, usize)>,
     compositor_theme: &crate::config::theme::CompositorTheme,
 ) -> (
     Vec<Vec<RenderCell>>,
@@ -1801,6 +1891,7 @@ async fn build_composite(
             .map(|(i, t)| (t.name.clone(), i == sess.active_tab))
             .collect(),
         layout_mode: tab.layout_mode.name().to_string(),
+        search_info,
     };
 
     let (cells, hit_regions) = composite(

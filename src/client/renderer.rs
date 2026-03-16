@@ -516,6 +516,66 @@ impl Renderer {
         self.clear_overlay(cols, rows)
     }
 
+    /// Render a search prompt overlay at the bottom of the screen (above the
+    /// status bar). Shows `/query_` during prompt phase, `/query (x/y)` during
+    /// navigation phase.
+    pub fn render_search_prompt(
+        &self,
+        query: &str,
+        phase: crate::client::input::SearchPhase,
+        match_info: Option<(usize, usize)>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+
+        // Draw on the second-to-last row (above status bar).
+        let prompt_row = rows.saturating_sub(2);
+
+        // Build the prompt string.
+        let prompt = match phase {
+            crate::client::input::SearchPhase::Prompt => {
+                format!("/{query}")
+            }
+            crate::client::input::SearchPhase::Navigation => {
+                if let Some((current, total)) = match_info {
+                    format!("/{query} ({}/{})", current + 1, total)
+                } else {
+                    format!("/{query}")
+                }
+            }
+        };
+
+        let max_len = cols as usize;
+        let display: String = prompt.chars().take(max_len).collect();
+        let padding = max_len.saturating_sub(display.len());
+
+        queue!(stdout, cursor::Hide)?;
+        queue!(stdout, MoveTo(0, prompt_row))?;
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Black),
+            SetBackgroundColor(Color::AnsiValue(11)), // Bright yellow
+        )?;
+        queue!(stdout, Print(&display))?;
+
+        // Fill remaining with spaces in the same bg color.
+        if padding > 0 {
+            queue!(stdout, Print(" ".repeat(padding)))?;
+        }
+
+        queue!(stdout, ResetColor)?;
+
+        // Show cursor at the end of the query during prompt phase.
+        if phase == crate::client::input::SearchPhase::Prompt {
+            let cursor_x = (display.len() as u16).min(cols.saturating_sub(1));
+            queue!(stdout, MoveTo(cursor_x, prompt_row), cursor::Show)?;
+        }
+
+        stdout.flush()?;
+        Ok(())
+    }
+
     /// Get a reference to the front buffer (for testing/inspection).
     pub fn front_buffer(&self) -> &[Vec<RenderCell>] {
         &self.front

@@ -131,9 +131,21 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         ),
     );
 
-    // s: Session
+    // s: Search
     root.insert(
         's',
+        group(
+            "Search",
+            vec![
+                ('s', leaf("search", "EnterSearchMode")),
+                ('e', leaf("edit in editor", "BufferEditInEditor")),
+            ],
+        ),
+    );
+
+    // x: Session
+    root.insert(
+        'x',
         group(
             "Session",
             vec![
@@ -155,18 +167,6 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('d', leaf("delete", "FolderDelete")),
                 ('l', leaf("list", "FolderList")),
                 ('m', leaf("move session", "FolderMoveSession")),
-            ],
-        ),
-    );
-
-    // b: Buffer
-    root.insert(
-        'b',
-        group(
-            "Buffer",
-            vec![
-                ('e', leaf("edit in editor", "BufferEditInEditor")),
-                ('/', leaf("search", "BufferSearch")),
             ],
         ),
     );
@@ -665,7 +665,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "SessionList" => Some(RemuxCommand::SessionList),
         "FolderList" => Some(RemuxCommand::FolderList),
         "BufferEditInEditor" => Some(RemuxCommand::BufferEditInEditor),
-        "BufferSearch" => Some(RemuxCommand::BufferSearch),
+        "EnterSearchMode" => Some(RemuxCommand::EnterSearchMode),
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
@@ -1108,12 +1108,14 @@ mod tests {
         let tree = KeybindingTree::default();
         assert!(tree.root.contains_key(&'t'));
         assert!(tree.root.contains_key(&'p'));
-        assert!(tree.root.contains_key(&'s'));
+        assert!(tree.root.contains_key(&'s')); // Search group
+        assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
         assert!(tree.root.contains_key(&'f'));
-        assert!(tree.root.contains_key(&'b'));
         assert!(tree.root.contains_key(&'r'));
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
+        // 'b' (Buffer group) was removed in the search-mode refactor.
+        assert!(!tree.root.contains_key(&'b'));
         // 'i' (EnterInsertMode) was removed in the leader-key-modes refactor.
         assert!(!tree.root.contains_key(&'i'));
     }

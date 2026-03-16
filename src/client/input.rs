@@ -22,6 +22,7 @@ pub enum Mode {
     Command,
     Visual,
     CommandPalette,
+    Search,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +241,83 @@ impl VisualState {
 }
 
 // ---------------------------------------------------------------------------
+// SearchPhase / SearchState
+// ---------------------------------------------------------------------------
+
+/// The phase of a search-mode interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPhase {
+    /// The user is typing a search query.
+    Prompt,
+    /// The user is navigating between matches.
+    Navigation,
+}
+
+/// State for Search mode.
+#[derive(Debug, Clone)]
+pub struct SearchState {
+    /// The query buffer (characters typed so far).
+    pub query_buffer: String,
+    /// The confirmed query (after Enter).
+    pub confirmed_query: Option<String>,
+    /// Match positions as (line, column) in the scrollback content.
+    pub matches: Vec<(usize, usize)>,
+    /// Index of the currently highlighted match.
+    pub current_match: usize,
+    /// Current search phase.
+    pub phase: SearchPhase,
+}
+
+impl SearchState {
+    /// Create a new `SearchState` in the Prompt phase.
+    pub fn new() -> Self {
+        Self {
+            query_buffer: String::new(),
+            confirmed_query: None,
+            matches: Vec::new(),
+            current_match: 0,
+            phase: SearchPhase::Prompt,
+        }
+    }
+
+    /// Move to the next match (with wrapping).
+    pub fn next_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current_match = (self.current_match + 1) % self.matches.len();
+        }
+    }
+
+    /// Move to the previous match (with wrapping).
+    pub fn prev_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current_match = if self.current_match == 0 {
+                self.matches.len() - 1
+            } else {
+                self.current_match - 1
+            };
+        }
+    }
+
+    /// Compute substring matches given scrollback lines and a query.
+    pub fn compute_matches(lines: &[String], query: &str) -> Vec<(usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_lower = line.to_lowercase();
+            let mut start = 0;
+            while let Some(pos) = line_lower[start..].find(&query_lower) {
+                results.push((line_idx, start + pos));
+                start += pos + 1;
+            }
+        }
+        results
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InputAction
 // ---------------------------------------------------------------------------
 
@@ -264,6 +342,12 @@ pub enum InputAction {
     EditInEditor,
     /// Enter search mode (prompt the user for a search query).
     SearchPrompt,
+    /// Search query confirmed -- request scrollback from server.
+    SearchConfirm(String),
+    /// Search cancelled -- exit search mode.
+    SearchCancel,
+    /// Search match navigation changed -- re-render prompt.
+    SearchNavigate,
     /// Update the visual mode scroll offset.
     VisualScroll { offset: usize },
     /// Activate the rename overlay for pane or tab renaming.
@@ -358,6 +442,8 @@ pub struct InputHandler {
     shortcut_bindings: ShortcutBindings,
     /// Command palette state. When `Some`, the palette overlay is active.
     pub command_palette: Option<CommandPaletteState>,
+    /// State for Search mode.
+    pub search_state: Option<SearchState>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -398,6 +484,7 @@ impl InputHandler {
             rename_overlay: None,
             shortcut_bindings,
             command_palette: None,
+            search_state: None,
         }
     }
 
@@ -430,6 +517,7 @@ impl InputHandler {
             Mode::Command => self.handle_command_key(key),
             Mode::Visual => self.handle_visual_key(key),
             Mode::CommandPalette => self.handle_command_palette_key(key),
+            Mode::Search => self.handle_search_key(key),
         }
     }
 
@@ -630,6 +718,11 @@ impl InputHandler {
                             self.mode = Mode::Visual;
                             self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
                             final_action = Some(InputAction::ModeChanged(Mode::Visual));
+                        }
+                        RemuxCommand::EnterSearchMode => {
+                            self.mode = Mode::Search;
+                            self.search_state = Some(SearchState::new());
+                            final_action = Some(InputAction::ModeChanged(Mode::Search));
                         }
                         RemuxCommand::PaneRename(_) => {
                             // Activate rename overlay instead of executing directly.
@@ -841,6 +934,75 @@ impl InputHandler {
         }
 
         InputAction::None
+    }
+
+    // -----------------------------------------------------------------------
+    // Search mode
+    // -----------------------------------------------------------------------
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> InputAction {
+        let search = match self.search_state.as_mut() {
+            Some(s) => s,
+            None => {
+                // No search state -- exit to Normal.
+                self.mode = Mode::Normal;
+                return InputAction::ModeChanged(Mode::Normal);
+            }
+        };
+
+        match search.phase {
+            SearchPhase::Prompt => {
+                match key.code {
+                    KeyCode::Esc => {
+                        // Cancel search.
+                        self.search_state = None;
+                        self.mode = Mode::Normal;
+                        InputAction::SearchCancel
+                    }
+                    KeyCode::Enter => {
+                        let query = search.query_buffer.clone();
+                        if query.is_empty() {
+                            // Empty query -- cancel.
+                            self.search_state = None;
+                            self.mode = Mode::Normal;
+                            InputAction::SearchCancel
+                        } else {
+                            search.confirmed_query = Some(query.clone());
+                            search.phase = SearchPhase::Navigation;
+                            InputAction::SearchConfirm(query)
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        search.query_buffer.pop();
+                        InputAction::SearchPrompt
+                    }
+                    KeyCode::Char(c) => {
+                        search.query_buffer.push(c);
+                        InputAction::SearchPrompt
+                    }
+                    _ => InputAction::None,
+                }
+            }
+            SearchPhase::Navigation => {
+                match key.code {
+                    KeyCode::Esc => {
+                        // Exit search mode.
+                        self.search_state = None;
+                        self.mode = Mode::Normal;
+                        InputAction::SearchCancel
+                    }
+                    KeyCode::Char('n') => {
+                        search.next_match();
+                        InputAction::SearchNavigate
+                    }
+                    KeyCode::Char('N') => {
+                        search.prev_match();
+                        InputAction::SearchNavigate
+                    }
+                    _ => InputAction::None,
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1261,7 +1423,8 @@ mod tests {
         handler.mode = Mode::Command;
 
         // Session detach is a single action (no EnterNormal in chain).
-        let _ = handler.handle_key(char_key('s'));
+        // Session group is now under 'x'.
+        let _ = handler.handle_key(char_key('x'));
         let action = handler.handle_key(char_key('d'));
         assert_eq!(action, InputAction::Execute(RemuxCommand::SessionDetach));
         // Should stay in Command mode since no EnterNormal in chain.
