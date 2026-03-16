@@ -632,6 +632,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let query = ss.confirmed_query.as_deref().unwrap_or("");
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                                    // Re-render highlights with updated current match.
+                                    renderer.render_search_highlight(
+                                        &ss.matches,
+                                        ss.current_match,
+                                        query.len(),
+                                        ss.scrollback_line_count,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
                                 }
                             }
                             InputAction::SessionManagerOpen => {
@@ -848,11 +856,18 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let draw_cmds = palette.render(c, r, &theme);
                             renderer.render_command_palette_overlay(&draw_cmds)?;
                         }
-                        // Re-render search prompt on top if in search mode
+                        // Re-render search prompt and highlights on top if in search mode
                         else if let Some(ref ss) = input.search_state {
                             let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
                             let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
                             let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_search_highlight(
+                                &ss.matches,
+                                ss.current_match,
+                                query.len(),
+                                ss.scrollback_line_count,
+                                focused_pane_rect.as_ref(),
+                            )?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
                         }
                         // Re-render session manager on top if active
@@ -891,11 +906,18 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let draw_cmds = palette.render(c, r, &theme);
                             renderer.render_command_palette_overlay(&draw_cmds)?;
                         }
-                        // Re-render search prompt on top if in search mode
+                        // Re-render search prompt and highlights on top if in search mode
                         else if let Some(ref ss) = input.search_state {
                             let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
                             let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
                             let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_search_highlight(
+                                &ss.matches,
+                                ss.current_match,
+                                query.len(),
+                                ss.scrollback_line_count,
+                                focused_pane_rect.as_ref(),
+                            )?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
                         }
                         // Re-render session manager on top if active
@@ -925,6 +947,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         // Compute search matches.
                         if let Some(ref mut ss) = input.search_state {
                             if let Some(ref query) = ss.confirmed_query {
+                                ss.scrollback_line_count = lines.len();
                                 ss.matches = crate::client::input::SearchState::compute_matches(&lines, query);
                                 ss.current_match = 0;
                                 // Send search info to server.
@@ -941,6 +964,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 let q = query.clone();
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.render_search_prompt(&q, ss.phase, match_info, c, r)?;
+                                // Highlight matches in the terminal content.
+                                renderer.render_search_highlight(
+                                    &ss.matches,
+                                    ss.current_match,
+                                    q.len(),
+                                    ss.scrollback_line_count,
+                                    focused_pane_rect.as_ref(),
+                                )?;
                             }
                         }
                     }

@@ -475,6 +475,9 @@ async fn handle_attach(
         }
     };
 
+    // Resize panes to match the attaching client's terminal dimensions.
+    resize_session_panes(session_name, cols, rows, state, panes, config).await?;
+
     send_full_render_to_client(
         client_id,
         session_name,
@@ -1040,6 +1043,7 @@ async fn handle_command(
                 }
             }
             start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
+            resize_session_panes(&session, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionSwitchPane {
@@ -1067,6 +1071,7 @@ async fn handle_command(
                 }
             }
             start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
+            resize_session_panes(&session, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabCloseByIndex {
