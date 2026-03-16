@@ -312,6 +312,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         if key.kind == KeyEventKind::Press =>
                     {
                         let was_renaming = input.rename_overlay.is_some();
+                        let was_in_palette = input.command_palette.is_some();
                         let action = input.handle_key(key);
 
                         // If rename popup was dismissed, clear overlay
@@ -329,6 +330,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
+                                // Clear command palette overlay if it was just closed.
+                                if was_in_palette && input.command_palette.is_none() {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_command_palette_overlay(c, r)?;
+                                }
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
                                     return Ok(());
                                 }
@@ -343,6 +349,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Normal => "NORMAL",
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
+                                    Mode::CommandPalette => "PALETTE",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -371,6 +378,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Normal => "NORMAL",
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
+                                    Mode::CommandPalette => "PALETTE",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -383,6 +391,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Normal => "NORMAL",
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
+                                    Mode::CommandPalette => "PALETTE",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -517,6 +526,54 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     renderer.render_visual_overlay(vs)?;
                                 }
                             }
+                            InputAction::CommandPaletteOpen => {
+                                // Hide which-key when opening palette.
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // Render the palette overlay.
+                                if let Some(ref palette) = input.command_palette {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    let draw_cmds = palette.render(c, r, &theme);
+                                    renderer.render_command_palette_overlay(&draw_cmds)?;
+                                }
+                                // Notify server of mode change.
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: "PALETTE".to_string(),
+                                    })
+                                    .await?;
+                            }
+                            InputAction::CommandPaletteUpdate
+                            | InputAction::CommandPaletteComplete => {
+                                // Re-render the palette overlay with updated state.
+                                if let Some(ref palette) = input.command_palette {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_command_palette_overlay(c, r)?;
+                                    let draw_cmds = palette.render(c, r, &theme);
+                                    renderer.render_command_palette_overlay(&draw_cmds)?;
+                                }
+                            }
+                            InputAction::CommandPaletteExecute => {
+                                // Already handled via Execute action path.
+                            }
+                            InputAction::CommandPaletteClose => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_command_palette_overlay(c, r)?;
+                                // Notify server of mode change.
+                                let mode_str = match input.mode {
+                                    Mode::Normal => "NORMAL",
+                                    Mode::Command => "COMMAND",
+                                    Mode::Visual => "VISUAL",
+                                    Mode::CommandPalette => "PALETTE",
+                                };
+                                client
+                                    .send(ClientMessage::ModeChanged {
+                                        mode: mode_str.to_string(),
+                                    })
+                                    .await?;
+                            }
                             InputAction::SearchPrompt
                             | InputAction::None => {}
                         }
@@ -602,6 +659,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
                         }
+                        // Re-render command palette on top if active
+                        else if let Some(ref palette) = input.command_palette {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = palette.render(c, r, &theme);
+                            renderer.render_command_palette_overlay(&draw_cmds)?;
+                        }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
@@ -625,6 +688,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             };
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
+                        }
+                        // Re-render command palette on top if active
+                        else if let Some(ref palette) = input.command_palette {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = palette.render(c, r, &theme);
+                            renderer.render_command_palette_overlay(&draw_cmds)?;
                         }
                         // Re-render popup on top if visible
                         else if whichkey.visible {

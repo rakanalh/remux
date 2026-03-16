@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::client::command_palette::CommandPaletteState;
 use crate::config::keybindings::{
     parse_command, InterceptAction, KeyNode, KeybindingTree, ShortcutBindings,
 };
@@ -20,6 +21,7 @@ pub enum Mode {
     Normal,
     Command,
     Visual,
+    CommandPalette,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +270,16 @@ pub enum InputAction {
     ActivateRenameOverlay,
     /// The rename overlay buffer was updated (for status bar display).
     RenameUpdate(String),
+    /// Open the command palette.
+    CommandPaletteOpen,
+    /// The command palette input/filter was updated.
+    CommandPaletteUpdate,
+    /// Tab completion was triggered in the command palette.
+    CommandPaletteComplete,
+    /// A command was selected/executed from the command palette.
+    CommandPaletteExecute,
+    /// The command palette was closed.
+    CommandPaletteClose,
     /// No action to take.
     None,
 }
@@ -344,6 +356,8 @@ pub struct InputHandler {
     pub rename_overlay: Option<RenameOverlay>,
     /// Modifier shortcut bindings for Normal mode (e.g. Alt-h, Alt-p).
     shortcut_bindings: ShortcutBindings,
+    /// Command palette state. When `Some`, the palette overlay is active.
+    pub command_palette: Option<CommandPaletteState>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -383,6 +397,7 @@ impl InputHandler {
             pending_g: false,
             rename_overlay: None,
             shortcut_bindings,
+            command_palette: None,
         }
     }
 
@@ -414,6 +429,7 @@ impl InputHandler {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Command => self.handle_command_key(key),
             Mode::Visual => self.handle_visual_key(key),
+            Mode::CommandPalette => self.handle_command_palette_key(key),
         }
     }
 
@@ -592,6 +608,13 @@ impl InputHandler {
         let mut final_action: Option<InputAction> = None;
 
         for action_str in actions {
+            // Handle client-only actions that are not RemuxCommand variants.
+            if action_str == "CommandPaletteOpen" {
+                self.mode = Mode::CommandPalette;
+                self.command_palette = Some(CommandPaletteState::new());
+                return InputAction::CommandPaletteOpen;
+            }
+
             match parse_command(action_str) {
                 Some(cmd) => {
                     match &cmd {
@@ -861,6 +884,74 @@ impl InputHandler {
                 overlay.buffer.push(c);
                 overlay.cursor += 1;
                 InputAction::RenameUpdate(overlay.buffer.clone())
+            }
+            _ => InputAction::None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Command palette
+    // -----------------------------------------------------------------------
+
+    fn handle_command_palette_key(&mut self, key: KeyEvent) -> InputAction {
+        let palette = match self.command_palette.as_mut() {
+            Some(p) => p,
+            None => return InputAction::None,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.command_palette = None;
+                self.mode = Mode::Command;
+                InputAction::CommandPaletteClose
+            }
+            KeyCode::Enter => {
+                let input = palette.current_input();
+                self.command_palette = None;
+                self.mode = Mode::Normal;
+                if let Some(cmd) = parse_command(&input) {
+                    // Check for mode-transition commands.
+                    match &cmd {
+                        RemuxCommand::EnterNormal => {
+                            self.mode = Mode::Normal;
+                        }
+                        RemuxCommand::EnterCommandMode => {
+                            self.mode = Mode::Command;
+                        }
+                        RemuxCommand::EnterVisualMode => {
+                            self.mode = Mode::Visual;
+                            self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
+                        }
+                        _ => {}
+                    }
+                    InputAction::Execute(cmd)
+                } else {
+                    InputAction::CommandPaletteClose
+                }
+            }
+            KeyCode::Tab => {
+                palette.tab_complete(false);
+                InputAction::CommandPaletteComplete
+            }
+            KeyCode::BackTab => {
+                palette.tab_complete(true);
+                InputAction::CommandPaletteComplete
+            }
+            KeyCode::Backspace => {
+                palette.backspace();
+                InputAction::CommandPaletteUpdate
+            }
+            KeyCode::Up => {
+                palette.select_prev();
+                InputAction::CommandPaletteUpdate
+            }
+            KeyCode::Down => {
+                palette.select_next();
+                InputAction::CommandPaletteUpdate
+            }
+            KeyCode::Char(c) => {
+                palette.insert_char(c);
+                InputAction::CommandPaletteUpdate
             }
             _ => InputAction::None,
         }

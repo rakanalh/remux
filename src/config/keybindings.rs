@@ -201,6 +201,9 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     );
     root.insert('m', leaf_chain("set master", &["SetMaster", "EnterNormal"]));
 
+    // Command palette.
+    root.insert(':', leaf("command palette", "CommandPaletteOpen"));
+
     root
 }
 
