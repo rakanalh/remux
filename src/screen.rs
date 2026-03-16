@@ -83,6 +83,8 @@ pub struct Screen {
     alt_screen_active: bool,
     /// Whether the cursor is visible.
     pub cursor_visible: bool,
+    /// Cursor style set by the application (DECSCUSR). 0 = default.
+    pub cursor_style: u8,
     /// Responses to be written back to the PTY (e.g., DSR cursor position replies).
     pub pty_responses: Vec<Vec<u8>>,
 }
@@ -111,6 +113,7 @@ impl Screen {
             saved_scroll_bottom: rows.saturating_sub(1),
             alt_screen_active: false,
             cursor_visible: true,
+            cursor_style: 0,
             pty_responses: Vec::new(),
         }
     }
@@ -698,6 +701,11 @@ impl vte::Perform for Screen {
                     }
                     _ => {}
                 }
+            }
+            // DECSCUSR - Set Cursor Style (CSI Ps SP q)
+            'q' if _intermediates.first() == Some(&b' ') => {
+                let style = Self::csi_param(params, 0, 0);
+                self.cursor_style = style as u8;
             }
             _ => {
                 // Unknown CSI sequence - ignore.
