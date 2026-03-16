@@ -72,6 +72,17 @@ pub struct Screen {
     pub scroll_bottom: u16,
     /// The VTE parser instance.
     parser: vte::Parser,
+    /// Saved primary screen state for alternate screen buffer switching.
+    saved_grid: Option<Vec<Vec<Cell>>>,
+    saved_cursor_x: u16,
+    saved_cursor_y: u16,
+    saved_attrs: CellAttrs,
+    saved_scroll_top: u16,
+    saved_scroll_bottom: u16,
+    /// Whether we are currently on the alternate screen.
+    alt_screen_active: bool,
+    /// Whether the cursor is visible.
+    pub cursor_visible: bool,
 }
 
 impl Screen {
@@ -90,6 +101,14 @@ impl Screen {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             parser: vte::Parser::new(),
+            saved_grid: None,
+            saved_cursor_x: 0,
+            saved_cursor_y: 0,
+            saved_attrs: CellAttrs::default(),
+            saved_scroll_top: 0,
+            saved_scroll_bottom: rows.saturating_sub(1),
+            alt_screen_active: false,
+            cursor_visible: true,
         }
     }
 
@@ -572,6 +591,88 @@ impl vte::Perform for Screen {
             // SGR - Select Graphic Rendition
             'm' => {
                 self.handle_sgr(params);
+            }
+            // SM/DECSET - Set Mode
+            'h' => {
+                let is_private = _intermediates.first() == Some(&b'?');
+                if is_private {
+                    for param_slice in params {
+                        let mode = param_slice[0];
+                        match mode {
+                            25 => self.cursor_visible = true,
+                            1049 => {
+                                // Save cursor and switch to alternate screen
+                                if !self.alt_screen_active {
+                                    self.saved_grid = Some(self.grid.clone());
+                                    self.saved_cursor_x = self.cursor_x;
+                                    self.saved_cursor_y = self.cursor_y;
+                                    self.saved_attrs = self.current_attrs.clone();
+                                    self.saved_scroll_top = self.scroll_top;
+                                    self.saved_scroll_bottom = self.scroll_bottom;
+                                    self.grid = Self::make_grid(self.cols, self.rows);
+                                    self.cursor_x = 0;
+                                    self.cursor_y = 0;
+                                    self.scroll_top = 0;
+                                    self.scroll_bottom = self.rows.saturating_sub(1);
+                                    self.alt_screen_active = true;
+                                }
+                            }
+                            1047 => {
+                                // Switch to alternate screen (no cursor save)
+                                if !self.alt_screen_active {
+                                    self.saved_grid = Some(self.grid.clone());
+                                    self.saved_scroll_top = self.scroll_top;
+                                    self.saved_scroll_bottom = self.scroll_bottom;
+                                    self.grid = Self::make_grid(self.cols, self.rows);
+                                    self.cursor_x = 0;
+                                    self.cursor_y = 0;
+                                    self.scroll_top = 0;
+                                    self.scroll_bottom = self.rows.saturating_sub(1);
+                                    self.alt_screen_active = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // RM/DECRST - Reset Mode
+            'l' => {
+                let is_private = _intermediates.first() == Some(&b'?');
+                if is_private {
+                    for param_slice in params {
+                        let mode = param_slice[0];
+                        match mode {
+                            25 => self.cursor_visible = false,
+                            1049 => {
+                                // Restore primary screen and cursor
+                                if self.alt_screen_active {
+                                    if let Some(grid) = self.saved_grid.take() {
+                                        self.grid = grid;
+                                    }
+                                    self.cursor_x = self.saved_cursor_x;
+                                    self.cursor_y = self.saved_cursor_y;
+                                    self.current_attrs = self.saved_attrs.clone();
+                                    self.scroll_top = self.saved_scroll_top;
+                                    self.scroll_bottom = self.saved_scroll_bottom;
+                                    self.alt_screen_active = false;
+                                }
+                            }
+                            1047 => {
+                                // Switch back to primary screen
+                                if self.alt_screen_active {
+                                    if let Some(grid) = self.saved_grid.take() {
+                                        self.grid = grid;
+                                    }
+                                    self.scroll_top = self.saved_scroll_top;
+                                    self.scroll_bottom = self.saved_scroll_bottom;
+                                    self.alt_screen_active = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             _ => {
                 // Unknown CSI sequence - ignore.

@@ -696,36 +696,28 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneClose => {
-            let (closed_pane, new_focus) = {
-                let mut st = state.lock().await;
-                let sess = match st.sessions.get_mut(&session_name) {
+            let closed_pane = {
+                let st = state.lock().await;
+                let sess = match st.sessions.get(&session_name) {
                     Some(s) => s,
                     None => return Ok(()),
                 };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                let tab = match sess.tabs.get(sess.active_tab) {
                     Some(t) => t,
                     None => return Ok(()),
                 };
-                let closed = tab.focused_pane;
-                let new_focus = tab.layout.close_pane(closed);
-                tab.pane_order.retain(|&id| id != closed);
-                if let Some(nf) = new_focus {
-                    tab.focused_pane = nf;
-                    // If in automatic mode, rebuild the tree
-                    if tab.layout_mode.is_automatic() {
-                        tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
-                    }
-                }
-                (closed, new_focus)
+                tab.focused_pane
             };
-            {
-                let mut ps = panes.lock().await;
-                ps.remove(&closed_pane);
-            }
-            if new_focus.is_some() {
-                broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
-                    .await;
-            }
+            close_pane(
+                closed_pane,
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
         }
         RemuxCommand::PaneFocusLeft
         | RemuxCommand::PaneFocusRight
@@ -1819,11 +1811,17 @@ async fn build_composite(
     let (cursor_x, cursor_y, cursor_visible) = if let Some(rc) = rename_cursor {
         rc
     } else if let Some(pane_data) = ps.get(&tab.focused_pane) {
-        if let Some((rect, x_off, y_off, _, _)) = focused_rect_and_offsets {
+        if let Some((rect, x_off, y_off, x_off_end, y_off_end)) = focused_rect_and_offsets {
+            let content_w = rect.width.saturating_sub(x_off + x_off_end);
+            let content_h = rect.height.saturating_sub(y_off + y_off_end);
             (
-                rect.x + x_off + pane_data.screen.cursor_x,
-                rect.y + y_off + pane_data.screen.cursor_y,
-                true,
+                rect.x
+                    + x_off
+                    + std::cmp::min(pane_data.screen.cursor_x, content_w.saturating_sub(1)),
+                rect.y
+                    + y_off
+                    + std::cmp::min(pane_data.screen.cursor_y, content_h.saturating_sub(1)),
+                pane_data.screen.cursor_visible,
             )
         } else {
             (0, 0, false)
@@ -1859,6 +1857,73 @@ fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellC
         }
     }
     changes
+}
+
+// ---------------------------------------------------------------------------
+// Pane close helper
+// ---------------------------------------------------------------------------
+
+/// Close a pane, updating layout and session state. If the pane is the last
+/// pane in its tab, the tab is closed. If the last tab closes, the session is
+/// left empty.
+async fn close_pane(
+    pane_id: PaneId,
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let should_broadcast = {
+        let mut st = state.lock().await;
+        let sess = match st.sessions.get_mut(session_name) {
+            Some(s) => s,
+            None => return,
+        };
+        let tab = match sess.tabs.get_mut(sess.active_tab) {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Check if this pane actually belongs to the current tab.
+        if !tab.pane_order.contains(&pane_id) {
+            return;
+        }
+
+        let new_focus = tab.layout.close_pane(pane_id);
+        tab.pane_order.retain(|&id| id != pane_id);
+
+        if let Some(nf) = new_focus {
+            tab.focused_pane = nf;
+            // If in automatic mode, rebuild the tree
+            if tab.layout_mode.is_automatic() {
+                tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
+            }
+            true
+        } else {
+            // Last pane in the tab was closed. Close the tab.
+            let tab_idx = sess.active_tab;
+            if sess.tabs.len() > 1 {
+                sess.tabs.remove(tab_idx);
+                if sess.active_tab >= sess.tabs.len() {
+                    sess.active_tab = sess.tabs.len().saturating_sub(1);
+                }
+                true
+            } else {
+                // Last tab in the session -- remove it too.
+                sess.tabs.remove(tab_idx);
+                true
+            }
+        }
+    };
+    {
+        let mut ps = panes.lock().await;
+        ps.remove(&pane_id);
+    }
+    if should_broadcast {
+        broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,36 +1963,61 @@ async fn start_pty_forwarding(
 
         tokio::spawn(async move {
             loop {
-                let data = {
+                let recv_result = {
                     let mut ps = panes.lock().await;
                     if let Some(pane_data) = ps.get_mut(&pane_id) {
-                        pane_data.pty_rx.try_recv().ok()
+                        match pane_data.pty_rx.try_recv() {
+                            Ok(data) => Some(Ok(data)),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                Some(Err(()))
+                            }
+                        }
                     } else {
                         break;
                     }
                 };
 
-                if let Some(data) = data {
-                    {
-                        let mut ps = panes.lock().await;
-                        if let Some(pane_data) = ps.get_mut(&pane_id) {
-                            pane_data.screen.process_output(&data);
+                match recv_result {
+                    Some(Ok(data)) => {
+                        {
+                            let mut ps = panes.lock().await;
+                            if let Some(pane_data) = ps.get_mut(&pane_id) {
+                                pane_data.screen.process_output(&data);
+                            }
                         }
+                        broadcast_full_render(
+                            &session_name,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                     }
-                    broadcast_full_render(
-                        &session_name,
-                        &state,
-                        &panes,
-                        &clients,
-                        &config,
-                        &prev_frames,
-                    )
-                    .await;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    let ps = panes.lock().await;
-                    if !ps.contains_key(&pane_id) {
+                    Some(Err(())) => {
+                        // Channel disconnected - process has exited.
+                        // Close the pane automatically.
+                        close_pane(
+                            pane_id,
+                            &session_name,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                         break;
+                    }
+                    None => {
+                        // No data available yet, sleep briefly.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        let ps = panes.lock().await;
+                        if !ps.contains_key(&pane_id) {
+                            break;
+                        }
                     }
                 }
             }

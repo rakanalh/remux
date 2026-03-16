@@ -308,7 +308,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
+                        let was_renaming = input.rename_overlay.is_some();
                         let action = input.handle_key(key);
+
+                        // If rename popup was dismissed, clear overlay
+                        if was_renaming && input.rename_overlay.is_none() && !matches!(action, InputAction::RenameUpdate(_)) {
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_overlay(c, r)?;
+                        }
                         match action {
                             InputAction::SendToPty(data) => {
                                 client.send(ClientMessage::Input { data }).await?;
@@ -426,6 +433,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
+                                // Show the rename popup with empty text
+                                let target_str = match input.rename_overlay.as_ref().map(|o| &o.target) {
+                                    Some(RenameTarget::Tab) => "Tab",
+                                    Some(RenameTarget::Pane) => "Pane",
+                                    None => "Pane",
+                                };
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.render_rename_popup("", target_str, c, r)?;
                                 // Notify server we're in a rename state
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -452,18 +467,19 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.resize(cols, rows);
                                 client.send(ClientMessage::Resize { cols, rows }).await?;
                             }
-                            InputAction::RenameUpdate(text) => {
-                                // Determine the rename target from the overlay.
+                            InputAction::RenameUpdate(ref text) => {
+                                // Re-render the rename popup with updated text.
                                 let target = input.rename_overlay.as_ref()
                                     .map(|o| o.target.clone())
                                     .unwrap_or(RenameTarget::Pane);
-                                let cmd = match target {
-                                    RenameTarget::Pane => RemuxCommand::PaneRename(text),
-                                    RenameTarget::Tab => RemuxCommand::TabRename(text),
+                                let target_str = match &target {
+                                    RenameTarget::Tab => "Tab",
+                                    RenameTarget::Pane => "Pane",
                                 };
-                                client
-                                    .send(ClientMessage::Command(cmd))
-                                    .await?;
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.render_rename_popup(text, target_str, c, r)?;
+                                // Don't send intermediate updates to server -
+                                // only the final rename command is sent on Enter.
                             }
                             InputAction::YankToClipboard(_) => {
                                 // Extract selected text from the front buffer
@@ -574,8 +590,17 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         if let Some(ref vs) = input.visual_state {
                             renderer.render_visual_overlay(vs)?;
                         }
+                        // Re-render rename popup on top if active
+                        if let Some(ref overlay) = input.rename_overlay {
+                            let target_str = match overlay.target {
+                                RenameTarget::Tab => "Tab",
+                                RenameTarget::Pane => "Pane",
+                            };
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
+                        }
                         // Re-render popup on top if visible
-                        if whichkey.visible {
+                        else if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
                             renderer.render_whichkey_overlay(&commands)?;
                         }
@@ -589,8 +614,17 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         if let Some(ref vs) = input.visual_state {
                             renderer.render_visual_overlay(vs)?;
                         }
+                        // Re-render rename popup on top if active
+                        if let Some(ref overlay) = input.rename_overlay {
+                            let target_str = match overlay.target {
+                                RenameTarget::Tab => "Tab",
+                                RenameTarget::Pane => "Pane",
+                            };
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
+                        }
                         // Re-render popup on top if visible
-                        if whichkey.visible {
+                        else if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
                             renderer.render_whichkey_overlay(&commands)?;
                         }

@@ -426,6 +426,10 @@ impl InputHandler {
         // Check for leader key -- enter Command mode.
         if self.is_leader_key(&key) {
             self.mode = Mode::Command;
+            // Show root-level which-key popup immediately.
+            if let Some(children) = self.keybinding_tree.children_at(&[]) {
+                return InputAction::ShowWhichKey("Remux".to_string(), children);
+            }
             return InputAction::ModeChanged(Mode::Command);
         }
 
@@ -929,10 +933,10 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         assert_eq!(handler.mode, Mode::Normal);
 
-        // Default leader is Ctrl-a.
+        // Default leader is Ctrl-a. Now shows which-key popup at root.
         let action = handler.handle_key(ctrl_key('a'));
         assert_eq!(handler.mode, Mode::Command);
-        assert_eq!(action, InputAction::ModeChanged(Mode::Command));
+        assert!(matches!(action, InputAction::ShowWhichKey(..)));
     }
 
     #[test]
@@ -1001,10 +1005,10 @@ mod tests {
     fn normal_leader_enters_command() {
         let mut handler = InputHandler::with_defaults();
         assert_eq!(handler.mode, Mode::Normal);
-        // Ctrl-a is the default leader.
+        // Ctrl-a is the default leader. Now shows which-key popup at root.
         let action = handler.handle_key(ctrl_key('a'));
         assert_eq!(handler.mode, Mode::Command);
-        assert_eq!(action, InputAction::ModeChanged(Mode::Command));
+        assert!(matches!(action, InputAction::ShowWhichKey(..)));
     }
 
     #[test]
