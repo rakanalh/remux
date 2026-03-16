@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use crate::config::theme::CompositorTheme;
 use crate::config::BorderStyle;
 use crate::protocol::{CellColor, RenderCell};
 use crate::screen::{Cell, Color, Screen};
@@ -165,6 +166,7 @@ pub fn composite(
     gap_size: u16,
     focused_pane: PaneId,
     selection: Option<&MouseSelection>,
+    theme: &CompositorTheme,
 ) -> (Vec<Vec<RenderCell>>, HitRegions) {
     let mut buffer = vec![vec![RenderCell::default(); total_cols as usize]; total_rows as usize];
     let mut hit_regions = HitRegions::default();
@@ -183,6 +185,7 @@ pub fn composite(
                 focused_pane,
                 mode,
                 &mut hit_regions,
+                theme,
             );
         }
         BorderStyle::TmuxStyle => {
@@ -196,6 +199,7 @@ pub fn composite(
                 focused_pane,
                 mode,
                 &mut hit_regions,
+                theme,
             );
         }
     }
@@ -214,6 +218,7 @@ pub fn composite(
         total_rows,
         status_info,
         &mut hit_regions,
+        theme,
     );
 
     (buffer, hit_regions)
@@ -298,6 +303,7 @@ fn normalize_selection(start: (u16, u16), end: (u16, u16)) -> ((u16, u16), (u16,
 /// Every pane gets a border (including single-pane layouts). The active pane
 /// gets a green border; inactive panes get dark grey. Stacked panes show
 /// tab names in the top border.
+#[allow(clippy::too_many_arguments)]
 fn draw_zellij_panes(
     buffer: &mut [Vec<RenderCell>],
     pane_rects: &[(PaneId, Rect)],
@@ -306,6 +312,7 @@ fn draw_zellij_panes(
     focused_pane: PaneId,
     mode: &str,
     hit_regions: &mut HitRegions,
+    theme: &CompositorTheme,
 ) {
     for &(pane_id, rect) in pane_rects {
         if rect.width == 0 || rect.height == 0 {
@@ -319,9 +326,9 @@ fn draw_zellij_panes(
 
         let is_active = pane_id == focused_pane;
         let border_fg = if is_active {
-            CellColor::Indexed(2) // Green for active pane
+            theme.frame_active_fg.clone()
         } else {
-            CellColor::Indexed(8) // Dark grey for inactive panes
+            theme.frame_fg.clone()
         };
 
         // If rect is too small for borders, blit content to full rect.
@@ -375,8 +382,14 @@ fn draw_zellij_panes(
         // Build the top border content (with pane name / tab labels).
         let stack_info = layout::find_stack_names(layout, pane_id);
         let available_width = w.saturating_sub(2); // inside the two corner chars
-        let top_content =
-            build_top_border_content(&stack_info, pane_id, &border_fg, mode, available_width);
+        let top_content = build_top_border_content(
+            &stack_info,
+            pane_id,
+            &border_fg,
+            mode,
+            available_width,
+            theme,
+        );
 
         // Track stack label regions for hit testing (multi-pane stacks).
         if let Some((names, pane_ids, _active_idx)) = &stack_info {
@@ -461,6 +474,7 @@ fn build_top_border_content(
     border_fg: &CellColor,
     mode: &str,
     max_width: usize,
+    theme: &CompositorTheme,
 ) -> Vec<RenderCell> {
     let mut cells = Vec::new();
 
@@ -525,7 +539,7 @@ fn build_top_border_content(
         // Fixed tab width: longest name + 2 (1 space padding each side), capped to fit.
         let tab_width = (max_name_len + 2).min(max_width);
 
-        let (active_fg, active_bg) = mode_tab_colors(mode);
+        let (active_fg, active_bg) = theme.mode_colors(mode);
 
         // Leading space before first tab.
         cells.push(RenderCell {
@@ -543,7 +557,7 @@ fn build_top_border_content(
                 for sep_ch in [' ', '|', ' '] {
                     cells.push(RenderCell {
                         c: sep_ch,
-                        fg: CellColor::Indexed(8),
+                        fg: theme.frame_fg.clone(),
                         bg: CellColor::Default,
                         bold: false,
                         italic: false,
@@ -556,7 +570,11 @@ fn build_top_border_content(
             let (tab_fg, tab_bg, tab_bold) = if is_this_active {
                 (active_fg.clone(), active_bg.clone(), true)
             } else {
-                (CellColor::Indexed(245), CellColor::Indexed(237), false)
+                (
+                    theme.tab_inactive_fg.clone(),
+                    CellColor::Indexed(237),
+                    false,
+                )
             };
 
             // Center the name within tab_width.
@@ -612,16 +630,6 @@ fn build_top_border_content(
     cells
 }
 
-/// Get foreground/background colors for the active tab based on current mode.
-fn mode_tab_colors(mode: &str) -> (CellColor, CellColor) {
-    match mode {
-        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
-        "COMMAND" => (CellColor::Indexed(0), CellColor::Indexed(12)), // Black on bright blue
-        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)), // Black on bright magenta
-        _ => (CellColor::Indexed(0), CellColor::Indexed(238)),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tmux-style rendering (edge-to-edge content with minimal dividers)
 // ---------------------------------------------------------------------------
@@ -630,6 +638,7 @@ fn mode_tab_colors(mode: &str) -> (CellColor, CellColor) {
 ///
 /// For stacks with more than one pane, a 1-row tab bar is rendered at the top
 /// of the pane area. For single-pane stacks, the full area is used for content.
+#[allow(clippy::too_many_arguments)]
 fn draw_tmux_panes(
     buffer: &mut [Vec<RenderCell>],
     pane_rects: &[(PaneId, Rect)],
@@ -638,6 +647,7 @@ fn draw_tmux_panes(
     _focused_pane: PaneId,
     mode: &str,
     hit_regions: &mut HitRegions,
+    theme: &CompositorTheme,
 ) {
     for &(pane_id, rect) in pane_rects {
         if rect.width == 0 || rect.height == 0 {
@@ -657,7 +667,7 @@ fn draw_tmux_panes(
 
         if is_multi && rect.height >= 2 {
             // Draw 1-row tab bar at the top, content below.
-            draw_tmux_tab_bar(buffer, rect, &stack_info, mode, hit_regions);
+            draw_tmux_tab_bar(buffer, rect, &stack_info, mode, hit_regions, theme);
 
             let content_rect = Rect {
                 x: rect.x,
@@ -674,7 +684,7 @@ fn draw_tmux_panes(
 
     // Draw dividers between adjacent panes.
     if pane_rects.len() > 1 {
-        draw_tmux_dividers(buffer, pane_rects);
+        draw_tmux_dividers(buffer, pane_rects, theme);
     }
 }
 
@@ -685,6 +695,7 @@ fn draw_tmux_tab_bar(
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
     mode: &str,
     hit_regions: &mut HitRegions,
+    theme: &CompositorTheme,
 ) {
     let y = rect.y as usize;
     let x_start = rect.x as usize;
@@ -699,8 +710,8 @@ fn draw_tmux_tab_bar(
             col,
             RenderCell {
                 c: ' ',
-                fg: CellColor::Indexed(243),
-                bg: CellColor::Indexed(235), // Very dark grey background
+                fg: theme.status_bar_fg.clone(),
+                bg: theme.status_bar_bg.clone(),
                 bold: false,
                 italic: false,
                 underline: false,
@@ -733,7 +744,7 @@ fn draw_tmux_tab_bar(
     // Fixed tab width: longest name + 2 (1 space padding each side), capped to fit.
     let tab_width = (max_name_len + 2).min(total_width);
 
-    let (active_fg, active_bg) = mode_tab_colors(mode);
+    let (active_fg, active_bg) = theme.mode_colors(mode);
     let mut col = x_start;
 
     for (i, display_name) in display_names.iter().enumerate() {
@@ -751,8 +762,8 @@ fn draw_tmux_tab_bar(
                         col,
                         RenderCell {
                             c: sep_ch,
-                            fg: CellColor::Indexed(240),
-                            bg: CellColor::Indexed(235),
+                            fg: theme.separator_fg.clone(),
+                            bg: theme.status_bar_bg.clone(),
                             bold: false,
                             italic: false,
                             underline: false,
@@ -777,7 +788,11 @@ fn draw_tmux_tab_bar(
         let (fg, bg, bold) = if is_active {
             (active_fg.clone(), active_bg.clone(), true)
         } else {
-            (CellColor::Indexed(245), CellColor::Indexed(237), false)
+            (
+                theme.tab_inactive_fg.clone(),
+                CellColor::Indexed(237),
+                false,
+            )
         };
 
         // Center the name within tab_width.
@@ -846,10 +861,14 @@ fn draw_tmux_tab_bar(
 }
 
 /// Draw simple divider lines between adjacent panes (tmux style).
-fn draw_tmux_dividers(buffer: &mut [Vec<RenderCell>], pane_rects: &[(PaneId, Rect)]) {
+fn draw_tmux_dividers(
+    buffer: &mut [Vec<RenderCell>],
+    pane_rects: &[(PaneId, Rect)],
+    theme: &CompositorTheme,
+) {
     let divider_cell = |c: char| RenderCell {
         c,
-        fg: CellColor::Indexed(8),
+        fg: theme.frame_fg.clone(),
         bg: CellColor::Default,
         bold: false,
         italic: false,
@@ -933,6 +952,7 @@ fn draw_status_bar(
     rows: u16,
     info: &StatusInfo,
     hit_regions: &mut HitRegions,
+    theme: &CompositorTheme,
 ) {
     let bar_row = (rows as usize).saturating_sub(1);
     if bar_row >= buffer.len() {
@@ -946,8 +966,8 @@ fn draw_status_bar(
         if col < buffer[bar_row].len() {
             buffer[bar_row][col] = RenderCell {
                 c: ' ',
-                fg: CellColor::Indexed(243), // Soft grey
-                bg: CellColor::Indexed(235), // Very dark grey
+                fg: theme.status_bar_fg.clone(),
+                bg: theme.status_bar_bg.clone(),
                 bold: false,
                 italic: false,
                 underline: false,
@@ -957,12 +977,7 @@ fn draw_status_bar(
 
     // Mode indicator.
     let mode_str = format!(" [{}] ", info.mode);
-    let (mode_fg, mode_bg) = match info.mode.as_str() {
-        "NORMAL" => (CellColor::Indexed(0), CellColor::Indexed(10)), // Black on bright green
-        "COMMAND" => (CellColor::Indexed(0), CellColor::Indexed(12)), // Black on bright blue
-        "VISUAL" => (CellColor::Indexed(0), CellColor::Indexed(13)), // Black on bright magenta
-        _ => (CellColor::Indexed(15), CellColor::Indexed(238)),
-    };
+    let (mode_fg, mode_bg) = theme.mode_colors(info.mode.as_str());
 
     let mut x = 0;
     for ch in mode_str.chars() {
@@ -985,8 +1000,8 @@ fn draw_status_bar(
         if x < cols && x < buffer[bar_row].len() {
             buffer[bar_row][x] = RenderCell {
                 c: ch,
-                fg: CellColor::Indexed(6),
-                bg: CellColor::Indexed(235),
+                fg: theme.session_name_fg.clone(),
+                bg: theme.status_bar_bg.clone(),
                 bold: false,
                 italic: false,
                 underline: false,
@@ -999,8 +1014,8 @@ fn draw_status_bar(
     if x < cols && x < buffer[bar_row].len() {
         buffer[bar_row][x] = RenderCell {
             c: '\u{2502}',
-            fg: CellColor::Indexed(240),
-            bg: CellColor::Indexed(235),
+            fg: theme.separator_fg.clone(),
+            bg: theme.status_bar_bg.clone(),
             bold: false,
             italic: false,
             underline: false,
@@ -1017,8 +1032,8 @@ fn draw_status_bar(
                 if x < cols && x < buffer[bar_row].len() {
                     buffer[bar_row][x] = RenderCell {
                         c: ch,
-                        fg: CellColor::Indexed(240),
-                        bg: CellColor::Indexed(235),
+                        fg: theme.separator_fg.clone(),
+                        bg: theme.status_bar_bg.clone(),
                         bold: false,
                         italic: false,
                         underline: false,
@@ -1035,9 +1050,17 @@ fn draw_status_bar(
         };
 
         let (tab_fg, tab_bg, tab_bold) = if *is_active {
-            (CellColor::Indexed(0), CellColor::Indexed(6), true)
+            (
+                theme.tab_active_fg.clone(),
+                theme.tab_active_bg.clone(),
+                true,
+            )
         } else {
-            (CellColor::Indexed(245), CellColor::Indexed(235), false)
+            (
+                theme.tab_inactive_fg.clone(),
+                theme.status_bar_bg.clone(),
+                false,
+            )
         };
 
         let tab_x_start = x;
@@ -1126,6 +1149,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         assert_eq!(result.len(), 5);
@@ -1173,6 +1197,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // The last row should have the mode indicator.
@@ -1218,6 +1243,7 @@ mod tests {
             gap_size,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // Compute the pane rects to find where the gap is.
@@ -1272,6 +1298,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // Top-left corner should be ╭.
@@ -1319,6 +1346,7 @@ mod tests {
             0,
             1, // pane 1 is focused
             None,
+            &CompositorTheme::default(),
         );
 
         // Active pane (1) top-left corner should be green (Indexed(2)).
@@ -1368,6 +1396,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // Both panes should have rounded corners.
@@ -1413,6 +1442,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // First row should not have tab bar (dark grey background).
@@ -1456,6 +1486,7 @@ mod tests {
             0,
             2,
             None,
+            &CompositorTheme::default(),
         );
 
         // First row should be the tab bar (inactive tab uses 237 background).
@@ -1495,6 +1526,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // The top row should contain the pane name "myshell".
@@ -1541,6 +1573,7 @@ mod tests {
             0,
             2,
             None,
+            &CompositorTheme::default(),
         );
 
         // The top row should contain both stacked pane names.
@@ -1586,6 +1619,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // No border characters should appear in the pane area.
@@ -1641,6 +1675,7 @@ mod tests {
             0,
             3,
             None,
+            &CompositorTheme::default(),
         );
 
         // First row should be a tab bar with all pane names.
@@ -1694,6 +1729,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // There should be vertical divider characters between the two panes.
@@ -1996,6 +2032,7 @@ mod tests {
             0,
             1,
             None,
+            &CompositorTheme::default(),
         );
 
         // Should have 2 tab regions (one per tab in status bar).

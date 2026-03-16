@@ -1172,8 +1172,18 @@ async fn handle_mouse_click(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) =
-        build_composite(&session_name, cols, rows, &mode, state, panes, config, None).await;
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) = build_composite(
+        &session_name,
+        cols,
+        rows,
+        &mode,
+        state,
+        panes,
+        config,
+        None,
+        &config.compositor_theme(),
+    )
+    .await;
 
     let target = hit_test(x, y, &hit_regions, &pane_rects);
 
@@ -1274,8 +1284,18 @@ async fn handle_mouse_drag(
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) =
-        build_composite(&session_name, cols, rows, &mode, state, panes, config, None).await;
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) = build_composite(
+        &session_name,
+        cols,
+        rows,
+        &mode,
+        state,
+        panes,
+        config,
+        None,
+        &config.compositor_theme(),
+    )
+    .await;
 
     // Find which pane the drag started in.
     let start_target = hit_test(start_x, start_y, &hit_regions, &pane_rects);
@@ -1520,6 +1540,7 @@ async fn send_full_render_to_client(
         panes,
         config,
         selection.as_ref(),
+        &config.compositor_theme(),
     )
     .await;
     {
@@ -1588,6 +1609,7 @@ async fn broadcast_full_render(
         panes,
         config,
         selection.as_ref(),
+        &config.compositor_theme(),
     )
     .await;
 
@@ -1690,6 +1712,7 @@ async fn build_composite(
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     _config: &Arc<Config>,
     selection: Option<&MouseSelection>,
+    compositor_theme: &crate::config::theme::CompositorTheme,
 ) -> (
     Vec<Vec<RenderCell>>,
     u16,
@@ -1772,6 +1795,7 @@ async fn build_composite(
         0,
         tab.focused_pane,
         selection,
+        compositor_theme,
     );
 
     // If there is an active rename, place the cursor in the pane's border

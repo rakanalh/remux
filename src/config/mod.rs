@@ -60,6 +60,7 @@ pub struct AppearanceConfig {
     pub status_bar_position: StatusBarPosition,
     pub border_style: BorderStyle,
     pub default_layout: DefaultLayout,
+    pub theme: theme::ThemeConfig,
 }
 
 impl Default for AppearanceConfig {
@@ -68,6 +69,7 @@ impl Default for AppearanceConfig {
             status_bar_position: StatusBarPosition::Bottom,
             border_style: BorderStyle::ZellijStyle,
             default_layout: DefaultLayout::default(),
+            theme: theme::ThemeConfig::default(),
         }
     }
 }
@@ -225,11 +227,13 @@ impl Config {
     }
 
     /// Return the theme for the current configuration.
-    ///
-    /// Currently returns the default theme; theme customization can be added
-    /// later.
     pub fn theme(&self) -> theme::Theme {
-        theme::Theme::default()
+        theme::Theme::from_config(&self.appearance.theme)
+    }
+
+    /// Return the compositor theme for the current configuration.
+    pub fn compositor_theme(&self) -> theme::CompositorTheme {
+        theme::CompositorTheme::from_config(&self.appearance.theme)
     }
 
     /// Build the effective keybinding tree by starting from defaults and
@@ -441,6 +445,7 @@ mod tests {
             status_bar_position: _,
             border_style,
             default_layout: _,
+            theme: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
     }
