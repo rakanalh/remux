@@ -37,6 +37,36 @@ border_style = "zellij_style"
 # Default layout mode for new tabs: "bsp", "master", "monocle", or "custom"
 # default_layout = "bsp"
 
+# Theme colors. Values can be:
+#   - A named color string: "black", "red", "green", "yellow", "blue", "magenta",
+#     "cyan", "white", "dark_grey", "bright_red", "bright_green", "bright_blue",
+#     "bright_magenta", "bright_cyan", "reset"
+#   - An ANSI 256-color index: { ansi = 235 }
+#   - An RGB color: { rgb = [255, 128, 0] }
+#
+# [appearance.theme]
+# mode_normal_fg = "black"
+# mode_normal_bg = "bright_green"
+# mode_command_fg = "black"
+# mode_command_bg = "bright_blue"
+# mode_visual_fg = "black"
+# mode_visual_bg = "bright_magenta"
+# frame_fg = { ansi = 8 }
+# frame_bg = "reset"
+# frame_active_fg = { ansi = 2 }
+# status_bar_fg = { ansi = 243 }
+# status_bar_bg = { ansi = 235 }
+# tab_active_fg = { ansi = 0 }
+# tab_active_bg = { ansi = 6 }
+# tab_inactive_fg = { ansi = 245 }
+# whichkey_fg = { ansi = 252 }
+# whichkey_bg = { ansi = 235 }
+# whichkey_key_fg = { ansi = 10 }
+# separator_fg = { ansi = 240 }
+# pane_label_fg = { ansi = 0 }
+# pane_label_bg = { ansi = 0 }
+# session_name_fg = { ansi = 6 }
+
 # -----------------------------------------------------------------------------
 # Modes
 # -----------------------------------------------------------------------------
