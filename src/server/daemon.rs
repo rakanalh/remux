@@ -1980,10 +1980,22 @@ async fn start_pty_forwarding(
 
                 match recv_result {
                     Some(Ok(data)) => {
-                        {
+                        let responses = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 pane_data.screen.process_output(&data);
+                                pane_data.screen.take_responses()
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        // Write any pending responses (e.g., DSR replies) back to the PTY.
+                        if !responses.is_empty() {
+                            let ps = panes.lock().await;
+                            if let Some(pane_data) = ps.get(&pane_id) {
+                                for resp in &responses {
+                                    let _ = pane_data.pty.write_input(resp);
+                                }
                             }
                         }
                         broadcast_full_render(

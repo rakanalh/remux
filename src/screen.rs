@@ -83,6 +83,8 @@ pub struct Screen {
     alt_screen_active: bool,
     /// Whether the cursor is visible.
     pub cursor_visible: bool,
+    /// Responses to be written back to the PTY (e.g., DSR cursor position replies).
+    pub pty_responses: Vec<Vec<u8>>,
 }
 
 impl Screen {
@@ -109,6 +111,7 @@ impl Screen {
             saved_scroll_bottom: rows.saturating_sub(1),
             alt_screen_active: false,
             cursor_visible: true,
+            pty_responses: Vec::new(),
         }
     }
 
@@ -332,6 +335,11 @@ impl Screen {
             }
             i += 1;
         }
+    }
+
+    /// Take any pending PTY responses (e.g., DSR replies).
+    pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pty_responses)
     }
 
     /// Get the first parameter value from a CSI parameter list, with a default.
@@ -672,6 +680,23 @@ impl vte::Perform for Screen {
                             _ => {}
                         }
                     }
+                }
+            }
+            // DSR - Device Status Report
+            'n' => {
+                let mode = Self::csi_param(params, 0, 0);
+                match mode {
+                    6 => {
+                        // Report cursor position: ESC [ <row> ; <col> R (1-based)
+                        let response =
+                            format!("\x1b[{};{}R", self.cursor_y + 1, self.cursor_x + 1,);
+                        self.pty_responses.push(response.into_bytes());
+                    }
+                    5 => {
+                        // Device status - report "OK"
+                        self.pty_responses.push(b"\x1b[0n".to_vec());
+                    }
+                    _ => {}
                 }
             }
             _ => {
