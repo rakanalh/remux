@@ -45,6 +45,10 @@ pub enum ClientMessage {
         /// `true` when the mouse button was released (final drag event).
         is_final: bool,
     },
+    /// Request the scrollback content for the active pane (for search).
+    RequestScrollback,
+    /// Send search match info to the server for status bar display.
+    SearchInfo { current: usize, total: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +86,8 @@ pub enum ServerMessage {
     Event(SessionEvent),
     /// Request the client to copy data to the system clipboard via OSC 52.
     CopyToClipboard { data: String },
+    /// Response to a `RequestScrollback` request with the pane's text content.
+    ScrollbackContent { lines: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +222,6 @@ pub enum RemuxCommand {
 
     // -- Buffer commands ----------------------------------------------------
     BufferEditInEditor,
-    BufferSearch,
 
     // -- Layout commands ------------------------------------------------------
     ToggleStyle,
@@ -230,6 +235,8 @@ pub enum RemuxCommand {
     EnterVisualMode,
     /// Send raw key bytes to the active pane's PTY (used for leader-leader normal mode).
     SendKey(Vec<u8>),
+    /// Enter search mode (client-side mode transition).
+    EnterSearchMode,
 }
 
 // ---------------------------------------------------------------------------

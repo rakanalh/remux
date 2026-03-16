@@ -109,7 +109,7 @@ pub fn hit_test(
 
 /// Information needed to render the status bar.
 pub struct StatusInfo {
-    /// Current mode name (e.g. "NORMAL", "COMMAND", "VISUAL").
+    /// Current mode name (e.g. "NORMAL", "COMMAND", "VISUAL", "SEARCH").
     pub mode: String,
     /// Session name or path.
     pub session_name: String,
@@ -117,6 +117,8 @@ pub struct StatusInfo {
     pub tabs: Vec<(String, bool)>,
     /// Layout mode name (e.g. "bsp", "master", "monocle", "custom").
     pub layout_mode: String,
+    /// Search match info: (current_match_index, total_matches). `None` when not searching.
+    pub search_info: Option<(usize, usize)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,20 +1087,42 @@ fn draw_status_bar(
         });
     }
 
-    // Layout mode indicator on the right side.
+    // Build right-side content: search info + layout mode.
+    let mut right_parts: Vec<String> = Vec::new();
+
+    if let Some((current, total)) = info.search_info {
+        right_parts.push(format!(" ({}/{}) ", current + 1, total));
+    }
+
     if !info.layout_mode.is_empty() {
-        let layout_str = format!(" {} ", info.layout_mode);
-        let layout_len = layout_str.len();
-        let right_x = cols.saturating_sub(layout_len);
+        right_parts.push(format!(" {} ", info.layout_mode));
+    }
+
+    if !right_parts.is_empty() {
+        let right_str: String = right_parts.concat();
+        let right_len = right_str.len();
+        let right_x = cols.saturating_sub(right_len);
         // Only draw if it doesn't overlap with the left-side content.
         if right_x > x {
             let mut rx = right_x;
-            for ch in layout_str.chars() {
+            // For search info portion, use yellow colors; for layout, use grey.
+            let search_info_len = if info.search_info.is_some() {
+                right_parts[0].len()
+            } else {
+                0
+            };
+
+            for (i, ch) in right_str.chars().enumerate() {
                 if rx < cols && rx < buffer[bar_row].len() {
+                    let (fg, bg) = if i < search_info_len {
+                        (CellColor::Indexed(0), CellColor::Indexed(11)) // Black on bright yellow
+                    } else {
+                        (CellColor::Indexed(0), CellColor::Indexed(245)) // Black on grey
+                    };
                     buffer[bar_row][rx] = RenderCell {
                         c: ch,
-                        fg: CellColor::Indexed(0),   // Black text
-                        bg: CellColor::Indexed(245), // Grey background
+                        fg,
+                        bg,
                         bold: false,
                         italic: false,
                         underline: false,
@@ -1136,6 +1160,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1184,6 +1209,7 @@ mod tests {
             session_name: "main".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1229,6 +1255,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let gap_size = 2;
@@ -1285,6 +1312,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1333,6 +1361,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1383,6 +1412,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1429,6 +1459,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1472,6 +1503,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         // Pane 2 is active (last added).
@@ -1513,6 +1545,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1560,6 +1593,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1606,6 +1640,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1662,6 +1697,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -1716,6 +1752,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (result, _hit_regions) = composite(
@@ -2019,6 +2056,7 @@ mod tests {
             session_name: "test".to_string(),
             tabs: vec![("tab-1".to_string(), true), ("tab-2".to_string(), false)],
             layout_mode: "bsp".to_string(),
+            search_info: None,
         };
 
         let (_result, hit_regions) = composite(

@@ -354,6 +354,7 @@ impl CompositorTheme {
             "NORMAL" => (self.mode_normal_fg.clone(), self.mode_normal_bg.clone()),
             "COMMAND" => (self.mode_command_fg.clone(), self.mode_command_bg.clone()),
             "VISUAL" => (self.mode_visual_fg.clone(), self.mode_visual_bg.clone()),
+            "SEARCH" => (CellColor::Indexed(0), CellColor::Indexed(11)), // Black on bright yellow
             _ => (CellColor::Indexed(15), CellColor::Indexed(238)),
         }
     }

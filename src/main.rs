@@ -350,6 +350,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
+                                    Mode::Search => "SEARCH",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -379,6 +380,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
+                                    Mode::Search => "SEARCH",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -392,6 +394,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
+                                    Mode::Search => "SEARCH",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -431,6 +434,13 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         if vs.total_lines < vs.visible_rows {
                                             vs.total_lines = vs.visible_rows;
                                         }
+                                    }
+                                }
+                                // When entering Search mode, render the prompt.
+                                if mode == Mode::Search {
+                                    if let Some(ref ss) = input.search_state {
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.render_search_prompt(&ss.query_buffer, ss.phase, None, c, r)?;
                                     }
                                 }
                                 // Hide which-key when mode changes
@@ -569,6 +579,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Command => "COMMAND",
                                     Mode::Visual => "VISUAL",
                                     Mode::CommandPalette => "PALETTE",
+                                    Mode::Search => "SEARCH",
                                 };
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -576,8 +587,49 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     })
                                     .await?;
                             }
-                            InputAction::SearchPrompt
-                            | InputAction::None => {}
+                            InputAction::SearchPrompt => {
+                                // Re-render the search prompt overlay.
+                                if let Some(ref ss) = input.search_state {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.render_search_prompt(&ss.query_buffer, ss.phase, None, c, r)?;
+                                }
+                            }
+                            InputAction::SearchConfirm(ref query) => {
+                                // Request scrollback from server.
+                                client.send(ClientMessage::RequestScrollback).await?;
+                                // Re-render prompt with confirmed query.
+                                if let Some(ref ss) = input.search_state {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.render_search_prompt(query, ss.phase, None, c, r)?;
+                                }
+                            }
+                            InputAction::SearchCancel => {
+                                // Clear search info on server.
+                                client.send(ClientMessage::SearchInfo { current: 0, total: 0 }).await?;
+                                // Send mode changed to NORMAL.
+                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                // Clear overlay.
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                            }
+                            InputAction::SearchNavigate => {
+                                // Update search info on server and re-render prompt.
+                                if let Some(ref ss) = input.search_state {
+                                    client.send(ClientMessage::SearchInfo {
+                                        current: ss.current_match,
+                                        total: ss.matches.len(),
+                                    }).await?;
+                                    let match_info = if ss.matches.is_empty() {
+                                        None
+                                    } else {
+                                        Some((ss.current_match, ss.matches.len()))
+                                    };
+                                    let query = ss.confirmed_query.as_deref().unwrap_or("");
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                                }
+                            }
+                            InputAction::None => {}
                         }
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
@@ -675,6 +727,13 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let draw_cmds = palette.render(c, r, &theme);
                             renderer.render_command_palette_overlay(&draw_cmds)?;
                         }
+                        // Re-render search prompt on top if in search mode
+                        else if let Some(ref ss) = input.search_state {
+                            let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
+                            let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                        }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
@@ -705,6 +764,13 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let draw_cmds = palette.render(c, r, &theme);
                             renderer.render_command_palette_overlay(&draw_cmds)?;
                         }
+                        // Re-render search prompt on top if in search mode
+                        else if let Some(ref ss) = input.search_state {
+                            let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
+                            let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                        }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
                             let commands = whichkey.render(cols, rows, &theme);
@@ -720,6 +786,29 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     Some(ServerMessage::CopyToClipboard { data }) => {
                         if let Err(e) = copy_to_clipboard(&data) {
                             log::error!("Failed to copy to clipboard: {}", e);
+                        }
+                    }
+                    Some(ServerMessage::ScrollbackContent { lines }) => {
+                        // Compute search matches.
+                        if let Some(ref mut ss) = input.search_state {
+                            if let Some(ref query) = ss.confirmed_query {
+                                ss.matches = crate::client::input::SearchState::compute_matches(&lines, query);
+                                ss.current_match = 0;
+                                // Send search info to server.
+                                client.send(ClientMessage::SearchInfo {
+                                    current: ss.current_match,
+                                    total: ss.matches.len(),
+                                }).await?;
+                                // Re-render prompt with match info.
+                                let match_info = if ss.matches.is_empty() {
+                                    None
+                                } else {
+                                    Some((ss.current_match, ss.matches.len()))
+                                };
+                                let q = query.clone();
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.render_search_prompt(&q, ss.phase, match_info, c, r)?;
+                            }
                         }
                     }
                     Some(ServerMessage::Event(event)) => {

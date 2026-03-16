@@ -158,8 +158,14 @@ a = "PaneStackAdd"
 "[" = "PaneStackPrev"
 r = "PaneRename"
 
-# --- Session (s) ---
+# --- Search (s) ---
 [keybindings.command.s]
+_label = "Search"
+s = "EnterSearchMode"
+e = "BufferEditInEditor"
+
+# --- Session (x) ---
+[keybindings.command.x]
 _label = "Session"
 n = "SessionNew"
 d = "SessionDetach"
@@ -173,12 +179,6 @@ n = "FolderNew"
 d = "FolderDelete"
 l = "FolderList"
 m = "FolderMoveSession"
-
-# --- Buffer (b) ---
-[keybindings.command.b]
-_label = "Buffer"
-e = "BufferEditInEditor"
-"/" = "BufferSearch"
 
 # --- Resize (r) ---
 [keybindings.command.r]
@@ -248,9 +248,9 @@ l = "ResizeRight 5"
 #   FolderList                      — List all folders
 #   FolderMoveSession <sess> [dir]  — Move a session to a folder
 #
-# Buffer commands:
+# Search commands:
+#   EnterSearchMode                 — Enter search mode (search scrollback)
 #   BufferEditInEditor              — Open scrollback in external editor
-#   BufferSearch                    — Search scrollback buffer
 #
 # Resize commands:
 #   ResizeLeft [amount]             — Resize pane left (default: 1)
