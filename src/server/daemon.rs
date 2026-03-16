@@ -1172,7 +1172,7 @@ async fn handle_mouse_click(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _fpr, hit_regions, pane_rects) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) =
         build_composite(&session_name, cols, rows, &mode, state, panes, config, None).await;
 
     let target = hit_test(x, y, &hit_regions, &pane_rects);
@@ -1274,7 +1274,7 @@ async fn handle_mouse_drag(
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _fpr, hit_regions, pane_rects) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) =
         build_composite(&session_name, cols, rows, &mode, state, panes, config, None).await;
 
     // Find which pane the drag started in.
@@ -1502,18 +1502,26 @@ async fn send_full_render_to_client(
     };
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
-    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect, _hit_regions, _pane_rects) =
-        build_composite(
-            session_name,
-            cols,
-            rows,
-            &mode,
-            state,
-            panes,
-            config,
-            selection.as_ref(),
-        )
-        .await;
+    let (
+        cells,
+        cursor_x,
+        cursor_y,
+        cursor_visible,
+        cursor_style,
+        focused_pane_rect,
+        _hit_regions,
+        _pane_rects,
+    ) = build_composite(
+        session_name,
+        cols,
+        rows,
+        &mode,
+        state,
+        panes,
+        config,
+        selection.as_ref(),
+    )
+    .await;
     {
         let mut pf = prev_frames.lock().await;
         pf.insert(session_name.to_string(), cells.clone());
@@ -1525,6 +1533,7 @@ async fn send_full_render_to_client(
             cursor_x,
             cursor_y,
             cursor_visible,
+            cursor_style,
             focused_pane_rect,
         });
     }
@@ -1561,18 +1570,26 @@ async fn broadcast_full_render(
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
 
-    let (cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect, _hit_regions, _pane_rects) =
-        build_composite(
-            session_name,
-            cols,
-            rows,
-            &mode,
-            state,
-            panes,
-            config,
-            selection.as_ref(),
-        )
-        .await;
+    let (
+        cells,
+        cursor_x,
+        cursor_y,
+        cursor_visible,
+        cursor_style,
+        focused_pane_rect,
+        _hit_regions,
+        _pane_rects,
+    ) = build_composite(
+        session_name,
+        cols,
+        rows,
+        &mode,
+        state,
+        panes,
+        config,
+        selection.as_ref(),
+    )
+    .await;
 
     let msg = {
         let prev_frames_map = prev_frames.lock().await;
@@ -1585,6 +1602,7 @@ async fn broadcast_full_render(
                     cursor_x,
                     cursor_y,
                     cursor_visible,
+                    cursor_style,
                     focused_pane_rect,
                 }
             } else {
@@ -1593,6 +1611,7 @@ async fn broadcast_full_render(
                     cursor_x,
                     cursor_y,
                     cursor_visible,
+                    cursor_style,
                     focused_pane_rect,
                 }
             }
@@ -1602,6 +1621,7 @@ async fn broadcast_full_render(
                 cursor_x,
                 cursor_y,
                 cursor_visible,
+                cursor_style,
                 focused_pane_rect,
             }
         }
@@ -1675,6 +1695,7 @@ async fn build_composite(
     u16,
     u16,
     bool,
+    u8,
     Option<PaneRect>,
     HitRegions,
     Vec<(PaneId, Rect)>,
@@ -1688,6 +1709,7 @@ async fn build_composite(
                 0,
                 0,
                 false,
+                0,
                 None,
                 HitRegions::default(),
                 Vec::new(),
@@ -1702,6 +1724,7 @@ async fn build_composite(
                 0,
                 0,
                 false,
+                0,
                 None,
                 HitRegions::default(),
                 Vec::new(),
@@ -1808,8 +1831,8 @@ async fn build_composite(
             height: rect.height.saturating_sub(y_off + y_off_end),
         });
 
-    let (cursor_x, cursor_y, cursor_visible) = if let Some(rc) = rename_cursor {
-        rc
+    let (cursor_x, cursor_y, cursor_visible, cursor_style) = if let Some(rc) = rename_cursor {
+        (rc.0, rc.1, rc.2, 0u8)
     } else if let Some(pane_data) = ps.get(&tab.focused_pane) {
         if let Some((rect, x_off, y_off, x_off_end, y_off_end)) = focused_rect_and_offsets {
             let content_w = rect.width.saturating_sub(x_off + x_off_end);
@@ -1822,12 +1845,13 @@ async fn build_composite(
                     + y_off
                     + std::cmp::min(pane_data.screen.cursor_y, content_h.saturating_sub(1)),
                 pane_data.screen.cursor_visible,
+                pane_data.screen.cursor_style,
             )
         } else {
-            (0, 0, false)
+            (0, 0, false, 0)
         }
     } else {
-        (0, 0, false)
+        (0, 0, false, 0)
     };
 
     (
@@ -1835,6 +1859,7 @@ async fn build_composite(
         cursor_x,
         cursor_y,
         cursor_visible,
+        cursor_style,
         focused_pane_rect,
         hit_regions,
         pane_rects,

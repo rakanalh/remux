@@ -633,6 +633,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         renderer.resize(new_cols, new_rows);
                         client.send(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
                     }
+                    Some(Ok(crossterm::event::Event::Paste(text))) => {
+                        // Wrap pasted text in bracketed paste sequences.
+                        let mut data = Vec::new();
+                        data.extend_from_slice(b"\x1b[200~");
+                        data.extend_from_slice(text.as_bytes());
+                        data.extend_from_slice(b"\x1b[201~");
+                        client.send(ClientMessage::Input { data }).await?;
+                    }
                     Some(Err(e)) => {
                         log::error!("Event error: {}", e);
                     }
@@ -643,11 +651,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
             // Server messages
             msg = client.recv() => {
                 match msg? {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, focused_pane_rect: fpr }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr }) => {
                         focused_pane_rect = fpr;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
-                        renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible)?;
+                        renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                         // Re-render visual overlay on top if in visual mode
                         if let Some(ref vs) = input.visual_state {
                             renderer.render_visual_overlay(vs)?;
@@ -673,11 +681,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             renderer.render_whichkey_overlay(&commands)?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, focused_pane_rect: fpr }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr }) => {
                         focused_pane_rect = fpr;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
-                        renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible)?;
+                        renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                         // Re-render visual overlay on top if in visual mode
                         if let Some(ref vs) = input.visual_state {
                             renderer.render_visual_overlay(vs)?;

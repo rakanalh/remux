@@ -60,6 +60,7 @@ pub enum ServerMessage {
         cursor_x: u16,
         cursor_y: u16,
         cursor_visible: bool,
+        cursor_style: u8,
         /// The focused pane's rectangle in the composited buffer.
         focused_pane_rect: Option<PaneRect>,
     },
@@ -69,6 +70,7 @@ pub enum ServerMessage {
         cursor_x: u16,
         cursor_y: u16,
         cursor_visible: bool,
+        cursor_style: u8,
         /// The focused pane's rectangle in the composited buffer.
         focused_pane_rect: Option<PaneRect>,
     },

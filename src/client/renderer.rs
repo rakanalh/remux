@@ -46,6 +46,7 @@ impl Renderer {
         cursor_x: u16,
         cursor_y: u16,
         cursor_visible: bool,
+        cursor_style: u8,
     ) -> Result<()> {
         let mut stdout = io::stdout().lock();
 
@@ -119,7 +120,12 @@ impl Renderer {
 
         // Update cursor.
         if cursor_visible {
-            queue!(stdout, MoveTo(cursor_x, cursor_y), cursor::Show)?;
+            queue!(
+                stdout,
+                MoveTo(cursor_x, cursor_y),
+                cursor_style_command(cursor_style),
+                cursor::Show,
+            )?;
         } else {
             queue!(stdout, cursor::Hide)?;
         }
@@ -139,6 +145,7 @@ impl Renderer {
         cursor_x: u16,
         cursor_y: u16,
         cursor_visible: bool,
+        cursor_style: u8,
     ) -> Result<()> {
         let mut stdout = io::stdout().lock();
 
@@ -178,7 +185,12 @@ impl Renderer {
 
         // Update cursor.
         if cursor_visible {
-            queue!(stdout, MoveTo(cursor_x, cursor_y), cursor::Show)?;
+            queue!(
+                stdout,
+                MoveTo(cursor_x, cursor_y),
+                cursor_style_command(cursor_style),
+                cursor::Show,
+            )?;
         } else {
             queue!(stdout, cursor::Hide)?;
         }
@@ -515,7 +527,7 @@ impl Renderer {
         // Re-render the current front buffer to clear any overlay.
         let cells = self.front.clone();
         // Determine cursor position from existing state (place at 0,0 hidden).
-        self.render_full(&cells, 0, 0, false)?;
+        self.render_full(&cells, 0, 0, false, 0)?;
         let _ = (cols, rows); // suppress unused warnings
         Ok(())
     }
@@ -530,6 +542,19 @@ fn crossterm_color_from_style(color: Color) -> Color {
 // ---------------------------------------------------------------------------
 // Color conversion
 // ---------------------------------------------------------------------------
+
+/// Convert a DECSCUSR cursor style number to a crossterm `SetCursorStyle`.
+fn cursor_style_command(style: u8) -> crossterm::cursor::SetCursorStyle {
+    match style {
+        1 => crossterm::cursor::SetCursorStyle::BlinkingBlock,
+        2 => crossterm::cursor::SetCursorStyle::SteadyBlock,
+        3 => crossterm::cursor::SetCursorStyle::BlinkingUnderScore,
+        4 => crossterm::cursor::SetCursorStyle::SteadyUnderScore,
+        5 => crossterm::cursor::SetCursorStyle::BlinkingBar,
+        6 => crossterm::cursor::SetCursorStyle::SteadyBar,
+        _ => crossterm::cursor::SetCursorStyle::DefaultUserShape,
+    }
+}
 
 /// Convert a protocol `CellColor` to a crossterm `Color`.
 fn cell_color_to_crossterm(color: &CellColor) -> Color {
