@@ -111,6 +111,33 @@ impl ServerState {
         id
     }
 
+    /// Ensure the pane and tab ID counters are higher than any existing ID.
+    ///
+    /// This is used after restoring persisted state to guard against
+    /// corruption where the counters might be lower than the max used ID.
+    pub fn ensure_id_counters(&mut self) {
+        let max_pane = self
+            .sessions
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .flat_map(|t| layout::all_pane_ids(&t.layout))
+            .max()
+            .unwrap_or(0);
+        let max_tab = self
+            .sessions
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .map(|t| t.id)
+            .max()
+            .unwrap_or(0);
+        if self.next_pane_id <= max_pane {
+            self.next_pane_id = max_pane + 1;
+        }
+        if self.next_tab_id <= max_tab {
+            self.next_tab_id = max_tab + 1;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Session CRUD
     // -----------------------------------------------------------------------

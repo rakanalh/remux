@@ -15,8 +15,9 @@
 # Maximum number of scrollback lines per pane.
 scrollback_lines = 10000
 
-# Interval in seconds between automatic session saves.
-auto_save_interval_secs = 30
+# Automatically save and restore sessions across server restarts.
+# State is saved after every structural change and restored on startup.
+automatic_restore = true
 
 # When true (default), mouse text selection auto-copies to clipboard on release
 # and clears the selection. When false, selection stays visible for keyboard

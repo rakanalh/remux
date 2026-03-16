@@ -30,8 +30,10 @@ pub struct GeneralConfig {
     pub default_shell: Option<String>,
     /// Maximum number of scrollback lines per pane.
     pub scrollback_lines: usize,
-    /// Interval in seconds between automatic session saves.
-    pub auto_save_interval_secs: u64,
+    /// When true (default), automatically save and restore sessions across
+    /// server restarts. State is saved after every structural change
+    /// (session/tab/pane create/close/rename) and restored on startup.
+    pub automatic_restore: bool,
     /// When true (default), mouse text selection auto-copies to clipboard on
     /// release and clears the selection. When false, the selection stays visible
     /// for keyboard adjustment in Visual mode.
@@ -43,7 +45,7 @@ impl Default for GeneralConfig {
         Self {
             default_shell: None,
             scrollback_lines: 10_000,
-            auto_save_interval_secs: 30,
+            automatic_restore: true,
             mouse_auto_yank: true,
         }
     }
@@ -327,7 +329,7 @@ mod tests {
     fn default_config_values() {
         let config = Config::default();
         assert_eq!(config.general.scrollback_lines, 10_000);
-        assert_eq!(config.general.auto_save_interval_secs, 30);
+        assert!(config.general.automatic_restore);
         assert_eq!(config.modes.command.timeout_ms, 500);
         assert_eq!(
             config.appearance.status_bar_position,
@@ -345,7 +347,7 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.scrollback_lines, 5000);
         // Other values should be defaults.
-        assert_eq!(config.general.auto_save_interval_secs, 30);
+        assert!(config.general.automatic_restore);
     }
 
     #[test]
@@ -354,7 +356,7 @@ mod tests {
             [general]
             default_shell = "/bin/zsh"
             scrollback_lines = 20000
-            auto_save_interval_secs = 60
+            automatic_restore = false
 
             [appearance]
             status_bar_position = "top"
