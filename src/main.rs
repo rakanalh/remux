@@ -461,8 +461,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     .await?;
                             }
                             InputAction::ShowWhichKey(label, entries) => {
+                                let (c, r) = crossterm::terminal::size()?;
                                 whichkey.show(label, entries);
-                                let commands = whichkey.render(cols, rows, &theme);
+                                renderer.clear_overlay(c, r)?;
+                                let commands = whichkey.render(c, r, &theme);
                                 renderer.render_whichkey_overlay(&commands)?;
                             }
                             InputAction::HideWhichKey => {
@@ -714,6 +716,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: {:?}", event);
+                        if matches!(event, crate::protocol::SessionEvent::SessionDeleted(_)) {
+                            break;
+                        }
                     }
                     None => {
                         // Server disconnected
