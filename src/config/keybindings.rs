@@ -164,21 +164,8 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('n', leaf("new", "SessionNew")),
                 ('d', leaf("detach", "SessionDetach")),
                 ('r', leaf("rename", "SessionRename")),
-                ('l', leaf("list", "SessionList")),
-            ],
-        ),
-    );
-
-    // f: Folder
-    root.insert(
-        'f',
-        group(
-            "Folder",
-            vec![
-                ('n', leaf("new", "FolderNew")),
-                ('d', leaf("delete", "FolderDelete")),
-                ('l', leaf("list", "FolderList")),
-                ('m', leaf("move session", "FolderMoveSession")),
+                ('l', leaf("list", "OpenSessionManager")),
+                ('m', leaf("move to folder", "SessionMoveToFolder")),
             ],
         ),
     );
@@ -675,6 +662,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "BufferEditInEditor" => Some(RemuxCommand::BufferEditInEditor),
         "EnterSearchMode" => Some(RemuxCommand::EnterSearchMode),
         "OpenSessionManager" => Some(RemuxCommand::OpenSessionManager),
+        "SessionMoveToFolder" => Some(RemuxCommand::SessionMoveToFolder),
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
@@ -1119,7 +1107,8 @@ mod tests {
         assert!(tree.root.contains_key(&'p'));
         assert!(tree.root.contains_key(&'s')); // Search group
         assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
-        assert!(tree.root.contains_key(&'f'));
+                                               // 'f' (Folder group) was removed in the folder-keybinding-removal refactor.
+        assert!(!tree.root.contains_key(&'f'));
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
         // 'b' (Buffer group) was removed in the search-mode refactor.

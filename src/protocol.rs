@@ -69,6 +69,9 @@ pub enum ServerMessage {
         cursor_style: u8,
         /// The focused pane's rectangle in the composited buffer.
         focused_pane_rect: Option<PaneRect>,
+        /// Whether the focused pane has application cursor keys (DECCKM) active.
+        #[serde(default)]
+        application_cursor_keys: bool,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -79,6 +82,9 @@ pub enum ServerMessage {
         cursor_style: u8,
         /// The focused pane's rectangle in the composited buffer.
         focused_pane_rect: Option<PaneRect>,
+        /// Whether the focused pane has application cursor keys (DECCKM) active.
+        #[serde(default)]
+        application_cursor_keys: bool,
     },
     /// Response to a `ListSessions` request.
     SessionList { sessions: Vec<SessionListEntry> },
@@ -282,6 +288,8 @@ pub enum RemuxCommand {
     EnterSearchMode,
     /// Open the session manager (client-side mode transition).
     OpenSessionManager,
+    /// Open folder selection popup to move current session (client-side only).
+    SessionMoveToFolder,
     /// Switch to a specific tab in a specific session.
     SessionSwitchTab {
         session: String,
@@ -343,6 +351,7 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
         ("FolderMoveSession", Some("<session> [folder]")),
         ("BufferEditInEditor", None),
         ("OpenSessionManager", None),
+        ("SessionMoveToFolder", None),
         ("ToggleStyle", None),
         ("LayoutNext", None),
         ("SetMaster", None),
