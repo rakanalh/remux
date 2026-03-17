@@ -169,6 +169,12 @@ pub struct ThemeConfig {
     pub pane_label_fg: ThemeColor,
     pub pane_label_bg: ThemeColor,
     pub session_name_fg: ThemeColor,
+
+    // Search highlight colors
+    pub search_match_fg: ThemeColor,
+    pub search_match_bg: ThemeColor,
+    pub search_current_fg: ThemeColor,
+    pub search_current_bg: ThemeColor,
 }
 
 impl Default for ThemeConfig {
@@ -206,6 +212,12 @@ impl Default for ThemeConfig {
             pane_label_fg: ThemeColor::Indexed(0),
             pane_label_bg: ThemeColor::Indexed(0),
             session_name_fg: ThemeColor::Indexed(6),
+
+            // Search highlight colors
+            search_match_fg: ThemeColor::Named("black".to_string()),
+            search_match_bg: ThemeColor::Indexed(58), // dim olive
+            search_current_fg: ThemeColor::Named("bright_white".to_string()),
+            search_current_bg: ThemeColor::Indexed(202), // orange
         }
     }
 }
@@ -252,6 +264,12 @@ pub struct Theme {
     pub pane_label_fg: Color,
     pub pane_label_bg: Color,
     pub session_name_fg: Color,
+
+    // Search highlight colors
+    pub search_match_fg: Color,
+    pub search_match_bg: Color,
+    pub search_current_fg: Color,
+    pub search_current_bg: Color,
 }
 
 impl Theme {
@@ -279,6 +297,10 @@ impl Theme {
             pane_label_fg: config.pane_label_fg.to_crossterm_color(),
             pane_label_bg: config.pane_label_bg.to_crossterm_color(),
             session_name_fg: config.session_name_fg.to_crossterm_color(),
+            search_match_fg: config.search_match_fg.to_crossterm_color(),
+            search_match_bg: config.search_match_bg.to_crossterm_color(),
+            search_current_fg: config.search_current_fg.to_crossterm_color(),
+            search_current_bg: config.search_current_bg.to_crossterm_color(),
         }
     }
 }
