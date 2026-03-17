@@ -42,31 +42,40 @@ border_style = "zellij_style"
 #   - A named color string: "black", "red", "green", "yellow", "blue", "magenta",
 #     "cyan", "white", "dark_grey", "bright_red", "bright_green", "bright_blue",
 #     "bright_magenta", "bright_cyan", "reset"
+#   - A CSS hex color: "#f5e0dc", "#CBA6F7" (6-digit, case-insensitive)
 #   - An ANSI 256-color index: { ansi = 235 }
 #   - An RGB color: { rgb = [255, 128, 0] }
 #
+# The default theme uses Catppuccin Mocha colors. To customize:
+#
 # [appearance.theme]
-# mode_normal_fg = "black"
-# mode_normal_bg = "bright_green"
-# mode_command_fg = "black"
-# mode_command_bg = "bright_blue"
-# mode_visual_fg = "black"
-# mode_visual_bg = "bright_magenta"
-# frame_fg = { ansi = 8 }
-# frame_bg = "reset"
-# frame_active_fg = { ansi = 2 }
-# status_bar_fg = { ansi = 243 }
-# status_bar_bg = { ansi = 235 }
-# tab_active_fg = { ansi = 0 }
-# tab_active_bg = { ansi = 6 }
-# tab_inactive_fg = { ansi = 245 }
-# whichkey_fg = { ansi = 252 }
-# whichkey_bg = { ansi = 235 }
-# whichkey_key_fg = { ansi = 10 }
-# separator_fg = { ansi = 240 }
-# pane_label_fg = { ansi = 0 }
-# pane_label_bg = { ansi = 0 }
-# session_name_fg = { ansi = 6 }
+# mode_normal_fg = "#1e1e2e"
+# mode_normal_bg = "#a6e3a1"
+# mode_command_fg = "#1e1e2e"
+# mode_command_bg = "#89b4fa"
+# mode_visual_fg = "#1e1e2e"
+# mode_visual_bg = "#cba6f7"
+# mode_search_fg = "#1e1e2e"
+# mode_search_bg = "#f9e2af"
+# frame_fg = "#585b70"
+# frame_bg = "#1e1e2e"
+# frame_active_fg = "#89b4fa"
+# status_bar_fg = "#a6adc8"
+# status_bar_bg = "#181825"
+# tab_active_fg = "#1e1e2e"
+# tab_active_bg = "#89b4fa"
+# tab_inactive_fg = "#9399b2"
+# whichkey_fg = "#cdd6f4"
+# whichkey_bg = "#181825"
+# whichkey_key_fg = "#a6e3a1"
+# separator_fg = "#6c7086"
+# pane_label_fg = "#cdd6f4"
+# pane_label_bg = "#1e1e2e"
+# session_name_fg = "#94e2d5"
+# search_match_fg = "#1e1e2e"
+# search_match_bg = "#585b70"
+# search_current_fg = "#1e1e2e"
+# search_current_bg = "#fab387"
 
 # -----------------------------------------------------------------------------
 # Modes

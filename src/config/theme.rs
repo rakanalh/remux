@@ -38,6 +38,15 @@ impl<'de> Deserialize<'de> for ThemeColor {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<ThemeColor, E> {
+                if let Some(hex) = v.strip_prefix('#') {
+                    if hex.len() == 6 {
+                        let r = u8::from_str_radix(&hex[0..2], 16).map_err(de::Error::custom)?;
+                        let g = u8::from_str_radix(&hex[2..4], 16).map_err(de::Error::custom)?;
+                        let b = u8::from_str_radix(&hex[4..6], 16).map_err(de::Error::custom)?;
+                        return Ok(ThemeColor::Rgb(r, g, b));
+                    }
+                    return Err(de::Error::custom("hex color must be 6 digits: #RRGGBB"));
+                }
                 Ok(ThemeColor::Named(v.to_string()))
             }
 
@@ -170,6 +179,10 @@ pub struct ThemeConfig {
     pub pane_label_bg: ThemeColor,
     pub session_name_fg: ThemeColor,
 
+    // Search mode indicator
+    pub mode_search_fg: ThemeColor,
+    pub mode_search_bg: ThemeColor,
+
     // Search highlight colors
     pub search_match_fg: ThemeColor,
     pub search_match_bg: ThemeColor,
@@ -180,44 +193,48 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            // Mode indicators (match compositor hardcoded values)
-            mode_normal_fg: ThemeColor::Named("black".to_string()),
-            mode_normal_bg: ThemeColor::Named("bright_green".to_string()),
-            mode_command_fg: ThemeColor::Named("black".to_string()),
-            mode_command_bg: ThemeColor::Named("bright_blue".to_string()),
-            mode_visual_fg: ThemeColor::Named("black".to_string()),
-            mode_visual_bg: ThemeColor::Named("bright_magenta".to_string()),
+            // Mode indicators
+            mode_normal_fg: ThemeColor::Rgb(30, 30, 46), // base (dark bg text)
+            mode_normal_bg: ThemeColor::Rgb(166, 227, 161), // green
+            mode_command_fg: ThemeColor::Rgb(30, 30, 46), // base
+            mode_command_bg: ThemeColor::Rgb(137, 180, 250), // blue
+            mode_visual_fg: ThemeColor::Rgb(30, 30, 46), // base
+            mode_visual_bg: ThemeColor::Rgb(203, 166, 247), // mauve
 
             // Pane frame
-            frame_fg: ThemeColor::Indexed(8),
-            frame_bg: ThemeColor::Named("reset".to_string()),
-            frame_active_fg: ThemeColor::Indexed(2),
+            frame_fg: ThemeColor::Rgb(88, 91, 112), // surface2
+            frame_bg: ThemeColor::Rgb(30, 30, 46),  // base
+            frame_active_fg: ThemeColor::Rgb(137, 180, 250), // blue
 
             // Status bar
-            status_bar_fg: ThemeColor::Indexed(243),
-            status_bar_bg: ThemeColor::Indexed(235),
+            status_bar_fg: ThemeColor::Rgb(166, 173, 200), // subtext0
+            status_bar_bg: ThemeColor::Rgb(24, 24, 37),    // mantle
 
             // Tabs
-            tab_active_fg: ThemeColor::Indexed(0),
-            tab_active_bg: ThemeColor::Indexed(6),
-            tab_inactive_fg: ThemeColor::Indexed(245),
+            tab_active_fg: ThemeColor::Rgb(30, 30, 46), // base
+            tab_active_bg: ThemeColor::Rgb(137, 180, 250), // blue
+            tab_inactive_fg: ThemeColor::Rgb(147, 153, 178), // overlay2
 
             // Which-key popup
-            whichkey_fg: ThemeColor::Indexed(252),
-            whichkey_bg: ThemeColor::Indexed(235),
-            whichkey_key_fg: ThemeColor::Indexed(10),
+            whichkey_fg: ThemeColor::Rgb(205, 214, 244), // text
+            whichkey_bg: ThemeColor::Rgb(24, 24, 37),    // mantle
+            whichkey_key_fg: ThemeColor::Rgb(166, 227, 161), // green
 
-            // Additional fields
-            separator_fg: ThemeColor::Indexed(240),
-            pane_label_fg: ThemeColor::Indexed(0),
-            pane_label_bg: ThemeColor::Indexed(0),
-            session_name_fg: ThemeColor::Indexed(6),
+            // Separators and labels
+            separator_fg: ThemeColor::Rgb(108, 112, 134), // overlay0
+            pane_label_fg: ThemeColor::Rgb(205, 214, 244), // text
+            pane_label_bg: ThemeColor::Rgb(30, 30, 46),   // base
+            session_name_fg: ThemeColor::Rgb(148, 226, 213), // teal
+
+            // Search mode indicator
+            mode_search_fg: ThemeColor::Rgb(30, 30, 46), // base
+            mode_search_bg: ThemeColor::Rgb(249, 226, 175), // yellow
 
             // Search highlight colors
-            search_match_fg: ThemeColor::Named("black".to_string()),
-            search_match_bg: ThemeColor::Indexed(58), // dim olive
-            search_current_fg: ThemeColor::Named("bright_white".to_string()),
-            search_current_bg: ThemeColor::Indexed(202), // orange
+            search_match_fg: ThemeColor::Rgb(30, 30, 46), // base
+            search_match_bg: ThemeColor::Rgb(88, 91, 112), // surface2 (subtle)
+            search_current_fg: ThemeColor::Rgb(30, 30, 46), // base
+            search_current_bg: ThemeColor::Rgb(250, 179, 135), // peach (stands out)
         }
     }
 }
@@ -265,6 +282,10 @@ pub struct Theme {
     pub pane_label_bg: Color,
     pub session_name_fg: Color,
 
+    // Search mode indicator
+    pub mode_search_fg: Color,
+    pub mode_search_bg: Color,
+
     // Search highlight colors
     pub search_match_fg: Color,
     pub search_match_bg: Color,
@@ -297,6 +318,8 @@ impl Theme {
             pane_label_fg: config.pane_label_fg.to_crossterm_color(),
             pane_label_bg: config.pane_label_bg.to_crossterm_color(),
             session_name_fg: config.session_name_fg.to_crossterm_color(),
+            mode_search_fg: config.mode_search_fg.to_crossterm_color(),
+            mode_search_bg: config.mode_search_bg.to_crossterm_color(),
             search_match_fg: config.search_match_fg.to_crossterm_color(),
             search_match_bg: config.search_match_bg.to_crossterm_color(),
             search_current_fg: config.search_current_fg.to_crossterm_color(),
@@ -336,6 +359,8 @@ pub struct CompositorTheme {
     pub whichkey_fg: CellColor,
     pub whichkey_bg: CellColor,
     pub whichkey_key_fg: CellColor,
+    pub mode_search_fg: CellColor,
+    pub mode_search_bg: CellColor,
     pub separator_fg: CellColor,
     pub pane_label_fg: CellColor,
     pub pane_label_bg: CellColor,
@@ -363,6 +388,8 @@ impl CompositorTheme {
             whichkey_fg: config.whichkey_fg.to_cell_color(),
             whichkey_bg: config.whichkey_bg.to_cell_color(),
             whichkey_key_fg: config.whichkey_key_fg.to_cell_color(),
+            mode_search_fg: config.mode_search_fg.to_cell_color(),
+            mode_search_bg: config.mode_search_bg.to_cell_color(),
             separator_fg: config.separator_fg.to_cell_color(),
             pane_label_fg: config.pane_label_fg.to_cell_color(),
             pane_label_bg: config.pane_label_bg.to_cell_color(),
@@ -376,7 +403,7 @@ impl CompositorTheme {
             "NORMAL" => (self.mode_normal_fg.clone(), self.mode_normal_bg.clone()),
             "COMMAND" => (self.mode_command_fg.clone(), self.mode_command_bg.clone()),
             "VISUAL" => (self.mode_visual_fg.clone(), self.mode_visual_bg.clone()),
-            "SEARCH" => (CellColor::Indexed(0), CellColor::Indexed(11)), // Black on bright yellow
+            "SEARCH" => (self.mode_search_fg.clone(), self.mode_search_bg.clone()),
             _ => (CellColor::Indexed(15), CellColor::Indexed(238)),
         }
     }
@@ -436,31 +463,35 @@ mod tests {
     fn theme_config_default_matches_compositor_hardcoded() {
         let ct = CompositorTheme::default();
 
-        // Mode colors
-        assert_eq!(ct.mode_normal_fg, CellColor::Indexed(0));
-        assert_eq!(ct.mode_normal_bg, CellColor::Indexed(10));
-        assert_eq!(ct.mode_command_fg, CellColor::Indexed(0));
-        assert_eq!(ct.mode_command_bg, CellColor::Indexed(12));
-        assert_eq!(ct.mode_visual_fg, CellColor::Indexed(0));
-        assert_eq!(ct.mode_visual_bg, CellColor::Indexed(13));
+        // Mode colors (Catppuccin Mocha)
+        assert_eq!(ct.mode_normal_fg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.mode_normal_bg, CellColor::Rgb(166, 227, 161)); // green
+        assert_eq!(ct.mode_command_fg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.mode_command_bg, CellColor::Rgb(137, 180, 250)); // blue
+        assert_eq!(ct.mode_visual_fg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.mode_visual_bg, CellColor::Rgb(203, 166, 247)); // mauve
 
         // Frame colors
-        assert_eq!(ct.frame_fg, CellColor::Indexed(8));
-        assert_eq!(ct.frame_bg, CellColor::Default);
-        assert_eq!(ct.frame_active_fg, CellColor::Indexed(2));
+        assert_eq!(ct.frame_fg, CellColor::Rgb(88, 91, 112)); // surface2
+        assert_eq!(ct.frame_bg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.frame_active_fg, CellColor::Rgb(137, 180, 250)); // blue
 
         // Status bar
-        assert_eq!(ct.status_bar_fg, CellColor::Indexed(243));
-        assert_eq!(ct.status_bar_bg, CellColor::Indexed(235));
+        assert_eq!(ct.status_bar_fg, CellColor::Rgb(166, 173, 200)); // subtext0
+        assert_eq!(ct.status_bar_bg, CellColor::Rgb(24, 24, 37)); // mantle
 
         // Tabs
-        assert_eq!(ct.tab_active_fg, CellColor::Indexed(0));
-        assert_eq!(ct.tab_active_bg, CellColor::Indexed(6));
-        assert_eq!(ct.tab_inactive_fg, CellColor::Indexed(245));
+        assert_eq!(ct.tab_active_fg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.tab_active_bg, CellColor::Rgb(137, 180, 250)); // blue
+        assert_eq!(ct.tab_inactive_fg, CellColor::Rgb(147, 153, 178)); // overlay2
 
         // Separators and session name
-        assert_eq!(ct.separator_fg, CellColor::Indexed(240));
-        assert_eq!(ct.session_name_fg, CellColor::Indexed(6));
+        assert_eq!(ct.separator_fg, CellColor::Rgb(108, 112, 134)); // overlay0
+        assert_eq!(ct.session_name_fg, CellColor::Rgb(148, 226, 213)); // teal
+
+        // Search mode
+        assert_eq!(ct.mode_search_fg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.mode_search_bg, CellColor::Rgb(249, 226, 175)); // yellow
     }
 
     #[test]
@@ -477,7 +508,7 @@ mod tests {
         );
         assert_eq!(config.frame_active_fg, ThemeColor::Indexed(4));
         // Default values preserved
-        assert_eq!(config.status_bar_bg, ThemeColor::Indexed(235));
+        assert_eq!(config.status_bar_bg, ThemeColor::Rgb(24, 24, 37));
     }
 
     #[test]
@@ -520,15 +551,33 @@ mod tests {
     fn compositor_theme_mode_colors() {
         let ct = CompositorTheme::default();
         let (fg, bg) = ct.mode_colors("NORMAL");
-        assert_eq!(fg, CellColor::Indexed(0));
-        assert_eq!(bg, CellColor::Indexed(10));
+        assert_eq!(fg, CellColor::Rgb(30, 30, 46));
+        assert_eq!(bg, CellColor::Rgb(166, 227, 161));
 
         let (fg, bg) = ct.mode_colors("COMMAND");
-        assert_eq!(fg, CellColor::Indexed(0));
-        assert_eq!(bg, CellColor::Indexed(12));
+        assert_eq!(fg, CellColor::Rgb(30, 30, 46));
+        assert_eq!(bg, CellColor::Rgb(137, 180, 250));
 
         let (fg, bg) = ct.mode_colors("VISUAL");
-        assert_eq!(fg, CellColor::Indexed(0));
-        assert_eq!(bg, CellColor::Indexed(13));
+        assert_eq!(fg, CellColor::Rgb(30, 30, 46));
+        assert_eq!(bg, CellColor::Rgb(203, 166, 247));
+
+        let (fg, bg) = ct.mode_colors("SEARCH");
+        assert_eq!(fg, CellColor::Rgb(30, 30, 46));
+        assert_eq!(bg, CellColor::Rgb(249, 226, 175));
+    }
+
+    #[test]
+    fn theme_color_serde_hex() {
+        let val: toml::Value = toml::from_str(r##"color = "#f5e0dc""##).unwrap();
+        let tc: ThemeColor = ThemeColor::deserialize(val.get("color").unwrap().clone()).unwrap();
+        assert_eq!(tc, ThemeColor::Rgb(245, 224, 220));
+    }
+
+    #[test]
+    fn theme_color_serde_hex_uppercase() {
+        let val: toml::Value = toml::from_str(r##"color = "#CBA6F7""##).unwrap();
+        let tc: ThemeColor = ThemeColor::deserialize(val.get("color").unwrap().clone()).unwrap();
+        assert_eq!(tc, ThemeColor::Rgb(203, 166, 247));
     }
 }
