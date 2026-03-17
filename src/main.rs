@@ -639,6 +639,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         query.len(),
                                         ss.scrollback_line_count,
                                         focused_pane_rect.as_ref(),
+                                        &theme,
                                     )?;
                                 }
                             }
@@ -867,6 +868,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 query.len(),
                                 ss.scrollback_line_count,
                                 focused_pane_rect.as_ref(),
+                                &theme,
                             )?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
                         }
@@ -917,6 +919,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 query.len(),
                                 ss.scrollback_line_count,
                                 focused_pane_rect.as_ref(),
+                                &theme,
                             )?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
                         }
@@ -971,6 +974,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     q.len(),
                                     ss.scrollback_line_count,
                                     focused_pane_rect.as_ref(),
+                                    &theme,
                                 )?;
                             }
                         }

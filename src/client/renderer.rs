@@ -595,6 +595,7 @@ impl Renderer {
         query_len: usize,
         scrollback_line_count: usize,
         pane_rect: Option<&crate::protocol::PaneRect>,
+        theme: &crate::config::theme::Theme,
     ) -> Result<()> {
         let pr = match pane_rect {
             Some(pr) => pr,
@@ -624,11 +625,11 @@ impl Renderer {
             let screen_y = pr.y as usize + (line - visible_start);
             let screen_x_start = pr.x as usize + col;
 
-            // Choose colors: bright yellow bg for current match, dark bg for others.
+            // Choose colors: bright for current match, subtle for others.
             let (hl_fg, hl_bg) = if idx == current_match {
-                (Color::Black, Color::AnsiValue(11)) // Bright yellow
+                (theme.search_current_fg, theme.search_current_bg)
             } else {
-                (Color::Black, Color::AnsiValue(3)) // Dark yellow
+                (theme.search_match_fg, theme.search_match_bg)
             };
 
             for offset in 0..query_len {
