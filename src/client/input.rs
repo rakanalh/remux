@@ -377,6 +377,19 @@ pub enum InputAction {
     SessionManagerAction(crate::client::session_manager::SessionManagerAction),
     /// Re-render the session manager overlay (after sub-mode state changes).
     SessionManagerUpdate,
+    /// Create a new session with the given name and switch to it.
+    NewSession(String),
+    /// Open folder selection popup (request folder list from server).
+    FolderSelectOpen,
+    /// Folder selection popup updated (re-render needed).
+    FolderSelectUpdate,
+    /// Folder selection completed - move session to chosen folder.
+    FolderSelectConfirm {
+        session: String,
+        folder: Option<String>,
+    },
+    /// Folder selection cancelled.
+    FolderSelectClose,
     /// No action to take.
     None,
 }
@@ -459,6 +472,10 @@ pub struct InputHandler {
     pub search_state: Option<SearchState>,
     /// State for Session Manager mode.
     pub session_manager: Option<crate::client::session_manager::SessionManagerState>,
+    /// Whether the focused pane has DECCKM (application cursor keys) active.
+    pub application_cursor_keys: bool,
+    /// State for the folder selection overlay.
+    pub folder_select: Option<FolderSelectOverlay>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -479,6 +496,170 @@ pub struct RenameOverlay {
 pub enum RenameTarget {
     Pane,
     Tab,
+    Session,
+    NewSession,
+}
+
+/// Folder selection overlay for moving the current session to a different folder.
+#[derive(Debug, Clone)]
+pub struct FolderSelectOverlay {
+    /// Available folder names (index 0 is always "(none)" for top-level).
+    pub folders: Vec<String>,
+    /// Currently highlighted folder index.
+    pub selected: usize,
+    /// The session name being moved.
+    pub session_name: String,
+}
+
+impl FolderSelectOverlay {
+    /// Render the folder selection popup as draw commands.
+    pub fn render(
+        &self,
+        screen_cols: u16,
+        screen_rows: u16,
+        theme: &crate::config::theme::Theme,
+    ) -> Vec<crate::client::whichkey::DrawCommand> {
+        use crate::client::whichkey::DrawCommand;
+        let mut commands = Vec::new();
+
+        let popup_width = 40u16.min(screen_cols);
+        let popup_height = (self.folders.len() as u16 + 4).min(screen_rows);
+        let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
+        let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
+
+        let fg = theme.whichkey_fg;
+        let bg = theme.whichkey_bg;
+        let sel_fg = theme.whichkey_bg;
+        let sel_bg = theme.whichkey_fg;
+        let border_fg = theme.separator_fg;
+        let inner_width = (popup_width - 2) as usize;
+
+        // Fill background
+        for row in 0..popup_height {
+            commands.push(DrawCommand {
+                x: start_x,
+                y: start_y + row,
+                text: " ".repeat(popup_width as usize),
+                fg,
+                bg,
+            });
+        }
+
+        // Top border with title
+        let title = " Move to Folder ";
+        let border_len = inner_width.saturating_sub(title.len());
+        let left_b = border_len / 2;
+        let right_b = border_len - left_b;
+        commands.push(DrawCommand {
+            x: start_x,
+            y: start_y,
+            text: format!(
+                "\u{256D}{}{}{}\u{256E}",
+                "\u{2500}".repeat(left_b),
+                title,
+                "\u{2500}".repeat(right_b)
+            ),
+            fg: border_fg,
+            bg,
+        });
+
+        // Folder list
+        for (i, folder) in self.folders.iter().enumerate() {
+            let y = start_y + 1 + i as u16;
+            if y >= start_y + popup_height - 2 {
+                break;
+            }
+            let is_selected = i == self.selected;
+            let text = format!("  {}", folder);
+            let padded = if text.len() >= inner_width {
+                text[..inner_width].to_string()
+            } else {
+                format!("{}{}", text, " ".repeat(inner_width - text.len()))
+            };
+
+            let (row_fg, row_bg) = if is_selected {
+                (sel_fg, sel_bg)
+            } else {
+                (fg, bg)
+            };
+
+            commands.push(DrawCommand {
+                x: start_x,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y,
+                text: padded,
+                fg: row_fg,
+                bg: row_bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+        }
+
+        // Fill empty rows if needed
+        let content_rows = self
+            .folders
+            .len()
+            .min((popup_height as usize).saturating_sub(3));
+        for row_idx in content_rows..(popup_height as usize).saturating_sub(3) {
+            let y = start_y + 1 + row_idx as u16;
+            commands.push(DrawCommand {
+                x: start_x,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y,
+                text: " ".repeat(inner_width),
+                fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+        }
+
+        // Separator line
+        let help_y = start_y + popup_height - 2;
+        let sep_line = format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width));
+        commands.push(DrawCommand {
+            x: start_x,
+            y: help_y,
+            text: sep_line,
+            fg: border_fg,
+            bg,
+        });
+
+        // Bottom border
+        let help_line_y = start_y + popup_height - 1;
+        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        commands.push(DrawCommand {
+            x: start_x,
+            y: help_line_y,
+            text: bottom_line,
+            fg: border_fg,
+            bg,
+        });
+
+        commands
+    }
 }
 
 impl InputHandler {
@@ -501,6 +682,8 @@ impl InputHandler {
             command_palette: None,
             search_state: None,
             session_manager: None,
+            application_cursor_keys: false,
+            folder_select: None,
         }
     }
 
@@ -523,6 +706,11 @@ impl InputHandler {
 
     /// Process a key event and return the appropriate action.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        // If the folder select overlay is active, capture keystrokes for it.
+        if self.folder_select.is_some() {
+            return self.handle_folder_select_key(key);
+        }
+
         // If the rename overlay is active, capture keystrokes for it.
         if self.rename_overlay.is_some() {
             return self.handle_rename_overlay_key(key);
@@ -600,7 +788,7 @@ impl InputHandler {
         }
 
         // All other keys are forwarded to the PTY.
-        match key_event_to_bytes(&key) {
+        match key_event_to_bytes(&key, self.application_cursor_keys) {
             Some(bytes) => InputAction::SendToPty(bytes),
             Option::None => InputAction::None,
         }
@@ -757,6 +945,9 @@ impl InputHandler {
                             );
                             return InputAction::SessionManagerOpen;
                         }
+                        RemuxCommand::SessionMoveToFolder => {
+                            return InputAction::FolderSelectOpen;
+                        }
                         RemuxCommand::PaneRename(_) => {
                             // Activate rename overlay instead of executing directly.
                             self.rename_overlay = Some(RenameOverlay {
@@ -772,6 +963,24 @@ impl InputHandler {
                                 buffer: String::new(),
                                 cursor: 0,
                                 target: RenameTarget::Tab,
+                            });
+                            return InputAction::ActivateRenameOverlay;
+                        }
+                        RemuxCommand::SessionRename(_) => {
+                            // Activate rename overlay instead of executing directly.
+                            self.rename_overlay = Some(RenameOverlay {
+                                buffer: String::new(),
+                                cursor: 0,
+                                target: RenameTarget::Session,
+                            });
+                            return InputAction::ActivateRenameOverlay;
+                        }
+                        RemuxCommand::SessionNew { .. } => {
+                            // Activate rename overlay to prompt for session name.
+                            self.rename_overlay = Some(RenameOverlay {
+                                buffer: String::new(),
+                                cursor: 0,
+                                target: RenameTarget::NewSession,
                             });
                             return InputAction::ActivateRenameOverlay;
                         }
@@ -1363,6 +1572,76 @@ impl InputHandler {
     }
 
     // -----------------------------------------------------------------------
+    // Folder select overlay
+    // -----------------------------------------------------------------------
+
+    fn handle_folder_select_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.folder_select.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.folder_select = None;
+                self.mode = Mode::Normal;
+                InputAction::FolderSelectClose
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !overlay.folders.is_empty() {
+                    overlay.selected = (overlay.selected + 1) % overlay.folders.len();
+                }
+                InputAction::FolderSelectUpdate
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !overlay.folders.is_empty() {
+                    if overlay.selected == 0 {
+                        overlay.selected = overlay.folders.len() - 1;
+                    } else {
+                        overlay.selected -= 1;
+                    }
+                }
+                InputAction::FolderSelectUpdate
+            }
+            KeyCode::Enter => {
+                let selected_name = overlay.folders.get(overlay.selected).cloned();
+                let session = overlay.session_name.clone();
+                self.folder_select = None;
+                self.mode = Mode::Normal;
+                // "(none)" means move to top-level (no folder)
+                let folder = selected_name.filter(|n| n != "(none)");
+                InputAction::FolderSelectConfirm { session, folder }
+            }
+            _ => InputAction::None,
+        }
+    }
+
+    /// Update the folder selection overlay with available folders,
+    /// filtering out the current session's folder.
+    pub fn update_folder_list(
+        &mut self,
+        all_folders: Vec<String>,
+        current_folder: Option<String>,
+        session_name: String,
+    ) {
+        let mut folders: Vec<String> = vec!["(none)".to_string()];
+        for f in all_folders {
+            if current_folder.as_deref() != Some(&f) {
+                folders.push(f);
+            }
+        }
+        // If session is already at top-level, remove "(none)"
+        if current_folder.is_none() {
+            folders.retain(|f| f != "(none)");
+        }
+        self.folder_select = Some(FolderSelectOverlay {
+            folders,
+            selected: 0,
+            session_name,
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Rename overlay
     // -----------------------------------------------------------------------
 
@@ -1386,11 +1665,18 @@ impl InputHandler {
                 let target = overlay.target.clone();
                 self.rename_overlay = None;
                 self.mode = Mode::Normal;
-                let cmd = match target {
-                    RenameTarget::Pane => RemuxCommand::PaneRename(name),
-                    RenameTarget::Tab => RemuxCommand::TabRename(name),
-                };
-                InputAction::Execute(cmd)
+                match target {
+                    RenameTarget::NewSession => InputAction::NewSession(name),
+                    _ => {
+                        let cmd = match target {
+                            RenameTarget::Pane => RemuxCommand::PaneRename(name),
+                            RenameTarget::Tab => RemuxCommand::TabRename(name),
+                            RenameTarget::Session => RemuxCommand::SessionRename(name),
+                            RenameTarget::NewSession => unreachable!(),
+                        };
+                        InputAction::Execute(cmd)
+                    }
+                }
             }
             KeyCode::Backspace => {
                 overlay.buffer.pop();
@@ -1483,7 +1769,7 @@ impl InputHandler {
 
 /// Convert a crossterm `KeyEvent` to the byte sequence that should be sent to
 /// a PTY. Returns `None` for key events that have no PTY representation.
-fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -1513,12 +1799,54 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Tab => Some(wrap_alt(alt, b'\t')),
         KeyCode::Backspace => Some(wrap_alt(alt, 0x7f)),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(escape_seq(alt, b"[A")),
-        KeyCode::Down => Some(escape_seq(alt, b"[B")),
-        KeyCode::Right => Some(escape_seq(alt, b"[C")),
-        KeyCode::Left => Some(escape_seq(alt, b"[D")),
-        KeyCode::Home => Some(escape_seq(alt, b"[H")),
-        KeyCode::End => Some(escape_seq(alt, b"[F")),
+        KeyCode::Up => Some(escape_seq(
+            alt,
+            if application_cursor_keys {
+                b"OA" as &[u8]
+            } else {
+                b"[A"
+            },
+        )),
+        KeyCode::Down => Some(escape_seq(
+            alt,
+            if application_cursor_keys {
+                b"OB"
+            } else {
+                b"[B"
+            },
+        )),
+        KeyCode::Right => Some(escape_seq(
+            alt,
+            if application_cursor_keys {
+                b"OC"
+            } else {
+                b"[C"
+            },
+        )),
+        KeyCode::Left => Some(escape_seq(
+            alt,
+            if application_cursor_keys {
+                b"OD"
+            } else {
+                b"[D"
+            },
+        )),
+        KeyCode::Home => Some(escape_seq(
+            alt,
+            if application_cursor_keys {
+                b"OH"
+            } else {
+                b"[H"
+            },
+        )),
+        KeyCode::End => Some(escape_seq(
+            alt,
+            if application_cursor_keys {
+                b"OF"
+            } else {
+                b"[F"
+            },
+        )),
         KeyCode::PageUp => Some(escape_seq(alt, b"[5~")),
         KeyCode::PageDown => Some(escape_seq(alt, b"[6~")),
         KeyCode::Insert => Some(escape_seq(alt, b"[2~")),
@@ -2113,7 +2441,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
-        assert_eq!(key_event_to_bytes(&key), Some(b"x".to_vec()));
+        assert_eq!(key_event_to_bytes(&key, false), Some(b"x".to_vec()));
     }
 
     #[test]
@@ -2124,7 +2452,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
-        assert_eq!(key_event_to_bytes(&key), Some(vec![0x1b, b'x']));
+        assert_eq!(key_event_to_bytes(&key, false), Some(vec![0x1b, b'x']));
     }
 
     #[test]
@@ -2135,7 +2463,10 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
-        assert_eq!(key_event_to_bytes(&key), Some(vec![0x1b, b'O', b'P']));
+        assert_eq!(
+            key_event_to_bytes(&key, false),
+            Some(vec![0x1b, b'O', b'P'])
+        );
     }
 
     #[test]
@@ -2146,7 +2477,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
-        assert_eq!(key_event_to_bytes(&key), Some(vec![0x7f]));
+        assert_eq!(key_event_to_bytes(&key, false), Some(vec![0x7f]));
     }
 
     #[test]
@@ -2157,7 +2488,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
-        let bytes = key_event_to_bytes(&key).unwrap();
+        let bytes = key_event_to_bytes(&key, false).unwrap();
         assert_eq!(bytes, "\u{00e9}".as_bytes());
     }
 

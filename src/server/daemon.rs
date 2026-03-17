@@ -110,7 +110,7 @@ struct ClientConnection {
     tx: mpsc::UnboundedSender<ServerMessage>,
     cols: u16,
     rows: u16,
-    /// The client's current input mode (e.g. "INSERT", "NORMAL", "VISUAL").
+    /// The client's current input mode (e.g. "NORMAL", "COMMAND", "VISUAL").
     mode: String,
     /// Active mouse selection, if any.
     mouse_selection: Option<MouseSelection>,
@@ -264,7 +264,7 @@ impl RemuxServer {
                     tx,
                     cols: 80,
                     rows: 24,
-                    mode: "INSERT".to_string(),
+                    mode: "NORMAL".to_string(),
                     mouse_selection: None,
                     search_info: None,
                 },
@@ -1172,8 +1172,35 @@ async fn handle_command(
             st.create_folder(&name)?;
         }
         RemuxCommand::FolderDelete(name) => {
-            let mut st = state.lock().await;
-            st.delete_folder(&name)?;
+            let deleted_sessions = {
+                let mut st = state.lock().await;
+                st.delete_folder_cascade(&name)?
+            };
+            // Clean up panes and notify clients for each deleted session.
+            {
+                let mut ps = panes.lock().await;
+                for (_, pane_ids) in &deleted_sessions {
+                    for pid in pane_ids {
+                        ps.remove(pid);
+                    }
+                }
+            }
+            {
+                let mut cls = clients.lock().await;
+                for (session_name, _) in &deleted_sessions {
+                    for client in cls.values_mut() {
+                        if client.session_name.as_deref() == Some(session_name) {
+                            client.session_name = None;
+                            let _ =
+                                client
+                                    .tx
+                                    .send(ServerMessage::Event(SessionEvent::SessionDeleted(
+                                        session_name.clone(),
+                                    )));
+                        }
+                    }
+                }
+            }
         }
         RemuxCommand::FolderMoveSession { session, folder } => {
             let mut st = state.lock().await;
@@ -1501,7 +1528,7 @@ async fn handle_mouse_click(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) = build_composite(
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack) = build_composite(
         &session_name,
         cols,
         rows,
@@ -1614,7 +1641,7 @@ async fn handle_mouse_drag(
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects) = build_composite(
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack) = build_composite(
         &session_name,
         cols,
         rows,
@@ -1848,7 +1875,7 @@ async fn send_full_render_to_client(
         let client = cls.get(&client_id);
         let mode = client
             .map(|c| c.mode.clone())
-            .unwrap_or_else(|| "INSERT".to_string());
+            .unwrap_or_else(|| "NORMAL".to_string());
         let selection = client.and_then(|c| c.mouse_selection.clone());
         let si = client.and_then(|c| c.search_info);
         (mode, selection, si)
@@ -1864,6 +1891,7 @@ async fn send_full_render_to_client(
         focused_pane_rect,
         _hit_regions,
         _pane_rects,
+        application_cursor_keys,
     ) = build_composite(
         session_name,
         cols,
@@ -1890,6 +1918,7 @@ async fn send_full_render_to_client(
             cursor_visible,
             cursor_style,
             focused_pane_rect,
+            application_cursor_keys,
         });
     }
 }
@@ -1917,7 +1946,7 @@ async fn broadcast_full_render(
         let first = attached.first();
         let mode = first
             .map(|c| c.mode.clone())
-            .unwrap_or_else(|| "INSERT".to_string());
+            .unwrap_or_else(|| "NORMAL".to_string());
         let selection = first.and_then(|c| c.mouse_selection.clone());
         let si = first.and_then(|c| c.search_info);
         (cols, rows, mode, selection, si)
@@ -1935,6 +1964,7 @@ async fn broadcast_full_render(
         focused_pane_rect,
         _hit_regions,
         _pane_rects,
+        application_cursor_keys,
     ) = build_composite(
         session_name,
         cols,
@@ -1962,6 +1992,7 @@ async fn broadcast_full_render(
                     cursor_visible,
                     cursor_style,
                     focused_pane_rect,
+                    application_cursor_keys,
                 }
             } else {
                 ServerMessage::RenderDiff {
@@ -1971,6 +2002,7 @@ async fn broadcast_full_render(
                     cursor_visible,
                     cursor_style,
                     focused_pane_rect,
+                    application_cursor_keys,
                 }
             }
         } else {
@@ -1981,6 +2013,7 @@ async fn broadcast_full_render(
                 cursor_visible,
                 cursor_style,
                 focused_pane_rect,
+                application_cursor_keys,
             }
         }
     };
@@ -2059,6 +2092,7 @@ async fn build_composite(
     Option<PaneRect>,
     HitRegions,
     Vec<(PaneId, Rect)>,
+    bool, // application_cursor_keys
 ) {
     let st = state.lock().await;
     let sess = match st.sessions.get(session_name) {
@@ -2073,6 +2107,7 @@ async fn build_composite(
                 None,
                 HitRegions::default(),
                 Vec::new(),
+                false,
             );
         }
     };
@@ -2088,6 +2123,7 @@ async fn build_composite(
                 None,
                 HitRegions::default(),
                 Vec::new(),
+                false,
             );
         }
     };
@@ -2216,6 +2252,11 @@ async fn build_composite(
         (0, 0, false, 0)
     };
 
+    let application_cursor_keys = ps
+        .get(&tab.focused_pane)
+        .map(|p| p.screen.application_cursor_keys)
+        .unwrap_or(false);
+
     (
         cells,
         cursor_x,
@@ -2225,6 +2266,7 @@ async fn build_composite(
         focused_pane_rect,
         hit_regions,
         pane_rects,
+        application_cursor_keys,
     )
 }
 

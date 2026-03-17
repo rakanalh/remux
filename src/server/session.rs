@@ -345,6 +345,30 @@ impl ServerState {
         Ok(())
     }
 
+    /// Delete a folder and all sessions it contains (cascade).
+    ///
+    /// Returns a list of `(session_name, pane_ids)` for each deleted session
+    /// so callers can clean up PTYs and notify clients.
+    pub fn delete_folder_cascade(&mut self, name: &str) -> Result<Vec<(String, Vec<PaneId>)>> {
+        let folder = self
+            .folders
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("folder '{}' not found", name))?;
+
+        let mut deleted_sessions = Vec::new();
+        for session_id in &folder.session_ids {
+            if let Some(session) = self.sessions.remove(session_id) {
+                let mut pane_ids = Vec::new();
+                for tab in &session.tabs {
+                    pane_ids.extend(layout::all_pane_ids(&tab.layout));
+                }
+                deleted_sessions.push((session_id.clone(), pane_ids));
+            }
+        }
+
+        Ok(deleted_sessions)
+    }
+
     /// List all folders with summary information.
     pub fn list_folders(&self) -> Vec<FolderInfo> {
         let mut infos: Vec<FolderInfo> = self

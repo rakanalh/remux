@@ -93,6 +93,8 @@ pub struct Screen {
     scp_cursor_y: u16,
     /// Whether renders are locked (Synchronized Update mode, CSI ? 2026 h/l).
     pub lock_renders: bool,
+    /// DECCKM: application cursor keys mode (CSI ? 1 h/l).
+    pub application_cursor_keys: bool,
 }
 
 impl Screen {
@@ -124,6 +126,7 @@ impl Screen {
             scp_cursor_x: 0,
             scp_cursor_y: 0,
             lock_renders: false,
+            application_cursor_keys: false,
         }
     }
 
@@ -646,6 +649,7 @@ impl vte::Perform for Screen {
                     for param_slice in params {
                         let mode = param_slice[0];
                         match mode {
+                            1 => self.application_cursor_keys = true,
                             25 => self.cursor_visible = true,
                             2026 => self.lock_renders = true,
                             1049 => {
@@ -691,6 +695,7 @@ impl vte::Perform for Screen {
                     for param_slice in params {
                         let mode = param_slice[0];
                         match mode {
+                            1 => self.application_cursor_keys = false,
                             25 => self.cursor_visible = false,
                             2026 => self.lock_renders = false,
                             1049 => {
