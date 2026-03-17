@@ -1,4 +1,10 @@
-# Remux
+<pre>
+ ____  _____ __  __ _   ___  __
+|  _ \| ____|  \/  | | | \ \/ /
+| |_) |  _| | |\/| | | | |\  /
+|  _ <| |___| |  | | |_| |/  \
+|_| \_\_____|_|  |_|\___//_/\_\
+</pre>
 
 A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, and a tree-view session manager.
 
@@ -9,7 +15,6 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Session persistence** -- sessions survive detach and server restarts. State auto-saves after structural changes and restores on startup.
 - **Folder organization** -- group sessions into named folders for better management.
 - **Modal input** -- Normal, Command, Visual, and Search modes. Keys pass through to the terminal in Normal mode; leader key enters Command mode.
-- **Which-key popup** -- after pressing the leader key, a popup shows available keybindings at each tree level (configurable timeout).
 - **Pane stacking** -- multiple panes can occupy the same screen position and cycle through like tabs within a split.
 - **Four layout algorithms** -- BSP, Master, Monocle, and Custom. Cycle with `Space` in Command mode.
 - **Two rendering styles** -- Zellij style (rounded box borders with pane names) and Tmux style (minimal dividers). Toggle with `g`.
@@ -20,7 +25,23 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Session manager** -- tree-view overlay for browsing, creating, deleting, and switching sessions/folders.
 - **Configurable theming** -- named colors, ANSI 256, and RGB. Per-mode status bar colors, frame colors, and more.
 - **Hot-reload config** -- file watcher reloads `~/.config/remux/config.toml` on save.
-- **Command palette** -- `:` in Command mode opens a searchable list of all commands.
+## Which-key
+
+After pressing the leader key, a popup shows available keybindings at each tree level. Timeout is configurable.
+
+![Which-key popup](docs/screenshots/whichkey.png)
+
+## Command Palette
+
+`:` in Command mode opens a searchable list of all available commands.
+
+![Command palette](docs/screenshots/command-pallet.png)
+
+## Session Manager
+
+Tree-view overlay for browsing, creating, deleting, and switching sessions and folders.
+
+![Session manager](docs/screenshots/session-manager.png)
 
 ## Layouts
 
@@ -28,43 +49,19 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 
 Recursively splits screen space, alternating horizontal and vertical. Each new pane takes 50% of the focused area. Produces a balanced, compact distribution. This is the default.
 
-```
-┌──────────┬──────────┐
-│          │          │
-│    1     ├────┬─────┤
-│          │  3 │  4  │
-├──────────┤    │     │
-│    2     ├────┴─────┤
-│          │    5     │
-└──────────┴──────────┘
-```
+![BSP layout](docs/screenshots/layout-bsp.png)
 
 ### Master
 
 One master pane occupies 50% of the screen. Secondary panes are divided evenly in the remaining space. Ideal for a primary editor with supporting terminals.
 
-```
-┌─────────────────┬────────┐
-│                 │   2    │
-│                 ├────────┤
-│     1 (master)  │   3    │
-│                 ├────────┤
-│                 │   4    │
-└─────────────────┴────────┘
-```
+![Master layout](docs/screenshots/layout-master.png)
 
 ### Monocle
 
 Full-screen single pane. Only the active pane is visible. Cycle through panes with stack next/prev.
 
-```
-┌──────────────────────────┐
-│                          │
-│        1 (active)        │
-│                          │
-│       [ 2 | 3 | 4 ]      │
-└──────────────────────────┘
-```
+![Monocle layout](docs/screenshots/layout-monocle.png)
 
 ### Custom
 
@@ -215,7 +212,14 @@ If the chain includes `EnterNormal`, you return to Normal mode after execution. 
 
 ## Configuration
 
-Place config at `~/.config/remux/config.toml`. See `config.sample.toml` for all options.
+Remux uses a TOML config file. To set it up:
+
+```bash
+mkdir -p ~/.config/remux
+cp config.sample.toml ~/.config/remux/config.toml
+```
+
+Edit `~/.config/remux/config.toml` to customize. Changes are picked up automatically via file watcher -- no restart needed.
 
 ```toml
 [general]
@@ -251,7 +255,7 @@ c = "TabClose; EnterNormal"
 
 ### Theming
 
-Colors accept named strings, ANSI 256 indices, or RGB tuples:
+Colors accept named strings, ANSI 256 indices, RGB tuples, or hex strings:
 
 ```toml
 [appearance.theme]
@@ -259,6 +263,7 @@ mode_normal_fg = "black"
 mode_normal_bg = "bright_green"
 frame_active_fg = { ansi = 2 }
 status_bar_bg = { rgb = [40, 40, 40] }
+session_name_fg = "#CBA6F7"
 ```
 
 ## CLI Usage
@@ -285,4 +290,4 @@ MIT -- see [LICENSE](LICENSE).
 
 ---
 
-This project was written by [Claude](https://claude.ai) (Anthropic) under the supervision of [Rakan Alhneiti](https://github.com/rakan). This is an AI-coded product. Issues and pull requests will not be actively monitored or reviewed.
+This project was written by [Claude](https://claude.ai) (Anthropic) with my specs and guidance. This is an AI-coded product. Issues and pull requests will not be actively monitored or reviewed.
