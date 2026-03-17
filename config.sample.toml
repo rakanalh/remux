@@ -156,7 +156,7 @@ l = "PaneFocusRight; EnterNormal"
 a = "PaneStackAdd"
 "]" = "PaneStackNext"
 "[" = "PaneStackPrev"
-r = "PaneRename"
+R = "PaneRename"
 
 # --- Search (s) ---
 [keybindings.command.s]
@@ -180,8 +180,8 @@ d = "FolderDelete"
 l = "FolderList"
 m = "FolderMoveSession"
 
-# --- Resize (r) ---
-[keybindings.command.r]
+# --- Resize (p → r) ---
+[keybindings.command.p.r]
 _label = "Resize"
 h = "ResizeLeft 5"
 j = "ResizeDown 5"

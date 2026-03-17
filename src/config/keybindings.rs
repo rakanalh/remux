@@ -126,7 +126,13 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     '[',
                     leaf_chain("stack prev", &["PaneStackPrev", "EnterNormal"]),
                 ),
-                ('r', leaf("rename", "PaneRename")),
+                ('r', group("Resize", vec![
+                    ('h', leaf("left", "ResizeLeft 5")),
+                    ('j', leaf("down", "ResizeDown 5")),
+                    ('k', leaf("up", "ResizeUp 5")),
+                    ('l', leaf("right", "ResizeRight 5")),
+                ])),
+                ('R', leaf("rename", "PaneRename")),
             ],
         ),
     );
@@ -167,20 +173,6 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('d', leaf("delete", "FolderDelete")),
                 ('l', leaf("list", "FolderList")),
                 ('m', leaf("move session", "FolderMoveSession")),
-            ],
-        ),
-    );
-
-    // r: Resize
-    root.insert(
-        'r',
-        group(
-            "Resize",
-            vec![
-                ('h', leaf("left", "ResizeLeft 5")),
-                ('j', leaf("down", "ResizeDown 5")),
-                ('k', leaf("up", "ResizeUp 5")),
-                ('l', leaf("right", "ResizeRight 5")),
             ],
         ),
     );
