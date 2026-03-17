@@ -102,6 +102,9 @@ impl Pty {
                     }
                 }
 
+                // Set TERM to match the escape sequences Remux generates.
+                std::env::set_var("TERM", "xterm-256color");
+
                 // Determine which shell/command to execute.
                 let shell = match command {
                     Some(cmd) => cmd.to_string(),

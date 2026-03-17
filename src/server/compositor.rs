@@ -1178,7 +1178,7 @@ mod tests {
         let status = StatusInfo {
             mode: "NORMAL".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1227,7 +1227,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "main".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1273,7 +1273,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1330,7 +1330,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1379,7 +1379,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1398,15 +1398,15 @@ mod tests {
             &CompositorTheme::default(),
         );
 
-        // Active pane (1) top-left corner should be green (Indexed(2)).
-        assert_eq!(result[0][0].fg, CellColor::Indexed(2));
+        // Active pane (1) top-left corner should be green (Catppuccin Mocha blue).
+        assert_eq!(result[0][0].fg, CellColor::Rgb(137, 180, 250));
 
         // Inactive pane (2) should have dark grey border.
         let pane_rects = layout::compute_layout(&layout, area, 0);
         let (_, r2) = pane_rects[1];
         assert_eq!(
             result[r2.y as usize][r2.x as usize].fg,
-            CellColor::Indexed(8)
+            CellColor::Rgb(88, 91, 112)
         );
     }
 
@@ -1430,7 +1430,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1477,7 +1477,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1521,7 +1521,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1563,7 +1563,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1611,7 +1611,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1658,7 +1658,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1715,7 +1715,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1770,7 +1770,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -2074,7 +2074,7 @@ mod tests {
         let status = StatusInfo {
             mode: "NORMAL".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("tab-1".to_string(), true), ("tab-2".to_string(), false)],
+            tabs: vec![("Tab 1".to_string(), true), ("Tab 2".to_string(), false)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };

@@ -512,7 +512,7 @@ mod tests {
                     name: "proj".to_string(),
                     tabs: vec![TabTreeEntry {
                         id: 1,
-                        name: "tab-1".to_string(),
+                        name: "Tab 1".to_string(),
                         panes: vec![PaneTreeEntry {
                             id: 10,
                             name: "zsh".to_string(),

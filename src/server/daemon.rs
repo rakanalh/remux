@@ -604,7 +604,13 @@ async fn handle_command(
         RemuxCommand::TabNew => {
             let pane_id = {
                 let mut st = state.lock().await;
-                st.create_tab(&session_name, "shell", LayoutMode::default())?
+                let tab_count = st
+                    .sessions
+                    .get(&session_name)
+                    .map(|s| s.tabs.len())
+                    .unwrap_or(0);
+                let tab_name = format!("Tab {}", tab_count + 1);
+                st.create_tab(&session_name, &tab_name, LayoutMode::default())?
             };
             spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
