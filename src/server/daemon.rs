@@ -1062,7 +1062,15 @@ async fn handle_command(
                 pf.remove(&session);
             }
             send_full_render_to_client(
-                client_id, &session, cols, rows, state, panes, clients, config, prev_frames,
+                client_id,
+                &session,
+                cols,
+                rows,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
             )
             .await;
         }
@@ -1098,7 +1106,15 @@ async fn handle_command(
                 pf.remove(&session);
             }
             send_full_render_to_client(
-                client_id, &session, cols, rows, state, panes, clients, config, prev_frames,
+                client_id,
+                &session,
+                cols,
+                rows,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
             )
             .await;
         }
