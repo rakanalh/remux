@@ -3,7 +3,7 @@
 //! This module manages the bookkeeping for sessions, folders, and tabs.
 //! It is pure -- no PTY management, no I/O -- just state management.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -178,7 +178,9 @@ impl ServerState {
                 .folders
                 .get_mut(folder_name)
                 .expect("folder was just created or already exists");
-            f.session_ids.push(name.to_string());
+            if !f.session_ids.contains(&name.to_string()) {
+                f.session_ids.push(name.to_string());
+            }
             Some(folder_name.to_string())
         } else {
             None
@@ -527,7 +529,11 @@ impl ServerState {
         let mut folders = Vec::new();
         for folder in self.folders.values() {
             let mut sessions = Vec::new();
+            let mut seen = HashSet::new();
             for session_id in &folder.session_ids {
+                if !seen.insert(session_id.clone()) {
+                    continue; // skip duplicates
+                }
                 if let Some(session) = self.sessions.get(session_id) {
                     sessions.push(build_entry(session));
                 }
@@ -588,7 +594,9 @@ impl ServerState {
                     .folders
                     .get_mut(folder_name)
                     .expect("folder was just created or already exists");
-                folder.session_ids.push(session_name.to_string());
+                if !folder.session_ids.contains(&session_name.to_string()) {
+                    folder.session_ids.push(session_name.to_string());
+                }
 
                 // Re-borrow session mutably.
                 let sess = self.sessions.get_mut(session_name).expect("session exists");

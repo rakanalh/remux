@@ -478,6 +478,13 @@ async fn handle_attach(
     // Resize panes to match the attaching client's terminal dimensions.
     resize_session_panes(session_name, cols, rows, state, panes, config).await?;
 
+    // Clear prev frame cache so the first render after attach is always a
+    // full render (not a diff against stale content from a previous attach).
+    {
+        let mut pf = prev_frames.lock().await;
+        pf.remove(session_name);
+    }
+
     send_full_render_to_client(
         client_id,
         session_name,
@@ -562,6 +569,10 @@ async fn handle_resize(
 
     if let Some(session_name) = session_name {
         resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+        {
+            let mut pf = prev_frames.lock().await;
+            pf.remove(&session_name);
+        }
         broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
     }
     Ok(())
@@ -1044,7 +1055,16 @@ async fn handle_command(
             }
             start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session, cols, rows, state, panes, config).await?;
-            broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
+            // Clear prev frame cache to force a full render (not a diff against
+            // stale content from a previous session).
+            {
+                let mut pf = prev_frames.lock().await;
+                pf.remove(&session);
+            }
+            send_full_render_to_client(
+                client_id, &session, cols, rows, state, panes, clients, config, prev_frames,
+            )
+            .await;
         }
         RemuxCommand::SessionSwitchPane {
             session,
@@ -1072,7 +1092,15 @@ async fn handle_command(
             }
             start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session, cols, rows, state, panes, config).await?;
-            broadcast_full_render(&session, state, panes, clients, config, prev_frames).await;
+            // Clear prev frame cache to force a full render.
+            {
+                let mut pf = prev_frames.lock().await;
+                pf.remove(&session);
+            }
+            send_full_render_to_client(
+                client_id, &session, cols, rows, state, panes, clients, config, prev_frames,
+            )
+            .await;
         }
         RemuxCommand::TabCloseByIndex {
             session: target_session,
@@ -1116,6 +1144,47 @@ async fn handle_command(
                     log::error!("TabCloseByIndex: {e}");
                 }
             }
+        }
+        RemuxCommand::FolderNew(name) => {
+            let mut st = state.lock().await;
+            st.create_folder(&name)?;
+        }
+        RemuxCommand::FolderDelete(name) => {
+            let mut st = state.lock().await;
+            st.delete_folder(&name)?;
+        }
+        RemuxCommand::FolderMoveSession { session, folder } => {
+            let mut st = state.lock().await;
+            st.move_session(&session, folder.as_deref())?;
+        }
+        RemuxCommand::FolderList => {
+            // Handled via SessionList or ListSessionTree.
+        }
+        RemuxCommand::SessionNew { name, folder } => {
+            handle_create_session(
+                client_id,
+                &name,
+                folder.as_deref(),
+                state,
+                panes,
+                clients,
+                config,
+            )
+            .await?;
+        }
+        RemuxCommand::TabMove(idx) => {
+            let mut st = state.lock().await;
+            if let Some(sess) = st.sessions.get_mut(&session_name) {
+                let target = idx.saturating_sub(1).min(sess.tabs.len().saturating_sub(1));
+                let current = sess.active_tab;
+                if current != target && current < sess.tabs.len() {
+                    let tab = sess.tabs.remove(current);
+                    sess.tabs.insert(target, tab);
+                    sess.active_tab = target;
+                }
+            }
+            drop(st);
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         _ => {
             log::debug!("unhandled command: {cmd:?}");
@@ -2322,11 +2391,25 @@ async fn start_pty_forwarding(
                 };
 
                 match recv_result {
-                    Some(Ok(data)) => {
+                    Some(Ok(first_chunk)) => {
+                        // Drain all available data from the channel before
+                        // processing, so rapid output is batched.
+                        let mut chunks = vec![first_chunk];
+                        {
+                            let mut ps = panes.lock().await;
+                            if let Some(pane_data) = ps.get_mut(&pane_id) {
+                                while let Ok(more) = pane_data.pty_rx.try_recv() {
+                                    chunks.push(more);
+                                }
+                            }
+                        }
+
                         let responses = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
-                                pane_data.screen.process_output(&data);
+                                for chunk in &chunks {
+                                    pane_data.screen.process_output(chunk);
+                                }
                                 pane_data.screen.take_responses()
                             } else {
                                 Vec::new()

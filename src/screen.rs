@@ -28,6 +28,7 @@ pub struct CellAttrs {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub reverse: bool,
     pub fg: Color,
     pub bg: Color,
 }
@@ -80,13 +81,18 @@ pub struct Screen {
     saved_scroll_top: u16,
     saved_scroll_bottom: u16,
     /// Whether we are currently on the alternate screen.
-    alt_screen_active: bool,
+    pub alt_screen_active: bool,
     /// Whether the cursor is visible.
     pub cursor_visible: bool,
     /// Cursor style set by the application (DECSCUSR). 0 = default.
     pub cursor_style: u8,
     /// Responses to be written back to the PTY (e.g., DSR cursor position replies).
     pub pty_responses: Vec<Vec<u8>>,
+    /// Saved cursor position for CSI s/u (separate from alt screen save).
+    scp_cursor_x: u16,
+    scp_cursor_y: u16,
+    /// Whether renders are locked (Synchronized Update mode, CSI ? 2026 h/l).
+    pub lock_renders: bool,
 }
 
 impl Screen {
@@ -115,6 +121,9 @@ impl Screen {
             cursor_visible: true,
             cursor_style: 0,
             pty_responses: Vec::new(),
+            scp_cursor_x: 0,
+            scp_cursor_y: 0,
+            lock_renders: false,
         }
     }
 
@@ -271,9 +280,11 @@ impl Screen {
                 1 => self.current_attrs.bold = true,
                 3 => self.current_attrs.italic = true,
                 4 => self.current_attrs.underline = true,
+                7 => self.current_attrs.reverse = true,
                 22 => self.current_attrs.bold = false,
                 23 => self.current_attrs.italic = false,
                 24 => self.current_attrs.underline = false,
+                27 => self.current_attrs.reverse = false,
 
                 // Standard foreground colors 30-37
                 30..=37 => {
@@ -430,6 +441,21 @@ impl vte::Perform for Screen {
             'D' => {
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_x = self.cursor_x.saturating_sub(n);
+            }
+            // CNL - Cursor Next Line (move down n lines, column 1)
+            'E' => {
+                let n = Self::csi_param(params, 0, 1);
+                self.cursor_y = std::cmp::min(self.cursor_y + n, self.scroll_bottom);
+                self.cursor_x = 0;
+            }
+            // CPL - Cursor Previous Line (move up n lines, column 1)
+            'F' => {
+                let n = Self::csi_param(params, 0, 1);
+                self.cursor_y = self.cursor_y.saturating_sub(n);
+                if self.cursor_y < self.scroll_top {
+                    self.cursor_y = self.scroll_top;
+                }
+                self.cursor_x = 0;
             }
             // CUP - Cursor Position (row;col, 1-based)
             'H' | 'f' => {
@@ -599,6 +625,16 @@ impl vte::Perform for Screen {
                 self.cursor_x = 0;
                 self.cursor_y = 0;
             }
+            // SCP - Save Cursor Position (CSI s, no intermediates)
+            's' if _intermediates.is_empty() => {
+                self.scp_cursor_x = self.cursor_x;
+                self.scp_cursor_y = self.cursor_y;
+            }
+            // RCP - Restore Cursor Position (CSI u, no intermediates)
+            'u' if _intermediates.is_empty() => {
+                self.cursor_x = self.scp_cursor_x;
+                self.cursor_y = self.scp_cursor_y;
+            }
             // SGR - Select Graphic Rendition
             'm' => {
                 self.handle_sgr(params);
@@ -611,6 +647,7 @@ impl vte::Perform for Screen {
                         let mode = param_slice[0];
                         match mode {
                             25 => self.cursor_visible = true,
+                            2026 => self.lock_renders = true,
                             1049 => {
                                 // Save cursor and switch to alternate screen
                                 if !self.alt_screen_active {
@@ -655,6 +692,7 @@ impl vte::Perform for Screen {
                         let mode = param_slice[0];
                         match mode {
                             25 => self.cursor_visible = false,
+                            2026 => self.lock_renders = false,
                             1049 => {
                                 // Restore primary screen and cursor
                                 if self.alt_screen_active {
@@ -731,6 +769,16 @@ impl vte::Perform for Screen {
                 } else {
                     self.cursor_y += 1;
                 }
+            }
+            // DECSC - Save Cursor Position
+            b'7' => {
+                self.scp_cursor_x = self.cursor_x;
+                self.scp_cursor_y = self.cursor_y;
+            }
+            // DECRC - Restore Cursor Position
+            b'8' => {
+                self.cursor_x = self.scp_cursor_x;
+                self.cursor_y = self.scp_cursor_y;
             }
             // RI - Reverse Index (move cursor up, scroll if at top)
             b'M' => {

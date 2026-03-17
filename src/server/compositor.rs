@@ -136,10 +136,30 @@ fn convert_color(color: &Color) -> CellColor {
 
 /// Convert a screen `Cell` to a protocol `RenderCell`.
 fn cell_to_render_cell(cell: &Cell) -> RenderCell {
+    let (fg, bg) = if cell.attrs.reverse {
+        // Swap fg and bg. When both are Default, use explicit colors
+        // so the inversion is visible (Default fg=light, Default bg=dark).
+        let mut fg = convert_color(&cell.attrs.bg);
+        let mut bg = convert_color(&cell.attrs.fg);
+        if fg == CellColor::Default && bg == CellColor::Default {
+            fg = CellColor::Indexed(0); // black foreground
+            bg = CellColor::Indexed(7); // white background
+        } else {
+            if fg == CellColor::Default {
+                fg = CellColor::Indexed(0); // dark on default bg
+            }
+            if bg == CellColor::Default {
+                bg = CellColor::Indexed(7); // light on default fg
+            }
+        }
+        (fg, bg)
+    } else {
+        (convert_color(&cell.attrs.fg), convert_color(&cell.attrs.bg))
+    };
     RenderCell {
         c: cell.c,
-        fg: convert_color(&cell.attrs.fg),
-        bg: convert_color(&cell.attrs.bg),
+        fg,
+        bg,
         bold: cell.attrs.bold,
         italic: cell.attrs.italic,
         underline: cell.attrs.underline,
