@@ -126,12 +126,18 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     '[',
                     leaf_chain("stack prev", &["PaneStackPrev", "EnterNormal"]),
                 ),
-                ('r', group("Resize", vec![
-                    ('h', leaf("left", "ResizeLeft 5")),
-                    ('j', leaf("down", "ResizeDown 5")),
-                    ('k', leaf("up", "ResizeUp 5")),
-                    ('l', leaf("right", "ResizeRight 5")),
-                ])),
+                (
+                    'r',
+                    group(
+                        "Resize",
+                        vec![
+                            ('h', leaf("left", "ResizeLeft 5")),
+                            ('j', leaf("down", "ResizeDown 5")),
+                            ('k', leaf("up", "ResizeUp 5")),
+                            ('l', leaf("right", "ResizeRight 5")),
+                        ],
+                    ),
+                ),
                 ('R', leaf("rename", "PaneRename")),
             ],
         ),
@@ -1108,7 +1114,6 @@ mod tests {
         assert!(tree.root.contains_key(&'s')); // Search group
         assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
         assert!(tree.root.contains_key(&'f'));
-        assert!(tree.root.contains_key(&'r'));
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
         // 'b' (Buffer group) was removed in the search-mode refactor.
@@ -1201,13 +1206,13 @@ mod tests {
     #[test]
     fn pane_group_has_rename_leaf() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['p', 'r']).unwrap();
+        let node = tree.lookup(&['p', 'R']).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
                 assert_eq!(action, &vec!["PaneRename".to_string()]);
                 assert_eq!(label, "rename");
             }
-            other => panic!("expected leaf for 'p' -> 'r', got {other:?}"),
+            other => panic!("expected leaf for 'p' -> 'R', got {other:?}"),
         }
     }
 

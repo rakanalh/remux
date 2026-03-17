@@ -206,10 +206,7 @@ impl Renderer {
         self.front = vec![vec![RenderCell::default(); cols as usize]; rows as usize];
         // Clear the terminal to avoid stale content from old layout.
         let mut stdout = io::stdout().lock();
-        let _ = crossterm::execute!(
-            stdout,
-            terminal::Clear(terminal::ClearType::All)
-        );
+        let _ = crossterm::execute!(stdout, terminal::Clear(terminal::ClearType::All));
     }
 
     /// Get the current terminal size.
