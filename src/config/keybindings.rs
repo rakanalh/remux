@@ -202,6 +202,12 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     // Command palette.
     root.insert(':', leaf("command palette", "CommandPaletteOpen"));
 
+    // Send the prefix key (Ctrl-a) to the terminal.
+    root.insert(
+        'a',
+        leaf_chain("send prefix", &["SendKey Ctrl-a", "EnterNormal"]),
+    );
+
     root
 }
 

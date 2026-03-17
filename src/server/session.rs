@@ -188,7 +188,7 @@ impl ServerState {
 
         let tab = Tab {
             id: tab_id,
-            name: format!("tab-{}", tab_id),
+            name: "Tab 1".to_string(),
             layout: LayoutNode::new_stack(pane_id),
             focused_pane: pane_id,
             layout_mode,

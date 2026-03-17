@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use crossterm::style::Color;
+use unicode_width::UnicodeWidthStr;
 
 use crate::client::whichkey::DrawCommand;
 use crate::config::theme::Theme;
@@ -132,6 +132,36 @@ pub struct SessionManagerState {
     /// Raw tree data from the server.
     folders: Vec<FolderTreeEntry>,
     unfiled: Vec<SessionTreeEntry>,
+}
+
+/// Pad or truncate a string to exactly `target_width` display columns,
+/// using `unicode-width` to account for ambiguous/wide characters.
+fn pad_to_display_width(text: &str, target_width: usize) -> String {
+    let display_w = UnicodeWidthStr::width(text);
+    if display_w >= target_width {
+        // Truncate: take chars until we reach target_width display columns.
+        let mut result = String::new();
+        let mut w = 0;
+        for c in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > target_width {
+                break;
+            }
+            result.push(c);
+            w += cw;
+        }
+        // Pad remaining if truncation left us short (due to a wide char).
+        while w < target_width {
+            result.push(' ');
+            w += 1;
+        }
+        result
+    } else {
+        let mut s = text.to_string();
+        let padding = target_width - display_w;
+        s.extend(std::iter::repeat_n(' ', padding));
+        s
+    }
 }
 
 impl SessionManagerState {
@@ -466,12 +496,12 @@ impl SessionManagerState {
     // -----------------------------------------------------------------------
 
     /// Render the session manager overlay as a list of draw commands.
-    pub fn render(&self, screen_cols: u16, screen_rows: u16, _theme: &Theme) -> Vec<DrawCommand> {
+    pub fn render(&self, screen_cols: u16, screen_rows: u16, theme: &Theme) -> Vec<DrawCommand> {
         let mut commands = Vec::new();
 
-        // Popup dimensions: take up ~80% of the screen, min 40x12.
-        let popup_width = (screen_cols * 4 / 5).max(40).min(screen_cols);
-        let popup_height = (screen_rows * 4 / 5).max(12).min(screen_rows);
+        // Popup dimensions: 50% of the screen, min 40x12.
+        let popup_width = (screen_cols / 2).max(40).min(screen_cols);
+        let popup_height = (screen_rows / 2).max(12).min(screen_rows);
 
         if popup_width < 20 || popup_height < 6 {
             return commands;
@@ -480,14 +510,25 @@ impl SessionManagerState {
         let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
         let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
 
-        let fg = Color::AnsiValue(252);
-        let bg = Color::AnsiValue(235);
-        let sel_fg = Color::AnsiValue(235);
-        let sel_bg = Color::AnsiValue(252);
-        let current_fg = Color::AnsiValue(10);
-        let border_fg = Color::AnsiValue(244);
+        let fg = theme.whichkey_fg;
+        let bg = theme.whichkey_bg;
+        let sel_fg = theme.whichkey_bg;
+        let sel_bg = theme.whichkey_fg;
+        let current_fg = theme.whichkey_key_fg;
+        let border_fg = theme.separator_fg;
 
         let inner_width = (popup_width - 2) as usize;
+
+        // Fill the entire popup area with background to prevent bleed-through.
+        for row in 0..popup_height {
+            commands.push(DrawCommand {
+                x: start_x,
+                y: start_y + row,
+                text: " ".repeat(popup_width as usize),
+                fg,
+                bg,
+            });
+        }
 
         // Top border with title.
         let title = " Session Manager ";
@@ -495,7 +536,7 @@ impl SessionManagerState {
         let left_border = border_len / 2;
         let right_border = border_len - left_border;
         let top_line = format!(
-            "\u{256D}{}\u{2500}{}{}\u{256E}",
+            "\u{256D}{}{}{}\u{256E}",
             "\u{2500}".repeat(left_border),
             title,
             "\u{2500}".repeat(right_border),
@@ -541,9 +582,7 @@ impl SessionManagerState {
                     "{}{}{}{}",
                     indent, expand_marker, current_marker, row.display_name
                 );
-                let padded = format!("\u{2502}{:<width$}\u{2502}", text, width = inner_width);
-                // Truncate if needed.
-                let display: String = padded.chars().take(popup_width as usize).collect();
+                let content = pad_to_display_width(&text, inner_width);
 
                 let (row_fg, row_bg) = if is_selected {
                     (sel_fg, sel_bg)
@@ -553,21 +592,53 @@ impl SessionManagerState {
                     (fg, bg)
                 };
 
+                // Left border (always border color).
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: display,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
+                // Content (selection/current/normal color).
+                commands.push(DrawCommand {
+                    x: start_x + 1,
+                    y,
+                    text: content,
                     fg: row_fg,
                     bg: row_bg,
                 });
+                // Right border (always border color).
+                commands.push(DrawCommand {
+                    x: start_x + 1 + inner_width as u16,
+                    y,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
             } else {
-                // Empty row.
-                let empty_line = format!("\u{2502}{}\u{2502}", " ".repeat(inner_width));
+                // Left border
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: empty_line,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
+                // Empty content
+                commands.push(DrawCommand {
+                    x: start_x + 1,
+                    y,
+                    text: " ".repeat(inner_width),
                     fg,
+                    bg,
+                });
+                // Right border
+                commands.push(DrawCommand {
+                    x: start_x + 1 + inner_width as u16,
+                    y,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
                     bg,
                 });
             }
@@ -601,34 +672,62 @@ impl SessionManagerState {
 
         // Separator line.
         let sep_y = start_y + 1 + content_height as u16;
-        let sep_line = if !prompt_line.is_empty() {
-            let padded = format!(
-                "\u{251C}{:<width$}\u{2524}",
-                prompt_line,
-                width = inner_width
-            );
-            padded.chars().take(popup_width as usize).collect()
+        if !prompt_line.is_empty() {
+            let prompt_content = pad_to_display_width(&prompt_line, inner_width);
+            commands.push(DrawCommand {
+                x: start_x,
+                y: sep_y,
+                text: "\u{251C}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y: sep_y,
+                text: prompt_content,
+                fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y: sep_y,
+                text: "\u{2524}".to_string(),
+                fg: border_fg,
+                bg,
+            });
         } else {
-            format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width))
-        };
-        commands.push(DrawCommand {
-            x: start_x,
-            y: sep_y,
-            text: sep_line,
-            fg: border_fg,
-            bg,
-        });
+            commands.push(DrawCommand {
+                x: start_x,
+                y: sep_y,
+                text: format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width)),
+                fg: border_fg,
+                bg,
+            });
+        }
 
         // Help line.
         let help_y = sep_y + 1;
         let help_text = " j/k:nav  Enter:select  d:delete  c:folder  n:session  m:move  q:quit ";
-        let help_padded = format!("\u{2502}{:<width$}\u{2502}", help_text, width = inner_width);
-        let help_display: String = help_padded.chars().take(popup_width as usize).collect();
+        let help_content = pad_to_display_width(help_text, inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_y,
-            text: help_display,
-            fg: Color::AnsiValue(244),
+            text: "\u{2502}".to_string(),
+            fg: border_fg,
+            bg,
+        });
+        commands.push(DrawCommand {
+            x: start_x + 1,
+            y: help_y,
+            text: help_content,
+            fg: theme.separator_fg,
+            bg,
+        });
+        commands.push(DrawCommand {
+            x: start_x + 1 + inner_width as u16,
+            y: help_y,
+            text: "\u{2502}".to_string(),
+            fg: border_fg,
             bg,
         });
 
@@ -663,7 +762,7 @@ mod tests {
                 name: "project-a".to_string(),
                 tabs: vec![TabTreeEntry {
                     id: 1,
-                    name: "tab-1".to_string(),
+                    name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
                         id: 10,
                         name: "zsh".to_string(),
@@ -678,7 +777,7 @@ mod tests {
             name: "scratch".to_string(),
             tabs: vec![TabTreeEntry {
                 id: 2,
-                name: "tab-1".to_string(),
+                name: "Tab 1".to_string(),
                 panes: vec![],
             }],
             client_count: 0,

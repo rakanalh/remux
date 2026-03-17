@@ -980,6 +980,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled }) => {
+                        if folders.is_empty() && unfiled.is_empty() {
+                            input.session_manager = None;
+                            input.mode = Mode::Normal;
+                            break;
+                        }
                         if let Some(ref mut sm) = input.session_manager {
                             sm.update_tree(folders, unfiled);
                             let (c, r) = crossterm::terminal::size()?;
