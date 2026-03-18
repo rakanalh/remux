@@ -390,6 +390,14 @@ pub enum InputAction {
     },
     /// Folder selection cancelled.
     FolderSelectClose,
+    /// Open the session quick-switch overlay.
+    SessionSwitchOpen,
+    /// Session quick-switch overlay updated (re-render needed).
+    SessionSwitchUpdate,
+    /// Session quick-switch confirmed - switch to the named session.
+    SessionSwitchConfirm(String),
+    /// Session quick-switch cancelled.
+    SessionSwitchClose,
     /// No action to take.
     None,
 }
@@ -476,6 +484,8 @@ pub struct InputHandler {
     pub application_cursor_keys: bool,
     /// State for the folder selection overlay.
     pub folder_select: Option<FolderSelectOverlay>,
+    /// State for the session quick-switch overlay.
+    pub session_switch: Option<SessionSwitchOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
 }
@@ -664,6 +674,125 @@ impl FolderSelectOverlay {
     }
 }
 
+/// Session quick-switch overlay for rapidly switching between sessions.
+#[derive(Debug, Clone)]
+pub struct SessionSwitchOverlay {
+    /// Available session names.
+    pub sessions: Vec<String>,
+    /// Currently highlighted session index.
+    pub selected: usize,
+}
+
+impl SessionSwitchOverlay {
+    /// Render the session switch popup as draw commands.
+    pub fn render(
+        &self,
+        screen_cols: u16,
+        screen_rows: u16,
+        theme: &crate::config::theme::Theme,
+    ) -> Vec<crate::client::whichkey::DrawCommand> {
+        use crate::client::whichkey::DrawCommand;
+        let mut commands = Vec::new();
+
+        let popup_width = 40u16.min(screen_cols);
+        let popup_height = (self.sessions.len() as u16 + 2).min(screen_rows);
+        let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
+        let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
+
+        let fg = theme.whichkey_fg;
+        let bg = theme.whichkey_bg;
+        let sel_fg = theme.whichkey_bg;
+        let sel_bg = theme.whichkey_fg;
+        let border_fg = theme.separator_fg;
+        let inner_width = (popup_width - 2) as usize;
+
+        // Fill background
+        for row in 0..popup_height {
+            commands.push(DrawCommand {
+                x: start_x,
+                y: start_y + row,
+                text: " ".repeat(popup_width as usize),
+                fg,
+                bg,
+            });
+        }
+
+        // Top border with title
+        let title = " Switch Session ";
+        let border_len = inner_width.saturating_sub(title.len());
+        let left_b = border_len / 2;
+        let right_b = border_len - left_b;
+        commands.push(DrawCommand {
+            x: start_x,
+            y: start_y,
+            text: format!(
+                "\u{256D}{}{}{}\u{256E}",
+                "\u{2500}".repeat(left_b),
+                title,
+                "\u{2500}".repeat(right_b)
+            ),
+            fg: border_fg,
+            bg,
+        });
+
+        // Session list
+        for (i, session) in self.sessions.iter().enumerate() {
+            let y = start_y + 1 + i as u16;
+            if y >= start_y + popup_height - 1 {
+                break;
+            }
+            let is_selected = i == self.selected;
+            let text = format!("  {}", session);
+            let padded = if text.len() >= inner_width {
+                text[..inner_width].to_string()
+            } else {
+                format!("{}{}", text, " ".repeat(inner_width - text.len()))
+            };
+
+            let (row_fg, row_bg) = if is_selected {
+                (sel_fg, sel_bg)
+            } else {
+                (fg, bg)
+            };
+
+            commands.push(DrawCommand {
+                x: start_x,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y,
+                text: padded,
+                fg: row_fg,
+                bg: row_bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+        }
+
+        // Bottom border
+        let help_line_y = start_y + popup_height - 1;
+        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        commands.push(DrawCommand {
+            x: start_x,
+            y: help_line_y,
+            text: bottom_line,
+            fg: border_fg,
+            bg,
+        });
+
+        commands
+    }
+}
+
 impl InputHandler {
     /// Create a new `InputHandler` with the given keybinding tree, leader key,
     /// and modifier shortcut bindings.
@@ -686,6 +815,7 @@ impl InputHandler {
             session_manager: None,
             application_cursor_keys: false,
             folder_select: None,
+            session_switch: None,
             pending_editor_open: false,
         }
     }
@@ -709,6 +839,11 @@ impl InputHandler {
 
     /// Process a key event and return the appropriate action.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        // If the session switch overlay is active, capture keystrokes for it.
+        if self.session_switch.is_some() {
+            return self.handle_session_switch_key(key);
+        }
+
         // If the folder select overlay is active, capture keystrokes for it.
         if self.folder_select.is_some() {
             return self.handle_folder_select_key(key);
@@ -808,6 +943,15 @@ impl InputHandler {
                 None,
             ));
             return InputAction::SessionManagerOpen;
+        }
+
+        if actions.len() == 1 && actions[0] == "SessionQuickSwitch" {
+            self.mode = Mode::Command;
+            self.session_switch = Some(SessionSwitchOverlay {
+                sessions: vec!["Loading...".to_string()],
+                selected: 0,
+            });
+            return InputAction::SessionSwitchOpen;
         }
 
         let mut commands: Vec<RemuxCommand> = Vec::new();
@@ -918,6 +1062,15 @@ impl InputHandler {
                 self.mode = Mode::CommandPalette;
                 self.command_palette = Some(CommandPaletteState::new());
                 return InputAction::CommandPaletteOpen;
+            }
+
+            if action_str == "SessionQuickSwitch" {
+                self.mode = Mode::Command;
+                self.session_switch = Some(SessionSwitchOverlay {
+                    sessions: vec!["Loading...".to_string()],
+                    selected: 0,
+                });
+                return InputAction::SessionSwitchOpen;
             }
 
             match parse_command(action_str) {
@@ -1642,6 +1795,60 @@ impl InputHandler {
             selected: 0,
             session_name,
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Session switch overlay
+    // -----------------------------------------------------------------------
+
+    fn handle_session_switch_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.session_switch.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.session_switch = None;
+                self.mode = Mode::Normal;
+                InputAction::SessionSwitchClose
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !overlay.sessions.is_empty() {
+                    overlay.selected = (overlay.selected + 1) % overlay.sessions.len();
+                }
+                InputAction::SessionSwitchUpdate
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !overlay.sessions.is_empty() {
+                    if overlay.selected == 0 {
+                        overlay.selected = overlay.sessions.len() - 1;
+                    } else {
+                        overlay.selected -= 1;
+                    }
+                }
+                InputAction::SessionSwitchUpdate
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                let selected_name = overlay.sessions.get(overlay.selected).cloned();
+                self.session_switch = None;
+                self.mode = Mode::Normal;
+                if let Some(name) = selected_name {
+                    InputAction::SessionSwitchConfirm(name)
+                } else {
+                    InputAction::SessionSwitchClose
+                }
+            }
+            _ => InputAction::None,
+        }
+    }
+
+    /// Update the session switch overlay with available session names.
+    pub fn update_session_switch_list(&mut self, sessions: Vec<String>) {
+        if let Some(ref mut ss) = self.session_switch {
+            ss.sessions = sessions;
+            ss.selected = 0;
+        }
     }
 
     // -----------------------------------------------------------------------
