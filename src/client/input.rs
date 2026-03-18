@@ -1390,11 +1390,13 @@ impl InputHandler {
                         InputAction::SearchCancel
                     }
                     KeyCode::Char('n') => {
-                        search.next_match();
+                        // Navigate upward (earlier in scrollback)
+                        search.prev_match();
                         InputAction::SearchNavigate
                     }
                     KeyCode::Char('N') => {
-                        search.prev_match();
+                        // Navigate downward (later in scrollback)
+                        search.next_match();
                         InputAction::SearchNavigate
                     }
                     _ => InputAction::None,
