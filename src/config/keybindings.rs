@@ -164,8 +164,9 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('n', leaf("new", "SessionNew")),
                 ('d', leaf("detach", "SessionDetach")),
                 ('r', leaf("rename", "SessionRename")),
-                ('l', leaf("list", "OpenSessionManager")),
-                ('m', leaf("move to folder", "SessionMoveToFolder")),
+                ('m', leaf("manager", "OpenSessionManager")),
+                ('x', leaf("switch", "SessionQuickSwitch")),
+                ('f', leaf("move to folder", "SessionMoveToFolder")),
             ],
         ),
     );

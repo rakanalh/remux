@@ -16,7 +16,9 @@ use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
 use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
-use crate::client::input::{FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget};
+use crate::client::input::{
+    FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget, SessionSwitchOverlay,
+};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
@@ -864,6 +866,42 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.clear_overlay(c, r)?;
                                 client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
+                            InputAction::SessionSwitchOpen => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                client.send(ClientMessage::ListSessionTree).await?;
+                                input.mode = Mode::Command;
+                                input.session_switch = Some(SessionSwitchOverlay {
+                                    sessions: vec!["Loading...".to_string()],
+                                    selected: 0,
+                                });
+                                client.send(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                            }
+                            InputAction::SessionSwitchUpdate => {
+                                if let Some(ref ss) = input.session_switch {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = ss.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                }
+                            }
+                            InputAction::SessionSwitchConfirm(ref session_name) => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                client.send(ClientMessage::Attach { session_name: session_name.clone() }).await?;
+                                input.session_switch = None;
+                                input.mode = Mode::Normal;
+                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
+                            InputAction::SessionSwitchClose => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                input.session_switch = None;
+                                input.mode = Mode::Normal;
+                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
                             InputAction::NewSession(ref name) => {
                                 // Create the session and then attach to it.
                                 client.send(ClientMessage::CreateSession {
@@ -1018,6 +1056,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             )?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
                         }
+                        // Re-render session switch overlay on top if active
+                        else if let Some(ref ss) = input.session_switch {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = ss.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                        }
                         // Re-render folder select overlay on top if active
                         else if let Some(ref fs) = input.folder_select {
                             let (c, r) = crossterm::terminal::size()?;
@@ -1078,6 +1122,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 &theme,
                             )?;
                             renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                        }
+                        // Re-render session switch overlay on top if active
+                        else if let Some(ref ss) = input.session_switch {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = ss.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
                         }
                         // Re-render folder select overlay on top if active
                         else if let Some(ref fs) = input.folder_select {
@@ -1155,8 +1205,32 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled }) => {
+                        // If session switch overlay is active, populate it
+                        if input.session_switch.is_some() {
+                            let mut session_names: Vec<String> = Vec::new();
+                            for f in &folders {
+                                for s in &f.sessions {
+                                    if !s.is_current {
+                                        session_names.push(s.name.clone());
+                                    }
+                                }
+                            }
+                            for s in &unfiled {
+                                if !s.is_current {
+                                    session_names.push(s.name.clone());
+                                }
+                            }
+                            input.update_session_switch_list(session_names);
+                            // Render the popup
+                            if let Some(ref ss) = input.session_switch {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                let draw_cmds = ss.render(c, r, &theme);
+                                renderer.render_whichkey_overlay(&draw_cmds)?;
+                            }
+                        }
                         // If folder select overlay is active, populate it
-                        if input.folder_select.is_some() {
+                        else if input.folder_select.is_some() {
                             let folder_names: Vec<String> = folders.iter().map(|f| f.name.clone()).collect();
                             // Find current session name and folder from the tree
                             let mut current_session_name = String::new();
