@@ -25,6 +25,7 @@ use crate::server::compositor::{
     composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
 };
 use crate::server::layout::{self, CustomLayout, LayoutMode, PaneId, Rect};
+use crate::server::persistence;
 use crate::server::pty::{self, Pty};
 use crate::server::session::ServerState;
 
@@ -689,7 +690,7 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneSplitVertical => {
-            let new_pane_id = {
+            let (new_pane_id, focused_pane_id) = {
                 let mut st = state.lock().await;
                 let new_pane_id = st.next_pane_id();
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -708,15 +709,30 @@ async fn handle_command(
                 tab.layout.split_vertical(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
                 tab.pane_order.push(new_pane_id);
-                new_pane_id
+                (new_pane_id, focused)
             };
-            spawn_pane(new_pane_id, cols / 2, rows, None, None, panes, config).await?;
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                panes_lock
+                    .get(&focused_pane_id)
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+            };
+            spawn_pane(
+                new_pane_id,
+                cols / 2,
+                rows,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneSplitHorizontal => {
-            let new_pane_id = {
+            let (new_pane_id, focused_pane_id) = {
                 let mut st = state.lock().await;
                 let new_pane_id = st.next_pane_id();
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -735,9 +751,24 @@ async fn handle_command(
                 tab.layout.split_horizontal(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
                 tab.pane_order.push(new_pane_id);
-                new_pane_id
+                (new_pane_id, focused)
             };
-            spawn_pane(new_pane_id, cols, rows / 2, None, None, panes, config).await?;
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                panes_lock
+                    .get(&focused_pane_id)
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+            };
+            spawn_pane(
+                new_pane_id,
+                cols,
+                rows / 2,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -802,7 +833,7 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackAdd => {
-            let new_pane_id = {
+            let (new_pane_id, focused_pane_id) = {
                 let mut st = state.lock().await;
                 let new_pane_id = st.next_pane_id();
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -817,9 +848,24 @@ async fn handle_command(
                 tab.layout.add_to_stack(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
                 tab.pane_order.push(new_pane_id);
-                new_pane_id
+                (new_pane_id, focused)
             };
-            spawn_pane(new_pane_id, cols, rows, None, None, panes, config).await?;
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                panes_lock
+                    .get(&focused_pane_id)
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+            };
+            spawn_pane(
+                new_pane_id,
+                cols,
+                rows,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -969,7 +1015,7 @@ async fn handle_command(
             }
         }
         RemuxCommand::PaneNew => {
-            let new_pane_id = {
+            let (new_pane_id, focused_pane_id) = {
                 let mut st = state.lock().await;
                 let new_pane_id = st.next_pane_id();
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -980,6 +1026,7 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                let prev_focused = tab.focused_pane;
                 tab.pane_order.push(new_pane_id);
                 if tab.layout_mode.is_automatic() {
                     // Rebuild tree from layout mode
@@ -991,9 +1038,24 @@ async fn handle_command(
                     tab.layout.split_vertical(focused, new_pane_id);
                     tab.focused_pane = new_pane_id;
                 }
-                new_pane_id
+                (new_pane_id, prev_focused)
             };
-            spawn_pane(new_pane_id, cols, rows, None, None, panes, config).await?;
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                panes_lock
+                    .get(&focused_pane_id)
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+            };
+            spawn_pane(
+                new_pane_id,
+                cols,
+                rows,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
