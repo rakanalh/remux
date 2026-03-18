@@ -117,6 +117,8 @@ struct ClientConnection {
     mouse_selection: Option<MouseSelection>,
     /// Search match info: (current_match, total_matches).
     search_info: Option<(usize, usize)>,
+    /// Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
+    scroll_offset: usize,
 }
 
 /// The Remux server.
@@ -268,6 +270,7 @@ impl RemuxServer {
                     mode: "NORMAL".to_string(),
                     mouse_selection: None,
                     search_info: None,
+                    scroll_offset: 0,
                 },
             );
             id
@@ -439,6 +442,66 @@ async fn handle_client_message(
                 prev_frames,
             )
             .await
+        }
+        ClientMessage::ScrollOffset { offset } => {
+            {
+                let mut cls = clients.lock().await;
+                if let Some(client) = cls.get_mut(&client_id) {
+                    client.scroll_offset = offset;
+                }
+            }
+            // Get session name and dimensions for this client
+            let (session_name, cols, rows) = {
+                let cls = clients.lock().await;
+                let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
+                let cols = cls.get(&client_id).map(|c| c.cols).unwrap_or(80);
+                let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
+                (sn, cols, rows)
+            };
+            if let Some(session_name) = session_name {
+                send_full_render_to_client(
+                    client_id,
+                    &session_name,
+                    cols,
+                    rows,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                )
+                .await;
+            }
+            Ok(())
+        }
+        ClientMessage::RequestScrollbackInfo => {
+            let (session_name, focused_pane_id) = {
+                let cls = clients.lock().await;
+                let session_name = cls.get(&client_id).and_then(|c| c.session_name.clone());
+                if let Some(ref sn) = session_name {
+                    let st = state.lock().await;
+                    let fp = st
+                        .sessions
+                        .get(sn)
+                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane));
+                    (session_name, fp)
+                } else {
+                    (None, None)
+                }
+            };
+            if let (Some(_sn), Some(fp)) = (session_name, focused_pane_id) {
+                let total_lines = {
+                    let ps = panes.lock().await;
+                    ps.get(&fp).map(|p| p.screen.total_lines()).unwrap_or(0)
+                };
+                let cls = clients.lock().await;
+                if let Some(client) = cls.get(&client_id) {
+                    let _ = client
+                        .tx
+                        .send(ServerMessage::ScrollbackInfo { total_lines });
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1600,6 +1663,7 @@ async fn handle_mouse_click(
         config,
         None,
         None,
+        0,
         &config.compositor_theme(),
     )
     .await;
@@ -1713,6 +1777,7 @@ async fn handle_mouse_drag(
         config,
         None,
         None,
+        0,
         &config.compositor_theme(),
     )
     .await;
@@ -1932,7 +1997,7 @@ async fn send_full_render_to_client(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (mode, selection, client_search_info) = {
+    let (mode, selection, client_search_info, scroll_offset) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
         let mode = client
@@ -1940,7 +2005,8 @@ async fn send_full_render_to_client(
             .unwrap_or_else(|| "NORMAL".to_string());
         let selection = client.and_then(|c| c.mouse_selection.clone());
         let si = client.and_then(|c| c.search_info);
-        (mode, selection, si)
+        let so = client.map(|c| c.scroll_offset).unwrap_or(0);
+        (mode, selection, si, so)
     };
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
@@ -1964,13 +2030,24 @@ async fn send_full_render_to_client(
         config,
         selection.as_ref(),
         client_search_info,
+        scroll_offset,
         &config.compositor_theme(),
     )
     .await;
-    {
+    let cursor_visible = if scroll_offset > 0 {
+        false
+    } else {
+        cursor_visible
+    };
+    // Only save to session-level prev_frames for live view (scroll_offset == 0).
+    // Scrolled frames must not pollute the broadcast diff cache.
+    if scroll_offset == 0 {
         let mut pf = prev_frames.lock().await;
         pf.insert(session_name.to_string(), cells.clone());
     }
+
+    // Always send FullRender — avoids all diff race conditions with
+    // broadcast_full_render which runs in a separate async task.
     let cls = clients.lock().await;
     if let Some(client) = cls.get(&client_id) {
         let _ = client.tx.send(ServerMessage::FullRender {
@@ -2037,10 +2114,14 @@ async fn broadcast_full_render(
         config,
         selection.as_ref(),
         si,
+        0,
         &config.compositor_theme(),
     )
     .await;
 
+    // Compute a single diff against session-level prev_frames.
+    // This is the ONLY writer to prev_frames during normal operation,
+    // so there are no race conditions with the diff cache.
     let msg = {
         let prev_frames_map = prev_frames.lock().await;
         let prev = prev_frames_map.get(session_name);
@@ -2085,9 +2166,14 @@ async fn broadcast_full_render(
         pf.insert(session_name.to_string(), cells);
     }
 
+    // Send to all non-scrolled clients. Scrolled clients get FullRender
+    // via send_full_render_to_client when they scroll.
     let cls = clients.lock().await;
     for client in cls.values() {
         if client.session_name.as_deref() == Some(session_name) {
+            if client.scroll_offset > 0 {
+                continue;
+            }
             let _ = client.tx.send(msg.clone());
         }
     }
@@ -2144,6 +2230,7 @@ async fn build_composite(
     _config: &Arc<Config>,
     selection: Option<&MouseSelection>,
     search_info: Option<(usize, usize)>,
+    scroll_offset: usize,
     compositor_theme: &crate::config::theme::CompositorTheme,
 ) -> (
     Vec<Vec<RenderCell>>,
@@ -2220,6 +2307,14 @@ async fn build_composite(
         search_info,
     };
 
+    let scroll_offsets = if scroll_offset > 0 {
+        let mut offsets = HashMap::new();
+        offsets.insert(tab.focused_pane, scroll_offset);
+        offsets
+    } else {
+        HashMap::new()
+    };
+
     let (cells, hit_regions) = composite(
         &tab.layout,
         &pane_screens,
@@ -2231,6 +2326,7 @@ async fn build_composite(
         0,
         tab.focused_pane,
         selection,
+        &scroll_offsets,
         compositor_theme,
     );
 

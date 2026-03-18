@@ -130,8 +130,6 @@ impl Renderer {
             queue!(stdout, cursor::Hide)?;
         }
 
-        stdout.flush()?;
-
         // Update front buffer.
         self.front = cells.to_vec();
 
@@ -195,7 +193,13 @@ impl Renderer {
             queue!(stdout, cursor::Hide)?;
         }
 
-        stdout.flush()?;
+        Ok(())
+    }
+
+    /// Flush all queued render commands to the terminal.
+    /// Call this after all render methods for a frame are done.
+    pub fn flush(&self) -> Result<()> {
+        io::stdout().flush()?;
         Ok(())
     }
 
@@ -237,7 +241,6 @@ impl Renderer {
             queue!(stdout, Print(text), ResetColor)?;
         }
 
-        stdout.flush()?;
         Ok(())
     }
 
@@ -356,7 +359,6 @@ impl Renderer {
             }
         }
 
-        stdout.flush()?;
         Ok(())
     }
 
@@ -504,7 +506,6 @@ impl Renderer {
         let cursor_x = start_x + 2 + display_text.len() as u16;
         queue!(stdout, MoveTo(cursor_x, start_y + 1), cursor::Show)?;
 
-        stdout.flush()?;
         Ok(())
     }
 
@@ -575,7 +576,6 @@ impl Renderer {
             queue!(stdout, MoveTo(cursor_x, prompt_row), cursor::Show)?;
         }
 
-        stdout.flush()?;
         Ok(())
     }
 
@@ -585,12 +585,14 @@ impl Renderer {
     /// current match with a bright background. Match positions are in
     /// scrollback coordinates; only those within the visible area of the
     /// focused pane are drawn.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_search_highlight(
         &self,
         matches: &[(usize, usize)],
         current_match: usize,
         query_len: usize,
         scrollback_line_count: usize,
+        scroll_offset: usize,
         pane_rect: Option<&crate::protocol::PaneRect>,
         theme: &crate::config::theme::Theme,
     ) -> Result<()> {
@@ -608,8 +610,8 @@ impl Renderer {
         }
 
         // The visible line range in scrollback coordinates.
-        let visible_start = scrollback_line_count.saturating_sub(pane_h);
-        let visible_end = scrollback_line_count;
+        let visible_end = scrollback_line_count.saturating_sub(scroll_offset);
+        let visible_start = visible_end.saturating_sub(pane_h);
 
         let mut stdout = io::stdout().lock();
         queue!(stdout, cursor::Hide)?;
@@ -658,7 +660,6 @@ impl Renderer {
             }
         }
 
-        stdout.flush()?;
         Ok(())
     }
 
