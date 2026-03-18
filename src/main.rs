@@ -488,14 +488,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.clear_overlay(cols, rows)?;
                             }
                             InputAction::EditInEditor => {
-                                // Temporarily restore terminal for editor
-                                restore_terminal()?;
-                                // TODO: get scrollback from server, open in editor
-                                setup_terminal()?;
-                                // Re-send resize in case terminal changed
-                                let (cols, rows) = crossterm::terminal::size()?;
-                                renderer.resize(cols, rows);
-                                client.send(ClientMessage::Resize { cols, rows }).await?;
+                                input.pending_editor_open = true;
+                                client.send(ClientMessage::RequestScrollback).await?;
                             }
                             InputAction::RenameUpdate(ref text) => {
                                 // Re-render the rename popup with updated text.
@@ -1025,8 +1019,20 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(ServerMessage::ScrollbackContent { lines }) => {
-                        // Compute search matches.
-                        if let Some(ref mut ss) = input.search_state {
+                        if input.pending_editor_open {
+                            input.pending_editor_open = false;
+                            let content = lines.join("\n");
+                            // Temporarily restore terminal for editor
+                            restore_terminal()?;
+                            if let Err(e) = crate::client::editor::open_in_editor(&content) {
+                                log::error!("Failed to open editor: {}", e);
+                            }
+                            setup_terminal()?;
+                            // Re-send resize in case terminal changed
+                            let (cols, rows) = crossterm::terminal::size()?;
+                            renderer.resize(cols, rows);
+                            client.send(ClientMessage::Resize { cols, rows }).await?;
+                        } else if let Some(ref mut ss) = input.search_state {
                             if let Some(ref query) = ss.confirmed_query {
                                 ss.scrollback_line_count = lines.len();
                                 ss.matches = crate::client::input::SearchState::compute_matches(&lines, query);

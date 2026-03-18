@@ -476,6 +476,8 @@ pub struct InputHandler {
     pub application_cursor_keys: bool,
     /// State for the folder selection overlay.
     pub folder_select: Option<FolderSelectOverlay>,
+    /// Whether we are waiting for scrollback content to open in an editor.
+    pub pending_editor_open: bool,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -684,6 +686,7 @@ impl InputHandler {
             session_manager: None,
             application_cursor_keys: false,
             folder_select: None,
+            pending_editor_open: false,
         }
     }
 
