@@ -298,7 +298,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     let mut last_cursor_y: u16 = 0;
 
     // Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
+    // Used by visual mode and search. Normal mode scrolling uses server-owned offset.
     let mut scroll_offset: usize = 0;
+    // Whether the client is currently scrolled back (server owns the actual offset).
+    let mut is_scrolled: bool = false;
 
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
@@ -318,9 +321,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         if key.kind == KeyEventKind::Press =>
                     {
                         // Reset scroll offset on any keyboard input in Normal mode
-                        if scroll_offset > 0 && input.mode == Mode::Normal {
+                        if is_scrolled && input.mode == Mode::Normal {
                             scroll_offset = 0;
-                            client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                            is_scrolled = false;
+                            client.send(ClientMessage::ScrollReset).await?;
                         }
 
                         let was_renaming = input.rename_overlay.is_some();
@@ -420,9 +424,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     })
                                     .await?;
                                 // Reset scroll offset when returning to normal mode.
-                                if mode == Mode::Normal && scroll_offset > 0 {
+                                if mode == Mode::Normal && (scroll_offset > 0 || is_scrolled) {
                                     scroll_offset = 0;
-                                    client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                                    is_scrolled = false;
+                                    client.send(ClientMessage::ScrollReset).await?;
                                 }
                                 // When entering Visual mode, scope to the
                                 // focused pane's bounds instead of the full
@@ -550,9 +555,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 }
                                 input.visual_state = None;
                                 input.mode = Mode::Normal;
-                                if scroll_offset > 0 {
+                                if scroll_offset > 0 || is_scrolled {
                                     scroll_offset = 0;
-                                    client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                                    is_scrolled = false;
+                                    client.send(ClientMessage::ScrollReset).await?;
                                 }
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -564,13 +570,15 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::VisualScroll { .. } => {
-                                // Send scroll offset to server so compositor renders scrollback.
+                                // Send scroll delta to server so compositor renders scrollback.
                                 if let Some(ref vs) = input.visual_state {
+                                    let old = scroll_offset;
                                     scroll_offset = vs.scroll_offset;
-                                    client.send(ClientMessage::ScrollOffset { offset: vs.scroll_offset }).await?;
+                                    let delta = scroll_offset as i32 - old as i32;
+                                    if delta != 0 {
+                                        client.send(ClientMessage::ScrollDelta { delta }).await?;
+                                    }
                                 }
-                                // The server will send a new render with the scrolled content.
-                                // We'll overlay visual mode on top when the render arrives.
                             }
                             InputAction::CommandPaletteOpen => {
                                 // Hide which-key when opening palette.
@@ -652,9 +660,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 // Reset scroll offset when exiting search mode.
-                                if scroll_offset > 0 {
+                                if scroll_offset > 0 || is_scrolled {
                                     scroll_offset = 0;
-                                    client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                                    is_scrolled = false;
+                                    client.send(ClientMessage::ScrollReset).await?;
                                 }
                                 renderer.flush()?;
                             }
@@ -697,8 +706,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         if match_line < visible_top_line || match_line >= visible_bottom_line {
                                             // Match is not visible, scroll to center it
                                             let target_offset = total.saturating_sub(match_line + pane_height / 2);
+                                            let delta = target_offset as i32 - scroll_offset as i32;
                                             scroll_offset = target_offset;
-                                            client.send(ClientMessage::ScrollOffset { offset: scroll_offset }).await?;
+                                            if delta != 0 {
+                                                client.send(ClientMessage::ScrollDelta { delta }).await?;
+                                            }
                                         }
                                     }
                                 }
@@ -974,32 +986,23 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 }
                             }
                             MouseEventKind::ScrollUp => {
-                                let old = scroll_offset;
                                 if input.mode == Mode::Visual {
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_up(3);
                                         scroll_offset = vs.scroll_offset;
                                     }
-                                } else {
-                                    scroll_offset = scroll_offset.saturating_add(3);
                                 }
-                                if scroll_offset != old {
-                                    client.send(ClientMessage::ScrollOffset { offset: scroll_offset }).await?;
-                                }
+                                is_scrolled = true;
+                                client.send(ClientMessage::ScrollDelta { delta: 3 }).await?;
                             }
                             MouseEventKind::ScrollDown => {
-                                let old = scroll_offset;
                                 if input.mode == Mode::Visual {
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_down(3);
                                         scroll_offset = vs.scroll_offset;
                                     }
-                                } else {
-                                    scroll_offset = scroll_offset.saturating_sub(3);
                                 }
-                                if scroll_offset != old {
-                                    client.send(ClientMessage::ScrollOffset { offset: scroll_offset }).await?;
-                                }
+                                client.send(ClientMessage::ScrollDelta { delta: -3 }).await?;
                             }
                             _ => {}
                         }
@@ -1100,6 +1103,74 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                        // Re-render visual overlay on top if in visual mode
+                        if let Some(ref vs) = input.visual_state {
+                            renderer.render_visual_overlay(vs)?;
+                        }
+                        // Re-render rename popup on top if active
+                        if let Some(ref overlay) = input.rename_overlay {
+                            let target_str = match overlay.target {
+                                RenameTarget::Tab => "Tab",
+                                RenameTarget::Pane => "Pane",
+                                RenameTarget::Session => "Session",
+                                RenameTarget::NewSession => "New Session",
+                            };
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
+                        }
+                        // Re-render command palette on top if active
+                        else if let Some(ref palette) = input.command_palette {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = palette.render(c, r, &theme);
+                            renderer.render_command_palette_overlay(&draw_cmds)?;
+                        }
+                        // Re-render search prompt and highlights on top if in search mode
+                        else if let Some(ref ss) = input.search_state {
+                            let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
+                            let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.render_search_highlight(
+                                &ss.matches,
+                                ss.current_match,
+                                query.len(),
+                                ss.scrollback_line_count,
+                                scroll_offset,
+                                focused_pane_rect.as_ref(),
+                                &theme,
+                            )?;
+                            renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                        }
+                        // Re-render session switch overlay on top if active
+                        else if let Some(ref ss) = input.session_switch {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = ss.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                        }
+                        // Re-render folder select overlay on top if active
+                        else if let Some(ref fs) = input.folder_select {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = fs.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                        }
+                        // Re-render session manager on top if active
+                        else if let Some(ref sm) = input.session_manager {
+                            let (c, r) = crossterm::terminal::size()?;
+                            let draw_cmds = sm.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                        }
+                        // Re-render popup on top if visible
+                        else if whichkey.visible {
+                            let commands = whichkey.render(cols, rows, &theme);
+                            renderer.render_whichkey_overlay(&commands)?;
+                        }
+                        renderer.flush()?;
+                    }
+                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack }) => {
+                        focused_pane_rect = fpr;
+                        input.application_cursor_keys = ack;
+                        last_cursor_x = cursor_x;
+                        last_cursor_y = cursor_y;
+                        renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                         // Re-render visual overlay on top if in visual mode
                         if let Some(ref vs) = input.visual_state {
                             renderer.render_visual_overlay(vs)?;
