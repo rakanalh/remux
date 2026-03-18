@@ -186,6 +186,10 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         leaf_chain("layout next", &["LayoutNext", "EnterNormal"]),
     );
     root.insert('m', leaf_chain("set master", &["SetMaster", "EnterNormal"]));
+    root.insert(
+        'f',
+        leaf_chain("zoom pane", &["PaneToggleZoom", "EnterNormal"]),
+    );
 
     // Command palette.
     root.insert(':', leaf("command palette", "CommandPaletteOpen"));
@@ -667,6 +671,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
+        "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterNormal" => Some(RemuxCommand::EnterNormal),
         "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),
@@ -1108,8 +1113,7 @@ mod tests {
         assert!(tree.root.contains_key(&'p'));
         assert!(tree.root.contains_key(&'s')); // Search group
         assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
-                                               // 'f' (Folder group) was removed in the folder-keybinding-removal refactor.
-        assert!(!tree.root.contains_key(&'f'));
+        assert!(tree.root.contains_key(&'f')); // Zoom pane toggle
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
         // 'b' (Buffer group) was removed in the search-mode refactor.
