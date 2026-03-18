@@ -188,6 +188,7 @@ pub fn composite(
     gap_size: u16,
     focused_pane: PaneId,
     selection: Option<&MouseSelection>,
+    scroll_offsets: &HashMap<PaneId, usize>,
     theme: &CompositorTheme,
 ) -> (Vec<Vec<RenderCell>>, HitRegions) {
     let mut buffer = vec![vec![RenderCell::default(); total_cols as usize]; total_rows as usize];
@@ -207,6 +208,7 @@ pub fn composite(
                 focused_pane,
                 mode,
                 &mut hit_regions,
+                scroll_offsets,
                 theme,
             );
         }
@@ -221,6 +223,7 @@ pub fn composite(
                 focused_pane,
                 mode,
                 &mut hit_regions,
+                scroll_offsets,
                 theme,
             );
         }
@@ -334,6 +337,7 @@ fn draw_zellij_panes(
     focused_pane: PaneId,
     mode: &str,
     hit_regions: &mut HitRegions,
+    scroll_offsets: &HashMap<PaneId, usize>,
     theme: &CompositorTheme,
 ) {
     for &(pane_id, rect) in pane_rects {
@@ -353,9 +357,11 @@ fn draw_zellij_panes(
             theme.frame_fg.clone()
         };
 
+        let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
+
         // If rect is too small for borders, blit content to full rect.
         if rect.width < 3 || rect.height < 3 {
-            blit_screen(buffer, screen, rect);
+            blit_screen(buffer, screen, rect, offset);
             continue;
         }
 
@@ -366,7 +372,7 @@ fn draw_zellij_panes(
             width: rect.width - 2,
             height: rect.height - 2,
         };
-        blit_screen(buffer, screen, inner);
+        blit_screen(buffer, screen, inner, offset);
 
         // Draw the full box border with rounded corners.
         let x = rect.x as usize;
@@ -669,6 +675,7 @@ fn draw_tmux_panes(
     _focused_pane: PaneId,
     mode: &str,
     hit_regions: &mut HitRegions,
+    scroll_offsets: &HashMap<PaneId, usize>,
     theme: &CompositorTheme,
 ) {
     for &(pane_id, rect) in pane_rects {
@@ -680,6 +687,8 @@ fn draw_tmux_panes(
             Some(s) => s,
             None => continue,
         };
+
+        let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
 
         let stack_info = layout::find_stack_names(layout, pane_id);
         let is_multi = stack_info
@@ -697,10 +706,10 @@ fn draw_tmux_panes(
                 width: rect.width,
                 height: rect.height - 1,
             };
-            blit_screen(buffer, screen, content_rect);
+            blit_screen(buffer, screen, content_rect, offset);
         } else {
             // Single-pane stack or too small: full content area.
-            blit_screen(buffer, screen, rect);
+            blit_screen(buffer, screen, rect, offset);
         }
     }
 
@@ -938,19 +947,46 @@ fn draw_tmux_dividers(
 // ---------------------------------------------------------------------------
 
 /// Blit a screen's content into the buffer at the given rectangle.
-fn blit_screen(buffer: &mut [Vec<RenderCell>], screen: &Screen, rect: Rect) {
-    for row in 0..rect.height as usize {
-        let buf_y = rect.y as usize + row;
-        if buf_y >= buffer.len() {
-            break;
-        }
-        for col in 0..rect.width as usize {
-            let buf_x = rect.x as usize + col;
-            if buf_x >= buffer[buf_y].len() {
+fn blit_screen(buffer: &mut [Vec<RenderCell>], screen: &Screen, rect: Rect, scroll_offset: usize) {
+    if scroll_offset == 0 {
+        // Original behavior: blit from grid directly (fast path)
+        for row in 0..rect.height as usize {
+            let buf_y = rect.y as usize + row;
+            if buf_y >= buffer.len() {
                 break;
             }
-            if row < screen.grid.len() && col < screen.grid[row].len() {
-                buffer[buf_y][buf_x] = cell_to_render_cell(&screen.grid[row][col]);
+            for col in 0..rect.width as usize {
+                let buf_x = rect.x as usize + col;
+                if buf_x >= buffer[buf_y].len() {
+                    break;
+                }
+                if row < screen.grid.len() && col < screen.grid[row].len() {
+                    buffer[buf_y][buf_x] = cell_to_render_cell(&screen.grid[row][col]);
+                }
+            }
+        }
+    } else {
+        // Scrollback view: blit from combined scrollback+grid buffer
+        let total = screen.total_lines();
+        let view_bottom = total.saturating_sub(scroll_offset);
+        let view_top = view_bottom.saturating_sub(rect.height as usize);
+
+        for row in 0..rect.height as usize {
+            let line_idx = view_top + row;
+            let buf_y = rect.y as usize + row;
+            if buf_y >= buffer.len() {
+                break;
+            }
+            if let Some(line) = screen.line_at(line_idx) {
+                for col in 0..rect.width as usize {
+                    let buf_x = rect.x as usize + col;
+                    if buf_x >= buffer[buf_y].len() {
+                        break;
+                    }
+                    if col < line.len() {
+                        buffer[buf_y][buf_x] = cell_to_render_cell(&line[col]);
+                    }
+                }
             }
         }
     }
@@ -1194,6 +1230,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1243,6 +1280,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1290,6 +1328,7 @@ mod tests {
             gap_size,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1346,6 +1385,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1395,6 +1435,7 @@ mod tests {
             0,
             1, // pane 1 is focused
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1446,6 +1487,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1493,6 +1535,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1538,6 +1581,7 @@ mod tests {
             0,
             2,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1579,6 +1623,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1627,6 +1672,7 @@ mod tests {
             0,
             2,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1674,6 +1720,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1731,6 +1778,7 @@ mod tests {
             0,
             3,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -1786,6 +1834,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 
@@ -2090,6 +2139,7 @@ mod tests {
             0,
             1,
             None,
+            &HashMap::new(),
             &CompositorTheme::default(),
         );
 

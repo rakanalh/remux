@@ -51,6 +51,10 @@ pub enum ClientMessage {
     SearchInfo { current: usize, total: usize },
     /// Request the full session tree (folders, sessions, tabs, panes).
     ListSessionTree,
+    /// Inform the server of the client's current scroll offset.
+    ScrollOffset { offset: usize },
+    /// Request scrollback info (total line count) for the active pane.
+    RequestScrollbackInfo,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +100,8 @@ pub enum ServerMessage {
     CopyToClipboard { data: String },
     /// Response to a `RequestScrollback` request with the pane's text content.
     ScrollbackContent { lines: Vec<String> },
+    /// Response to a `RequestScrollbackInfo` request with the total line count.
+    ScrollbackInfo { total_lines: usize },
     /// Response to a `ListSessionTree` request with the full hierarchy.
     SessionTree {
         folders: Vec<FolderTreeEntry>,

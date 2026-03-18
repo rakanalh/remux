@@ -191,6 +191,21 @@ impl Screen {
         result
     }
 
+    /// Total number of lines: scrollback + visible grid.
+    pub fn total_lines(&self) -> usize {
+        self.scrollback.len() + self.grid.len()
+    }
+
+    /// Get a row from the combined scrollback+grid buffer by absolute index.
+    /// Index 0 = oldest scrollback line.
+    pub fn line_at(&self, index: usize) -> Option<&Vec<Cell>> {
+        if index < self.scrollback.len() {
+            self.scrollback.get(index)
+        } else {
+            self.grid.get(index - self.scrollback.len())
+        }
+    }
+
     // -- Private helpers ----------------------------------------------------
 
     /// Create an empty grid filled with default cells.

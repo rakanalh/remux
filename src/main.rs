@@ -295,6 +295,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     let mut last_cursor_x: u16 = 0;
     let mut last_cursor_y: u16 = 0;
 
+    // Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
+    let mut scroll_offset: usize = 0;
+
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
     let mut last_drag_send: Instant = Instant::now();
@@ -312,6 +315,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
+                        // Reset scroll offset on any keyboard input in Normal mode
+                        if scroll_offset > 0 && input.mode == Mode::Normal {
+                            scroll_offset = 0;
+                            client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                        }
+
                         let was_renaming = input.rename_overlay.is_some();
                         let was_in_palette = input.command_palette.is_some();
                         let action = input.handle_key(key);
@@ -320,6 +329,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         if was_renaming && input.rename_overlay.is_none() && !matches!(action, InputAction::RenameUpdate(_)) {
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.clear_overlay(c, r)?;
+                            renderer.flush()?;
                         }
                         match action {
                             InputAction::SendToPty(data) => {
@@ -336,6 +346,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.clear_command_palette_overlay(c, r)?;
                                 }
+                                renderer.flush()?;
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
                                     return Ok(());
                                 }
@@ -365,6 +376,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 if whichkey.visible {
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
+                                    renderer.flush()?;
                                 }
                                 for cmd in cmds {
                                     if matches!(cmd, RemuxCommand::SessionDetach) {
@@ -405,6 +417,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
+                                // Reset scroll offset when returning to normal mode.
+                                if mode == Mode::Normal && scroll_offset > 0 {
+                                    scroll_offset = 0;
+                                    client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                                }
                                 // When entering Visual mode, scope to the
                                 // focused pane's bounds instead of the full
                                 // terminal dimensions.
@@ -439,6 +456,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                             vs.total_lines = vs.visible_rows;
                                         }
                                     }
+                                    // Request scrollback info to get accurate total_lines.
+                                    client.send(ClientMessage::RequestScrollbackInfo).await?;
                                 }
                                 // When entering Search mode, render the prompt.
                                 if mode == Mode::Search {
@@ -452,6 +471,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::ActivateRenameOverlay => {
                                 // Hide which-key when rename overlay activates
@@ -469,6 +489,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 };
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.render_rename_popup("", target_str, c, r)?;
+                                renderer.flush()?;
                                 // Notify server we're in a rename state
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -482,10 +503,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.clear_overlay(c, r)?;
                                 let commands = whichkey.render(c, r, &theme);
                                 renderer.render_whichkey_overlay(&commands)?;
+                                renderer.flush()?;
                             }
                             InputAction::HideWhichKey => {
                                 whichkey.hide();
                                 renderer.clear_overlay(cols, rows)?;
+                                renderer.flush()?;
                             }
                             InputAction::EditInEditor => {
                                 input.pending_editor_open = true;
@@ -504,6 +527,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 };
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.render_rename_popup(text, target_str, c, r)?;
+                                renderer.flush()?;
                                 // Don't send intermediate updates to server -
                                 // only the final rename command is sent on Enter.
                             }
@@ -524,6 +548,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 }
                                 input.visual_state = None;
                                 input.mode = Mode::Normal;
+                                if scroll_offset > 0 {
+                                    scroll_offset = 0;
+                                    client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                                }
                                 client
                                     .send(ClientMessage::ModeChanged {
                                         mode: "NORMAL".to_string(),
@@ -531,14 +559,16 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     .await?;
                                 // Re-render to clear selection highlighting.
                                 renderer.clear_overlay(cols, rows)?;
+                                renderer.flush()?;
                             }
                             InputAction::VisualScroll { .. } => {
-                                // Re-render visual overlay with updated cursor/selection.
-                                // First restore the base buffer, then overlay.
-                                renderer.clear_overlay(cols, rows)?;
+                                // Send scroll offset to server so compositor renders scrollback.
                                 if let Some(ref vs) = input.visual_state {
-                                    renderer.render_visual_overlay(vs)?;
+                                    scroll_offset = vs.scroll_offset;
+                                    client.send(ClientMessage::ScrollOffset { offset: vs.scroll_offset }).await?;
                                 }
+                                // The server will send a new render with the scrolled content.
+                                // We'll overlay visual mode on top when the render arrives.
                             }
                             InputAction::CommandPaletteOpen => {
                                 // Hide which-key when opening palette.
@@ -552,6 +582,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let draw_cmds = palette.render(c, r, &theme);
                                     renderer.render_command_palette_overlay(&draw_cmds)?;
                                 }
+                                renderer.flush()?;
                                 // Notify server of mode change.
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -568,6 +599,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let draw_cmds = palette.render(c, r, &theme);
                                     renderer.render_command_palette_overlay(&draw_cmds)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::CommandPaletteExecute => {
                                 // Already handled via Execute action path.
@@ -575,6 +607,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::CommandPaletteClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_command_palette_overlay(c, r)?;
+                                renderer.flush()?;
                                 // Notify server of mode change.
                                 let mode_str = match input.mode {
                                     Mode::Normal => "NORMAL",
@@ -596,6 +629,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.render_search_prompt(&ss.query_buffer, ss.phase, None, c, r)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::SearchConfirm(ref query) => {
                                 // Request scrollback from server.
@@ -605,6 +639,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.render_search_prompt(query, ss.phase, None, c, r)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::SearchCancel => {
                                 // Clear search info on server.
@@ -614,6 +649,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 // Clear overlay.
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                // Reset scroll offset when exiting search mode.
+                                if scroll_offset > 0 {
+                                    scroll_offset = 0;
+                                    client.send(ClientMessage::ScrollOffset { offset: 0 }).await?;
+                                }
+                                renderer.flush()?;
                             }
                             InputAction::SearchNavigate => {
                                 // Update search info on server and re-render prompt.
@@ -636,9 +677,28 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         ss.current_match,
                                         query.len(),
                                         ss.scrollback_line_count,
+                                        scroll_offset,
                                         focused_pane_rect.as_ref(),
                                         &theme,
                                     )?;
+
+                                    // Scroll to match if it's in scrollback (not visible).
+                                    if !ss.matches.is_empty() {
+                                        let (match_line, _match_col) = ss.matches[ss.current_match];
+                                        let pane_height = focused_pane_rect
+                                            .map(|pr| pr.height as usize)
+                                            .unwrap_or(24);
+                                        let total = ss.scrollback_line_count;
+                                        // Calculate the scroll offset needed to center the match
+                                        let visible_bottom_line = total.saturating_sub(scroll_offset);
+                                        let visible_top_line = visible_bottom_line.saturating_sub(pane_height);
+                                        if match_line < visible_top_line || match_line >= visible_bottom_line {
+                                            // Match is not visible, scroll to center it
+                                            let target_offset = total.saturating_sub(match_line + pane_height / 2);
+                                            scroll_offset = target_offset;
+                                            client.send(ClientMessage::ScrollOffset { offset: scroll_offset }).await?;
+                                        }
+                                    }
                                 }
                             }
                             InputAction::SessionManagerOpen => {
@@ -862,6 +922,34 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     }
                                 }
                             }
+                            MouseEventKind::ScrollUp => {
+                                let old = scroll_offset;
+                                if input.mode == Mode::Visual {
+                                    if let Some(ref mut vs) = input.visual_state {
+                                        vs.scroll_up(3);
+                                        scroll_offset = vs.scroll_offset;
+                                    }
+                                } else {
+                                    scroll_offset = scroll_offset.saturating_add(3);
+                                }
+                                if scroll_offset != old {
+                                    client.send(ClientMessage::ScrollOffset { offset: scroll_offset }).await?;
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                let old = scroll_offset;
+                                if input.mode == Mode::Visual {
+                                    if let Some(ref mut vs) = input.visual_state {
+                                        vs.scroll_down(3);
+                                        scroll_offset = vs.scroll_offset;
+                                    }
+                                } else {
+                                    scroll_offset = scroll_offset.saturating_sub(3);
+                                }
+                                if scroll_offset != old {
+                                    client.send(ClientMessage::ScrollOffset { offset: scroll_offset }).await?;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -924,6 +1012,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 ss.current_match,
                                 query.len(),
                                 ss.scrollback_line_count,
+                                scroll_offset,
                                 focused_pane_rect.as_ref(),
                                 &theme,
                             )?;
@@ -984,6 +1073,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 ss.current_match,
                                 query.len(),
                                 ss.scrollback_line_count,
+                                scroll_offset,
                                 focused_pane_rect.as_ref(),
                                 &theme,
                             )?;
@@ -1057,6 +1147,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     ss.current_match,
                                     q.len(),
                                     ss.scrollback_line_count,
+                                    scroll_offset,
                                     focused_pane_rect.as_ref(),
                                     &theme,
                                 )?;
@@ -1119,6 +1210,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             } else {
                                 break;
                             }
+                        }
+                    }
+                    Some(ServerMessage::ScrollbackInfo { total_lines }) => {
+                        // Update visual state with accurate total line count.
+                        if let Some(ref mut vs) = input.visual_state {
+                            vs.total_lines = total_lines;
                         }
                     }
                     None => {
