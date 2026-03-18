@@ -250,6 +250,7 @@ pub enum RemuxCommand {
     PaneStackNext,
     PaneStackPrev,
     PaneRename(String),
+    PaneToggleZoom,
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -342,6 +343,7 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
         ("PaneStackNext", None),
         ("PaneStackPrev", None),
         ("PaneRename", Some("<name>")),
+        ("PaneToggleZoom", None),
         ("ResizeLeft", Some("<amount>")),
         ("ResizeRight", Some("<amount>")),
         ("ResizeUp", Some("<amount>")),

@@ -81,6 +81,8 @@ pub struct Tab {
     pub layout_mode: LayoutMode,
     #[serde(default)]
     pub pane_order: Vec<PaneId>,
+    #[serde(default)]
+    pub zoomed_pane: Option<PaneId>,
 }
 
 fn default_border_style() -> BorderStyle {
@@ -193,6 +195,7 @@ impl ServerState {
             focused_pane: pane_id,
             layout_mode,
             pane_order: vec![pane_id],
+            zoomed_pane: None,
         };
 
         let session = Session {
@@ -409,6 +412,7 @@ impl ServerState {
             focused_pane: pane_id,
             layout_mode,
             pane_order: vec![pane_id],
+            zoomed_pane: None,
         };
 
         sess.tabs.push(tab);

@@ -1360,6 +1360,30 @@ async fn handle_command(
             drop(st);
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
+        RemuxCommand::PaneToggleZoom => {
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                // No-op in Monocle mode (already fullscreen).
+                if matches!(tab.layout_mode, LayoutMode::Monocle(_)) {
+                    return Ok(());
+                }
+                if tab.zoomed_pane == Some(tab.focused_pane) {
+                    tab.zoomed_pane = None;
+                } else {
+                    tab.zoomed_pane = Some(tab.focused_pane);
+                }
+            }
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
         _ => {
             log::debug!("unhandled command: {cmd:?}");
         }
@@ -1966,7 +1990,11 @@ async fn resize_session_panes(
             width: cols,
             height: content_rows,
         };
-        layout::compute_layout(&tab.layout, area, 0)
+        if let Some(zoomed_id) = tab.zoomed_pane {
+            vec![(zoomed_id, area)]
+        } else {
+            layout::compute_layout(&tab.layout, area, 0)
+        }
     };
 
     let mut ps = panes.lock().await;
@@ -2287,7 +2315,11 @@ async fn build_composite(
 
     let ps = panes.lock().await;
     let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
-    let pane_rects = layout::compute_layout(&tab.layout, area, 0);
+    let pane_rects = if let Some(zoomed_id) = tab.zoomed_pane {
+        vec![(zoomed_id, area)]
+    } else {
+        layout::compute_layout(&tab.layout, area, 0)
+    };
     for (pane_id, _rect) in &pane_rects {
         if let Some(pane_data) = ps.get(pane_id) {
             pane_screens.insert(*pane_id, &pane_data.screen);
@@ -2301,7 +2333,14 @@ async fn build_composite(
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.name.clone(), i == sess.active_tab))
+            .map(|(i, t)| {
+                let name = if i == sess.active_tab && t.zoomed_pane.is_some() {
+                    format!("{} Z", t.name)
+                } else {
+                    t.name.clone()
+                };
+                (name, i == sess.active_tab)
+            })
             .collect(),
         layout_mode: tab.layout_mode.name().to_string(),
         search_info,
@@ -2315,8 +2354,16 @@ async fn build_composite(
         HashMap::new()
     };
 
+    let zoomed_layout;
+    let effective_layout = if tab.zoomed_pane.is_some() {
+        zoomed_layout = layout::LayoutNode::new_stack(tab.focused_pane);
+        &zoomed_layout
+    } else {
+        &tab.layout
+    };
+
     let (cells, hit_regions) = composite(
-        &tab.layout,
+        effective_layout,
         &pane_screens,
         area,
         &sess.border_style,
