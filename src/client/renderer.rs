@@ -196,6 +196,171 @@ impl Renderer {
         Ok(())
     }
 
+    /// Apply a scroll render: shift front buffer within a pane rect and render
+    /// only the new rows. Much faster than render_full for scroll events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_scroll(
+        &mut self,
+        pane_x: u16,
+        pane_y: u16,
+        pane_width: u16,
+        pane_height: u16,
+        delta: i16,
+        new_rows: &[Vec<RenderCell>],
+        cursor_x: u16,
+        cursor_y: u16,
+        cursor_visible: bool,
+        cursor_style: u8,
+    ) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        queue!(stdout, cursor::Hide)?;
+
+        let px = pane_x as usize;
+        let py = pane_y as usize;
+        let pw = pane_width as usize;
+        let ph = pane_height as usize;
+        let abs_delta = delta.unsigned_abs() as usize;
+
+        if abs_delta == 0 || abs_delta >= ph {
+            // Nothing to shift or entire pane replaced — caller should use render_full
+            return Ok(());
+        }
+
+        // 1. Shift front buffer rows within the pane rect
+        if delta > 0 {
+            // Content moves UP: shift rows up, new rows appear at top
+            for row in (abs_delta..ph).rev() {
+                let src_y = py + row - abs_delta;
+                let dst_y = py + row;
+                if dst_y < self.front.len() && src_y < self.front.len() {
+                    for col in 0..pw {
+                        let src_x = px + col;
+                        if src_x < self.front[src_y].len() && src_x < self.front[dst_y].len() {
+                            self.front[dst_y][src_x] = self.front[src_y][src_x].clone();
+                        }
+                    }
+                }
+            }
+        } else {
+            // Content moves DOWN: shift rows down, new rows appear at bottom
+            for row in 0..ph.saturating_sub(abs_delta) {
+                let src_y = py + row + abs_delta;
+                let dst_y = py + row;
+                if dst_y < self.front.len() && src_y < self.front.len() {
+                    for col in 0..pw {
+                        let src_x = px + col;
+                        if src_x < self.front[src_y].len() && src_x < self.front[dst_y].len() {
+                            self.front[dst_y][src_x] = self.front[src_y][src_x].clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Write new rows into front buffer
+        for (i, row_cells) in new_rows.iter().enumerate() {
+            let screen_y = if delta > 0 {
+                py + i // New rows at top of pane
+            } else {
+                py + ph - abs_delta + i // New rows at bottom of pane
+            };
+
+            if screen_y >= self.front.len() {
+                continue;
+            }
+
+            for (col, cell) in row_cells.iter().enumerate() {
+                let screen_x = px + col;
+                if screen_x < self.front[screen_y].len() {
+                    self.front[screen_y][screen_x] = cell.clone();
+                }
+            }
+        }
+
+        // 3. Re-render the entire pane rect from the (now correct) front buffer.
+        // The front buffer was shifted + new rows inserted, so it has the right
+        // content. We must re-render all pane rows because the terminal doesn't
+        // know the content shifted.
+        for row in 0..ph {
+            let screen_y = py + row;
+            if screen_y >= self.front.len() || screen_y as u16 >= self.rows {
+                break;
+            }
+
+            queue!(stdout, MoveTo(pane_x, screen_y as u16))?;
+
+            let mut last_fg = CellColor::Default;
+            let mut last_bg = CellColor::Default;
+            let mut last_bold = false;
+            let mut last_italic = false;
+            let mut last_underline = false;
+
+            queue!(stdout, ResetColor)?;
+
+            for col in 0..pw {
+                let screen_x = px + col;
+                if screen_x >= self.cols as usize {
+                    break;
+                }
+                let cell = if screen_x < self.front[screen_y].len() {
+                    &self.front[screen_y][screen_x]
+                } else {
+                    continue;
+                };
+
+                if cell.fg != last_fg {
+                    queue!(stdout, SetForegroundColor(cell_color_to_crossterm(&cell.fg)))?;
+                    last_fg = cell.fg.clone();
+                }
+                if cell.bg != last_bg {
+                    queue!(stdout, SetBackgroundColor(cell_color_to_crossterm(&cell.bg)))?;
+                    last_bg = cell.bg.clone();
+                }
+                if cell.bold != last_bold {
+                    if cell.bold {
+                        queue!(stdout, SetAttribute(Attribute::Bold))?;
+                    } else {
+                        queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+                    }
+                    last_bold = cell.bold;
+                }
+                if cell.italic != last_italic {
+                    if cell.italic {
+                        queue!(stdout, SetAttribute(Attribute::Italic))?;
+                    } else {
+                        queue!(stdout, SetAttribute(Attribute::NoItalic))?;
+                    }
+                    last_italic = cell.italic;
+                }
+                if cell.underline != last_underline {
+                    if cell.underline {
+                        queue!(stdout, SetAttribute(Attribute::Underlined))?;
+                    } else {
+                        queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
+                    }
+                    last_underline = cell.underline;
+                }
+                queue!(stdout, Print(cell.c))?;
+            }
+
+            queue!(stdout, ResetColor)?;
+        }
+
+        // 3. Update cursor
+        if cursor_visible {
+            queue!(
+                stdout,
+                MoveTo(cursor_x, cursor_y),
+                cursor_style_command(cursor_style),
+                cursor::Show,
+            )?;
+        } else {
+            queue!(stdout, cursor::Hide)?;
+        }
+
+        Ok(())
+    }
+
     /// Flush all queued render commands to the terminal.
     /// Call this after all render methods for a frame are done.
     pub fn flush(&self) -> Result<()> {

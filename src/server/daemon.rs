@@ -119,6 +119,8 @@ struct ClientConnection {
     search_info: Option<(usize, usize)>,
     /// Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
     scroll_offset: usize,
+    /// Previous scroll_offset, for detecting scroll delta.
+    prev_scroll_offset: usize,
 }
 
 /// The Remux server.
@@ -271,6 +273,7 @@ impl RemuxServer {
                     mouse_selection: None,
                     search_info: None,
                     scroll_offset: 0,
+                    prev_scroll_offset: 0,
                 },
             );
             id
@@ -443,14 +446,77 @@ async fn handle_client_message(
             )
             .await
         }
-        ClientMessage::ScrollOffset { offset } => {
+        ClientMessage::ScrollDelta { delta } => {
+            // Apply delta to server-owned scroll offset, clamp to valid range.
+            let (session_name, cols, rows, old_offset) = {
+                let cls = clients.lock().await;
+                let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
+                let cols = cls.get(&client_id).map(|c| c.cols).unwrap_or(80);
+                let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
+                let so = cls.get(&client_id).map(|c| c.scroll_offset).unwrap_or(0);
+                (sn, cols, rows, so)
+            };
+            let new_offset = if delta > 0 {
+                old_offset.saturating_add(delta as usize)
+            } else {
+                old_offset.saturating_sub((-delta) as usize)
+            };
+            // Clamp to max scrollable range
+            let max_offset = if let Some(ref sn) = session_name {
+                let focused_pane_id = {
+                    let st = state.lock().await;
+                    st.sessions.get(sn).and_then(|sess| {
+                        sess.tabs.get(sess.active_tab).map(|t| t.focused_pane)
+                    })
+                };
+                if let Some(fp) = focused_pane_id {
+                    let ps = panes.lock().await;
+                    ps.get(&fp).map(|p| {
+                        let total = p.screen.total_lines();
+                        let content_rows = (rows as usize).saturating_sub(1);
+                        total.saturating_sub(content_rows)
+                    }).unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let clamped = new_offset.min(max_offset);
+            let changed = clamped != old_offset;
             {
                 let mut cls = clients.lock().await;
                 if let Some(client) = cls.get_mut(&client_id) {
-                    client.scroll_offset = offset;
+                    client.scroll_offset = clamped;
                 }
             }
-            // Get session name and dimensions for this client
+            // Only render if the offset actually changed (skip at boundary).
+            if changed {
+                if let Some(session_name) = session_name {
+                    send_full_render_to_client(
+                        client_id,
+                        &session_name,
+                        cols,
+                        rows,
+                        state,
+                        panes,
+                        clients,
+                        config,
+                        prev_frames,
+                    )
+                    .await;
+                }
+            }
+            Ok(())
+        }
+        ClientMessage::ScrollReset => {
+            {
+                let mut cls = clients.lock().await;
+                if let Some(client) = cls.get_mut(&client_id) {
+                    client.scroll_offset = 0;
+                    client.prev_scroll_offset = 0;
+                }
+            }
             let (session_name, cols, rows) = {
                 let cls = clients.lock().await;
                 let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
@@ -2074,19 +2140,79 @@ async fn send_full_render_to_client(
         pf.insert(session_name.to_string(), cells.clone());
     }
 
-    // Always send FullRender — avoids all diff race conditions with
-    // broadcast_full_render which runs in a separate async task.
-    let cls = clients.lock().await;
-    if let Some(client) = cls.get(&client_id) {
-        let _ = client.tx.send(ServerMessage::FullRender {
-            cells,
-            cursor_x,
-            cursor_y,
-            cursor_visible,
-            cursor_style,
-            focused_pane_rect,
-            application_cursor_keys,
-        });
+    let mut cls = clients.lock().await;
+    if let Some(client) = cls.get_mut(&client_id) {
+        let prev_so = client.prev_scroll_offset;
+        client.prev_scroll_offset = scroll_offset;
+
+        // Detect incremental scroll for ScrollRender optimization.
+        let delta = scroll_offset as i64 - prev_so as i64;
+        let abs_delta = delta.unsigned_abs() as usize;
+
+        let use_scroll_render = scroll_offset > 0
+            && prev_so > 0
+            && abs_delta > 0
+            && abs_delta <= 10
+            && focused_pane_rect.is_some();
+
+        if use_scroll_render {
+            let fpr = focused_pane_rect.unwrap();
+            let px = fpr.x as usize;
+            let py = fpr.y as usize;
+            let pw = fpr.width as usize;
+            let ph = fpr.height as usize;
+
+            let new_rows: Vec<Vec<RenderCell>> = if delta > 0 {
+                // Scrolled UP (deeper into history) — new rows at TOP of pane
+                (0..abs_delta)
+                    .map(|i| {
+                        let y = py + i;
+                        if y < cells.len() && px + pw <= cells[y].len() {
+                            cells[y][px..px + pw].to_vec()
+                        } else {
+                            vec![RenderCell::default(); pw]
+                        }
+                    })
+                    .collect()
+            } else {
+                // Scrolled DOWN (toward live view) — new rows at BOTTOM of pane
+                (0..abs_delta)
+                    .map(|i| {
+                        let y = py + ph - abs_delta + i;
+                        if y < cells.len() && px + pw <= cells[y].len() {
+                            cells[y][px..px + pw].to_vec()
+                        } else {
+                            vec![RenderCell::default(); pw]
+                        }
+                    })
+                    .collect()
+            };
+
+            let _ = client.tx.send(ServerMessage::ScrollRender {
+                pane_x: fpr.x,
+                pane_y: fpr.y,
+                pane_width: fpr.width,
+                pane_height: fpr.height,
+                delta: delta as i16,
+                new_rows,
+                cursor_x,
+                cursor_y,
+                cursor_visible,
+                cursor_style,
+                focused_pane_rect: Some(fpr),
+                application_cursor_keys,
+            });
+        } else {
+            let _ = client.tx.send(ServerMessage::FullRender {
+                cells,
+                cursor_x,
+                cursor_y,
+                cursor_visible,
+                cursor_style,
+                focused_pane_rect,
+                application_cursor_keys,
+            });
+        }
     }
 }
 

@@ -51,8 +51,11 @@ pub enum ClientMessage {
     SearchInfo { current: usize, total: usize },
     /// Request the full session tree (folders, sessions, tabs, panes).
     ListSessionTree,
-    /// Inform the server of the client's current scroll offset.
-    ScrollOffset { offset: usize },
+    /// Scroll the focused pane by delta lines (positive = up/back, negative = down/forward).
+    /// The server owns the scroll offset and clamps it to valid range.
+    ScrollDelta { delta: i32 },
+    /// Reset scroll to live view (offset 0).
+    ScrollReset,
     /// Request scrollback info (total line count) for the active pane.
     RequestScrollbackInfo,
 }
@@ -88,6 +91,26 @@ pub enum ServerMessage {
         focused_pane_rect: Option<PaneRect>,
         /// Whether the focused pane has application cursor keys (DECCKM) active.
         #[serde(default)]
+        application_cursor_keys: bool,
+    },
+    /// Optimized scroll render: shift content within a pane rect and render
+    /// only the new rows that appeared.
+    ScrollRender {
+        /// Pane content area to scroll within.
+        pane_x: u16,
+        pane_y: u16,
+        pane_width: u16,
+        pane_height: u16,
+        /// Rows to scroll. Positive = content moves UP (new rows at top).
+        /// Negative = content moves DOWN (new rows at bottom).
+        delta: i16,
+        /// The new rows to render. Length = abs(delta).
+        new_rows: Vec<Vec<RenderCell>>,
+        cursor_x: u16,
+        cursor_y: u16,
+        cursor_visible: bool,
+        cursor_style: u8,
+        focused_pane_rect: Option<PaneRect>,
         application_cursor_keys: bool,
     },
     /// Response to a `ListSessions` request.
