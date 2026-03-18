@@ -702,6 +702,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         }
                                     }
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::SessionManagerOpen => {
                                 // Hide which-key when opening session manager.
@@ -721,6 +722,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::SessionManagerClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
                                 // Notify server of mode change.
                                 client
                                     .send(ClientMessage::ModeChanged {
@@ -736,6 +738,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let draw_cmds = sm.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::SessionManagerAction(ref sm_action) => {
                                 match sm_action {
@@ -744,6 +747,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         input.mode = Mode::Normal;
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
                                         client.send(ClientMessage::Attach { session_name: name.clone() }).await?;
                                         client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                     }
@@ -752,6 +756,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         input.mode = Mode::Normal;
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
                                         client.send(ClientMessage::Command(RemuxCommand::SessionSwitchTab {
                                             session: session.clone(),
                                             tab_index: *tab_index,
@@ -763,6 +768,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         input.mode = Mode::Normal;
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
                                         client.send(ClientMessage::Command(RemuxCommand::SessionSwitchPane {
                                             session: session.clone(),
                                             tab_index: *tab_index,
@@ -817,6 +823,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         input.mode = Mode::Normal;
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
                                         if !has_sessions {
                                             break;
                                         }
@@ -850,10 +857,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let draw_cmds = fs.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::FolderSelectConfirm { ref session, ref folder } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
                                 // Send the move command
                                 client.send(ClientMessage::Command(RemuxCommand::FolderMoveSession {
                                     session: session.clone(),
@@ -864,6 +873,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::FolderSelectClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
                                 client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::SessionSwitchOpen => {
@@ -886,10 +896,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     let draw_cmds = ss.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                 }
+                                renderer.flush()?;
                             }
                             InputAction::SessionSwitchConfirm(ref session_name) => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
                                 client.send(ClientMessage::Attach { session_name: session_name.clone() }).await?;
                                 input.session_switch = None;
                                 input.mode = Mode::Normal;
@@ -898,6 +910,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
                                 input.session_switch = None;
                                 input.mode = Mode::Normal;
                                 client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -1079,6 +1092,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let commands = whichkey.render(cols, rows, &theme);
                             renderer.render_whichkey_overlay(&commands)?;
                         }
+                        renderer.flush()?;
                     }
                     Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack }) => {
                         focused_pane_rect = fpr;
@@ -1146,6 +1160,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             let commands = whichkey.render(cols, rows, &theme);
                             renderer.render_whichkey_overlay(&commands)?;
                         }
+                        renderer.flush()?;
                     }
                     Some(ServerMessage::SessionList { sessions }) => {
                         log::debug!("received session list with {} sessions", sessions.len());
@@ -1201,6 +1216,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     focused_pane_rect.as_ref(),
                                     &theme,
                                 )?;
+                                renderer.flush()?;
                             }
                         }
                     }
@@ -1273,6 +1289,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.render_whichkey_overlay(&draw_cmds)?;
                             }
                         }
+                        renderer.flush()?;
                     }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: {:?}", event);
