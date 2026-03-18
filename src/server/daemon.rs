@@ -465,17 +465,19 @@ async fn handle_client_message(
             let max_offset = if let Some(ref sn) = session_name {
                 let focused_pane_id = {
                     let st = state.lock().await;
-                    st.sessions.get(sn).and_then(|sess| {
-                        sess.tabs.get(sess.active_tab).map(|t| t.focused_pane)
-                    })
+                    st.sessions
+                        .get(sn)
+                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
                 };
                 if let Some(fp) = focused_pane_id {
                     let ps = panes.lock().await;
-                    ps.get(&fp).map(|p| {
-                        let total = p.screen.total_lines();
-                        let content_rows = (rows as usize).saturating_sub(1);
-                        total.saturating_sub(content_rows)
-                    }).unwrap_or(0)
+                    ps.get(&fp)
+                        .map(|p| {
+                            let total = p.screen.total_lines();
+                            let content_rows = (rows as usize).saturating_sub(1);
+                            total.saturating_sub(content_rows)
+                        })
+                        .unwrap_or(0)
                 } else {
                     0
                 }

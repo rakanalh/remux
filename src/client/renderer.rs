@@ -309,11 +309,17 @@ impl Renderer {
                 };
 
                 if cell.fg != last_fg {
-                    queue!(stdout, SetForegroundColor(cell_color_to_crossterm(&cell.fg)))?;
+                    queue!(
+                        stdout,
+                        SetForegroundColor(cell_color_to_crossterm(&cell.fg))
+                    )?;
                     last_fg = cell.fg.clone();
                 }
                 if cell.bg != last_bg {
-                    queue!(stdout, SetBackgroundColor(cell_color_to_crossterm(&cell.bg)))?;
+                    queue!(
+                        stdout,
+                        SetBackgroundColor(cell_color_to_crossterm(&cell.bg))
+                    )?;
                     last_bg = cell.bg.clone();
                 }
                 if cell.bold != last_bold {
