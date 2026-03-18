@@ -150,7 +150,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
             "Search",
             vec![
                 ('s', leaf("search", "EnterSearchMode")),
-                ('e', leaf("edit in editor", "BufferEditInEditor")),
+                ('e', leaf("open in editor", "BufferEditInEditor")),
             ],
         ),
     );
