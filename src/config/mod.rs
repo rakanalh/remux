@@ -16,6 +16,48 @@ pub struct Config {
     pub appearance: AppearanceConfig,
     pub modes: ModesConfig,
     pub keybindings: KeybindingsConfig,
+    /// Named remote servers reachable over SSH, keyed by a short label used in
+    /// the session manager tree. Configured via `[remotes.<name>]` tables.
+    pub remotes: std::collections::HashMap<String, RemoteConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Remotes
+// ---------------------------------------------------------------------------
+
+/// Configuration for a single remote Remux server reachable over SSH.
+///
+/// Example `config.toml`:
+/// ```toml
+/// [remotes.pi]
+/// ssh = "pi@raspberrypi.local"
+/// remux_path = "/usr/local/bin/remux"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// SSH destination, e.g. `"user@host"` (relies on `~/.ssh/config`).
+    pub ssh: String,
+    /// Optional SSH port (`-p`).
+    pub port: Option<u16>,
+    /// Optional identity file (`-i`).
+    pub identity: Option<String>,
+    /// Path to the `remux` binary on the remote host.
+    pub remux_path: String,
+    /// Extra arguments passed to `ssh` before the destination.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            ssh: String::new(),
+            port: None,
+            identity: None,
+            remux_path: "remux".to_string(),
+            extra_args: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +242,7 @@ impl Default for Config {
             appearance: AppearanceConfig::default(),
             modes: ModesConfig::default(),
             keybindings: KeybindingsConfig::default(),
+            remotes: std::collections::HashMap::new(),
         }
     }
 }
@@ -464,6 +507,42 @@ mod tests {
         let leader = config.leader_key();
         assert_eq!(leader.code, crossterm::event::KeyCode::Char('a'));
         assert_eq!(leader.modifiers, crossterm::event::KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn deserialize_remotes_config() {
+        let toml_str = r#"
+            [remotes.pi]
+            ssh = "pi@raspberrypi.local"
+            remux_path = "/usr/local/bin/remux"
+
+            [remotes.server]
+            ssh = "user@example.com"
+            port = 2222
+            identity = "~/.ssh/id_ed25519"
+            extra_args = ["-o", "StrictHostKeyChecking=no"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.remotes.len(), 2);
+
+        let pi = &config.remotes["pi"];
+        assert_eq!(pi.ssh, "pi@raspberrypi.local");
+        assert_eq!(pi.remux_path, "/usr/local/bin/remux");
+        assert!(pi.port.is_none());
+        assert!(pi.extra_args.is_empty());
+
+        let server = &config.remotes["server"];
+        assert_eq!(server.port, Some(2222));
+        assert_eq!(server.identity.as_deref(), Some("~/.ssh/id_ed25519"));
+        // remux_path defaults to "remux" when omitted.
+        assert_eq!(server.remux_path, "remux");
+        assert_eq!(server.extra_args, vec!["-o", "StrictHostKeyChecking=no"]);
+    }
+
+    #[test]
+    fn default_config_has_no_remotes() {
+        let config = Config::default();
+        assert!(config.remotes.is_empty());
     }
 
     #[test]

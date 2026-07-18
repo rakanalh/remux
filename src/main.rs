@@ -19,6 +19,7 @@ use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
     FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget, SessionSwitchOverlay,
 };
+use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
@@ -137,7 +138,7 @@ async fn main() -> Result<()> {
                 .await?
                 .context("server disconnected unexpectedly")?;
 
-            match response {
+            let attached_session = match response {
                 ServerMessage::SessionList { sessions } => {
                     if sessions.is_empty() {
                         // No sessions exist, create a default one
@@ -154,18 +155,25 @@ async fn main() -> Result<()> {
                                 session_name: "main".to_string(),
                             })
                             .await?;
+                        "main".to_string()
                     } else {
                         // Attach to the first session
                         let session_name = sessions[0].name.clone();
-                        client.send(ClientMessage::Attach { session_name }).await?;
+                        client
+                            .send(ClientMessage::Attach {
+                                session_name: session_name.clone(),
+                            })
+                            .await?;
+                        session_name
                     }
                 }
                 _ => {
                     anyhow::bail!("unexpected response from server");
                 }
-            }
+            };
 
-            client_event_loop(&mut client, &config).await?;
+            let mut mgr = ConnectionManager::new(client, &config.remotes);
+            client_event_loop(&mut mgr, &config, Some(attached_session)).await?;
         }
         Some(Commands::New { session, folder }) => {
             log::debug!("cmd: new session={session:?} folder={folder:?}");
@@ -183,11 +191,12 @@ async fn main() -> Result<()> {
             let _ = client.recv().await?;
             client
                 .send(ClientMessage::Attach {
-                    session_name: session,
+                    session_name: session.clone(),
                 })
                 .await?;
 
-            client_event_loop(&mut client, &config).await?;
+            let mut mgr = ConnectionManager::new(client, &config.remotes);
+            client_event_loop(&mut mgr, &config, Some(session)).await?;
         }
         Some(Commands::Attach { name }) => {
             log::debug!("cmd: attach session={name:?}");
@@ -196,10 +205,13 @@ async fn main() -> Result<()> {
             let config = Config::load()?;
 
             client
-                .send(ClientMessage::Attach { session_name: name })
+                .send(ClientMessage::Attach {
+                    session_name: name.clone(),
+                })
                 .await?;
 
-            client_event_loop(&mut client, &config).await?;
+            let mut mgr = ConnectionManager::new(client, &config.remotes);
+            client_event_loop(&mut mgr, &config, Some(name)).await?;
         }
         Some(Commands::Ls) => {
             log::debug!("cmd: list sessions");
@@ -252,14 +264,17 @@ async fn main() -> Result<()> {
             );
             // The server we want is the remote one; the relay starts it there,
             // so we deliberately do NOT call ensure_server_running() locally.
-            let mut client = RemuxClient::connect_ssh(&dest, &remux_path).await?;
+            let mut client = RemuxClient::connect_ssh(&dest, None, None, &[], &remux_path).await?;
             let config = Config::load()?;
 
             client
                 .send(ClientMessage::Attach { session_name: name })
                 .await?;
 
-            client_event_loop(&mut client, &config).await?;
+            // Wrap in a manager with a synthetic remote foreground so the loop's
+            // multi-connection routing applies uniformly; no `[remotes]` involved.
+            let mut mgr = ConnectionManager::new_foreground_remote(&dest, client);
+            client_event_loop(&mut mgr, &config, None).await?;
         }
         Some(Commands::Relay) => {
             log::info!("cmd: relay starting");
@@ -377,11 +392,19 @@ async fn ensure_server_running() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Run the client event loop with terminal setup/restore.
-async fn client_event_loop(client: &mut RemuxClient, config: &Config) -> Result<()> {
+///
+/// `initial_local_session` is the local session attached before the loop
+/// started (if any); it seeds `last_local_session` so a foreground-remote drop
+/// can fall back to it.
+async fn client_event_loop(
+    mgr: &mut ConnectionManager,
+    config: &Config,
+    initial_local_session: Option<String>,
+) -> Result<()> {
     log::debug!("client_event_loop: setting up terminal");
     setup_terminal()?;
 
-    let result = run_client_loop(client, config).await;
+    let result = run_client_loop(mgr, config, initial_local_session).await;
 
     log::debug!(
         "client_event_loop: restoring terminal, result={}",
@@ -391,8 +414,43 @@ async fn client_event_loop(client: &mut RemuxClient, config: &Config) -> Result<
     result
 }
 
+/// Hand the foreground over to `target`: connect it if it is a not-yet-connected
+/// remote, detach the current foreground so it stops streaming, make `target`
+/// the foreground, and resize it to the current terminal.
+///
+/// No-op (and crucially no `Detach`) when `target` is already the foreground, so
+/// same-server switches behave exactly as before. The detach-before-attach step
+/// is mandatory on a cross-server handoff: skipping it leaves the old server
+/// streaming `RenderDiff`s into a socket nobody drains (backpressure).
+async fn switch_to_server(
+    mgr: &mut ConnectionManager,
+    target: &ConnId,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    if mgr.is_foreground(target) {
+        return Ok(());
+    }
+    // Ensure a remote target is connected before handing off (it usually already
+    // is, from expanding its node, but be safe).
+    if let ConnId::Remote(name) = target {
+        if mgr.remote_state(name) != RemoteState::Connected {
+            mgr.connect_remote(name).await?;
+        }
+    }
+    let _ = mgr.send_foreground(ClientMessage::Detach).await;
+    mgr.set_foreground(target.clone());
+    mgr.send(target, ClientMessage::Resize { cols, rows })
+        .await?;
+    Ok(())
+}
+
 /// The inner client event loop.
-async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()> {
+async fn run_client_loop(
+    mgr: &mut ConnectionManager,
+    config: &Config,
+    initial_local_session: Option<String>,
+) -> Result<()> {
     use crossterm::event::EventStream;
 
     config.validate();
@@ -419,6 +477,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     // Whether the client is currently scrolled back (server owns the actual offset).
     let mut is_scrolled: bool = false;
 
+    // The last local session we attached to; the fallback target if a
+    // foreground-remote connection drops. Seeded from the pre-loop attach.
+    let mut last_local_session: Option<String> = initial_local_session;
+
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
     let mut last_drag_send: Instant = Instant::now();
@@ -427,7 +489,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
 
     // Tell server our terminal size
     log::debug!("run_client_loop: sending initial resize {}x{}", cols, rows);
-    client.send(ClientMessage::Resize { cols, rows }).await?;
+    mgr.send_foreground(ClientMessage::Resize { cols, rows })
+        .await?;
 
     loop {
         tokio::select! {
@@ -454,9 +517,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 if is_scrolled {
                                     scroll_offset = 0;
                                     is_scrolled = false;
-                                    client.send(ClientMessage::ScrollReset).await?;
+                                    mgr.send_foreground(ClientMessage::ScrollReset).await?;
                                 }
-                                client.send(ClientMessage::Input { data }).await?;
+                                mgr.send_foreground(ClientMessage::Input { data }).await?;
                             }
                             InputAction::Execute(cmd) => {
                                 log::debug!("input: Execute cmd={:?}", cmd);
@@ -476,9 +539,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 }
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
-                                    client.send(ClientMessage::Input { data: bytes.clone() }).await?;
+                                    mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
                                 } else {
-                                    client.send(ClientMessage::Command(cmd)).await?;
+                                    mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                 }
                                 // Notify server of current mode if it changed.
                                 let mode_str = match input.mode {
@@ -489,8 +552,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Search => "SEARCH",
                                     Mode::SessionManager => "SESSION_MANAGER",
                                 };
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
@@ -508,9 +571,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         return Ok(());
                                     }
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
-                                        client.send(ClientMessage::Input { data: bytes.clone() }).await?;
+                                        mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
                                     } else {
-                                        client.send(ClientMessage::Command(cmd)).await?;
+                                        mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                     }
                                 }
                                 // Notify server of current mode.
@@ -522,8 +585,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Search => "SEARCH",
                                     Mode::SessionManager => "SESSION_MANAGER",
                                 };
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
@@ -538,8 +601,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Search => "SEARCH",
                                     Mode::SessionManager => "SESSION_MANAGER",
                                 };
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
@@ -548,7 +611,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     log::debug!("input: resetting scroll on mode change, old offset={}", scroll_offset);
                                     scroll_offset = 0;
                                     is_scrolled = false;
-                                    client.send(ClientMessage::ScrollReset).await?;
+                                    mgr.send_foreground(ClientMessage::ScrollReset).await?;
                                 }
                                 // When entering Visual mode, scope to the
                                 // focused pane's bounds instead of the full
@@ -585,7 +648,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         }
                                     }
                                     // Request scrollback info to get accurate total_lines.
-                                    client.send(ClientMessage::RequestScrollbackInfo).await?;
+                                    mgr.send_foreground(ClientMessage::RequestScrollbackInfo).await?;
                                 }
                                 // When entering Search mode, render the prompt.
                                 if mode == Mode::Search {
@@ -619,8 +682,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.render_rename_popup("", target_str, c, r)?;
                                 renderer.flush()?;
                                 // Notify server we're in a rename state
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: "COMMAND".to_string(),
                                     })
                                     .await?;
@@ -641,7 +704,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::EditInEditor => {
                                 log::debug!("input: EditInEditor requested");
                                 input.pending_editor_open = true;
-                                client.send(ClientMessage::RequestScrollback).await?;
+                                mgr.send_foreground(ClientMessage::RequestScrollback).await?;
                             }
                             InputAction::RenameUpdate(ref text) => {
                                 // Re-render the rename popup with updated text.
@@ -681,10 +744,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 if scroll_offset > 0 || is_scrolled {
                                     scroll_offset = 0;
                                     is_scrolled = false;
-                                    client.send(ClientMessage::ScrollReset).await?;
+                                    mgr.send_foreground(ClientMessage::ScrollReset).await?;
                                 }
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: "NORMAL".to_string(),
                                     })
                                     .await?;
@@ -700,7 +763,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     scroll_offset = vs.scroll_offset;
                                     let delta = scroll_offset as i32 - old as i32;
                                     if delta != 0 {
-                                        client.send(ClientMessage::ScrollDelta { delta }).await?;
+                                        mgr.send_foreground(ClientMessage::ScrollDelta { delta }).await?;
                                     }
                                 }
                             }
@@ -718,8 +781,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 }
                                 renderer.flush()?;
                                 // Notify server of mode change.
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: "PALETTE".to_string(),
                                     })
                                     .await?;
@@ -751,8 +814,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     Mode::Search => "SEARCH",
                                     Mode::SessionManager => "SESSION_MANAGER",
                                 };
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
@@ -770,7 +833,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 log::debug!("input: SearchConfirm query={query:?}");
                                 // Keep current scroll position — search starts from where user is.
                                 // Request scrollback from server.
-                                client.send(ClientMessage::RequestScrollback).await?;
+                                mgr.send_foreground(ClientMessage::RequestScrollback).await?;
                                 // Re-render prompt with confirmed query.
                                 if let Some(ref ss) = input.search_state {
                                     let (c, r) = crossterm::terminal::size()?;
@@ -781,9 +844,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::SearchCancel => {
                                 log::debug!("input: SearchCancel");
                                 // Clear search info on server.
-                                client.send(ClientMessage::SearchInfo { current: 0, total: 0 }).await?;
+                                mgr.send_foreground(ClientMessage::SearchInfo { current: 0, total: 0 }).await?;
                                 // Send mode changed to NORMAL.
-                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 // Clear overlay.
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
@@ -791,7 +854,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 if scroll_offset > 0 || is_scrolled {
                                     scroll_offset = 0;
                                     is_scrolled = false;
-                                    client.send(ClientMessage::ScrollReset).await?;
+                                    mgr.send_foreground(ClientMessage::ScrollReset).await?;
                                 }
                                 renderer.flush()?;
                             }
@@ -801,7 +864,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     input.search_state.as_ref().map(|s| s.matches.len()).unwrap_or(0));
                                 // Update search info on server and re-render prompt.
                                 if let Some(ref ss) = input.search_state {
-                                    client.send(ClientMessage::SearchInfo {
+                                    mgr.send_foreground(ClientMessage::SearchInfo {
                                         current: ss.current_match,
                                         total: ss.matches.len(),
                                     }).await?;
@@ -838,7 +901,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                             let delta = scroll_offset as i32 - target_vt as i32;
                                             scroll_offset = target_vt;
                                             if delta != 0 {
-                                                client.send(ClientMessage::ScrollDelta { delta }).await?;
+                                                mgr.send_foreground(ClientMessage::ScrollDelta { delta }).await?;
                                             }
                                         }
                                     }
@@ -852,11 +915,19 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
-                                // Request session tree from server.
-                                client.send(ClientMessage::ListSessionTree).await?;
-                                // Notify server of mode change.
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                // Seed the freshly-opened manager with the server
+                                // roster and current foreground.
+                                if let Some(sm) = input.session_manager.as_mut() {
+                                    sm.set_foreground(mgr.foreground().clone());
+                                    sm.set_roster(mgr.server_roster());
+                                }
+                                // Refresh every connected server's subtree.
+                                for id in mgr.connected_ids() {
+                                    mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                                }
+                                // Notify the foreground server of the mode change.
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: "SESSION_MANAGER".to_string(),
                                     })
                                     .await?;
@@ -866,8 +937,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
                                 // Notify server of mode change.
-                                client
-                                    .send(ClientMessage::ModeChanged {
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
                                         mode: "NORMAL".to_string(),
                                     })
                                     .await?;
@@ -884,83 +955,121 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             }
                             InputAction::SessionManagerAction(ref sm_action) => {
                                 log::debug!("input: SessionManagerAction {:?}", sm_action);
+                                // Clone out of the borrow so we can mutate `input`/`mgr` freely.
+                                let sm_action = sm_action.clone();
                                 match sm_action {
-                                    SessionManagerAction::SwitchSession(name) => {
-                                        input.session_manager = None;
-                                        input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
-                                        renderer.flush()?;
-                                        client.send(ClientMessage::Attach { session_name: name.clone() }).await?;
-                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    SessionManagerAction::ConnectRemote(name) => {
+                                        // Lazily connect the remote server node, then
+                                        // list its tree and refresh the roster/rows.
+                                        match mgr.connect_remote(&name).await {
+                                            Ok(()) => {
+                                                mgr.send(&ConnId::Remote(name.clone()), ClientMessage::ListSessionTree).await?;
+                                            }
+                                            Err(e) => {
+                                                log::warn!("connect remote '{name}' failed: {e:#}");
+                                            }
+                                        }
+                                        // Reflect new state (Connected or Failed) on the node.
+                                        if let Some(sm) = input.session_manager.as_mut() {
+                                            sm.set_foreground(mgr.foreground().clone());
+                                            sm.set_roster(mgr.server_roster());
+                                            let (c, r) = crossterm::terminal::size()?;
+                                            renderer.clear_overlay(c, r)?;
+                                            let draw_cmds = sm.render(c, r, &theme);
+                                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                                            renderer.flush()?;
+                                        }
                                     }
-                                    SessionManagerAction::SwitchTab { session, tab_index } => {
+                                    SessionManagerAction::SwitchSession { server, session } => {
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        client.send(ClientMessage::Command(RemuxCommand::SessionSwitchTab {
+                                        switch_to_server(mgr, &server, c, r).await?;
+                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
+                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        if server == ConnId::Local {
+                                            last_local_session = Some(session.clone());
+                                        }
+                                    }
+                                    SessionManagerAction::SwitchTab { server, session, tab_index } => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
+                                        switch_to_server(mgr, &server, c, r).await?;
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchTab {
                                             session: session.clone(),
-                                            tab_index: *tab_index,
+                                            tab_index,
                                         })).await?;
-                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        if server == ConnId::Local {
+                                            last_local_session = Some(session.clone());
+                                        }
                                     }
-                                    SessionManagerAction::SwitchPane { session, tab_index, pane_id } => {
+                                    SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        client.send(ClientMessage::Command(RemuxCommand::SessionSwitchPane {
+                                        switch_to_server(mgr, &server, c, r).await?;
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchPane {
                                             session: session.clone(),
-                                            tab_index: *tab_index,
-                                            pane_id: *pane_id,
+                                            tab_index,
+                                            pane_id,
                                         })).await?;
-                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        if server == ConnId::Local {
+                                            last_local_session = Some(session.clone());
+                                        }
                                     }
+                                    // Structural edits are Local-only (guarded in the
+                                    // session manager) and always target the Local server,
+                                    // regardless of which connection is foreground.
                                     SessionManagerAction::CreateFolder(name) => {
-                                        client.send(ClientMessage::Command(RemuxCommand::FolderNew(name.clone()))).await?;
-                                        // Refresh tree.
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderNew(name.clone()))).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::CreateSession { name, folder } => {
-                                        client.send(ClientMessage::CreateSession {
+                                        mgr.send(&ConnId::Local, ClientMessage::CreateSession {
                                             name: name.clone(),
                                             folder: folder.clone(),
                                         }).await?;
-                                        // Wait for creation event before refreshing tree.
-                                        // The refresh will happen when we receive SessionTree.
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::MoveSession { session, folder } => {
-                                        client.send(ClientMessage::Command(RemuxCommand::FolderMoveSession {
+                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderMoveSession {
                                             session: session.clone(),
                                             folder: folder.clone(),
                                         })).await?;
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::DeleteSession(name) => {
-                                        client.send(ClientMessage::KillSession { name: name.clone() }).await?;
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::KillSession { name: name.clone() }).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::DeleteFolder(name) => {
-                                        client.send(ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::CloseTab { session, tab_index } => {
-                                        client.send(ClientMessage::Command(RemuxCommand::TabCloseByIndex {
+                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::TabCloseByIndex {
                                             session: session.clone(),
-                                            tab_index: *tab_index,
+                                            tab_index,
                                         })).await?;
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::RefreshTree => {
-                                        client.send(ClientMessage::ListSessionTree).await?;
+                                        for id in mgr.connected_ids() {
+                                            mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                                        }
                                     }
                                     SessionManagerAction::Close => {
                                         let has_sessions = input.session_manager.as_ref()
-                                            .map(|sm| sm.rows.iter().any(|r| matches!(r.node_type, NodeType::Session(_))))
+                                            .map(|sm| sm.rows.iter().any(|r| matches!(r.node_type, NodeType::Session { .. })))
                                             .unwrap_or(false);
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
@@ -970,7 +1079,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         if !has_sessions {
                                             break;
                                         }
-                                        client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                     }
                                     SessionManagerAction::None => {}
                                 }
@@ -982,7 +1091,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     renderer.clear_overlay(cols, rows)?;
                                 }
                                 // Request session tree to get folder list
-                                client.send(ClientMessage::ListSessionTree).await?;
+                                mgr.send_foreground(ClientMessage::ListSessionTree).await?;
                                 // Set mode to Command to block normal input
                                 input.mode = Mode::Command;
                                 // Initialize with a loading placeholder
@@ -991,7 +1100,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     selected: 0,
                                     session_name: String::new(),
                                 });
-                                client.send(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
                             }
                             InputAction::FolderSelectUpdate => {
                                 if let Some(ref fs) = input.folder_select {
@@ -1007,30 +1116,30 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
                                 // Send the move command
-                                client.send(ClientMessage::Command(RemuxCommand::FolderMoveSession {
+                                mgr.send_foreground(ClientMessage::Command(RemuxCommand::FolderMoveSession {
                                     session: session.clone(),
                                     folder: folder.clone(),
                                 })).await?;
-                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::FolderSelectClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::SessionSwitchOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
-                                client.send(ClientMessage::ListSessionTree).await?;
+                                mgr.send_foreground(ClientMessage::ListSessionTree).await?;
                                 input.mode = Mode::Command;
                                 input.session_switch = Some(SessionSwitchOverlay {
                                     sessions: vec!["Loading...".to_string()],
                                     selected: 0,
                                 });
-                                client.send(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
                             }
                             InputAction::SessionSwitchUpdate => {
                                 if let Some(ref ss) = input.session_switch {
@@ -1045,10 +1154,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                client.send(ClientMessage::Attach { session_name: session_name.clone() }).await?;
+                                mgr.send_foreground(ClientMessage::Attach { session_name: session_name.clone() }).await?;
                                 input.session_switch = None;
                                 input.mode = Mode::Normal;
-                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
@@ -1056,16 +1165,16 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                                 input.session_switch = None;
                                 input.mode = Mode::Normal;
-                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::NewSession(ref name) => {
                                 // Create the session and then attach to it.
-                                client.send(ClientMessage::CreateSession {
+                                mgr.send_foreground(ClientMessage::CreateSession {
                                     name: name.clone(),
                                     folder: None,
                                 }).await?;
-                                client.send(ClientMessage::Attach { session_name: name.clone() }).await?;
-                                client.send(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                mgr.send_foreground(ClientMessage::Attach { session_name: name.clone() }).await?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
                             InputAction::None => {}
                         }
@@ -1076,8 +1185,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 log::debug!("mouse: click at ({}, {})", mouse.column, mouse.row);
                                 drag_start = Some((mouse.column, mouse.row));
                                 // Send click immediately.
-                                client
-                                    .send(ClientMessage::MouseClick {
+                                mgr
+                                    .send_foreground(ClientMessage::MouseClick {
                                         x: mouse.column,
                                         y: mouse.row,
                                     })
@@ -1088,8 +1197,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 let now = Instant::now();
                                 if now.duration_since(last_drag_send) >= DRAG_THROTTLE {
                                     if let Some((sx, sy)) = drag_start {
-                                        client
-                                            .send(ClientMessage::MouseDrag {
+                                        mgr
+                                            .send_foreground(ClientMessage::MouseDrag {
                                                 start_x: sx,
                                                 start_y: sy,
                                                 end_x: mouse.column,
@@ -1105,8 +1214,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 // Send final drag on release.
                                 if let Some((sx, sy)) = drag_start.take() {
                                     if sx != mouse.column || sy != mouse.row {
-                                        client
-                                            .send(ClientMessage::MouseDrag {
+                                        mgr
+                                            .send_foreground(ClientMessage::MouseDrag {
                                                 start_x: sx,
                                                 start_y: sy,
                                                 end_x: mouse.column,
@@ -1126,7 +1235,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     }
                                 }
                                 is_scrolled = true;
-                                client.send(ClientMessage::ScrollDelta { delta: 3 }).await?;
+                                mgr.send_foreground(ClientMessage::ScrollDelta { delta: 3 }).await?;
                             }
                             MouseEventKind::ScrollDown => {
                                 log::debug!("mouse: scroll down, is_scrolled={}", is_scrolled);
@@ -1136,7 +1245,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         scroll_offset = vs.scroll_offset;
                                     }
                                 }
-                                client.send(ClientMessage::ScrollDelta { delta: -3 }).await?;
+                                mgr.send_foreground(ClientMessage::ScrollDelta { delta: -3 }).await?;
                             }
                             _ => {}
                         }
@@ -1144,7 +1253,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
                         log::debug!("resize: {}x{}", new_cols, new_rows);
                         renderer.resize(new_cols, new_rows);
-                        client.send(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
+                        mgr.send_foreground(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
                     }
                     Some(Ok(crossterm::event::Event::Paste(text))) => {
                         // Wrap pasted text in bracketed paste sequences.
@@ -1152,7 +1261,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         data.extend_from_slice(b"\x1b[200~");
                         data.extend_from_slice(text.as_bytes());
                         data.extend_from_slice(b"\x1b[201~");
-                        client.send(ClientMessage::Input { data }).await?;
+                        mgr.send_foreground(ClientMessage::Input { data }).await?;
                     }
                     Some(Err(e)) => {
                         log::error!("Event error: {}", e);
@@ -1162,8 +1271,101 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                 }
             }
             // Server messages
-            msg = client.recv() => {
-                match msg? {
+            maybe_incoming = mgr.recv() => {
+                // Decode the routed message and its source connection. A `Closed`
+                // is handled here (foreground-drop fallback / background cleanup);
+                // otherwise we get the source id and an owned `ServerMessage`.
+                let incoming = match maybe_incoming {
+                    Some(i) => i,
+                    // Every connection (including local) is gone — nothing left to
+                    // drive the loop.
+                    None => return Ok(()),
+                };
+                let (src, msg) = match incoming {
+                    Incoming::Message(src, m) => (src, Some(m)),
+                    Incoming::Closed(src) => {
+                        log::debug!("srv: connection closed src={:?}", src);
+                        if mgr.is_foreground(&src) {
+                            match &src {
+                                // Local foreground drop: exit the client (unchanged).
+                                ConnId::Local => return Ok(()),
+                                // Foreground remote drop: fall back to local; MUST
+                                // NOT exit the client.
+                                ConnId::Remote(name) => {
+                                    log::warn!("foreground remote '{name}' dropped; falling back to local");
+                                    mgr.fail_remote(name, "connection lost".to_string());
+                                    // The standalone `attach-remote` flow has no local
+                                    // connection to fall back to — exit gracefully.
+                                    if !mgr.connected_ids().contains(&ConnId::Local) {
+                                        log::warn!("no local connection to fall back to; exiting");
+                                        return Ok(());
+                                    }
+                                    mgr.set_foreground(ConnId::Local);
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    mgr.send(&ConnId::Local, ClientMessage::Resize { cols: c, rows: r }).await?;
+                                    if let Some(session) = last_local_session.clone() {
+                                        // Reattach; the server responds with a fresh FullRender.
+                                        mgr.send(&ConnId::Local, ClientMessage::Attach { session_name: session }).await?;
+                                    } else {
+                                        // Nothing to fall back to: open the session manager.
+                                        input.mode = Mode::SessionManager;
+                                        input.session_manager = Some(
+                                            crate::client::session_manager::SessionManagerState::new(None),
+                                        );
+                                        if let Some(sm) = input.session_manager.as_mut() {
+                                            sm.set_foreground(mgr.foreground().clone());
+                                            sm.set_roster(mgr.server_roster());
+                                        }
+                                        for id in mgr.connected_ids() {
+                                            mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                                        }
+                                        mgr.send(&ConnId::Local, ClientMessage::ModeChanged { mode: "SESSION_MANAGER".to_string() }).await?;
+                                    }
+                                    // If the session manager was open when the remote
+                                    // dropped, refresh it so the node stops showing
+                                    // Connected and reflects the new foreground.
+                                    if let Some(sm) = input.session_manager.as_mut() {
+                                        sm.set_foreground(mgr.foreground().clone());
+                                        sm.set_roster(mgr.server_roster());
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        let draw_cmds = sm.render(c, r, &theme);
+                                        renderer.render_whichkey_overlay(&draw_cmds)?;
+                                        renderer.flush()?;
+                                    }
+                                }
+                            }
+                        } else {
+                            // A background remote dropped: mark it Failed and, if the
+                            // session manager is open, refresh its roster/rows.
+                            if let ConnId::Remote(name) = &src {
+                                mgr.fail_remote(name, "connection lost".to_string());
+                            }
+                            if let Some(sm) = input.session_manager.as_mut() {
+                                sm.set_foreground(mgr.foreground().clone());
+                                sm.set_roster(mgr.server_roster());
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                let draw_cmds = sm.render(c, r, &theme);
+                                renderer.render_whichkey_overlay(&draw_cmds)?;
+                                renderer.flush()?;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                // Background connections' renders are dropped: only the foreground
+                // streams to the screen. This preserves the tuned render hot path.
+                if matches!(
+                    msg,
+                    Some(ServerMessage::FullRender { .. })
+                        | Some(ServerMessage::RenderDiff { .. })
+                        | Some(ServerMessage::ScrollRender { .. })
+                ) && !mgr.is_foreground(&src)
+                {
+                    continue;
+                }
+                match msg {
                     Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so);
@@ -1400,7 +1602,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             // Re-send resize in case terminal changed
                             let (cols, rows) = crossterm::terminal::size()?;
                             renderer.resize(cols, rows);
-                            client.send(ClientMessage::Resize { cols, rows }).await?;
+                            mgr.send_foreground(ClientMessage::Resize { cols, rows }).await?;
                         } else if let Some(ref mut ss) = input.search_state {
                             if let Some(ref query) = ss.confirmed_query {
                                 let pane_height = focused_pane_rect
@@ -1420,7 +1622,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 ss.current_match = first_match_idx.unwrap_or(ss.matches.len().saturating_sub(1));
 
                                 // Send search info to server.
-                                client.send(ClientMessage::SearchInfo {
+                                mgr.send_foreground(ClientMessage::SearchInfo {
                                     current: ss.current_match,
                                     total: ss.matches.len(),
                                 }).await?;
@@ -1438,7 +1640,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         scroll_offset = target_vt;
                                         is_scrolled = true;
                                         if delta != 0 {
-                                            client.send(ClientMessage::ScrollDelta { delta }).await?;
+                                            mgr.send_foreground(ClientMessage::ScrollDelta { delta }).await?;
                                         }
                                     }
                                 }
@@ -1461,9 +1663,10 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled }) => {
-                        log::debug!("srv: SessionTree folders={} unfiled={}", folders.len(), unfiled.len());
-                        // If session switch overlay is active, populate it
-                        if input.session_switch.is_some() {
+                        log::debug!("srv: SessionTree src={:?} folders={} unfiled={}", src, folders.len(), unfiled.len());
+                        // The session-switch / folder-select popups are foreground
+                        // concerns (only the foreground ever requests their trees).
+                        if mgr.is_foreground(&src) && input.session_switch.is_some() {
                             let mut session_names: Vec<String> = Vec::new();
                             for f in &folders {
                                 for s in &f.sessions {
@@ -1487,7 +1690,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             }
                         }
                         // If folder select overlay is active, populate it
-                        else if input.folder_select.is_some() {
+                        else if mgr.is_foreground(&src) && input.folder_select.is_some() {
                             let folder_names: Vec<String> = folders.iter().map(|f| f.name.clone()).collect();
                             // Find current session name and folder from the tree
                             let mut current_session_name = String::new();
@@ -1515,30 +1718,46 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 let draw_cmds = fs.render(c, r, &theme);
                                 renderer.render_whichkey_overlay(&draw_cmds)?;
                             }
-                        } else {
-                            let has_any_sessions = folders.iter().any(|f| !f.sessions.is_empty()) || !unfiled.is_empty();
-                            if !has_any_sessions && input.session_manager.is_some() {
+                        }
+                        // Otherwise route the tree into the session manager,
+                        // updating the source server's subtree.
+                        else if let Some(sm) = input.session_manager.as_mut() {
+                            sm.set_foreground(mgr.foreground().clone());
+                            sm.set_roster(mgr.server_roster());
+                            sm.update_tree(src, folders, unfiled);
+                            // If, after merging, no server has any session and the
+                            // foreground is local, the last session was closed —
+                            // exit as before. A remote-only empty tree must not
+                            // exit the client.
+                            let has_any = sm
+                                .rows
+                                .iter()
+                                .any(|r| matches!(r.node_type, NodeType::Session { .. }));
+                            if !has_any && mgr.is_foreground(&ConnId::Local) {
                                 input.session_manager = None;
                                 input.mode = Mode::Normal;
                                 break;
                             }
-                            if let Some(ref mut sm) = input.session_manager {
-                                sm.update_tree(folders, unfiled);
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
-                                let draw_cmds = sm.render(c, r, &theme);
-                                renderer.render_whichkey_overlay(&draw_cmds)?;
-                            }
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_overlay(c, r)?;
+                            let draw_cmds = sm.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
                         }
                         renderer.flush()?;
                     }
                     Some(ServerMessage::Event(event)) => {
-                        log::debug!("server event: {:?}", event);
-                        if matches!(event, crate::protocol::SessionEvent::SessionDeleted(_)) {
+                        log::debug!("server event: src={:?} {:?}", src, event);
+                        // Events are foreground-scoped: a background remote's
+                        // SessionDeleted must not drive the local loop.
+                        if mgr.is_foreground(&src)
+                            && matches!(event, crate::protocol::SessionEvent::SessionDeleted(_))
+                        {
                             // If session manager is open, just refresh the tree
                             // instead of breaking out of the event loop.
                             if input.session_manager.is_some() {
-                                client.send(ClientMessage::ListSessionTree).await?;
+                                for id in mgr.connected_ids() {
+                                    mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                                }
                             } else {
                                 break;
                             }
@@ -1551,11 +1770,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             vs.total_lines = total_lines;
                         }
                     }
-                    None => {
-                        log::debug!("srv: disconnected (None)");
-                        // Server disconnected
-                        break;
-                    }
+                    // Unreachable: `Closed` is handled in the preamble above, so
+                    // `msg` is always `Some` here.
+                    None => {}
                 }
             }
         }

@@ -97,19 +97,38 @@ impl RemuxClient {
     /// remote host and pumping the wire protocol through its stdio.
     ///
     /// `dest` is any SSH destination (`user@host`, or a `~/.ssh/config` alias);
-    /// `remux_path` is where the `remux` binary lives on the remote.
-    pub async fn connect_ssh(dest: &str, remux_path: &str) -> Result<Self> {
-        log::debug!("terminal: connect_ssh dest={dest} remux_path={remux_path}");
+    /// `remux_path` is where the `remux` binary lives on the remote. Optional
+    /// `port`/`identity` map to `ssh -p`/`-i`; `extra_args` are inserted before
+    /// the destination so `~/.ssh/config`-style options can be passed.
+    pub async fn connect_ssh(
+        dest: &str,
+        port: Option<u16>,
+        identity: Option<&str>,
+        extra_args: &[String],
+        remux_path: &str,
+    ) -> Result<Self> {
+        log::debug!(
+            "terminal: connect_ssh dest={dest} port={port:?} identity={identity:?} \
+             extra_args={extra_args:?} remux_path={remux_path}"
+        );
         // stderr is inherited so ssh host-key / password prompts are visible;
         // this runs before the terminal enters raw mode.
-        let mut child = Command::new("ssh")
+        let mut cmd = Command::new("ssh");
+        if let Some(port) = port {
+            cmd.arg("-p").arg(port.to_string());
+        }
+        if let Some(identity) = identity {
+            cmd.arg("-i").arg(identity);
+        }
+        cmd.args(extra_args)
             .arg(dest)
             .arg(remux_path)
             .arg("relay")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning ssh to {dest}"))?;
 
@@ -147,6 +166,20 @@ impl RemuxClient {
     /// Returns `Ok(None)` if the server closed the connection.
     pub async fn recv(&mut self) -> Result<Option<ServerMessage>> {
         read_message::<ServerMessage>(&mut self.reader).await
+    }
+
+    /// Decompose the client into its owned reader, writer, and (for SSH
+    /// connections) the child process handle. Used by the connection registry
+    /// to store the writer and spawn a dedicated reader task per connection.
+    #[allow(clippy::type_complexity)]
+    pub fn into_split(
+        self,
+    ) -> (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+        Option<Child>,
+    ) {
+        (self.reader, self.writer, self._child)
     }
 }
 

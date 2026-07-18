@@ -277,3 +277,25 @@ l = "ResizeRight 5"
 #   ToggleStyle                     — Toggle border style between zellij and tmux
 #   LayoutNext                      — Cycle through layout modes (BSP → Master → Monocle)
 #   SetMaster                       — Set the focused pane as the master pane
+
+# -----------------------------------------------------------------------------
+# Remotes
+# -----------------------------------------------------------------------------
+# Named remote Remux servers reachable over SSH. Each `[remotes.<name>]` table
+# adds a top-level node to the session manager tree; expanding it lazily
+# connects over SSH (spawning `<remux_path> relay` on the remote) and lists that
+# server's sessions. Attaching to a remote session hands the foreground render
+# loop over to the remote transport — remote sessions feel like local ones.
+#
+# Remote nodes support expand (connect) and switch-to-session/tab/pane only.
+# Structural edits (create/delete/rename/move) remain local-only.
+#
+# [remotes.pi]
+# ssh = "pi@raspberrypi.local"   # SSH destination; relies on ~/.ssh/config
+# remux_path = "/usr/local/bin/remux"  # path to remux on the remote (default: "remux")
+#
+# [remotes.server]
+# ssh = "user@example.com"
+# port = 2222                    # optional SSH port (-p)
+# identity = "~/.ssh/id_ed25519" # optional identity file (-i)
+# extra_args = ["-o", "StrictHostKeyChecking=no"]  # extra ssh args before the destination
