@@ -371,6 +371,9 @@ pub enum InputAction {
     CommandPaletteClose,
     /// Open the session manager overlay.
     SessionManagerOpen,
+    /// Connect to a remote (dest or alias), opening the session manager so the
+    /// remote and its sessions become visible.
+    RemoteConnect(String),
     /// Close the session manager overlay.
     SessionManagerClose,
     /// An action from the session manager (switch, delete, create, etc.).
@@ -1106,6 +1109,15 @@ impl InputHandler {
                                 crate::client::session_manager::SessionManagerState::new(None),
                             );
                             return InputAction::SessionManagerOpen;
+                        }
+                        RemuxCommand::RemoteConnect(dest) => {
+                            // Open the session manager (same as OpenSessionManager),
+                            // then request the connect via a dedicated action.
+                            self.mode = Mode::SessionManager;
+                            self.session_manager = Some(
+                                crate::client::session_manager::SessionManagerState::new(None),
+                            );
+                            return InputAction::RemoteConnect(dest.clone());
                         }
                         RemuxCommand::SessionMoveToFolder => {
                             return InputAction::FolderSelectOpen;
@@ -1944,6 +1956,16 @@ impl InputHandler {
                         RemuxCommand::EnterVisualMode => {
                             self.mode = Mode::Visual;
                             self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
+                        }
+                        RemuxCommand::RemoteConnect(dest) => {
+                            // Client-side command: open the session manager and
+                            // request the connect via a dedicated action rather
+                            // than forwarding the command to the server.
+                            self.mode = Mode::SessionManager;
+                            self.session_manager = Some(
+                                crate::client::session_manager::SessionManagerState::new(None),
+                            );
+                            return InputAction::RemoteConnect(dest.clone());
                         }
                         _ => {}
                     }

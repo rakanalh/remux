@@ -179,6 +179,22 @@ impl ConnectionManager {
     // Connecting remotes
     // -----------------------------------------------------------------------
 
+    /// Whether `name` is a key in the remotes map (configured or ad-hoc).
+    pub fn has_remote(&self, name: &str) -> bool {
+        self.remotes.contains_key(name)
+    }
+
+    /// Add a remote entry in state `NotConnected` with the given config, mirroring
+    /// how [`ConnectionManager::new`] seeds config remotes. Idempotent: if `name`
+    /// is already present it is left unchanged. Does NOT connect.
+    pub fn add_remote(&mut self, name: String, config: RemoteConfig) {
+        self.remotes.entry(name).or_insert_with(|| RemoteEntry {
+            config,
+            state: RemoteState::NotConnected,
+            _child: None,
+        });
+    }
+
     /// Lazily connect to a named remote over SSH. No-op if already `Connected`.
     /// On success spawns a reader task and marks the remote `Connected`; on
     /// failure or timeout marks it `Failed(msg)` and returns the error.
@@ -432,6 +448,34 @@ mod tests {
             mgr.connected_ids(),
             vec![ConnId::Remote("alpha".to_string())]
         );
+    }
+
+    #[test]
+    fn add_remote_is_idempotent_and_has_remote_reports_presence() {
+        let mut mgr = ConnectionManager::empty(&HashMap::new(), ConnId::Local);
+        assert!(!mgr.has_remote("adhoc"));
+
+        // First insert seeds a NotConnected entry with the given config.
+        mgr.add_remote(
+            "adhoc".to_string(),
+            RemoteConfig {
+                ssh: "user@adhoc".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(mgr.has_remote("adhoc"));
+        assert_eq!(mgr.remote_state("adhoc"), RemoteState::NotConnected);
+
+        // Mutate state, then re-add: the existing entry must be left unchanged.
+        mgr.set_state("adhoc", RemoteState::Connected);
+        mgr.add_remote(
+            "adhoc".to_string(),
+            RemoteConfig {
+                ssh: "different@host".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(mgr.remote_state("adhoc"), RemoteState::Connected);
     }
 
     #[test]

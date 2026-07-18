@@ -359,6 +359,11 @@ pub enum RemuxCommand {
     EnterSearchMode,
     /// Open the session manager (client-side mode transition).
     OpenSessionManager,
+    /// Connect to a remote (client-side command). The argument is either an
+    /// SSH destination (`user@host` or an `~/.ssh/config` Host alias) or the
+    /// name of a remote already declared in `[remotes]`. Opens the session
+    /// manager and makes the remote and its sessions visible.
+    RemoteConnect(String),
     /// Open folder selection popup to move current session (client-side only).
     SessionMoveToFolder,
     /// Switch to a specific tab in a specific session.
@@ -423,6 +428,7 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
         ("FolderMoveSession", Some("<session> [folder]")),
         ("BufferEditInEditor", None),
         ("OpenSessionManager", None),
+        ("RemoteConnect", Some("<user@host|alias>")),
         ("SessionMoveToFolder", None),
         ("ToggleStyle", None),
         ("LayoutNext", None),

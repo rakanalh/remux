@@ -24,7 +24,7 @@ use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
 use crate::client::whichkey::WhichKeyPopup;
-use crate::config::Config;
+use crate::config::{Config, RemoteConfig};
 use crate::protocol::{ClientMessage, RemuxCommand, ServerMessage};
 use crate::server::daemon::{socket_path, RemuxServer};
 
@@ -931,6 +931,73 @@ async fn run_client_loop(
                                         mode: "SESSION_MANAGER".to_string(),
                                     })
                                     .await?;
+                            }
+                            InputAction::RemoteConnect(dest) => {
+                                log::debug!("input: RemoteConnect dest={dest}");
+                                // Hide which-key when opening the session manager.
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // This command usually arrives from the palette;
+                                // clear its overlay so it doesn't render underneath.
+                                if was_in_palette && input.command_palette.is_none() {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_command_palette_overlay(c, r)?;
+                                }
+                                // Resolve the connection name. If the arg is not a
+                                // configured remote, register an ad-hoc (session-only)
+                                // entry using the arg as the SSH destination.
+                                let name = dest.clone();
+                                if !mgr.has_remote(&name) {
+                                    mgr.add_remote(
+                                        name.clone(),
+                                        RemoteConfig {
+                                            ssh: dest.clone(),
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                                // Seed the freshly-opened manager with the roster and
+                                // foreground, then refresh every connected subtree.
+                                if let Some(sm) = input.session_manager.as_mut() {
+                                    sm.set_foreground(mgr.foreground().clone());
+                                    sm.set_roster(mgr.server_roster());
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = sm.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
+                                for id in mgr.connected_ids() {
+                                    mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                                }
+                                // Notify the foreground server of the mode change.
+                                mgr
+                                    .send_foreground(ClientMessage::ModeChanged {
+                                        mode: "SESSION_MANAGER".to_string(),
+                                    })
+                                    .await?;
+                                // Connect the remote. A failure must NOT exit the
+                                // client -- it surfaces as a Failed node in the tree.
+                                match mgr.connect_remote(&name).await {
+                                    Ok(()) => {
+                                        mgr.send(&ConnId::Remote(name.clone()), ClientMessage::ListSessionTree).await?;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("RemoteConnect '{name}' failed: {e}");
+                                    }
+                                }
+                                // Refresh the roster/rows to reflect the new node's
+                                // state (Connected or Failed) and redraw.
+                                if let Some(sm) = input.session_manager.as_mut() {
+                                    sm.set_roster(mgr.server_roster());
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = sm.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
                             }
                             InputAction::SessionManagerClose => {
                                 let (c, r) = crossterm::terminal::size()?;

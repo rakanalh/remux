@@ -727,6 +727,9 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
             let name = args.first().map(|s| s.to_string()).unwrap_or_default();
             Some(RemuxCommand::PaneRename(name))
         }
+        // A destination/alias is a single token (no spaces), so `args.first()`
+        // is correct here -- returns `None` when no argument is given.
+        "RemoteConnect" => args.first().map(|s| RemuxCommand::RemoteConnect(s.clone())),
 
         // -- usize arg commands -----------------------------------------------
         "TabGoto" => {
@@ -1023,6 +1026,25 @@ mod tests {
     #[test]
     fn parse_command_tab_move_default() {
         assert_eq!(parse_command("TabMove"), Some(RemuxCommand::TabMove(0)));
+    }
+
+    #[test]
+    fn parse_command_remote_connect() {
+        assert_eq!(
+            parse_command("RemoteConnect user@host"),
+            Some(RemuxCommand::RemoteConnect("user@host".into()))
+        );
+        // A bare alias (single token) also works.
+        assert_eq!(
+            parse_command("RemoteConnect pi"),
+            Some(RemuxCommand::RemoteConnect("pi".into()))
+        );
+    }
+
+    #[test]
+    fn parse_command_remote_connect_missing_arg() {
+        // No argument -> None, so an empty command does nothing.
+        assert_eq!(parse_command("RemoteConnect"), None);
     }
 
     #[test]
