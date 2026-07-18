@@ -77,6 +77,10 @@ pub enum ClientMessage {
         /// `true` when the mouse button was released (final drag event).
         is_final: bool,
     },
+    /// A mouse wheel event at the given full-screen 0-based coordinates.
+    /// `up` is true for wheel-up, false for wheel-down. The server decides
+    /// whether to forward it to the pane's application or scroll remux.
+    MouseScroll { x: u16, y: u16, up: bool },
     /// Request the scrollback content for the active pane (for search).
     RequestScrollback,
     /// Send search match info to the server for status bar display.

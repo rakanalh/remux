@@ -1304,23 +1304,44 @@ async fn run_client_loop(
                             MouseEventKind::ScrollUp => {
                                 log::debug!("mouse: scroll up, is_scrolled={}", is_scrolled);
                                 if input.mode == Mode::Visual {
+                                    // Visual mode is remux's copy-mode: wheel scrolls the
+                                    // local copy view and is never forwarded to the app.
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_up(3);
                                         scroll_offset = vs.scroll_offset;
                                     }
+                                } else {
+                                    // Server decides: forward to the app (mouse/alt screen)
+                                    // or scroll remux scrollback. It replies with a render
+                                    // that re-syncs scroll_offset/is_scrolled.
+                                    mgr.send_foreground(ClientMessage::MouseScroll {
+                                        x: mouse.column,
+                                        y: mouse.row,
+                                        up: true,
+                                    })
+                                    .await?;
                                 }
-                                is_scrolled = true;
-                                mgr.send_foreground(ClientMessage::ScrollDelta { delta: 3 }).await?;
                             }
                             MouseEventKind::ScrollDown => {
                                 log::debug!("mouse: scroll down, is_scrolled={}", is_scrolled);
                                 if input.mode == Mode::Visual {
+                                    // Visual mode is remux's copy-mode: wheel scrolls the
+                                    // local copy view and is never forwarded to the app.
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_down(3);
                                         scroll_offset = vs.scroll_offset;
                                     }
+                                } else {
+                                    // Server decides: forward to the app (mouse/alt screen)
+                                    // or scroll remux scrollback. It replies with a render
+                                    // that re-syncs scroll_offset/is_scrolled.
+                                    mgr.send_foreground(ClientMessage::MouseScroll {
+                                        x: mouse.column,
+                                        y: mouse.row,
+                                        up: false,
+                                    })
+                                    .await?;
                                 }
-                                mgr.send_foreground(ClientMessage::ScrollDelta { delta: -3 }).await?;
                             }
                             _ => {}
                         }

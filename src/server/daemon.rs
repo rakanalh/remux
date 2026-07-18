@@ -516,72 +516,21 @@ async fn handle_client_message(
             .await
         }
         ClientMessage::ScrollDelta { delta } => {
-            // Apply delta to server-owned scroll offset, clamp to valid range.
-            let (session_name, cols, rows, old_offset) = {
-                let cls = clients.lock().await;
-                let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
-                let cols = cls.get(&client_id).map(|c| c.cols).unwrap_or(80);
-                let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
-                let so = cls.get(&client_id).map(|c| c.scroll_offset).unwrap_or(0);
-                (sn, cols, rows, so)
-            };
-            let new_offset = if delta > 0 {
-                old_offset.saturating_add(delta as usize)
-            } else {
-                old_offset.saturating_sub((-delta) as usize)
-            };
-            // Clamp to max scrollable range
-            let max_offset = if let Some(ref sn) = session_name {
-                let focused_pane_id = {
-                    let st = state.lock().await;
-                    st.sessions
-                        .get(sn)
-                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
-                };
-                if let Some(fp) = focused_pane_id {
-                    let ps = panes.lock().await;
-                    ps.get(&fp)
-                        .map(|p| {
-                            let total = p.screen.total_lines();
-                            let content_rows = (rows as usize).saturating_sub(1);
-                            total.saturating_sub(content_rows)
-                        })
-                        .unwrap_or(0)
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            let clamped = new_offset.min(max_offset);
-            let changed = clamped != old_offset;
-            log::debug!(
-                "server: ScrollDelta client_id={client_id} delta={delta} new_offset={clamped} max_scrollable={max_offset}"
-            );
-            {
-                let mut cls = clients.lock().await;
-                if let Some(client) = cls.get_mut(&client_id) {
-                    client.scroll_offset = clamped;
-                }
-            }
-            // Only render if the offset actually changed (skip at boundary).
-            if changed {
-                if let Some(session_name) = session_name {
-                    send_full_render_to_client(
-                        client_id,
-                        &session_name,
-                        cols,
-                        rows,
-                        state,
-                        panes,
-                        clients,
-                        config,
-                        prev_frames,
-                    )
-                    .await;
-                }
-            }
-            Ok(())
+            handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
+        }
+        ClientMessage::MouseScroll { x, y, up } => {
+            handle_mouse_scroll(
+                client_id,
+                x,
+                y,
+                up,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
         }
         ClientMessage::ScrollReset => {
             log::debug!("server: ScrollReset client_id={client_id}");
@@ -1827,6 +1776,248 @@ async fn handle_mode_changed(
 // ---------------------------------------------------------------------------
 // Mouse handling
 // ---------------------------------------------------------------------------
+
+/// Build a wheel mouse-report byte sequence for a pane with mouse tracking on.
+///
+/// Button code is 64 for wheel-up, 65 for wheel-down. `col`/`row` are
+/// pane-relative 1-based coordinates. When `sgr` is true, the SGR (1006)
+/// encoding is used; otherwise the legacy X10 encoding (offset +32, single
+/// byte per field, saturated) is emitted.
+fn wheel_report(sgr: bool, up: bool, col: u16, row: u16) -> Vec<u8> {
+    let btn: u16 = if up { 64 } else { 65 };
+    if sgr {
+        format!("\x1b[<{btn};{col};{row}M").into_bytes()
+    } else {
+        let b = (32u32 + btn as u32).min(255) as u8;
+        let c = (32u32 + col as u32).min(255) as u8;
+        let r = (32u32 + row as u32).min(255) as u8;
+        vec![0x1b, b'[', b'M', b, c, r]
+    }
+}
+
+/// Build a single arrow-key escape sequence for the alternate-scroll fallback.
+///
+/// Up = `A`, Down = `B`. With `app_cursor` (DECCKM) the SS3 form `ESC O x` is
+/// used, otherwise the CSI form `ESC [ x`.
+fn arrow_report(app_cursor: bool, up: bool) -> Vec<u8> {
+    let final_byte = if up { b'A' } else { b'B' };
+    let mid = if app_cursor { b'O' } else { b'[' };
+    vec![0x1b, mid, final_byte]
+}
+
+/// Apply a scroll delta to the client's server-owned scroll offset, clamp it to
+/// the valid range, and send a render if the offset changed. Shared by the
+/// `ScrollDelta` message (keyboard/visual scrolling) and the plain-shell
+/// fallback of `MouseScroll`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_scroll_delta(
+    client_id: u64,
+    delta: i32,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    // Apply delta to server-owned scroll offset, clamp to valid range.
+    let (session_name, cols, rows, old_offset) = {
+        let cls = clients.lock().await;
+        let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
+        let cols = cls.get(&client_id).map(|c| c.cols).unwrap_or(80);
+        let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
+        let so = cls.get(&client_id).map(|c| c.scroll_offset).unwrap_or(0);
+        (sn, cols, rows, so)
+    };
+    let new_offset = if delta > 0 {
+        old_offset.saturating_add(delta as usize)
+    } else {
+        old_offset.saturating_sub((-delta) as usize)
+    };
+    // Clamp to max scrollable range
+    let max_offset = if let Some(ref sn) = session_name {
+        let focused_pane_id = {
+            let st = state.lock().await;
+            st.sessions
+                .get(sn)
+                .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
+        };
+        if let Some(fp) = focused_pane_id {
+            let ps = panes.lock().await;
+            ps.get(&fp)
+                .map(|p| {
+                    let total = p.screen.total_lines();
+                    let content_rows = (rows as usize).saturating_sub(1);
+                    total.saturating_sub(content_rows)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let clamped = new_offset.min(max_offset);
+    let changed = clamped != old_offset;
+    log::debug!(
+        "server: ScrollDelta client_id={client_id} delta={delta} new_offset={clamped} max_scrollable={max_offset}"
+    );
+    {
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            client.scroll_offset = clamped;
+        }
+    }
+    // Only render if the offset actually changed (skip at boundary).
+    if changed {
+        if let Some(session_name) = session_name {
+            send_full_render_to_client(
+                client_id,
+                &session_name,
+                cols,
+                rows,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// Route a mouse wheel event. If the pane under the cursor has mouse tracking
+/// enabled, forward a wheel report to its application. Otherwise, if it is on
+/// the alternate screen, emit the alternate-scroll arrow-key fallback. For a
+/// plain shell, fall back to remux's own scrollback scroll.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mouse_scroll(
+    client_id: u64,
+    x: u16,
+    y: u16,
+    up: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let (session_name, cols, rows, mode) = {
+        let cls = clients.lock().await;
+        let client = match cls.get(&client_id) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        (
+            client.session_name.clone(),
+            client.cols,
+            client.rows,
+            client.mode.clone(),
+        )
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Build composite to get hit regions and pane rects.
+    update_auto_pane_names(&session_name, state, panes).await;
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack) = build_composite(
+        &session_name,
+        cols,
+        rows,
+        &mode,
+        state,
+        panes,
+        config,
+        None,
+        None,
+        0,
+        &config.compositor_theme(),
+    )
+    .await;
+
+    // Find the pane under the cursor; fall back to the active tab's focused pane.
+    let target = hit_test(x, y, &hit_regions, &pane_rects);
+    let target_pane = match target {
+        ClickTarget::Pane(id) => id,
+        _ => {
+            let st = state.lock().await;
+            match st
+                .sessions
+                .get(&session_name)
+                .and_then(|s| s.tabs.get(s.active_tab).map(|t| t.focused_pane))
+            {
+                Some(fp) => fp,
+                None => return Ok(()),
+            }
+        }
+    };
+
+    // Find the target pane's rect for coordinate mapping.
+    let pane_rect = match pane_rects.iter().find(|(id, _)| *id == target_pane) {
+        Some((_, r)) => *r,
+        None => return Ok(()),
+    };
+
+    // Read the target pane's emulator flags.
+    let (mouse_tracking, mouse_sgr, alt_screen_active, app_cursor_keys) = {
+        let ps = panes.lock().await;
+        match ps.get(&target_pane) {
+            Some(p) => (
+                p.screen.mouse_tracking,
+                p.screen.mouse_sgr,
+                p.screen.alt_screen_active,
+                p.screen.application_cursor_keys,
+            ),
+            None => return Ok(()),
+        }
+    };
+
+    if mouse_tracking {
+        // Same border-inset logic as handle_mouse_drag, but 1-based coords.
+        let border_offset: u16 = match config.appearance.border_style {
+            BorderStyle::ZellijStyle if pane_rect.width >= 3 && pane_rect.height >= 3 => 1,
+            _ => 0,
+        };
+        let col = x
+            .saturating_sub(pane_rect.x + border_offset)
+            .saturating_add(1);
+        let row = y
+            .saturating_sub(pane_rect.y + border_offset)
+            .saturating_add(1);
+        let bytes = wheel_report(mouse_sgr, up, col, row);
+        log::debug!(
+            "server: MouseScroll->app client_id={client_id} pane_id={target_pane} sgr={mouse_sgr} up={up} col={col} row={row}"
+        );
+        let ps = panes.lock().await;
+        if let Some(pane_data) = ps.get(&target_pane) {
+            pane_data.pty.write_input(&bytes)?;
+        }
+        Ok(())
+    } else if alt_screen_active {
+        // Alternate-scroll fallback: three arrow keys per wheel notch.
+        let one = arrow_report(app_cursor_keys, up);
+        let mut bytes = Vec::with_capacity(one.len() * 3);
+        for _ in 0..3 {
+            bytes.extend_from_slice(&one);
+        }
+        log::debug!(
+            "server: MouseScroll->alt-arrows client_id={client_id} pane_id={target_pane} app_cursor={app_cursor_keys} up={up}"
+        );
+        let ps = panes.lock().await;
+        if let Some(pane_data) = ps.get(&target_pane) {
+            pane_data.pty.write_input(&bytes)?;
+        }
+        Ok(())
+    } else {
+        // Plain shell: preserve remux's own scrollback scroll (delta ±3).
+        let delta = if up { 3 } else { -3 };
+        log::debug!("server: MouseScroll->remux-scroll client_id={client_id} delta={delta}");
+        handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_mouse_click(
@@ -3308,4 +3499,39 @@ async fn restore_state(
         pane_spawns.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arrow_report, wheel_report};
+
+    #[test]
+    fn test_wheel_report_sgr() {
+        // Wheel up: button 64, SGR encoding, 1-based coords.
+        assert_eq!(wheel_report(true, true, 5, 10), b"\x1b[<64;5;10M".to_vec());
+        // Wheel down: button 65.
+        assert_eq!(wheel_report(true, false, 1, 1), b"\x1b[<65;1;1M".to_vec());
+    }
+
+    #[test]
+    fn test_wheel_report_legacy() {
+        // Legacy X10: ESC [ M then (32+btn), (32+col), (32+row).
+        assert_eq!(
+            wheel_report(false, true, 5, 10),
+            vec![0x1b, b'[', b'M', 32 + 64, 32 + 5, 32 + 10]
+        );
+        // Coordinates saturate into a single byte.
+        assert_eq!(
+            wheel_report(false, false, 300, 400),
+            vec![0x1b, b'[', b'M', 32 + 65, 255, 255]
+        );
+    }
+
+    #[test]
+    fn test_arrow_report() {
+        assert_eq!(arrow_report(false, true), vec![0x1b, b'[', b'A']);
+        assert_eq!(arrow_report(false, false), vec![0x1b, b'[', b'B']);
+        assert_eq!(arrow_report(true, true), vec![0x1b, b'O', b'A']);
+        assert_eq!(arrow_report(true, false), vec![0x1b, b'O', b'B']);
+    }
 }

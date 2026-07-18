@@ -95,6 +95,10 @@ pub struct Screen {
     pub lock_renders: bool,
     /// DECCKM: application cursor keys mode (CSI ? 1 h/l).
     pub application_cursor_keys: bool,
+    /// Whether the application has enabled mouse tracking (modes 1000/1002/1003).
+    pub mouse_tracking: bool,
+    /// Whether the application requested SGR mouse encoding (mode 1006).
+    pub mouse_sgr: bool,
 }
 
 impl Screen {
@@ -127,6 +131,8 @@ impl Screen {
             scp_cursor_y: 0,
             lock_renders: false,
             application_cursor_keys: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
         }
     }
 
@@ -696,6 +702,10 @@ impl vte::Perform for Screen {
                             1 => self.application_cursor_keys = true,
                             25 => self.cursor_visible = true,
                             2026 => self.lock_renders = true,
+                            // Mouse tracking: 1000=normal, 1002=button-event, 1003=any-event.
+                            1000 | 1002 | 1003 => self.mouse_tracking = true,
+                            // 1006 = SGR mouse encoding.
+                            1006 => self.mouse_sgr = true,
                             1049 => {
                                 // Save cursor and switch to alternate screen
                                 if !self.alt_screen_active {
@@ -742,6 +752,10 @@ impl vte::Perform for Screen {
                             1 => self.application_cursor_keys = false,
                             25 => self.cursor_visible = false,
                             2026 => self.lock_renders = false,
+                            // Mouse tracking: 1000=normal, 1002=button-event, 1003=any-event.
+                            1000 | 1002 | 1003 => self.mouse_tracking = false,
+                            // 1006 = SGR mouse encoding.
+                            1006 => self.mouse_sgr = false,
                             1049 => {
                                 // Restore primary screen and cursor
                                 if self.alt_screen_active {
@@ -890,6 +904,33 @@ mod tests {
         s.process_output(b"A");
         assert_eq!(s.grid[0][0].c, 'A');
         assert_eq!(s.cursor_x, 1);
+    }
+
+    #[test]
+    fn test_mouse_tracking_decset() {
+        let mut s = make_screen();
+        assert!(!s.mouse_tracking);
+        assert!(!s.mouse_sgr);
+
+        // Enable normal mouse tracking (1000) and SGR encoding (1006).
+        s.process_output(b"\x1b[?1000h");
+        s.process_output(b"\x1b[?1006h");
+        assert!(s.mouse_tracking);
+        assert!(s.mouse_sgr);
+
+        // Disable both.
+        s.process_output(b"\x1b[?1000l");
+        s.process_output(b"\x1b[?1006l");
+        assert!(!s.mouse_tracking);
+        assert!(!s.mouse_sgr);
+
+        // Button-event (1002) and any-event (1003) also set mouse_tracking.
+        s.process_output(b"\x1b[?1002h");
+        assert!(s.mouse_tracking);
+        s.process_output(b"\x1b[?1002l");
+        assert!(!s.mouse_tracking);
+        s.process_output(b"\x1b[?1003h");
+        assert!(s.mouse_tracking);
     }
 
     #[test]
