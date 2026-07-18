@@ -191,6 +191,12 @@ pub fn composite(
     scroll_offsets: &HashMap<PaneId, usize>,
     theme: &CompositorTheme,
 ) -> (Vec<Vec<RenderCell>>, HitRegions) {
+    log::debug!(
+        "compositor: composite area={}x{} at ({},{}), total={}x{}, gap={}, focused_pane={}, border={:?}",
+        area.width, area.height, area.x, area.y,
+        total_cols, total_rows, gap_size, focused_pane, border_style
+    );
+
     let mut buffer = vec![vec![RenderCell::default(); total_cols as usize]; total_rows as usize];
     let mut hit_regions = HitRegions::default();
 
@@ -372,6 +378,18 @@ fn draw_zellij_panes(
             width: rect.width - 2,
             height: rect.height - 2,
         };
+        log::debug!(
+            "draw_zellij_panes: pane_id={}, rect={}x{} at ({},{}), inner={}x{} at ({},{})",
+            pane_id,
+            rect.width,
+            rect.height,
+            rect.x,
+            rect.y,
+            inner.width,
+            inner.height,
+            inner.x,
+            inner.y
+        );
         blit_screen(buffer, screen, inner, offset);
 
         // Draw the full box border with rounded corners.

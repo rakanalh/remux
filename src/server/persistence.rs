@@ -68,6 +68,7 @@ pub fn save_state(state: &PersistedState) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
 
     let state_path = dir.join("state.json");
+    log::debug!("persistence: save_state path={:?}", state_path);
     let tmp_path = dir.join("state.json.tmp");
 
     let json = serde_json::to_string_pretty(state)?;
@@ -82,6 +83,7 @@ pub fn save_state(state: &PersistedState) -> Result<()> {
 /// exists but cannot be read or parsed.
 pub fn load_state() -> Result<Option<PersistedState>> {
     let state_path = data_dir().join("state.json");
+    log::debug!("persistence: load_state path={:?}", state_path);
 
     if !state_path.exists() {
         return Ok(None);

@@ -69,16 +69,44 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
-
     let cli = Cli::parse();
+
+    // Determine log file based on command: server.log vs client.log.
+    let log_filename = match cli.command {
+        Some(Commands::Server) => "server.log",
+        _ => "client.log",
+    };
+    let log_dir = dirs::state_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("remux");
+    std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
+    let log_path = log_dir.join(log_filename);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("failed to open log file");
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)
+        .format_timestamp_millis()
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .init();
+
+    let role = match cli.command {
+        Some(Commands::Server) => "server",
+        _ => "client",
+    };
+    log::info!("remux starting as {role}, log={}", log_path.display());
 
     match cli.command {
         Some(Commands::Server) => {
+            log::debug!("launching server daemon");
             let config = Config::load()?;
             RemuxServer::run(config).await?;
         }
         None => {
+            log::debug!("no subcommand: default attach/create flow");
             // Try to connect to existing server, start if needed
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
@@ -123,6 +151,7 @@ async fn main() -> Result<()> {
             client_event_loop(&mut client, &config).await?;
         }
         Some(Commands::New { session, folder }) => {
+            log::debug!("cmd: new session={session:?} folder={folder:?}");
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
@@ -144,6 +173,7 @@ async fn main() -> Result<()> {
             client_event_loop(&mut client, &config).await?;
         }
         Some(Commands::Attach { name }) => {
+            log::debug!("cmd: attach session={name:?}");
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
@@ -155,6 +185,7 @@ async fn main() -> Result<()> {
             client_event_loop(&mut client, &config).await?;
         }
         Some(Commands::Ls) => {
+            log::debug!("cmd: list sessions");
             if !socket_path().exists() {
                 println!("No server running. No sessions.");
                 return Ok(());
@@ -195,6 +226,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Kill { name }) => {
+            log::debug!("cmd: kill session={name:?}");
             if !socket_path().exists() {
                 eprintln!("No server running.");
                 return Ok(());
@@ -230,18 +262,31 @@ async fn main() -> Result<()> {
 
 /// Ensure a server is running, starting one in the background if needed.
 async fn ensure_server_running() -> Result<()> {
-    if socket_path().exists() {
+    let sock = socket_path();
+    log::debug!(
+        "ensure_server_running: checking socket at {}",
+        sock.display()
+    );
+    if sock.exists() {
         // Try connecting to verify the socket is live
         match RemuxClient::connect().await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                log::debug!("ensure_server_running: server already running");
+                return Ok(());
+            }
             Err(_) => {
                 // Stale socket file, remove it
-                let _ = std::fs::remove_file(socket_path());
+                log::debug!("ensure_server_running: stale socket detected, removing");
+                let _ = std::fs::remove_file(&sock);
             }
         }
     }
 
     let exe = std::env::current_exe().context("finding current executable")?;
+    log::debug!(
+        "ensure_server_running: spawning server from {}",
+        exe.display()
+    );
     std::process::Command::new(exe)
         .arg("server")
         .stdin(std::process::Stdio::null())
@@ -251,8 +296,9 @@ async fn ensure_server_running() -> Result<()> {
         .context("spawning server process")?;
 
     // Wait for the socket to appear
-    for _ in 0..50 {
-        if socket_path().exists() {
+    for i in 0..50 {
+        if sock.exists() {
+            log::debug!("ensure_server_running: socket ready after {} iterations", i);
             // Give the server a moment to start accepting connections
             tokio::time::sleep(Duration::from_millis(50)).await;
             return Ok(());
@@ -260,6 +306,7 @@ async fn ensure_server_running() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    log::debug!("ensure_server_running: timed out waiting for socket");
     anyhow::bail!("timed out waiting for server to start")
 }
 
@@ -269,10 +316,15 @@ async fn ensure_server_running() -> Result<()> {
 
 /// Run the client event loop with terminal setup/restore.
 async fn client_event_loop(client: &mut RemuxClient, config: &Config) -> Result<()> {
+    log::debug!("client_event_loop: setting up terminal");
     setup_terminal()?;
 
     let result = run_client_loop(client, config).await;
 
+    log::debug!(
+        "client_event_loop: restoring terminal, result={}",
+        result.is_ok()
+    );
     restore_terminal()?;
     result
 }
@@ -286,9 +338,11 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     let mut event_stream = EventStream::new();
     let keybindings = config.keybinding_tree();
     let leader_key = config.leader_key();
+    log::debug!("run_client_loop: leader_key={:?}", leader_key);
     let shortcut_bindings = config.shortcut_bindings();
     let mut input = InputHandler::new(keybindings, leader_key, shortcut_bindings);
     let (cols, rows) = crossterm::terminal::size()?;
+    log::debug!("run_client_loop: terminal size={}x{}", cols, rows);
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();
     let theme = config.theme();
@@ -310,6 +364,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
     const DRAG_THROTTLE: Duration = Duration::from_millis(16);
 
     // Tell server our terminal size
+    log::debug!("run_client_loop: sending initial resize {}x{}", cols, rows);
     client.send(ClientMessage::Resize { cols, rows }).await?;
 
     loop {
@@ -320,13 +375,6 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
-                        // Reset scroll offset on any keyboard input in Normal mode
-                        if is_scrolled && input.mode == Mode::Normal {
-                            scroll_offset = 0;
-                            is_scrolled = false;
-                            client.send(ClientMessage::ScrollReset).await?;
-                        }
-
                         let was_renaming = input.rename_overlay.is_some();
                         let was_in_palette = input.command_palette.is_some();
                         let action = input.handle_key(key);
@@ -339,9 +387,17 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                         match action {
                             InputAction::SendToPty(data) => {
+                                log::debug!("input: SendToPty {} bytes", data.len());
+                                // Reset scroll when user types (sends PTY input)
+                                if is_scrolled {
+                                    scroll_offset = 0;
+                                    is_scrolled = false;
+                                    client.send(ClientMessage::ScrollReset).await?;
+                                }
                                 client.send(ClientMessage::Input { data }).await?;
                             }
                             InputAction::Execute(cmd) => {
+                                log::debug!("input: Execute cmd={:?}", cmd);
                                 // Hide which-key popup when executing a command
                                 if whichkey.visible {
                                     whichkey.hide();
@@ -378,6 +434,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     .await?;
                             }
                             InputAction::ExecuteChain(cmds) => {
+                                log::debug!("input: ExecuteChain count={} cmds={:?}", cmds.len(), cmds);
                                 // Hide which-key popup when executing commands
                                 if whichkey.visible {
                                     whichkey.hide();
@@ -410,6 +467,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     .await?;
                             }
                             InputAction::ModeChanged(mode) => {
+                                log::debug!("input: ModeChanged to {:?}", mode);
                                 let mode_str = match mode {
                                     Mode::Normal => "NORMAL",
                                     Mode::Command => "COMMAND",
@@ -425,6 +483,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     .await?;
                                 // Reset scroll offset when returning to normal mode.
                                 if mode == Mode::Normal && (scroll_offset > 0 || is_scrolled) {
+                                    log::debug!("input: resetting scroll on mode change, old offset={}", scroll_offset);
                                     scroll_offset = 0;
                                     is_scrolled = false;
                                     client.send(ClientMessage::ScrollReset).await?;
@@ -518,6 +577,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::EditInEditor => {
+                                log::debug!("input: EditInEditor requested");
                                 input.pending_editor_open = true;
                                 client.send(ClientMessage::RequestScrollback).await?;
                             }
@@ -539,6 +599,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 // only the final rename command is sent on Enter.
                             }
                             InputAction::YankToClipboard(_) => {
+                                log::debug!("input: YankToClipboard");
                                 // Extract selected text from the front buffer
                                 // using the visual state.
                                 if let Some(ref vs) = input.visual_state {
@@ -572,6 +633,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             InputAction::VisualScroll { .. } => {
                                 // Send scroll delta to server so compositor renders scrollback.
                                 if let Some(ref vs) = input.visual_state {
+                                    log::debug!("input: VisualScroll offset={} delta from old={}", vs.scroll_offset, scroll_offset);
                                     let old = scroll_offset;
                                     scroll_offset = vs.scroll_offset;
                                     let delta = scroll_offset as i32 - old as i32;
@@ -634,6 +696,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                     .await?;
                             }
                             InputAction::SearchPrompt => {
+                                log::debug!("input: SearchPrompt query={:?}", input.search_state.as_ref().map(|s| &s.query_buffer));
                                 // Re-render the search prompt overlay.
                                 if let Some(ref ss) = input.search_state {
                                     let (c, r) = crossterm::terminal::size()?;
@@ -642,6 +705,8 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::SearchConfirm(ref query) => {
+                                log::debug!("input: SearchConfirm query={query:?}");
+                                // Keep current scroll position — search starts from where user is.
                                 // Request scrollback from server.
                                 client.send(ClientMessage::RequestScrollback).await?;
                                 // Re-render prompt with confirmed query.
@@ -652,6 +717,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::SearchCancel => {
+                                log::debug!("input: SearchCancel");
                                 // Clear search info on server.
                                 client.send(ClientMessage::SearchInfo { current: 0, total: 0 }).await?;
                                 // Send mode changed to NORMAL.
@@ -668,6 +734,9 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::SearchNavigate => {
+                                log::debug!("input: SearchNavigate current={} total={}",
+                                    input.search_state.as_ref().map(|s| s.current_match).unwrap_or(0),
+                                    input.search_state.as_ref().map(|s| s.matches.len()).unwrap_or(0));
                                 // Update search info on server and re-render prompt.
                                 if let Some(ref ss) = input.search_state {
                                     client.send(ClientMessage::SearchInfo {
@@ -687,7 +756,6 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         &ss.matches,
                                         ss.current_match,
                                         query.len(),
-                                        ss.scrollback_line_count,
                                         scroll_offset,
                                         focused_pane_rect.as_ref(),
                                         &theme,
@@ -699,15 +767,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                         let pane_height = focused_pane_rect
                                             .map(|pr| pr.height as usize)
                                             .unwrap_or(24);
-                                        let total = ss.scrollback_line_count;
                                         // Calculate the scroll offset needed to center the match
-                                        let visible_bottom_line = total.saturating_sub(scroll_offset);
-                                        let visible_top_line = visible_bottom_line.saturating_sub(pane_height);
+                                        let visible_top_line = scroll_offset;
+                                        let visible_bottom_line = scroll_offset + pane_height;
                                         if match_line < visible_top_line || match_line >= visible_bottom_line {
                                             // Match is not visible, scroll to center it
-                                            let target_offset = total.saturating_sub(match_line + pane_height / 2);
-                                            let delta = target_offset as i32 - scroll_offset as i32;
-                                            scroll_offset = target_offset;
+                                            let target_vt = match_line.saturating_sub(pane_height / 2);
+                                            let delta = scroll_offset as i32 - target_vt as i32;
+                                            scroll_offset = target_vt;
                                             if delta != 0 {
                                                 client.send(ClientMessage::ScrollDelta { delta }).await?;
                                             }
@@ -717,6 +784,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::SessionManagerOpen => {
+                                log::debug!("input: SessionManagerOpen");
                                 // Hide which-key when opening session manager.
                                 if whichkey.visible {
                                     whichkey.hide();
@@ -753,6 +821,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 renderer.flush()?;
                             }
                             InputAction::SessionManagerAction(ref sm_action) => {
+                                log::debug!("input: SessionManagerAction {:?}", sm_action);
                                 match sm_action {
                                     SessionManagerAction::SwitchSession(name) => {
                                         input.session_manager = None;
@@ -942,6 +1011,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
+                                log::debug!("mouse: click at ({}, {})", mouse.column, mouse.row);
                                 drag_start = Some((mouse.column, mouse.row));
                                 // Send click immediately.
                                 client
@@ -986,6 +1056,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 }
                             }
                             MouseEventKind::ScrollUp => {
+                                log::debug!("mouse: scroll up, is_scrolled={}", is_scrolled);
                                 if input.mode == Mode::Visual {
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_up(3);
@@ -996,6 +1067,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 client.send(ClientMessage::ScrollDelta { delta: 3 }).await?;
                             }
                             MouseEventKind::ScrollDown => {
+                                log::debug!("mouse: scroll down, is_scrolled={}", is_scrolled);
                                 if input.mode == Mode::Visual {
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_down(3);
@@ -1008,6 +1080,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
+                        log::debug!("resize: {}x{}", new_cols, new_rows);
                         renderer.resize(new_cols, new_rows);
                         client.send(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
                     }
@@ -1029,9 +1102,13 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
             // Server messages
             msg = client.recv() => {
                 match msg? {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
+                        log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} scroll_offset={}",
+                            cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
+                        scroll_offset = so;
+                        is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
@@ -1065,7 +1142,6 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 &ss.matches,
                                 ss.current_match,
                                 query.len(),
-                                ss.scrollback_line_count,
                                 scroll_offset,
                                 focused_pane_rect.as_ref(),
                                 &theme,
@@ -1097,9 +1173,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                         renderer.flush()?;
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
+                        log::debug!("srv: RenderDiff changes={} cursor=({},{}) scroll_offset={}", changes.len(), cursor_x, cursor_y, so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
+                        scroll_offset = so;
+                        is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
@@ -1133,7 +1212,6 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 &ss.matches,
                                 ss.current_match,
                                 query.len(),
-                                ss.scrollback_line_count,
                                 scroll_offset,
                                 focused_pane_rect.as_ref(),
                                 &theme,
@@ -1165,9 +1243,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                         renderer.flush()?;
                     }
-                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack }) => {
+                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
+                        log::debug!("srv: ScrollRender delta={} pane=({},{} {}x{}) scroll_offset={}", delta, pane_x, pane_y, pane_width, pane_height, so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
+                        scroll_offset = so;
+                        is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
@@ -1201,7 +1282,6 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 &ss.matches,
                                 ss.current_match,
                                 query.len(),
-                                ss.scrollback_line_count,
                                 scroll_offset,
                                 focused_pane_rect.as_ref(),
                                 &theme,
@@ -1245,6 +1325,7 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(ServerMessage::ScrollbackContent { lines }) => {
+                        log::debug!("srv: ScrollbackContent line_count={}", lines.len());
                         if input.pending_editor_open {
                             input.pending_editor_open = false;
                             let content = lines.join("\n");
@@ -1260,15 +1341,51 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                             client.send(ClientMessage::Resize { cols, rows }).await?;
                         } else if let Some(ref mut ss) = input.search_state {
                             if let Some(ref query) = ss.confirmed_query {
+                                let pane_height = focused_pane_rect
+                                    .map(|pr| pr.height as usize)
+                                    .unwrap_or(24);
+
                                 ss.scrollback_line_count = lines.len();
                                 ss.matches = crate::client::input::SearchState::compute_matches(&lines, query);
-                                ss.current_match = 0;
+
+                                // Find the first match at or above the current view position.
+                                // scroll_offset holds viewport_top (absolute scrollback line index).
+                                let current_view_top = scroll_offset;
+
+                                // Find the closest match at or above the current view top (searching upward).
+                                let first_match_idx = ss.matches.iter()
+                                    .rposition(|&(line, _)| line <= current_view_top + pane_height);
+                                ss.current_match = first_match_idx.unwrap_or(ss.matches.len().saturating_sub(1));
+
                                 // Send search info to server.
                                 client.send(ClientMessage::SearchInfo {
                                     current: ss.current_match,
                                     total: ss.matches.len(),
                                 }).await?;
-                                // Re-render prompt with match info.
+
+                                // Scroll to the current match if it's not in the visible area.
+                                if !ss.matches.is_empty() {
+                                    let (match_line, _) = ss.matches[ss.current_match];
+                                    let visible_top = scroll_offset;
+                                    let visible_bottom = scroll_offset + pane_height;
+
+                                    if match_line < visible_top || match_line >= visible_bottom {
+                                        // Scroll to center the match
+                                        let target_vt = match_line.saturating_sub(pane_height / 2);
+                                        let delta = scroll_offset as i32 - target_vt as i32;
+                                        scroll_offset = target_vt;
+                                        is_scrolled = true;
+                                        if delta != 0 {
+                                            client.send(ClientMessage::ScrollDelta { delta }).await?;
+                                        }
+                                    }
+                                }
+
+                                // Render highlights at current display offset (0 if at bottom,
+                                // or wherever the server has scrolled to).
+                                // NOTE: Don't render highlights here — the server will send a
+                                // render response (FullRender/ScrollRender) which triggers the
+                                // overlay re-render with correct positions. Just render the prompt.
                                 let match_info = if ss.matches.is_empty() {
                                     None
                                 } else {
@@ -1277,21 +1394,12 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                                 let q = query.clone();
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.render_search_prompt(&q, ss.phase, match_info, c, r)?;
-                                // Highlight matches in the terminal content.
-                                renderer.render_search_highlight(
-                                    &ss.matches,
-                                    ss.current_match,
-                                    q.len(),
-                                    ss.scrollback_line_count,
-                                    scroll_offset,
-                                    focused_pane_rect.as_ref(),
-                                    &theme,
-                                )?;
                                 renderer.flush()?;
                             }
                         }
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled }) => {
+                        log::debug!("srv: SessionTree folders={} unfiled={}", folders.len(), unfiled.len());
                         // If session switch overlay is active, populate it
                         if input.session_switch.is_some() {
                             let mut session_names: Vec<String> = Vec::new();
@@ -1375,12 +1483,14 @@ async fn run_client_loop(client: &mut RemuxClient, config: &Config) -> Result<()
                         }
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
+                        log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);
                         // Update visual state with accurate total line count.
                         if let Some(ref mut vs) = input.visual_state {
                             vs.total_lines = total_lines;
                         }
                     }
                     None => {
+                        log::debug!("srv: disconnected (None)");
                         // Server disconnected
                         break;
                     }

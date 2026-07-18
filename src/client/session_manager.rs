@@ -181,6 +181,11 @@ impl SessionManagerState {
 
     /// Update with new tree data from the server.
     pub fn update_tree(&mut self, folders: Vec<FolderTreeEntry>, unfiled: Vec<SessionTreeEntry>) {
+        log::debug!(
+            "session_manager: update_tree folders={} unfiled={}",
+            folders.len(),
+            unfiled.len()
+        );
         // Collect previously known keys so we can auto-expand only new entries.
         let mut known_keys: HashSet<String> = HashSet::new();
         for f in &self.folders {
@@ -314,6 +319,7 @@ impl SessionManagerState {
             return;
         }
         self.selected = (self.selected + 1) % self.rows.len();
+        log::debug!("session_manager: select_next selected={}", self.selected);
     }
 
     /// Move selection up, wrapping to the bottom.
@@ -326,6 +332,7 @@ impl SessionManagerState {
         } else {
             self.selected -= 1;
         }
+        log::debug!("session_manager: select_prev selected={}", self.selected);
     }
 
     /// Toggle the expand/collapse state of the selected node.

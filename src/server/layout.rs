@@ -370,6 +370,11 @@ impl LayoutNode {
     ///
     /// Returns `true` if the split was performed.
     pub fn split_vertical(&mut self, target_pane: PaneId, new_pane: PaneId) -> bool {
+        log::debug!(
+            "layout: split_vertical target={}, new={}",
+            target_pane,
+            new_pane
+        );
         self.split_at(target_pane, new_pane, Direction::Vertical)
     }
 
@@ -380,6 +385,11 @@ impl LayoutNode {
     ///
     /// Returns `true` if the split was performed.
     pub fn split_horizontal(&mut self, target_pane: PaneId, new_pane: PaneId) -> bool {
+        log::debug!(
+            "layout: split_horizontal target={}, new={}",
+            target_pane,
+            new_pane
+        );
         self.split_at(target_pane, new_pane, Direction::Horizontal)
     }
 
@@ -473,6 +483,7 @@ impl LayoutNode {
     /// Returns the pane that should receive focus, or `None` if the layout
     /// is now empty.
     pub fn close_pane(&mut self, pane_id: PaneId) -> Option<PaneId> {
+        log::debug!("layout: close_pane pane_id={}", pane_id);
         match self {
             LayoutNode::Stack {
                 panes,
@@ -735,6 +746,14 @@ fn contains_pane(node: &LayoutNode, pane_id: PaneId) -> bool {
 /// The current implementation uses straightforward ratio-based division with
 /// min-size clamping.
 pub fn compute_layout(node: &LayoutNode, area: Rect, gap_size: u16) -> Vec<(PaneId, Rect)> {
+    log::debug!(
+        "layout: compute_layout area={}x{} at ({},{}), gap={}",
+        area.width,
+        area.height,
+        area.x,
+        area.y,
+        gap_size
+    );
     let mut result = Vec::new();
     compute_layout_inner(node, area, gap_size, &mut result);
     result
@@ -974,7 +993,14 @@ pub fn find_neighbor(
         }
     }
 
-    best.map(|(id, _)| id)
+    let result = best.map(|(id, _)| id);
+    log::debug!(
+        "layout: find_neighbor current_pane={}, direction={:?}, result={:?}",
+        current_pane,
+        direction,
+        result
+    );
+    result
 }
 
 /// Compute the center point of a rectangle as (x, y) in f64.

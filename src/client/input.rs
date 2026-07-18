@@ -839,6 +839,12 @@ impl InputHandler {
 
     /// Process a key event and return the appropriate action.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        log::debug!(
+            "input: handle_key code={:?} modifiers={:?} mode={:?}",
+            key.code,
+            key.modifiers,
+            self.mode
+        );
         // If the session switch overlay is active, capture keystrokes for it.
         if self.session_switch.is_some() {
             return self.handle_session_switch_key(key);

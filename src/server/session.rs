@@ -158,6 +158,12 @@ impl ServerState {
         border_style: BorderStyle,
         layout_mode: LayoutMode,
     ) -> Result<PaneId> {
+        log::debug!(
+            "session: create_session name={:?}, folder={:?}",
+            name,
+            folder
+        );
+
         if self.sessions.contains_key(name) {
             bail!("session '{}' already exists", name);
         }
@@ -213,6 +219,11 @@ impl ServerState {
 
     /// Rename a session. The new name must be unique.
     pub fn rename_session(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        log::debug!(
+            "session: rename_session old={:?}, new={:?}",
+            old_name,
+            new_name
+        );
         if old_name == new_name {
             return Ok(());
         }
@@ -241,6 +252,7 @@ impl ServerState {
     /// Delete a session. Returns all pane IDs that need cleanup (e.g., PTY
     /// teardown).
     pub fn delete_session(&mut self, name: &str) -> Result<Vec<PaneId>> {
+        log::debug!("session: delete_session name={:?}", name);
         let session = self
             .sessions
             .remove(name)
@@ -291,6 +303,7 @@ impl ServerState {
 
     /// Create a new folder.
     pub fn create_folder(&mut self, name: &str) -> Result<()> {
+        log::debug!("session: create_folder name={:?}", name);
         if self.folders.contains_key(name) {
             bail!("folder '{}' already exists", name);
         }
@@ -306,6 +319,11 @@ impl ServerState {
 
     /// Rename a folder.
     pub fn rename_folder(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        log::debug!(
+            "session: rename_folder old={:?}, new={:?}",
+            old_name,
+            new_name
+        );
         if old_name == new_name {
             return Ok(());
         }
@@ -331,6 +349,7 @@ impl ServerState {
 
     /// Delete a folder. The folder must be empty (no sessions).
     pub fn delete_folder(&mut self, name: &str) -> Result<()> {
+        log::debug!("session: delete_folder name={:?}", name);
         let folder = self
             .folders
             .get(name)
@@ -353,6 +372,7 @@ impl ServerState {
     /// Returns a list of `(session_name, pane_ids)` for each deleted session
     /// so callers can clean up PTYs and notify clients.
     pub fn delete_folder_cascade(&mut self, name: &str) -> Result<Vec<(String, Vec<PaneId>)>> {
+        log::debug!("session: delete_folder_cascade name={:?}", name);
         let folder = self
             .folders
             .remove(name)
@@ -397,6 +417,7 @@ impl ServerState {
         name: &str,
         layout_mode: LayoutMode,
     ) -> Result<PaneId> {
+        log::debug!("session: create_tab name={:?}, session={:?}", name, session);
         let pane_id = self.next_pane_id();
         let tab_id = self.next_tab_id();
 
@@ -423,6 +444,11 @@ impl ServerState {
     /// Close a tab by index. Returns the pane IDs that need cleanup and
     /// whether the session was deleted (if it was the last tab).
     pub fn close_tab(&mut self, session: &str, tab_idx: usize) -> Result<(Vec<PaneId>, bool)> {
+        log::debug!(
+            "session: close_tab index={}, session={:?}",
+            tab_idx,
+            session
+        );
         let sess = self
             .sessions
             .get_mut(session)
@@ -468,6 +494,12 @@ impl ServerState {
 
     /// Rename a tab by index.
     pub fn rename_tab(&mut self, session: &str, tab_idx: usize, new_name: &str) -> Result<()> {
+        log::debug!(
+            "session: rename_tab index={}, new_name={:?}, session={:?}",
+            tab_idx,
+            new_name,
+            session
+        );
         let sess = self
             .sessions
             .get_mut(session)
@@ -484,6 +516,7 @@ impl ServerState {
 
     /// Navigate to a tab by index.
     pub fn goto_tab(&mut self, session: &str, tab_idx: usize) -> Result<()> {
+        log::debug!("session: goto_tab index={}, session={:?}", tab_idx, session);
         let sess = self
             .sessions
             .get_mut(session)
@@ -591,6 +624,11 @@ impl ServerState {
 
     /// Move a session to a different folder (or to top-level if `None`).
     pub fn move_session(&mut self, session_name: &str, target_folder: Option<&str>) -> Result<()> {
+        log::debug!(
+            "session: move_session name={:?}, target_folder={:?}",
+            session_name,
+            target_folder
+        );
         let sess = self
             .sessions
             .get_mut(session_name)

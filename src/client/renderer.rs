@@ -48,6 +48,16 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
+        let rows = cells.len();
+        let cols = cells.first().map_or(0, |r| r.len());
+        log::debug!(
+            "renderer: render_full dims={}x{} cursor=({},{}) visible={}",
+            rows,
+            cols,
+            cursor_x,
+            cursor_y,
+            cursor_visible
+        );
         let mut stdout = io::stdout().lock();
 
         // Hide cursor during rendering to avoid flicker.
@@ -145,6 +155,12 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
+        log::debug!(
+            "renderer: render_diff changes={} cursor=({},{})",
+            changes.len(),
+            cursor_x,
+            cursor_y
+        );
         let mut stdout = io::stdout().lock();
 
         queue!(stdout, cursor::Hide)?;
@@ -212,6 +228,14 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
+        log::debug!(
+            "renderer: render_scroll delta={} pane={}x{} at ({},{})",
+            delta,
+            pane_width,
+            pane_height,
+            pane_x,
+            pane_y
+        );
         let mut stdout = io::stdout().lock();
         queue!(stdout, cursor::Hide)?;
 
@@ -376,6 +400,7 @@ impl Renderer {
 
     /// Resize the renderer to new dimensions.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        log::debug!("renderer: resize cols={} rows={}", cols, rows);
         self.cols = cols;
         self.rows = rows;
         self.front = vec![vec![RenderCell::default(); cols as usize]; rows as usize];
@@ -762,8 +787,7 @@ impl Renderer {
         matches: &[(usize, usize)],
         current_match: usize,
         query_len: usize,
-        scrollback_line_count: usize,
-        scroll_offset: usize,
+        viewport_top: usize,
         pane_rect: Option<&crate::protocol::PaneRect>,
         theme: &crate::config::theme::Theme,
     ) -> Result<()> {
@@ -781,8 +805,8 @@ impl Renderer {
         }
 
         // The visible line range in scrollback coordinates.
-        let visible_end = scrollback_line_count.saturating_sub(scroll_offset);
-        let visible_start = visible_end.saturating_sub(pane_h);
+        let visible_start = viewport_top;
+        let visible_end = viewport_top + pane_h;
 
         let mut stdout = io::stdout().lock();
         queue!(stdout, cursor::Hide)?;

@@ -134,6 +134,13 @@ impl Screen {
     ///
     /// Content is preserved where possible. New cells are filled with defaults.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        log::debug!(
+            "screen: resize old={}x{}, new={}x{}",
+            self.cols,
+            self.rows,
+            cols,
+            rows
+        );
         let mut new_grid = Self::make_grid(cols, rows);
 
         let copy_rows = std::cmp::min(self.rows as usize, rows as usize);
@@ -163,6 +170,7 @@ impl Screen {
     /// Feed raw terminal output bytes through the VTE parser, updating the
     /// screen state.
     pub fn process_output(&mut self, data: &[u8]) {
+        log::trace!("screen: process_output bytes={}", data.len());
         for &byte in data {
             // We need to temporarily take ownership of the parser to satisfy
             // the borrow checker (advance requires &mut Parser and &mut Perform).
@@ -183,6 +191,27 @@ impl Screen {
         }
 
         for row in &self.grid {
+            let text: String = row.iter().map(|c| c.c).collect();
+            result.push_str(text.trim_end());
+            result.push('\n');
+        }
+
+        result
+    }
+
+    /// Return scrollback + only the first `visible_rows` grid rows as plain text.
+    /// Use this instead of `scrollback_content()` when the grid is larger than
+    /// the displayed content area (e.g., due to borders).
+    pub fn scrollback_content_visible(&self, visible_rows: usize) -> String {
+        let mut result = String::new();
+
+        for line in &self.scrollback {
+            let text: String = line.iter().map(|c| c.c).collect();
+            result.push_str(text.trim_end());
+            result.push('\n');
+        }
+
+        for row in self.grid.iter().take(visible_rows) {
             let text: String = row.iter().map(|c| c.c).collect();
             result.push_str(text.trim_end());
             result.push('\n');

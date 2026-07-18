@@ -51,6 +51,14 @@ impl Pty {
         command: Option<&str>,
         cwd: Option<&std::path::Path>,
     ) -> Result<Pty> {
+        log::debug!(
+            "pty: spawn cols={}, rows={}, command={:?}, cwd={:?}",
+            cols,
+            rows,
+            command,
+            cwd
+        );
+
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -129,6 +137,8 @@ impl Pty {
                 // -- Parent process --
                 // Close the slave side; we only communicate through the master.
                 drop(slave);
+
+                log::debug!("pty: child process spawned with pid={}", child);
 
                 Ok(Pty {
                     master_fd: master,
@@ -275,6 +285,8 @@ impl Drop for Pty {
 /// The caller must ensure that `master_fd` remains valid for the lifetime of
 /// the returned task. The task does not own the fd and will not close it.
 pub fn start_reader(master_fd: RawFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
+    log::debug!("pty: start_reader watching fd={}", master_fd);
+
     // Set the fd to non-blocking mode, which is required by AsyncFd.
     // SAFETY: The fd is valid (caller guarantees).
     unsafe {

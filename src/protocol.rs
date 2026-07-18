@@ -79,6 +79,9 @@ pub enum ServerMessage {
         /// Whether the focused pane has application cursor keys (DECCKM) active.
         #[serde(default)]
         application_cursor_keys: bool,
+        /// Index in the combined scrollback+grid buffer of the first displayed line.
+        #[serde(default)]
+        viewport_top: usize,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -92,6 +95,9 @@ pub enum ServerMessage {
         /// Whether the focused pane has application cursor keys (DECCKM) active.
         #[serde(default)]
         application_cursor_keys: bool,
+        /// Index in the combined scrollback+grid buffer of the first displayed line.
+        #[serde(default)]
+        viewport_top: usize,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -112,6 +118,9 @@ pub enum ServerMessage {
         cursor_style: u8,
         focused_pane_rect: Option<PaneRect>,
         application_cursor_keys: bool,
+        /// Index in the combined scrollback+grid buffer of the first displayed line.
+        #[serde(default)]
+        viewport_top: usize,
     },
     /// Response to a `ListSessions` request.
     SessionList { sessions: Vec<SessionListEntry> },
@@ -413,6 +422,7 @@ pub enum SessionEvent {
 /// Serialize a message into a length-prefixed JSON frame.
 pub fn encode_message<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)?;
+    log::trace!("protocol: encode_message bytes={}", json.len());
     let len = (json.len() as u32).to_be_bytes();
     let mut buf = Vec::with_capacity(4 + json.len());
     buf.extend_from_slice(&len);
@@ -422,7 +432,9 @@ pub fn encode_message<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
 
 /// Read the payload length from a 4-byte big-endian header.
 pub fn decode_message_length(header: &[u8; 4]) -> usize {
-    u32::from_be_bytes(*header) as usize
+    let len = u32::from_be_bytes(*header) as usize;
+    log::trace!("protocol: decode_message_length bytes={}", len);
+    len
 }
 
 // ---------------------------------------------------------------------------

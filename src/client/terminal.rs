@@ -57,16 +57,19 @@ impl RemuxClient {
     /// Connect to an existing server, or return an error if none is running.
     pub async fn connect() -> Result<Self> {
         let path = socket_path();
+        log::debug!("terminal: connect socket_path={}", path.display());
         let stream = UnixStream::connect(&path)
             .await
             .with_context(|| format!("connecting to server at {}", path.display()))?;
 
+        log::debug!("terminal: connect success");
         let (reader, writer) = stream.into_split();
         Ok(Self { reader, writer })
     }
 
     /// Send a message to the server.
     pub async fn send(&mut self, msg: ClientMessage) -> Result<()> {
+        log::debug!("terminal: send {}", client_message_summary(&msg));
         write_message(&mut self.writer, &msg).await
     }
 
@@ -75,5 +78,13 @@ impl RemuxClient {
     /// Returns `Ok(None)` if the server closed the connection.
     pub async fn recv(&mut self) -> Result<Option<ServerMessage>> {
         read_message::<ServerMessage>(&mut self.reader).await
+    }
+}
+
+/// Produce a concise summary of a `ClientMessage` for debug logging.
+fn client_message_summary(msg: &ClientMessage) -> String {
+    match msg {
+        ClientMessage::Input { data } => format!("Input({} bytes)", data.len()),
+        other => format!("{:?}", other),
     }
 }

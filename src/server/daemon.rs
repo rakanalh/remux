@@ -276,6 +276,7 @@ impl RemuxServer {
                     prev_scroll_offset: 0,
                 },
             );
+            log::debug!("server: new client connection, assigned client_id={id}");
             id
         };
 
@@ -352,6 +353,33 @@ async fn handle_client_message(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    // Log a summary of every incoming client message.
+    match &msg {
+        ClientMessage::Input { data } => {
+            log::debug!(
+                "server: client_id={client_id} msg=Input({} bytes)",
+                data.len()
+            );
+        }
+        ClientMessage::ScrollDelta { delta } => {
+            log::debug!("server: client_id={client_id} msg=ScrollDelta(delta={delta})");
+        }
+        ClientMessage::MouseDrag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            is_final,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final})"
+            );
+        }
+        other => {
+            log::debug!("server: client_id={client_id} msg={other:?}");
+        }
+    }
+
     match msg {
         ClientMessage::Attach { session_name } => {
             handle_attach(
@@ -486,6 +514,9 @@ async fn handle_client_message(
             };
             let clamped = new_offset.min(max_offset);
             let changed = clamped != old_offset;
+            log::debug!(
+                "server: ScrollDelta client_id={client_id} delta={delta} new_offset={clamped} max_scrollable={max_offset}"
+            );
             {
                 let mut cls = clients.lock().await;
                 if let Some(client) = cls.get_mut(&client_id) {
@@ -512,6 +543,7 @@ async fn handle_client_message(
             Ok(())
         }
         ClientMessage::ScrollReset => {
+            log::debug!("server: ScrollReset client_id={client_id}");
             {
                 let mut cls = clients.lock().await;
                 if let Some(client) = cls.get_mut(&client_id) {
@@ -607,6 +639,8 @@ async fn handle_attach(
         }
     };
 
+    log::debug!("server: client_id={client_id} attach session={session_name:?} dims={cols}x{rows}");
+
     // Resize panes to match the attaching client's terminal dimensions.
     resize_session_panes(session_name, cols, rows, state, panes, config).await?;
 
@@ -635,6 +669,7 @@ async fn handle_attach(
 }
 
 async fn handle_detach(client_id: u64, clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>) {
+    log::debug!("server: client_id={client_id} detach");
     let mut cls = clients.lock().await;
     if let Some(client) = cls.get_mut(&client_id) {
         client.session_name = None;
@@ -670,6 +705,11 @@ async fn handle_input(
         tab.focused_pane
     };
 
+    log::debug!(
+        "server: client_id={client_id} input {} bytes -> pane_id={active_pane}",
+        data.len()
+    );
+
     let ps = panes.lock().await;
     if let Some(pane_data) = ps.get(&active_pane) {
         pane_data.pty.write_input(data)?;
@@ -698,6 +738,8 @@ async fn handle_resize(
             None
         }
     };
+
+    log::debug!("server: client_id={client_id} resize cols={cols} rows={rows}");
 
     if let Some(session_name) = session_name {
         resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
@@ -732,6 +774,8 @@ async fn handle_command(
         None => return Ok(()),
     };
 
+    log::debug!("server: client_id={client_id} command={cmd:?} session={session_name:?}");
+
     match cmd {
         RemuxCommand::TabNew => {
             let pane_id = {
@@ -744,6 +788,7 @@ async fn handle_command(
                 let tab_name = format!("Tab {}", tab_count + 1);
                 st.create_tab(&session_name, &tab_name, LayoutMode::default())?
             };
+            log::debug!("server: TabNew session={session_name:?} new pane_id={pane_id}");
             spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -756,6 +801,7 @@ async fn handle_command(
                     None => return Ok(()),
                 }
             };
+            log::debug!("server: TabClose session={session_name:?} tab_idx={tab_idx}");
             let (pane_ids, _deleted) = {
                 let mut st = state.lock().await;
                 st.close_tab(&session_name, tab_idx)?
@@ -808,6 +854,7 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabRename(name) => {
+            log::debug!("server: TabRename session={session_name:?} new_name={name:?}");
             {
                 let mut st = state.lock().await;
                 let idx = {
@@ -840,6 +887,9 @@ async fn handle_command(
                 tab.layout.split_vertical(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
                 tab.pane_order.push(new_pane_id);
+                log::debug!(
+                    "server: PaneSplitVertical new_pane_id={new_pane_id} from focused={focused}"
+                );
                 (new_pane_id, focused)
             };
             let focused_cwd = {
@@ -882,6 +932,9 @@ async fn handle_command(
                 tab.layout.split_horizontal(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
                 tab.pane_order.push(new_pane_id);
+                log::debug!(
+                    "server: PaneSplitHorizontal new_pane_id={new_pane_id} from focused={focused}"
+                );
                 (new_pane_id, focused)
             };
             let focused_cwd = {
@@ -917,6 +970,7 @@ async fn handle_command(
                 };
                 tab.focused_pane
             };
+            log::debug!("server: PaneClose pane_id={closed_pane}");
             close_pane(
                 closed_pane,
                 &session_name,
@@ -939,6 +993,7 @@ async fn handle_command(
                 RemuxCommand::PaneFocusDown => layout::FocusDirection::Down,
                 _ => unreachable!(),
             };
+            log::debug!("server: PaneFocus direction={direction:?}");
             {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -979,6 +1034,9 @@ async fn handle_command(
                 tab.layout.add_to_stack(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
                 tab.pane_order.push(new_pane_id);
+                log::debug!(
+                    "server: PaneStackAdd new_pane_id={new_pane_id} from focused={focused}"
+                );
                 (new_pane_id, focused)
             };
             let focused_cwd = {
@@ -1084,6 +1142,7 @@ async fn handle_command(
                     BorderStyle::ZellijStyle => BorderStyle::TmuxStyle,
                     BorderStyle::TmuxStyle => BorderStyle::ZellijStyle,
                 };
+                log::debug!("server: ToggleStyle new_style={:?}", sess.border_style);
             }
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -1095,6 +1154,7 @@ async fn handle_command(
             handle_list_sessions(client_id, state, clients).await?;
         }
         RemuxCommand::SessionRename(new_name) => {
+            log::debug!("server: SessionRename old={session_name:?} new={new_name:?}");
             {
                 let mut st = state.lock().await;
                 st.rename_session(&session_name, &new_name)?;
@@ -1107,6 +1167,7 @@ async fn handle_command(
             }
         }
         RemuxCommand::PaneRename(name) => {
+            log::debug!("server: PaneRename new_name={name:?}");
             {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -1203,6 +1264,7 @@ async fn handle_command(
                     None => return Ok(()),
                 };
                 tab.layout_mode = tab.layout_mode.next();
+                log::debug!("server: LayoutNext new_mode={}", tab.layout_mode.name());
                 if tab.layout_mode.is_automatic() {
                     tab.layout = tab
                         .layout_mode
@@ -1448,6 +1510,11 @@ async fn handle_command(
                 } else {
                     tab.zoomed_pane = Some(tab.focused_pane);
                 }
+                log::debug!(
+                    "server: PaneToggleZoom pane={} zoomed={}",
+                    tab.focused_pane,
+                    tab.zoomed_pane.is_some()
+                );
             }
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -1486,6 +1553,7 @@ async fn handle_create_session(
         let layout_mode = config.appearance.default_layout.to_layout_mode();
         st.create_session(name, folder, border_style, layout_mode)?
     };
+    log::debug!("server: CreateSession name={name:?} folder={folder:?} pane_id={pane_id}");
     spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
 
     let cls = clients.lock().await;
@@ -1581,6 +1649,10 @@ async fn handle_kill_session(
         let mut st = state.lock().await;
         st.delete_session(name)?
     };
+    log::debug!(
+        "server: KillSession name={name:?} panes_removed={}",
+        pane_ids.len()
+    );
     {
         let mut ps = panes.lock().await;
         for pid in pane_ids {
@@ -1605,6 +1677,7 @@ async fn handle_client_disconnect(
     client_id: u64,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 ) {
+    log::debug!("server: client_id={client_id} disconnected, removing from client map");
     let mut cls = clients.lock().await;
     cls.remove(&client_id);
 }
@@ -1615,10 +1688,10 @@ async fn handle_request_scrollback(
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 ) -> Result<()> {
-    let (session_name, _cols, _rows) = {
+    let session_name = {
         let cls = clients.lock().await;
         match cls.get(&client_id) {
-            Some(c) => (c.session_name.clone(), c.cols, c.rows),
+            Some(c) => c.session_name.clone(),
             None => return Ok(()),
         }
     };
@@ -1627,7 +1700,7 @@ async fn handle_request_scrollback(
         None => return Ok(()),
     };
 
-    // Find the active pane for this client's session.
+    // Find the active pane.
     let active_pane_id = {
         let st = state.lock().await;
         let sess = match st.sessions.get(&session_name) {
@@ -1668,6 +1741,7 @@ async fn handle_search_info(
     total: usize,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 ) {
+    log::debug!("server: SearchInfo client_id={client_id} current={current} total={total}");
     let mut cls = clients.lock().await;
     if let Some(client) = cls.get_mut(&client_id) {
         if total == 0 {
@@ -1688,6 +1762,7 @@ async fn handle_mode_changed(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    log::debug!("server: ModeChanged client_id={client_id} new_mode={mode:?}");
     let session_name = {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
@@ -1761,6 +1836,7 @@ async fn handle_mouse_click(
     .await;
 
     let target = hit_test(x, y, &hit_regions, &pane_rects);
+    log::debug!("server: MouseClick client_id={client_id} x={x} y={y} target={target:?}");
 
     match target {
         ClickTarget::Pane(pane_id) => {
@@ -1839,6 +1915,9 @@ async fn handle_mouse_drag(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    log::debug!(
+        "server: MouseDrag client_id={client_id} start=({start_x},{start_y}) end=({end_x},{end_y}) is_final={is_final}"
+    );
     let (session_name, cols, rows, mode) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
@@ -2016,6 +2095,7 @@ async fn spawn_pane(
     config: &Arc<Config>,
 ) -> Result<()> {
     let cmd = command.or(config.general.default_shell.as_deref());
+    log::debug!("server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} cwd={cwd:?}");
     let pty_instance = Pty::spawn(cols, rows, cmd, cwd)?;
     let raw_fd = pty_instance.master_fd.as_raw_fd();
     let (_reader_handle, pty_rx) = pty::start_reader(raw_fd);
@@ -2058,18 +2138,51 @@ async fn resize_session_panes(
             width: cols,
             height: content_rows,
         };
-        if let Some(zoomed_id) = tab.zoomed_pane {
+        let pane_rects = if let Some(zoomed_id) = tab.zoomed_pane {
             vec![(zoomed_id, area)]
         } else {
             layout::compute_layout(&tab.layout, area, 0)
+        };
+
+        // Compute the content dimensions (what blit_screen actually renders)
+        // based on border style, so the PTY/screen match the visible area.
+        let mut content_rects = Vec::new();
+        for &(pane_id, rect) in &pane_rects {
+            let (content_cols, content_rows) = match sess.border_style {
+                BorderStyle::ZellijStyle => {
+                    if rect.width >= 3 && rect.height >= 3 {
+                        (rect.width - 2, rect.height - 2)
+                    } else {
+                        (rect.width, rect.height)
+                    }
+                }
+                BorderStyle::TmuxStyle => {
+                    let stack_info = layout::find_stack_names(&tab.layout, pane_id);
+                    let is_multi = stack_info
+                        .as_ref()
+                        .map(|(_, panes, _)| panes.len() > 1)
+                        .unwrap_or(false);
+                    if is_multi && rect.height >= 2 {
+                        (rect.width, rect.height - 1)
+                    } else {
+                        (rect.width, rect.height)
+                    }
+                }
+            };
+            content_rects.push((pane_id, content_cols, content_rows));
         }
+        content_rects
     };
 
     let mut ps = panes.lock().await;
-    for (pane_id, rect) in rects {
+    for (pane_id, content_cols, content_rows) in rects {
         if let Some(pane_data) = ps.get_mut(&pane_id) {
-            let inner_cols = rect.width.max(1);
-            let inner_rows = rect.height.max(1);
+            let inner_cols = content_cols.max(1);
+            let inner_rows = content_rows.max(1);
+            log::debug!(
+                "resize_session_panes: pane_id={}, content={}x{}, pty/screen resize to cols={} rows={}",
+                pane_id, content_cols, content_rows, inner_cols, inner_rows
+            );
             let _ = pane_data.pty.resize(inner_cols, inner_rows);
             pane_data.screen.resize(inner_cols, inner_rows);
         }
@@ -2093,6 +2206,9 @@ async fn send_full_render_to_client(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
+    log::debug!(
+        "server: send_full_render_to_client client_id={client_id} session={session_name:?} dims={cols}x{rows}"
+    );
     let (mode, selection, client_search_info, scroll_offset) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
@@ -2135,6 +2251,40 @@ async fn send_full_render_to_client(
     } else {
         cursor_visible
     };
+
+    // Compute viewport_top: the scrollback line index of the first displayed line.
+    let viewport_top = {
+        let st = state.lock().await;
+        let fp = st
+            .sessions
+            .get(session_name)
+            .and_then(|s| s.tabs.get(s.active_tab))
+            .map(|t| t.focused_pane);
+        drop(st);
+        if let Some(fp) = fp {
+            let ps = panes.lock().await;
+            ps.get(&fp)
+                .map(|p| {
+                    if scroll_offset == 0 {
+                        // Not scrolled: blit_screen fast path reads from grid[0]
+                        // which is line_at(scrollback.len())
+                        p.screen.scrollback.len()
+                    } else {
+                        // Scrolled: blit_screen_scrolled computes
+                        // view_top = total - scroll_offset - pane_h
+                        let total = p.screen.total_lines();
+                        let pane_h = focused_pane_rect
+                            .map(|r| r.height as usize)
+                            .unwrap_or(rows.saturating_sub(1) as usize);
+                        total.saturating_sub(scroll_offset).saturating_sub(pane_h)
+                    }
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
     // Only save to session-level prev_frames for live view (scroll_offset == 0).
     // Scrolled frames must not pollute the broadcast diff cache.
     if scroll_offset == 0 {
@@ -2156,6 +2306,10 @@ async fn send_full_render_to_client(
             && abs_delta > 0
             && abs_delta <= 10
             && focused_pane_rect.is_some();
+
+        log::debug!(
+            "server: render decision client_id={client_id} scroll_offset={scroll_offset} prev_so={prev_so} delta={delta} use_scroll_render={use_scroll_render}"
+        );
 
         if use_scroll_render {
             let fpr = focused_pane_rect.unwrap();
@@ -2203,6 +2357,7 @@ async fn send_full_render_to_client(
                 cursor_style,
                 focused_pane_rect: Some(fpr),
                 application_cursor_keys,
+                viewport_top,
             });
         } else {
             let _ = client.tx.send(ServerMessage::FullRender {
@@ -2213,6 +2368,7 @@ async fn send_full_render_to_client(
                 cursor_style,
                 focused_pane_rect,
                 application_cursor_keys,
+                viewport_top,
             });
         }
     }
@@ -2226,7 +2382,7 @@ async fn broadcast_full_render(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (cols, rows, mode, selection, si) = {
+    let (cols, rows, mode, selection, si, client_count) = {
         let cls = clients.lock().await;
         let attached: Vec<_> = cls
             .values()
@@ -2235,6 +2391,7 @@ async fn broadcast_full_render(
         if attached.is_empty() {
             return;
         }
+        let count = attached.len();
         let cols = attached.iter().map(|c| c.cols).min().unwrap_or(80);
         let rows = attached.iter().map(|c| c.rows).min().unwrap_or(24);
         // Use the mode and selection from the first attached client.
@@ -2244,8 +2401,10 @@ async fn broadcast_full_render(
             .unwrap_or_else(|| "NORMAL".to_string());
         let selection = first.and_then(|c| c.mouse_selection.clone());
         let si = first.and_then(|c| c.search_info);
-        (cols, rows, mode, selection, si)
+        (cols, rows, mode, selection, si, count)
     };
+
+    log::debug!("server: broadcast_full_render session={session_name:?} clients={client_count}");
 
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;
@@ -2275,6 +2434,28 @@ async fn broadcast_full_render(
     )
     .await;
 
+    // Compute viewport_top for live view (scroll_offset=0): first displayed line index.
+    let viewport_top = {
+        let st = state.lock().await;
+        let fp = st
+            .sessions
+            .get(session_name)
+            .and_then(|s| s.tabs.get(s.active_tab))
+            .map(|t| t.focused_pane);
+        drop(st);
+        if let Some(fp) = fp {
+            let ps = panes.lock().await;
+            ps.get(&fp)
+                .map(|p| {
+                    // Live view (offset=0): blit reads from grid[0] = line_at(scrollback.len())
+                    p.screen.scrollback.len()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
     // Compute a single diff against session-level prev_frames.
     // This is the ONLY writer to prev_frames during normal operation,
     // so there are no race conditions with the diff cache.
@@ -2283,7 +2464,13 @@ async fn broadcast_full_render(
         let prev = prev_frames_map.get(session_name);
         if let Some(prev_cells) = prev {
             let changes = compute_diff(prev_cells, &cells);
-            if changes.len() > (cols as usize * rows as usize / 2) {
+            let threshold = cols as usize * rows as usize / 2;
+            if changes.len() > threshold {
+                log::debug!(
+                    "server: broadcast render=Full (diff {} changes > threshold {})",
+                    changes.len(),
+                    threshold
+                );
                 ServerMessage::FullRender {
                     cells: cells.clone(),
                     cursor_x,
@@ -2292,8 +2479,14 @@ async fn broadcast_full_render(
                     cursor_style,
                     focused_pane_rect,
                     application_cursor_keys,
+                    viewport_top,
                 }
             } else {
+                log::debug!(
+                    "server: broadcast render=Diff ({} changes, threshold {})",
+                    changes.len(),
+                    threshold
+                );
                 ServerMessage::RenderDiff {
                     changes,
                     cursor_x,
@@ -2302,9 +2495,11 @@ async fn broadcast_full_render(
                     cursor_style,
                     focused_pane_rect,
                     application_cursor_keys,
+                    viewport_top,
                 }
             }
         } else {
+            log::debug!("server: broadcast render=Full (no prev frame)");
             ServerMessage::FullRender {
                 cells: cells.clone(),
                 cursor_x,
@@ -2313,6 +2508,7 @@ async fn broadcast_full_render(
                 cursor_style,
                 focused_pane_rect,
                 application_cursor_keys,
+                viewport_top,
             }
         }
     };
@@ -2760,6 +2956,8 @@ async fn start_pty_forwarding(
         layout::all_pane_ids(&tab.layout)
     };
 
+    log::debug!("server: start_pty_forwarding session={session_name:?} pane_ids={pane_ids:?}");
+
     let session_name = session_name.to_string();
 
     for pane_id in pane_ids {
@@ -2807,6 +3005,14 @@ async fn start_pty_forwarding(
                                 for chunk in &chunks {
                                     pane_data.screen.process_output(chunk);
                                 }
+                                log::debug!(
+                                    "pty_forwarding: pane_id={}, cursor=({},{}), screen.rows={}, scroll_bottom={}",
+                                    pane_id,
+                                    pane_data.screen.cursor_x,
+                                    pane_data.screen.cursor_y,
+                                    pane_data.screen.rows,
+                                    pane_data.screen.scroll_bottom
+                                );
                                 pane_data.screen.take_responses()
                             } else {
                                 Vec::new()
@@ -2833,6 +3039,9 @@ async fn start_pty_forwarding(
                     }
                     Some(Err(())) => {
                         // Channel disconnected - process has exited.
+                        log::debug!(
+                            "server: PTY channel disconnected for pane_id={pane_id} session={session_name:?}"
+                        );
                         // Close the pane automatically.
                         close_pane(
                             pane_id,
@@ -2876,8 +3085,10 @@ async fn save_if_enabled(
     config: &Arc<Config>,
 ) {
     if !config.general.automatic_restore {
+        log::debug!("server: save_if_enabled skipped (automatic_restore=false)");
         return;
     }
+    log::debug!("server: save_if_enabled saving state");
     let st = state.lock().await;
     let ps = panes.lock().await;
     let mut pane_cwds = HashMap::new();
