@@ -1067,6 +1067,10 @@ async fn run_client_loop(
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
                                         switch_to_server(mgr, &server, c, r).await?;
+                                        // The server's handle_command ignores commands from a
+                                        // client with no attached session, so a remote tab switch
+                                        // must attach first (harmless re-attach for local).
+                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                         mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchTab {
                                             session: session.clone(),
                                             tab_index,
@@ -1083,6 +1087,10 @@ async fn run_client_loop(
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
                                         switch_to_server(mgr, &server, c, r).await?;
+                                        // The server's handle_command ignores commands from a
+                                        // client with no attached session, so a remote pane switch
+                                        // must attach first (harmless re-attach for local).
+                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                         mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchPane {
                                             session: session.clone(),
                                             tab_index,
