@@ -62,18 +62,34 @@ enum Commands {
         name: String,
     },
 
+    /// Attach to a session on a remote machine over SSH
+    AttachRemote {
+        /// SSH destination (e.g. user@host); relies on ~/.ssh/config
+        dest: String,
+        /// Session name on the remote to attach to
+        name: String,
+        /// Path to the remux binary on the remote
+        #[arg(long, default_value = "remux")]
+        remux_path: String,
+    },
+
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
     Server,
+
+    /// Internal: relay stdio to the local server socket (used over SSH)
+    #[command(hide = true)]
+    Relay,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Determine log file based on command: server.log vs client.log.
+    // Determine log file based on command: server.log vs relay.log vs client.log.
     let log_filename = match cli.command {
         Some(Commands::Server) => "server.log",
+        Some(Commands::Relay) => "relay.log",
         _ => "client.log",
     };
     let log_dir = dirs::state_dir()
@@ -95,6 +111,7 @@ async fn main() -> Result<()> {
 
     let role = match cli.command {
         Some(Commands::Server) => "server",
+        Some(Commands::Relay) => "relay",
         _ => "client",
     };
     log::info!("remux starting as {role}, log={}", log_path.display());
@@ -224,6 +241,51 @@ async fn main() -> Result<()> {
                     eprintln!("Unexpected response from server.");
                 }
             }
+        }
+        Some(Commands::AttachRemote {
+            dest,
+            name,
+            remux_path,
+        }) => {
+            log::debug!(
+                "cmd: attach-remote dest={dest:?} session={name:?} remux_path={remux_path:?}"
+            );
+            // The server we want is the remote one; the relay starts it there,
+            // so we deliberately do NOT call ensure_server_running() locally.
+            let mut client = RemuxClient::connect_ssh(&dest, &remux_path).await?;
+            let config = Config::load()?;
+
+            client
+                .send(ClientMessage::Attach { session_name: name })
+                .await?;
+
+            client_event_loop(&mut client, &config).await?;
+        }
+        Some(Commands::Relay) => {
+            log::info!("cmd: relay starting");
+            // Make sure this machine's own server is up, then become a dumb
+            // transparent byte pump between our stdio and the local socket.
+            // We do NOT use RemuxClient and perform NO handshake here: the real
+            // handshake flows through end-to-end between the far client and this
+            // machine's server.
+            ensure_server_running().await?;
+            let sock = tokio::net::UnixStream::connect(socket_path())
+                .await
+                .context("relay: connecting to local server socket")?;
+            let (mut srd, mut swr) = sock.into_split();
+            let mut stdin = tokio::io::stdin();
+            let mut stdout = tokio::io::stdout();
+
+            // Exit as soon as EITHER direction hits EOF.
+            tokio::select! {
+                r = tokio::io::copy(&mut stdin, &mut swr) => {
+                    log::debug!("relay: stdin->socket ended: {:?}", r);
+                }
+                r = tokio::io::copy(&mut srd, &mut stdout) => {
+                    log::debug!("relay: socket->stdout ended: {:?}", r);
+                }
+            }
+            log::info!("cmd: relay exiting");
         }
         Some(Commands::Kill { name }) => {
             log::debug!("cmd: kill session={name:?}");

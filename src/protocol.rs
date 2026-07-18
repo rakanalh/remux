@@ -7,6 +7,38 @@ use serde::{Deserialize, Serialize};
 pub type PaneId = u64;
 
 // ---------------------------------------------------------------------------
+// Version handshake
+// ---------------------------------------------------------------------------
+
+/// The wire protocol version. Bump when a breaking change is made to the
+/// framed message shapes exchanged between client and server.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// First frame sent by a connecting client, announcing its protocol/build.
+///
+/// FROZEN WIRE SHAPE — never rename/remove/retype existing fields; only add
+/// `#[serde(default)]` optional fields. This is the one message exchanged
+/// before version-compatible messaging is established, so a version skew must
+/// be detectable here rather than crashing mid-session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hello {
+    pub protocol_version: u32,
+    pub remux_version: String,
+}
+
+/// First frame sent by the server in response to a `Hello`.
+///
+/// FROZEN WIRE SHAPE — never rename/remove/retype existing fields; only add
+/// `#[serde(default)]` optional fields. This is the one message exchanged
+/// before version-compatible messaging is established, so a version skew must
+/// be detectable here rather than crashing mid-session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Welcome {
+    pub protocol_version: u32,
+    pub remux_version: String,
+}
+
+// ---------------------------------------------------------------------------
 // Client -> Server
 // ---------------------------------------------------------------------------
 
@@ -638,6 +670,28 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn round_trip_hello_welcome() {
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            remux_version: "1.2.3".into(),
+        };
+        let encoded = encode_message(&hello).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: Hello = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(decoded.remux_version, "1.2.3");
+
+        let welcome = Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            remux_version: "1.2.3".into(),
+        };
+        let encoded = encode_message(&welcome).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: Welcome = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
     }
 
     #[test]

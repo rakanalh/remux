@@ -255,7 +255,48 @@ impl RemuxServer {
 
     /// Handle a newly accepted client connection.
     async fn handle_new_connection(&self, stream: tokio::net::UnixStream) {
-        let (read_half, write_half) = stream.into_split();
+        let (mut read_half, mut write_half) = stream.into_split();
+
+        // Version handshake: exchange Hello/Welcome as the first frames, directly
+        // on the split halves before wiring up the ServerMessage channel or
+        // spawning the reader/writer tasks. Bounded by a timeout so a silent peer
+        // cannot hold this open indefinitely. The server is lenient about version
+        // skew (it logs and proceeds); the client decides whether to abort.
+        let handshake = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let hello: Hello = read_message(&mut read_half)
+                .await?
+                .context("client closed connection during handshake")?;
+            log::info!(
+                "server: handshake from remux {} protocol v{}",
+                hello.remux_version,
+                hello.protocol_version
+            );
+            if hello.protocol_version != PROTOCOL_VERSION {
+                log::warn!(
+                    "server: protocol version mismatch (client v{}, server v{}); proceeding leniently",
+                    hello.protocol_version,
+                    PROTOCOL_VERSION
+                );
+            }
+            let welcome = Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                remux_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            write_message(&mut write_half, &welcome).await?;
+            anyhow::Ok(())
+        })
+        .await;
+        match handshake {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::warn!("server: handshake failed: {e}; dropping connection");
+                return;
+            }
+            Err(_) => {
+                log::warn!("server: handshake timed out; dropping connection");
+                return;
+            }
+        }
 
         let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
