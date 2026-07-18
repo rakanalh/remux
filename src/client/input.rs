@@ -1044,9 +1044,12 @@ impl InputHandler {
                 }
             }
             Option::None => {
-                // No match -- reset and ignore.
+                // No binding for this key: abort the chord back to Normal so the next
+                // key is a normal keystroke rather than being swallowed as another
+                // failed chord. (ModeChanged(Normal) also hides the which-key popup.)
                 self.keybinding_state.reset();
-                InputAction::HideWhichKey
+                self.mode = Mode::Normal;
+                InputAction::ModeChanged(Mode::Normal)
             }
         }
     }
@@ -2311,9 +2314,34 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
 
+        // An unbound key aborts the chord back to Normal (rather than staying
+        // in Command mode and swallowing the next keypress).
         let action = handler.handle_key(char_key('z'));
-        assert_eq!(action, InputAction::HideWhichKey);
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert_eq!(handler.mode, Mode::Normal);
         assert!(handler.keybinding_state.is_at_root());
+    }
+
+    #[test]
+    fn leader_then_unbound_key_returns_to_normal_and_next_key_passes_through() {
+        // Regression: leader + <unbound key> used to leave the handler stuck in
+        // Command mode, silently swallowing the following keypress.
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(handler.mode, Mode::Normal);
+
+        // Press the leader (Ctrl-a) to enter Command mode.
+        let action = handler.handle_key(ctrl_key('a'));
+        assert_eq!(handler.mode, Mode::Command);
+        assert!(matches!(action, InputAction::ShowWhichKey(..)));
+
+        // Press 'z', which has no binding at root -- should abort back to Normal.
+        let action = handler.handle_key(char_key('z'));
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert_eq!(handler.mode, Mode::Normal);
+
+        // The next ordinary key must be forwarded to the PTY, not swallowed.
+        let action = handler.handle_key(char_key('x'));
+        assert_eq!(action, InputAction::SendToPty(b"x".to_vec()));
     }
 
     #[test]
