@@ -85,7 +85,7 @@ impl Pty {
                 // SAFETY: TIOCSCTTY is a well-defined ioctl for setting the
                 // controlling terminal. The slave fd is valid.
                 unsafe {
-                    if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) == -1 {
+                    if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                         libc::_exit(1);
                     }
                 }
@@ -238,7 +238,7 @@ impl Pty {
         let ret = unsafe {
             libc::ioctl(
                 self.master_fd.as_raw_fd(),
-                libc::TIOCSWINSZ,
+                libc::TIOCSWINSZ as libc::c_ulong,
                 &winsize as *const Winsize,
             )
         };
