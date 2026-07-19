@@ -85,6 +85,10 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         ),
     );
 
+    // Quick tab navigation: Shift+] / Shift+[ (next / previous tab).
+    root.insert('}', leaf_chain("next tab", &["TabNext", "EnterNormal"]));
+    root.insert('{', leaf_chain("prev tab", &["TabPrev", "EnterNormal"]));
+
     // p: Pane
     root.insert(
         'p',
@@ -1235,6 +1239,29 @@ mod tests {
                 assert_eq!(label, "rename");
             }
             other => panic!("expected leaf for 'p' -> 'R', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_tree_has_quick_tab_navigation() {
+        let tree = KeybindingTree::default();
+
+        let next = tree.lookup(&['}']).unwrap();
+        match next {
+            KeyNode::Leaf { action, label, .. } => {
+                assert!(action.contains(&"TabNext".to_string()));
+                assert_eq!(label, "next tab");
+            }
+            other => panic!("expected leaf for '}}', got {other:?}"),
+        }
+
+        let prev = tree.lookup(&['{']).unwrap();
+        match prev {
+            KeyNode::Leaf { action, label, .. } => {
+                assert!(action.contains(&"TabPrev".to_string()));
+                assert_eq!(label, "prev tab");
+            }
+            other => panic!("expected leaf for '{{', got {other:?}"),
         }
     }
 

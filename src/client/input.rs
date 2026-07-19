@@ -1514,8 +1514,15 @@ impl InputHandler {
                 sm.select_prev();
                 InputAction::SessionManagerUpdate
             }
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Enter => {
                 let action = sm.handle_enter();
+                match action {
+                    SessionManagerAction::None => InputAction::SessionManagerUpdate,
+                    _ => InputAction::SessionManagerAction(action),
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                let action = sm.handle_expand();
                 match action {
                     SessionManagerAction::None => InputAction::SessionManagerUpdate,
                     _ => InputAction::SessionManagerAction(action),

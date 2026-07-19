@@ -591,6 +591,42 @@ impl SessionManagerState {
         }
     }
 
+    /// Expand the selected node (Right / `l`). Unlike [`handle_enter`], this
+    /// never switches/activates a Session/Tab/Pane -- it only reveals children.
+    ///
+    /// For a Pane (leaf) it does nothing. For a not-yet-connected/failed remote
+    /// Server it force-expands and returns [`SessionManagerAction::ConnectRemote`]
+    /// so the connection is established lazily (mirroring `handle_enter`).
+    pub fn handle_expand(&mut self) -> SessionManagerAction {
+        let row = match self.rows.get(self.selected) {
+            Some(r) => r.clone(),
+            None => return SessionManagerAction::None,
+        };
+
+        match &row.node_type {
+            NodeType::Server { id, state } => match id {
+                ConnId::Remote(name) if *state != RemoteState::Connected => {
+                    // Force-expand so children appear once the tree arrives,
+                    // and kick off the lazy connect.
+                    self.expanded.insert(server_key(id));
+                    self.rebuild_rows();
+                    SessionManagerAction::ConnectRemote(name.clone())
+                }
+                _ => {
+                    self.expand_selected();
+                    SessionManagerAction::None
+                }
+            },
+            // Leaf: nothing to expand.
+            NodeType::Pane { .. } => SessionManagerAction::None,
+            // Folder / Session / Tab: reveal children without switching.
+            _ => {
+                self.expand_selected();
+                SessionManagerAction::None
+            }
+        }
+    }
+
     /// Handle 'd' key -- enter delete confirmation sub-mode.
     ///
     /// Structural edits are Local-only: on a remote node this is a no-op.
@@ -1218,6 +1254,81 @@ mod tests {
             .find(|r| matches!(&r.node_type, NodeType::Session { server: ConnId::Remote(s), .. } if s == "pi"))
             .unwrap();
         assert!(!remote_session.is_current);
+    }
+
+    #[test]
+    fn test_handle_expand_reveals_tab_panes_without_switching() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+
+        // Reveal the tab: expand server -> folder -> session.
+        expand_server(&mut state, &ConnId::Local);
+        let folder_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Folder { name, .. } if name == "work"))
+            .unwrap();
+        state.selected = folder_idx;
+        state.expand_selected();
+        state.selected = session_row(&state, "project-a");
+        state.expand_selected();
+
+        // Select the tab row.
+        let tab_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
+            .unwrap();
+        let tab_key = state.node_key(&state.rows[tab_idx].node_type.clone());
+
+        // handle_enter on the tab still SWITCHES (returns SwitchTab).
+        state.selected = tab_idx;
+        let enter_action = state.handle_enter();
+        assert!(matches!(
+            enter_action,
+            SessionManagerAction::SwitchTab { .. }
+        ));
+
+        // handle_expand on the tab EXPANDS: inserts the tab key, no switch.
+        // Re-find the tab row (rebuilds may have shifted indices).
+        let tab_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
+            .unwrap();
+        state.selected = tab_idx;
+        let expand_action = state.handle_expand();
+        assert!(matches!(expand_action, SessionManagerAction::None));
+        assert!(state.expanded.contains(&tab_key));
+        // The tab's pane is now visible.
+        assert!(state
+            .rows
+            .iter()
+            .any(|r| matches!(&r.node_type, NodeType::Pane { .. })));
+    }
+
+    #[test]
+    fn test_handle_expand_remote_server_triggers_lazy_connect() {
+        let mut state = SessionManagerState::new(None);
+        state.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Remote("pi".to_string()),
+                "pi".to_string(),
+                RemoteState::NotConnected,
+            ),
+        ]);
+
+        let remote_idx = state
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
+            })
+            .unwrap();
+        state.selected = remote_idx;
+        let action = state.handle_expand();
+        assert!(matches!(action, SessionManagerAction::ConnectRemote(ref n) if n == "pi"));
     }
 
     #[test]
