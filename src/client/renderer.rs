@@ -590,6 +590,13 @@ impl Renderer {
                         break;
                     }
                     let cell = &row[screen_x];
+                    // Skip the continuation cell of a wide glyph: the preceding
+                    // width-2 lead was printed inverted and already covers both
+                    // physical columns, so printing here would misalign the
+                    // highlight. Mirrors render_full/render_diff width-0 handling.
+                    if cell.width == 0 {
+                        continue;
+                    }
 
                     let fg = if cell.bg == CellColor::Default {
                         Color::Black
@@ -693,26 +700,51 @@ impl Renderer {
             let pane_row_len = pane_w.min(row.len().saturating_sub(pane_ox));
             let pane_row: Vec<&RenderCell> = (0..pane_row_len).map(|c| &row[pane_ox + c]).collect();
 
+            // Collect glyph chars, skipping the width-0 continuation cell that
+            // follows a wide glyph (its char is a blank placeholder). A wide
+            // glyph still occupies 2 physical columns, so column slicing uses
+            // the physical column indices; only the char collection skips the
+            // continuation so `中文` yields "中文" and not "中 文".
             if is_line_mode {
-                let line: String = pane_row.iter().map(|c| c.c).collect();
+                let line: String = pane_row
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.c)
+                    .collect();
                 result.push_str(line.trim_end());
                 result.push('\n');
             } else if start_row == end_row {
                 let cs = start_col.min(pane_row.len());
                 let ce = (end_col + 1).min(pane_row.len());
-                let text: String = pane_row[cs..ce].iter().map(|c| c.c).collect();
+                let text: String = pane_row[cs..ce]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.c)
+                    .collect();
                 result.push_str(text.trim_end());
             } else if scrollback_row == start_row {
                 let cs = start_col.min(pane_row.len());
-                let text: String = pane_row[cs..].iter().map(|c| c.c).collect();
+                let text: String = pane_row[cs..]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.c)
+                    .collect();
                 result.push_str(text.trim_end());
                 result.push('\n');
             } else if scrollback_row == end_row {
                 let ce = (end_col + 1).min(pane_row.len());
-                let text: String = pane_row[..ce].iter().map(|c| c.c).collect();
+                let text: String = pane_row[..ce]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.c)
+                    .collect();
                 result.push_str(text.trim_end());
             } else {
-                let text: String = pane_row.iter().map(|c| c.c).collect();
+                let text: String = pane_row
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.c)
+                    .collect();
                 result.push_str(text.trim_end());
                 result.push('\n');
             }
@@ -1125,6 +1157,48 @@ mod tests {
         vs.cursor_row = 1;
         let text = renderer.extract_text(&vs);
         assert_eq!(text, "line one\nline two\n");
+    }
+
+    #[test]
+    fn test_extract_text_wide_glyph_no_interior_space() {
+        // Build a front buffer containing two wide glyphs "中文". Each wide
+        // glyph is a width-2 lead cell followed by a width-0 continuation cell
+        // (a blank placeholder). Layout: col0='中'(w2) col1=' '(w0)
+        // col2='文'(w2) col3=' '(w0), remaining cells are default spaces.
+        let mut renderer = Renderer::new(10, 1);
+        renderer.front[0][0] = RenderCell {
+            c: '中',
+            width: 2,
+            ..RenderCell::default()
+        };
+        renderer.front[0][1] = RenderCell {
+            c: ' ',
+            width: 0,
+            ..RenderCell::default()
+        };
+        renderer.front[0][2] = RenderCell {
+            c: '文',
+            width: 2,
+            ..RenderCell::default()
+        };
+        renderer.front[0][3] = RenderCell {
+            c: ' ',
+            width: 0,
+            ..RenderCell::default()
+        };
+
+        let mut vs = VisualState::with_cols(1, 1, 10);
+        // Select physical columns 0..=3, which span both wide glyphs and their
+        // continuation cells.
+        vs.cursor_row = 0;
+        vs.cursor_col = 0;
+        vs.start_char_selection();
+        vs.cursor_col = 3;
+
+        let text = renderer.extract_text(&vs);
+        // The continuation cells must be skipped: no stray interior/trailing
+        // space between the glyphs.
+        assert_eq!(text, "中文");
     }
 
     #[test]

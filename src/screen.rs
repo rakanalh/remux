@@ -814,6 +814,14 @@ impl vte::Perform for Screen {
                                     self.scroll_top = self.saved_scroll_top;
                                     self.scroll_bottom = self.saved_scroll_bottom;
                                     self.alt_screen_active = false;
+                                    // Safety: mouse-tracking apps are almost always
+                                    // alt-screen apps that enable/disable both together.
+                                    // Reset the mouse flags when leaving the alt screen
+                                    // so a crashed/exited app that never sent the
+                                    // matching DECRST doesn't leave the wheel forwarding
+                                    // escape sequences to the shell instead of scrolling.
+                                    self.mouse_tracking = false;
+                                    self.mouse_sgr = false;
                                 }
                             }
                             1047 => {
@@ -825,6 +833,11 @@ impl vte::Perform for Screen {
                                     self.scroll_top = self.saved_scroll_top;
                                     self.scroll_bottom = self.saved_scroll_bottom;
                                     self.alt_screen_active = false;
+                                    // Safety: reset mouse flags on leaving the alt screen
+                                    // (see mode 1049 above) to recover the common
+                                    // "app gone, flag stuck" case.
+                                    self.mouse_tracking = false;
+                                    self.mouse_sgr = false;
                                 }
                             }
                             _ => {}
@@ -977,6 +990,28 @@ mod tests {
         assert!(!s.mouse_tracking);
         s.process_output(b"\x1b[?1003h");
         assert!(s.mouse_tracking);
+    }
+
+    #[test]
+    fn test_leaving_alt_screen_resets_mouse_tracking() {
+        let mut s = make_screen();
+
+        // Enter alt screen (1049) and enable mouse tracking (1000) + SGR (1006),
+        // simulating a TUI app.
+        s.process_output(b"\x1b[?1049h");
+        s.process_output(b"\x1b[?1000h");
+        s.process_output(b"\x1b[?1006h");
+        assert!(s.alt_screen_active);
+        assert!(s.mouse_tracking);
+        assert!(s.mouse_sgr);
+
+        // The app exits/crashes and only the alt-screen reset (1049l) arrives,
+        // without the matching mouse DECRSTs. Leaving the alt screen must clear
+        // the stuck mouse flags.
+        s.process_output(b"\x1b[?1049l");
+        assert!(!s.alt_screen_active);
+        assert!(!s.mouse_tracking);
+        assert!(!s.mouse_sgr);
     }
 
     #[test]
