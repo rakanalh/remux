@@ -1340,7 +1340,20 @@ impl InputHandler {
                 return InputAction::YankToClipboard(String::new());
             }
             '/' => {
-                return InputAction::SearchPrompt;
+                // Open the search query prompt from within Visual mode. Reuse
+                // the same flow Normal-mode search uses: create a fresh
+                // `SearchState` in the Prompt phase and switch to Search mode so
+                // the query-typing input flow runs. On submit, the
+                // `ScrollbackContent` completion path computes the matches and
+                // lands back in Visual mode at the bottom-most match (it keys
+                // off `search_state` and rebuilds `visual_state`), so resetting
+                // the current selection here is enough.
+                if let Some(vs) = self.visual_state.as_mut() {
+                    vs.reset();
+                }
+                self.mode = Mode::Search;
+                self.search_state = Some(SearchState::new());
+                return InputAction::ModeChanged(Mode::Search);
             }
             'n' => {
                 // Search lands on the bottom-most match; 'n' moves UP toward
@@ -2534,7 +2547,11 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         handler.enter_visual_mode(24, 100);
         let action = handler.handle_key(char_key('/'));
-        assert_eq!(action, InputAction::SearchPrompt);
+        // In-visual '/' now opens a working typed-search prompt (Search mode
+        // with a fresh SearchState), rather than being a dead key.
+        assert_eq!(action, InputAction::ModeChanged(Mode::Search));
+        assert_eq!(handler.mode, Mode::Search);
+        assert!(handler.search_state.is_some());
     }
 
     #[test]
@@ -2709,6 +2726,60 @@ mod tests {
         handler.enter_visual_mode(24, 100);
         let action = handler.handle_key(char_key('V'));
         assert!(matches!(action, InputAction::VisualScroll { .. }));
+    }
+
+    #[test]
+    fn visual_mode_slash_opens_search_prompt() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        let action = handler.handle_key(char_key('/'));
+        // Pressing '/' in Visual mode must open a working typed-search prompt:
+        // switch to Search mode and create a fresh SearchState in the Prompt
+        // phase so the query-typing flow runs. On submit, the completion path
+        // lands back in Visual mode at the bottom-most match.
+        assert_eq!(handler.mode, Mode::Search);
+        let ss = handler
+            .search_state
+            .as_ref()
+            .expect("'/' in Visual mode must create a SearchState");
+        assert_eq!(ss.phase, SearchPhase::Prompt);
+        assert!(ss.query_buffer.is_empty());
+        assert!(matches!(action, InputAction::ModeChanged(Mode::Search)));
+    }
+
+    #[test]
+    fn visual_mode_slash_then_typing_builds_query() {
+        // The in-visual '/' must route into the same query-typing input flow
+        // Normal-mode search uses: subsequent characters append to the buffer.
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        handler.handle_key(char_key('/'));
+        handler.handle_key(char_key('f'));
+        handler.handle_key(char_key('o'));
+        handler.handle_key(char_key('o'));
+        let ss = handler.search_state.as_ref().unwrap();
+        assert_eq!(ss.query_buffer, "foo");
+        assert_eq!(ss.phase, SearchPhase::Prompt);
+    }
+
+    #[test]
+    fn search_landing_reports_bottom_match_one_based() {
+        // On search completion the client lands on the bottom-most match:
+        // current_match = matches.len() - 1 (0-based). The wire value stays
+        // 0-based -- BOTH display sites (status bar compositor and the search
+        // prompt) render `current + 1` -- so the shown count is len/len.
+        // Adding +1 to the wire value here would double-count to (len+1)/len.
+        let lines = vec![
+            "alpha match".to_string(),
+            "beta".to_string(),
+            "gamma match".to_string(),
+        ];
+        let matches = SearchState::compute_matches(&lines, "match");
+        assert_eq!(matches.len(), 2);
+        let current_match = matches.len().saturating_sub(1); // landing target
+        assert_eq!(current_match, 1); // 0-based bottom-most
+                                      // Display layer renders `current + 1`, giving a 1-based len/len.
+        assert_eq!((current_match + 1, matches.len()), (2, 2));
     }
 
     // -- VisualState unit tests ---------------------------------------------

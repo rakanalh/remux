@@ -968,6 +968,23 @@ impl Renderer {
         let _ = (cols, rows); // suppress unused warnings
         Ok(())
     }
+
+    /// Restore the hardware cursor to a known terminal position and visibility.
+    ///
+    /// `clear_overlay` re-renders the front buffer via `render_full(.., false, ..)`,
+    /// which hardcodes the cursor HIDDEN at (0,0). When an overlay (visual/search)
+    /// is torn down and no server frame follows to repaint the cursor, call this
+    /// AFTER `clear_overlay` to put the cursor back where the last server frame
+    /// reported it. Queues the operation; the caller must `flush()`.
+    pub fn restore_cursor(&mut self, x: u16, y: u16, visible: bool) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        if visible {
+            queue!(stdout, MoveTo(x, y), cursor::Show)?;
+        } else {
+            queue!(stdout, cursor::Hide)?;
+        }
+        Ok(())
+    }
 }
 
 /// Convert a crossterm `Color` (from the theme/draw commands) to crossterm `Color`.

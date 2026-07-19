@@ -480,6 +480,10 @@ async fn run_client_loop(
     let mut focused_pane_rect: Option<crate::protocol::PaneRect> = None;
     let mut last_cursor_x: u16 = 0;
     let mut last_cursor_y: u16 = 0;
+    // Last known hardware cursor visibility from a server render frame. Used to
+    // restore the real cursor when tearing down a visual/search overlay (the
+    // overlay clear hides it and no server frame may follow to bring it back).
+    let mut last_cursor_visible: bool = true;
 
     // Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
     // Used by visual mode and search. Normal mode scrolling uses server-owned offset.
@@ -687,6 +691,19 @@ async fn run_client_loop(
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
+                                // Returning to Normal from a visual/search
+                                // overlay: clear_overlay above hid the hardware
+                                // cursor. Restore it to the terminal's real
+                                // position (Escape at the bottom sends no
+                                // server frame that would otherwise bring it
+                                // back).
+                                if mode == Mode::Normal {
+                                    renderer.restore_cursor(
+                                        last_cursor_x,
+                                        last_cursor_y,
+                                        last_cursor_visible,
+                                    )?;
+                                }
                                 renderer.flush()?;
                             }
                             InputAction::ActivateRenameOverlay => {
@@ -765,6 +782,11 @@ async fn run_client_loop(
                                     vs.reset();
                                 }
                                 input.visual_state = None;
+                                // Clear any search state carried in from a
+                                // search-to-visual transition so its match
+                                // highlights / search status bar don't linger
+                                // in Normal mode (mirrors the Escape path).
+                                input.search_state = None;
                                 input.mode = Mode::Normal;
                                 if scroll_offset > 0 || is_scrolled {
                                     scroll_offset = 0;
@@ -778,6 +800,10 @@ async fn run_client_loop(
                                     .await?;
                                 // Re-render to clear selection highlighting.
                                 renderer.clear_overlay(cols, rows)?;
+                                // clear_overlay hides the hardware cursor; no
+                                // server frame necessarily follows the yank, so
+                                // put the real cursor back at its last position.
+                                renderer.restore_cursor(last_cursor_x, last_cursor_y, last_cursor_visible)?;
                                 renderer.flush()?;
                             }
                             InputAction::VisualScroll { .. } => {
@@ -981,6 +1007,12 @@ async fn run_client_loop(
                                 // Clear overlay.
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
+                                // clear_overlay hides the hardware cursor. This
+                                // search->Normal exit does not flow through the
+                                // ModeChanged(Normal) handler and, when
+                                // unscrolled, sends no follow-up frame, so
+                                // restore the real cursor here too.
+                                renderer.restore_cursor(last_cursor_x, last_cursor_y, last_cursor_visible)?;
                                 // Reset scroll offset when exiting search mode.
                                 if scroll_offset > 0 || is_scrolled {
                                     scroll_offset = 0;
@@ -1605,6 +1637,7 @@ async fn run_client_loop(
                         is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
+                        last_cursor_visible = cursor_visible;
                         renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                         // Re-render visual overlay on top if in visual mode
                         if let Some(ref vs) = input.visual_state {
@@ -1678,6 +1711,7 @@ async fn run_client_loop(
                         is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
+                        last_cursor_visible = cursor_visible;
                         renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                         // Re-render visual overlay on top if in visual mode
                         if let Some(ref vs) = input.visual_state {
@@ -1751,6 +1785,7 @@ async fn run_client_loop(
                         is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
+                        last_cursor_visible = cursor_visible;
                         renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
                         // Re-render visual overlay on top if in visual mode
                         if let Some(ref vs) = input.visual_state {
