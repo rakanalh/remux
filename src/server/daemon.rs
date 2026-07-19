@@ -29,8 +29,15 @@ use crate::server::persistence;
 use crate::server::pty::{self, Pty};
 use crate::server::session::ServerState;
 
-/// Type alias for the per-session previous-frame cache used for diff rendering.
-pub type PrevFrameCache = Arc<Mutex<HashMap<String, Vec<Vec<RenderCell>>>>>;
+/// Type alias for the per-client previous-frame cache used for diff rendering.
+///
+/// Keyed by `client_id` (not session name): each client is diffed against what
+/// *it* last displayed. Multiple clients of different sizes can attach to one
+/// session, so a shared session-keyed baseline would poison diffs across
+/// differently-sized clients. All render paths composite at one consistent
+/// session render size (min over attached clients), so a given client never
+/// mixes differently-sized frames.
+pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
 
 /// Read the process name from `/proc/<pid>/comm`.
 ///
@@ -131,8 +138,9 @@ pub struct RemuxServer {
     clients: Arc<Mutex<HashMap<u64, ClientConnection>>>,
     /// Monotonically increasing counter for stable client IDs.
     next_client_id: Arc<AtomicU64>,
-    /// Previous composite frame per session, for diff computation.
-    prev_frames: Arc<Mutex<HashMap<String, Vec<Vec<RenderCell>>>>>,
+    /// Previous composite frame per client (keyed by `client_id`), for diff
+    /// computation. See [`PrevFrameCache`].
+    prev_frames: Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,12 +374,12 @@ impl RemuxServer {
                     }
                     Ok(None) => {
                         log::info!("client {client_id} disconnected");
-                        handle_client_disconnect(client_id, &clients).await;
+                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
                         break;
                     }
                     Err(e) => {
                         log::error!("error reading from client {client_id}: {e}");
-                        handle_client_disconnect(client_id, &clients).await;
+                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
                         break;
                     }
                 }
@@ -541,19 +549,14 @@ async fn handle_client_message(
                     client.prev_scroll_offset = 0;
                 }
             }
-            let (session_name, cols, rows) = {
+            let session_name = {
                 let cls = clients.lock().await;
-                let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
-                let cols = cls.get(&client_id).map(|c| c.cols).unwrap_or(80);
-                let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
-                (sn, cols, rows)
+                cls.get(&client_id).and_then(|c| c.session_name.clone())
             };
             if let Some(session_name) = session_name {
                 send_full_render_to_client(
                     client_id,
                     &session_name,
-                    cols,
-                    rows,
                     state,
                     panes,
                     clients,
@@ -634,18 +637,14 @@ async fn handle_attach(
     // Resize panes to match the attaching client's terminal dimensions.
     resize_session_panes(session_name, cols, rows, state, panes, config).await?;
 
-    // Clear prev frame cache so the first render after attach is always a
-    // full render (not a diff against stale content from a previous attach).
-    {
-        let mut pf = prev_frames.lock().await;
-        pf.remove(session_name);
-    }
+    // Invalidate every attached client's baseline: this client's attach may
+    // change the session render size (min over clients), so all clients must
+    // re-render full at the new size on their next frame.
+    invalidate_session_baselines(session_name, clients, prev_frames).await;
 
     send_full_render_to_client(
         client_id,
         session_name,
-        cols,
-        rows,
         state,
         panes,
         clients,
@@ -733,10 +732,10 @@ async fn handle_resize(
 
     if let Some(session_name) = session_name {
         resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
-        {
-            let mut pf = prev_frames.lock().await;
-            pf.remove(&session_name);
-        }
+        // Invalidate all attached clients' baselines: a resize changes the
+        // session render size, so every client must re-render full at the new
+        // size on the broadcast below.
+        invalidate_session_baselines(&session_name, clients, prev_frames).await;
         broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
     }
     Ok(())
@@ -781,6 +780,9 @@ async fn handle_command(
             log::debug!("server: TabNew session={session_name:?} new pane_id={pane_id}");
             spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            // Tab switch: the whole displayed content changes, so invalidate
+            // all clients' baselines to force a clean full render.
+            invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabClose => {
@@ -802,6 +804,7 @@ async fn handle_command(
                     ps.remove(&pid);
                 }
             }
+            invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabGoto(idx) => {
@@ -809,6 +812,7 @@ async fn handle_command(
                 let mut st = state.lock().await;
                 st.goto_tab(&session_name, idx)?;
             }
+            invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabNext => {
@@ -823,6 +827,7 @@ async fn handle_command(
                 };
                 st.goto_tab(&session_name, next)?;
             }
+            invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabPrev => {
@@ -841,6 +846,7 @@ async fn handle_command(
                 };
                 st.goto_tab(&session_name, prev)?;
             }
+            invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::TabRename(name) => {
@@ -1306,17 +1312,12 @@ async fn handle_command(
             }
             start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session, cols, rows, state, panes, config).await?;
-            // Clear prev frame cache to force a full render (not a diff against
-            // stale content from a previous session).
-            {
-                let mut pf = prev_frames.lock().await;
-                pf.remove(&session);
-            }
+            // Invalidate all attached clients' baselines to force a fresh full
+            // render (not a diff against stale content from a previous tab).
+            invalidate_session_baselines(&session, clients, prev_frames).await;
             send_full_render_to_client(
                 client_id,
                 &session,
-                cols,
-                rows,
                 state,
                 panes,
                 clients,
@@ -1351,16 +1352,12 @@ async fn handle_command(
             }
             start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
             resize_session_panes(&session, cols, rows, state, panes, config).await?;
-            // Clear prev frame cache to force a full render.
-            {
-                let mut pf = prev_frames.lock().await;
-                pf.remove(&session);
-            }
+            // Invalidate all attached clients' baselines to force a fresh full
+            // render.
+            invalidate_session_baselines(&session, clients, prev_frames).await;
             send_full_render_to_client(
                 client_id,
                 &session,
-                cols,
-                rows,
                 state,
                 panes,
                 clients,
@@ -1396,6 +1393,7 @@ async fn handle_command(
                             }
                         }
                     } else {
+                        invalidate_session_baselines(&target_session, clients, prev_frames).await;
                         broadcast_full_render(
                             &target_session,
                             state,
@@ -1666,10 +1664,19 @@ async fn handle_kill_session(
 async fn handle_client_disconnect(
     client_id: u64,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    prev_frames: &PrevFrameCache,
 ) {
     log::debug!("server: client_id={client_id} disconnected, removing from client map");
-    let mut cls = clients.lock().await;
-    cls.remove(&client_id);
+    {
+        let mut cls = clients.lock().await;
+        cls.remove(&client_id);
+    }
+    // Drop this client's diff baseline so the per-client cache doesn't grow
+    // unbounded as clients come and go.
+    {
+        let mut pf = prev_frames.lock().await;
+        pf.remove(&client_id);
+    }
 }
 
 async fn handle_request_scrollback(
@@ -1820,13 +1827,12 @@ async fn handle_scroll_delta(
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
     // Apply delta to server-owned scroll offset, clamp to valid range.
-    let (session_name, cols, rows, old_offset) = {
+    let (session_name, rows, old_offset) = {
         let cls = clients.lock().await;
         let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
-        let cols = cls.get(&client_id).map(|c| c.cols).unwrap_or(80);
         let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
         let so = cls.get(&client_id).map(|c| c.scroll_offset).unwrap_or(0);
-        (sn, cols, rows, so)
+        (sn, rows, so)
     };
     let new_offset = if delta > 0 {
         old_offset.saturating_add(delta as usize)
@@ -1873,8 +1879,6 @@ async fn handle_scroll_delta(
             send_full_render_to_client(
                 client_id,
                 &session_name,
-                cols,
-                rows,
                 state,
                 panes,
                 clients,
@@ -2426,18 +2430,72 @@ async fn resize_session_panes(
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
+/// Compute the consistent render size for a session: the minimum cols and rows
+/// over all clients currently attached to it. Falls back to 80x24 if no clients
+/// are attached. Every render path for a session composites at this size so a
+/// client never mixes differently-sized frames. With a single attached client
+/// this equals that client's size (behavior unchanged from a single baseline).
+async fn session_render_size(
+    session_name: &str,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> (u16, u16) {
+    let cls = clients.lock().await;
+    let cols = cls
+        .values()
+        .filter(|c| c.session_name.as_deref() == Some(session_name))
+        .map(|c| c.cols)
+        .min()
+        .unwrap_or(80);
+    let rows = cls
+        .values()
+        .filter(|c| c.session_name.as_deref() == Some(session_name))
+        .map(|c| c.rows)
+        .min()
+        .unwrap_or(24);
+    (cols, rows)
+}
+
+/// Invalidate the previous-frame baselines of every client attached to a
+/// session by removing their `client_id` entries. Each affected client then
+/// receives a fresh FULL render on its next frame (instead of a diff against a
+/// stale, possibly wrong-size baseline). Used on attach/resize/tab changes.
+///
+/// Collects the client ids under the `clients` lock, drops it, then locks
+/// `prev_frames` — this avoids ever holding both locks nested, keeping lock
+/// ordering uniform with the render paths and preventing deadlock.
+async fn invalidate_session_baselines(
+    session_name: &str,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    prev_frames: &PrevFrameCache,
+) {
+    let ids: Vec<u64> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| c.session_name.as_deref() == Some(session_name))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    let mut pf = prev_frames.lock().await;
+    for id in ids {
+        pf.remove(&id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_full_render_to_client(
     client_id: u64,
     session_name: &str,
-    cols: u16,
-    rows: u16,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
+    // Render at the consistent session size (min over all attached clients),
+    // not the caller's own dimensions, so this client's frames never mix sizes
+    // with the shared broadcast path. With a single client this equals the
+    // caller's size, so single-client behavior is unchanged.
+    let (cols, rows) = session_render_size(session_name, clients).await;
     log::debug!(
         "server: send_full_render_to_client client_id={client_id} session={session_name:?} dims={cols}x{rows}"
     );
@@ -2517,11 +2575,12 @@ async fn send_full_render_to_client(
         }
     };
 
-    // Only save to session-level prev_frames for live view (scroll_offset == 0).
-    // Scrolled frames must not pollute the broadcast diff cache.
+    // Only save this client's baseline for live view (scroll_offset == 0).
+    // Scrolled frames must not pollute the diff baseline: when the client
+    // returns to the live view it renders here again and repopulates it.
     if scroll_offset == 0 {
         let mut pf = prev_frames.lock().await;
-        pf.insert(session_name.to_string(), cells.clone());
+        pf.insert(client_id, cells.clone());
     }
 
     let mut cls = clients.lock().await;
@@ -2688,20 +2747,79 @@ async fn broadcast_full_render(
         }
     };
 
-    // Compute a single diff against session-level prev_frames.
-    // This is the ONLY writer to prev_frames during normal operation,
-    // so there are no race conditions with the diff cache.
-    let msg = {
-        let prev_frames_map = prev_frames.lock().await;
-        let prev = prev_frames_map.get(session_name);
-        if let Some(prev_cells) = prev {
-            let changes = compute_diff(prev_cells, &cells);
-            let threshold = cols as usize * rows as usize / 2;
-            if changes.len() > threshold {
+    // The composite `cells` is identical for every live client (all at the
+    // session render size), so it is computed once above. The diff, however, is
+    // per-client: each client is diffed against *its own* baseline so a client
+    // whose size differs from another's never diffs against a poisoned frame.
+    //
+    // Collect the eligible (attached, non-scrolled) clients and their senders
+    // under the `clients` lock, then drop it before locking `prev_frames`. This
+    // keeps lock ordering uniform (never `clients`+`prev_frames` nested) and
+    // avoids deadlock against `invalidate_session_baselines`. Scrolled clients
+    // are excluded here; they get a FullRender via `send_full_render_to_client`
+    // when they scroll and are refreshed when they return to the live view.
+    let targets: Vec<(u64, mpsc::UnboundedSender<ServerMessage>)> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| {
+                c.session_name.as_deref() == Some(session_name) && c.scroll_offset == 0
+            })
+            .map(|(id, c)| (*id, c.tx.clone()))
+            .collect()
+    };
+
+    let threshold = cols as usize * rows as usize / 2;
+    let mut pf = prev_frames.lock().await;
+    for (cid, tx) in targets {
+        // Force a full render when this client has no baseline yet, or when its
+        // baseline's dimensions differ from the current frame (a size change,
+        // e.g. after another client of a different size attached/detached).
+        // compute_diff never clears cells that exist only in a larger prev
+        // frame, so a diff across a size change would leave stale content.
+        let baseline = pf.get(&cid);
+        let size_changed = baseline.is_some_and(|prev| {
+            prev.len() != cells.len() || prev.first().map(Vec::len) != cells.first().map(Vec::len)
+        });
+        let msg = match baseline {
+            Some(prev_cells) if !size_changed => {
+                let changes = compute_diff(prev_cells, &cells);
+                if changes.len() > threshold {
+                    log::debug!(
+                        "server: broadcast client_id={cid} render=Full (diff {} changes > threshold {})",
+                        changes.len(),
+                        threshold
+                    );
+                    ServerMessage::FullRender {
+                        cells: cells.clone(),
+                        cursor_x,
+                        cursor_y,
+                        cursor_visible,
+                        cursor_style,
+                        focused_pane_rect,
+                        application_cursor_keys,
+                        viewport_top,
+                    }
+                } else {
+                    log::debug!(
+                        "server: broadcast client_id={cid} render=Diff ({} changes, threshold {})",
+                        changes.len(),
+                        threshold
+                    );
+                    ServerMessage::RenderDiff {
+                        changes,
+                        cursor_x,
+                        cursor_y,
+                        cursor_visible,
+                        cursor_style,
+                        focused_pane_rect,
+                        application_cursor_keys,
+                        viewport_top,
+                    }
+                }
+            }
+            _ => {
                 log::debug!(
-                    "server: broadcast render=Full (diff {} changes > threshold {})",
-                    changes.len(),
-                    threshold
+                    "server: broadcast client_id={cid} render=Full (no baseline or size changed)"
                 );
                 ServerMessage::FullRender {
                     cells: cells.clone(),
@@ -2713,53 +2831,10 @@ async fn broadcast_full_render(
                     application_cursor_keys,
                     viewport_top,
                 }
-            } else {
-                log::debug!(
-                    "server: broadcast render=Diff ({} changes, threshold {})",
-                    changes.len(),
-                    threshold
-                );
-                ServerMessage::RenderDiff {
-                    changes,
-                    cursor_x,
-                    cursor_y,
-                    cursor_visible,
-                    cursor_style,
-                    focused_pane_rect,
-                    application_cursor_keys,
-                    viewport_top,
-                }
             }
-        } else {
-            log::debug!("server: broadcast render=Full (no prev frame)");
-            ServerMessage::FullRender {
-                cells: cells.clone(),
-                cursor_x,
-                cursor_y,
-                cursor_visible,
-                cursor_style,
-                focused_pane_rect,
-                application_cursor_keys,
-                viewport_top,
-            }
-        }
-    };
-
-    {
-        let mut pf = prev_frames.lock().await;
-        pf.insert(session_name.to_string(), cells);
-    }
-
-    // Send to all non-scrolled clients. Scrolled clients get FullRender
-    // via send_full_render_to_client when they scroll.
-    let cls = clients.lock().await;
-    for client in cls.values() {
-        if client.session_name.as_deref() == Some(session_name) {
-            if client.scroll_offset > 0 {
-                continue;
-            }
-            let _ = client.tx.send(msg.clone());
-        }
+        };
+        let _ = tx.send(msg);
+        pf.insert(cid, cells.clone());
     }
 }
 
@@ -3145,6 +3220,9 @@ async fn close_pane(
                     }
                 }
             }
+            // Clients now display a different session; invalidate their
+            // baselines (from the old session) so they get a clean full render.
+            invalidate_session_baselines(next, clients, prev_frames).await;
             broadcast_full_render(next, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::Disconnect => {
