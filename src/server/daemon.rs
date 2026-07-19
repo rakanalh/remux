@@ -3161,6 +3161,25 @@ fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellC
         for (x, cell) in row.iter().enumerate() {
             let prev_cell = prev_row.and_then(|r| r.get(x));
             if prev_cell != Some(cell) {
+                // If this is a continuation cell (width 0) following a wide lead,
+                // also repaint the lead so the wide glyph covers this column.
+                // (The client skips width-0 changes, so a lone continuation change
+                // would otherwise leave half a stale glyph.) Only push the lead
+                // when it did not already differ this pass, to avoid duplicates.
+                if cell.width == 0 && x > 0 {
+                    if let Some(lead) = row.get(x - 1) {
+                        if lead.width == 2 {
+                            let prev_lead = prev_row.and_then(|r| r.get(x - 1));
+                            if prev_lead == Some(lead) {
+                                changes.push(CellChange {
+                                    x: (x - 1) as u16,
+                                    y: y as u16,
+                                    cell: lead.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
                 changes.push(CellChange {
                     x: x as u16,
                     y: y as u16,
@@ -3629,7 +3648,49 @@ async fn restore_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{arrow_report, wheel_report};
+    use super::{arrow_report, compute_diff, wheel_report};
+    use crate::protocol::RenderCell;
+
+    #[test]
+    fn compute_diff_emits_wide_lead_when_only_continuation_differs() {
+        let lead = RenderCell {
+            c: '中',
+            width: 2,
+            ..RenderCell::default()
+        };
+        let continuation = RenderCell {
+            c: ' ',
+            width: 0,
+            ..RenderCell::default()
+        };
+        let narrow_a = RenderCell {
+            c: 'a',
+            ..RenderCell::default()
+        };
+
+        // Lead unchanged; only the continuation column differs (it used to hold a
+        // narrow char, now it is the wide glyph's continuation). The client skips
+        // width-0 changes, so the diff must ALSO re-emit the unchanged lead to
+        // repaint the whole glyph and cover the continuation column.
+        let prev = vec![vec![lead.clone(), narrow_a.clone()]];
+        let curr = vec![vec![lead.clone(), continuation.clone()]];
+
+        let changes = compute_diff(&prev, &curr);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].x, 0);
+        assert_eq!(changes[0].cell.width, 2);
+        assert_eq!(changes[1].x, 1);
+        assert_eq!(changes[1].cell.width, 0);
+
+        // When the lead itself also changed, it is emitted once (at x=0) and not
+        // duplicated by the continuation handling at x=1.
+        let prev2 = vec![vec![narrow_a.clone(), narrow_a.clone()]];
+        let curr2 = vec![vec![lead.clone(), continuation.clone()]];
+        let changes2 = compute_diff(&prev2, &curr2);
+        assert_eq!(changes2.len(), 2);
+        assert_eq!(changes2[0].x, 0);
+        assert_eq!(changes2[1].x, 1);
+    }
 
     #[test]
     fn test_wheel_report_sgr() {

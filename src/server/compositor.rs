@@ -163,6 +163,7 @@ fn cell_to_render_cell(cell: &Cell) -> RenderCell {
         bold: cell.attrs.bold,
         italic: cell.attrs.italic,
         underline: cell.attrs.underline,
+        width: cell.width,
     }
 }
 
@@ -405,6 +406,7 @@ fn draw_zellij_panes(
             bold: false,
             italic: false,
             underline: false,
+            width: 1,
         };
 
         // Top-left corner.
@@ -543,6 +545,7 @@ fn build_top_border_content(
                 bold: false,
                 italic: false,
                 underline: false,
+                width: 1,
             });
             for ch in name.chars() {
                 cells.push(RenderCell {
@@ -552,6 +555,7 @@ fn build_top_border_content(
                     bold: false,
                     italic: false,
                     underline: false,
+                    width: 1,
                 });
             }
             cells.push(RenderCell {
@@ -561,6 +565,7 @@ fn build_top_border_content(
                 bold: false,
                 italic: false,
                 underline: false,
+                width: 1,
             });
         }
     } else {
@@ -595,6 +600,7 @@ fn build_top_border_content(
             bold: false,
             italic: false,
             underline: false,
+            width: 1,
         });
 
         for (i, display_name) in display_names.iter().enumerate() {
@@ -608,6 +614,7 @@ fn build_top_border_content(
                         bold: false,
                         italic: false,
                         underline: false,
+                        width: 1,
                     });
                 }
             }
@@ -638,6 +645,7 @@ fn build_top_border_content(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    width: 1,
                 });
             }
             for ch in display_name.chars().take(tab_width) {
@@ -648,6 +656,7 @@ fn build_top_border_content(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    width: 1,
                 });
             }
             for _ in 0..pad_right {
@@ -658,6 +667,7 @@ fn build_top_border_content(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    width: 1,
                 });
             }
         }
@@ -670,6 +680,7 @@ fn build_top_border_content(
             bold: false,
             italic: false,
             underline: false,
+            width: 1,
         });
     }
 
@@ -764,6 +775,7 @@ fn draw_tmux_tab_bar(
                 bold: false,
                 italic: false,
                 underline: false,
+                width: 1,
             },
         );
     }
@@ -816,6 +828,7 @@ fn draw_tmux_tab_bar(
                             bold: false,
                             italic: false,
                             underline: false,
+                            width: 1,
                         },
                     );
                     col += 1;
@@ -864,6 +877,7 @@ fn draw_tmux_tab_bar(
                         bold,
                         italic: false,
                         underline: false,
+                        width: 1,
                     },
                 );
                 col += 1;
@@ -884,6 +898,7 @@ fn draw_tmux_tab_bar(
                     bold,
                     italic: false,
                     underline: false,
+                    width: 1,
                 },
             );
             col += 1;
@@ -901,6 +916,7 @@ fn draw_tmux_tab_bar(
                         bold,
                         italic: false,
                         underline: false,
+                        width: 1,
                     },
                 );
                 col += 1;
@@ -922,6 +938,7 @@ fn draw_tmux_dividers(
         bold: false,
         italic: false,
         underline: false,
+        width: 1,
     };
 
     for i in 0..pane_rects.len() {
@@ -1047,6 +1064,7 @@ fn draw_status_bar(
                 bold: false,
                 italic: false,
                 underline: false,
+                width: 1,
             };
         }
     }
@@ -1065,6 +1083,7 @@ fn draw_status_bar(
                 bold: true,
                 italic: false,
                 underline: false,
+                width: 1,
             };
         }
         x += 1;
@@ -1081,6 +1100,7 @@ fn draw_status_bar(
                 bold: false,
                 italic: false,
                 underline: false,
+                width: 1,
             };
         }
         x += 1;
@@ -1095,6 +1115,7 @@ fn draw_status_bar(
             bold: false,
             italic: false,
             underline: false,
+            width: 1,
         };
         x += 1;
     }
@@ -1113,6 +1134,7 @@ fn draw_status_bar(
                         bold: false,
                         italic: false,
                         underline: false,
+                        width: 1,
                     };
                 }
                 x += 1;
@@ -1149,6 +1171,7 @@ fn draw_status_bar(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    width: 1,
                 };
             }
             x += 1;
@@ -1200,6 +1223,7 @@ fn draw_status_bar(
                         bold: false,
                         italic: false,
                         underline: false,
+                        width: 1,
                     };
                 }
                 rx += 1;

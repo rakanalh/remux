@@ -6,6 +6,8 @@
 
 use std::collections::VecDeque;
 
+use unicode_width::UnicodeWidthChar;
+
 // ---------------------------------------------------------------------------
 // Cell types
 // ---------------------------------------------------------------------------
@@ -37,6 +39,9 @@ pub struct CellAttrs {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
+    /// Display width in columns: `1` normal, `2` wide lead (CJK/emoji), `0`
+    /// continuation cell placed in the column after a wide lead.
+    pub width: u8,
     pub attrs: CellAttrs,
 }
 
@@ -44,6 +49,7 @@ impl Default for Cell {
     fn default() -> Self {
         Cell {
             c: ' ',
+            width: 1,
             attrs: CellAttrs::default(),
         }
     }
@@ -296,7 +302,28 @@ impl Screen {
     /// cursor. Wraps to the next line at the end of a row and scrolls if
     /// necessary.
     fn put_char(&mut self, c: char) {
+        // Zero-width / combining characters: with a single-`char` cell model we
+        // cannot attach them to the previous glyph, so skip them entirely rather
+        // than consume a column (which would desync the row). Known limitation.
+        let display_width = UnicodeWidthChar::width(c);
+        if display_width == Some(0) {
+            return;
+        }
+        let width: u8 = if display_width == Some(2) { 2 } else { 1 };
+
+        // Existing end-of-row wrap.
         if self.cursor_x >= self.cols {
+            self.cursor_x = 0;
+            self.cursor_y += 1;
+            if self.cursor_y > self.scroll_bottom {
+                self.cursor_y = self.scroll_bottom;
+                self.scroll_up_region();
+            }
+        }
+
+        // A wide glyph must never straddle the right edge. If it would not fit,
+        // wrap first and leave the last cell of the previous row blank.
+        if width == 2 && self.cursor_x + 2 > self.cols {
             self.cursor_x = 0;
             self.cursor_y += 1;
             if self.cursor_y > self.scroll_bottom {
@@ -309,13 +336,32 @@ impl Screen {
         let col = self.cursor_x as usize;
 
         if row < self.grid.len() && col < self.grid[row].len() {
+            let old_width = self.grid[row][col].width;
+
             self.grid[row][col] = Cell {
                 c,
+                width,
                 attrs: self.current_attrs.clone(),
             };
+
+            if width == 2 {
+                // Write the continuation spacer for the wide lead.
+                if col + 1 < self.grid[row].len() {
+                    self.grid[row][col + 1] = Cell {
+                        c: ' ',
+                        width: 0,
+                        attrs: self.current_attrs.clone(),
+                    };
+                }
+            } else if old_width == 2 && col + 1 < self.grid[row].len() {
+                // We overwrote a former wide lead with a narrow char; blank the
+                // now-dangling continuation cell so it renders as a space.
+                self.grid[row][col + 1].c = ' ';
+                self.grid[row][col + 1].width = 1;
+            }
         }
 
-        self.cursor_x += 1;
+        self.cursor_x += width as u16;
     }
 
     /// Handle the SGR (Select Graphic Rendition) escape sequence.
@@ -943,6 +989,65 @@ mod tests {
         assert_eq!(s.grid[0][3].c, 'l');
         assert_eq!(s.grid[0][4].c, 'o');
         assert_eq!(s.cursor_x, 5);
+    }
+
+    #[test]
+    fn test_wide_char_placement() {
+        let mut s = make_screen();
+        // '中' (U+4E2D) is unambiguously display-width 2.
+        s.process_output("中".as_bytes());
+        assert_eq!(s.grid[0][0].c, '中');
+        assert_eq!(s.grid[0][0].width, 2);
+        // Continuation spacer in the next column.
+        assert_eq!(s.grid[0][1].c, ' ');
+        assert_eq!(s.grid[0][1].width, 0);
+        // Cursor advanced by two columns.
+        assert_eq!(s.cursor_x, 2);
+    }
+
+    #[test]
+    fn test_zero_width_char_skipped() {
+        let mut s = make_screen();
+        s.process_output(b"A");
+        // U+0301 COMBINING ACUTE ACCENT is display-width 0; with a single-char
+        // cell model it is skipped (no write, no cursor advance).
+        s.process_output("\u{0301}".as_bytes());
+        assert_eq!(s.grid[0][0].c, 'A');
+        assert_eq!(s.grid[0][0].width, 1);
+        assert_eq!(s.cursor_x, 1);
+    }
+
+    #[test]
+    fn test_wide_char_wraps_at_last_column() {
+        let mut s = make_screen();
+        // Fill the first 79 columns, leaving the cursor at the last column (79).
+        for _ in 0..79 {
+            s.process_output(b"a");
+        }
+        assert_eq!(s.cursor_x, 79);
+        // A wide glyph cannot fit in the single remaining column, so it wraps to
+        // the next row and leaves the last cell of row 0 blank.
+        s.process_output("中".as_bytes());
+        assert_eq!(s.grid[0][79].c, ' ');
+        assert_eq!(s.grid[0][79].width, 1);
+        assert_eq!(s.grid[1][0].c, '中');
+        assert_eq!(s.grid[1][0].width, 2);
+        assert_eq!(s.grid[1][1].width, 0);
+        assert_eq!(s.cursor_y, 1);
+        assert_eq!(s.cursor_x, 2);
+    }
+
+    #[test]
+    fn test_narrow_over_wide_blanks_continuation() {
+        let mut s = make_screen();
+        s.process_output("中".as_bytes()); // cols 0-1: wide lead + continuation
+                                           // Return to column 0 and overwrite the lead with a narrow char.
+        s.process_output(b"\rX");
+        assert_eq!(s.grid[0][0].c, 'X');
+        assert_eq!(s.grid[0][0].width, 1);
+        // The now-dangling continuation cell is blanked to a normal space.
+        assert_eq!(s.grid[0][1].c, ' ');
+        assert_eq!(s.grid[0][1].width, 1);
     }
 
     #[test]

@@ -196,6 +196,12 @@ pub struct PaneRect {
 // Rendering primitives
 // ---------------------------------------------------------------------------
 
+/// Serde default for [`RenderCell::width`]. Older peers that omit the field
+/// decode as normal (single-column) width.
+fn default_cell_width() -> u8 {
+    1
+}
+
 /// A single cell in the rendered terminal grid.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenderCell {
@@ -205,6 +211,11 @@ pub struct RenderCell {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// Display width in columns: `1` normal, `2` wide lead (CJK/emoji), `0`
+    /// continuation cell placed after a wide lead. Defaults to `1` on the wire
+    /// for back-compat with peers that predate the field.
+    #[serde(default = "default_cell_width")]
+    pub width: u8,
 }
 
 impl Default for RenderCell {
@@ -216,6 +227,7 @@ impl Default for RenderCell {
             bold: false,
             italic: false,
             underline: false,
+            width: 1,
         }
     }
 }
@@ -513,6 +525,25 @@ mod tests {
             ServerMessage::Error { message } => assert_eq!(message, "not found"),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn render_cell_width_defaults_to_one_when_absent() {
+        // A peer that predates the `width` field omits it on the wire; it must
+        // decode as normal (single-column) width via the serde default.
+        let json = r#"{"c":"a","fg":"Default","bg":"Default","bold":false,"italic":false,"underline":false}"#;
+        let cell: RenderCell = serde_json::from_str(json).unwrap();
+        assert_eq!(cell.width, 1);
+
+        // A present width field is preserved through a round trip.
+        let wide = RenderCell {
+            c: '中',
+            width: 2,
+            ..RenderCell::default()
+        };
+        let encoded = serde_json::to_string(&wide).unwrap();
+        let decoded: RenderCell = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.width, 2);
     }
 
     #[test]

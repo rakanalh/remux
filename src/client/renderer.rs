@@ -82,6 +82,12 @@ impl Renderer {
                     break;
                 }
 
+                // Continuation cell of a wide glyph: the preceding width-2 Print
+                // already advanced the physical cursor by 2, so skip it.
+                if cell.width == 0 {
+                    continue;
+                }
+
                 // Apply style changes only when needed.
                 if cell.fg != last_fg {
                     queue!(
@@ -170,37 +176,43 @@ impl Renderer {
                 continue;
             }
 
-            queue!(
-                stdout,
-                MoveTo(change.x, change.y),
-                SetForegroundColor(cell_color_to_crossterm(&change.cell.fg)),
-                SetBackgroundColor(cell_color_to_crossterm(&change.cell.bg)),
-            )?;
+            // Continuation cells (width 0) must not be drawn: printing a space
+            // there would erase half the wide glyph the lead already painted.
+            // The front buffer is still updated below so later scrolls carry the
+            // correct width and don't re-print stale content.
+            if change.cell.width != 0 {
+                queue!(
+                    stdout,
+                    MoveTo(change.x, change.y),
+                    SetForegroundColor(cell_color_to_crossterm(&change.cell.fg)),
+                    SetBackgroundColor(cell_color_to_crossterm(&change.cell.bg)),
+                )?;
 
-            // Each change repositions the cursor, so there is no reliable
-            // previous-cell attribute state to diff against. Emit the attribute
-            // state absolutely (on OR explicit off) per change so a non-bold
-            // cell following a bold one renders correctly regardless of how the
-            // terminal treats the trailing ResetColor.
-            if change.cell.bold {
-                queue!(stdout, SetAttribute(Attribute::Bold))?;
-            } else {
-                queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
-            }
-            if change.cell.italic {
-                queue!(stdout, SetAttribute(Attribute::Italic))?;
-            } else {
-                queue!(stdout, SetAttribute(Attribute::NoItalic))?;
-            }
-            if change.cell.underline {
-                queue!(stdout, SetAttribute(Attribute::Underlined))?;
-            } else {
-                queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
+                // Each change repositions the cursor, so there is no reliable
+                // previous-cell attribute state to diff against. Emit the attribute
+                // state absolutely (on OR explicit off) per change so a non-bold
+                // cell following a bold one renders correctly regardless of how the
+                // terminal treats the trailing ResetColor.
+                if change.cell.bold {
+                    queue!(stdout, SetAttribute(Attribute::Bold))?;
+                } else {
+                    queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+                }
+                if change.cell.italic {
+                    queue!(stdout, SetAttribute(Attribute::Italic))?;
+                } else {
+                    queue!(stdout, SetAttribute(Attribute::NoItalic))?;
+                }
+                if change.cell.underline {
+                    queue!(stdout, SetAttribute(Attribute::Underlined))?;
+                } else {
+                    queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
+                }
+
+                queue!(stdout, Print(change.cell.c), ResetColor)?;
             }
 
-            queue!(stdout, Print(change.cell.c), ResetColor)?;
-
-            // Update front buffer.
+            // Update front buffer (always, even for skipped continuation cells).
             let y = change.y as usize;
             let x = change.x as usize;
             if y < self.front.len() && x < self.front[y].len() {
@@ -342,6 +354,12 @@ impl Renderer {
                 } else {
                     continue;
                 };
+
+                // Continuation cell of a wide glyph: the preceding width-2 Print
+                // already advanced the physical cursor by 2, so skip it.
+                if cell.width == 0 {
+                    continue;
+                }
 
                 if cell.fg != last_fg {
                     queue!(
