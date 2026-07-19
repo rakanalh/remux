@@ -216,6 +216,11 @@ pub struct RenderCell {
     /// for back-compat with peers that predate the field.
     #[serde(default = "default_cell_width")]
     pub width: u8,
+    /// Zero-width combining marks composed onto the base glyph `c`. Empty in the
+    /// overwhelmingly common case; `skip_serializing_if` keeps empty cells at
+    /// zero wire bytes so ASCII rendering is unchanged on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub combining: Vec<char>,
 }
 
 impl Default for RenderCell {
@@ -228,6 +233,7 @@ impl Default for RenderCell {
             italic: false,
             underline: false,
             width: 1,
+            combining: Vec::new(),
         }
     }
 }
@@ -572,6 +578,38 @@ mod tests {
         assert_eq!(cell.c, ' ');
         assert_eq!(cell.fg, CellColor::Default);
         assert!(!cell.bold);
+        assert!(cell.combining.is_empty());
+    }
+
+    #[test]
+    fn render_cell_empty_combining_is_not_serialized() {
+        // The overwhelmingly common case (no combining marks) must add zero wire
+        // bytes: `skip_serializing_if` omits the field from the JSON entirely.
+        let cell = RenderCell::default();
+        let json = serde_json::to_string(&cell).unwrap();
+        assert!(
+            !json.contains("combining"),
+            "empty combining must be skipped, got: {json}"
+        );
+
+        // Absent on the wire decodes back to an empty vec via serde default.
+        let decoded: RenderCell = serde_json::from_str(&json).unwrap();
+        assert!(decoded.combining.is_empty());
+    }
+
+    #[test]
+    fn render_cell_combining_round_trips() {
+        // A decomposed `é` (base 'e' + U+0301) round-trips with its marks.
+        let cell = RenderCell {
+            c: 'e',
+            combining: vec!['\u{301}'],
+            ..RenderCell::default()
+        };
+        let json = serde_json::to_string(&cell).unwrap();
+        assert!(json.contains("combining"));
+        let decoded: RenderCell = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.c, 'e');
+        assert_eq!(decoded.combining, vec!['\u{301}']);
     }
 
     #[test]

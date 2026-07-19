@@ -129,6 +129,11 @@ impl Renderer {
                 }
 
                 queue!(stdout, Print(cell.c))?;
+                // Combining marks are zero-width; the terminal composes them onto
+                // the base glyph just printed without advancing the cursor.
+                for m in &cell.combining {
+                    queue!(stdout, Print(*m))?;
+                }
             }
 
             queue!(stdout, ResetColor)?;
@@ -209,7 +214,12 @@ impl Renderer {
                     queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
                 }
 
-                queue!(stdout, Print(change.cell.c), ResetColor)?;
+                queue!(stdout, Print(change.cell.c))?;
+                // Combining marks compose onto the base glyph just printed.
+                for m in &change.cell.combining {
+                    queue!(stdout, Print(*m))?;
+                }
+                queue!(stdout, ResetColor)?;
             }
 
             // Update front buffer (always, even for skipped continuation cells).
@@ -400,6 +410,10 @@ impl Renderer {
                     last_underline = cell.underline;
                 }
                 queue!(stdout, Print(cell.c))?;
+                // Combining marks compose onto the base glyph just printed.
+                for m in &cell.combining {
+                    queue!(stdout, Print(*m))?;
+                }
             }
 
             queue!(stdout, ResetColor)?;
@@ -544,6 +558,10 @@ impl Renderer {
                     last_underline = cell.underline;
                 }
                 queue!(stdout, Print(cell.c))?;
+                // Combining marks compose onto the base glyph just printed.
+                for m in &cell.combining {
+                    queue!(stdout, Print(*m))?;
+                }
             }
             queue!(stdout, ResetColor)?;
         }
@@ -618,7 +636,12 @@ impl Renderer {
                     if cell.bold {
                         queue!(stdout, SetAttribute(Attribute::Bold))?;
                     }
-                    queue!(stdout, Print(cell.c), ResetColor)?;
+                    queue!(stdout, Print(cell.c))?;
+                    // Combining marks compose onto the base glyph just printed.
+                    for m in &cell.combining {
+                        queue!(stdout, Print(*m))?;
+                    }
+                    queue!(stdout, ResetColor)?;
                 }
             }
         }
@@ -651,8 +674,12 @@ impl Renderer {
                         SetForegroundColor(fg),
                         SetBackgroundColor(bg),
                         Print(cell.c),
-                        ResetColor,
                     )?;
+                    // Combining marks compose onto the base glyph just printed.
+                    for m in &cell.combining {
+                        queue!(stdout, Print(*m))?;
+                    }
+                    queue!(stdout, ResetColor)?;
                 }
             }
         }
@@ -709,7 +736,7 @@ impl Renderer {
                 let line: String = pane_row
                     .iter()
                     .filter(|c| c.width != 0)
-                    .map(|c| c.c)
+                    .flat_map(|c| std::iter::once(c.c).chain(c.combining.iter().copied()))
                     .collect();
                 result.push_str(line.trim_end());
                 result.push('\n');
@@ -719,7 +746,7 @@ impl Renderer {
                 let text: String = pane_row[cs..ce]
                     .iter()
                     .filter(|c| c.width != 0)
-                    .map(|c| c.c)
+                    .flat_map(|c| std::iter::once(c.c).chain(c.combining.iter().copied()))
                     .collect();
                 result.push_str(text.trim_end());
             } else if scrollback_row == start_row {
@@ -727,7 +754,7 @@ impl Renderer {
                 let text: String = pane_row[cs..]
                     .iter()
                     .filter(|c| c.width != 0)
-                    .map(|c| c.c)
+                    .flat_map(|c| std::iter::once(c.c).chain(c.combining.iter().copied()))
                     .collect();
                 result.push_str(text.trim_end());
                 result.push('\n');
@@ -736,14 +763,14 @@ impl Renderer {
                 let text: String = pane_row[..ce]
                     .iter()
                     .filter(|c| c.width != 0)
-                    .map(|c| c.c)
+                    .flat_map(|c| std::iter::once(c.c).chain(c.combining.iter().copied()))
                     .collect();
                 result.push_str(text.trim_end());
             } else {
                 let text: String = pane_row
                     .iter()
                     .filter(|c| c.width != 0)
-                    .map(|c| c.c)
+                    .flat_map(|c| std::iter::once(c.c).chain(c.combining.iter().copied()))
                     .collect();
                 result.push_str(text.trim_end());
                 result.push('\n');

@@ -164,6 +164,7 @@ fn cell_to_render_cell(cell: &Cell) -> RenderCell {
         italic: cell.attrs.italic,
         underline: cell.attrs.underline,
         width: cell.width,
+        combining: cell.combining.clone(),
     }
 }
 
@@ -407,6 +408,7 @@ fn draw_zellij_panes(
             italic: false,
             underline: false,
             width: 1,
+            combining: Vec::new(),
         };
 
         // Top-left corner.
@@ -546,6 +548,7 @@ fn build_top_border_content(
                 italic: false,
                 underline: false,
                 width: 1,
+                combining: Vec::new(),
             });
             for ch in name.chars() {
                 cells.push(RenderCell {
@@ -556,6 +559,7 @@ fn build_top_border_content(
                     italic: false,
                     underline: false,
                     width: 1,
+                    combining: Vec::new(),
                 });
             }
             cells.push(RenderCell {
@@ -566,6 +570,7 @@ fn build_top_border_content(
                 italic: false,
                 underline: false,
                 width: 1,
+                combining: Vec::new(),
             });
         }
     } else {
@@ -601,6 +606,7 @@ fn build_top_border_content(
             italic: false,
             underline: false,
             width: 1,
+            combining: Vec::new(),
         });
 
         for (i, display_name) in display_names.iter().enumerate() {
@@ -615,6 +621,7 @@ fn build_top_border_content(
                         italic: false,
                         underline: false,
                         width: 1,
+                        combining: Vec::new(),
                     });
                 }
             }
@@ -646,6 +653,7 @@ fn build_top_border_content(
                     italic: false,
                     underline: false,
                     width: 1,
+                    combining: Vec::new(),
                 });
             }
             for ch in display_name.chars().take(tab_width) {
@@ -657,6 +665,7 @@ fn build_top_border_content(
                     italic: false,
                     underline: false,
                     width: 1,
+                    combining: Vec::new(),
                 });
             }
             for _ in 0..pad_right {
@@ -668,6 +677,7 @@ fn build_top_border_content(
                     italic: false,
                     underline: false,
                     width: 1,
+                    combining: Vec::new(),
                 });
             }
         }
@@ -681,6 +691,7 @@ fn build_top_border_content(
             italic: false,
             underline: false,
             width: 1,
+            combining: Vec::new(),
         });
     }
 
@@ -776,6 +787,7 @@ fn draw_tmux_tab_bar(
                 italic: false,
                 underline: false,
                 width: 1,
+                combining: Vec::new(),
             },
         );
     }
@@ -829,6 +841,7 @@ fn draw_tmux_tab_bar(
                             italic: false,
                             underline: false,
                             width: 1,
+                            combining: Vec::new(),
                         },
                     );
                     col += 1;
@@ -878,6 +891,7 @@ fn draw_tmux_tab_bar(
                         italic: false,
                         underline: false,
                         width: 1,
+                        combining: Vec::new(),
                     },
                 );
                 col += 1;
@@ -899,6 +913,7 @@ fn draw_tmux_tab_bar(
                     italic: false,
                     underline: false,
                     width: 1,
+                    combining: Vec::new(),
                 },
             );
             col += 1;
@@ -917,6 +932,7 @@ fn draw_tmux_tab_bar(
                         italic: false,
                         underline: false,
                         width: 1,
+                        combining: Vec::new(),
                     },
                 );
                 col += 1;
@@ -939,6 +955,7 @@ fn draw_tmux_dividers(
         italic: false,
         underline: false,
         width: 1,
+        combining: Vec::new(),
     };
 
     for i in 0..pane_rects.len() {
@@ -1065,6 +1082,7 @@ fn draw_status_bar(
                 italic: false,
                 underline: false,
                 width: 1,
+                combining: Vec::new(),
             };
         }
     }
@@ -1084,6 +1102,7 @@ fn draw_status_bar(
                 italic: false,
                 underline: false,
                 width: 1,
+                combining: Vec::new(),
             };
         }
         x += 1;
@@ -1101,6 +1120,7 @@ fn draw_status_bar(
                 italic: false,
                 underline: false,
                 width: 1,
+                combining: Vec::new(),
             };
         }
         x += 1;
@@ -1116,6 +1136,7 @@ fn draw_status_bar(
             italic: false,
             underline: false,
             width: 1,
+            combining: Vec::new(),
         };
         x += 1;
     }
@@ -1135,6 +1156,7 @@ fn draw_status_bar(
                         italic: false,
                         underline: false,
                         width: 1,
+                        combining: Vec::new(),
                     };
                 }
                 x += 1;
@@ -1172,6 +1194,7 @@ fn draw_status_bar(
                     italic: false,
                     underline: false,
                     width: 1,
+                    combining: Vec::new(),
                 };
             }
             x += 1;
@@ -1224,6 +1247,7 @@ fn draw_status_bar(
                         italic: false,
                         underline: false,
                         width: 1,
+                        combining: Vec::new(),
                     };
                 }
                 rx += 1;

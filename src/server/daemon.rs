@@ -3705,6 +3705,34 @@ mod tests {
     }
 
     #[test]
+    fn compute_diff_emits_cell_when_only_combining_differs() {
+        // A base glyph gaining a combining mark differs only in `combining`.
+        // `RenderCell` derives `PartialEq` over all fields, so the diff must
+        // detect and emit the changed cell.
+        let base = RenderCell {
+            c: 'e',
+            ..RenderCell::default()
+        };
+        let accented = RenderCell {
+            c: 'e',
+            combining: vec!['\u{301}'],
+            ..RenderCell::default()
+        };
+
+        let prev = vec![vec![base.clone()]];
+        let curr = vec![vec![accented.clone()]];
+        let changes = compute_diff(&prev, &curr);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].x, 0);
+        assert_eq!(changes[0].cell.combining, vec!['\u{301}']);
+
+        // Losing the mark is likewise detected.
+        let changes_back = compute_diff(&curr, &prev);
+        assert_eq!(changes_back.len(), 1);
+        assert!(changes_back[0].cell.combining.is_empty());
+    }
+
+    #[test]
     fn test_wheel_report_sgr() {
         // Wheel up: button 64, SGR encoding, 1-based coords.
         assert_eq!(wheel_report(true, true, 5, 10), b"\x1b[<64;5;10M".to_vec());

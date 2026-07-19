@@ -43,6 +43,10 @@ pub struct Cell {
     /// continuation cell placed in the column after a wide lead.
     pub width: u8,
     pub attrs: CellAttrs,
+    /// Zero-width combining marks (e.g. U+0301 COMBINING ACUTE ACCENT) that
+    /// compose onto the base glyph `c`. Empty for the overwhelmingly common
+    /// case of a plain glyph.
+    pub combining: Vec<char>,
 }
 
 impl Default for Cell {
@@ -51,6 +55,7 @@ impl Default for Cell {
             c: ' ',
             width: 1,
             attrs: CellAttrs::default(),
+            combining: Vec::new(),
         }
     }
 }
@@ -302,11 +307,20 @@ impl Screen {
     /// cursor. Wraps to the next line at the end of a row and scrolls if
     /// necessary.
     fn put_char(&mut self, c: char) {
-        // Zero-width / combining characters: with a single-`char` cell model we
-        // cannot attach them to the previous glyph, so skip them entirely rather
-        // than consume a column (which would desync the row). Known limitation.
+        // Zero-width / combining characters (e.g. U+0301 COMBINING ACUTE
+        // ACCENT): attach them to the base glyph in the cell immediately to the
+        // left of the cursor -- the last-written cell -- without advancing the
+        // cursor or overwriting any cell. At column 0 there is no preceding base
+        // on this row, so the mark is dropped (rare edge case).
         let display_width = UnicodeWidthChar::width(c);
         if display_width == Some(0) {
+            if self.cursor_x > 0 {
+                let row = self.cursor_y as usize;
+                let col = (self.cursor_x - 1) as usize;
+                if row < self.grid.len() && col < self.grid[row].len() {
+                    self.grid[row][col].combining.push(c);
+                }
+            }
             return;
         }
         let width: u8 = if display_width == Some(2) { 2 } else { 1 };
@@ -342,6 +356,7 @@ impl Screen {
                 c,
                 width,
                 attrs: self.current_attrs.clone(),
+                combining: Vec::new(),
             };
 
             if width == 2 {
@@ -351,13 +366,16 @@ impl Screen {
                         c: ' ',
                         width: 0,
                         attrs: self.current_attrs.clone(),
+                        combining: Vec::new(),
                     };
                 }
             } else if old_width == 2 && col + 1 < self.grid[row].len() {
                 // We overwrote a former wide lead with a narrow char; blank the
-                // now-dangling continuation cell so it renders as a space.
+                // now-dangling continuation cell so it renders as a space. Clear
+                // any marks the in-place path would otherwise leave behind.
                 self.grid[row][col + 1].c = ' ';
                 self.grid[row][col + 1].width = 1;
+                self.grid[row][col + 1].combining.clear();
             }
         }
 
@@ -1041,14 +1059,52 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_width_char_skipped() {
+    fn test_combining_mark_attaches_to_base() {
         let mut s = make_screen();
-        s.process_output(b"A");
-        // U+0301 COMBINING ACUTE ACCENT is display-width 0; with a single-char
-        // cell model it is skipped (no write, no cursor advance).
+        s.process_output(b"e");
+        // U+0301 COMBINING ACUTE ACCENT is display-width 0; it attaches to the
+        // base glyph to the left of the cursor without advancing the cursor or
+        // consuming a column (so `e` + U+0301 renders as `é`).
         s.process_output("\u{0301}".as_bytes());
-        assert_eq!(s.grid[0][0].c, 'A');
+        assert_eq!(s.grid[0][0].c, 'e');
         assert_eq!(s.grid[0][0].width, 1);
+        assert_eq!(s.grid[0][0].combining, vec!['\u{301}']);
+        // Cursor advanced by exactly 1 (the base), not 2.
+        assert_eq!(s.cursor_x, 1);
+    }
+
+    #[test]
+    fn test_combining_mark_at_column_zero_dropped() {
+        let mut s = make_screen();
+        // A combining mark with no preceding base on the row is dropped.
+        s.process_output("\u{0301}".as_bytes());
+        assert_eq!(s.cursor_x, 0);
+        assert!(s.grid[0][0].combining.is_empty());
+        assert_eq!(s.grid[0][0].c, ' ');
+    }
+
+    #[test]
+    fn test_new_base_clears_previous_combining() {
+        let mut s = make_screen();
+        // Build 'e' + combining acute at col 0.
+        s.process_output(b"e");
+        s.process_output("\u{0301}".as_bytes());
+        assert_eq!(s.grid[0][0].combining, vec!['\u{301}']);
+        // Overwrite the cell with a fresh base char; combining must reset.
+        s.process_output(b"\rX");
+        assert_eq!(s.grid[0][0].c, 'X');
+        assert!(s.grid[0][0].combining.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_combining_marks_accumulate() {
+        let mut s = make_screen();
+        s.process_output(b"a");
+        // Two combining marks stack onto the same base.
+        s.process_output("\u{0301}".as_bytes());
+        s.process_output("\u{0308}".as_bytes());
+        assert_eq!(s.grid[0][0].c, 'a');
+        assert_eq!(s.grid[0][0].combining, vec!['\u{301}', '\u{308}']);
         assert_eq!(s.cursor_x, 1);
     }
 
