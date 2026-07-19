@@ -475,7 +475,24 @@ async fn run_client_loop(
     log::debug!("run_client_loop: terminal size={}x{}", cols, rows);
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();
-    let theme = config.theme();
+    let mut theme = config.theme();
+
+    // Spawn the config-file watcher for live hot-reload. This is best-effort:
+    // if it fails to start we log and continue without hot-reload rather than
+    // failing the client. We keep a spare sender (`_cfg_keepalive`) alive for
+    // the loop's duration so `cfg_rx.recv()` stays Pending (never returns
+    // `None`) even if the watcher never starts or its handle is dropped —
+    // otherwise the select! branch below would busy-spin. `_cfg_watch` is bound
+    // so the watcher isn't dropped for the loop's lifetime.
+    let (cfg_tx, mut cfg_rx) = tokio::sync::mpsc::unbounded_channel::<Config>();
+    let _cfg_keepalive = cfg_tx.clone();
+    let _cfg_watch = match crate::config::watcher::watch_config(cfg_tx) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::warn!("client: config watcher failed to start: {e:#}");
+            None
+        }
+    };
     // Last known focused pane rect from the server, and cursor position.
     let mut focused_pane_rect: Option<crate::protocol::PaneRect> = None;
     let mut last_cursor_x: u16 = 0;
@@ -2160,6 +2177,45 @@ async fn run_client_loop(
                     // Unreachable: `Closed` is handled in the preamble above, so
                     // `msg` is always `Some` here.
                     None => {}
+                }
+            }
+            // Config hot-reload (rare, low-priority). Applies client-side
+            // settings live so edits to ~/.config/remux/config.toml don't
+            // require a restart. The channel is kept open by `_cfg_keepalive`,
+            // so `None` only appears on a genuine full teardown.
+            maybe_cfg = cfg_rx.recv() => {
+                if let Some(new_config) = maybe_cfg {
+                    // Revalidate cross-references (logs on bad refs, like startup).
+                    new_config.validate();
+
+                    // Swap keybindings/leader/shortcuts and reset any stale chord.
+                    input.reload_keybindings(
+                        new_config.keybinding_tree(),
+                        new_config.leader_key(),
+                        new_config.shortcut_bindings(),
+                    );
+
+                    // Update theme before any re-render so overlays repaint with
+                    // the new colors.
+                    theme = new_config.theme();
+
+                    // Reconcile the remotes roster (update in place / add new /
+                    // drop idle config-removed remotes).
+                    mgr.update_remotes(&new_config.remotes);
+
+                    // If the session-manager overlay is open, repaint it so the
+                    // new theme takes effect immediately.
+                    if input.session_manager.is_some() {
+                        if let Some(sm) = input.session_manager.as_ref() {
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_overlay(c, r)?;
+                            let draw_cmds = sm.render(c, r, &theme);
+                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                            renderer.flush()?;
+                        }
+                    }
+
+                    log::info!("client: config reloaded");
                 }
             }
         }

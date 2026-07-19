@@ -71,6 +71,11 @@ struct RemoteEntry {
     state: RemoteState,
     /// Keeps the ssh child alive; dropping it triggers `kill_on_drop`.
     _child: Option<Child>,
+    /// Whether this entry originates from the `[remotes]` config map (vs. an
+    /// ad-hoc remote added at runtime via `RemoteConnect`/`add_remote`). Only
+    /// config-derived entries are eligible for removal by [`update_remotes`]
+    /// when they disappear from a reloaded config.
+    from_config: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +121,7 @@ impl ConnectionManager {
                 config: RemoteConfig::default(),
                 state: RemoteState::Connected,
                 _child: None,
+                from_config: false,
             },
         );
         let (reader, writer, child) = client.into_split();
@@ -140,6 +146,7 @@ impl ConnectionManager {
                         config: config.clone(),
                         state: RemoteState::NotConnected,
                         _child: None,
+                        from_config: true,
                     },
                 )
             })
@@ -192,7 +199,72 @@ impl ConnectionManager {
             config,
             state: RemoteState::NotConnected,
             _child: None,
+            from_config: false,
         });
+    }
+
+    /// Reconcile the remotes map against a reloaded config's `[remotes]` map.
+    ///
+    /// For each `(name, config)` in `new_remotes`:
+    /// - if an entry already exists, its `config` is updated in place and it is
+    ///   marked config-derived (`from_config = true`); its `state` and live
+    ///   connection are left untouched, so a `Connected` remote keeps running
+    ///   and a `NotConnected`/`Failed` remote picks up the new config on its
+    ///   next connect;
+    /// - otherwise a fresh `NotConnected` entry is inserted (like
+    ///   [`add_remote`]) marked config-derived.
+    ///
+    /// Entries no longer present in `new_remotes` are removed ONLY when they are
+    /// config-derived (`from_config == true`), currently `NotConnected` or
+    /// `Failed`, and not the foreground. Ad-hoc remotes (added via
+    /// `RemoteConnect`/`add_remote`) and any `Connected`/`Connecting` remote are
+    /// never dropped here.
+    ///
+    /// Note: an existing ad-hoc entry that now appears in the config becomes
+    /// config-derived (`from_config` flips `false -> true`), so it is eligible
+    /// for a future config-removal like any other configured remote.
+    pub fn update_remotes(&mut self, new_remotes: &HashMap<String, RemoteConfig>) {
+        // Update existing / insert new.
+        for (name, config) in new_remotes {
+            match self.remotes.get_mut(name) {
+                Some(entry) => {
+                    entry.config = config.clone();
+                    entry.from_config = true;
+                }
+                None => {
+                    self.remotes.insert(
+                        name.clone(),
+                        RemoteEntry {
+                            config: config.clone(),
+                            state: RemoteState::NotConnected,
+                            _child: None,
+                            from_config: true,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Remove config-derived entries that dropped out of the config, but only
+        // if they are idle (NotConnected/Failed) and not the foreground.
+        let to_remove: Vec<String> = self
+            .remotes
+            .iter()
+            .filter(|(name, entry)| {
+                entry.from_config
+                    && !new_remotes.contains_key(*name)
+                    && matches!(
+                        entry.state,
+                        RemoteState::NotConnected | RemoteState::Failed(_)
+                    )
+                    && self.foreground != ConnId::Remote((*name).clone())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in to_remove {
+            self.remotes.remove(&name);
+            self.writers.remove(&ConnId::Remote(name));
+        }
     }
 
     /// Lazily connect to a named remote over SSH. No-op if already `Connected`.
@@ -476,6 +548,121 @@ mod tests {
             },
         );
         assert_eq!(mgr.remote_state("adhoc"), RemoteState::Connected);
+    }
+
+    #[test]
+    fn update_remotes_updates_existing_config_without_disturbing_connection() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        // Bring "alpha" up as if it were live.
+        mgr.set_state("alpha", RemoteState::Connected);
+        assert_eq!(mgr.remotes["alpha"].config.ssh, "user@alpha");
+
+        // Reload with a new ssh target for "alpha" (and "zulu" unchanged).
+        let mut new_map = sample_remotes();
+        new_map.insert(
+            "alpha".to_string(),
+            RemoteConfig {
+                ssh: "user@alpha-new".to_string(),
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        // Config was updated in place, state left untouched.
+        assert_eq!(mgr.remotes["alpha"].config.ssh, "user@alpha-new");
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Connected);
+    }
+
+    #[test]
+    fn update_remotes_adds_new_entry() {
+        let mut mgr = ConnectionManager::empty(&HashMap::new(), ConnId::Local);
+        assert!(!mgr.has_remote("beta"));
+
+        let mut new_map = HashMap::new();
+        new_map.insert(
+            "beta".to_string(),
+            RemoteConfig {
+                ssh: "user@beta".to_string(),
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        assert!(mgr.has_remote("beta"));
+        assert_eq!(mgr.remote_state("beta"), RemoteState::NotConnected);
+        assert_eq!(mgr.remotes["beta"].config.ssh, "user@beta");
+        assert!(mgr.remotes["beta"].from_config);
+    }
+
+    #[test]
+    fn update_remotes_removes_idle_config_absent_entry() {
+        // Both start config-derived and NotConnected.
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        assert!(mgr.has_remote("alpha"));
+        assert!(mgr.has_remote("zulu"));
+
+        // New config drops "zulu".
+        let mut new_map = HashMap::new();
+        new_map.insert(
+            "alpha".to_string(),
+            RemoteConfig {
+                ssh: "user@alpha".to_string(),
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        // Idle + config-derived + config-absent => removed.
+        assert!(mgr.has_remote("alpha"));
+        assert!(!mgr.has_remote("zulu"));
+    }
+
+    #[test]
+    fn update_remotes_keeps_connected_config_absent_entry() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("zulu", RemoteState::Connected);
+
+        // New config drops "zulu", but it's live -> must be kept.
+        let mut new_map = HashMap::new();
+        new_map.insert(
+            "alpha".to_string(),
+            RemoteConfig {
+                ssh: "user@alpha".to_string(),
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        assert!(mgr.has_remote("zulu"));
+        assert_eq!(mgr.remote_state("zulu"), RemoteState::Connected);
+    }
+
+    #[test]
+    fn update_remotes_keeps_adhoc_config_absent_entry() {
+        let mut mgr = ConnectionManager::empty(&HashMap::new(), ConnId::Local);
+        // Ad-hoc remote (from_config = false), idle.
+        mgr.add_remote(
+            "adhoc".to_string(),
+            RemoteConfig {
+                ssh: "user@adhoc".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(!mgr.remotes["adhoc"].from_config);
+
+        // Reload with an unrelated config; the ad-hoc entry is absent from it but
+        // must NOT be removed (it wasn't config-derived).
+        let mut new_map = HashMap::new();
+        new_map.insert(
+            "beta".to_string(),
+            RemoteConfig {
+                ssh: "user@beta".to_string(),
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        assert!(mgr.has_remote("adhoc"));
     }
 
     #[test]

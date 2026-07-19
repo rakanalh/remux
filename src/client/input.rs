@@ -844,6 +844,22 @@ impl InputHandler {
         )
     }
 
+    /// Swap in a freshly-built keybinding configuration (used by config
+    /// hot-reload). Replaces the keybinding tree, leader key, and modifier
+    /// shortcut bindings, and resets any in-progress Command-mode chord so a
+    /// stale path can't misfire against the new tree.
+    pub fn reload_keybindings(
+        &mut self,
+        keybinding_tree: KeybindingTree,
+        leader_key: KeyEvent,
+        shortcut_bindings: ShortcutBindings,
+    ) {
+        self.keybinding_tree = keybinding_tree;
+        self.leader_key = leader_key;
+        self.shortcut_bindings = shortcut_bindings;
+        self.keybinding_state.reset();
+    }
+
     /// Process a key event and return the appropriate action.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         log::debug!(
@@ -3220,5 +3236,71 @@ mod tests {
         let action = handler.handle_key(n);
         assert_eq!(action, InputAction::Execute(RemuxCommand::PaneNew));
         assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    // -- reload_keybindings (config hot-reload) -----------------------------
+
+    #[test]
+    fn reload_keybindings_swaps_tree_and_leader() {
+        let mut handler = InputHandler::with_defaults();
+
+        // Default tree has no 'z' binding at root, and the default leader is
+        // Ctrl-a.
+        assert!(handler.keybinding_tree.lookup(&['z']).is_none());
+        let ctrl_a = ctrl_key('a');
+        assert!(matches!(
+            handler.handle_key(ctrl_a),
+            InputAction::ShowWhichKey(..)
+        ));
+        assert_eq!(handler.mode, Mode::Command);
+        handler.mode = Mode::Normal;
+        handler.keybinding_state.reset();
+
+        // Build a distinct tree that binds 'z' at root and a new leader (Ctrl-b).
+        let mut root = std::collections::HashMap::new();
+        root.insert(
+            'z',
+            KeyNode::Leaf {
+                label: "new tab".to_string(),
+                action: vec!["TabNew".to_string(), "EnterNormal".to_string()],
+            },
+        );
+        let new_tree = KeybindingTree { root };
+        let new_leader = ctrl_key('b');
+
+        handler.reload_keybindings(new_tree, new_leader, ShortcutBindings::default());
+
+        // The tree actually changed: 'z' now resolves at root.
+        assert!(handler.keybinding_tree.lookup(&['z']).is_some());
+
+        // The old leader (Ctrl-a) no longer enters Command mode; it is a normal
+        // keystroke forwarded to the PTY.
+        let action = handler.handle_key(ctrl_key('a'));
+        assert_eq!(handler.mode, Mode::Normal);
+        assert!(matches!(action, InputAction::SendToPty(_)));
+
+        // The new leader (Ctrl-b) enters Command mode.
+        let action = handler.handle_key(ctrl_key('b'));
+        assert_eq!(handler.mode, Mode::Command);
+        assert!(matches!(action, InputAction::ShowWhichKey(..)));
+    }
+
+    #[test]
+    fn reload_keybindings_resets_in_progress_chord() {
+        let mut handler = InputHandler::with_defaults();
+
+        // Simulate an in-progress Command-mode chord.
+        handler.mode = Mode::Command;
+        handler.keybinding_state.push('t');
+        assert!(!handler.keybinding_state.is_at_root());
+
+        handler.reload_keybindings(
+            KeybindingTree::default(),
+            handler.leader_key,
+            ShortcutBindings::default(),
+        );
+
+        // The stale chord path was reset so it can't misfire on the new tree.
+        assert!(handler.keybinding_state.is_at_root());
     }
 }
