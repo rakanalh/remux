@@ -482,6 +482,72 @@ impl Renderer {
         let pane_w = visual_state.visible_cols;
         let pane_h = visual_state.visible_rows;
 
+        // Repaint the pane region from the front buffer before drawing the
+        // selection/cursor highlights. This function runs both after a server
+        // frame (where render_full/diff/scroll already refreshed the physical
+        // screen, so this is a harmless no-op) and standalone on in-view cursor
+        // moves (where no server frame refreshes the buffer). Repainting here
+        // restores each cell to its true content so the previous cursor cell
+        // and any previous selection cells are cleared — the cursor leaves no
+        // trail when it moves within the visible area.
+        for pane_y in 0..pane_h {
+            let screen_y = pane_oy as usize + pane_y;
+            if screen_y >= self.front.len() || screen_y >= self.rows as usize {
+                break;
+            }
+            let row = &self.front[screen_y];
+            queue!(stdout, MoveTo(pane_ox, screen_y as u16), ResetColor)?;
+            let mut last_bold = false;
+            let mut last_italic = false;
+            let mut last_underline = false;
+            for pane_x in 0..pane_w {
+                let screen_x = pane_ox as usize + pane_x;
+                if screen_x >= self.cols as usize || screen_x >= row.len() {
+                    break;
+                }
+                let cell = &row[screen_x];
+                // Skip the continuation cell of a wide glyph: the preceding
+                // width-2 Print already advanced the physical cursor by 2.
+                if cell.width == 0 {
+                    continue;
+                }
+                queue!(
+                    stdout,
+                    SetForegroundColor(cell_color_to_crossterm(&cell.fg)),
+                    SetBackgroundColor(cell_color_to_crossterm(&cell.bg)),
+                )?;
+                if cell.bold != last_bold {
+                    let attr = if cell.bold {
+                        Attribute::Bold
+                    } else {
+                        Attribute::NormalIntensity
+                    };
+                    queue!(stdout, SetAttribute(attr))?;
+                    last_bold = cell.bold;
+                }
+                if cell.italic != last_italic {
+                    let attr = if cell.italic {
+                        Attribute::Italic
+                    } else {
+                        Attribute::NoItalic
+                    };
+                    queue!(stdout, SetAttribute(attr))?;
+                    last_italic = cell.italic;
+                }
+                if cell.underline != last_underline {
+                    let attr = if cell.underline {
+                        Attribute::Underlined
+                    } else {
+                        Attribute::NoUnderline
+                    };
+                    queue!(stdout, SetAttribute(attr))?;
+                    last_underline = cell.underline;
+                }
+                queue!(stdout, Print(cell.c))?;
+            }
+            queue!(stdout, ResetColor)?;
+        }
+
         let selection_range = visual_state.selection_range();
         let is_line_mode = visual_state.selection_mode == SelectionMode::Line;
 

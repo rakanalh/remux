@@ -355,6 +355,10 @@ pub enum InputAction {
     SearchNavigate,
     /// Update the visual mode scroll offset.
     VisualScroll { offset: usize },
+    /// Navigate to the current search match in Visual mode. The visual state's
+    /// `current_match` has already been advanced by `n`/`N`/`p`; the handler
+    /// moves the cursor to that match and scrolls the view if it is off-screen.
+    VisualMatchNav,
     /// Activate the rename overlay for pane or tab renaming.
     ActivateRenameOverlay,
     /// The rename overlay buffer was updated (for status bar display).
@@ -1212,6 +1216,10 @@ impl InputHandler {
                 vs.reset();
             }
             self.visual_state = None;
+            // Clear any search state carried in from a search-to-visual
+            // transition so its match highlights/prompt don't linger in
+            // Normal mode.
+            self.search_state = None;
             self.pending_g = false;
             return InputAction::ModeChanged(Mode::Normal);
         }
@@ -1307,7 +1315,7 @@ impl InputHandler {
                 self.pending_g = true;
                 return InputAction::None;
             }
-            'v' => {
+            'v' | ' ' => {
                 if let Some(vs) = self.visual_state.as_mut() {
                     vs.start_char_selection();
                     return InputAction::VisualScroll {
@@ -1337,12 +1345,14 @@ impl InputHandler {
             'n' => {
                 if let Some(vs) = self.visual_state.as_mut() {
                     vs.next_match();
+                    return InputAction::VisualMatchNav;
                 }
                 return InputAction::None;
             }
-            'N' => {
+            'N' | 'p' => {
                 if let Some(vs) = self.visual_state.as_mut() {
                     vs.prev_match();
+                    return InputAction::VisualMatchNav;
                 }
                 return InputAction::None;
             }
@@ -2553,6 +2563,56 @@ mod tests {
             handler.visual_state.as_ref().unwrap().selection_mode,
             SelectionMode::Line
         );
+    }
+
+    #[test]
+    fn visual_mode_space_toggles_char_selection() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        // Space is an alias for 'v'.
+        handler.handle_key(char_key(' '));
+        assert_eq!(
+            handler.visual_state.as_ref().unwrap().selection_mode,
+            SelectionMode::Character
+        );
+        handler.handle_key(char_key(' '));
+        assert_eq!(
+            handler.visual_state.as_ref().unwrap().selection_mode,
+            SelectionMode::None
+        );
+    }
+
+    #[test]
+    fn visual_mode_match_nav_keys_advance_and_report() {
+        let mut handler = InputHandler::with_defaults();
+        handler.enter_visual_mode(24, 100);
+        if let Some(vs) = handler.visual_state.as_mut() {
+            vs.search_matches = vec![(0, 0), (5, 3), (10, 7)];
+            vs.current_match = 0;
+        }
+        // 'n' -> next match, returns VisualMatchNav.
+        let action = handler.handle_key(char_key('n'));
+        assert_eq!(action, InputAction::VisualMatchNav);
+        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 1);
+        // 'p' -> previous match (alias for 'N').
+        let action = handler.handle_key(char_key('p'));
+        assert_eq!(action, InputAction::VisualMatchNav);
+        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 0);
+        // 'N' -> previous match (wraps).
+        let action = handler.handle_key(char_key('N'));
+        assert_eq!(action, InputAction::VisualMatchNav);
+        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 2);
+    }
+
+    #[test]
+    fn visual_mode_escape_clears_search_state() {
+        let mut handler = InputHandler::with_defaults();
+        handler.search_state = Some(SearchState::new());
+        handler.enter_visual_mode(24, 100);
+        let action = handler.handle_key(esc_key());
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert!(handler.visual_state.is_none());
+        assert!(handler.search_state.is_none());
     }
 
     #[test]

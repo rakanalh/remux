@@ -28,6 +28,16 @@ use crate::config::{Config, RemoteConfig};
 use crate::protocol::{ClientMessage, RemuxCommand, ServerMessage};
 use crate::server::daemon::{socket_path, RemuxServer};
 
+/// Data captured while computing search matches, used to transition from
+/// Search into Visual mode positioned at the current match.
+struct SearchToVisual {
+    matches: Vec<(usize, usize)>,
+    current_match: usize,
+    total_lines: usize,
+    match_line: usize,
+    match_col: usize,
+}
+
 #[derive(Parser)]
 #[command(name = "remux", version, about = "A terminal multiplexer")]
 struct Cli {
@@ -764,6 +774,112 @@ async fn run_client_loop(
                                     let delta = scroll_offset as i32 - old as i32;
                                     if delta != 0 {
                                         mgr.send_foreground(ClientMessage::ScrollDelta { delta }).await?;
+                                    }
+                                }
+                                // Always repaint the visual overlay so an in-view
+                                // cursor/selection move (offset unchanged) shows up
+                                // immediately. When the offset changed, the server
+                                // frame triggered by the ScrollDelta above also
+                                // repaints the overlay — this extra paint is harmless.
+                                if let Some(ref vs) = input.visual_state {
+                                    renderer.render_visual_overlay(vs)?;
+                                    // The overlay repaints the pane from the front
+                                    // buffer, which does not contain the search-match
+                                    // highlights (they are drawn on top). Redraw them
+                                    // so they survive an in-view cursor move.
+                                    if let Some(ref ss) = input.search_state {
+                                        let query =
+                                            ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
+                                        renderer.render_search_highlight(
+                                            &ss.matches,
+                                            ss.current_match,
+                                            query.len(),
+                                            scroll_offset,
+                                            focused_pane_rect.as_ref(),
+                                            &theme,
+                                        )?;
+                                    }
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::VisualMatchNav => {
+                                // handle_visual_key already advanced the visual
+                                // state's current_match. Move the cursor to that
+                                // match and, if it is off-screen, scroll to it using
+                                // a viewport_top-based delta (mirroring the search
+                                // flow) rather than the VisualScroll delta path.
+                                let pane_h = focused_pane_rect
+                                    .map(|pr| pr.height as usize)
+                                    .unwrap_or(24);
+                                let target = input.visual_state.as_ref().and_then(|vs| {
+                                    vs.search_matches.get(vs.current_match).copied()
+                                });
+                                if let Some((match_line, match_col)) = target {
+                                    // Keep the search highlight's current match in
+                                    // sync with the visual cursor.
+                                    if let Some(ref mut ss) = input.search_state {
+                                        let cur = input
+                                            .visual_state
+                                            .as_ref()
+                                            .map(|vs| vs.current_match)
+                                            .unwrap_or(0);
+                                        ss.current_match =
+                                            cur.min(ss.matches.len().saturating_sub(1));
+                                        mgr.send_foreground(ClientMessage::SearchInfo {
+                                            current: ss.current_match,
+                                            total: ss.matches.len(),
+                                        })
+                                        .await?;
+                                    }
+                                    // scroll_offset holds viewport_top (absolute
+                                    // scrollback line index of the first visible line).
+                                    let visible_top = scroll_offset;
+                                    let visible_bottom = scroll_offset + pane_h;
+                                    let mut sent_scroll = false;
+                                    if match_line < visible_top || match_line >= visible_bottom {
+                                        let target_vt = match_line.saturating_sub(pane_h / 2);
+                                        let delta = scroll_offset as i32 - target_vt as i32;
+                                        scroll_offset = target_vt;
+                                        is_scrolled = scroll_offset > 0;
+                                        if delta != 0 {
+                                            mgr.send_foreground(ClientMessage::ScrollDelta { delta })
+                                                .await?;
+                                            sent_scroll = true;
+                                        }
+                                    }
+                                    // Cursor is pane-relative: row = line - viewport_top.
+                                    if let Some(vs) = input.visual_state.as_mut() {
+                                        vs.cursor_row = match_line
+                                            .saturating_sub(scroll_offset)
+                                            .min(vs.visible_rows.saturating_sub(1));
+                                        vs.cursor_col =
+                                            match_col.min(vs.visible_cols.saturating_sub(1));
+                                    }
+                                    // Repaint now for the on-screen case. When a
+                                    // ScrollDelta was sent, the resulting server frame
+                                    // repaints the overlay at the new position (and the
+                                    // front buffer will then hold the scrolled content).
+                                    if !sent_scroll {
+                                        if let Some(ref vs) = input.visual_state {
+                                            renderer.render_visual_overlay(vs)?;
+                                            // Redraw the match highlights on top of the
+                                            // pane repaint (see the VisualScroll arm).
+                                            if let Some(ref ss) = input.search_state {
+                                                let query = ss
+                                                    .confirmed_query
+                                                    .as_deref()
+                                                    .unwrap_or(&ss.query_buffer);
+                                                renderer.render_search_highlight(
+                                                    &ss.matches,
+                                                    ss.current_match,
+                                                    query.len(),
+                                                    scroll_offset,
+                                                    focused_pane_rect.as_ref(),
+                                                    &theme,
+                                                )?;
+                                            }
+                                            renderer.flush()?;
+                                        }
                                     }
                                 }
                             }
@@ -1686,6 +1802,9 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::ScrollbackContent { lines }) => {
                         log::debug!("srv: ScrollbackContent line_count={}", lines.len());
+                        // Data captured for a Search -> Visual transition once the
+                        // search-state borrow below is released.
+                        let mut enter_visual_at_match: Option<SearchToVisual> = None;
                         if input.pending_editor_open {
                             input.pending_editor_open = false;
                             let content = lines.join("\n");
@@ -1741,6 +1860,20 @@ async fn run_client_loop(
                                     }
                                 }
 
+                                // If we found a match, capture the data needed to
+                                // switch into Visual mode at the match (applied
+                                // below, after the search-state borrow is dropped).
+                                if !ss.matches.is_empty() {
+                                    let (match_line, match_col) = ss.matches[ss.current_match];
+                                    enter_visual_at_match = Some(SearchToVisual {
+                                        matches: ss.matches.clone(),
+                                        current_match: ss.current_match,
+                                        total_lines: ss.scrollback_line_count,
+                                        match_line,
+                                        match_col,
+                                    });
+                                }
+
                                 // Render highlights at current display offset (0 if at bottom,
                                 // or wherever the server has scrolled to).
                                 // NOTE: Don't render highlights here — the server will send a
@@ -1756,6 +1889,59 @@ async fn run_client_loop(
                                 renderer.render_search_prompt(&q, ss.phase, match_info, c, r)?;
                                 renderer.flush()?;
                             }
+                        }
+
+                        // Search found a match: leave the user in Visual mode at
+                        // the match so they can hjkl-move and select around it.
+                        // search_state is kept alongside so the all-match highlight
+                        // and prompt keep rendering; n/p/N keep both indices in sync.
+                        if let Some(SearchToVisual {
+                            matches,
+                            current_match,
+                            total_lines,
+                            match_line,
+                            match_col,
+                        }) = enter_visual_at_match
+                        {
+                            let match_total = matches.len();
+                            let mut vs = crate::client::input::VisualState::new(
+                                focused_pane_rect.map(|pr| pr.height as usize).unwrap_or(24),
+                                total_lines,
+                            );
+                            if let Some(pr) = focused_pane_rect {
+                                vs.visible_rows = pr.height as usize;
+                                vs.visible_cols = pr.width as usize;
+                                vs.pane_offset_x = pr.x;
+                                vs.pane_offset_y = pr.y;
+                            }
+                            vs.total_lines = total_lines.max(vs.visible_rows);
+                            vs.search_matches = matches;
+                            vs.current_match = current_match;
+                            // vs.scroll_offset is lines-from-bottom (used by its own
+                            // selection math); scroll_offset here is viewport_top.
+                            vs.scroll_offset = vs
+                                .total_lines
+                                .saturating_sub(vs.visible_rows + scroll_offset);
+                            // Cursor is pane-relative: row = line - viewport_top.
+                            vs.cursor_row = match_line
+                                .saturating_sub(scroll_offset)
+                                .min(vs.visible_rows.saturating_sub(1));
+                            vs.cursor_col = match_col.min(vs.visible_cols.saturating_sub(1));
+                            input.visual_state = Some(vs);
+                            input.mode = Mode::Visual;
+                            // Notify the server (also triggers a fresh frame that
+                            // repaints the visual overlay at the match).
+                            mgr.send_foreground(ClientMessage::ModeChanged {
+                                mode: "VISUAL".to_string(),
+                            })
+                            .await?;
+                            // Re-assert the match count (ModeChanged clears the
+                            // server-side search info for non-SEARCH modes).
+                            mgr.send_foreground(ClientMessage::SearchInfo {
+                                current: current_match,
+                                total: match_total,
+                            })
+                            .await?;
                         }
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled }) => {
