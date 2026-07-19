@@ -1343,15 +1343,18 @@ impl InputHandler {
                 return InputAction::SearchPrompt;
             }
             'n' => {
+                // Search lands on the bottom-most match; 'n' moves UP toward
+                // older/top results (decrement = ascending-order previous).
                 if let Some(vs) = self.visual_state.as_mut() {
-                    vs.next_match();
+                    vs.prev_match();
                     return InputAction::VisualMatchNav;
                 }
                 return InputAction::None;
             }
             'N' | 'p' => {
+                // 'p' (and 'N') move DOWN toward newer/bottom results.
                 if let Some(vs) = self.visual_state.as_mut() {
-                    vs.prev_match();
+                    vs.next_match();
                     return InputAction::VisualMatchNav;
                 }
                 return InputAction::None;
@@ -1383,8 +1386,10 @@ impl InputHandler {
             SearchPhase::Prompt => {
                 match key.code {
                     KeyCode::Esc => {
-                        // Cancel search.
+                        // Cancel search: return to Normal and clear all
+                        // search/visual state so no highlights linger.
                         self.search_state = None;
+                        self.visual_state = None;
                         self.mode = Mode::Normal;
                         InputAction::SearchCancel
                     }
@@ -1415,8 +1420,10 @@ impl InputHandler {
             SearchPhase::Navigation => {
                 match key.code {
                     KeyCode::Esc => {
-                        // Exit search mode.
+                        // Exit search mode: return to Normal and clear all
+                        // search/visual state so no highlights linger.
                         self.search_state = None;
+                        self.visual_state = None;
                         self.mode = Mode::Normal;
                         InputAction::SearchCancel
                     }
@@ -2586,22 +2593,28 @@ mod tests {
     fn visual_mode_match_nav_keys_advance_and_report() {
         let mut handler = InputHandler::with_defaults();
         handler.enter_visual_mode(24, 100);
+        // Search lands on the bottom-most match (last index).
         if let Some(vs) = handler.visual_state.as_mut() {
             vs.search_matches = vec![(0, 0), (5, 3), (10, 7)];
-            vs.current_match = 0;
+            vs.current_match = vs.search_matches.len() - 1;
         }
-        // 'n' -> next match, returns VisualMatchNav.
+        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 2);
+        // 'n' -> move UP (decrement toward older/top), returns VisualMatchNav.
         let action = handler.handle_key(char_key('n'));
         assert_eq!(action, InputAction::VisualMatchNav);
         assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 1);
-        // 'p' -> previous match (alias for 'N').
+        // 'p' -> move DOWN (increment toward newer/bottom).
+        let action = handler.handle_key(char_key('p'));
+        assert_eq!(action, InputAction::VisualMatchNav);
+        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 2);
+        // 'p' again wraps to the top-most match (increment past the end).
         let action = handler.handle_key(char_key('p'));
         assert_eq!(action, InputAction::VisualMatchNav);
         assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 0);
-        // 'N' -> previous match (wraps).
+        // 'N' behaves like 'p' (move DOWN); wraps back to the bottom-most.
         let action = handler.handle_key(char_key('N'));
         assert_eq!(action, InputAction::VisualMatchNav);
-        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 2);
+        assert_eq!(handler.visual_state.as_ref().unwrap().current_match, 1);
     }
 
     #[test]
@@ -2613,6 +2626,35 @@ mod tests {
         assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
         assert!(handler.visual_state.is_none());
         assert!(handler.search_state.is_none());
+        assert!(!handler.pending_g);
+    }
+
+    #[test]
+    fn search_mode_escape_clears_all_state() {
+        // Escape from the Prompt phase returns to Normal and clears state.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Search;
+        handler.search_state = Some(SearchState::new());
+        let action = handler.handle_key(esc_key());
+        assert_eq!(action, InputAction::SearchCancel);
+        assert_eq!(handler.mode, Mode::Normal);
+        assert!(handler.search_state.is_none());
+        assert!(handler.visual_state.is_none());
+
+        // Escape from the Navigation phase (search->visual landing kept both
+        // states) clears search AND visual state.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Search;
+        let mut ss = SearchState::new();
+        ss.phase = SearchPhase::Navigation;
+        handler.search_state = Some(ss);
+        handler.enter_visual_mode(24, 100);
+        handler.mode = Mode::Search;
+        let action = handler.handle_key(esc_key());
+        assert_eq!(action, InputAction::SearchCancel);
+        assert_eq!(handler.mode, Mode::Normal);
+        assert!(handler.search_state.is_none());
+        assert!(handler.visual_state.is_none());
     }
 
     #[test]

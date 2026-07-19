@@ -484,6 +484,11 @@ async fn run_client_loop(
     // Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
     // Used by visual mode and search. Normal mode scrolling uses server-owned offset.
     let mut scroll_offset: usize = 0;
+    // The true server-owned viewport top (absolute index of the first visible
+    // scrollback line). Updated ONLY from server render frames, so it stays a
+    // stable coordinate for drawing search-match highlights even when
+    // `scroll_offset` is transiently repurposed by in-view visual moves.
+    let mut viewport_top: usize = 0;
     // Whether the client is currently scrolled back (server owns the actual offset).
     let mut is_scrolled: bool = false;
 
@@ -622,6 +627,16 @@ async fn run_client_loop(
                                     scroll_offset = 0;
                                     is_scrolled = false;
                                     mgr.send_foreground(ClientMessage::ScrollReset).await?;
+                                }
+                                // Returning to Normal: erase any lingering
+                                // search-match highlight / visual overlay
+                                // (mirrors SearchCancel). Not gated on
+                                // scroll/whichkey — Escape at the bottom sends no
+                                // ScrollReset, so nothing else would repaint the
+                                // highlights away.
+                                if mode == Mode::Normal {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
                                 }
                                 // When entering Visual mode, scope to the
                                 // focused pane's bounds instead of the full
@@ -794,7 +809,7 @@ async fn run_client_loop(
                                             &ss.matches,
                                             ss.current_match,
                                             query.len(),
-                                            scroll_offset,
+                                            viewport_top,
                                             focused_pane_rect.as_ref(),
                                             &theme,
                                         )?;
@@ -873,7 +888,7 @@ async fn run_client_loop(
                                                     &ss.matches,
                                                     ss.current_match,
                                                     query.len(),
-                                                    scroll_offset,
+                                                    viewport_top,
                                                     focused_pane_rect.as_ref(),
                                                     &theme,
                                                 )?;
@@ -997,7 +1012,7 @@ async fn run_client_loop(
                                         &ss.matches,
                                         ss.current_match,
                                         query.len(),
-                                        scroll_offset,
+                                        viewport_top,
                                         focused_pane_rect.as_ref(),
                                         &theme,
                                     )?;
@@ -1584,6 +1599,9 @@ async fn run_client_loop(
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
                         scroll_offset = so;
+                        // Server render is authoritative for the viewport top;
+                        // keep the dedicated highlight coordinate in sync.
+                        viewport_top = so;
                         is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
@@ -1618,7 +1636,7 @@ async fn run_client_loop(
                                 &ss.matches,
                                 ss.current_match,
                                 query.len(),
-                                scroll_offset,
+                                viewport_top,
                                 focused_pane_rect.as_ref(),
                                 &theme,
                             )?;
@@ -1654,6 +1672,9 @@ async fn run_client_loop(
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
                         scroll_offset = so;
+                        // Server render is authoritative for the viewport top;
+                        // keep the dedicated highlight coordinate in sync.
+                        viewport_top = so;
                         is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
@@ -1688,7 +1709,7 @@ async fn run_client_loop(
                                 &ss.matches,
                                 ss.current_match,
                                 query.len(),
-                                scroll_offset,
+                                viewport_top,
                                 focused_pane_rect.as_ref(),
                                 &theme,
                             )?;
@@ -1724,6 +1745,9 @@ async fn run_client_loop(
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
                         scroll_offset = so;
+                        // Server render is authoritative for the viewport top;
+                        // keep the dedicated highlight coordinate in sync.
+                        viewport_top = so;
                         is_scrolled = so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
@@ -1758,7 +1782,7 @@ async fn run_client_loop(
                                 &ss.matches,
                                 ss.current_match,
                                 query.len(),
-                                scroll_offset,
+                                viewport_top,
                                 focused_pane_rect.as_ref(),
                                 &theme,
                             )?;
@@ -1827,14 +1851,10 @@ async fn run_client_loop(
                                 ss.scrollback_line_count = lines.len();
                                 ss.matches = crate::client::input::SearchState::compute_matches(&lines, query);
 
-                                // Find the first match at or above the current view position.
-                                // scroll_offset holds viewport_top (absolute scrollback line index).
-                                let current_view_top = scroll_offset;
-
-                                // Find the closest match at or above the current view top (searching upward).
-                                let first_match_idx = ss.matches.iter()
-                                    .rposition(|&(line, _)| line <= current_view_top + pane_height);
-                                ss.current_match = first_match_idx.unwrap_or(ss.matches.len().saturating_sub(1));
+                                // Search behaves like scrollback: land on the
+                                // bottom-most (most recent) match. From there,
+                                // 'n' moves up (older) and 'p' moves down (newer).
+                                ss.current_match = ss.matches.len().saturating_sub(1);
 
                                 // Send search info to server.
                                 mgr.send_foreground(ClientMessage::SearchInfo {
