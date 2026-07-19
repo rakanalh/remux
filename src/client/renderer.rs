@@ -177,14 +177,25 @@ impl Renderer {
                 SetBackgroundColor(cell_color_to_crossterm(&change.cell.bg)),
             )?;
 
+            // Each change repositions the cursor, so there is no reliable
+            // previous-cell attribute state to diff against. Emit the attribute
+            // state absolutely (on OR explicit off) per change so a non-bold
+            // cell following a bold one renders correctly regardless of how the
+            // terminal treats the trailing ResetColor.
             if change.cell.bold {
                 queue!(stdout, SetAttribute(Attribute::Bold))?;
+            } else {
+                queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
             }
             if change.cell.italic {
                 queue!(stdout, SetAttribute(Attribute::Italic))?;
+            } else {
+                queue!(stdout, SetAttribute(Attribute::NoItalic))?;
             }
             if change.cell.underline {
                 queue!(stdout, SetAttribute(Attribute::Underlined))?;
+            } else {
+                queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
             }
 
             queue!(stdout, Print(change.cell.c), ResetColor)?;

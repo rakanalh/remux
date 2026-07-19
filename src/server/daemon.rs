@@ -780,6 +780,10 @@ async fn handle_command(
             log::debug!("server: TabNew session={session_name:?} new pane_id={pane_id}");
             spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
             start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            // Resize the new tab's panes to the drawn content area (mirrors the
+            // PaneSplit* path) so the child sees the same rows the compositor
+            // draws — otherwise the footer is clipped.
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             // Tab switch: the whole displayed content changes, so invalidate
             // all clients' baselines to force a clean full render.
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
@@ -812,6 +816,9 @@ async fn handle_command(
                 let mut st = state.lock().await;
                 st.goto_tab(&session_name, idx)?;
             }
+            // Resize the newly-active tab's panes to the drawn content area
+            // before rendering so the footer isn't clipped.
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -827,6 +834,9 @@ async fn handle_command(
                 };
                 st.goto_tab(&session_name, next)?;
             }
+            // Resize the newly-active tab's panes to the drawn content area
+            // before rendering so the footer isn't clipped.
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -846,6 +856,9 @@ async fn handle_command(
                 };
                 st.goto_tab(&session_name, prev)?;
             }
+            // Resize the newly-active tab's panes to the drawn content area
+            // before rendering so the footer isn't clipped.
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -1393,6 +1406,37 @@ async fn handle_command(
                             }
                         }
                     } else {
+                        // Closing a tab may switch the active tab. The requesting
+                        // client (session manager) is generally viewing a
+                        // different session, so its cols/rows don't apply here.
+                        // Derive the target session's dims from its own attached
+                        // clients (min, as broadcast_full_render does) and resize
+                        // the newly-active tab's panes so the footer isn't clipped.
+                        let target_dims = {
+                            let cls = clients.lock().await;
+                            let cols = cls
+                                .values()
+                                .filter(|c| c.session_name.as_deref() == Some(&target_session))
+                                .map(|c| c.cols)
+                                .min();
+                            let rows = cls
+                                .values()
+                                .filter(|c| c.session_name.as_deref() == Some(&target_session))
+                                .map(|c| c.rows)
+                                .min();
+                            cols.zip(rows)
+                        };
+                        if let Some((t_cols, t_rows)) = target_dims {
+                            resize_session_panes(
+                                &target_session,
+                                t_cols,
+                                t_rows,
+                                state,
+                                panes,
+                                config,
+                            )
+                            .await?;
+                        }
                         invalidate_session_baselines(&target_session, clients, prev_frames).await;
                         broadcast_full_render(
                             &target_session,
@@ -2592,11 +2636,15 @@ async fn send_full_render_to_client(
         let delta = scroll_offset as i64 - prev_so as i64;
         let abs_delta = delta.unsigned_abs() as usize;
 
+        // The client's render_scroll is a no-op when abs_delta >= pane_height
+        // (it expects the caller to fall back to a full repaint), so only use a
+        // ScrollRender when the delta is strictly smaller than the focused
+        // pane's content height; otherwise send a FullRender.
         let use_scroll_render = scroll_offset > 0
             && prev_so > 0
             && abs_delta > 0
             && abs_delta <= 10
-            && focused_pane_rect.is_some();
+            && focused_pane_rect.is_some_and(|r| abs_delta < r.height as usize);
 
         log::debug!(
             "server: render decision client_id={client_id} scroll_offset={scroll_offset} prev_so={prev_so} delta={delta} use_scroll_render={use_scroll_render}"
