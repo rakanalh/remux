@@ -1011,6 +1011,98 @@ fn rect_center(r: Rect) -> (f64, f64) {
     )
 }
 
+/// Find the stack containing `pane_id`, returning `(stack_len, index_within_stack)`.
+///
+/// The index is the position of `pane_id` in the stack's `panes` vector. For a
+/// focused/active pane this equals the stack's `active` index (only active panes
+/// are visible and thus focusable). Returns `None` if the pane is not present in
+/// any stack.
+pub fn stack_of(node: &LayoutNode, pane_id: PaneId) -> Option<(usize, usize)> {
+    match node {
+        LayoutNode::Stack { panes, .. } => panes
+            .iter()
+            .position(|&p| p == pane_id)
+            .map(|idx| (panes.len(), idx)),
+        LayoutNode::Split { first, second, .. } => {
+            stack_of(first, pane_id).or_else(|| stack_of(second, pane_id))
+        }
+    }
+}
+
+/// Move focus one step in `direction` from `focused`, with zellij-style
+/// stack-aware behavior.
+///
+/// When `focused` sits inside a multi-pane `Stack`:
+/// - `Left`/`Up` move to the PREVIOUS stack member if one exists, otherwise
+///   fall back to the spatial neighbor (`find_neighbor`) in that direction.
+/// - `Right`/`Down` move to the NEXT stack member if one exists, otherwise
+///   fall back to the spatial neighbor.
+///
+/// When `focused` is not in a multi-pane stack, this is a plain spatial
+/// `find_neighbor` in `direction`. Stepping within the stack mutates the
+/// stack's `active` index (the same operation as `stack_prev`/`stack_next`).
+///
+/// Returns the pane that should receive focus, or `None` if there is no pane to
+/// move to in that direction.
+pub fn focus_in_direction(
+    node: &mut LayoutNode,
+    area: Rect,
+    focused: PaneId,
+    direction: FocusDirection,
+    gap_size: u16,
+) -> Option<PaneId> {
+    if let Some((len, idx)) = stack_of(node, focused) {
+        if len > 1 {
+            match direction {
+                FocusDirection::Left | FocusDirection::Up if idx > 0 => {
+                    return node.stack_prev(focused);
+                }
+                FocusDirection::Right | FocusDirection::Down if idx < len - 1 => {
+                    return node.stack_next(focused);
+                }
+                _ => {}
+            }
+        }
+    }
+    find_neighbor(node, area, focused, direction, gap_size)
+}
+
+/// Swap the positions of two panes in the layout tree by exchanging their ids
+/// wherever they occur in a stack slot. Because pane ids are unique across the
+/// tree, each id appears in exactly one slot; after the swap the two panes trade
+/// rectangles. If one of the panes lives in a multi-pane stack, only that pane's
+/// slot is swapped (the rest of the stack is untouched). Names/custom-names stay
+/// with the slot; they auto-refresh from the running process.
+///
+/// Returns `true` if both panes were found and swapped.
+pub fn swap_panes(node: &mut LayoutNode, a: PaneId, b: PaneId) -> bool {
+    // Verify both panes exist before mutating anything, so a missing target
+    // leaves the tree untouched (the swap is atomic).
+    if a == b || !contains_pane(node, a) || !contains_pane(node, b) {
+        return false;
+    }
+    swap_panes_inner(node, a, b);
+    true
+}
+
+fn swap_panes_inner(node: &mut LayoutNode, a: PaneId, b: PaneId) {
+    match node {
+        LayoutNode::Stack { panes, .. } => {
+            for p in panes.iter_mut() {
+                if *p == a {
+                    *p = b;
+                } else if *p == b {
+                    *p = a;
+                }
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            swap_panes_inner(first, a, b);
+            swap_panes_inner(second, a, b);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Automatic layout builders
 // ---------------------------------------------------------------------------
@@ -1878,5 +1970,144 @@ mod tests {
         let bsp_tree = BspLayout.build_tree(&panes, 1);
         // Both should produce the same active pane set
         assert_eq!(active_pane_ids(&custom_tree), active_pane_ids(&bsp_tree));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stack-aware directional focus (zellij behavior) + pane swap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stack_of() {
+        // | P1 | Stack[P2 | P3] | with P3 active.
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.add_to_stack(2, 3);
+        // P1 is a lone stack.
+        assert_eq!(stack_of(&node, 1), Some((1, 0)));
+        // P2 is index 0 of the 2-pane stack, P3 is index 1.
+        assert_eq!(stack_of(&node, 2), Some((2, 0)));
+        assert_eq!(stack_of(&node, 3), Some((2, 1)));
+        // Unknown pane.
+        assert_eq!(stack_of(&node, 99), None);
+    }
+
+    #[test]
+    fn test_focus_in_direction_stack_aware_left() {
+        // | P1 | Stack[P2 | P3] | with P3 active/focused.
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.add_to_stack(2, 3); // stack [2, 3], active -> pane 3
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+
+        // Focused on P3 (last stack member): Left steps to the PREVIOUS member P2.
+        let f = focus_in_direction(&mut node, area, 3, FocusDirection::Left, 0);
+        assert_eq!(f, Some(2));
+
+        // Now focused on P2 (first stack member): Left exhausts the stack and
+        // falls back to the spatial neighbor P1.
+        let f = focus_in_direction(&mut node, area, 2, FocusDirection::Left, 0);
+        assert_eq!(f, Some(1));
+    }
+
+    #[test]
+    fn test_focus_in_direction_stack_aware_right() {
+        // | P1 | Stack[P2 | P3] | with P2 active/focused.
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.add_to_stack(2, 3);
+        node.stack_prev(3); // make P2 active
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+
+        // Focused on P2 (first stack member): Right steps to the NEXT member P3.
+        let f = focus_in_direction(&mut node, area, 2, FocusDirection::Right, 0);
+        assert_eq!(f, Some(3));
+
+        // Now focused on P3 (last stack member): Right exhausts the stack and,
+        // with no spatial neighbor to the right, returns None.
+        let f = focus_in_direction(&mut node, area, 3, FocusDirection::Right, 0);
+        assert_eq!(f, None);
+    }
+
+    #[test]
+    fn test_focus_in_direction_non_stack_is_spatial() {
+        // | P1 | P2 | — no multi-pane stack, plain spatial navigation.
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        assert_eq!(
+            focus_in_direction(&mut node, area, 1, FocusDirection::Right, 0),
+            Some(2)
+        );
+        assert_eq!(
+            focus_in_direction(&mut node, area, 2, FocusDirection::Left, 0),
+            Some(1)
+        );
+        assert_eq!(
+            focus_in_direction(&mut node, area, 1, FocusDirection::Left, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn test_swap_panes_exchanges_positions() {
+        // | P1 | P2 | — P1 on the left, P2 on the right.
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+
+        let rects = compute_layout(&node, area, 0);
+        assert_eq!(rects.iter().find(|(id, _)| *id == 1).unwrap().1.x, 0);
+        assert_eq!(rects.iter().find(|(id, _)| *id == 2).unwrap().1.x, 40);
+
+        assert!(swap_panes(&mut node, 1, 2));
+
+        // After the swap the ids trade slots: P2 on the left, P1 on the right.
+        let rects = compute_layout(&node, area, 0);
+        assert_eq!(rects.iter().find(|(id, _)| *id == 2).unwrap().1.x, 0);
+        assert_eq!(rects.iter().find(|(id, _)| *id == 1).unwrap().1.x, 40);
+    }
+
+    #[test]
+    fn test_swap_panes_not_found_or_identical() {
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        // Target does not exist -> no swap.
+        assert!(!swap_panes(&mut node, 1, 99));
+        // Same pane -> no swap.
+        assert!(!swap_panes(&mut node, 1, 1));
+        // Layout unchanged.
+        assert_eq!(all_pane_ids(&node), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_swap_panes_into_stack_member() {
+        // | P1 | Stack[P2 | P3] | ; swap P1 with stack member P3.
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.add_to_stack(2, 3); // stack [2, 3]
+        assert!(swap_panes(&mut node, 1, 3));
+        // The lone left leaf now holds P3; the stack holds [2, 1].
+        assert_eq!(find_stack_for_pane(&node, 3), Some(vec![3]));
+        assert_eq!(find_stack_for_pane(&node, 1), Some(vec![2, 1]));
     }
 }

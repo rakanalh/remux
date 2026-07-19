@@ -1019,12 +1019,64 @@ async fn handle_command(
                     width: cols,
                     height: rows.saturating_sub(1),
                 };
+                // Stack-aware directional focus (zellij behavior): step within a
+                // multi-pane stack first, else fall back to the spatial neighbor.
+                if let Some(target) = layout::focus_in_direction(
+                    &mut tab.layout,
+                    area,
+                    tab.focused_pane,
+                    direction,
+                    0,
+                ) {
+                    tab.focused_pane = target;
+                }
+            }
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneMoveLeft
+        | RemuxCommand::PaneMoveRight
+        | RemuxCommand::PaneMoveUp
+        | RemuxCommand::PaneMoveDown => {
+            let direction = match cmd {
+                RemuxCommand::PaneMoveLeft => layout::FocusDirection::Left,
+                RemuxCommand::PaneMoveRight => layout::FocusDirection::Right,
+                RemuxCommand::PaneMoveUp => layout::FocusDirection::Up,
+                RemuxCommand::PaneMoveDown => layout::FocusDirection::Down,
+                _ => unreachable!(),
+            };
+            log::debug!("server: PaneMove direction={direction:?}");
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: cols,
+                    height: rows.saturating_sub(1),
+                };
+                // Swap the focused pane with its spatial neighbor in `direction`.
+                // Focus stays on the moved pane (its id is unchanged; only its
+                // slot in the tree changes).
                 if let Some(neighbor) =
                     layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction, 0)
                 {
-                    tab.focused_pane = neighbor;
+                    if layout::swap_panes(&mut tab.layout, tab.focused_pane, neighbor)
+                        && tab.layout_mode.is_automatic()
+                    {
+                        // A manual move ejects to Custom so an automatic rebuild
+                        // from `pane_order` doesn't revert the swap.
+                        tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                    }
                 }
             }
+            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackAdd => {
