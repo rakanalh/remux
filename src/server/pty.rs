@@ -121,12 +121,27 @@ impl Pty {
 
                 let c_shell = std::ffi::CString::new(shell.as_str()).expect("CString::new failed");
 
+                // Spawn the shell as a LOGIN shell. By convention, a shell
+                // treats itself as a login shell when its argv[0] begins with a
+                // leading dash (e.g. "-zsh"). This is what tmux/screen and
+                // login(1) do, and it ensures login-only init files such as
+                // ~/.zprofile, ~/.zlogin and ~/.bash_profile are sourced.
+                // We still exec the real binary at `c_shell`, but present its
+                // argv[0] as "-<basename>".
+                let shell_basename = std::path::Path::new(&shell)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(shell.as_str());
+                let login_argv0 = format!("-{shell_basename}");
+                let c_argv0 =
+                    std::ffi::CString::new(login_argv0.as_str()).expect("CString::new failed");
+
                 // exec the shell. On success this does not return.
                 // On failure, expect() panics (which is appropriate for a
                 // post-fork child process).
                 #[allow(unreachable_code)]
                 {
-                    unistd::execvp(&c_shell, &[&c_shell]).expect("execvp failed");
+                    unistd::execvp(&c_shell, &[&c_argv0]).expect("execvp failed");
                     // SAFETY: execvp either succeeds (never returns) or expect()
                     // panics. This line is unreachable but satisfies the type
                     // checker.
@@ -436,5 +451,62 @@ mod tests {
 
         pty.write_input(b"exit\n").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn spawns_login_shell() {
+        // A login shell has an argv[0] that begins with a leading dash, so
+        // `$0` inside the shell reports "-sh" rather than "/bin/sh" or "sh".
+        // The sentinel is split across a shell string concatenation
+        // ("AR""GV0=") so the assembled token "ARGV0=" appears only in the
+        // shell's actual output, never in the (terminal-echoed) command line.
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let raw_fd = pty.master_fd.as_raw_fd();
+
+        let (_handle, mut rx) = start_reader(raw_fd);
+
+        pty.write_input(b"echo \"AR\"\"GV0=$0\"\n")
+            .expect("write failed");
+
+        let mut collected = Vec::new();
+        let mut argv0: Option<String> = None;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                data = rx.recv() => {
+                    match data {
+                        Some(d) => {
+                            collected.extend_from_slice(&d);
+                            let output = String::from_utf8_lossy(&collected);
+                            if let Some(start) = output.find("ARGV0=") {
+                                let rest = &output[start + "ARGV0=".len()..];
+                                if let Some(end) = rest.find(['\r', '\n']) {
+                                    argv0 = Some(rest[..end].to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = &mut timeout => break,
+            }
+        }
+
+        pty.write_input(b"exit\n").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let argv0 = argv0.unwrap_or_else(|| {
+            panic!(
+                "did not observe $0 output; got: {}",
+                String::from_utf8_lossy(&collected)
+            )
+        });
+        assert!(
+            argv0.starts_with('-'),
+            "expected a login shell (argv[0] beginning with '-'), got $0={argv0:?}"
+        );
     }
 }
