@@ -2862,6 +2862,62 @@ mod tests {
         assert_eq!(vs.scroll_offset, 0);
     }
 
+    // Mirrors the VisualScroll delta computation in `run_client_loop`: the
+    // ScrollDelta sent to the server is the CHANGE in `vs.scroll_offset`
+    // (lines-from-bottom) against the baseline captured on entry / last move.
+    fn visual_scroll_delta(new_offset: usize, last_offset: usize) -> i32 {
+        new_offset as i32 - last_offset as i32
+    }
+
+    #[test]
+    fn visual_scroll_delta_zero_for_in_view_move_off_screen_landing() {
+        // Reproduces the off-screen search-landing bug: land deep in scrollback
+        // (large offset), then move the cursor while it stays within the visible
+        // pane. `scroll_offset` must not change, so the emitted delta is 0 (no
+        // ScrollDelta -> no viewport jump).
+        let mut vs = VisualState::new(24, 10_000);
+        // Simulate a landing deep in scrollback with the cursor mid-pane.
+        vs.scroll_offset = 5_000;
+        vs.cursor_row = 12; // not at an edge -> move stays in view
+        let baseline = vs.scroll_offset; // last_visual_scroll captured at landing
+
+        vs.cursor_up(); // in-view move: only cursor_row changes
+        assert_eq!(vs.scroll_offset, 5_000, "in-view move must not scroll");
+        assert_eq!(visual_scroll_delta(vs.scroll_offset, baseline), 0);
+
+        vs.cursor_down(); // still in view
+        assert_eq!(vs.scroll_offset, 5_000);
+        assert_eq!(visual_scroll_delta(vs.scroll_offset, baseline), 0);
+    }
+
+    #[test]
+    fn visual_scroll_delta_positive_when_moving_up_past_top() {
+        // At the top edge, cursor_up scrolls the view one line further back.
+        // vs.scroll_offset increases -> positive delta == ScrollDelta up/back.
+        let mut vs = VisualState::new(24, 10_000);
+        vs.scroll_offset = 5_000;
+        vs.cursor_row = 0; // at the top edge
+        let baseline = vs.scroll_offset;
+
+        vs.cursor_up(); // pushes the view up by one line
+        assert_eq!(vs.scroll_offset, 5_001);
+        assert_eq!(visual_scroll_delta(vs.scroll_offset, baseline), 1);
+    }
+
+    #[test]
+    fn visual_scroll_delta_negative_when_moving_down_past_bottom() {
+        // At the bottom edge, cursor_down scrolls the view forward one line.
+        // vs.scroll_offset decreases -> negative delta == ScrollDelta down/forward.
+        let mut vs = VisualState::new(24, 10_000);
+        vs.scroll_offset = 5_000;
+        vs.cursor_row = vs.visible_rows - 1; // at the bottom edge
+        let baseline = vs.scroll_offset;
+
+        vs.cursor_down();
+        assert_eq!(vs.scroll_offset, 4_999);
+        assert_eq!(visual_scroll_delta(vs.scroll_offset, baseline), -1);
+    }
+
     #[test]
     fn visual_state_search_match_navigation() {
         let mut vs = VisualState::new(24, 100);

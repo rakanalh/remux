@@ -495,6 +495,13 @@ async fn run_client_loop(
     let mut viewport_top: usize = 0;
     // Whether the client is currently scrolled back (server owns the actual offset).
     let mut is_scrolled: bool = false;
+    // Baseline for computing VisualScroll deltas, in VisualState's own units
+    // (lines-from-bottom). Re-synced to `vs.scroll_offset` at every point the
+    // visual view moves without a VisualScroll delta being emitted: every visual
+    // entry (keybinding, palette command, search landing) and mouse-wheel scroll.
+    // The delta sent to the server is the CHANGE in this value, so an in-view
+    // cursor move (which leaves `vs.scroll_offset` unchanged) yields delta 0.
+    let mut last_visual_scroll: usize = 0;
 
     // The last local session we attached to; the fallback target if a
     // foreground-remote connection drops. Seeded from the pre-loop attach.
@@ -576,6 +583,15 @@ async fn run_client_loop(
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
+                                // A palette command may have just entered Visual mode
+                                // (e.g. `:visual`). Baseline the delta tracker to the
+                                // fresh state so a stale value from a prior visual
+                                // session can't produce a bogus first-move scroll.
+                                if input.mode == Mode::Visual {
+                                    if let Some(ref vs) = input.visual_state {
+                                        last_visual_scroll = vs.scroll_offset;
+                                    }
+                                }
                             }
                             InputAction::ExecuteChain(cmds) => {
                                 log::debug!("input: ExecuteChain count={} cmds={:?}", cmds.len(), cmds);
@@ -609,6 +625,14 @@ async fn run_client_loop(
                                         mode: mode_str.to_string(),
                                     })
                                     .await?;
+                                // A chained command may have just entered Visual mode.
+                                // Baseline the delta tracker to the fresh state (see the
+                                // Execute arm above).
+                                if input.mode == Mode::Visual {
+                                    if let Some(ref vs) = input.visual_state {
+                                        last_visual_scroll = vs.scroll_offset;
+                                    }
+                                }
                             }
                             InputAction::ModeChanged(mode) => {
                                 log::debug!("input: ModeChanged to {:?}", mode);
@@ -675,6 +699,12 @@ async fn run_client_loop(
                                         if vs.total_lines < vs.visible_rows {
                                             vs.total_lines = vs.visible_rows;
                                         }
+                                    }
+                                    // Baseline the VisualScroll delta tracker to this
+                                    // fresh state (scroll_offset 0 at the bottom) so the
+                                    // first cursor move measures from the right origin.
+                                    if let Some(ref vs) = input.visual_state {
+                                        last_visual_scroll = vs.scroll_offset;
                                     }
                                     // Request scrollback info to get accurate total_lines.
                                     mgr.send_foreground(ClientMessage::RequestScrollbackInfo).await?;
@@ -809,10 +839,16 @@ async fn run_client_loop(
                             InputAction::VisualScroll { .. } => {
                                 // Send scroll delta to server so compositor renders scrollback.
                                 if let Some(ref vs) = input.visual_state {
-                                    log::debug!("input: VisualScroll offset={} delta from old={}", vs.scroll_offset, scroll_offset);
-                                    let old = scroll_offset;
-                                    scroll_offset = vs.scroll_offset;
-                                    let delta = scroll_offset as i32 - old as i32;
+                                    // Delta is the CHANGE in vs.scroll_offset (its own
+                                    // lines-from-bottom units), measured against the
+                                    // baseline set when the visual view last moved.
+                                    // vs.scroll_offset increasing = scrolling up/back,
+                                    // which matches ScrollDelta's positive = up/back.
+                                    // An in-view cursor move leaves vs.scroll_offset
+                                    // unchanged, so delta == 0 and nothing is sent.
+                                    let delta = vs.scroll_offset as i32 - last_visual_scroll as i32;
+                                    log::debug!("input: VisualScroll offset={} last={} delta={}", vs.scroll_offset, last_visual_scroll, delta);
+                                    last_visual_scroll = vs.scroll_offset;
                                     if delta != 0 {
                                         mgr.send_foreground(ClientMessage::ScrollDelta { delta }).await?;
                                     }
@@ -1472,6 +1508,10 @@ async fn run_client_loop(
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_up(3);
                                         scroll_offset = vs.scroll_offset;
+                                        // Keep the VisualScroll delta baseline in sync so
+                                        // a following cursor-move key doesn't re-send this
+                                        // wheel scroll as a bogus delta.
+                                        last_visual_scroll = vs.scroll_offset;
                                     }
                                 } else {
                                     // Server decides: forward to the app (mouse/alt screen)
@@ -1493,6 +1533,10 @@ async fn run_client_loop(
                                     if let Some(ref mut vs) = input.visual_state {
                                         vs.scroll_down(3);
                                         scroll_offset = vs.scroll_offset;
+                                        // Keep the VisualScroll delta baseline in sync so
+                                        // a following cursor-move key doesn't re-send this
+                                        // wheel scroll as a bogus delta.
+                                        last_visual_scroll = vs.scroll_offset;
                                     }
                                 } else {
                                     // Server decides: forward to the app (mouse/alt screen)
@@ -1983,6 +2027,12 @@ async fn run_client_loop(
                                 .min(vs.visible_rows.saturating_sub(1));
                             vs.cursor_col = match_col.min(vs.visible_cols.saturating_sub(1));
                             input.visual_state = Some(vs);
+                            // Baseline the VisualScroll delta tracker to the landing
+                            // position so the first cursor move (in view) yields delta 0
+                            // instead of a bogus jump. This is the off-screen-match fix.
+                            if let Some(ref vs) = input.visual_state {
+                                last_visual_scroll = vs.scroll_offset;
+                            }
                             input.mode = Mode::Visual;
                             // Notify the server (also triggers a fresh frame that
                             // repaints the visual overlay at the match).
