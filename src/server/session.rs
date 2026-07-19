@@ -1174,4 +1174,45 @@ mod tests {
         // First tab should have pane with name "zsh"
         assert_eq!(unfiled[0].tabs[0].panes[0].name, "zsh");
     }
+
+    #[test]
+    fn test_build_session_tree_custom_pane_name_wins() {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+
+        // Identify the first pane and give it a user-set custom name (as PaneRename does).
+        let pane_id = {
+            let sess = state.sessions.get_mut("s").unwrap();
+            let tab = &mut sess.tabs[0];
+            let pane_id = layout::all_pane_ids(&tab.layout)[0];
+            assert!(layout::set_pane_custom_name(
+                &mut tab.layout,
+                pane_id,
+                "XYZZY"
+            ));
+            pane_id
+        };
+
+        // Simulate the daemon: start from the auto-detected process name, then
+        // apply the custom-name override (mirrors handle_list_session_tree).
+        let counts = HashMap::new();
+        let mut pane_names = HashMap::new();
+        pane_names.insert(pane_id, "zsh".to_string());
+        for sess in state.sessions.values() {
+            for tab in &sess.tabs {
+                for pid in layout::all_pane_ids(&tab.layout) {
+                    if let Some(Some(custom)) = layout::get_pane_custom_name(&tab.layout, pid) {
+                        pane_names.insert(pid, custom);
+                    }
+                }
+            }
+        }
+
+        let (_, unfiled) = state.build_session_tree(None, &counts, &pane_names);
+        assert_eq!(unfiled.len(), 1);
+        // The custom name must win over the auto-detected process name.
+        assert_eq!(unfiled[0].tabs[0].panes[0].name, "XYZZY");
+    }
 }

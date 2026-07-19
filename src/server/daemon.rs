@@ -1660,6 +1660,18 @@ async fn handle_list_session_tree(
         pane_names.insert(pid, name);
     }
 
+    // A user-set custom pane name (PaneRename) takes precedence over the
+    // auto-detected process name, matching what the pane border shows.
+    for sess in st.sessions.values() {
+        for tab in &sess.tabs {
+            for pane_id in layout::all_pane_ids(&tab.layout) {
+                if let Some(Some(custom)) = layout::get_pane_custom_name(&tab.layout, pane_id) {
+                    pane_names.insert(pane_id, custom);
+                }
+            }
+        }
+    }
+
     let (folders, unfiled) =
         st.build_session_tree(current_session.as_deref(), &client_counts, &pane_names);
 
