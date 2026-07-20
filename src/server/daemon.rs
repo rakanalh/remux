@@ -1134,6 +1134,8 @@ async fn handle_command(
             close_pane(
                 closed_pane,
                 &session_name,
+                cols,
+                rows,
                 state,
                 panes,
                 clients,
@@ -3462,6 +3464,8 @@ fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellC
 async fn close_pane(
     pane_id: PaneId,
     session_name: &str,
+    cols: u16,
+    rows: u16,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -3536,6 +3540,7 @@ async fn close_pane(
     }
     match action {
         CloseAction::Broadcast => {
+            let _ = resize_session_panes(session_name, cols, rows, state, panes, config).await;
             broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::SwitchSession(ref next) => {
@@ -3551,6 +3556,7 @@ async fn close_pane(
             // Clients now display a different session; invalidate their
             // baselines (from the old session) so they get a clean full render.
             invalidate_session_baselines(next, clients, prev_frames).await;
+            let _ = resize_session_panes(next, cols, rows, state, panes, config).await;
             broadcast_full_render(next, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::Disconnect => {
@@ -3692,9 +3698,12 @@ async fn start_pty_forwarding(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name:?}"
                         );
                         // Close the pane automatically.
+                        let (cols, rows) = session_render_size(&session_name, &clients).await;
                         close_pane(
                             pane_id,
                             &session_name,
+                            cols,
+                            rows,
                             &state,
                             &panes,
                             &clients,
@@ -3933,9 +3942,12 @@ async fn materialize_session(
                         .await;
                     }
                     Some(Err(())) => {
+                        let (cols, rows) = session_render_size(&session_name, &clients).await;
                         close_pane(
                             pane_id,
                             &session_name,
+                            cols,
+                            rows,
                             &state,
                             &panes,
                             &clients,
