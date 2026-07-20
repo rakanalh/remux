@@ -1,54 +1,84 @@
 # =============================================================================
-# Remux Configuration
+# Remux Configuration — Complete Reference
 # =============================================================================
 # Place this file at ~/.config/remux/config.toml
-# All values below show their defaults. Uncomment and modify as needed.
+#
+# EVERY option below is shown COMMENTED OUT set to its DEFAULT value. This file
+# is therefore a complete reference: copying it verbatim yields exactly the
+# built-in defaults. Uncomment and edit any line to override that default.
+#
+# When you uncomment options, keep TOML ordering in mind: a table's own flat
+# keys must appear BEFORE any of its sub-table headers. This file is already
+# laid out in a valid order, so uncomment lines in place.
 
 # -----------------------------------------------------------------------------
-# General
+# GENERAL
 # -----------------------------------------------------------------------------
+# [general]
 
-[general]
-# Override the default login shell. Uses $SHELL if not set.
+# Override the default login shell. Uses the $SHELL environment variable if
+# not set (default: unset).
 # default_shell = "/bin/zsh"
 
-# Maximum number of scrollback lines per pane.
-scrollback_lines = 10000
+# Maximum number of scrollback lines kept per pane (default: 10000).
+# scrollback_lines = 10000
 
-# Automatically save and restore sessions across server restarts.
-# State is saved after every structural change and restored on startup.
-automatic_restore = true
+# Whether the server persists session state to disk. When true (default),
+# state is written after every structural change and on shutdown. When false,
+# nothing is ever written to disk and `automatic_restore` is ignored
+# (default: true).
+# save_sessions = true
 
-# When true (default), mouse text selection auto-copies to clipboard on release
-# and clears the selection. When false, selection stays visible for keyboard
-# adjustment in Visual mode.
-mouse_auto_yank = true
+# How persisted sessions are brought back on startup (only relevant when
+# `save_sessions = true`). When true (default), persisted sessions are restored
+# live automatically. When false, they are loaded as dormant/resurrectable
+# entries instead and can be materialized on demand from the session manager.
+# Ignored entirely when `save_sessions = false` (default: true).
+# automatic_restore = true
+
+# When true (default), mouse text selection auto-copies to the clipboard on
+# release and clears the selection. When false, the selection stays visible for
+# keyboard adjustment in Visual mode (default: true).
+# mouse_auto_yank = true
 
 # -----------------------------------------------------------------------------
-# Appearance
+# APPEARANCE
 # -----------------------------------------------------------------------------
+# [appearance]
 
-[appearance]
-# Where the status bar is placed: "top" or "bottom".
-status_bar_position = "bottom"
+# Where the status bar is placed: "top" | "bottom" (default: "bottom").
+# status_bar_position = "bottom"
 
-# Pane border rendering style: "zellij_style" (borders, pane names) or "tmux_style" (minimal dividers).
-border_style = "zellij_style"
+# Pane border rendering style: "zellij_style" (borders with pane names) |
+# "tmux_style" (minimal dividers) (default: "zellij_style").
+# border_style = "zellij_style"
 
-# Default layout mode for new tabs: "bsp", "master", "monocle", or "custom"
+# Default layout mode for new tabs: "bsp" | "master" | "monocle" | "custom"
+# (default: "bsp").
 # default_layout = "bsp"
 
-# Theme colors. Values can be:
-#   - A named color string: "black", "red", "green", "yellow", "blue", "magenta",
-#     "cyan", "white", "dark_grey", "bright_red", "bright_green", "bright_blue",
-#     "bright_magenta", "bright_cyan", "reset"
+# Which-key popup placement: "anchored" (bordered box centered horizontally,
+# anchored to the bottom) | "centered" (bordered box centered both axes) |
+# "full_width" (emacs/ivy-like panel spanning the full width, above the status
+# bar row) (default: "anchored").
+# which_key_position = "anchored"
+
+# -----------------------------------------------------------------------------
+# APPEARANCE - THEME
+# -----------------------------------------------------------------------------
+# Theme colors. Each value can be one of:
+#   - A named color: "black", "red", "green", "yellow", "blue", "magenta",
+#     "cyan", "white", "dark_grey", "bright_red", "bright_green",
+#     "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan",
+#     "bright_white", "reset"
 #   - A CSS hex color: "#f5e0dc", "#CBA6F7" (6-digit, case-insensitive)
 #   - An ANSI 256-color index: { ansi = 235 }
 #   - An RGB color: { rgb = [255, 128, 0] }
 #
-# The default theme uses Catppuccin Mocha colors. To customize:
-#
+# The defaults below are the Catppuccin Mocha palette.
 # [appearance.theme]
+
+# Mode indicators (foreground / background per mode):
 # mode_normal_fg = "#1e1e2e"
 # mode_normal_bg = "#a6e3a1"
 # mode_command_fg = "#1e1e2e"
@@ -57,33 +87,46 @@ border_style = "zellij_style"
 # mode_visual_bg = "#cba6f7"
 # mode_search_fg = "#1e1e2e"
 # mode_search_bg = "#f9e2af"
+
+# Pane frame:
 # frame_fg = "#585b70"
 # frame_bg = "#1e1e2e"
 # frame_active_fg = "#89b4fa"
+
+# Status bar:
 # status_bar_fg = "#a6adc8"
 # status_bar_bg = "#181825"
+
+# Tab bar:
 # tab_active_fg = "#1e1e2e"
 # tab_active_bg = "#89b4fa"
 # tab_inactive_fg = "#9399b2"
+
+# Which-key popup:
 # whichkey_fg = "#cdd6f4"
 # whichkey_bg = "#181825"
 # whichkey_key_fg = "#a6e3a1"
+
+# Separators and labels:
 # separator_fg = "#6c7086"
 # pane_label_fg = "#cdd6f4"
 # pane_label_bg = "#1e1e2e"
 # session_name_fg = "#94e2d5"
+
+# Search highlight colors (all matches vs. the current match):
 # search_match_fg = "#1e1e2e"
 # search_match_bg = "#585b70"
 # search_current_fg = "#1e1e2e"
 # search_current_bg = "#fab387"
 
 # -----------------------------------------------------------------------------
-# Modes
+# MODES - COMMAND
 # -----------------------------------------------------------------------------
+# [modes.command]
 
-[modes.command]
-# Timeout in milliseconds before the which-key popup appears.
-timeout_ms = 500
+# Delay in milliseconds before the which-key popup appears after pressing the
+# leader key (default: 500).
+# timeout_ms = 500
 
 # -----------------------------------------------------------------------------
 # Keybindings — Command Mode
@@ -92,17 +135,17 @@ timeout_ms = 500
 # mode, keys navigate a tree of bindings. Press a group key (e.g. "t") to see
 # available sub-keys in the which-key popup, then press a sub-key to execute.
 #
-# All other keys pass through to the inner terminal application (Normal).
+# All other keys pass through to the inner terminal application (Normal mode).
 # Press Escape in Command mode to return to Normal.
 #
-# Action chains: Use semicolons to chain multiple actions on a single binding.
-# If the chain includes "EnterNormal", you return to Normal after
-# execution. Otherwise, you stay in Command mode for further commands.
+# Action chains: use semicolons to chain multiple actions on a single binding.
+# If the chain includes "EnterNormal", you return to Normal after execution;
+# otherwise you stay in Command mode for further commands.
 #
 # Examples:
-#   n = "TabNew; EnterNormal"     — Create tab and return to normal
-#   n = "PaneNew"                      — Create pane and stay in command mode
-#   n = "PaneNew; ResizeRight 10"      — Create pane, resize, stay in command mode
+#   n = "TabNew; EnterNormal"          — create tab and return to Normal
+#   n = "PaneNew"                       — create pane and stay in Command mode
+#   n = "PaneNew; ResizeRight 10"       — create pane, resize, stay in Command mode
 #
 # To override a default binding, redefine it here. User bindings merge on top
 # of defaults — only the keys you specify are changed.
@@ -110,34 +153,39 @@ timeout_ms = 500
 # To remove a default binding, set it to an empty string:
 #   v = ""
 #
-# Commands use PascalCase names matching RemuxCommand variants.
-# Arguments are space-separated. Quote strings with spaces: "SessionNew \"my project\""
-
-# Leader key (default: Ctrl-a). Double-tap sends the raw key to the terminal.
-leader = "Ctrl-a"
-
-# --- Modifier shortcuts (Normal mode) ---
-# These modifier-based shortcuts are checked in Normal mode before keys are
-# forwarded to the terminal. They provide quick access to common operations
-# without pressing the leader key first.
+# Commands use PascalCase names matching RemuxCommand variants (see the
+# "Available Commands Reference" at the bottom of this file). Arguments are
+# space-separated; quote arguments containing spaces: SessionNew "my project".
 #
-# Keys MUST include a modifier (Alt, Ctrl, etc.) — plain character keys go
-# through the leader key tree instead.
+# NOTE: `[keybindings.normal]` is accepted as a DEPRECATED alias for
+# `[keybindings.command]` (it logs a warning). Use `[keybindings.command]`.
+#
+# The `[keybindings.command]` table below holds the flat keys (`leader` and the
+# modifier shortcuts) and MUST appear before the group sub-tables
+# (`[keybindings.command.p]`, `.t`, ...).
+# [keybindings.command]
+
+# Leader key that enters Command mode (default: "Ctrl-a"). Double-tapping it
+# sends the raw key through to the terminal (see the `a` binding below).
+# leader = "Ctrl-a"
+
+# --- Modifier shortcuts (checked in Normal mode) ---
+# These modifier-based shortcuts are checked in Normal mode BEFORE keys are
+# forwarded to the terminal, giving quick access to common operations without
+# first pressing the leader key.
+#
+# Keys MUST include a modifier (Alt, Ctrl, ...) — plain character keys are
+# reserved for the leader-key tree and are rejected here.
 #
 # Values can be:
 #   - A command string:       "Alt-h" = "PaneFocusLeft"
 #   - An action chain:        "Alt-x" = "PaneNew; PaneFocusRight"
 #   - A group prefix (@key):  "Alt-p" = "@p"  (opens the Pane which-key group)
 #
-# Group prefixes enter Command mode at the specified keybinding tree group,
-# showing the which-key popup for that group immediately.
+# The default Alt shortcuts are listed below (commented out = active by
+# default). Uncomment and edit any line to change it, or set it to an empty
+# string to remove a default shortcut, e.g.:  "Alt-h" = ""
 #
-# The default Alt shortcuts are listed below (commented out — they are active
-# by default). Uncomment and edit any line to change it, or set it to an empty
-# string to remove a default shortcut:
-#   "Alt-h" = ""
-#
-# --- Default Alt shortcuts ---
 # Focus panes directionally:
 # "Alt-h" = "PaneFocusLeft"
 # "Alt-j" = "PaneFocusDown"
@@ -169,92 +217,96 @@ leader = "Ctrl-a"
 # --- Command-mode leader tree (defaults) ---
 # The tables below mirror the built-in leader (Ctrl-a) tree. They are shown for
 # reference; user bindings merge on top of the defaults, so you only need to
-# redefine the keys you want to change.
+# redefine the keys you want to change. `_label` sets the which-key group name.
 
 # --- Pane (p) ---
-[keybindings.command.p]
-_label = "Pane"
-n = "PaneNew; EnterNormal"
-x = "PaneClose; EnterNormal"
-s = "PaneSplitVertical; EnterNormal"
-S = "PaneSplitHorizontal; EnterNormal"
-h = "PaneFocusLeft; EnterNormal"
-j = "PaneFocusDown; EnterNormal"
-k = "PaneFocusUp; EnterNormal"
-l = "PaneFocusRight; EnterNormal"
-H = "PaneMoveLeft; EnterNormal"
-J = "PaneMoveDown; EnterNormal"
-K = "PaneMoveUp; EnterNormal"
-L = "PaneMoveRight; EnterNormal"
-z = "PaneToggleZoom; EnterNormal"
-r = "PaneRename"
-a = "PaneStackAdd; EnterNormal"
-"]" = "PaneStackNext; EnterNormal"
-"[" = "PaneStackPrev; EnterNormal"
+# [keybindings.command.p]
+# _label = "Pane"
+# n = "PaneNew; EnterNormal"
+# x = "PaneClose; EnterNormal"
+# s = "PaneSplitVertical; EnterNormal"
+# S = "PaneSplitHorizontal; EnterNormal"
+# h = "PaneFocusLeft; EnterNormal"
+# j = "PaneFocusDown; EnterNormal"
+# k = "PaneFocusUp; EnterNormal"
+# l = "PaneFocusRight; EnterNormal"
+# H = "PaneMoveLeft; EnterNormal"
+# J = "PaneMoveDown; EnterNormal"
+# K = "PaneMoveUp; EnterNormal"
+# L = "PaneMoveRight; EnterNormal"
+# z = "PaneToggleZoom; EnterNormal"
+# r = "PaneRename"
+# a = "PaneStackAdd; EnterNormal"
+# "]" = "PaneStackNext; EnterNormal"
+# "[" = "PaneStackPrev; EnterNormal"
 
-# --- Resize (p → R) ---
-[keybindings.command.p.R]
-_label = "Resize"
-h = "ResizeLeft 5"
-j = "ResizeDown 5"
-k = "ResizeUp 5"
-l = "ResizeRight 5"
+# --- Resize (p -> R) ---
+# [keybindings.command.p.R]
+# _label = "Resize"
+# h = "ResizeLeft 5"
+# j = "ResizeDown 5"
+# k = "ResizeUp 5"
+# l = "ResizeRight 5"
 
 # --- Tab (t) ---
-[keybindings.command.t]
-_label = "Tab"
-n = "TabNew; EnterNormal"
-x = "TabClose; EnterNormal"
-r = "TabRename"
-"]" = "TabNext; EnterNormal"
-"[" = "TabPrev; EnterNormal"
-m = "TabMove"
-"1" = "TabGoto 0; EnterNormal"
-"2" = "TabGoto 1; EnterNormal"
-"3" = "TabGoto 2; EnterNormal"
-"4" = "TabGoto 3; EnterNormal"
-"5" = "TabGoto 4; EnterNormal"
-"6" = "TabGoto 5; EnterNormal"
-"7" = "TabGoto 6; EnterNormal"
-"8" = "TabGoto 7; EnterNormal"
-"9" = "TabGoto 8; EnterNormal"
+# [keybindings.command.t]
+# _label = "Tab"
+# n = "TabNew; EnterNormal"
+# x = "TabClose; EnterNormal"
+# r = "TabRename"
+# "]" = "TabNext; EnterNormal"
+# "[" = "TabPrev; EnterNormal"
+# m = "TabMove"
+# "1" = "TabGoto 0; EnterNormal"
+# "2" = "TabGoto 1; EnterNormal"
+# "3" = "TabGoto 2; EnterNormal"
+# "4" = "TabGoto 3; EnterNormal"
+# "5" = "TabGoto 4; EnterNormal"
+# "6" = "TabGoto 5; EnterNormal"
+# "7" = "TabGoto 6; EnterNormal"
+# "8" = "TabGoto 7; EnterNormal"
+# "9" = "TabGoto 8; EnterNormal"
 
 # --- Session (x) ---
-[keybindings.command.x]
-_label = "Session"
-s = "SessionQuickSwitch"
-n = "SessionNew"
-r = "SessionRename"
-d = "SessionDetach"
-m = "OpenSessionManager"
-f = "SessionMoveToFolder"
+# [keybindings.command.x]
+# _label = "Session"
+# s = "SessionQuickSwitch"
+# n = "SessionNew"
+# r = "SessionRename"
+# d = "SessionDetach"
+# m = "OpenSessionManager"
+# f = "SessionMoveToFolder"
 
 # --- Search (s) ---
-[keybindings.command.s]
-_label = "Search"
-s = "EnterSearchMode"
-e = "BufferEditInEditor"
+# [keybindings.command.s]
+# _label = "Search"
+# s = "EnterSearchMode"
+# e = "BufferEditInEditor"
 
 # --- Direct bindings (root level) ---
-# These are top-level keys, not inside a group. Defaults:
-# v     = "EnterVisualMode"
-# g     = "ToggleStyle; EnterNormal"
-# Space = "LayoutNext; EnterNormal"
-# f     = "PaneToggleZoom; EnterNormal"    # zoom pane
-# ":"   = "CommandPaletteOpen"
-# a     = "SendKey Ctrl-a; EnterNormal"    # send the prefix key to the terminal
-# "}"   = "TabNext; EnterNormal"           # quick next tab
-# "{"   = "TabPrev; EnterNormal"           # quick prev tab
+# These are top-level keys pressed right after the leader, not inside a group.
+# They live directly under [keybindings.command] as single-character keys.
+# Defaults:
+#   v     = "EnterVisualMode"                — enter Visual (scrollback) mode
+#   g     = "ToggleStyle; EnterNormal"       — toggle border style
+#   Space = "LayoutNext; EnterNormal"        — cycle layout (key is a literal space)
+#   f     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
+#   ":"   = "CommandPaletteOpen"             — open the command palette
+#   a     = "SendKey Ctrl-a; EnterNormal"    — send the prefix key to the terminal
+#   "}"   = "TabNext; EnterNormal"           — quick next tab
+#   "{"   = "TabPrev; EnterNormal"           — quick prev tab
+#
+# To place these under [keybindings.command], put them ABOVE the group
+# sub-tables above, e.g.:
+#   v = "EnterVisualMode"
 
 # -----------------------------------------------------------------------------
 # Keybindings — Visual Mode
 # -----------------------------------------------------------------------------
-# Visual mode overrides (tree-based, same format as command mode).
-# Visual mode has built-in keys for scrollback navigation (j/k, gg, G, Ctrl-d/u,
-# v/V for selection, y to yank, / to search, e to open editor).
-# Press Escape to return to Normal.
-# Add overrides here if needed.
-
+# Visual mode overrides (tree-based, same format as command mode). Visual mode
+# has built-in keys for scrollback navigation (j/k, gg, G, Ctrl-d/u, v/V for
+# selection, y to yank, / to search, e to open editor). Press Escape to return
+# to Normal. Add overrides here if needed. Defaults to empty.
 # [keybindings.visual]
 
 
@@ -265,10 +317,10 @@ e = "BufferEditInEditor"
 # Tab commands:
 #   TabNew                          — Create a new tab
 #   TabClose                        — Close the active tab
-#   TabGoto <index>                 — Jump to tab by index (1-based)
+#   TabGoto <index>                 — Jump to tab by 0-based index
 #   TabNext                         — Focus next tab
 #   TabPrev                         — Focus previous tab
-#   TabMove <index>                 — Move tab to position (1-based)
+#   TabMove [index]                 — Move tab to position (default: 0)
 #   TabRename <name>                — Rename the active tab
 #
 # Pane commands:
@@ -293,12 +345,12 @@ e = "BufferEditInEditor"
 # Session commands:
 #   SessionNew <name> [folder]      — Create a new session
 #   SessionQuickSwitch              — Open the quick session switcher
-#   SessionDetach                   — Detach from current session
-#   SessionRename <name>            — Rename current session
-#   SessionMoveToFolder             — Move current session to a folder
+#   SessionDetach                   — Detach from the current session
+#   SessionRename <name>            — Rename the current session
+#   SessionMoveToFolder             — Move the current session to a folder
 #   OpenSessionManager              — Open the full session manager
 #   SessionList                     — List all sessions
-#   SessionSave                     — Save session state
+#   SessionSave                     — Save session state to disk
 #
 # Folder commands:
 #   FolderNew <name>                — Create a new folder
@@ -308,7 +360,7 @@ e = "BufferEditInEditor"
 #
 # Search commands:
 #   EnterSearchMode                 — Enter search mode (search scrollback)
-#   BufferEditInEditor              — Open scrollback in external editor
+#   BufferEditInEditor              — Open scrollback in an external editor
 #
 # Resize commands:
 #   ResizeLeft [amount]             — Resize pane left (default: 1)
@@ -317,20 +369,23 @@ e = "BufferEditInEditor"
 #   ResizeDown [amount]             — Resize pane down (default: 1)
 #
 # Mode commands:
-#   EnterNormal                — Return to normal (keys go to terminal)
-#   EnterCommandMode                — Enter command mode (navigate keybindings)
-#   EnterVisualMode                 — Enter visual mode (scrollback selection)
-#   SendKey <bytes>                 — Send raw key bytes to the active PTY
-#
+#   EnterNormal                     — Return to Normal (keys go to the terminal)
+#   EnterCommandMode                — Enter Command mode (navigate keybindings)
+#   EnterVisualMode                 — Enter Visual mode (scrollback selection)
+#   SendKey <key-notation>          — Send a key (e.g. "Ctrl-a") to the active PTY
 #   CommandPaletteOpen              — Open the command palette
 #
 # Layout commands:
 #   ToggleStyle                     — Toggle border style between zellij and tmux
-#   LayoutNext                      — Cycle through layout modes (BSP → Master → Monocle)
+#   LayoutNext                      — Cycle through layout modes (BSP -> Master -> Monocle)
 #   SetMaster                       — Set the focused pane as the master pane
+#
+# Remote commands:
+#   RemoteConnect <dest|alias>      — Connect to a remote server (SSH destination
+#                                     or a `[remotes.<name>]` alias)
 
 # -----------------------------------------------------------------------------
-# Remotes
+# REMOTES
 # -----------------------------------------------------------------------------
 # Named remote Remux servers reachable over SSH. Each `[remotes.<name>]` table
 # adds a top-level node to the session manager tree; expanding it lazily
@@ -341,12 +396,19 @@ e = "BufferEditInEditor"
 # Remote nodes support expand (connect) and switch-to-session/tab/pane only.
 # Structural edits (create/delete/rename/move) remain local-only.
 #
+# Per-remote fields:
+#   ssh         — SSH destination, e.g. "user@host" (relies on ~/.ssh/config). Required.
+#   remux_path  — path to the remux binary on the remote (default: "remux").
+#   port        — optional SSH port passed as `-p` (default: unset).
+#   identity    — optional identity file passed as `-i` (default: unset).
+#   extra_args  — extra ssh arguments placed before the destination (default: []).
+#
 # [remotes.pi]
-# ssh = "pi@raspberrypi.local"   # SSH destination; relies on ~/.ssh/config
-# remux_path = "/usr/local/bin/remux"  # path to remux on the remote (default: "remux")
+# ssh = "pi@raspberrypi.local"
+# remux_path = "/usr/local/bin/remux"
 #
 # [remotes.server]
 # ssh = "user@example.com"
-# port = 2222                    # optional SSH port (-p)
-# identity = "~/.ssh/id_ed25519" # optional identity file (-i)
-# extra_args = ["-o", "StrictHostKeyChecking=no"]  # extra ssh args before the destination
+# port = 2222
+# identity = "~/.ssh/id_ed25519"
+# extra_args = ["-o", "StrictHostKeyChecking=no"]
