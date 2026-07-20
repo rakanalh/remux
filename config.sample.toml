@@ -211,6 +211,7 @@
 # Misc quick actions:
 # "Alt-t" = "TabNew"
 # "Alt-s" = "SessionQuickSwitch"
+# "Alt-o" = "SessionSwitchLast"
 # "Alt-z" = "PaneToggleZoom"
 # "Alt-Space" = "LayoutNext"
 
@@ -271,6 +272,7 @@
 # [keybindings.command.x]
 # _label = "Session"
 # s = "SessionQuickSwitch"
+# o = "SessionSwitchLast"
 # n = "SessionNew"
 # r = "SessionRename"
 # d = "SessionDetach"
@@ -345,6 +347,7 @@
 # Session commands:
 #   SessionNew <name> [folder]      — Create a new session
 #   SessionQuickSwitch              — Open the quick session switcher
+#   SessionSwitchLast               — Toggle to the previously-attached session
 #   SessionDetach                   — Detach from the current session
 #   SessionRename <name>            — Rename the current session
 #   SessionMoveToFolder             — Move the current session to a folder

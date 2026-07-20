@@ -367,6 +367,10 @@ pub enum RemuxCommand {
     SessionDetach,
     SessionRename(String),
     SessionList,
+    /// Toggle to the previously-attached session ("last session", like tmux's
+    /// last-session). CLIENT-side: intercepted by the client and never
+    /// forwarded to the server.
+    SessionSwitchLast,
 
     // -- Folder commands ----------------------------------------------------
     FolderNew(String),
@@ -471,6 +475,7 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
         ("OpenSessionManager", None),
         ("RemoteConnect", Some("<user@host|alias>")),
         ("SessionMoveToFolder", None),
+        ("SessionSwitchLast", None),
         ("ToggleStyle", None),
         ("LayoutNext", None),
         ("SetMaster", None),

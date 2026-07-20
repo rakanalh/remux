@@ -455,6 +455,26 @@ async fn switch_to_server(
     Ok(())
 }
 
+/// Record a foreground switch to `(server, session)` for the "last session"
+/// toggle (`Alt-o`). When the new target differs from the current attachment,
+/// the current attachment becomes the previous one and the new target becomes
+/// current. Switching to the session that is already current is ignored, so the
+/// toggle never records a self-switch that would strand `previous_attached`.
+fn record_switch(
+    current: &mut Option<(ConnId, String)>,
+    previous: &mut Option<(ConnId, String)>,
+    server: ConnId,
+    session: String,
+) {
+    let new_attached = (server, session);
+    if current.as_ref() == Some(&new_attached) {
+        // Same session as the current foreground: nothing to toggle.
+        return;
+    }
+    *previous = current.take();
+    *current = Some(new_attached);
+}
+
 /// The inner client event loop.
 async fn run_client_loop(
     mgr: &mut ConnectionManager,
@@ -524,6 +544,15 @@ async fn run_client_loop(
     // The last local session we attached to; the fallback target if a
     // foreground-remote connection drops. Seeded from the pre-loop attach.
     let mut last_local_session: Option<String> = initial_local_session;
+
+    // Track the current and previously-attached (server, session) for the
+    // "last session" toggle (Alt-o). Seeded with the initial local session as
+    // `(ConnId::Local, name)` when known; `previous` starts empty so the first
+    // Alt-o before any switch is a no-op.
+    let mut current_attached: Option<(ConnId, String)> = last_local_session
+        .as_ref()
+        .map(|name| (ConnId::Local, name.clone()));
+    let mut previous_attached: Option<(ConnId, String)> = None;
 
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
@@ -1276,6 +1305,7 @@ async fn run_client_loop(
                                         if server == ConnId::Local {
                                             last_local_session = Some(session.clone());
                                         }
+                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
                                     }
                                     SessionManagerAction::SwitchTab { server, session, tab_index } => {
                                         input.session_manager = None;
@@ -1296,6 +1326,7 @@ async fn run_client_loop(
                                         if server == ConnId::Local {
                                             last_local_session = Some(session.clone());
                                         }
+                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
                                     }
                                     SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
                                         input.session_manager = None;
@@ -1317,6 +1348,7 @@ async fn run_client_loop(
                                         if server == ConnId::Local {
                                             last_local_session = Some(session.clone());
                                         }
+                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
                                     }
                                     // Structural edits are Local-only (guarded in the
                                     // session manager) and always target the Local server,
@@ -1466,6 +1498,36 @@ async fn run_client_loop(
                                 if server == ConnId::Local {
                                     last_local_session = Some(session.clone());
                                 }
+                                record_switch(&mut current_attached, &mut previous_attached, server, session);
+                            }
+                            InputAction::SessionSwitchLast => {
+                                // Toggle to the previously-attached session. Reset
+                                // mode and tear down any which-key popup first so
+                                // the leader `x o` path can't leave it lingering,
+                                // then either switch (when a previous exists) or
+                                // just re-sync the server's mode (no-op switch).
+                                input.mode = Mode::Normal;
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                if let Some((server, session)) = previous_attached.clone() {
+                                    // Mirror the SessionSwitchConfirm path.
+                                    switch_to_server(mgr, &server, c, r).await?;
+                                    mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
+                                    mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    if server == ConnId::Local {
+                                        last_local_session = Some(session.clone());
+                                    }
+                                    // Record so repeated Alt-o toggles back and forth.
+                                    record_switch(&mut current_attached, &mut previous_attached, server, session);
+                                } else {
+                                    // No previous session: keep the server's mode in sync.
+                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                }
                             }
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
@@ -1483,6 +1545,11 @@ async fn run_client_loop(
                                 }).await?;
                                 mgr.send_foreground(ClientMessage::Attach { session_name: name.clone() }).await?;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                // Creating-and-attaching is a foreground switch too:
+                                // record it so the Alt-o toggle baseline stays in
+                                // sync with the actual foreground session.
+                                let fg = mgr.foreground().clone();
+                                record_switch(&mut current_attached, &mut previous_attached, fg, name.clone());
                             }
                             InputAction::None => {}
                         }
@@ -1642,7 +1709,8 @@ async fn run_client_loop(
                                     mgr.send(&ConnId::Local, ClientMessage::Resize { cols: c, rows: r }).await?;
                                     if let Some(session) = last_local_session.clone() {
                                         // Reattach; the server responds with a fresh FullRender.
-                                        mgr.send(&ConnId::Local, ClientMessage::Attach { session_name: session }).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::Attach { session_name: session.clone() }).await?;
+                                        record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, session);
                                     } else {
                                         // Nothing to fall back to: open the session manager.
                                         input.mode = Mode::SessionManager;
@@ -2242,4 +2310,84 @@ async fn run_client_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local(name: &str) -> (ConnId, String) {
+        (ConnId::Local, name.to_string())
+    }
+
+    #[test]
+    fn record_switch_sets_previous_on_change() {
+        let mut current = Some(local("a"));
+        let mut previous = None;
+
+        record_switch(&mut current, &mut previous, ConnId::Local, "b".to_string());
+
+        assert_eq!(current, Some(local("b")));
+        assert_eq!(previous, Some(local("a")));
+    }
+
+    #[test]
+    fn record_switch_ignores_same_session() {
+        let mut current = Some(local("a"));
+        let mut previous = Some(local("z"));
+
+        record_switch(&mut current, &mut previous, ConnId::Local, "a".to_string());
+
+        // No self-switch: current unchanged and previous is NOT clobbered.
+        assert_eq!(current, Some(local("a")));
+        assert_eq!(previous, Some(local("z")));
+    }
+
+    #[test]
+    fn record_switch_from_empty_seeds_current() {
+        let mut current: Option<(ConnId, String)> = None;
+        let mut previous: Option<(ConnId, String)> = None;
+
+        record_switch(&mut current, &mut previous, ConnId::Local, "a".to_string());
+
+        assert_eq!(current, Some(local("a")));
+        assert_eq!(previous, None);
+    }
+
+    #[test]
+    fn record_switch_toggles_back_and_forth() {
+        let mut current = Some(local("a"));
+        let mut previous = None;
+
+        // a -> b
+        record_switch(&mut current, &mut previous, ConnId::Local, "b".to_string());
+        assert_eq!(current, Some(local("b")));
+        assert_eq!(previous, Some(local("a")));
+
+        // Toggle back to previous (b -> a): repeated Alt-o must ping-pong.
+        record_switch(&mut current, &mut previous, ConnId::Local, "a".to_string());
+        assert_eq!(current, Some(local("a")));
+        assert_eq!(previous, Some(local("b")));
+
+        record_switch(&mut current, &mut previous, ConnId::Local, "b".to_string());
+        assert_eq!(current, Some(local("b")));
+        assert_eq!(previous, Some(local("a")));
+    }
+
+    #[test]
+    fn record_switch_tracks_remote_server() {
+        let mut current = Some(local("a"));
+        let mut previous = None;
+        let remote = (ConnId::Remote("mini".to_string()), "build".to_string());
+
+        record_switch(
+            &mut current,
+            &mut previous,
+            ConnId::Remote("mini".to_string()),
+            "build".to_string(),
+        );
+
+        assert_eq!(current, Some(remote));
+        assert_eq!(previous, Some(local("a")));
+    }
 }

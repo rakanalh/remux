@@ -178,6 +178,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
             "Session",
             vec![
                 ('s', leaf("switch", "SessionQuickSwitch")),
+                ('o', leaf("last session", "SessionSwitchLast")),
                 ('n', leaf("new", "SessionNew")),
                 ('r', leaf("rename", "SessionRename")),
                 ('d', leaf("detach", "SessionDetach")),
@@ -558,6 +559,7 @@ impl Default for ShortcutBindings {
         // Misc quick actions.
         bindings.insert(alt_key('t'), cmd("TabNew"));
         bindings.insert(alt_key('s'), cmd("SessionQuickSwitch"));
+        bindings.insert(alt_key('o'), cmd("SessionSwitchLast"));
         bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
         bindings.insert(alt_key(' '), cmd("LayoutNext"));
 
@@ -710,6 +712,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "EnterSearchMode" => Some(RemuxCommand::EnterSearchMode),
         "OpenSessionManager" => Some(RemuxCommand::OpenSessionManager),
         "SessionMoveToFolder" => Some(RemuxCommand::SessionMoveToFolder),
+        "SessionSwitchLast" => Some(RemuxCommand::SessionSwitchLast),
         "ToggleStyle" => Some(RemuxCommand::ToggleStyle),
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
@@ -1092,6 +1095,44 @@ mod tests {
     #[test]
     fn parse_command_unknown() {
         assert_eq!(parse_command("NonexistentCommand"), None);
+    }
+
+    #[test]
+    fn parse_command_session_switch_last() {
+        assert_eq!(
+            parse_command("SessionSwitchLast"),
+            Some(RemuxCommand::SessionSwitchLast)
+        );
+    }
+
+    #[test]
+    fn session_group_has_last_session_leaf() {
+        let tree = KeybindingTree::default();
+        let node = tree.lookup(&['x', 'o']).unwrap();
+        match node {
+            KeyNode::Leaf { action, label, .. } => {
+                assert_eq!(action, &vec!["SessionSwitchLast".to_string()]);
+                assert_eq!(label, "last session");
+            }
+            other => panic!("expected leaf for 'x' -> 'o', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_shortcut_binds_alt_o_to_last_session() {
+        let bindings = ShortcutBindings::default();
+        let key = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('o'),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        );
+        match bindings.lookup(&key) {
+            Some(InterceptAction::Command(cmds)) => {
+                assert_eq!(cmds, &vec!["SessionSwitchLast".to_string()]);
+            }
+            other => panic!("expected Alt-o -> SessionSwitchLast, got {other:?}"),
+        }
     }
 
     #[test]

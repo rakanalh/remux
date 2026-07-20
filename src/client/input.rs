@@ -409,6 +409,10 @@ pub enum InputAction {
     SessionSwitchConfirm { server: ConnId, session: String },
     /// Session quick-switch cancelled.
     SessionSwitchClose,
+    /// Toggle to the previously-attached session ("last session"). Handled
+    /// entirely client-side by the event loop, which tracks the current and
+    /// previous attached `(server, session)`.
+    SessionSwitchLast,
     /// No action to take.
     None,
 }
@@ -1068,6 +1072,11 @@ impl InputHandler {
             return InputAction::SessionSwitchOpen;
         }
 
+        // "Last session" toggle is client-side: never forward to the server.
+        if actions.len() == 1 && actions[0] == "SessionSwitchLast" {
+            return InputAction::SessionSwitchLast;
+        }
+
         let mut commands: Vec<RemuxCommand> = Vec::new();
         for action_str in actions {
             match parse_command(action_str) {
@@ -1226,6 +1235,10 @@ impl InputHandler {
                         }
                         RemuxCommand::SessionMoveToFolder => {
                             return InputAction::FolderSelectOpen;
+                        }
+                        RemuxCommand::SessionSwitchLast => {
+                            // Client-side toggle to the previous session.
+                            return InputAction::SessionSwitchLast;
                         }
                         RemuxCommand::PaneRename(_) => {
                             // Activate rename overlay instead of executing directly.
@@ -2341,6 +2354,36 @@ mod tests {
         let action = handler.handle_key(esc_key());
         assert_eq!(handler.mode, Mode::Normal);
         assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+    }
+
+    #[test]
+    fn alt_o_shortcut_returns_session_switch_last() {
+        // The default Alt-o shortcut is intercepted client-side and never
+        // forwarded to the server as a command.
+        let mut handler = InputHandler::with_defaults();
+        assert_eq!(handler.mode, Mode::Normal);
+
+        let action = handler.handle_key(make_key(KeyCode::Char('o'), KeyModifiers::ALT));
+        assert_eq!(action, InputAction::SessionSwitchLast);
+        // Stays in Normal mode -- no overlay/mode transition on the shortcut.
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn leader_x_o_returns_session_switch_last() {
+        // The `x o` leader path (Session group -> last session) also resolves
+        // to the client-side SessionSwitchLast action.
+        let mut handler = InputHandler::with_defaults();
+
+        // Ctrl-a enters Command mode.
+        let _ = handler.handle_key(ctrl_key('a'));
+        assert_eq!(handler.mode, Mode::Command);
+        // 'x' opens the Session group (which-key popup).
+        let group = handler.handle_key(char_key('x'));
+        assert!(matches!(group, InputAction::ShowWhichKey(..)));
+        // 'o' resolves the leaf.
+        let action = handler.handle_key(char_key('o'));
+        assert_eq!(action, InputAction::SessionSwitchLast);
     }
 
     #[test]
