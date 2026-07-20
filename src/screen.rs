@@ -820,8 +820,11 @@ impl vte::Perform for Screen {
                 self.cursor_x = self.scp_cursor_x;
                 self.cursor_y = self.scp_cursor_y;
             }
-            // SGR - Select Graphic Rendition
-            'm' => {
+            // SGR - Select Graphic Rendition. A private/intermediate prefix (e.g.
+            // `CSI > 4 m` = XTMODKEYS/modifyOtherKeys) is NOT SGR; ignore it so its
+            // numeric params are never misparsed as graphic attributes (was latching
+            // underline on permanently).
+            'm' if _intermediates.is_empty() => {
                 self.handle_sgr(params);
             }
             // SM/DECSET - Set Mode
@@ -1437,6 +1440,19 @@ mod tests {
         s.process_output(b"\x1b[58:2:1:2:3mA");
         assert!(!s.current_attrs.underline);
         assert!(!s.grid[0][0].attrs.underline);
+    }
+
+    #[test]
+    fn test_csi_gt_4m_not_treated_as_underline() {
+        // `CSI > 4 m` (XTMODKEYS) must NOT enable underline; only real SGR `CSI 4 m` does.
+        let mut s = Screen::new(20, 3, 100);
+        s.process_output(b"\x1b[>4m");
+        s.process_output(b"A");
+        assert!(!s.current_attrs.underline, "CSI >4m must not set underline");
+        assert!(!s.grid[0][0].attrs.underline, "char after CSI >4m must not be underlined");
+        // Plain SGR 4 still works.
+        s.process_output(b"\x1b[4mB");
+        assert!(s.current_attrs.underline, "plain CSI 4m must still set underline");
     }
 
     #[test]
