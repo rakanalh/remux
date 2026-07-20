@@ -99,9 +99,12 @@ pub struct Screen {
     pub cursor_style: u8,
     /// Responses to be written back to the PTY (e.g., DSR cursor position replies).
     pub pty_responses: Vec<Vec<u8>>,
-    /// Saved cursor position for CSI s/u (separate from alt screen save).
+    /// Saved cursor position for CSI s/u and DECSC/DECRC (separate from alt screen save).
     scp_cursor_x: u16,
     scp_cursor_y: u16,
+    /// Saved graphic rendition for DECSC/DECRC (ESC 7 / ESC 8). Not touched by
+    /// the SCO save/restore (CSI s/u), which is position-only by convention.
+    scp_attrs: CellAttrs,
     /// Whether renders are locked (Synchronized Update mode, CSI ? 2026 h/l).
     pub lock_renders: bool,
     /// DECCKM: application cursor keys mode (CSI ? 1 h/l).
@@ -143,6 +146,7 @@ impl Screen {
             pty_responses: Vec::new(),
             scp_cursor_x: 0,
             scp_cursor_y: 0,
+            scp_attrs: CellAttrs::default(),
             lock_renders: false,
             application_cursor_keys: false,
             mouse_tracking: false,
@@ -974,15 +978,17 @@ impl vte::Perform for Screen {
                     self.cursor_y += 1;
                 }
             }
-            // DECSC - Save Cursor Position
+            // DECSC - Save Cursor (position + graphic rendition)
             b'7' => {
                 self.scp_cursor_x = self.cursor_x;
                 self.scp_cursor_y = self.cursor_y;
+                self.scp_attrs = self.current_attrs.clone();
             }
-            // DECRC - Restore Cursor Position
+            // DECRC - Restore Cursor (position + graphic rendition)
             b'8' => {
                 self.cursor_x = self.scp_cursor_x;
                 self.cursor_y = self.scp_cursor_y;
+                self.current_attrs = self.scp_attrs.clone();
             }
             // RI - Reverse Index (move cursor up, scroll if at top)
             b'M' => {
@@ -1608,6 +1614,68 @@ mod tests {
         assert!(
             !s.grid[0][1].attrs.underline,
             "Y should NOT be underlined after ESC[24m"
+        );
+    }
+
+    #[test]
+    fn test_decsc_decrc_restores_underline() {
+        // DECSC (ESC 7) saves attrs, DECRC (ESC 8) must restore them.
+        // ESC 7 -> ESC[4m (underline on) -> X -> ESC 8 -> (reposition) -> Y
+        // X is underlined; Y must NOT be, because DECRC restores the
+        // pre-underline rendition. DECRC also restores the cursor position,
+        // so we move to column 11 before writing Y to avoid overwriting X.
+        let mut s = make_screen();
+        s.process_output(b"\x1b7\x1b[4mX\x1b8\x1b[1;11HY");
+
+        assert!(
+            s.grid[0][0].attrs.underline,
+            "X should be underlined (written while underline was on)"
+        );
+        assert!(
+            !s.grid[0][10].attrs.underline,
+            "Y should NOT be underlined (DECRC restored pre-underline attrs)"
+        );
+        assert!(
+            !s.current_attrs.underline,
+            "current_attrs.underline must be false after DECRC"
+        );
+    }
+
+    #[test]
+    fn test_decsc_decrc_restores_bold() {
+        // ESC 7 -> ESC[1m (bold on) -> X -> ESC 8 -> (reposition) -> Y
+        // X is bold; Y must NOT be after DECRC.
+        let mut s = make_screen();
+        s.process_output(b"\x1b7\x1b[1mX\x1b8\x1b[1;11HY");
+
+        assert!(
+            s.grid[0][0].attrs.bold,
+            "X should be bold (written while bold was on)"
+        );
+        assert!(
+            !s.grid[0][10].attrs.bold,
+            "Y should NOT be bold (DECRC restored pre-bold attrs)"
+        );
+        assert!(
+            !s.current_attrs.bold,
+            "current_attrs.bold must be false after DECRC"
+        );
+    }
+
+    #[test]
+    fn test_decsc_decrc_restores_cursor_position() {
+        // ESC 7 saves the cursor position; ESC 8 restores it.
+        // Move to (row 3, col 6), save, move elsewhere, restore -> back to saved.
+        let mut s = make_screen();
+        s.process_output(b"\x1b[3;6H"); // cursor to row 2, col 5 (0-based)
+        s.process_output(b"\x1b7"); // DECSC: save position
+        s.process_output(b"\x1b[1;1H"); // move to home
+        assert_eq!((s.cursor_x, s.cursor_y), (0, 0), "cursor moved to home");
+        s.process_output(b"\x1b8"); // DECRC: restore position
+        assert_eq!(
+            (s.cursor_x, s.cursor_y),
+            (5, 2),
+            "DECRC must restore the saved cursor position"
         );
     }
 }
