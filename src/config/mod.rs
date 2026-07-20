@@ -112,6 +112,8 @@ pub struct AppearanceConfig {
     pub border_style: BorderStyle,
     pub default_layout: DefaultLayout,
     pub theme: theme::ThemeConfig,
+    /// Placement style for the which-key hint popup.
+    pub which_key_position: WhichKeyPosition,
 }
 
 impl Default for AppearanceConfig {
@@ -121,8 +123,24 @@ impl Default for AppearanceConfig {
             border_style: BorderStyle::ZellijStyle,
             default_layout: DefaultLayout::default(),
             theme: theme::ThemeConfig::default(),
+            which_key_position: WhichKeyPosition::default(),
         }
     }
+}
+
+/// Placement style for the which-key hint popup.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhichKeyPosition {
+    /// A bordered box centered horizontally and anchored to the bottom of the
+    /// screen (the historical default).
+    #[default]
+    Anchored,
+    /// The same bordered box, centered both horizontally and vertically.
+    Centered,
+    /// An emacs/ivy-like panel spanning the full terminal width, anchored to
+    /// the bottom above the status bar row.
+    FullWidth,
 }
 
 /// Default layout mode for new tabs.
@@ -390,6 +408,28 @@ mod tests {
     }
 
     #[test]
+    fn default_which_key_position_is_anchored() {
+        let config = Config::default();
+        assert_eq!(
+            config.appearance.which_key_position,
+            WhichKeyPosition::Anchored
+        );
+    }
+
+    #[test]
+    fn deserialize_which_key_position_full_width() {
+        let toml_str = r#"
+            [appearance]
+            which_key_position = "full_width"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.appearance.which_key_position,
+            WhichKeyPosition::FullWidth
+        );
+    }
+
+    #[test]
     fn deserialize_partial_config() {
         let toml_str = r#"
             [general]
@@ -512,6 +552,7 @@ mod tests {
             border_style,
             default_layout: _,
             theme: _,
+            which_key_position: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
     }

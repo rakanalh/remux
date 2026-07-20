@@ -595,7 +595,7 @@ impl FolderSelectOverlay {
             let is_selected = i == self.selected;
             let text = format!("  {}", folder);
             let padded = if text.len() >= inner_width {
-                text[..inner_width].to_string()
+                text.chars().take(inner_width).collect::<String>()
             } else {
                 format!("{}{}", text, " ".repeat(inner_width - text.len()))
             };
@@ -839,7 +839,7 @@ impl SessionSwitchOverlay {
             let marker = if entry.is_current { "* " } else { "  " };
             let text = format!("{marker}{}", Self::entry_label(entry));
             let padded = if text.len() >= inner_width {
-                text[..inner_width].to_string()
+                text.chars().take(inner_width).collect::<String>()
             } else {
                 format!("{}{}", text, " ".repeat(inner_width - text.len()))
             };
@@ -3433,6 +3433,37 @@ mod tests {
                 name: "beta".to_string(),
                 is_current: false,
             }
+        );
+    }
+
+    #[test]
+    fn session_switch_render_multibyte_label_no_panic_char_boundary() {
+        use crate::config::theme::Theme;
+
+        let mut overlay = SessionSwitchOverlay::new();
+        // A remote session whose label ("server: name") is long and multibyte,
+        // so the truncation width lands mid-UTF-8 with a byte slice.
+        overlay.merge_server(
+            remote("srv"),
+            vec![("日本語のセッション名前".to_string(), true)],
+        );
+
+        let theme = Theme::default();
+        // Narrow screen forces inner_width (= popup_width - 2 = 18) truncation
+        // at a byte offset that is not a UTF-8 char boundary.
+        let commands = overlay.render(20, 24, &theme);
+        assert!(!commands.is_empty());
+
+        // The truncated content row is drawn at x = start_x + 1 (start_x = 0
+        // when popup_width == screen_cols). It must be truncated on a char
+        // boundary to exactly inner_width columns.
+        let inner_width = 18usize;
+        let truncated = commands
+            .iter()
+            .find(|c| c.x == 1 && c.text.chars().count() == inner_width);
+        assert!(
+            truncated.is_some(),
+            "expected a content row truncated to {inner_width} chars"
         );
     }
 

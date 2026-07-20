@@ -476,6 +476,7 @@ async fn run_client_loop(
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();
     let mut theme = config.theme();
+    let mut which_key_position = config.appearance.which_key_position.clone();
 
     // Spawn the config-file watcher for live hot-reload. This is best-effort:
     // if it fails to start we log and continue without hot-reload rather than
@@ -781,7 +782,7 @@ async fn run_client_loop(
                                 let (c, r) = crossterm::terminal::size()?;
                                 whichkey.show(label, entries);
                                 renderer.clear_overlay(c, r)?;
-                                let commands = whichkey.render(c, r, &theme);
+                                let commands = whichkey.render(c, r, &theme, which_key_position.clone());
                                 renderer.render_whichkey_overlay(&commands)?;
                                 renderer.flush()?;
                             }
@@ -1772,7 +1773,7 @@ async fn run_client_loop(
                         }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
-                            let commands = whichkey.render(cols, rows, &theme);
+                            let commands = whichkey.render(cols, rows, &theme, which_key_position.clone());
                             renderer.render_whichkey_overlay(&commands)?;
                         }
                         renderer.flush()?;
@@ -1846,7 +1847,7 @@ async fn run_client_loop(
                         }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
-                            let commands = whichkey.render(cols, rows, &theme);
+                            let commands = whichkey.render(cols, rows, &theme, which_key_position.clone());
                             renderer.render_whichkey_overlay(&commands)?;
                         }
                         renderer.flush()?;
@@ -1920,7 +1921,7 @@ async fn run_client_loop(
                         }
                         // Re-render popup on top if visible
                         else if whichkey.visible {
-                            let commands = whichkey.render(cols, rows, &theme);
+                            let commands = whichkey.render(cols, rows, &theme, which_key_position.clone());
                             renderer.render_whichkey_overlay(&commands)?;
                         }
                         renderer.flush()?;
@@ -2214,6 +2215,9 @@ async fn run_client_loop(
                     // Update theme before any re-render so overlays repaint with
                     // the new colors.
                     theme = new_config.theme();
+
+                    // Update which-key placement so it changes live too.
+                    which_key_position = new_config.appearance.which_key_position.clone();
 
                     // Reconcile the remotes roster (update in place / add new /
                     // drop idle config-removed remotes).
