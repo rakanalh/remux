@@ -238,6 +238,12 @@ impl RemuxServer {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("registering SIGINT handler")?;
 
+        // Periodic tick that promotes quiet background `Activity` tabs to
+        // `Silent` ("finished"). Runs in the real server binary, so
+        // `Instant::now()`/`interval` are unrestricted.
+        const SILENCE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(3);
+        let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -248,6 +254,26 @@ impl RemuxServer {
                         Err(e) => {
                             log::error!("accept error: {e}");
                         }
+                    }
+                }
+                _ = activity_tick.tick() => {
+                    // Scan for background tabs that have gone silent past the
+                    // threshold. Only broadcast to sessions that actually
+                    // changed, so idle clients aren't woken every second.
+                    let affected = {
+                        let mut st = server.state.lock().await;
+                        st.promote_silent_tabs(std::time::Instant::now(), SILENCE_THRESHOLD)
+                    };
+                    for session_name in affected {
+                        broadcast_full_render(
+                            &session_name,
+                            &server.state,
+                            &server.panes,
+                            &server.clients,
+                            &server.config,
+                            &server.prev_frames,
+                        )
+                        .await;
                     }
                 }
                 _ = sigterm.recv() => {
@@ -715,6 +741,12 @@ async fn handle_attach(
     };
 
     log::debug!("server: client_id={client_id} attach session={session_name:?} dims={cols}x{rows}");
+
+    // The active tab is now being viewed; clear any stale activity marker.
+    {
+        let mut st = state.lock().await;
+        st.clear_active_tab_activity(session_name);
+    }
 
     // Resize panes to match the attaching client's terminal dimensions.
     resize_session_panes(session_name, cols, rows, state, panes, config).await?;
@@ -3247,7 +3279,7 @@ async fn build_composite(
                 } else {
                     t.name.clone()
                 };
-                (name, i == sess.active_tab)
+                (name, i == sess.active_tab, t.activity)
             })
             .collect(),
         layout_mode: tab.layout_mode.name().to_string(),
@@ -3607,7 +3639,7 @@ async fn start_pty_forwarding(
                             }
                         }
 
-                        let responses = {
+                        let (responses, bell) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 for chunk in &chunks {
@@ -3621,11 +3653,20 @@ async fn start_pty_forwarding(
                                     pane_data.screen.rows,
                                     pane_data.screen.scroll_bottom
                                 );
-                                pane_data.screen.take_responses()
+                                let bell = pane_data.screen.take_bell();
+                                (pane_data.screen.take_responses(), bell)
                             } else {
-                                Vec::new()
+                                (Vec::new(), false)
                             }
                         };
+                        // Record background-tab activity (no-op if this pane's
+                        // tab is the foreground/active tab). Panes lock is
+                        // released above; acquire state alone to preserve the
+                        // state-before-panes lock order used elsewhere.
+                        {
+                            let mut st = state.lock().await;
+                            st.record_pane_activity(pane_id, bell, std::time::Instant::now());
+                        }
                         // Write any pending responses (e.g., DSR replies) back to the PTY.
                         if !responses.is_empty() {
                             let ps = panes.lock().await;
@@ -3859,15 +3900,20 @@ async fn materialize_session(
 
                 match recv_result {
                     Some(Ok(data)) => {
-                        let responses = {
+                        let (responses, bell) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 pane_data.screen.process_output(&data);
-                                pane_data.screen.take_responses()
+                                let bell = pane_data.screen.take_bell();
+                                (pane_data.screen.take_responses(), bell)
                             } else {
-                                Vec::new()
+                                (Vec::new(), false)
                             }
                         };
+                        {
+                            let mut st = state.lock().await;
+                            st.record_pane_activity(pane_id, bell, std::time::Instant::now());
+                        }
                         if !responses.is_empty() {
                             let ps = panes.lock().await;
                             if let Some(pane_data) = ps.get(&pane_id) {

@@ -110,6 +110,9 @@ pub struct Screen {
     pub mouse_tracking: bool,
     /// Whether the application requested SGR mouse encoding (mode 1006).
     pub mouse_sgr: bool,
+    /// Set when a BEL (`0x07`) is received; consumed via [`Screen::take_bell`].
+    /// Used by the server for per-tab bell activity monitoring.
+    pub bell_pending: bool,
 }
 
 impl Screen {
@@ -144,7 +147,14 @@ impl Screen {
             application_cursor_keys: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            bell_pending: false,
         }
+    }
+
+    /// Consume the pending-bell flag, returning whether a BEL was received
+    /// since the last call and clearing it.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_pending)
     }
 
     /// Resize the screen to new dimensions.
@@ -520,7 +530,10 @@ impl vte::Perform for Screen {
             }
             // Bell
             0x07 => {
-                // Ignore bell for now.
+                // Flag a pending bell for per-tab activity monitoring. The
+                // server consumes this via `take_bell()` after processing
+                // output for a background tab.
+                self.bell_pending = true;
             }
             _ => {}
         }
@@ -981,6 +994,28 @@ mod tests {
         s.process_output(b"A");
         assert_eq!(s.grid[0][0].c, 'A');
         assert_eq!(s.cursor_x, 1);
+    }
+
+    #[test]
+    fn test_bell_sets_pending_flag() {
+        let mut s = make_screen();
+        assert!(!s.bell_pending);
+        // BEL (0x07) should raise the pending-bell flag.
+        s.process_output(b"\x07");
+        assert!(s.bell_pending);
+    }
+
+    #[test]
+    fn test_take_bell_consumes_flag() {
+        let mut s = make_screen();
+        s.process_output(b"hi\x07there");
+        // First take returns true and clears the flag.
+        assert!(s.take_bell());
+        assert!(!s.bell_pending);
+        // Second take returns false (already consumed).
+        assert!(!s.take_bell());
+        // BEL should not disturb normal text output.
+        assert_eq!(s.grid[0][0].c, 'h');
     }
 
     #[test]

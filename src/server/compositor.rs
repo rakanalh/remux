@@ -10,6 +10,7 @@ use crate::config::BorderStyle;
 use crate::protocol::{CellColor, RenderCell};
 use crate::screen::{Cell, Color, Screen};
 use crate::server::layout::{self, LayoutNode, PaneId, Rect};
+use crate::server::session::TabActivity;
 
 // ---------------------------------------------------------------------------
 // Mouse selection (shared with daemon)
@@ -113,8 +114,9 @@ pub struct StatusInfo {
     pub mode: String,
     /// Session name or path.
     pub session_name: String,
-    /// Tab list: (name, is_active) pairs.
-    pub tabs: Vec<(String, bool)>,
+    /// Tab list: `(name, is_active, activity)` triples. `activity` drives the
+    /// background-activity marker/color for non-active tabs.
+    pub tabs: Vec<(String, bool, TabActivity)>,
     /// Layout mode name (e.g. "bsp", "master", "monocle", "custom").
     pub layout_mode: String,
     /// Search match info: (current_match_index, total_matches). `None` when not searching.
@@ -1142,7 +1144,7 @@ fn draw_status_bar(
     }
 
     // Tab list.
-    for (i, (tab_name, is_active)) in info.tabs.iter().enumerate() {
+    for (i, (tab_name, is_active, activity)) in info.tabs.iter().enumerate() {
         if i > 0 {
             // Tab separator.
             let sep = " | ";
@@ -1163,8 +1165,26 @@ fn draw_status_bar(
             }
         }
 
+        // Background-activity marker. The active tab is always shown clean
+        // (gated on `!is_active`, not on the activity value) so a briefly-stale
+        // state never leaks a marker onto the focused tab. A leading marker
+        // char is folded into `tab_str`, so the hit-test width below (derived
+        // from the rendered string) stays correct automatically.
+        let marker = if *is_active {
+            None
+        } else {
+            match activity {
+                TabActivity::Bell => Some(('!', CellColor::Indexed(9))), // bright red: urgent
+                TabActivity::Activity => Some(('\u{25CF}', CellColor::Indexed(11))), // ●, bright yellow
+                TabActivity::Silent => Some(('\u{2713}', CellColor::Indexed(10))), // ✓, bright green
+                TabActivity::None => None,
+            }
+        };
+
         let tab_str = if *is_active {
             format!(" *{tab_name}* ")
+        } else if let Some((mark, _)) = marker {
+            format!(" {mark} {tab_name} ")
         } else {
             format!(" {tab_name} ")
         };
@@ -1175,6 +1195,10 @@ fn draw_status_bar(
                 theme.tab_active_bg.clone(),
                 true,
             )
+        } else if let Some((_, mark_fg)) = marker {
+            // Highlight the whole label in the attention color so a background
+            // tab needing attention stands out even at a glance.
+            (mark_fg, theme.status_bar_bg.clone(), true)
         } else {
             (
                 theme.tab_inactive_fg.clone(),
@@ -1280,7 +1304,7 @@ mod tests {
         let status = StatusInfo {
             mode: "NORMAL".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1330,7 +1354,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "main".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1377,7 +1401,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1435,7 +1459,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1485,7 +1509,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1537,7 +1561,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1585,7 +1609,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1630,7 +1654,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1673,7 +1697,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1722,7 +1746,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1770,7 +1794,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1828,7 +1852,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -1884,7 +1908,7 @@ mod tests {
         let status = StatusInfo {
             mode: "COMMAND".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true)],
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -2189,7 +2213,10 @@ mod tests {
         let status = StatusInfo {
             mode: "NORMAL".to_string(),
             session_name: "test".to_string(),
-            tabs: vec![("Tab 1".to_string(), true), ("Tab 2".to_string(), false)],
+            tabs: vec![
+                ("Tab 1".to_string(), true, TabActivity::None),
+                ("Tab 2".to_string(), false, TabActivity::None),
+            ],
             layout_mode: "bsp".to_string(),
             search_info: None,
         };
@@ -2215,5 +2242,50 @@ mod tests {
         assert_eq!(hit_regions.tab_regions[1].tab_index, 1);
         // Tab regions should be on the last row.
         assert_eq!(hit_regions.tab_regions[0].y, 23);
+    }
+
+    /// A background tab with non-None activity renders a leading marker glyph
+    /// in an attention color, while the active tab stays clean.
+    #[test]
+    fn test_status_bar_renders_activity_marker() {
+        let mut buffer = vec![vec![RenderCell::default(); 80]; 24];
+        let theme = CompositorTheme::default();
+        let mut hit_regions = HitRegions::default();
+        let status = StatusInfo {
+            mode: "NORMAL".to_string(),
+            session_name: "test".to_string(),
+            tabs: vec![
+                ("Tab 1".to_string(), true, TabActivity::None),
+                ("Tab 2".to_string(), false, TabActivity::Activity),
+                ("Tab 3".to_string(), false, TabActivity::Bell),
+                ("Tab 4".to_string(), false, TabActivity::Silent),
+            ],
+            layout_mode: "bsp".to_string(),
+            search_info: None,
+        };
+
+        draw_status_bar(&mut buffer, 80, 24, &status, &mut hit_regions, &theme);
+
+        let bar: String = buffer[23].iter().map(|c| c.c).collect();
+        // Each non-active tab shows its distinct marker glyph; the active tab
+        // shows the `*name*` styling with no marker.
+        assert!(
+            bar.contains('\u{25CF}'),
+            "activity ● marker missing: {bar:?}"
+        );
+        assert!(bar.contains('!'), "bell ! marker missing: {bar:?}");
+        assert!(bar.contains('\u{2713}'), "silent ✓ marker missing: {bar:?}");
+        assert!(
+            bar.contains("*Tab 1*"),
+            "active tab styling missing: {bar:?}"
+        );
+
+        // The Activity marker cell must carry the attention color (bright yellow)
+        // rather than the plain inactive-tab foreground.
+        let marker_col = buffer[23]
+            .iter()
+            .position(|c| c.c == '\u{25CF}')
+            .expect("activity marker present");
+        assert_eq!(buffer[23][marker_col].fg, CellColor::Indexed(11));
     }
 }

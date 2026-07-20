@@ -4,6 +4,7 @@
 //! It is pure -- no PTY management, no I/O -- just state management.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,26 @@ pub struct Session {
     pub rename_state: Option<(PaneId, String)>,
 }
 
+/// Per-tab activity state for background activity monitoring (tmux-like
+/// `monitor-activity` / `monitor-silence`).
+///
+/// Only ever applies to *background* tabs (a tab that is not its session's
+/// `active_tab`); the foreground tab is always [`TabActivity::None`] because it
+/// is being viewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabActivity {
+    /// No pending activity (default / cleared on focus).
+    #[default]
+    None,
+    /// The tab produced new output while in the background ("needs attention").
+    Activity,
+    /// The tab emitted a terminal bell (BEL). Takes precedence over `Activity`
+    /// until the tab is focused.
+    Bell,
+    /// The tab was active but has since gone quiet ("finished").
+    Silent,
+}
+
 /// A tab holds a layout tree and tracks the focused pane.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Tab {
@@ -83,6 +104,33 @@ pub struct Tab {
     pub pane_order: Vec<PaneId>,
     #[serde(default)]
     pub zoomed_pane: Option<PaneId>,
+    /// Runtime-only background activity state. Not persisted: activity is a
+    /// live-session concern, meaningless once a session is dormant/restored.
+    #[serde(skip)]
+    pub activity: TabActivity,
+    /// Runtime-only timestamp of the most recent background output, used to
+    /// promote `Activity` to `Silent` after a quiet threshold. Not persisted.
+    #[serde(skip)]
+    pub last_output: Option<Instant>,
+}
+
+/// Return true if a tab currently in [`TabActivity::Activity`] should be
+/// promoted to [`TabActivity::Silent`] given the current time `now` and the
+/// silence `threshold`.
+///
+/// Pure and deterministic: takes an injected `now` so the promotion logic can
+/// be unit-tested without real sleeps. Only `Activity` is eligible — `Bell`
+/// stays `Bell`, and `None`/`Silent` are never promoted.
+pub fn should_promote_to_silent(
+    activity: TabActivity,
+    last_output: Option<Instant>,
+    now: Instant,
+    threshold: Duration,
+) -> bool {
+    matches!(activity, TabActivity::Activity)
+        && last_output
+            .map(|t| now.duration_since(t) >= threshold)
+            .unwrap_or(false)
 }
 
 fn default_border_style() -> BorderStyle {
@@ -235,6 +283,8 @@ impl ServerState {
             layout_mode,
             pane_order: vec![pane_id],
             zoomed_pane: None,
+            activity: TabActivity::None,
+            last_output: None,
         };
 
         let session = Session {
@@ -467,6 +517,8 @@ impl ServerState {
             layout_mode,
             pane_order: vec![pane_id],
             zoomed_pane: None,
+            activity: TabActivity::None,
+            last_output: None,
         };
 
         sess.tabs.push(tab);
@@ -522,6 +574,14 @@ impl ServerState {
             sess.active_tab -= 1;
         }
 
+        // Closing the active tab moves focus to a different existing tab that
+        // may carry stale background activity; clear it (harmless no-op when
+        // the surviving active tab was already clean).
+        if let Some(tab) = sess.tabs.get_mut(sess.active_tab) {
+            tab.activity = TabActivity::None;
+            tab.last_output = None;
+        }
+
         Ok((pane_ids, false))
     }
 
@@ -564,7 +624,77 @@ impl ServerState {
         }
 
         sess.active_tab = tab_idx;
+        // Clear activity for the newly-focused tab: it is now being viewed.
+        if let Some(tab) = sess.tabs.get_mut(tab_idx) {
+            tab.activity = TabActivity::None;
+            tab.last_output = None;
+        }
         Ok(())
+    }
+
+    /// Record background output for the tab that owns `pane_id`.
+    ///
+    /// If the owning tab is its session's `active_tab` (foreground / being
+    /// viewed), this is a no-op — the foreground tab never accrues activity.
+    /// Otherwise the tab's state is updated: `Bell` if `bell` is set (Bell wins
+    /// and is never downgraded to `Activity`), else `Activity`. `last_output`
+    /// is refreshed to `now` so the silence timer restarts on every new byte.
+    pub fn record_pane_activity(&mut self, pane_id: PaneId, bell: bool, now: Instant) {
+        for sess in self.sessions.values_mut() {
+            let active = sess.active_tab;
+            for (idx, tab) in sess.tabs.iter_mut().enumerate() {
+                if layout::all_pane_ids(&tab.layout).contains(&pane_id) {
+                    if idx == active {
+                        // Foreground tab: being viewed, never accrues activity.
+                        return;
+                    }
+                    if bell {
+                        tab.activity = TabActivity::Bell;
+                    } else if tab.activity != TabActivity::Bell {
+                        // Don't downgrade a pending Bell to Activity. New output
+                        // also revives a Silent tab back to Activity.
+                        tab.activity = TabActivity::Activity;
+                    }
+                    tab.last_output = Some(now);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Promote any background tab that has been quietly in `Activity` past the
+    /// `threshold` to `Silent` ("finished"). Returns the names of sessions that
+    /// had at least one tab change, so the caller can re-render only those.
+    ///
+    /// `Bell` tabs are left untouched. `now` is injected for deterministic
+    /// testing (see [`should_promote_to_silent`]).
+    pub fn promote_silent_tabs(&mut self, now: Instant, threshold: Duration) -> Vec<String> {
+        let mut affected = Vec::new();
+        for (name, sess) in self.sessions.iter_mut() {
+            let mut changed = false;
+            for tab in sess.tabs.iter_mut() {
+                if should_promote_to_silent(tab.activity, tab.last_output, now, threshold) {
+                    tab.activity = TabActivity::Silent;
+                    changed = true;
+                }
+            }
+            if changed {
+                affected.push(name.clone());
+            }
+        }
+        affected
+    }
+
+    /// Clear activity on a session's currently-active tab. Used on attach/focus
+    /// so a freshly-viewed tab never shows a stale marker.
+    pub fn clear_active_tab_activity(&mut self, session: &str) {
+        if let Some(sess) = self.sessions.get_mut(session) {
+            let active = sess.active_tab;
+            if let Some(tab) = sess.tabs.get_mut(active) {
+                tab.activity = TabActivity::None;
+                tab.last_output = None;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1081,6 +1211,157 @@ mod tests {
 
         let sess = state.sessions.get("s").unwrap();
         assert_eq!(sess.active_tab, 0);
+    }
+
+    #[test]
+    fn test_record_activity_background_tab_only() {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+        // pane 1 is in tab 0 (initially active). Create tab 1 (now active) with
+        // pane 2. So tab 0 is now a background tab holding pane 1.
+        let pane2 = state
+            .create_tab("s", "tab2", LayoutMode::default())
+            .unwrap();
+        let now = Instant::now();
+
+        // Output on the background tab's pane => Activity.
+        state.record_pane_activity(1, false, now);
+        let sess = state.sessions.get("s").unwrap();
+        assert_eq!(sess.tabs[0].activity, TabActivity::Activity);
+        assert!(sess.tabs[0].last_output.is_some());
+        // The active (foreground) tab never accrues activity.
+        assert_eq!(sess.tabs[1].activity, TabActivity::None);
+
+        // Output on the active tab's pane => still None.
+        state.record_pane_activity(pane2, false, now);
+        let sess = state.sessions.get("s").unwrap();
+        assert_eq!(sess.tabs[1].activity, TabActivity::None);
+    }
+
+    #[test]
+    fn test_record_activity_bell_wins_and_no_downgrade() {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+        state
+            .create_tab("s", "tab2", LayoutMode::default())
+            .unwrap();
+        let now = Instant::now();
+
+        // Bell on background tab 0 => Bell.
+        state.record_pane_activity(1, true, now);
+        assert_eq!(
+            state.sessions.get("s").unwrap().tabs[0].activity,
+            TabActivity::Bell
+        );
+
+        // Subsequent plain output must NOT downgrade Bell to Activity.
+        state.record_pane_activity(1, false, now);
+        assert_eq!(
+            state.sessions.get("s").unwrap().tabs[0].activity,
+            TabActivity::Bell
+        );
+    }
+
+    #[test]
+    fn test_goto_tab_clears_activity() {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+        state
+            .create_tab("s", "tab2", LayoutMode::default())
+            .unwrap();
+        // Give background tab 0 some activity.
+        state.record_pane_activity(1, true, Instant::now());
+        assert_eq!(
+            state.sessions.get("s").unwrap().tabs[0].activity,
+            TabActivity::Bell
+        );
+
+        // Switching to tab 0 clears its activity.
+        state.goto_tab("s", 0).unwrap();
+        let sess = state.sessions.get("s").unwrap();
+        assert_eq!(sess.tabs[0].activity, TabActivity::None);
+        assert!(sess.tabs[0].last_output.is_none());
+    }
+
+    #[test]
+    fn test_should_promote_to_silent_pure() {
+        let base = Instant::now();
+        let threshold = Duration::from_secs(3);
+        let last = Some(base);
+
+        // Activity older than threshold => promote.
+        assert!(should_promote_to_silent(
+            TabActivity::Activity,
+            last,
+            base + Duration::from_secs(4),
+            threshold
+        ));
+        // Activity younger than threshold => no promote.
+        assert!(!should_promote_to_silent(
+            TabActivity::Activity,
+            last,
+            base + Duration::from_secs(1),
+            threshold
+        ));
+        // Bell stays Bell regardless of age.
+        assert!(!should_promote_to_silent(
+            TabActivity::Bell,
+            last,
+            base + Duration::from_secs(10),
+            threshold
+        ));
+        // None / Silent never promoted.
+        assert!(!should_promote_to_silent(
+            TabActivity::None,
+            last,
+            base + Duration::from_secs(10),
+            threshold
+        ));
+        // No last_output => never promoted.
+        assert!(!should_promote_to_silent(
+            TabActivity::Activity,
+            None,
+            base + Duration::from_secs(10),
+            threshold
+        ));
+    }
+
+    #[test]
+    fn test_promote_silent_tabs_transitions_activity() {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+        state
+            .create_tab("s", "tab2", LayoutMode::default())
+            .unwrap();
+        let base = Instant::now();
+        // Background tab 0: Activity as of `base`.
+        state.record_pane_activity(1, false, base);
+        assert_eq!(
+            state.sessions.get("s").unwrap().tabs[0].activity,
+            TabActivity::Activity
+        );
+
+        // Past the threshold, it promotes to Silent and reports the session.
+        let affected =
+            state.promote_silent_tabs(base + Duration::from_secs(4), Duration::from_secs(3));
+        assert_eq!(affected, vec!["s".to_string()]);
+        assert_eq!(
+            state.sessions.get("s").unwrap().tabs[0].activity,
+            TabActivity::Silent
+        );
+
+        // Running again is idempotent: nothing changes (empty affected list).
+        let affected2 =
+            state.promote_silent_tabs(base + Duration::from_secs(8), Duration::from_secs(3));
+        assert!(affected2.is_empty());
     }
 
     #[test]
