@@ -8,6 +8,10 @@ use crossterm::style::Color;
 use crate::config::theme::Theme;
 use crate::config::WhichKeyPosition;
 
+/// Fixed cell width for a single entry in the full-width layout:
+/// `" <key> \u{2192} <label>"`.
+const CELL_WIDTH: u16 = 22;
+
 /// A which-key popup that displays available keybindings in a bordered box.
 #[derive(Debug)]
 pub struct WhichKeyPopup {
@@ -294,14 +298,23 @@ impl WhichKeyPopup {
 
     /// Render the full-width, bottom-anchored panel. Entries flow left-to-right
     /// across as many columns as fit in the terminal width, wrapping onto
-    /// additional rows as needed. The group label occupies the top band row.
+    /// additional rows as needed. The group label occupies the top content row.
+    ///
+    /// The whole band is enclosed in a light box (`\u{250C}\u{2500}\u{2510}`
+    /// top, `\u{2502}` side edges, `\u{2514}\u{2500}\u{2518}` bottom) drawn in
+    /// the theme frame color, so it is visually separated from the terminal
+    /// content above and the status bar below. The box borders occupy two extra
+    /// rows and two extra columns, which are reserved in the layout so nothing
+    /// is clipped and the band still sits above the status-bar row.
     fn render_full_width(
         &self,
         screen_cols: u16,
         screen_rows: u16,
         theme: &Theme,
     ) -> Vec<DrawCommand> {
-        if screen_cols == 0 {
+        // The box needs a left edge, at least one content column, and a right
+        // edge. Anything narrower cannot be framed, so bail gracefully.
+        if screen_cols < 3 {
             return Vec::new();
         }
 
@@ -309,28 +322,39 @@ impl WhichKeyPopup {
         let bg = theme.whichkey_bg;
         let key_fg = theme.whichkey_key_fg;
 
+        // Content region sits inside the left/right border columns.
+        let inner_cols = screen_cols - 2;
+        // Content starts at column 1 (after the left border); a cell in column
+        // `col` starts here.
+        let content_x = |col: u16| -> u16 { 1 + col * CELL_WIDTH };
+        // Rightmost content column is `screen_cols - 2`; column `screen_cols - 1`
+        // holds the right border. `avail` for a cell at `x` is the number of
+        // content columns from `x` up to (but excluding) the right border.
+        let avail_at = |x: u16| -> usize { (screen_cols - 1 - x) as usize };
+
         // Each entry occupies a fixed-width cell: " <key> \u{2192} <label>".
-        let cell_width: u16 = 22;
-        let cols_per_row = (screen_cols / cell_width).max(1);
+        let cols_per_row = (inner_cols / CELL_WIDTH).max(1);
         let entry_rows = (self.entries.len() as u16).div_ceil(cols_per_row);
         let has_shortcuts = !self.shortcuts.is_empty();
         let shortcut_rows_full = (self.shortcuts.len() as u16).div_ceil(cols_per_row);
 
-        // Base band: label header row plus the entry rows. Reserve the last
-        // screen row for the status bar; the band sits above it.
+        // Base content: label header row plus the entry rows. The full band also
+        // needs a top and bottom border row (2), and the last screen row is
+        // reserved for the status bar (1). Bail if even the minimal framed band
+        // does not fit above the status bar.
         let base = entry_rows + 1;
-        if base + 1 > screen_rows {
+        if base + 3 > screen_rows {
             return Vec::new();
         }
 
         // Fit the Alt shortcuts below the entries: a small "Alt:" label row
         // plus as many shortcut rows as fit, truncating with an ellipsis row.
+        // Rows available for content = screen_rows - status(1) - borders(2) - base.
         let mut alt_label = false;
         let mut shortcut_rows = 0u16;
         let mut truncated = false;
         if has_shortcuts {
-            // Rows available for the shortcut section within the band region.
-            let remaining = screen_rows.saturating_sub(1).saturating_sub(base);
+            let remaining = screen_rows.saturating_sub(3).saturating_sub(base);
             if remaining >= 2 {
                 alt_label = true;
                 let room = remaining - 1;
@@ -343,23 +367,45 @@ impl WhichKeyPopup {
             }
         }
 
-        let band_height = base + u16::from(alt_label) + shortcut_rows;
+        let content_rows = base + u16::from(alt_label) + shortcut_rows;
+        let band_height = content_rows + 2; // + top/bottom border rows
         let start_y = screen_rows - 1 - band_height;
+        // First content row (just below the top border).
+        let content_y0 = start_y + 1;
 
         let mut commands = Vec::new();
 
-        // Full-width background band.
-        for row in 0..band_height {
+        // Top border row: \u{250C}\u{2500}...\u{2500}\u{2510} spanning full width.
+        commands.push(DrawCommand {
+            x: 0,
+            y: start_y,
+            text: format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_cols as usize)),
+            fg,
+            bg,
+        });
+
+        // Content rows: left/right edge chars with a blank interior. Content is
+        // overlaid on top of this background afterwards.
+        for row in 0..content_rows {
             commands.push(DrawCommand {
                 x: 0,
-                y: start_y + row,
-                text: " ".repeat(screen_cols as usize),
+                y: content_y0 + row,
+                text: format!("\u{2502}{}\u{2502}", " ".repeat(inner_cols as usize)),
                 fg,
                 bg,
             });
         }
 
-        // Label header on the top band row.
+        // Bottom border row: \u{2514}\u{2500}...\u{2500}\u{2518}.
+        commands.push(DrawCommand {
+            x: 0,
+            y: content_y0 + content_rows,
+            text: format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_cols as usize)),
+            fg,
+            bg,
+        });
+
+        // Label header on the first content row.
         let label_text = if self.group_label.is_empty() {
             " which-key ".to_string()
         } else {
@@ -367,11 +413,11 @@ impl WhichKeyPopup {
         };
         let label_text = label_text
             .chars()
-            .take(screen_cols as usize)
+            .take(inner_cols as usize)
             .collect::<String>();
         commands.push(DrawCommand {
-            x: 0,
-            y: start_y,
+            x: 1,
+            y: content_y0,
             text: label_text,
             fg: key_fg,
             bg,
@@ -381,13 +427,12 @@ impl WhichKeyPopup {
         for (i, (key, label)) in self.entries.iter().enumerate() {
             let col = (i as u16) % cols_per_row;
             let row = (i as u16) / cols_per_row;
-            let x = col * cell_width;
-            let y = start_y + 1 + row;
+            let x = content_x(col);
+            let y = content_y0 + 1 + row;
 
             // Never draw past the right edge: cap the cell to the remaining
-            // width (matters on very narrow screens where a cell would spill).
-            let avail = (screen_cols - x) as usize;
-            let take = (cell_width as usize).min(avail);
+            // content width (matters on very narrow screens).
+            let take = (CELL_WIDTH as usize).min(avail_at(x));
             let entry_str = format!(" {} \u{2192} {}", key, label);
             let entry_str = entry_str.chars().take(take).collect::<String>();
             commands.push(DrawCommand {
@@ -399,7 +444,7 @@ impl WhichKeyPopup {
             });
 
             // Highlight the key char (drawn after the leading space). Only when
-            // the cell is wide enough for it to fall within screen bounds.
+            // the cell is wide enough for it to fall within the content bounds.
             if take >= 2 {
                 commands.push(DrawCommand {
                     x: x + 1,
@@ -413,13 +458,13 @@ impl WhichKeyPopup {
 
         // Alt shortcuts section.
         if alt_label {
-            let alt_y = start_y + base;
+            let alt_y = content_y0 + base;
             let alt_header = " Alt:"
                 .chars()
-                .take(screen_cols as usize)
+                .take(inner_cols as usize)
                 .collect::<String>();
             commands.push(DrawCommand {
-                x: 0,
+                x: 1,
                 y: alt_y,
                 text: alt_header,
                 fg: key_fg,
@@ -434,11 +479,12 @@ impl WhichKeyPopup {
                     break;
                 }
                 let y = alt_y + 1 + row;
+                let x = content_x(col);
 
                 // The final row becomes an ellipsis when truncated.
                 if truncated && row == last_row {
                     commands.push(DrawCommand {
-                        x: col * cell_width,
+                        x,
                         y,
                         text: "\u{2026}".to_string(),
                         fg,
@@ -447,9 +493,7 @@ impl WhichKeyPopup {
                     continue;
                 }
 
-                let x = col * cell_width;
-                let avail = (screen_cols - x) as usize;
-                let take = (cell_width as usize).min(avail);
+                let take = (CELL_WIDTH as usize).min(avail_at(x));
                 let cell_str = format!(" {} {}", notation, label);
                 let cell_str = cell_str.chars().take(take).collect::<String>();
                 commands.push(DrawCommand {
@@ -647,6 +691,50 @@ mod tests {
         }
     }
 
+    /// Assert the full-width layout is framed by a light box: a top border row
+    /// (`\u{250C}\u{2500}...\u{2510}`) and a bottom border row
+    /// (`\u{2514}\u{2500}...\u{2518}`) each spanning the full width at `x == 0`,
+    /// plus side-edge rows (`\u{2502}...\u{2502}`). Also checks the frame stays
+    /// within bounds and above the status-bar row (`rows - 1`).
+    fn assert_full_width_box(commands: &[DrawCommand], cols: u16, rows: u16) {
+        let top = commands
+            .iter()
+            .find(|c| c.x == 0 && c.text.starts_with('\u{250C}') && c.text.ends_with('\u{2510}'))
+            .expect("expected a top border row starting with \u{250C} and ending with \u{2510}");
+        assert_eq!(
+            top.text.chars().count(),
+            cols as usize,
+            "top border must span the full width"
+        );
+
+        let bottom = commands
+            .iter()
+            .find(|c| c.x == 0 && c.text.starts_with('\u{2514}') && c.text.ends_with('\u{2518}'))
+            .expect("expected a bottom border row starting with \u{2514} and ending with \u{2518}");
+        assert_eq!(
+            bottom.text.chars().count(),
+            cols as usize,
+            "bottom border must span the full width"
+        );
+
+        // The bottom border must sit above the status-bar row (the last row).
+        assert!(
+            bottom.y < rows - 1,
+            "bottom border y={} must be above the status-bar row {}",
+            bottom.y,
+            rows - 1
+        );
+        assert!(top.y < bottom.y, "top border must be above bottom border");
+
+        // At least one content row carries side edges.
+        assert!(
+            commands.iter().any(|c| c.x == 0
+                && c.text.starts_with('\u{2502}')
+                && c.text.ends_with('\u{2502}')),
+            "expected side-edge (\u{2502}) rows"
+        );
+    }
+
     fn sample_popup() -> WhichKeyPopup {
         let mut popup = WhichKeyPopup::new();
         popup.show(
@@ -734,6 +822,7 @@ mod tests {
             "expected an Alt: header"
         );
         assert!(any_text_contains(&commands, "focus left"));
+        assert_full_width_box(&commands, cols, rows);
     }
 
     /// Build a popup with many shortcuts to force the truncation path.
@@ -783,6 +872,7 @@ mod tests {
         assert!(!commands.is_empty());
         assert_within_bounds(&commands, cols, rows);
         assert!(any_text_contains(&commands, "\u{2026}"));
+        assert_full_width_box(&commands, cols, rows);
     }
 
     #[test]
@@ -822,13 +912,15 @@ mod tests {
         let commands = popup.render(cols, rows, &theme, WhichKeyPosition::FullWidth);
         assert!(!commands.is_empty());
         assert_within_bounds(&commands, cols, rows);
-        // At least one band row spans the full terminal width.
+        // At least one band row spans the full terminal width (the box borders
+        // do, `\u{250C}\u{2500}...\u{2510}` / `\u{2514}\u{2500}...\u{2518}`).
         assert!(
             commands
                 .iter()
                 .any(|c| c.x == 0 && c.text.chars().count() == cols as usize),
-            "expected a full-width background band row"
+            "expected a full-width band row"
         );
+        assert_full_width_box(&commands, cols, rows);
     }
 
     #[test]
@@ -840,5 +932,6 @@ mod tests {
         let commands = popup.render(cols, rows, &theme, WhichKeyPosition::FullWidth);
         assert!(!commands.is_empty());
         assert_within_bounds(&commands, cols, rows);
+        assert_full_width_box(&commands, cols, rows);
     }
 }
