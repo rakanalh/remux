@@ -6,40 +6,91 @@
 |_| \_\_____|_|  |_|\___//_/\_\
 </pre>
 
-A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, and a tree-view session manager.
+A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, a tree-view session manager, and first-class SSH remote sessions.
 
-Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates.
+Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Config changes hot-reload live — no restart needed.
+
+---
 
 ## Features
 
-- **Session persistence** -- sessions survive detach and server restarts. State auto-saves after structural changes and restores on startup.
-- **Folder organization** -- group sessions into named folders for better management.
-- **Modal input** -- Normal, Command, Visual, and Search modes. Keys pass through to the terminal in Normal mode; leader key enters Command mode.
-- **Pane stacking** -- multiple panes can occupy the same screen position and cycle through like tabs within a split.
-- **Four layout algorithms** -- BSP, Master, Monocle, and Custom. Cycle with `Space` in Command mode.
-- **Two rendering styles** -- Zellij style (rounded box borders with pane names) and Tmux style (minimal dividers). Toggle with `g`.
-- **Visual mode** -- vim-style scrollback navigation with character-wise and line-wise selection, search, and yank to clipboard.
-- **Search mode** -- `/` in Visual mode to search scrollback with highlighted matches and `n`/`N` navigation.
-- **Mouse support** -- click-to-select text, auto-copy on release, click tabs/stacks to switch.
-- **External editor** -- open full scrollback in `$EDITOR` for review.
-- **Session manager** -- tree-view overlay for browsing, creating, deleting, and switching sessions/folders.
-- **Configurable theming** -- named colors, ANSI 256, and RGB. Per-mode status bar colors, frame colors, and more.
-- **Hot-reload config** -- file watcher reloads `~/.config/remux/config.toml` on save.
+### Sessions & persistence
+
+- **Session persistence** — sessions live in a background server and survive client detach and disconnects. State auto-saves after every structural change and on shutdown when `save_sessions` is enabled.
+- **Automatic restore** — with `automatic_restore = true` (the default), persisted sessions come back live when the server starts.
+- **Dormant "resurrect" sessions** — with `save_sessions = true` and `automatic_restore = false`, saved sessions load as dormant entries instead of coming live. They appear in the session manager and are materialized on demand when you switch to one.
+- **Folder organization** — group sessions into named folders in the session tree for tidy management.
+- **Session switcher** — a quick switcher (`Alt-s`) that aggregates local **and** remote sessions into one list so you can jump anywhere without opening the full manager.
+- **Last session toggle** — `Alt-o` (or `Ctrl-a x o`) flips back to the previously-attached session, like tmux's last-session.
+- **Session manager** — a tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — across both local and remote servers.
+
+### Panes & layouts
+
+- **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
+- **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting.
+- **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`).
+- **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
+- **Resize** — grow/shrink the focused pane edge by a configurable amount.
+- **Four layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), and **Custom** (your exact manual splits, no auto-redistribution). Cycle with `Alt-Space` / `Ctrl-a Space`.
+- **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
+- **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
+
+### Tabs & activity monitoring
+
+- **Tabs** — each session holds multiple tabs; create, close, rename, reorder, and jump to tabs by index.
+- **Background activity monitoring** — non-active tabs surface a marker in the tab bar so you know what changed while you were elsewhere:
+  - `!` (red) — a **bell** fired in the tab.
+  - `●` (yellow) — new **output/activity** appeared.
+  - `✓` (green) — a previously-busy tab went **silent/finished**.
+
+### Modal input & which-key
+
+- **Modal input** — Normal, Command, Visual, and Search modes. In **Normal** mode keys pass straight through to the running application.
+- **Leader key** — the leader (`Ctrl-a` by default) enters **Command** mode, which drives a tree of keybindings.
+- **Which-key popup** — after the leader, a popup lists the available keys at the current tree level (and the global Alt shortcuts, emacs-style). Appearance delay is configurable via `timeout_ms`.
+- **Configurable which-key position** — `anchored` (bordered box centered horizontally, anchored bottom), `centered` (bordered box, both axes), or `full_width` (a bordered ivy/emacs-style panel spanning the terminal width above the status bar).
+- **Instant Alt shortcuts** — a set of `Alt-…` shortcuts act immediately in Normal mode without pressing the leader first.
+- **Command palette** — `Ctrl-a :` opens a searchable list of every command.
+
+### Visual / copy mode & search
+
+- **Visual (copy) mode** — vim-style scrollback navigation with `h/j/k/l` cursor movement, `Ctrl-d`/`Ctrl-u` half-page scroll, `gg`/`G` to jump, character-wise (`v` or `Space`) and line-wise (`V`) selection, and `y` to yank the selection to the system clipboard (via OSC 52).
+- **Search** — `/` from Visual mode (or the Search leader binding) searches scrollback with highlighted matches; navigate with `n` (previous) / `N` (next), landing back in Visual mode on a match.
+- **External editor** — open a pane's full scrollback in `$EDITOR` for review, copy, or piping.
+
+### Remote sessions (SSH)
+
+- **Remote attach over SSH** — declare servers in `[remotes.<name>]` (or connect ad-hoc with `RemoteConnect user@host`). Each remote is a top-level node in the session manager tree.
+- **Unified lazy tree** — expanding a remote node lazily connects over SSH (spawning `remux relay` on the remote) and lists that server's sessions, merged into the same tree as local sessions.
+- **Foreground handoff** — attaching to a remote session hands the render loop over to the remote transport, so remote sessions feel just like local ones. Structural edits (create/delete/rename/move) stay local-only; remotes support expand and switch-to-session/tab/pane.
+
+### Mouse
+
+- **Text selection** — click-drag to select; on release the selection auto-copies to the clipboard and clears (`mouse_auto_yank`, on by default). Disable it to keep the selection for keyboard adjustment in Visual mode.
+- **Click to switch** — click tabs and stacked panes to switch to them.
+- **Wheel forwarding** — the mouse wheel is forwarded to applications that request mouse tracking or use the alternate screen (e.g. `less`, `vim`); otherwise it scrolls Remux's own scrollback.
+
+### Theming & configuration
+
+- **Configurable theming** — named colors, CSS hex, ANSI 256 indices, and RGB tuples. Per-mode status bar colors, frame colors, tab colors, which-key colors, search-highlight colors, and more (defaults are Catppuccin Mocha).
+- **Hot-reload** — a file watcher reloads `~/.config/remux/config.toml` on save and the client applies new **keybindings, theme, and remotes** live.
+- **Fully configurable keybindings** — override or unbind any leader-tree key or Alt shortcut, remap the leader, and chain commands. See [Keybindings](#keybindings) and [Chaining commands](#chaining-commands).
+
 ## Which-key
 
-After pressing the leader key, a popup shows available keybindings at each tree level. Timeout is configurable.
+After pressing the leader key, a popup shows the available keybindings at each tree level, plus the global Alt shortcuts. The delay before it appears is configurable (`timeout_ms`).
 
 ![Which-key popup](docs/screenshots/whichkey.png)
 
-## Command Palette
+## Command palette
 
-`:` in Command mode opens a searchable list of all available commands.
+`Ctrl-a :` opens a searchable list of all available commands.
 
 ![Command palette](docs/screenshots/command-pallet.png)
 
-## Session Manager
+## Session manager
 
-Tree-view overlay for browsing, creating, deleting, and switching sessions and folders.
+Tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — local and remote.
 
 ![Session manager](docs/screenshots/session-manager.png)
 
@@ -53,240 +104,333 @@ Recursively splits screen space, alternating horizontal and vertical. Each new p
 
 ### Master
 
-One master pane occupies 50% of the screen. Secondary panes are divided evenly in the remaining space. Ideal for a primary editor with supporting terminals.
+One master pane occupies 50% of the screen; secondary panes divide the remaining space evenly. Ideal for a primary editor with supporting terminals. Use `SetMaster` to promote the focused pane.
 
 ![Master layout](docs/screenshots/layout-master.png)
 
 ### Monocle
 
-Full-screen single pane. Only the active pane is visible. Cycle through panes with stack next/prev.
+Full-screen single pane — only the active pane is visible. Cycle through panes with stack next/prev.
 
 ![Monocle layout](docs/screenshots/layout-monocle.png)
 
 ### Custom
 
-Manual splits created by the user. No automatic redistribution. Preserves your exact arrangement. Activated when you perform manual split operations.
+Manual splits created by you. No automatic redistribution — your exact arrangement is preserved.
 
-## Keybindings
+## Install / build / run
 
-### Normal Mode
-
-All keys pass through to the active terminal, except:
-
-| Key | Action |
-|-----|--------|
-| `Ctrl-a` | Enter Command mode (leader key) |
-| `Ctrl-a Ctrl-a` | Send literal `Ctrl-a` to terminal |
-| `Alt-h/j/k/l` | Focus pane left/down/up/right |
-| `Alt-n` | Next tab |
-| `Alt-p` | Open Pane group (which-key) |
-| `Alt-t` | Open Tab group (which-key) |
-
-### Command Mode
-
-Entered via leader key (`Ctrl-a`). Press `Escape` to return to Normal.
-
-#### Tab (`t`)
-
-| Key | Action |
-|-----|--------|
-| `t n` | New tab |
-| `t c` | Close tab |
-| `t m` | Move tab |
-| `t r` | Rename tab |
-| `t l` | Next tab |
-
-#### Pane (`p`)
-
-| Key | Action |
-|-----|--------|
-| `p n` | New pane |
-| `p c` | Close pane |
-| `p s` | Split vertical |
-| `p S` | Split horizontal |
-| `p h/j/k/l` | Focus left/down/up/right |
-| `p a` | Add pane to stack |
-| `p ]` | Next pane in stack |
-| `p [` | Previous pane in stack |
-| `p R` | Rename pane |
-
-#### Pane Resize (`p r`)
-
-| Key | Action |
-|-----|--------|
-| `p r h` | Resize left |
-| `p r j` | Resize down |
-| `p r k` | Resize up |
-| `p r l` | Resize right |
-
-#### Search (`s`)
-
-| Key | Action |
-|-----|--------|
-| `s s` | Enter search mode |
-| `s e` | Open scrollback in editor |
-
-#### Session (`x`)
-
-| Key | Action |
-|-----|--------|
-| `x n` | New session |
-| `x d` | Detach |
-| `x r` | Rename session |
-| `x l` | Session list |
-
-#### Folder (`f`)
-
-| Key | Action |
-|-----|--------|
-| `f n` | New folder |
-| `f d` | Delete folder |
-| `f l` | List folders |
-| `f m` | Move session to folder |
-
-#### Root-level
-
-| Key | Action |
-|-----|--------|
-| `v` | Enter Visual mode |
-| `g` | Toggle rendering style (Zellij/Tmux) |
-| `Space` | Cycle layout (BSP -> Master -> Monocle) |
-| `m` | Set focused pane as master |
-| `:` | Open command palette |
-
-### Visual Mode
-
-Entered via `v` in Command mode. Vim-style scrollback navigation.
-
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Scroll down/up |
-| `Ctrl-d` / `Ctrl-u` | Half-page down/up |
-| `gg` | Jump to top |
-| `G` | Jump to bottom |
-| `h` / `l` | Move cursor left/right |
-| `v` | Toggle character selection |
-| `V` | Toggle line selection |
-| `y` | Yank selection to clipboard |
-| `/` | Enter search mode |
-| `e` | Open scrollback in `$EDITOR` |
-| `Escape` | Return to Normal |
-
-### Search Mode
-
-Entered via `/` in Visual mode.
-
-| Key | Action |
-|-----|--------|
-| _text_ | Type search query |
-| `Enter` | Confirm search |
-| `n` | Next match |
-| `N` | Previous match |
-| `Escape` | Cancel search |
-
-### Session Manager
-
-Opened via `x l` or `Alt-s`.
-
-| Key | Action |
-|-----|--------|
-| `Up` / `Down` | Navigate tree |
-| `Enter` | Switch session / expand folder |
-| `Left` / `Right` | Collapse / expand |
-| `n` | New session |
-| `c` | New folder |
-| `d` | Delete session |
-| `m` | Move session |
-| `Escape` | Close |
-
-## Action Chains
-
-Keybindings support chaining multiple commands with semicolons:
-
-```toml
-n = "TabNew; EnterNormal"          # Create tab, return to Normal
-n = "PaneNew; ResizeRight 10"      # Create pane, resize, stay in Command
+```bash
+cargo build --release
 ```
 
-If the chain includes `EnterNormal`, you return to Normal mode after execution. Otherwise you stay in Command mode.
+Requires a Unix/Linux system (uses POSIX PTY).
 
-## Configuration
+### CLI usage
 
-Remux uses a TOML config file. To set it up:
+```
+remux                                          # Attach to "main" (creating it if needed)
+remux new --session <name> [--folder <dir>]    # Create a session
+remux attach <name>                            # Attach to a session
+remux ls                                       # List sessions
+remux kill <name>                              # Kill a session
+```
+
+### Configuration file
+
+Remux reads `~/.config/remux/config.toml`. A complete, fully-commented reference lives in [`config.sample.toml`](config.sample.toml) — every option is shown commented-out at its default value, so copying it verbatim reproduces the built-in defaults:
 
 ```bash
 mkdir -p ~/.config/remux
 cp config.sample.toml ~/.config/remux/config.toml
 ```
 
-Edit `~/.config/remux/config.toml` to customize. Changes are picked up automatically via file watcher -- no restart needed.
+Edits are picked up automatically by the file watcher — no restart needed.
+
+## Keybindings
+
+Remux is modal:
+
+- **Normal mode** passes every key straight through to the running application, *except* the leader key and the configured Alt shortcuts.
+- The **leader key** (`Ctrl-a` by default) enters **Command mode** and opens the which-key popup showing the keybinding tree.
+- **Alt shortcuts** act **instantly in Normal mode** — no leader press required.
+
+Both the leader tree and the Alt shortcuts are fully configurable and **hot-reload live**. The which-key popup lists both the current tree level and the global Alt shortcuts.
+
+### Leader tree (default, leader = `Ctrl-a`)
+
+Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you to Normal mode after running; the rest leave you in Command mode for chaining.
+
+#### Root
+
+| Key | Action |
+|-----|--------|
+| `p` | Open the **Pane** group |
+| `t` | Open the **Tab** group |
+| `x` | Open the **Session** group |
+| `s` | Open the **Search** group |
+| `v` | Enter Visual mode |
+| `g` | Toggle border style (Zellij ⇄ Tmux) *(→ Normal)* |
+| `Space` | Cycle layout (BSP → Master → Monocle) *(→ Normal)* |
+| `f` | Zoom the focused pane *(→ Normal)* |
+| `}` | Next tab *(→ Normal)* |
+| `{` | Previous tab *(→ Normal)* |
+| `:` | Open the command palette |
+| `a` | Send the literal prefix key (`Ctrl-a`) to the app *(→ Normal)* |
+
+#### Pane (`p`)
+
+| Key | Action |
+|-----|--------|
+| `n` | New pane *(→ Normal)* |
+| `x` | Close pane *(→ Normal)* |
+| `s` | Split vertical *(→ Normal)* |
+| `S` | Split horizontal *(→ Normal)* |
+| `h` / `j` / `k` / `l` | Focus left / down / up / right *(→ Normal)* |
+| `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right *(→ Normal)* |
+| `z` | Toggle zoom *(→ Normal)* |
+| `r` | Rename pane |
+| `a` | Add pane to stack *(→ Normal)* |
+| `]` | Next pane in stack *(→ Normal)* |
+| `[` | Previous pane in stack *(→ Normal)* |
+| `R` | Open the **Resize** sub-group |
+
+#### Pane → Resize (`p R`)
+
+| Key | Action |
+|-----|--------|
+| `h` / `j` / `k` / `l` | Resize left / down / up / right by 5 |
+
+#### Tab (`t`)
+
+| Key | Action |
+|-----|--------|
+| `n` | New tab *(→ Normal)* |
+| `x` | Close tab *(→ Normal)* |
+| `r` | Rename tab |
+| `]` / `[` | Next / previous tab *(→ Normal)* |
+| `m` | Move tab |
+| `1`–`9` | Jump to tab 1–9 *(→ Normal)* |
+
+#### Session (`x`)
+
+| Key | Action |
+|-----|--------|
+| `s` | Quick session switcher |
+| `o` | Last session (toggle) |
+| `n` | New session |
+| `r` | Rename session |
+| `d` | Detach |
+| `m` | Open session manager |
+| `f` | Move session to folder |
+
+#### Search (`s`)
+
+| Key | Action |
+|-----|--------|
+| `s` | Enter search mode |
+| `e` | Open scrollback in `$EDITOR` |
+
+### Alt shortcuts (default, instant in Normal mode)
+
+| Shortcut | Action |
+|----------|--------|
+| `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right |
+| `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
+| `Alt-,` / `Alt-.` | Previous / next tab |
+| `Alt-1` … `Alt-9` | Jump to tab 1–9 |
+| `Alt-t` | New tab |
+| `Alt-s` | Quick session switcher (local + remote) |
+| `Alt-o` | Last session (toggle) |
+| `Alt-z` | Toggle pane zoom |
+| `Alt-Space` | Cycle layout |
+
+### Visual mode
+
+Entered with `v` in Command mode. Vim-style scrollback navigation and selection.
+
+| Key | Action |
+|-----|--------|
+| `h` / `j` / `k` / `l` | Move cursor left / down / up / right |
+| `Ctrl-d` / `Ctrl-u` | Half-page down / up |
+| `gg` / `G` | Jump to top / bottom |
+| `v` or `Space` | Start/toggle character-wise selection |
+| `V` | Start/toggle line-wise selection |
+| `y` | Yank selection to clipboard |
+| `/` | Search scrollback |
+| `e` | Open scrollback in `$EDITOR` |
+| `Esc` | Return to Normal |
+
+### Search mode
+
+Entered with `/` in Visual mode (or the Search leader binding).
+
+| Key | Action |
+|-----|--------|
+| _text_ | Type the query |
+| `Enter` | Confirm search |
+| `n` / `N` | Previous / next match |
+| `Esc` | Cancel and clear highlights |
+
+### Session manager
+
+Opened with `Ctrl-a x m` (or `Alt-s` for the quick switcher).
+
+| Key | Action |
+|-----|--------|
+| `Up` / `Down` | Navigate the tree |
+| `Enter` | Switch to node (or expand it) |
+| `l` / `Right` / `+` | Expand (including connecting a remote) |
+| `h` / `Left` / `-` | Collapse |
+| `}` / `{` | Switch tab within the highlighted session |
+| `n` | New session |
+| `c` | New folder |
+| `d` | Delete session |
+| `m` | Move session |
+| `Esc` | Close |
+
+## Commands
+
+Every command below is a `RemuxCommand` recognised by the config parser and the command palette. Commands are written in PascalCase; arguments are space-separated (quote any argument containing spaces, e.g. `SessionNew "my project"`).
+
+| Command | Arguments | Description |
+|---------|-----------|-------------|
+| `TabNew` | — | Create a new tab. |
+| `TabClose` | — | Close the active tab. |
+| `TabRename` | `<name>` | Rename the active tab. |
+| `TabGoto` | `<index>` | Jump to the tab at the given 0-based index. |
+| `TabNext` | — | Focus the next tab. |
+| `TabPrev` | — | Focus the previous tab. |
+| `TabMove` | `<index>` | Move the active tab to the given position (default 0). |
+| `PaneNew` | — | Open a new pane in the current tab. |
+| `PaneClose` | — | Close the focused pane. |
+| `PaneSplitVertical` | — | Split the focused pane vertically. |
+| `PaneSplitHorizontal` | — | Split the focused pane horizontally. |
+| `PaneFocusLeft` | — | Move focus to the pane on the left (stack-aware). |
+| `PaneFocusRight` | — | Move focus to the pane on the right (stack-aware). |
+| `PaneFocusUp` | — | Move focus to the pane above (stack-aware). |
+| `PaneFocusDown` | — | Move focus to the pane below (stack-aware). |
+| `PaneStackAdd` | — | Add the focused pane to a stack at its position. |
+| `PaneStackNext` | — | Cycle to the next pane in the current stack. |
+| `PaneStackPrev` | — | Cycle to the previous pane in the current stack. |
+| `PaneMoveLeft` | — | Swap the focused pane with its left neighbour. |
+| `PaneMoveRight` | — | Swap the focused pane with its right neighbour. |
+| `PaneMoveUp` | — | Swap the focused pane with the pane above. |
+| `PaneMoveDown` | — | Swap the focused pane with the pane below. |
+| `PaneRename` | `<name>` | Rename the focused pane. |
+| `PaneToggleZoom` | — | Toggle fullscreen zoom for the focused pane. |
+| `ResizeLeft` | `<amount>` | Resize the focused pane's left edge (default 1). |
+| `ResizeRight` | `<amount>` | Resize the focused pane's right edge (default 1). |
+| `ResizeUp` | `<amount>` | Resize the focused pane's top edge (default 1). |
+| `ResizeDown` | `<amount>` | Resize the focused pane's bottom edge (default 1). |
+| `SessionNew` | `<name> [folder]` | Create a new session, optionally inside a folder. |
+| `SessionDetach` | — | Detach the client from the current session. |
+| `SessionRename` | `<name>` | Rename the current session. |
+| `SessionList` | — | List active sessions. |
+| `SessionSave` | — | Persist session state to disk immediately. |
+| `FolderNew` | `<name>` | Create a new folder. |
+| `FolderDelete` | `<name>` | Delete a folder. |
+| `FolderList` | — | List folders. |
+| `FolderMoveSession` | `<session> [folder]` | Move a session into a folder (omit folder to unfile it). |
+| `BufferEditInEditor` | — | Open the focused pane's scrollback in `$EDITOR`. |
+| `OpenSessionManager` | — | Open the tree-view session manager overlay. |
+| `RemoteConnect` | `<user@host\|alias>` | Connect to a remote server over SSH — an SSH destination/`~/.ssh/config` host, or a `[remotes.<name>]` alias. |
+| `SessionMoveToFolder` | — | Open a folder picker to move the current session. |
+| `SessionSwitchLast` | — | Toggle back to the previously-attached session. |
+| `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
+| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle). |
+| `SetMaster` | — | Make the focused pane the master pane (Master layout). |
+| `EnterNormal` | — | Return to Normal mode (keys pass to the app). |
+| `EnterCommandMode` | — | Enter Command mode (navigate the leader tree). |
+| `EnterVisualMode` | — | Enter Visual/copy mode. |
+
+> A few binding-only actions are handled directly by the client and so aren't in the palette list above: `EnterSearchMode`, `SendKey <key-notation>`, `SessionQuickSwitch`, and `CommandPaletteOpen`.
+
+## Chaining commands
+
+A keybinding value can run **multiple commands in sequence** by separating them with semicolons. This works for both leader-tree leaves and Alt shortcuts:
 
 ```toml
-[general]
-scrollback_lines = 10000
-automatic_restore = true
-mouse_auto_yank = true
+[keybindings.command]
+"Alt-x" = "PaneNew; PaneFocusRight"     # create a pane, then focus right
 
-[appearance]
-status_bar_position = "bottom"     # "top" or "bottom"
-border_style = "zellij_style"      # "zellij_style" or "tmux_style"
-
-[modes.command]
-timeout_ms = 500                   # Which-key popup delay
-
-# Leader key
-leader = "Ctrl-a"
-
-# Modifier shortcuts (Normal mode, bypass leader)
-"Alt-h" = "PaneFocusLeft"
-"Alt-j" = "PaneFocusDown"
-"Alt-k" = "PaneFocusUp"
-"Alt-l" = "PaneFocusRight"
-"Alt-n" = "TabNext"
-"Alt-p" = "@p"                     # Open Pane which-key group
-"Alt-t" = "@t"                     # Open Tab which-key group
-
-# Keybinding groups
-[keybindings.command.t]
-_label = "Tab"
-n = "TabNew; EnterNormal"
-c = "TabClose; EnterNormal"
+[keybindings.command.p]
+n = "PaneNew; EnterNormal"              # create a pane and drop back to Normal
 ```
 
-### Theming
+If a chain includes `EnterNormal`, you return to Normal mode after it runs; otherwise you stay in Command mode for further keys. This is why most default tree leaves end in `; EnterNormal` — the action fires and control returns to the application.
 
-Colors accept named strings, ANSI 256 indices, RGB tuples, or hex strings:
+### Group-prefix shortcuts (`@group`)
+
+An Alt shortcut value can be a `@`-prefixed **group path** instead of a command chain. It opens that leader-tree group directly (showing its which-key level) without pressing the leader first:
+
+```toml
+[keybindings.command]
+"Alt-p" = "@p"      # jump straight into the Pane group
+"Alt-t" = "@t"      # jump straight into the Tab group
+```
+
+### Overriding and unbinding
+
+User bindings **merge on top of** the defaults — you only redefine the keys you want to change. Set a binding to an empty string to remove it:
+
+```toml
+[keybindings.command]
+leader = "Ctrl-b"   # remap the leader key
+"Alt-h" = ""        # remove a default Alt shortcut
+
+[keybindings.command.v]
+# (root-level leader keys go directly under [keybindings.command])
+```
+
+## Configuration
+
+The full, commented reference is [`config.sample.toml`](config.sample.toml). Highlights:
+
+- **`[general]`**
+  - `default_shell` — override `$SHELL` for new panes.
+  - `scrollback_lines` — lines kept per pane (default 10000).
+  - `save_sessions` — persist session state to disk (default `true`). When `false`, nothing is written and `automatic_restore` is ignored.
+  - `automatic_restore` — restore persisted sessions live on startup (default `true`). With `save_sessions = true` and this `false`, saved sessions load as **dormant/resurrectable** entries in the session manager instead.
+  - `mouse_auto_yank` — auto-copy mouse selections on release (default `true`).
+- **`[appearance]`**
+  - `status_bar_position` — `"top"` or `"bottom"`.
+  - `border_style` — `"zellij_style"` or `"tmux_style"`.
+  - `default_layout` — `"bsp"`, `"master"`, `"monocle"`, or `"custom"`.
+  - `which_key_position` — `"anchored"`, `"centered"`, or `"full_width"`.
+  - `[appearance.theme]` — per-role colors (named / hex / `{ ansi = N }` / `{ rgb = [r,g,b] }`); defaults are Catppuccin Mocha.
+- **`[modes.command]`**
+  - `timeout_ms` — delay before the which-key popup appears (default 500).
+- **`[remotes.<name>]`** — declare SSH-reachable remote servers:
+
+```toml
+[remotes.pi]
+ssh = "pi@raspberrypi.local"
+remux_path = "/usr/local/bin/remux"
+
+[remotes.server]
+ssh = "user@example.com"
+port = 2222
+identity = "~/.ssh/id_ed25519"
+extra_args = ["-o", "StrictHostKeyChecking=no"]
+```
+
+### Theming example
+
+Colors accept named strings, CSS hex, ANSI 256 indices, or RGB tuples:
 
 ```toml
 [appearance.theme]
-mode_normal_fg = "black"
-mode_normal_bg = "bright_green"
+mode_normal_fg = "#1e1e2e"
+mode_normal_bg = "#a6e3a1"
 frame_active_fg = { ansi = 2 }
 status_bar_bg = { rgb = [40, 40, 40] }
-session_name_fg = "#CBA6F7"
+session_name_fg = "#94e2d5"
 ```
-
-## CLI Usage
-
-```
-remux new --session <name> [--folder <dir>]   # Create session
-remux attach <name>                            # Attach to session
-remux ls                                       # List sessions
-remux kill <name>                              # Kill session
-remux                                          # Attach to "main" or create it
-```
-
-## Building
-
-```
-cargo build --release
-```
-
-Requires a Unix/Linux system (uses POSIX PTY).
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
 
 ---
 
