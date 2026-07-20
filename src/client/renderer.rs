@@ -75,7 +75,11 @@ impl Renderer {
             let mut last_italic = false;
             let mut last_underline = false;
 
-            queue!(stdout, ResetColor)?;
+            // Full SGR reset (SGR 0) so the terminal's real state matches the
+            // per-row assumption that fg/bg are Default and bold/italic/underline
+            // are off. `ResetColor` only clears colors, leaving stale
+            // bold/italic/underline from a previous row visible on leading cells.
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
 
             for (x, cell) in row.iter().enumerate() {
                 if x as u16 >= self.cols {
@@ -352,7 +356,10 @@ impl Renderer {
             let mut last_italic = false;
             let mut last_underline = false;
 
-            queue!(stdout, ResetColor)?;
+            // Full SGR reset (SGR 0): see render_full. Matches the per-row
+            // last_* = Default/false assumption so a non-underlined leading cell
+            // is not left underlined by a previous row's trailing state.
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
 
             for col in 0..pw {
                 let screen_x = px + col;
