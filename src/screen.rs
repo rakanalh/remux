@@ -394,6 +394,9 @@ impl Screen {
 
     /// Handle the SGR (Select Graphic Rendition) escape sequence.
     fn handle_sgr(&mut self, params: &[&[u16]]) {
+        if std::env::var("REMUX_DEBUG_SGR").is_ok() {
+            log::info!("SGR params={:?}", params);
+        }
         if params.is_empty() {
             self.current_attrs = CellAttrs::default();
             return;
@@ -442,41 +445,40 @@ impl Screen {
                     self.current_attrs.bg = Color::Indexed((code - 100 + 8) as u8);
                 }
 
-                // Extended color: 38;5;N (256-color fg) or 38;2;R;G;B (truecolor fg)
+                // Extended foreground color. Two wire forms:
+                //   SEMICOLON: `38;5;N` / `38;2;R;G;B` — sub-params are in the
+                //     following separate param slices; we advance `i` past them.
+                //   COLON: `38:5:N` / `38:2:R:G:B` (or `38:2::R:G:B` with an
+                //     empty colorspace field) — vte packs the whole sequence
+                //     into this one slice, so nothing extra to advance.
                 38 => {
-                    if i + 1 < params.len() {
-                        let sub = params[i + 1].first().copied().unwrap_or(0);
-                        if sub == 5 && i + 2 < params.len() {
-                            let n = params[i + 2].first().copied().unwrap_or(0);
-                            self.current_attrs.fg = Color::Indexed(n as u8);
-                            i += 2;
-                        } else if sub == 2 && i + 4 < params.len() {
-                            let r = params[i + 2].first().copied().unwrap_or(0) as u8;
-                            let g = params[i + 3].first().copied().unwrap_or(0) as u8;
-                            let b = params[i + 4].first().copied().unwrap_or(0) as u8;
-                            self.current_attrs.fg = Color::Rgb(r, g, b);
-                            i += 4;
+                    if params[i].len() > 1 {
+                        if let Some(c) = Self::parse_colon_color(params[i]) {
+                            self.current_attrs.fg = c;
                         }
+                    } else if let Some((c, adv)) = Self::parse_semicolon_color(params, i) {
+                        self.current_attrs.fg = c;
+                        i += adv;
                     }
                 }
 
-                // Extended color: 48;5;N (256-color bg) or 48;2;R;G;B (truecolor bg)
+                // Extended background color (see `38` above for the two forms).
                 48 => {
-                    if i + 1 < params.len() {
-                        let sub = params[i + 1].first().copied().unwrap_or(0);
-                        if sub == 5 && i + 2 < params.len() {
-                            let n = params[i + 2].first().copied().unwrap_or(0);
-                            self.current_attrs.bg = Color::Indexed(n as u8);
-                            i += 2;
-                        } else if sub == 2 && i + 4 < params.len() {
-                            let r = params[i + 2].first().copied().unwrap_or(0) as u8;
-                            let g = params[i + 3].first().copied().unwrap_or(0) as u8;
-                            let b = params[i + 4].first().copied().unwrap_or(0) as u8;
-                            self.current_attrs.bg = Color::Rgb(r, g, b);
-                            i += 4;
+                    if params[i].len() > 1 {
+                        if let Some(c) = Self::parse_colon_color(params[i]) {
+                            self.current_attrs.bg = c;
                         }
+                    } else if let Some((c, adv)) = Self::parse_semicolon_color(params, i) {
+                        self.current_attrs.bg = c;
+                        i += adv;
                     }
                 }
+
+                // Underline color set (58) / reset (59): explicitly ignored so
+                // they never leak into the `underline` bool. The colon form
+                // packs its sub-params into this slice; the semicolon form's
+                // trailing params are harmless no-ops on subsequent iterations.
+                58 | 59 => {}
 
                 _ => {} // Ignore unknown SGR codes
             }
@@ -487,6 +489,49 @@ impl Screen {
     /// Take any pending PTY responses (e.g., DSR replies).
     pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pty_responses)
+    }
+
+    /// Parse an extended color from the COLON form, where vte has packed the
+    /// whole sequence into a single param slice, e.g. `38:5:N` → `[38, 5, N]`
+    /// and `38:2:R:G:B` → `[38, 2, R, G, B]` (with `38:2::R:G:B` giving an
+    /// empty colorspace field as `[38, 2, 0, R, G, B]`).
+    fn parse_colon_color(param: &[u16]) -> Option<Color> {
+        match *param.get(1)? {
+            5 => param.get(2).map(|&n| Color::Indexed(n as u8)),
+            2 => {
+                // Trailing components after the `2` selector. Either
+                // `[R, G, B]` or `[colorspace, R, G, B]` (possibly with more
+                // fields) — in the latter case take the last three as RGB.
+                let comps = &param[2..];
+                let rgb = match comps.len() {
+                    n if n >= 4 => &comps[n - 3..],
+                    3 => comps,
+                    _ => return None,
+                };
+                Some(Color::Rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8))
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse an extended color from the SEMICOLON form, where the sub-params
+    /// live in separate param slices starting at `params[i + 1]` (`38;5;N` or
+    /// `38;2;R;G;B`). Returns the color and how many extra params it consumed
+    /// so the caller can advance its index.
+    fn parse_semicolon_color(params: &[&[u16]], i: usize) -> Option<(Color, usize)> {
+        match params.get(i + 1)?.first().copied()? {
+            5 => {
+                let n = params.get(i + 2)?.first().copied()?;
+                Some((Color::Indexed(n as u8), 2))
+            }
+            2 => {
+                let r = params.get(i + 2)?.first().copied()? as u8;
+                let g = params.get(i + 3)?.first().copied()? as u8;
+                let b = params.get(i + 4)?.first().copied()? as u8;
+                Some((Color::Rgb(r, g, b), 4))
+            }
+            _ => None,
+        }
     }
 
     /// Get the first parameter value from a CSI parameter list, with a default.
@@ -1356,6 +1401,36 @@ mod tests {
         let mut s = make_screen();
         s.process_output(b"\x1b[38;2;100;150;200mA"); // Truecolor fg
         assert_eq!(s.grid[0][0].attrs.fg, Color::Rgb(100, 150, 200));
+    }
+
+    #[test]
+    fn test_sgr_truecolor_colon() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b[38:2:10:20:30mA"); // colon-form truecolor fg
+        assert_eq!(s.grid[0][0].attrs.fg, Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn test_sgr_truecolor_colon_empty_colorspace() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b[38:2::10:20:30mA"); // empty colorspace field
+        assert_eq!(s.grid[0][0].attrs.fg, Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn test_sgr_256_color_colon() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b[38:5:200mA"); // colon-form 256-color fg
+        assert_eq!(s.grid[0][0].attrs.fg, Color::Indexed(200));
+    }
+
+    #[test]
+    fn test_sgr_underline_color_ignored() {
+        let mut s = make_screen();
+        // 58 is underline color; it must not set the underline attribute.
+        s.process_output(b"\x1b[58:2:1:2:3mA");
+        assert!(!s.current_attrs.underline);
+        assert!(!s.grid[0][0].attrs.underline);
     }
 
     #[test]
