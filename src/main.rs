@@ -1346,6 +1346,13 @@ async fn run_client_loop(
                                         mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;
                                         mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
+                                    // Resurrecting a dormant session is Local-only: it
+                                    // materializes the saved session on the local server,
+                                    // then refreshes the tree so it moves from Saved to live.
+                                    SessionManagerAction::ResurrectSession(name) => {
+                                        mgr.send(&ConnId::Local, ClientMessage::ResurrectSession { name: name.clone() }).await?;
+                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                    }
                                     SessionManagerAction::CloseTab { session, tab_index } => {
                                         mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::TabCloseByIndex {
                                             session: session.clone(),
@@ -2075,8 +2082,8 @@ async fn run_client_loop(
                             .await?;
                         }
                     }
-                    Some(ServerMessage::SessionTree { folders, unfiled }) => {
-                        log::debug!("srv: SessionTree src={:?} folders={} unfiled={}", src, folders.len(), unfiled.len());
+                    Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
+                        log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
                         // The session-switch popup aggregates every connected
                         // server's tree, so it accepts trees from ANY source
                         // (not just the foreground) and tags each with `src`,
@@ -2137,7 +2144,7 @@ async fn run_client_loop(
                         else if let Some(sm) = input.session_manager.as_mut() {
                             sm.set_foreground(mgr.foreground().clone());
                             sm.set_roster(mgr.server_roster());
-                            sm.update_tree(src, folders, unfiled);
+                            sm.update_tree(src, folders, unfiled, dormant);
                             // If, after merging, no server has any session and the
                             // foreground is local, the last session was closed —
                             // exit as before. A remote-only empty tree must not

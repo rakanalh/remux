@@ -87,6 +87,11 @@ pub enum ClientMessage {
     SearchInfo { current: usize, total: usize },
     /// Request the full session tree (folders, sessions, tabs, panes).
     ListSessionTree,
+    /// Materialize a dormant (saved-but-not-live) session into a live session
+    /// by name, reusing the startup restore path. Only meaningful when the
+    /// server was started with `save_sessions = true` and
+    /// `automatic_restore = false`.
+    ResurrectSession { name: String },
     /// Scroll the focused pane by delta lines (positive = up/back, negative = down/forward).
     /// The server owns the scroll offset and clamps it to valid range.
     ScrollDelta { delta: i32 },
@@ -174,6 +179,12 @@ pub enum ServerMessage {
     SessionTree {
         folders: Vec<FolderTreeEntry>,
         unfiled: Vec<SessionTreeEntry>,
+        /// Names of dormant (saved-but-not-live) sessions that can be
+        /// resurrected. Empty unless the server runs with `save_sessions` and
+        /// `automatic_restore = false`. `#[serde(default)]` keeps the field
+        /// optional on the wire for back-compat with older peers.
+        #[serde(default)]
+        dormant: Vec<String>,
     },
 }
 
@@ -700,18 +711,24 @@ mod tests {
                 client_count: 0,
                 is_current: false,
             }],
+            dormant: vec!["saved-a".to_string()],
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         match decoded {
-            ServerMessage::SessionTree { folders, unfiled } => {
+            ServerMessage::SessionTree {
+                folders,
+                unfiled,
+                dormant,
+            } => {
                 assert_eq!(folders.len(), 1);
                 assert_eq!(folders[0].name, "work");
                 assert_eq!(folders[0].sessions[0].name, "proj");
                 assert!(folders[0].sessions[0].is_current);
                 assert_eq!(unfiled.len(), 1);
                 assert_eq!(unfiled[0].name, "scratch");
+                assert_eq!(dormant, vec!["saved-a".to_string()]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

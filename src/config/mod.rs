@@ -72,9 +72,15 @@ pub struct GeneralConfig {
     pub default_shell: Option<String>,
     /// Maximum number of scrollback lines per pane.
     pub scrollback_lines: usize,
-    /// When true (default), automatically save and restore sessions across
-    /// server restarts. State is saved after every structural change
-    /// (session/tab/pane create/close/rename) and restored on startup.
+    /// When true (default), the server persists session state to disk (after
+    /// every structural change and on shutdown). When false, no persistence
+    /// happens at all -- sessions are never written to disk and
+    /// `automatic_restore` is ignored.
+    pub save_sessions: bool,
+    /// When true (default), automatically restore persisted sessions live on
+    /// startup. When false (and `save_sessions` is true), persisted sessions
+    /// are loaded as dormant/resurrectable instead of being brought live, and
+    /// can be materialized on demand from the session manager.
     pub automatic_restore: bool,
     /// When true (default), mouse text selection auto-copies to clipboard on
     /// release and clears the selection. When false, the selection stays visible
@@ -87,6 +93,7 @@ impl Default for GeneralConfig {
         Self {
             default_shell: None,
             scrollback_lines: 10_000,
+            save_sessions: true,
             automatic_restore: true,
             mouse_auto_yank: true,
         }
@@ -373,6 +380,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.general.scrollback_lines, 10_000);
         assert!(config.general.automatic_restore);
+        assert!(config.general.save_sessions);
         assert_eq!(config.modes.command.timeout_ms, 500);
         assert_eq!(
             config.appearance.status_bar_position,
@@ -390,6 +398,19 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.scrollback_lines, 5000);
         // Other values should be defaults.
+        assert!(config.general.automatic_restore);
+        assert!(config.general.save_sessions);
+    }
+
+    #[test]
+    fn deserialize_save_sessions_false() {
+        let toml_str = r#"
+            [general]
+            save_sessions = false
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.general.save_sessions);
+        // automatic_restore keeps its default when unspecified.
         assert!(config.general.automatic_restore);
     }
 

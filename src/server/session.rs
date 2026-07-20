@@ -141,6 +141,39 @@ impl ServerState {
         }
     }
 
+    /// Raise this state's pane/tab id counters so future allocations never
+    /// collide with any id used by `other`.
+    ///
+    /// Used when a dormant snapshot is loaded alongside a fresh live state
+    /// (`automatic_restore = false`): sessions created before a resurrect must
+    /// allocate ids above the *entire* dormant id range, otherwise a
+    /// resurrected pane/tab id would clash with a live one in the global pane
+    /// map. Reserves above both `other`'s used ids and its own next counters.
+    pub fn reserve_ids_above(&mut self, other: &ServerState) {
+        let other_max_pane = other
+            .sessions
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .flat_map(|t| layout::all_pane_ids(&t.layout))
+            .max()
+            .unwrap_or(0)
+            .max(other.next_pane_id.saturating_sub(1));
+        let other_max_tab = other
+            .sessions
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .map(|t| t.id)
+            .max()
+            .unwrap_or(0)
+            .max(other.next_tab_id.saturating_sub(1));
+        if self.next_pane_id <= other_max_pane {
+            self.next_pane_id = other_max_pane + 1;
+        }
+        if self.next_tab_id <= other_max_tab {
+            self.next_tab_id = other_max_tab + 1;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Session CRUD
     // -----------------------------------------------------------------------
@@ -705,6 +738,42 @@ mod tests {
         assert_eq!(state.next_pane_id(), 1);
         assert_eq!(state.next_pane_id(), 2);
         assert_eq!(state.next_pane_id(), 3);
+    }
+
+    #[test]
+    fn test_reserve_ids_above_prevents_collision() {
+        // A dormant snapshot that used pane ids 1..=3.
+        let mut dormant = ServerState::new();
+        dormant
+            .create_session(
+                "alpha",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+            )
+            .unwrap();
+        dormant
+            .create_session(
+                "beta",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+            )
+            .unwrap();
+
+        // A fresh live state would otherwise start allocating at pane id 1,
+        // colliding with the dormant snapshot.
+        let mut live = ServerState::new();
+        live.reserve_ids_above(&dormant);
+
+        // The next live pane id must exceed every id the dormant snapshot used.
+        let next = live.next_pane_id();
+        assert!(
+            next >= dormant.next_pane_id,
+            "live next_pane_id {next} should be >= dormant next {}",
+            dormant.next_pane_id
+        );
+        assert!(next > 2);
     }
 
     #[test]

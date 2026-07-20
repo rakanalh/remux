@@ -48,6 +48,17 @@ pub enum NodeType {
         tab_index: usize,
         pane_id: u64,
     },
+    /// Header row for the "Saved (resurrect)" group of dormant sessions. Local
+    /// server only for now.
+    SavedGroup {
+        server: ConnId,
+    },
+    /// A dormant (saved-but-not-live) session that can be resurrected. Pressing
+    /// Enter on it materializes the session on the server.
+    DormantSession {
+        server: ConnId,
+        name: String,
+    },
 }
 
 impl NodeType {
@@ -58,7 +69,9 @@ impl NodeType {
             NodeType::Folder { server, .. }
             | NodeType::Session { server, .. }
             | NodeType::Tab { server, .. }
-            | NodeType::Pane { server, .. } => server.clone(),
+            | NodeType::Pane { server, .. }
+            | NodeType::SavedGroup { server }
+            | NodeType::DormantSession { server, .. } => server.clone(),
         }
     }
 }
@@ -141,6 +154,8 @@ pub enum SessionManagerAction {
     },
     DeleteSession(String),
     DeleteFolder(String),
+    /// Resurrect a dormant (saved) session by name (Local server only).
+    ResurrectSession(String),
     CloseTab {
         session: String,
         tab_index: usize,
@@ -175,6 +190,10 @@ pub struct SessionManagerState {
     roster: Vec<(ConnId, String, RemoteState)>,
     /// Per-server raw tree data: `(folders, unfiled)`.
     trees: HashMap<ConnId, (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>)>,
+    /// Names of the Local server's dormant (saved-but-not-live) sessions,
+    /// rendered as a "Saved (resurrect)" group. Dormant sessions are a
+    /// Local-server concept for now.
+    dormant: Vec<String>,
 }
 
 /// Pad or truncate a string to exactly `target_width` display columns,
@@ -227,12 +246,19 @@ fn tab_key(server: &ConnId, session: &str, tab_index: usize) -> String {
     format!("tab:{}:{}:{}", server.key(), session, tab_index)
 }
 
+/// Expansion key for the "Saved (resurrect)" group node (namespaced by server).
+fn saved_key(server: &ConnId) -> String {
+    format!("saved:{}", server.key())
+}
+
 impl SessionManagerState {
     /// Create a new session manager state (initially just a local server node,
     /// expanded so local sessions show immediately as before).
     pub fn new(current_session: Option<String>) -> Self {
         let mut expanded = HashSet::new();
         expanded.insert(server_key(&ConnId::Local));
+        // Expand the Saved group by default so dormant sessions are discoverable.
+        expanded.insert(saved_key(&ConnId::Local));
         Self {
             rows: Vec::new(),
             selected: 0,
@@ -242,6 +268,7 @@ impl SessionManagerState {
             foreground: ConnId::Local,
             roster: vec![(ConnId::Local, "local".to_string(), RemoteState::Connected)],
             trees: HashMap::new(),
+            dormant: Vec::new(),
         }
     }
 
@@ -271,13 +298,19 @@ impl SessionManagerState {
         server: ConnId,
         folders: Vec<FolderTreeEntry>,
         unfiled: Vec<SessionTreeEntry>,
+        dormant: Vec<String>,
     ) {
         log::debug!(
-            "session_manager: update_tree server={:?} folders={} unfiled={}",
+            "session_manager: update_tree server={:?} folders={} unfiled={} dormant={}",
             server,
             folders.len(),
-            unfiled.len()
+            unfiled.len(),
+            dormant.len()
         );
+        // Dormant sessions are a Local-server concept for now.
+        if server == ConnId::Local {
+            self.dormant = dormant;
+        }
         // Determine whether this is the first data we've seen for this server.
         let is_first_load = self
             .trees
@@ -372,6 +405,34 @@ impl SessionManagerState {
 
                     for session in unfiled {
                         self.add_session_rows(&mut rows, id, session, 1);
+                    }
+                }
+
+                // Render the "Saved (resurrect)" group at the bottom of the
+                // Local server's children. Dormant sessions are Local-only.
+                if *id == ConnId::Local && !self.dormant.is_empty() {
+                    let gkey = saved_key(id);
+                    let group_expanded = self.expanded.contains(&gkey);
+                    rows.push(TreeRow {
+                        indent: 1,
+                        node_type: NodeType::SavedGroup { server: id.clone() },
+                        display_name: "Saved (resurrect)".to_string(),
+                        is_expanded: group_expanded,
+                        is_current: false,
+                    });
+                    if group_expanded {
+                        for name in &self.dormant {
+                            rows.push(TreeRow {
+                                indent: 2,
+                                node_type: NodeType::DormantSession {
+                                    server: id.clone(),
+                                    name: name.clone(),
+                                },
+                                display_name: format!("\u{1F4A4} {}", name),
+                                is_expanded: false,
+                                is_current: false,
+                            });
+                        }
                     }
                 }
             }
@@ -519,7 +580,9 @@ impl SessionManagerState {
                 session,
                 tab_index,
             } => tab_key(server, session, *tab_index),
-            NodeType::Pane { .. } => String::new(), // Panes don't expand.
+            NodeType::SavedGroup { server } => saved_key(server),
+            // Panes and dormant sessions don't expand.
+            NodeType::Pane { .. } | NodeType::DormantSession { .. } => String::new(),
         }
     }
 
@@ -588,6 +651,15 @@ impl SessionManagerState {
                 tab_index: *tab_index,
                 pane_id: *pane_id,
             },
+            // Enter on the Saved group toggles it; on a dormant session it
+            // resurrects that session.
+            NodeType::SavedGroup { .. } => {
+                self.toggle_expand();
+                SessionManagerAction::None
+            }
+            NodeType::DormantSession { name, .. } => {
+                SessionManagerAction::ResurrectSession(name.clone())
+            }
         }
     }
 
@@ -618,8 +690,8 @@ impl SessionManagerState {
                 }
             },
             // Leaf: nothing to expand.
-            NodeType::Pane { .. } => SessionManagerAction::None,
-            // Folder / Session / Tab: reveal children without switching.
+            NodeType::Pane { .. } | NodeType::DormantSession { .. } => SessionManagerAction::None,
+            // Folder / Session / Tab / SavedGroup: reveal children without switching.
             _ => {
                 self.expand_selected();
                 SessionManagerAction::None
@@ -645,8 +717,12 @@ impl SessionManagerState {
             NodeType::Tab {
                 session, tab_index, ..
             } => format!("tab {} in '{}'", tab_index, session),
-            // Cannot delete panes or server nodes.
-            NodeType::Pane { .. } | NodeType::Server { .. } => {
+            // Cannot delete panes, server nodes, or the saved group / dormant
+            // sessions.
+            NodeType::Pane { .. }
+            | NodeType::Server { .. }
+            | NodeType::SavedGroup { .. }
+            | NodeType::DormantSession { .. } => {
                 return SessionManagerAction::None;
             }
         };
@@ -683,7 +759,10 @@ impl SessionManagerState {
                 session: session.clone(),
                 tab_index: *tab_index,
             },
-            NodeType::Pane { .. } | NodeType::Server { .. } => SessionManagerAction::None,
+            NodeType::Pane { .. }
+            | NodeType::Server { .. }
+            | NodeType::SavedGroup { .. }
+            | NodeType::DormantSession { .. } => SessionManagerAction::None,
         }
     }
 
@@ -827,7 +906,7 @@ impl SessionManagerState {
                 let indent = "  ".repeat(row.indent);
 
                 let expand_marker = match &row.node_type {
-                    NodeType::Pane { .. } => "  ",
+                    NodeType::Pane { .. } | NodeType::DormantSession { .. } => "  ",
                     _ => {
                         if row.is_expanded {
                             "\u{25BC} "
@@ -1049,7 +1128,7 @@ mod tests {
 
     fn local_tree(state: &mut SessionManagerState) {
         let (folders, unfiled) = sample_tree();
-        state.update_tree(ConnId::Local, folders, unfiled);
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
     }
 
     /// Expand a server node by selecting its row and expanding it.
@@ -1216,7 +1295,12 @@ mod tests {
             ),
         ]);
         let (folders, unfiled) = sample_tree();
-        state.update_tree(ConnId::Remote("pi".to_string()), folders, unfiled);
+        state.update_tree(
+            ConnId::Remote("pi".to_string()),
+            folders,
+            unfiled,
+            Vec::new(),
+        );
         expand_server(&mut state, &ConnId::Remote("pi".to_string()));
 
         // Select the remote's session and try to delete it -> no-op, no sub-mode.
@@ -1245,7 +1329,12 @@ mod tests {
         ]);
         // Remote reports an is_current session, but it is not the foreground.
         let (folders, unfiled) = sample_tree();
-        state.update_tree(ConnId::Remote("pi".to_string()), folders, unfiled);
+        state.update_tree(
+            ConnId::Remote("pi".to_string()),
+            folders,
+            unfiled,
+            Vec::new(),
+        );
         expand_server(&mut state, &ConnId::Remote("pi".to_string()));
 
         let remote_session = state
@@ -1339,5 +1428,111 @@ mod tests {
         let theme = Theme::default();
         let cmds = state.render(80, 24, &theme);
         assert!(!cmds.is_empty());
+    }
+
+    #[test]
+    fn test_saved_group_built_from_dormant_sessions() {
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = sample_tree();
+        state.update_tree(
+            ConnId::Local,
+            folders,
+            unfiled,
+            vec!["saved-a".to_string(), "saved-b".to_string()],
+        );
+
+        // A SavedGroup header row exists under the Local server.
+        assert!(state.rows.iter().any(|r| matches!(
+            &r.node_type,
+            NodeType::SavedGroup {
+                server: ConnId::Local
+            }
+        )));
+        // Both dormant sessions are shown as DormantSession rows (expanded by
+        // default).
+        let dormant_names: Vec<&str> = state
+            .rows
+            .iter()
+            .filter_map(|r| match &r.node_type {
+                NodeType::DormantSession { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dormant_names, vec!["saved-a", "saved-b"]);
+    }
+
+    #[test]
+    fn test_no_saved_group_when_no_dormant_sessions() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state); // dormant is empty
+        assert!(!state
+            .rows
+            .iter()
+            .any(|r| matches!(&r.node_type, NodeType::SavedGroup { .. })));
+    }
+
+    #[test]
+    fn test_enter_on_dormant_session_returns_resurrect() {
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = sample_tree();
+        state.update_tree(ConnId::Local, folders, unfiled, vec!["saved-a".to_string()]);
+
+        let idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::DormantSession { name, .. } if name == "saved-a"))
+            .unwrap();
+        state.selected = idx;
+        let action = state.handle_enter();
+        assert!(matches!(
+            action,
+            SessionManagerAction::ResurrectSession(ref n) if n == "saved-a"
+        ));
+    }
+
+    #[test]
+    fn test_enter_on_saved_group_toggles_expand() {
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = sample_tree();
+        state.update_tree(ConnId::Local, folders, unfiled, vec!["saved-a".to_string()]);
+
+        let group_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::SavedGroup { .. }))
+            .unwrap();
+        state.selected = group_idx;
+        // Group starts expanded (dormant row visible); Enter collapses it.
+        let action = state.handle_enter();
+        assert!(matches!(action, SessionManagerAction::None));
+        assert!(!state
+            .rows
+            .iter()
+            .any(|r| matches!(&r.node_type, NodeType::DormantSession { .. })));
+    }
+
+    #[test]
+    fn test_dormant_only_for_local_server() {
+        let mut state = SessionManagerState::new(None);
+        state.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Remote("pi".to_string()),
+                "pi".to_string(),
+                RemoteState::Connected,
+            ),
+        ]);
+        // A remote server reporting dormant names must not create a Saved group.
+        let (folders, unfiled) = sample_tree();
+        state.update_tree(
+            ConnId::Remote("pi".to_string()),
+            folders,
+            unfiled,
+            vec!["remote-saved".to_string()],
+        );
+        assert!(!state
+            .rows
+            .iter()
+            .any(|r| matches!(&r.node_type, NodeType::SavedGroup { .. })));
     }
 }

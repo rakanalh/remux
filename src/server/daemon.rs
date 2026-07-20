@@ -25,9 +25,18 @@ use crate::server::compositor::{
     composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
 };
 use crate::server::layout::{self, CustomLayout, LayoutMode, PaneId, Rect};
-use crate::server::persistence;
+use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, Pty};
-use crate::server::session::ServerState;
+use crate::server::session::{Folder, ServerState};
+
+/// In-memory store of dormant (saved-but-not-live) sessions.
+///
+/// Populated at startup when `save_sessions = true` and
+/// `automatic_restore = false`: the persisted snapshot is loaded here instead
+/// of being brought live. Sessions migrate out of this store (into live
+/// `ServerState`) when the client resurrects them. Empty in every other mode,
+/// so the merge-on-save is a no-op on the default path.
+pub type DormantStore = Arc<Mutex<PersistedState>>;
 
 /// Type alias for the per-client previous-frame cache used for diff rendering.
 ///
@@ -141,6 +150,9 @@ pub struct RemuxServer {
     /// Previous composite frame per client (keyed by `client_id`), for diff
     /// computation. See [`PrevFrameCache`].
     prev_frames: Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>,
+    /// Dormant (saved-but-not-live) sessions awaiting resurrection. See
+    /// [`DormantStore`].
+    dormant: DormantStore,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +169,10 @@ impl RemuxServer {
             clients: Arc::new(Mutex::new(HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(0)),
             prev_frames: Arc::new(Mutex::new(HashMap::new())),
+            dormant: Arc::new(Mutex::new(PersistedState {
+                state: ServerState::new(),
+                pane_cwds: HashMap::new(),
+            })),
         }
     }
 
@@ -164,13 +180,34 @@ impl RemuxServer {
     pub async fn run(config: Config) -> Result<()> {
         let server = Self::new(config);
 
-        // Restore persisted state before accepting connections.
-        if server.config.general.automatic_restore {
+        // Load persisted state before accepting connections. Behavior depends
+        // on two config flags:
+        //   save_sessions=false            -> no persistence at all (skip load).
+        //   save_sessions, automatic_restore -> bring persisted sessions live.
+        //   save_sessions, !automatic_restore -> load persisted sessions as
+        //                                        dormant/resurrectable instead.
+        if server.config.general.save_sessions {
             match crate::server::persistence::load_state() {
                 Ok(Some(persisted)) => {
-                    log::info!("restoring persisted state");
-                    if let Err(e) = restore_state(&server, persisted).await {
-                        log::warn!("failed to restore state: {e}, starting fresh");
+                    if server.config.general.automatic_restore {
+                        log::info!("restoring persisted state");
+                        if let Err(e) = restore_state(&server, persisted).await {
+                            log::warn!("failed to restore state: {e}, starting fresh");
+                        }
+                    } else {
+                        let count = persisted.state.sessions.len();
+                        log::info!(
+                            "automatic_restore disabled: loaded {count} session(s) as dormant"
+                        );
+                        // Reserve live id space above the whole dormant id range
+                        // so sessions created before a resurrect never collide
+                        // with dormant pane/tab ids in the global pane map.
+                        {
+                            let mut st = server.state.lock().await;
+                            st.reserve_ids_above(&persisted.state);
+                        }
+                        let mut d = server.dormant.lock().await;
+                        *d = persisted;
                     }
                 }
                 Ok(None) => {
@@ -180,6 +217,8 @@ impl RemuxServer {
                     log::warn!("failed to load persisted state: {e}, starting fresh");
                 }
             }
+        } else {
+            log::info!("save_sessions disabled: persistence is off");
         }
 
         let path = socket_path();
@@ -229,6 +268,14 @@ impl RemuxServer {
 
     /// Perform graceful shutdown: save state, drop panes, remove socket.
     async fn shutdown(&self, socket_path: &std::path::Path) {
+        // Persistence is fully off when save_sessions is disabled.
+        if !self.config.general.save_sessions {
+            log::info!("save_sessions disabled: skipping state save on shutdown");
+            let _ = std::fs::remove_file(socket_path);
+            log::info!("shutdown complete");
+            return;
+        }
+
         log::info!("saving state before shutdown...");
 
         // Save persistent state.
@@ -242,9 +289,15 @@ impl RemuxServer {
             }
         }
 
-        if let Ok(persisted) =
+        if let Ok(mut persisted) =
             crate::server::persistence::PersistedState::from_server(&state, &pane_cwds)
         {
+            // Persist live + still-dormant sessions so a live-only save never
+            // clobbers un-resurrected dormant sessions on disk.
+            {
+                let dormant = self.dormant.lock().await;
+                merge_dormant_into(&mut persisted, &dormant);
+            }
             if let Err(e) = crate::server::persistence::save_state(&persisted) {
                 log::error!("failed to save state on shutdown: {e}");
             } else {
@@ -346,6 +399,7 @@ impl RemuxServer {
         let clients = Arc::clone(&self.clients);
         let config = Arc::clone(&self.config);
         let prev_frames = Arc::clone(&self.prev_frames);
+        let dormant = Arc::clone(&self.dormant);
 
         tokio::spawn(async move {
             let mut reader = read_half;
@@ -360,6 +414,7 @@ impl RemuxServer {
                             &clients,
                             &config,
                             &prev_frames,
+                            &dormant,
                         )
                         .await
                         {
@@ -401,6 +456,7 @@ async fn handle_client_message(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) -> Result<()> {
     // Log a summary of every incoming client message.
     match &msg {
@@ -439,6 +495,7 @@ async fn handle_client_message(
                 clients,
                 config,
                 prev_frames,
+                dormant,
             )
             .await
         }
@@ -463,7 +520,17 @@ async fn handle_client_message(
             .await
         }
         ClientMessage::Command(cmd) => {
-            handle_command(client_id, cmd, state, panes, clients, config, prev_frames).await
+            handle_command(
+                client_id,
+                cmd,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await
         }
         ClientMessage::CreateSession { name, folder } => {
             let result = handle_create_session(
@@ -476,17 +543,31 @@ async fn handle_client_message(
                 config,
             )
             .await;
-            save_if_enabled(state, panes, config).await;
+            save_if_enabled(state, panes, config, dormant).await;
             result
         }
         ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
         ClientMessage::KillSession { name } => {
             let result = handle_kill_session(&name, state, panes, clients).await;
-            save_if_enabled(state, panes, config).await;
+            save_if_enabled(state, panes, config, dormant).await;
             result
         }
         ClientMessage::ListSessionTree => {
-            handle_list_session_tree(client_id, state, panes, clients).await
+            handle_list_session_tree(client_id, state, panes, clients, dormant).await
+        }
+        ClientMessage::ResurrectSession { name } => {
+            let result = handle_resurrect_session(
+                &name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
+            save_if_enabled(state, panes, config, dormant).await;
+            result
         }
         ClientMessage::RequestScrollback => {
             handle_request_scrollback(client_id, state, panes, clients).await
@@ -608,6 +689,7 @@ async fn handle_attach(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) -> Result<()> {
     {
         let st = state.lock().await;
@@ -653,7 +735,16 @@ async fn handle_attach(
     )
     .await;
 
-    start_pty_forwarding(session_name, state, panes, clients, config, prev_frames).await;
+    start_pty_forwarding(
+        session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await;
     Ok(())
 }
 
@@ -750,6 +841,7 @@ async fn handle_command(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) -> Result<()> {
     let (session_name, cols, rows) = {
         let cls = clients.lock().await;
@@ -779,7 +871,16 @@ async fn handle_command(
             };
             log::debug!("server: TabNew session={session_name:?} new pane_id={pane_id}");
             spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
-            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             // Resize the new tab's panes to the drawn content area (mirrors the
             // PaneSplit* path) so the child sees the same rows the compositor
             // draws — otherwise the footer is clipped.
@@ -917,7 +1018,16 @@ async fn handle_command(
                 config,
             )
             .await?;
-            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -962,7 +1072,16 @@ async fn handle_command(
                 config,
             )
             .await?;
-            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -1116,7 +1235,16 @@ async fn handle_command(
                 config,
             )
             .await?;
-            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -1309,7 +1437,16 @@ async fn handle_command(
                 config,
             )
             .await?;
-            start_pty_forwarding(&session_name, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session_name,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -1375,7 +1512,16 @@ async fn handle_command(
                     return Ok(());
                 }
             }
-            start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             resize_session_panes(&session, cols, rows, state, panes, config).await?;
             // Invalidate all attached clients' baselines to force a fresh full
             // render (not a diff against stale content from a previous tab).
@@ -1415,7 +1561,16 @@ async fn handle_command(
                     }
                 }
             }
-            start_pty_forwarding(&session, state, panes, clients, config, prev_frames).await;
+            start_pty_forwarding(
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
             resize_session_panes(&session, cols, rows, state, panes, config).await?;
             // Invalidate all attached clients' baselines to force a fresh full
             // render.
@@ -1609,7 +1764,7 @@ async fn handle_command(
     }
 
     // Persist state after every command that may have changed structure.
-    save_if_enabled(state, panes, config).await;
+    save_if_enabled(state, panes, config, dormant).await;
 
     Ok(())
 }
@@ -1687,7 +1842,15 @@ async fn handle_list_session_tree(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    dormant: &DormantStore,
 ) -> Result<()> {
+    let dormant_names: Vec<String> = {
+        let d = dormant.lock().await;
+        let mut names: Vec<String> = d.state.sessions.keys().cloned().collect();
+        names.sort();
+        names
+    };
+
     let current_session = {
         let cls = clients.lock().await;
         cls.get(&client_id).and_then(|c| c.session_name.clone())
@@ -1728,9 +1891,11 @@ async fn handle_list_session_tree(
         st.build_session_tree(current_session.as_deref(), &client_counts, &pane_names);
 
     if let Some(client) = cls.get(&client_id) {
-        let _ = client
-            .tx
-            .send(ServerMessage::SessionTree { folders, unfiled });
+        let _ = client.tx.send(ServerMessage::SessionTree {
+            folders,
+            unfiled,
+            dormant: dormant_names,
+        });
     }
     Ok(())
 }
@@ -3383,6 +3548,7 @@ async fn start_pty_forwarding(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) {
     let pane_ids = {
         let st = state.lock().await;
@@ -3407,6 +3573,7 @@ async fn start_pty_forwarding(
         let clients = Arc::clone(clients);
         let config = Arc::clone(config);
         let prev_frames = Arc::clone(prev_frames);
+        let dormant = Arc::clone(dormant);
         let session_name = session_name.clone();
 
         tokio::spawn(async move {
@@ -3494,7 +3661,7 @@ async fn start_pty_forwarding(
                             &prev_frames,
                         )
                         .await;
-                        save_if_enabled(&state, &panes, &config).await;
+                        save_if_enabled(&state, &panes, &config, &dormant).await;
                         break;
                     }
                     None => {
@@ -3515,18 +3682,20 @@ async fn start_pty_forwarding(
 // Event-driven save helper
 // ---------------------------------------------------------------------------
 
-/// Save the server state to disk if automatic_restore is enabled.
+/// Save the server state to disk if `save_sessions` is enabled.
 ///
 /// This captures the current working directory of every pane and writes
-/// the full server state to the persistence file. It is called after
+/// the full server state (live sessions merged with any still-dormant
+/// sessions) to the persistence file. It is called after
 /// every structural change (session/tab/pane create/close/rename).
 async fn save_if_enabled(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
+    dormant: &DormantStore,
 ) {
-    if !config.general.automatic_restore {
-        log::debug!("server: save_if_enabled skipped (automatic_restore=false)");
+    if !config.general.save_sessions {
+        log::debug!("server: save_if_enabled skipped (save_sessions=false)");
         return;
     }
     log::debug!("server: save_if_enabled saving state");
@@ -3538,54 +3707,113 @@ async fn save_if_enabled(
             pane_cwds.insert(pane_id, cwd);
         }
     }
-    if let Ok(persisted) = crate::server::persistence::PersistedState::from_server(&st, &pane_cwds)
+    if let Ok(mut persisted) =
+        crate::server::persistence::PersistedState::from_server(&st, &pane_cwds)
     {
+        // Persist live + still-dormant sessions so a live-only save never
+        // clobbers un-resurrected dormant sessions on disk. No-op (byte-identical
+        // to a live-only save) whenever the dormant store is empty, which is the
+        // case on the default automatic_restore path and when save_sessions is
+        // the only persistence toggle.
+        {
+            let d = dormant.lock().await;
+            merge_dormant_into(&mut persisted, &d);
+        }
         if let Err(e) = crate::server::persistence::save_state(&persisted) {
             log::error!("failed to save state: {e}");
         }
     }
 }
 
+/// Deep-clone a [`ServerState`] via serde (it doesn't derive `Clone`).
+fn clone_server_state(state: &ServerState) -> Option<ServerState> {
+    let json = serde_json::to_string(state).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Merge the still-dormant sessions/folders/cwds into a live snapshot so a
+/// save writes the union of live and dormant state. Live entries win on any
+/// name collision; folders are unioned by `session_ids`.
+fn merge_dormant_into(target: &mut PersistedState, dormant: &PersistedState) {
+    if dormant.state.sessions.is_empty() && dormant.state.folders.is_empty() {
+        return;
+    }
+    let dstate = match clone_server_state(&dormant.state) {
+        Some(s) => s,
+        None => {
+            log::error!("merge_dormant_into: failed to clone dormant state; saving live-only");
+            return;
+        }
+    };
+    for (name, session) in dstate.sessions {
+        target.state.sessions.entry(name).or_insert(session);
+    }
+    for (fname, folder) in dstate.folders {
+        let entry = target
+            .state
+            .folders
+            .entry(fname.clone())
+            .or_insert_with(|| Folder {
+                name: fname,
+                session_ids: Vec::new(),
+            });
+        for sid in folder.session_ids {
+            if !entry.session_ids.contains(&sid) {
+                entry.session_ids.push(sid);
+            }
+        }
+    }
+    for (&pid, cwd) in &dormant.pane_cwds {
+        target.pane_cwds.entry(pid).or_insert_with(|| cwd.clone());
+    }
+    // Keep id counters above any merged pane/tab id.
+    target.state.ensure_id_counters();
+}
+
 // ---------------------------------------------------------------------------
 // State restore on startup
 // ---------------------------------------------------------------------------
 
-/// Restore server state from a persisted snapshot.
+/// Bring a single session (already present in live `ServerState`) to life:
+/// spawn a PTY for each of its panes (using saved CWDs) and start PTY
+/// forwarding for them. Panes are initially sized 80x24; they are resized when
+/// the first client attaches and sends a `Resize`.
 ///
-/// Replaces the server's state with the deserialized state, spawns new PTYs
-/// for every pane (using saved CWDs), and starts PTY forwarding. Panes are
-/// initially sized 80x24; they will be resized when the first client attaches
-/// and sends a `Resize` message.
-async fn restore_state(
-    server: &RemuxServer,
-    persisted: crate::server::persistence::PersistedState,
+/// This is the shared per-session materialization path used by both startup
+/// `automatic_restore` ([`restore_state`]) and on-demand
+/// [`handle_resurrect_session`].
+#[allow(clippy::too_many_arguments)]
+async fn materialize_session(
+    session_name: &str,
+    pane_cwds: &HashMap<u64, String>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
 ) -> Result<()> {
-    let mut restored_state = persisted.state;
-    restored_state.ensure_id_counters();
-
-    // Collect all (session_name, pane_id, cwd) triples for PTY spawning.
-    let mut pane_spawns: Vec<(String, PaneId, Option<String>)> = Vec::new();
-    for (session_name, session) in &restored_state.sessions {
-        for tab in &session.tabs {
-            let pane_ids = layout::all_pane_ids(&tab.layout);
-            for pane_id in pane_ids {
-                let cwd = persisted.pane_cwds.get(&pane_id).cloned();
-                pane_spawns.push((session_name.clone(), pane_id, cwd));
+    // Collect this session's pane ids across all tabs from live state.
+    let pane_ids: Vec<PaneId> = {
+        let st = state.lock().await;
+        match st.sessions.get(session_name) {
+            Some(sess) => sess
+                .tabs
+                .iter()
+                .flat_map(|t| layout::all_pane_ids(&t.layout))
+                .collect(),
+            None => {
+                log::warn!("materialize_session: session '{session_name}' not in live state");
+                return Ok(());
             }
         }
-    }
+    };
 
-    // Replace the server state.
-    {
-        let mut st = server.state.lock().await;
-        *st = restored_state;
-    }
-
-    // Spawn PTYs for all restored panes.
+    // Spawn PTYs for all panes. Panes start at 80x24 and are resized on attach.
     let default_cols: u16 = 80;
     let default_rows: u16 = 24;
-
-    for (_session_name, pane_id, cwd) in &pane_spawns {
+    for pane_id in &pane_ids {
+        let cwd = pane_cwds.get(pane_id).cloned();
         let cwd_path = cwd.as_deref().map(std::path::Path::new);
         if let Err(e) = spawn_pane(
             *pane_id,
@@ -3593,8 +3821,8 @@ async fn restore_state(
             default_rows,
             None,
             cwd_path,
-            &server.panes,
-            &server.config,
+            panes,
+            config,
         )
         .await
         {
@@ -3602,118 +3830,343 @@ async fn restore_state(
         }
     }
 
-    // Start PTY forwarding for all sessions and all tabs.
-    let session_names: Vec<String> = {
-        let st = server.state.lock().await;
-        st.sessions.keys().cloned().collect()
-    };
-    for session_name in &session_names {
-        let all_pane_ids: Vec<PaneId> = {
-            let st = server.state.lock().await;
-            if let Some(sess) = st.sessions.get(session_name) {
-                sess.tabs
-                    .iter()
-                    .flat_map(|t| layout::all_pane_ids(&t.layout))
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
+    // Start PTY forwarding for every pane.
+    for pane_id in pane_ids {
+        let state = Arc::clone(state);
+        let panes = Arc::clone(panes);
+        let clients = Arc::clone(clients);
+        let config = Arc::clone(config);
+        let prev_frames = Arc::clone(prev_frames);
+        let dormant = Arc::clone(dormant);
+        let session_name = session_name.to_string();
 
-        let sn = session_name.clone();
-        for pane_id in all_pane_ids {
-            let state = Arc::clone(&server.state);
-            let panes = Arc::clone(&server.panes);
-            let clients = Arc::clone(&server.clients);
-            let config = Arc::clone(&server.config);
-            let prev_frames = Arc::clone(&server.prev_frames);
-            let session_name = sn.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    let recv_result = {
-                        let mut ps = panes.lock().await;
-                        if let Some(pane_data) = ps.get_mut(&pane_id) {
-                            match pane_data.pty_rx.try_recv() {
-                                Ok(data) => Some(Ok(data)),
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    Some(Err(()))
-                                }
+        tokio::spawn(async move {
+            loop {
+                let recv_result = {
+                    let mut ps = panes.lock().await;
+                    if let Some(pane_data) = ps.get_mut(&pane_id) {
+                        match pane_data.pty_rx.try_recv() {
+                            Ok(data) => Some(Ok(data)),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                Some(Err(()))
                             }
-                        } else {
-                            break;
                         }
-                    };
+                    } else {
+                        break;
+                    }
+                };
 
-                    match recv_result {
-                        Some(Ok(data)) => {
-                            let responses = {
-                                let mut ps = panes.lock().await;
-                                if let Some(pane_data) = ps.get_mut(&pane_id) {
-                                    pane_data.screen.process_output(&data);
-                                    pane_data.screen.take_responses()
-                                } else {
-                                    Vec::new()
-                                }
-                            };
-                            if !responses.is_empty() {
-                                let ps = panes.lock().await;
-                                if let Some(pane_data) = ps.get(&pane_id) {
-                                    for resp in &responses {
-                                        let _ = pane_data.pty.write_input(resp);
-                                    }
-                                }
+                match recv_result {
+                    Some(Ok(data)) => {
+                        let responses = {
+                            let mut ps = panes.lock().await;
+                            if let Some(pane_data) = ps.get_mut(&pane_id) {
+                                pane_data.screen.process_output(&data);
+                                pane_data.screen.take_responses()
+                            } else {
+                                Vec::new()
                             }
-                            broadcast_full_render(
-                                &session_name,
-                                &state,
-                                &panes,
-                                &clients,
-                                &config,
-                                &prev_frames,
-                            )
-                            .await;
-                        }
-                        Some(Err(())) => {
-                            close_pane(
-                                pane_id,
-                                &session_name,
-                                &state,
-                                &panes,
-                                &clients,
-                                &config,
-                                &prev_frames,
-                            )
-                            .await;
-                            save_if_enabled(&state, &panes, &config).await;
-                            break;
-                        }
-                        None => {
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        };
+                        if !responses.is_empty() {
                             let ps = panes.lock().await;
-                            if !ps.contains_key(&pane_id) {
-                                break;
+                            if let Some(pane_data) = ps.get(&pane_id) {
+                                for resp in &responses {
+                                    let _ = pane_data.pty.write_input(resp);
+                                }
                             }
+                        }
+                        broadcast_full_render(
+                            &session_name,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
+                    }
+                    Some(Err(())) => {
+                        close_pane(
+                            pane_id,
+                            &session_name,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
+                        save_if_enabled(&state, &panes, &config, &dormant).await;
+                        break;
+                    }
+                    None => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        let ps = panes.lock().await;
+                        if !ps.contains_key(&pane_id) {
+                            break;
                         }
                     }
                 }
-            });
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Restore server state from a persisted snapshot on startup
+/// (`automatic_restore = true`).
+///
+/// Replaces the server's state with the deserialized state, then materializes
+/// every session via the shared [`materialize_session`] path.
+async fn restore_state(
+    server: &RemuxServer,
+    persisted: crate::server::persistence::PersistedState,
+) -> Result<()> {
+    let mut restored_state = persisted.state;
+    restored_state.ensure_id_counters();
+
+    let session_names: Vec<String> = restored_state.sessions.keys().cloned().collect();
+
+    // Replace the server state.
+    {
+        let mut st = server.state.lock().await;
+        *st = restored_state;
+    }
+
+    for session_name in &session_names {
+        materialize_session(
+            session_name,
+            &persisted.pane_cwds,
+            &server.state,
+            &server.panes,
+            &server.clients,
+            &server.config,
+            &server.prev_frames,
+            &server.dormant,
+        )
+        .await?;
+    }
+
+    log::info!("restored {} sessions", session_names.len());
+    Ok(())
+}
+
+/// Move the named session from a dormant snapshot into live `ServerState`,
+/// recreating folder membership. Returns the CWDs of the session's panes (for
+/// PTY spawning) on success, or `None` if the name isn't dormant or a live
+/// session already exists under that name.
+///
+/// Pure state manipulation with no PTY side effects, so it is unit-testable
+/// independently of [`materialize_session`]. Guards on the live collision
+/// *before* removing from the dormant snapshot so a name clash never silently
+/// drops the dormant session.
+fn take_dormant_session(
+    dormant: &mut PersistedState,
+    live: &mut ServerState,
+    name: &str,
+) -> Option<HashMap<u64, String>> {
+    if live.sessions.contains_key(name) {
+        log::warn!("resurrect: live session '{name}' already exists; ignoring");
+        return None;
+    }
+    let session = match dormant.state.sessions.remove(name) {
+        Some(s) => s,
+        None => {
+            log::warn!("resurrect: no dormant session '{name}'");
+            return None;
+        }
+    };
+
+    // Detach from any dormant folder membership and collect its pane CWDs.
+    let folder = session.folder.clone();
+    if let Some(ref fname) = folder {
+        if let Some(f) = dormant.state.folders.get_mut(fname) {
+            f.session_ids.retain(|s| s != name);
+        }
+    }
+    let pane_ids: Vec<u64> = session
+        .tabs
+        .iter()
+        .flat_map(|t| layout::all_pane_ids(&t.layout))
+        .collect();
+    let mut cwds = HashMap::new();
+    for pid in &pane_ids {
+        if let Some(cwd) = dormant.pane_cwds.remove(pid) {
+            cwds.insert(*pid, cwd);
         }
     }
 
-    log::info!(
-        "restored {} sessions with {} panes",
-        session_names.len(),
-        pane_spawns.len()
-    );
+    // Insert into live state, recreating folder membership if needed.
+    if let Some(ref fname) = folder {
+        let entry = live.folders.entry(fname.clone()).or_insert_with(|| Folder {
+            name: fname.clone(),
+            session_ids: Vec::new(),
+        });
+        if !entry.session_ids.iter().any(|s| s == name) {
+            entry.session_ids.push(name.to_string());
+        }
+    }
+    live.sessions.insert(name.to_string(), session);
+    live.ensure_id_counters();
+    Some(cwds)
+}
+
+/// Materialize a dormant session into a live session on client request.
+///
+/// Migrates the session out of the dormant store into live `ServerState` (via
+/// [`take_dormant_session`]) and brings it live via the shared
+/// [`materialize_session`] path. No-op if the name isn't dormant or a live
+/// session already exists under that name.
+async fn handle_resurrect_session(
+    name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<()> {
+    // Lock state before dormant to match `save_if_enabled`'s ordering and avoid
+    // any lock-order inversion.
+    let cwds = {
+        let mut st = state.lock().await;
+        let mut d = dormant.lock().await;
+        match take_dormant_session(&mut d, &mut st, name) {
+            Some(c) => c,
+            None => return Ok(()),
+        }
+    };
+
+    log::info!("resurrecting dormant session '{name}'");
+    materialize_session(
+        name,
+        &cwds,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{arrow_report, compute_diff, wheel_report};
+    use super::{
+        arrow_report, compute_diff, merge_dormant_into, take_dormant_session, wheel_report,
+    };
     use crate::protocol::RenderCell;
+    use crate::server::persistence::PersistedState;
+    use crate::server::session::ServerState;
+    use std::collections::HashMap;
+
+    /// Build a `ServerState` with the named sessions (each optionally filed
+    /// under a folder), returning it alongside the first pane id of the first
+    /// listed session (handy for CWD assertions).
+    fn state_with_sessions(sessions: &[(&str, Option<&str>)]) -> ServerState {
+        let mut st = ServerState::new();
+        for (name, folder) in sessions {
+            if let Some(f) = folder {
+                if !st.folders.contains_key(*f) {
+                    st.create_folder(f).unwrap();
+                }
+            }
+            st.create_session(
+                name,
+                *folder,
+                crate::config::BorderStyle::ZellijStyle,
+                Default::default(),
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    #[test]
+    fn take_dormant_session_migrates_one_session_from_persisted_state() {
+        // A dormant snapshot with two sessions, one filed under "work".
+        let dstate = state_with_sessions(&[("alpha", Some("work")), ("beta", None)]);
+        let alpha_pane =
+            crate::server::layout::all_pane_ids(&dstate.sessions["alpha"].tabs[0].layout)[0];
+        let mut cwds = HashMap::new();
+        cwds.insert(alpha_pane, "/tmp/alpha".to_string());
+        let mut dormant = PersistedState {
+            state: dstate,
+            pane_cwds: cwds,
+        };
+
+        let mut live = ServerState::new();
+        let got =
+            take_dormant_session(&mut dormant, &mut live, "alpha").expect("alpha should resurrect");
+
+        // alpha migrated into live with its folder membership recreated.
+        assert!(live.sessions.contains_key("alpha"));
+        assert!(live
+            .folders
+            .get("work")
+            .unwrap()
+            .session_ids
+            .contains(&"alpha".to_string()));
+        assert_eq!(got.get(&alpha_pane).unwrap(), "/tmp/alpha");
+
+        // alpha (and its cwd) removed from dormant; beta remains dormant.
+        assert!(!dormant.state.sessions.contains_key("alpha"));
+        assert!(dormant.state.sessions.contains_key("beta"));
+        assert!(dormant.pane_cwds.is_empty());
+
+        // A name already live returns None (no double-resurrect).
+        assert!(take_dormant_session(&mut dormant, &mut live, "alpha").is_none());
+        // An unknown name returns None.
+        assert!(take_dormant_session(&mut dormant, &mut live, "nope").is_none());
+    }
+
+    #[test]
+    fn merge_dormant_into_unions_live_and_dormant() {
+        let mut target = PersistedState {
+            state: state_with_sessions(&[("live1", None)]),
+            pane_cwds: HashMap::new(),
+        };
+        let dormant = PersistedState {
+            state: state_with_sessions(&[("dorm1", Some("f"))]),
+            pane_cwds: HashMap::new(),
+        };
+
+        merge_dormant_into(&mut target, &dormant);
+
+        assert!(target.state.sessions.contains_key("live1"));
+        assert!(target.state.sessions.contains_key("dorm1"));
+        assert!(target
+            .state
+            .folders
+            .get("f")
+            .unwrap()
+            .session_ids
+            .contains(&"dorm1".to_string()));
+    }
+
+    #[test]
+    fn merge_dormant_into_is_noop_when_dormant_empty() {
+        // This is the default automatic_restore path: dormant is empty, so the
+        // save must be byte-identical to a live-only save.
+        let mut target = PersistedState {
+            state: state_with_sessions(&[("live1", None), ("live2", None)]),
+            pane_cwds: HashMap::new(),
+        };
+        let before = serde_json::to_string(&target).unwrap();
+
+        let empty = PersistedState {
+            state: ServerState::new(),
+            pane_cwds: HashMap::new(),
+        };
+        merge_dormant_into(&mut target, &empty);
+
+        let after = serde_json::to_string(&target).unwrap();
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn compute_diff_emits_wide_lead_when_only_continuation_differs() {
