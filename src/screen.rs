@@ -406,7 +406,13 @@ impl Screen {
                 0 => self.current_attrs = CellAttrs::default(),
                 1 => self.current_attrs.bold = true,
                 3 => self.current_attrs.italic = true,
-                4 => self.current_attrs.underline = true,
+                4 => {
+                    // Extended underline: `4:0` disables, `4:1..=4:5` are styles
+                    // (all shown as underline in our bool model), plain `4`
+                    // enables. vte groups colon sub-parameters into this slice,
+                    // so `params[i].get(1)` is the sub-param when present.
+                    self.current_attrs.underline = params[i].get(1).copied() != Some(0);
+                }
                 7 => self.current_attrs.reverse = true,
                 22 => self.current_attrs.bold = false,
                 23 => self.current_attrs.italic = false,
@@ -1489,5 +1495,44 @@ mod tests {
         s.cursor_x = 10;
         s.process_output(b"\x1b[5G"); // HPA col 5 (1-based) -> col 4 (0-based)
         assert_eq!(s.cursor_x, 4);
+    }
+
+    #[test]
+    fn test_sgr_extended_underline_off() {
+        // Regression: `ESC[4:0m` (extended-underline OFF) was mishandled because
+        // vte groups colon sub-parameters into a single param slice `[4, 0]`, and
+        // the SGR handler ignored the sub-param, leaving underline stuck on. This
+        // made every subsequent character render underlined under modern TUIs.
+        let mut s = make_screen();
+        // `4:3` (curly underline) enables underline in our bool model.
+        s.process_output(b"\x1b[4:3mX");
+        // `4:0` must turn underline back OFF.
+        s.process_output(b"\x1b[4:0mY");
+
+        assert!(
+            s.grid[0][0].attrs.underline,
+            "X should be underlined after ESC[4:3m"
+        );
+        assert!(
+            !s.grid[0][1].attrs.underline,
+            "Y should NOT be underlined after ESC[4:0m"
+        );
+    }
+
+    #[test]
+    fn test_sgr_plain_underline_on_off() {
+        // Plain-underline path still works: `ESC[4m` on, `ESC[24m` off.
+        let mut s = make_screen();
+        s.process_output(b"\x1b[4mX");
+        s.process_output(b"\x1b[24mY");
+
+        assert!(
+            s.grid[0][0].attrs.underline,
+            "X should be underlined after ESC[4m"
+        );
+        assert!(
+            !s.grid[0][1].attrs.underline,
+            "Y should NOT be underlined after ESC[24m"
+        );
     }
 }
