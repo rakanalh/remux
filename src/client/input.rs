@@ -2223,6 +2223,18 @@ mod tests {
         make_key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// Build a handler with `Alt-p` registered as a group-prefix shortcut.
+    ///
+    /// `Alt-p` is no longer a default shortcut, so tests that exercise the
+    /// `GroupPrefix` (which-key entry) mechanism register it explicitly here.
+    fn handler_with_alt_p_group() -> InputHandler {
+        let mut handler = InputHandler::with_defaults();
+        let value: toml::Value = "\"Alt-p\" = \"@p\"".parse().unwrap();
+        let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+        handler.reload_keybindings(KeybindingTree::default(), ctrl_key('a'), shortcuts);
+        handler
+    }
+
     // -- Mode transitions ---------------------------------------------------
 
     #[test]
@@ -3032,9 +3044,9 @@ mod tests {
     fn normal_alt_keys_unbound_pass_to_pty() {
         let mut handler = InputHandler::with_defaults();
         assert_eq!(handler.mode, Mode::Normal);
-        // Alt-z has no shortcut binding, so it passes through to PTY.
-        let action = handler.handle_key(alt_key('z'));
-        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'z']));
+        // Alt-w has no shortcut binding, so it passes through to PTY.
+        let action = handler.handle_key(alt_key('w'));
+        assert_eq!(action, InputAction::SendToPty(vec![0x1b, b'w']));
         assert_eq!(handler.mode, Mode::Normal);
     }
 
@@ -3154,7 +3166,7 @@ mod tests {
 
     #[test]
     fn alt_p_enters_command_mode_at_pane_group() {
-        let mut handler = InputHandler::with_defaults();
+        let mut handler = handler_with_alt_p_group();
         let key = KeyEvent::new_with_kind_and_state(
             KeyCode::Char('p'),
             KeyModifiers::ALT,
@@ -3190,7 +3202,7 @@ mod tests {
 
     #[test]
     fn escape_from_group_shortcut_returns_to_normal() {
-        let mut handler = InputHandler::with_defaults();
+        let mut handler = handler_with_alt_p_group();
         // Enter command mode at Pane group via Alt-p
         let alt_p = KeyEvent::new_with_kind_and_state(
             KeyCode::Char('p'),
@@ -3215,7 +3227,7 @@ mod tests {
 
     #[test]
     fn alt_p_then_n_creates_pane() {
-        let mut handler = InputHandler::with_defaults();
+        let mut handler = handler_with_alt_p_group();
         // Alt-p enters Pane group
         let alt_p = KeyEvent::new_with_kind_and_state(
             KeyCode::Char('p'),

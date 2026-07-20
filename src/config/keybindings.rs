@@ -70,25 +70,6 @@ fn group(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
 fn build_default_tree() -> HashMap<char, KeyNode> {
     let mut root = HashMap::new();
 
-    // t: Tab
-    root.insert(
-        't',
-        group(
-            "Tab",
-            vec![
-                ('n', leaf_chain("new", &["TabNew", "EnterNormal"])),
-                ('c', leaf_chain("close", &["TabClose", "EnterNormal"])),
-                ('m', leaf("move", "TabMove")),
-                ('r', leaf("rename", "TabRename")),
-                ('l', leaf_chain("list", &["TabNext", "EnterNormal"])),
-            ],
-        ),
-    );
-
-    // Quick tab navigation: Shift+] / Shift+[ (next / previous tab).
-    root.insert('}', leaf_chain("next tab", &["TabNext", "EnterNormal"]));
-    root.insert('{', leaf_chain("prev tab", &["TabPrev", "EnterNormal"]));
-
     // p: Pane
     root.insert(
         'p',
@@ -96,7 +77,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
             "Pane",
             vec![
                 ('n', leaf_chain("new", &["PaneNew", "EnterNormal"])),
-                ('c', leaf_chain("close", &["PaneClose", "EnterNormal"])),
+                ('x', leaf_chain("close", &["PaneClose", "EnterNormal"])),
                 (
                     's',
                     leaf_chain("split vertical", &["PaneSplitVertical", "EnterNormal"]),
@@ -119,6 +100,21 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     leaf_chain("focus right", &["PaneFocusRight", "EnterNormal"]),
                 ),
                 (
+                    'H',
+                    leaf_chain("move left", &["PaneMoveLeft", "EnterNormal"]),
+                ),
+                (
+                    'J',
+                    leaf_chain("move down", &["PaneMoveDown", "EnterNormal"]),
+                ),
+                ('K', leaf_chain("move up", &["PaneMoveUp", "EnterNormal"])),
+                (
+                    'L',
+                    leaf_chain("move right", &["PaneMoveRight", "EnterNormal"]),
+                ),
+                ('z', leaf_chain("zoom", &["PaneToggleZoom", "EnterNormal"])),
+                ('r', leaf("rename", "PaneRename")),
+                (
                     'a',
                     leaf_chain("stack add", &["PaneStackAdd", "EnterNormal"]),
                 ),
@@ -131,7 +127,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     leaf_chain("stack prev", &["PaneStackPrev", "EnterNormal"]),
                 ),
                 (
-                    'r',
+                    'R',
                     group(
                         "Resize",
                         vec![
@@ -142,7 +138,51 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                         ],
                     ),
                 ),
-                ('R', leaf("rename", "PaneRename")),
+            ],
+        ),
+    );
+
+    // t: Tab
+    root.insert(
+        't',
+        group(
+            "Tab",
+            vec![
+                ('n', leaf_chain("new", &["TabNew", "EnterNormal"])),
+                ('x', leaf_chain("close", &["TabClose", "EnterNormal"])),
+                ('r', leaf("rename", "TabRename")),
+                (']', leaf_chain("next", &["TabNext", "EnterNormal"])),
+                ('[', leaf_chain("prev", &["TabPrev", "EnterNormal"])),
+                ('m', leaf("move", "TabMove")),
+                ('1', leaf_chain("tab 1", &["TabGoto 0", "EnterNormal"])),
+                ('2', leaf_chain("tab 2", &["TabGoto 1", "EnterNormal"])),
+                ('3', leaf_chain("tab 3", &["TabGoto 2", "EnterNormal"])),
+                ('4', leaf_chain("tab 4", &["TabGoto 3", "EnterNormal"])),
+                ('5', leaf_chain("tab 5", &["TabGoto 4", "EnterNormal"])),
+                ('6', leaf_chain("tab 6", &["TabGoto 5", "EnterNormal"])),
+                ('7', leaf_chain("tab 7", &["TabGoto 6", "EnterNormal"])),
+                ('8', leaf_chain("tab 8", &["TabGoto 7", "EnterNormal"])),
+                ('9', leaf_chain("tab 9", &["TabGoto 8", "EnterNormal"])),
+            ],
+        ),
+    );
+
+    // Quick tab navigation: Shift+] / Shift+[ (next / previous tab).
+    root.insert('}', leaf_chain("next tab", &["TabNext", "EnterNormal"]));
+    root.insert('{', leaf_chain("prev tab", &["TabPrev", "EnterNormal"]));
+
+    // x: Session
+    root.insert(
+        'x',
+        group(
+            "Session",
+            vec![
+                ('s', leaf("switch", "SessionQuickSwitch")),
+                ('n', leaf("new", "SessionNew")),
+                ('r', leaf("rename", "SessionRename")),
+                ('d', leaf("detach", "SessionDetach")),
+                ('m', leaf("manager", "OpenSessionManager")),
+                ('f', leaf("move to folder", "SessionMoveToFolder")),
             ],
         ),
     );
@@ -155,22 +195,6 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
             vec![
                 ('s', leaf("search", "EnterSearchMode")),
                 ('e', leaf("open in editor", "BufferEditInEditor")),
-            ],
-        ),
-    );
-
-    // x: Session
-    root.insert(
-        'x',
-        group(
-            "Session",
-            vec![
-                ('n', leaf("new", "SessionNew")),
-                ('d', leaf("detach", "SessionDetach")),
-                ('r', leaf("rename", "SessionRename")),
-                ('m', leaf("manager", "OpenSessionManager")),
-                ('x', leaf("switch", "SessionQuickSwitch")),
-                ('f', leaf("move to folder", "SessionMoveToFolder")),
             ],
         ),
     );
@@ -189,7 +213,6 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         ' ',
         leaf_chain("layout next", &["LayoutNext", "EnterNormal"]),
     );
-    root.insert('m', leaf_chain("set master", &["SetMaster", "EnterNormal"]));
     root.insert(
         'f',
         leaf_chain("zoom pane", &["PaneToggleZoom", "EnterNormal"]),
@@ -496,36 +519,47 @@ fn alt_key(c: char) -> NormalizedKeyEvent {
     NormalizedKeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
 }
 
+/// Helper to build an `InterceptAction::Command` from a single command string.
+fn cmd(command: &str) -> InterceptAction {
+    InterceptAction::Command(vec![command.to_string()])
+}
+
 impl Default for ShortcutBindings {
     fn default() -> Self {
         let mut bindings = HashMap::new();
 
-        bindings.insert(
-            alt_key('h'),
-            InterceptAction::Command(vec!["PaneFocusLeft".to_string()]),
-        );
-        bindings.insert(
-            alt_key('j'),
-            InterceptAction::Command(vec!["PaneFocusDown".to_string()]),
-        );
-        bindings.insert(
-            alt_key('k'),
-            InterceptAction::Command(vec!["PaneFocusUp".to_string()]),
-        );
-        bindings.insert(
-            alt_key('l'),
-            InterceptAction::Command(vec!["PaneFocusRight".to_string()]),
-        );
-        bindings.insert(
-            alt_key('n'),
-            InterceptAction::Command(vec!["TabNext".to_string()]),
-        );
-        bindings.insert(alt_key('p'), InterceptAction::GroupPrefix(vec!['p']));
-        bindings.insert(alt_key('t'), InterceptAction::GroupPrefix(vec!['t']));
-        bindings.insert(
-            NormalizedKeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            InterceptAction::Command(vec!["OpenSessionManager".to_string()]),
-        );
+        // Focus panes directionally (Alt-h/j/k/l).
+        bindings.insert(alt_key('h'), cmd("PaneFocusLeft"));
+        bindings.insert(alt_key('j'), cmd("PaneFocusDown"));
+        bindings.insert(alt_key('k'), cmd("PaneFocusUp"));
+        bindings.insert(alt_key('l'), cmd("PaneFocusRight"));
+
+        // Move panes directionally (Alt-Shift-h/j/k/l -> Alt-H/J/K/L). These
+        // match `parse_key_notation("Alt-H")`, i.e. an uppercase char with the
+        // Alt modifier.
+        bindings.insert(alt_key('H'), cmd("PaneMoveLeft"));
+        bindings.insert(alt_key('J'), cmd("PaneMoveDown"));
+        bindings.insert(alt_key('K'), cmd("PaneMoveUp"));
+        bindings.insert(alt_key('L'), cmd("PaneMoveRight"));
+
+        // Tab navigation (Alt-, / Alt-.) and direct jumps (Alt-1..Alt-9).
+        bindings.insert(alt_key(','), cmd("TabPrev"));
+        bindings.insert(alt_key('.'), cmd("TabNext"));
+        bindings.insert(alt_key('1'), cmd("TabGoto 0"));
+        bindings.insert(alt_key('2'), cmd("TabGoto 1"));
+        bindings.insert(alt_key('3'), cmd("TabGoto 2"));
+        bindings.insert(alt_key('4'), cmd("TabGoto 3"));
+        bindings.insert(alt_key('5'), cmd("TabGoto 4"));
+        bindings.insert(alt_key('6'), cmd("TabGoto 5"));
+        bindings.insert(alt_key('7'), cmd("TabGoto 6"));
+        bindings.insert(alt_key('8'), cmd("TabGoto 7"));
+        bindings.insert(alt_key('9'), cmd("TabGoto 8"));
+
+        // Misc quick actions.
+        bindings.insert(alt_key('t'), cmd("TabNew"));
+        bindings.insert(alt_key('s'), cmd("SessionQuickSwitch"));
+        bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
+        bindings.insert(alt_key(' '), cmd("LayoutNext"));
 
         Self { bindings }
     }
@@ -1198,7 +1232,7 @@ mod tests {
         let children = tree.children_at(&['t']).unwrap();
         let keys: Vec<char> = children.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&'n'));
-        assert!(keys.contains(&'c'));
+        assert!(keys.contains(&'x'));
     }
 
     #[test]
@@ -1236,13 +1270,65 @@ mod tests {
     #[test]
     fn pane_group_has_rename_leaf() {
         let tree = KeybindingTree::default();
-        let node = tree.lookup(&['p', 'R']).unwrap();
+        let node = tree.lookup(&['p', 'r']).unwrap();
         match node {
             KeyNode::Leaf { action, label, .. } => {
                 assert_eq!(action, &vec!["PaneRename".to_string()]);
                 assert_eq!(label, "rename");
             }
-            other => panic!("expected leaf for 'p' -> 'R', got {other:?}"),
+            other => panic!("expected leaf for 'p' -> 'r', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pane_group_has_move_and_resize() {
+        let tree = KeybindingTree::default();
+        // 'H' is now a move-pane leaf.
+        let mv = tree.lookup(&['p', 'H']).unwrap();
+        match mv {
+            KeyNode::Leaf { action, label, .. } => {
+                assert!(action.contains(&"PaneMoveLeft".to_string()));
+                assert_eq!(label, "move left");
+            }
+            other => panic!("expected leaf for 'p' -> 'H', got {other:?}"),
+        }
+        // 'R' is now the Resize group.
+        let resize = tree.lookup(&['p', 'R']).unwrap();
+        assert!(matches!(resize, KeyNode::Group { .. }));
+        let down = tree.lookup(&['p', 'R', 'j']).unwrap();
+        match down {
+            KeyNode::Leaf { action, .. } => assert_eq!(action, &vec!["ResizeDown 5".to_string()]),
+            other => panic!("expected leaf for 'p' -> 'R' -> 'j', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_group_has_close_and_goto() {
+        let tree = KeybindingTree::default();
+        // 'x' closes the tab.
+        let close = tree.lookup(&['t', 'x']).unwrap();
+        match close {
+            KeyNode::Leaf { action, .. } => assert!(action.contains(&"TabClose".to_string())),
+            other => panic!("expected leaf for 't' -> 'x', got {other:?}"),
+        }
+        // '1' jumps to the first tab (0-indexed).
+        let goto = tree.lookup(&['t', '1']).unwrap();
+        match goto {
+            KeyNode::Leaf { action, .. } => assert!(action.contains(&"TabGoto 0".to_string())),
+            other => panic!("expected leaf for 't' -> '1', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_group_has_switch_leaf() {
+        let tree = KeybindingTree::default();
+        let node = tree.lookup(&['x', 's']).unwrap();
+        match node {
+            KeyNode::Leaf { action, label, .. } => {
+                assert_eq!(action, &vec!["SessionQuickSwitch".to_string()]);
+                assert_eq!(label, "switch");
+            }
+            other => panic!("expected leaf for 'x' -> 's', got {other:?}"),
         }
     }
 
@@ -1316,7 +1402,7 @@ mod tests {
         // 'n' should be removed from the Tab group.
         assert!(base.lookup(&['t', 'n']).is_none());
         // Other Tab children should still exist.
-        assert!(base.lookup(&['t', 'c']).is_some());
+        assert!(base.lookup(&['t', 'x']).is_some());
     }
 
     // -- Merge tests ----------------------------------------------------------
@@ -1495,31 +1581,100 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_shortcuts_has_alt_p_group() {
-        let bindings = ShortcutBindings::default();
+    /// Helper: look up an Alt-modified char in the default shortcut set.
+    fn lookup_alt(bindings: &ShortcutBindings, c: char) -> Option<InterceptAction> {
         let key = KeyEvent::new_with_kind_and_state(
-            KeyCode::Char('p'),
+            KeyCode::Char(c),
             KeyModifiers::ALT,
             KeyEventKind::Press,
             KeyEventState::NONE,
         );
-        match bindings.lookup(&key).unwrap() {
-            InterceptAction::GroupPrefix(path) => assert_eq!(path, &['p']),
-            other => panic!("expected GroupPrefix, got {other:?}"),
+        bindings.lookup(&key).cloned()
+    }
+
+    #[test]
+    fn default_shortcuts_has_alt_tab_next() {
+        let bindings = ShortcutBindings::default();
+        match lookup_alt(&bindings, '.').unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["TabNext"]),
+            other => panic!("expected Command(TabNext) for Alt-., got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_shortcuts_has_alt_tab_prev() {
+        let bindings = ShortcutBindings::default();
+        match lookup_alt(&bindings, ',').unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["TabPrev"]),
+            other => panic!("expected Command(TabPrev) for Alt-,, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_shortcuts_has_alt_move_left() {
+        let bindings = ShortcutBindings::default();
+        // Capital 'H' with the Alt modifier (matches parse_key_notation("Alt-H")).
+        match lookup_alt(&bindings, 'H').unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["PaneMoveLeft"]),
+            other => panic!("expected Command(PaneMoveLeft) for Alt-H, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_shortcuts_has_alt_tab_goto() {
+        let bindings = ShortcutBindings::default();
+        // Alt-1 jumps to the first tab (0-indexed).
+        match lookup_alt(&bindings, '1').unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["TabGoto 0"]),
+            other => panic!("expected Command(TabGoto 0) for Alt-1, got {other:?}"),
+        }
+        // Alt-9 jumps to the ninth tab.
+        match lookup_alt(&bindings, '9').unwrap() {
+            InterceptAction::Command(cmds) => assert_eq!(cmds, &["TabGoto 8"]),
+            other => panic!("expected Command(TabGoto 8) for Alt-9, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_shortcuts_has_alt_extras() {
+        let bindings = ShortcutBindings::default();
+        assert!(matches!(
+            lookup_alt(&bindings, 't').unwrap(),
+            InterceptAction::Command(cmds) if cmds == ["TabNew"]
+        ));
+        assert!(matches!(
+            lookup_alt(&bindings, 's').unwrap(),
+            InterceptAction::Command(cmds) if cmds == ["SessionQuickSwitch"]
+        ));
+        assert!(matches!(
+            lookup_alt(&bindings, 'z').unwrap(),
+            InterceptAction::Command(cmds) if cmds == ["PaneToggleZoom"]
+        ));
+        assert!(matches!(
+            lookup_alt(&bindings, ' ').unwrap(),
+            InterceptAction::Command(cmds) if cmds == ["LayoutNext"]
+        ));
+    }
+
+    #[test]
+    fn default_shortcuts_no_group_prefixes() {
+        // The new default set is entirely command shortcuts -- no @-group
+        // prefixes (the old Alt-p/Alt-t group defaults were removed).
+        let bindings = ShortcutBindings::default();
+        assert!(
+            !bindings
+                .bindings
+                .values()
+                .any(|a| matches!(a, InterceptAction::GroupPrefix(_))),
+            "default shortcuts should not contain any GroupPrefix bindings"
+        );
     }
 
     #[test]
     fn default_shortcuts_unbound_returns_none() {
         let bindings = ShortcutBindings::default();
-        let key = KeyEvent::new_with_kind_and_state(
-            KeyCode::Char('z'),
-            KeyModifiers::ALT,
-            KeyEventKind::Press,
-            KeyEventState::NONE,
-        );
-        assert!(bindings.lookup(&key).is_none());
+        // Alt-w is not part of the default set.
+        assert!(lookup_alt(&bindings, 'w').is_none());
     }
 
     // -- ShortcutBindings TOML parsing tests ----------------------------------

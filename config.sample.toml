@@ -132,40 +132,102 @@ leader = "Ctrl-a"
 # Group prefixes enter Command mode at the specified keybinding tree group,
 # showing the which-key popup for that group immediately.
 #
-# To remove a default shortcut, set it to an empty string:
+# The default Alt shortcuts are listed below (commented out — they are active
+# by default). Uncomment and edit any line to change it, or set it to an empty
+# string to remove a default shortcut:
 #   "Alt-h" = ""
-"Alt-h" = "PaneFocusLeft"
-"Alt-j" = "PaneFocusDown"
-"Alt-k" = "PaneFocusUp"
-"Alt-l" = "PaneFocusRight"
-"Alt-n" = "TabNext"
-"Alt-p" = "@p"                         # Open Pane group (which-key)
-"Alt-t" = "@t"                         # Open Tab group (which-key)
+#
+# --- Default Alt shortcuts ---
+# Focus panes directionally:
+# "Alt-h" = "PaneFocusLeft"
+# "Alt-j" = "PaneFocusDown"
+# "Alt-k" = "PaneFocusUp"
+# "Alt-l" = "PaneFocusRight"
+# Move panes directionally (Alt-Shift-h/j/k/l):
+# "Alt-H" = "PaneMoveLeft"
+# "Alt-J" = "PaneMoveDown"
+# "Alt-K" = "PaneMoveUp"
+# "Alt-L" = "PaneMoveRight"
+# Tab navigation and direct jumps:
+# "Alt-," = "TabPrev"
+# "Alt-." = "TabNext"
+# "Alt-1" = "TabGoto 0"
+# "Alt-2" = "TabGoto 1"
+# "Alt-3" = "TabGoto 2"
+# "Alt-4" = "TabGoto 3"
+# "Alt-5" = "TabGoto 4"
+# "Alt-6" = "TabGoto 5"
+# "Alt-7" = "TabGoto 6"
+# "Alt-8" = "TabGoto 7"
+# "Alt-9" = "TabGoto 8"
+# Misc quick actions:
+# "Alt-t" = "TabNew"
+# "Alt-s" = "SessionQuickSwitch"
+# "Alt-z" = "PaneToggleZoom"
+# "Alt-Space" = "LayoutNext"
 
-# --- Tab (t) ---
-[keybindings.command.t]
-_label = "Tab"
-n = "TabNew; EnterNormal"
-c = "TabClose; EnterNormal"
-m = "TabMove"
-r = "TabRename"
-l = "TabNext"                       # list / cycle tabs
+# --- Command-mode leader tree (defaults) ---
+# The tables below mirror the built-in leader (Ctrl-a) tree. They are shown for
+# reference; user bindings merge on top of the defaults, so you only need to
+# redefine the keys you want to change.
 
 # --- Pane (p) ---
 [keybindings.command.p]
 _label = "Pane"
 n = "PaneNew; EnterNormal"
-c = "PaneClose; EnterNormal"
+x = "PaneClose; EnterNormal"
 s = "PaneSplitVertical; EnterNormal"
 S = "PaneSplitHorizontal; EnterNormal"
 h = "PaneFocusLeft; EnterNormal"
 j = "PaneFocusDown; EnterNormal"
 k = "PaneFocusUp; EnterNormal"
 l = "PaneFocusRight; EnterNormal"
-a = "PaneStackAdd"
-"]" = "PaneStackNext"
-"[" = "PaneStackPrev"
-R = "PaneRename"
+H = "PaneMoveLeft; EnterNormal"
+J = "PaneMoveDown; EnterNormal"
+K = "PaneMoveUp; EnterNormal"
+L = "PaneMoveRight; EnterNormal"
+z = "PaneToggleZoom; EnterNormal"
+r = "PaneRename"
+a = "PaneStackAdd; EnterNormal"
+"]" = "PaneStackNext; EnterNormal"
+"[" = "PaneStackPrev; EnterNormal"
+
+# --- Resize (p → R) ---
+[keybindings.command.p.R]
+_label = "Resize"
+h = "ResizeLeft 5"
+j = "ResizeDown 5"
+k = "ResizeUp 5"
+l = "ResizeRight 5"
+
+# --- Tab (t) ---
+[keybindings.command.t]
+_label = "Tab"
+n = "TabNew; EnterNormal"
+x = "TabClose; EnterNormal"
+r = "TabRename"
+"]" = "TabNext; EnterNormal"
+"[" = "TabPrev; EnterNormal"
+m = "TabMove"
+"1" = "TabGoto 0; EnterNormal"
+"2" = "TabGoto 1; EnterNormal"
+"3" = "TabGoto 2; EnterNormal"
+"4" = "TabGoto 3; EnterNormal"
+"5" = "TabGoto 4; EnterNormal"
+"6" = "TabGoto 5; EnterNormal"
+"7" = "TabGoto 6; EnterNormal"
+"8" = "TabGoto 7; EnterNormal"
+"9" = "TabGoto 8; EnterNormal"
+
+# --- Session (x) ---
+[keybindings.command.x]
+_label = "Session"
+s = "SessionQuickSwitch"
+n = "SessionNew"
+r = "SessionRename"
+d = "SessionDetach"
+m = "OpenSessionManager"
+f = "SessionMoveToFolder"
 
 # --- Search (s) ---
 [keybindings.command.s]
@@ -173,37 +235,16 @@ _label = "Search"
 s = "EnterSearchMode"
 e = "BufferEditInEditor"
 
-# --- Session (x) ---
-[keybindings.command.x]
-_label = "Session"
-n = "SessionNew"
-d = "SessionDetach"
-r = "SessionRename"
-l = "SessionList"
-
-# --- Folder (f) ---
-[keybindings.command.f]
-_label = "Folder"
-n = "FolderNew"
-d = "FolderDelete"
-l = "FolderList"
-m = "FolderMoveSession"
-
-# --- Resize (p → r) ---
-[keybindings.command.p.r]
-_label = "Resize"
-h = "ResizeLeft 5"
-j = "ResizeDown 5"
-k = "ResizeUp 5"
-l = "ResizeRight 5"
-
 # --- Direct bindings (root level) ---
-# These are top-level keys, not inside a group.
-# Uncomment to override:
-# v = "EnterVisualMode"
-# g = "ToggleStyle"
-# Space = "LayoutNext"
-# m = "SetMaster"
+# These are top-level keys, not inside a group. Defaults:
+# v     = "EnterVisualMode"
+# g     = "ToggleStyle; EnterNormal"
+# Space = "LayoutNext; EnterNormal"
+# f     = "PaneToggleZoom; EnterNormal"    # zoom pane
+# ":"   = "CommandPaletteOpen"
+# a     = "SendKey Ctrl-a; EnterNormal"    # send the prefix key to the terminal
+# "}"   = "TabNext; EnterNormal"           # quick next tab
+# "{"   = "TabPrev; EnterNormal"           # quick prev tab
 
 # -----------------------------------------------------------------------------
 # Keybindings — Visual Mode
@@ -239,15 +280,23 @@ l = "ResizeRight 5"
 #   PaneFocusRight                  — Focus pane to the right
 #   PaneFocusUp                     — Focus pane above
 #   PaneFocusDown                   — Focus pane below
+#   PaneMoveLeft                    — Move focused pane left
+#   PaneMoveRight                   — Move focused pane right
+#   PaneMoveUp                      — Move focused pane up
+#   PaneMoveDown                    — Move focused pane down
 #   PaneStackAdd                    — Add focused pane to a stack
 #   PaneStackNext                   — Focus next pane in stack
 #   PaneStackPrev                   — Focus previous pane in stack
+#   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
 #   PaneRename <name>               — Rename the focused pane
 #
 # Session commands:
 #   SessionNew <name> [folder]      — Create a new session
+#   SessionQuickSwitch              — Open the quick session switcher
 #   SessionDetach                   — Detach from current session
 #   SessionRename <name>            — Rename current session
+#   SessionMoveToFolder             — Move current session to a folder
+#   OpenSessionManager              — Open the full session manager
 #   SessionList                     — List all sessions
 #   SessionSave                     — Save session state
 #
@@ -272,6 +321,8 @@ l = "ResizeRight 5"
 #   EnterCommandMode                — Enter command mode (navigate keybindings)
 #   EnterVisualMode                 — Enter visual mode (scrollback selection)
 #   SendKey <bytes>                 — Send raw key bytes to the active PTY
+#
+#   CommandPaletteOpen              — Open the command palette
 #
 # Layout commands:
 #   ToggleStyle                     — Toggle border style between zellij and tmux
