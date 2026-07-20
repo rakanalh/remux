@@ -513,6 +513,138 @@ impl ShortcutBindings {
 
         Some(ShortcutBindings { bindings })
     }
+
+    /// Enumerate the shortcut bindings as `(key_notation, label)` pairs, sorted
+    /// by notation. Used to display the global shortcuts in the which-key popup.
+    ///
+    /// - `Command` actions are humanized from their first (non-`EnterNormal`)
+    ///   command, e.g. `PaneFocusLeft` -> `"focus left"`.
+    /// - `GroupPrefix` actions are labelled `"→ <path>"` (the group's own label
+    ///   is not resolvable without the tree here, so the path is shown).
+    pub fn entries(&self) -> Vec<(String, String)> {
+        let mut result: Vec<(String, String)> = self
+            .bindings
+            .iter()
+            .map(|(key, action)| {
+                let notation = format_key_notation(key);
+                let label = match action {
+                    InterceptAction::Command(cmds) => {
+                        let cmd = cmds
+                            .iter()
+                            .find(|c| c.as_str() != "EnterNormal")
+                            .or_else(|| cmds.first());
+                        match cmd {
+                            Some(c) => humanize_command(c),
+                            None => String::new(),
+                        }
+                    }
+                    InterceptAction::GroupPrefix(path) => {
+                        let path_str: String = path.iter().collect();
+                        format!("\u{2192} {path_str}")
+                    }
+                };
+                (notation, label)
+            })
+            .collect();
+        result.sort_by(|(a, _), (b, _)| a.cmp(b));
+        result
+    }
+}
+
+/// Format a [`NormalizedKeyEvent`] back into key notation (the inverse of
+/// [`parse_key_notation`]), e.g. `Alt` + `h` -> `"Alt-h"`, `Alt` + `,` ->
+/// `"Alt-,"`, `Alt` + `H` -> `"Alt-H"`.
+pub fn format_key_notation(ev: &NormalizedKeyEvent) -> String {
+    let mut prefix = String::new();
+    if ev.modifiers.contains(KeyModifiers::CONTROL) {
+        prefix.push_str("Ctrl-");
+    }
+    if ev.modifiers.contains(KeyModifiers::ALT) {
+        prefix.push_str("Alt-");
+    }
+    // Shift is only rendered explicitly for keys whose case does not already
+    // encode it (character keys carry Shift via their uppercase form).
+    let shift_char = matches!(ev.code, KeyCode::Char(_));
+    if ev.modifiers.contains(KeyModifiers::SHIFT) && !shift_char && ev.code != KeyCode::BackTab {
+        prefix.push_str("Shift-");
+    }
+
+    let key = match ev.code {
+        KeyCode::Char(' ') => "Space".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "Shift-Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::F(n) => format!("F{n}"),
+        other => format!("{other:?}"),
+    };
+
+    format!("{prefix}{key}")
+}
+
+/// Split a PascalCase identifier into lowercase, space-separated words, e.g.
+/// `"FocusLeft"` -> `"focus left"`.
+fn split_pascal(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// Humanize a command string into a short, friendly label for the which-key
+/// popup, e.g. `"PaneFocusLeft"` -> `"focus left"`, `"TabNext"` -> `"next tab"`,
+/// `"TabGoto 0"` -> `"tab 1"`, `"SessionQuickSwitch"` -> `"switch session"`.
+///
+/// Reasonable and concise; it does not aim to be perfect.
+pub fn humanize_command(command: &str) -> String {
+    let mut parts = command.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let arg = parts.next();
+
+    // `TabGoto N` -> `tab N+1` (bindings are 0-indexed, display is 1-indexed).
+    if name == "TabGoto" {
+        if let Some(n) = arg.and_then(|a| a.parse::<usize>().ok()) {
+            return format!("tab {}", n + 1);
+        }
+    }
+
+    // Friendlier phrasings for a few verbose command names.
+    match name {
+        "SessionQuickSwitch" => return "switch session".to_string(),
+        "SessionSwitchLast" => return "last session".to_string(),
+        "LayoutNext" => return "next layout".to_string(),
+        _ => {}
+    }
+
+    // `Tab*` / `Session*` read better with the noun trailing ("next tab"),
+    // while `Pane*` reads better with the prefix simply dropped ("focus left").
+    if let Some(rest) = name.strip_prefix("Tab") {
+        if !rest.is_empty() {
+            return format!("{} tab", split_pascal(rest));
+        }
+    }
+    if let Some(rest) = name.strip_prefix("Session") {
+        if !rest.is_empty() {
+            return format!("{} session", split_pascal(rest));
+        }
+    }
+    if let Some(rest) = name.strip_prefix("Pane") {
+        if !rest.is_empty() {
+            return split_pascal(rest);
+        }
+    }
+
+    split_pascal(name)
 }
 
 /// Helper to create a `NormalizedKeyEvent` with the Alt modifier.
@@ -1852,5 +1984,71 @@ mod tests {
             .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['z']));
         let tree = KeybindingTree::default();
         assert!(!bindings.validate_group_refs(&tree));
+    }
+
+    // -- entries / humanize / format_key_notation tests -----------------------
+
+    #[test]
+    fn shortcut_entries_include_expected_pairs() {
+        let entries = ShortcutBindings::default().entries();
+        assert!(
+            entries.contains(&("Alt-h".to_string(), "focus left".to_string())),
+            "expected Alt-h -> focus left, got: {entries:?}"
+        );
+        assert!(
+            entries.contains(&("Alt-.".to_string(), "next tab".to_string())),
+            "expected Alt-. -> next tab, got: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn shortcut_entries_are_sorted_by_notation() {
+        let entries = ShortcutBindings::default().entries();
+        let mut sorted = entries.clone();
+        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+        assert_eq!(entries, sorted);
+    }
+
+    #[test]
+    fn shortcut_entries_group_prefix_uses_path_label() {
+        let mut bindings = ShortcutBindings::default();
+        bindings
+            .bindings
+            .insert(alt_key('p'), InterceptAction::GroupPrefix(vec!['p']));
+        let entries = bindings.entries();
+        assert!(
+            entries.contains(&("Alt-p".to_string(), "\u{2192} p".to_string())),
+            "expected Alt-p -> '\u{2192} p', got: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn humanize_command_cases() {
+        assert_eq!(humanize_command("PaneFocusLeft"), "focus left");
+        assert_eq!(humanize_command("PaneMoveLeft"), "move left");
+        assert_eq!(humanize_command("PaneToggleZoom"), "toggle zoom");
+        assert_eq!(humanize_command("TabNext"), "next tab");
+        assert_eq!(humanize_command("TabNew"), "new tab");
+        assert_eq!(humanize_command("TabGoto 0"), "tab 1");
+        assert_eq!(humanize_command("TabGoto 8"), "tab 9");
+        assert_eq!(humanize_command("SessionQuickSwitch"), "switch session");
+        assert_eq!(humanize_command("SessionSwitchLast"), "last session");
+        assert_eq!(humanize_command("LayoutNext"), "next layout");
+    }
+
+    #[test]
+    fn format_key_notation_cases() {
+        assert_eq!(format_key_notation(&alt_key('h')), "Alt-h");
+        assert_eq!(format_key_notation(&alt_key('H')), "Alt-H");
+        assert_eq!(format_key_notation(&alt_key(',')), "Alt-,");
+        assert_eq!(format_key_notation(&alt_key('.')), "Alt-.");
+        assert_eq!(format_key_notation(&alt_key(' ')), "Alt-Space");
+        assert_eq!(
+            format_key_notation(&NormalizedKeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL
+            )),
+            "Ctrl-b"
+        );
     }
 }

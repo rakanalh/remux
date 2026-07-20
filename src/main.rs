@@ -807,9 +807,13 @@ async fn run_client_loop(
                                     })
                                     .await?;
                             }
-                            InputAction::ShowWhichKey(label, entries) => {
+                            InputAction::ShowWhichKey {
+                                label,
+                                entries,
+                                shortcuts,
+                            } => {
                                 let (c, r) = crossterm::terminal::size()?;
-                                whichkey.show(label, entries);
+                                whichkey.show(label, entries, shortcuts);
                                 renderer.clear_overlay(c, r)?;
                                 let commands = whichkey.render(c, r, &theme, which_key_position.clone());
                                 renderer.render_whichkey_overlay(&commands)?;

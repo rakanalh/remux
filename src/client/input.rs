@@ -341,7 +341,15 @@ pub enum InputAction {
     /// The input mode changed.
     ModeChanged(Mode),
     /// Show the which-key popup for a group.
-    ShowWhichKey(String, Vec<(char, String)>),
+    ///
+    /// `shortcuts` carries the global Alt shortcuts as `(notation, label)`
+    /// pairs; it is populated for the root/main menu and empty for nested
+    /// sub-group pages.
+    ShowWhichKey {
+        label: String,
+        entries: Vec<(char, String)>,
+        shortcuts: Vec<(String, String)>,
+    },
     /// Hide the which-key popup.
     HideWhichKey,
     /// Yank (copy) the selected text to the clipboard.
@@ -1029,7 +1037,11 @@ impl InputHandler {
                             Some(KeyNode::Group { label, .. }) => label.clone(),
                             _ => "Remux".to_string(),
                         };
-                        return InputAction::ShowWhichKey(label, children);
+                        return InputAction::ShowWhichKey {
+                            label,
+                            entries: children,
+                            shortcuts: self.shortcut_bindings.entries(),
+                        };
                     }
                     return InputAction::ModeChanged(Mode::Command);
                 }
@@ -1041,7 +1053,11 @@ impl InputHandler {
             self.mode = Mode::Command;
             // Show root-level which-key popup immediately.
             if let Some(children) = self.keybinding_tree.children_at(&[]) {
-                return InputAction::ShowWhichKey("Remux".to_string(), children);
+                return InputAction::ShowWhichKey {
+                    label: "Remux".to_string(),
+                    entries: children,
+                    shortcuts: self.shortcut_bindings.entries(),
+                };
             }
             return InputAction::ModeChanged(Mode::Command);
         }
@@ -1152,7 +1168,13 @@ impl InputHandler {
             Some(KeyNode::Group { label, .. }) => {
                 // We have entered a group -- show which-key popup.
                 if let Some(children) = self.keybinding_tree.children_at(path) {
-                    InputAction::ShowWhichKey(label.clone(), children)
+                    // Nested sub-group page: show only this group's keys. The
+                    // global Alt shortcuts belong on the main menu, not here.
+                    InputAction::ShowWhichKey {
+                        label: label.clone(),
+                        entries: children,
+                        shortcuts: Vec::new(),
+                    }
                 } else {
                     InputAction::None
                 }
@@ -2343,7 +2365,7 @@ mod tests {
         // Default leader is Ctrl-a. Now shows which-key popup at root.
         let action = handler.handle_key(ctrl_key('a'));
         assert_eq!(handler.mode, Mode::Command);
-        assert!(matches!(action, InputAction::ShowWhichKey(..)));
+        assert!(matches!(action, InputAction::ShowWhichKey { .. }));
     }
 
     #[test]
@@ -2380,7 +2402,7 @@ mod tests {
         assert_eq!(handler.mode, Mode::Command);
         // 'x' opens the Session group (which-key popup).
         let group = handler.handle_key(char_key('x'));
-        assert!(matches!(group, InputAction::ShowWhichKey(..)));
+        assert!(matches!(group, InputAction::ShowWhichKey { .. }));
         // 'o' resolves the leaf.
         let action = handler.handle_key(char_key('o'));
         assert_eq!(action, InputAction::SessionSwitchLast);
@@ -2445,7 +2467,7 @@ mod tests {
         // Ctrl-a is the default leader. Now shows which-key popup at root.
         let action = handler.handle_key(ctrl_key('a'));
         assert_eq!(handler.mode, Mode::Command);
-        assert!(matches!(action, InputAction::ShowWhichKey(..)));
+        assert!(matches!(action, InputAction::ShowWhichKey { .. }));
     }
 
     #[test]
@@ -2466,9 +2488,9 @@ mod tests {
 
         let action = handler.handle_key(char_key('t'));
         match action {
-            InputAction::ShowWhichKey(label, children) => {
+            InputAction::ShowWhichKey { label, entries, .. } => {
                 assert_eq!(label, "Tab");
-                assert!(!children.is_empty());
+                assert!(!entries.is_empty());
             }
             other => panic!("expected ShowWhichKey, got {other:?}"),
         }
@@ -2525,7 +2547,7 @@ mod tests {
         // Press the leader (Ctrl-a) to enter Command mode.
         let action = handler.handle_key(ctrl_key('a'));
         assert_eq!(handler.mode, Mode::Command);
-        assert!(matches!(action, InputAction::ShowWhichKey(..)));
+        assert!(matches!(action, InputAction::ShowWhichKey { .. }));
 
         // Press 'z', which has no binding at root -- should abort back to Normal.
         let action = handler.handle_key(char_key('z'));
@@ -3304,9 +3326,9 @@ mod tests {
         let action = handler.handle_key(key);
         assert_eq!(handler.mode, Mode::Command);
         match action {
-            InputAction::ShowWhichKey(label, children) => {
+            InputAction::ShowWhichKey { label, entries, .. } => {
                 assert_eq!(label, "Pane");
-                let keys: Vec<char> = children.iter().map(|(k, _)| *k).collect();
+                let keys: Vec<char> = entries.iter().map(|(k, _)| *k).collect();
                 assert!(keys.contains(&'n'));
                 assert!(keys.contains(&'h'));
             }
@@ -3390,7 +3412,7 @@ mod tests {
         let ctrl_a = ctrl_key('a');
         assert!(matches!(
             handler.handle_key(ctrl_a),
-            InputAction::ShowWhichKey(..)
+            InputAction::ShowWhichKey { .. }
         ));
         assert_eq!(handler.mode, Mode::Command);
         handler.mode = Mode::Normal;
@@ -3422,7 +3444,7 @@ mod tests {
         // The new leader (Ctrl-b) enters Command mode.
         let action = handler.handle_key(ctrl_key('b'));
         assert_eq!(handler.mode, Mode::Command);
-        assert!(matches!(action, InputAction::ShowWhichKey(..)));
+        assert!(matches!(action, InputAction::ShowWhichKey { .. }));
     }
 
     #[test]
