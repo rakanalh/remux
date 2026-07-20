@@ -1424,12 +1424,13 @@ async fn run_client_loop(
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
-                                mgr.send_foreground(ClientMessage::ListSessionTree).await?;
+                                // Query every connected server (local + remotes)
+                                // so the switcher aggregates all their sessions.
+                                for id in mgr.connected_ids() {
+                                    mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                                }
                                 input.mode = Mode::Command;
-                                input.session_switch = Some(SessionSwitchOverlay {
-                                    sessions: vec!["Loading...".to_string()],
-                                    selected: 0,
-                                });
+                                input.session_switch = Some(SessionSwitchOverlay::new());
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
                             }
                             InputAction::SessionSwitchUpdate => {
@@ -1441,14 +1442,22 @@ async fn run_client_loop(
                                 }
                                 renderer.flush()?;
                             }
-                            InputAction::SessionSwitchConfirm(ref session_name) => {
+                            InputAction::SessionSwitchConfirm { server, session } => {
+                                input.session_switch = None;
+                                input.mode = Mode::Normal;
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                mgr.send_foreground(ClientMessage::Attach { session_name: session_name.clone() }).await?;
-                                input.session_switch = None;
-                                input.mode = Mode::Normal;
-                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                // Hand off to the target server (no-op when it is
+                                // already foreground) and attach. Re-attaching to
+                                // the current session is harmless. Mirrors the
+                                // session-manager SwitchSession path.
+                                switch_to_server(mgr, &server, c, r).await?;
+                                mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
+                                mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                if server == ConnId::Local {
+                                    last_local_session = Some(session.clone());
+                                }
                             }
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
@@ -2068,23 +2077,23 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={}", src, folders.len(), unfiled.len());
-                        // The session-switch / folder-select popups are foreground
-                        // concerns (only the foreground ever requests their trees).
-                        if mgr.is_foreground(&src) && input.session_switch.is_some() {
-                            let mut session_names: Vec<String> = Vec::new();
+                        // The session-switch popup aggregates every connected
+                        // server's tree, so it accepts trees from ANY source
+                        // (not just the foreground) and tags each with `src`,
+                        // including the current session (marked, not filtered).
+                        if input.session_switch.is_some() {
+                            let mut sessions: Vec<(String, bool)> = Vec::new();
                             for f in &folders {
                                 for s in &f.sessions {
-                                    if !s.is_current {
-                                        session_names.push(s.name.clone());
-                                    }
+                                    sessions.push((s.name.clone(), s.is_current));
                                 }
                             }
                             for s in &unfiled {
-                                if !s.is_current {
-                                    session_names.push(s.name.clone());
-                                }
+                                sessions.push((s.name.clone(), s.is_current));
                             }
-                            input.update_session_switch_list(session_names);
+                            // Replace this server's rows (a re-received tree for
+                            // the same `src` overwrites rather than duplicates).
+                            input.merge_session_switch(src.clone(), sessions);
                             // Render the popup
                             if let Some(ref ss) = input.session_switch {
                                 let (c, r) = crossterm::terminal::size()?;

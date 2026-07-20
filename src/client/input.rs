@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::client::command_palette::CommandPaletteState;
+use crate::client::registry::ConnId;
 use crate::config::keybindings::{
     parse_command, InterceptAction, KeyNode, KeybindingTree, ShortcutBindings,
 };
@@ -401,8 +404,9 @@ pub enum InputAction {
     SessionSwitchOpen,
     /// Session quick-switch overlay updated (re-render needed).
     SessionSwitchUpdate,
-    /// Session quick-switch confirmed - switch to the named session.
-    SessionSwitchConfirm(String),
+    /// Session quick-switch confirmed - switch to the named session on the
+    /// given server (may be a different server than the current foreground).
+    SessionSwitchConfirm { server: ConnId, session: String },
     /// Session quick-switch cancelled.
     SessionSwitchClose,
     /// No action to take.
@@ -681,16 +685,97 @@ impl FolderSelectOverlay {
     }
 }
 
-/// Session quick-switch overlay for rapidly switching between sessions.
-#[derive(Debug, Clone)]
+/// A single row in the session quick-switch overlay: a session on a specific
+/// server, flagged if it is the currently-attached session on that server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSwitchEntry {
+    /// The server this session lives on.
+    pub server: ConnId,
+    /// The session name.
+    pub name: String,
+    /// Whether this is the currently-attached session on `server`.
+    pub is_current: bool,
+}
+
+/// Session quick-switch overlay for rapidly switching between sessions across
+/// every connected server.
+#[derive(Debug, Clone, Default)]
 pub struct SessionSwitchOverlay {
-    /// Available session names.
-    pub sessions: Vec<String>,
-    /// Currently highlighted session index.
+    /// Per-server session groups keyed by [`ConnId`]. Kept so a re-received
+    /// tree for one server REPLACES that server's rows rather than duplicating
+    /// them. Each value is `(name, is_current)` in tree order.
+    groups: HashMap<ConnId, Vec<(String, bool)>>,
+    /// Flattened, ordered rows rebuilt from `groups` on every merge: Local
+    /// first, then remotes by name; tree order preserved within a server.
+    pub entries: Vec<SessionSwitchEntry>,
+    /// Currently highlighted entry index.
     pub selected: usize,
 }
 
 impl SessionSwitchOverlay {
+    /// Create an empty overlay (no sessions known yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Merge (replacing) one server's sessions into the overlay and rebuild the
+    /// flat, ordered `entries` list. Re-merging the same server replaces its
+    /// prior rows instead of appending, so per-server trees arriving
+    /// asynchronously never duplicate.
+    pub fn merge_server(&mut self, server: ConnId, sessions: Vec<(String, bool)>) {
+        self.groups.insert(server, sessions);
+        self.rebuild();
+    }
+
+    /// Rebuild `entries` from `groups` with a stable order: Local first, then
+    /// remotes sorted by name; within a server, tree order is preserved.
+    fn rebuild(&mut self) {
+        let mut entries = Vec::new();
+        if let Some(sessions) = self.groups.get(&ConnId::Local) {
+            for (name, is_current) in sessions {
+                entries.push(SessionSwitchEntry {
+                    server: ConnId::Local,
+                    name: name.clone(),
+                    is_current: *is_current,
+                });
+            }
+        }
+        let mut remote_names: Vec<&String> = self
+            .groups
+            .keys()
+            .filter_map(|id| match id {
+                ConnId::Remote(name) => Some(name),
+                ConnId::Local => None,
+            })
+            .collect();
+        remote_names.sort();
+        for name in remote_names {
+            let server = ConnId::Remote(name.clone());
+            if let Some(sessions) = self.groups.get(&server) {
+                for (sname, is_current) in sessions {
+                    entries.push(SessionSwitchEntry {
+                        server: server.clone(),
+                        name: sname.clone(),
+                        is_current: *is_current,
+                    });
+                }
+            }
+        }
+        self.entries = entries;
+        if self.selected >= self.entries.len() {
+            self.selected = 0;
+        }
+    }
+
+    /// The label shown for an entry: remote sessions are prefixed with the
+    /// server name (e.g. `mini: build`); local sessions show just the name.
+    fn entry_label(entry: &SessionSwitchEntry) -> String {
+        match &entry.server {
+            ConnId::Remote(server) => format!("{server}: {}", entry.name),
+            ConnId::Local => entry.name.clone(),
+        }
+    }
+
     /// Render the session switch popup as draw commands.
     pub fn render(
         &self,
@@ -702,7 +787,7 @@ impl SessionSwitchOverlay {
         let mut commands = Vec::new();
 
         let popup_width = 40u16.min(screen_cols);
-        let popup_height = (self.sessions.len() as u16 + 2).min(screen_rows);
+        let popup_height = (self.entries.len() as u16 + 2).min(screen_rows);
         let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
         let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
 
@@ -743,13 +828,16 @@ impl SessionSwitchOverlay {
         });
 
         // Session list
-        for (i, session) in self.sessions.iter().enumerate() {
+        for (i, entry) in self.entries.iter().enumerate() {
             let y = start_y + 1 + i as u16;
             if y >= start_y + popup_height - 1 {
                 break;
             }
             let is_selected = i == self.selected;
-            let text = format!("  {}", session);
+            // Mark the currently-attached session on its server with a leading
+            // '*' (one per connected server may be marked).
+            let marker = if entry.is_current { "* " } else { "  " };
+            let text = format!("{marker}{}", Self::entry_label(entry));
             let padded = if text.len() >= inner_width {
                 text[..inner_width].to_string()
             } else {
@@ -976,10 +1064,7 @@ impl InputHandler {
 
         if actions.len() == 1 && actions[0] == "SessionQuickSwitch" {
             self.mode = Mode::Command;
-            self.session_switch = Some(SessionSwitchOverlay {
-                sessions: vec!["Loading...".to_string()],
-                selected: 0,
-            });
+            self.session_switch = Some(SessionSwitchOverlay::new());
             return InputAction::SessionSwitchOpen;
         }
 
@@ -1098,10 +1183,7 @@ impl InputHandler {
 
             if action_str == "SessionQuickSwitch" {
                 self.mode = Mode::Command;
-                self.session_switch = Some(SessionSwitchOverlay {
-                    sessions: vec!["Loading...".to_string()],
-                    selected: 0,
-                });
+                self.session_switch = Some(SessionSwitchOverlay::new());
                 return InputAction::SessionSwitchOpen;
             }
 
@@ -1890,15 +1972,15 @@ impl InputHandler {
                 InputAction::SessionSwitchClose
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if !overlay.sessions.is_empty() {
-                    overlay.selected = (overlay.selected + 1) % overlay.sessions.len();
+                if !overlay.entries.is_empty() {
+                    overlay.selected = (overlay.selected + 1) % overlay.entries.len();
                 }
                 InputAction::SessionSwitchUpdate
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if !overlay.sessions.is_empty() {
+                if !overlay.entries.is_empty() {
                     if overlay.selected == 0 {
-                        overlay.selected = overlay.sessions.len() - 1;
+                        overlay.selected = overlay.entries.len() - 1;
                     } else {
                         overlay.selected -= 1;
                     }
@@ -1906,11 +1988,14 @@ impl InputHandler {
                 InputAction::SessionSwitchUpdate
             }
             KeyCode::Enter | KeyCode::Char('l') => {
-                let selected_name = overlay.sessions.get(overlay.selected).cloned();
+                let selected = overlay.entries.get(overlay.selected).cloned();
                 self.session_switch = None;
                 self.mode = Mode::Normal;
-                if let Some(name) = selected_name {
-                    InputAction::SessionSwitchConfirm(name)
+                if let Some(entry) = selected {
+                    InputAction::SessionSwitchConfirm {
+                        server: entry.server,
+                        session: entry.name,
+                    }
                 } else {
                     InputAction::SessionSwitchClose
                 }
@@ -1919,11 +2004,11 @@ impl InputHandler {
         }
     }
 
-    /// Update the session switch overlay with available session names.
-    pub fn update_session_switch_list(&mut self, sessions: Vec<String>) {
+    /// Merge one server's sessions (tagged with its [`ConnId`]) into the session
+    /// switch overlay, replacing any prior rows for that server.
+    pub fn merge_session_switch(&mut self, server: ConnId, sessions: Vec<(String, bool)>) {
         if let Some(ref mut ss) = self.session_switch {
-            ss.sessions = sessions;
-            ss.selected = 0;
+            ss.merge_server(server, sessions);
         }
     }
 
@@ -3314,5 +3399,137 @@ mod tests {
 
         // The stale chord path was reset so it can't misfire on the new tree.
         assert!(handler.keybinding_state.is_at_root());
+    }
+
+    // -----------------------------------------------------------------------
+    // Session switch overlay
+    // -----------------------------------------------------------------------
+
+    fn remote(name: &str) -> ConnId {
+        ConnId::Remote(name.to_string())
+    }
+
+    #[test]
+    fn session_switch_entries_carry_server_and_is_current() {
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![("alpha".to_string(), true), ("beta".to_string(), false)],
+        );
+
+        assert_eq!(overlay.entries.len(), 2);
+        assert_eq!(
+            overlay.entries[0],
+            SessionSwitchEntry {
+                server: ConnId::Local,
+                name: "alpha".to_string(),
+                is_current: true,
+            }
+        );
+        assert_eq!(
+            overlay.entries[1],
+            SessionSwitchEntry {
+                server: ConnId::Local,
+                name: "beta".to_string(),
+                is_current: false,
+            }
+        );
+    }
+
+    #[test]
+    fn session_switch_orders_local_first_then_remotes_by_name() {
+        let mut overlay = SessionSwitchOverlay::new();
+        // Merge out of order: a remote first, then local, then another remote.
+        overlay.merge_server(remote("zulu"), vec![("z1".to_string(), false)]);
+        overlay.merge_server(ConnId::Local, vec![("l1".to_string(), true)]);
+        overlay.merge_server(remote("alpha"), vec![("a1".to_string(), true)]);
+
+        let servers: Vec<&ConnId> = overlay.entries.iter().map(|e| &e.server).collect();
+        assert_eq!(
+            servers,
+            vec![&ConnId::Local, &remote("alpha"), &remote("zulu")]
+        );
+    }
+
+    #[test]
+    fn session_switch_within_server_keeps_tree_order() {
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            remote("mini"),
+            vec![
+                ("build".to_string(), false),
+                ("test".to_string(), true),
+                ("deploy".to_string(), false),
+            ],
+        );
+        let names: Vec<&str> = overlay.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["build", "test", "deploy"]);
+    }
+
+    #[test]
+    fn session_switch_re_merge_replaces_not_duplicates() {
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![("a".to_string(), true), ("b".to_string(), false)],
+        );
+        overlay.merge_server(remote("mini"), vec![("x".to_string(), true)]);
+        assert_eq!(overlay.entries.len(), 3);
+
+        // A re-received tree for Local with a changed list replaces the two
+        // prior Local rows rather than appending.
+        overlay.merge_server(ConnId::Local, vec![("c".to_string(), false)]);
+        assert_eq!(overlay.entries.len(), 2);
+        let local: Vec<&str> = overlay
+            .entries
+            .iter()
+            .filter(|e| e.server == ConnId::Local)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(local, vec!["c"]);
+    }
+
+    #[test]
+    fn session_switch_confirm_returns_selected_server_and_session() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(ConnId::Local, vec![("local-sess".to_string(), true)]);
+        overlay.merge_server(remote("mini"), vec![("remote-sess".to_string(), false)]);
+        handler.session_switch = Some(overlay);
+
+        // Move down to the second (remote) entry, then confirm.
+        let _ = handler.handle_session_switch_key(char_key('j'));
+        let action = handler.handle_session_switch_key(enter_key());
+        match action {
+            InputAction::SessionSwitchConfirm { server, session } => {
+                assert_eq!(server, remote("mini"));
+                assert_eq!(session, "remote-sess");
+            }
+            other => panic!("expected SessionSwitchConfirm, got {other:?}"),
+        }
+        // Overlay closed and mode restored.
+        assert!(handler.session_switch.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn session_switch_confirm_can_return_current_session() {
+        // Selecting the currently-attached session yields a confirm for it;
+        // the main loop treats a same-server re-attach as a no-op.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(ConnId::Local, vec![("cur".to_string(), true)]);
+        handler.session_switch = Some(overlay);
+
+        let action = handler.handle_session_switch_key(enter_key());
+        match action {
+            InputAction::SessionSwitchConfirm { server, session } => {
+                assert_eq!(server, ConnId::Local);
+                assert_eq!(session, "cur");
+            }
+            other => panic!("expected SessionSwitchConfirm, got {other:?}"),
+        }
     }
 }
