@@ -167,6 +167,7 @@ fn cell_to_render_cell(cell: &Cell) -> RenderCell {
         underline: cell.attrs.underline,
         width: cell.width,
         combining: cell.combining.clone(),
+        hyperlink: cell.hyperlink.clone(),
     }
 }
 
@@ -409,6 +410,7 @@ fn draw_zellij_panes(
             bold: false,
             italic: false,
             underline: false,
+            hyperlink: None,
             width: 1,
             combining: Vec::new(),
         };
@@ -549,6 +551,7 @@ fn build_top_border_content(
                 bold: false,
                 italic: false,
                 underline: false,
+                hyperlink: None,
                 width: 1,
                 combining: Vec::new(),
             });
@@ -560,6 +563,7 @@ fn build_top_border_content(
                     bold: false,
                     italic: false,
                     underline: false,
+                    hyperlink: None,
                     width: 1,
                     combining: Vec::new(),
                 });
@@ -571,6 +575,7 @@ fn build_top_border_content(
                 bold: false,
                 italic: false,
                 underline: false,
+                hyperlink: None,
                 width: 1,
                 combining: Vec::new(),
             });
@@ -607,6 +612,7 @@ fn build_top_border_content(
             bold: false,
             italic: false,
             underline: false,
+            hyperlink: None,
             width: 1,
             combining: Vec::new(),
         });
@@ -622,6 +628,7 @@ fn build_top_border_content(
                         bold: false,
                         italic: false,
                         underline: false,
+                        hyperlink: None,
                         width: 1,
                         combining: Vec::new(),
                     });
@@ -654,6 +661,7 @@ fn build_top_border_content(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    hyperlink: None,
                     width: 1,
                     combining: Vec::new(),
                 });
@@ -666,6 +674,7 @@ fn build_top_border_content(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    hyperlink: None,
                     width: 1,
                     combining: Vec::new(),
                 });
@@ -678,6 +687,7 @@ fn build_top_border_content(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    hyperlink: None,
                     width: 1,
                     combining: Vec::new(),
                 });
@@ -692,6 +702,7 @@ fn build_top_border_content(
             bold: false,
             italic: false,
             underline: false,
+            hyperlink: None,
             width: 1,
             combining: Vec::new(),
         });
@@ -788,6 +799,7 @@ fn draw_tmux_tab_bar(
                 bold: false,
                 italic: false,
                 underline: false,
+                hyperlink: None,
                 width: 1,
                 combining: Vec::new(),
             },
@@ -842,6 +854,7 @@ fn draw_tmux_tab_bar(
                             bold: false,
                             italic: false,
                             underline: false,
+                            hyperlink: None,
                             width: 1,
                             combining: Vec::new(),
                         },
@@ -892,6 +905,7 @@ fn draw_tmux_tab_bar(
                         bold,
                         italic: false,
                         underline: false,
+                        hyperlink: None,
                         width: 1,
                         combining: Vec::new(),
                     },
@@ -914,6 +928,7 @@ fn draw_tmux_tab_bar(
                     bold,
                     italic: false,
                     underline: false,
+                    hyperlink: None,
                     width: 1,
                     combining: Vec::new(),
                 },
@@ -933,6 +948,7 @@ fn draw_tmux_tab_bar(
                         bold,
                         italic: false,
                         underline: false,
+                        hyperlink: None,
                         width: 1,
                         combining: Vec::new(),
                     },
@@ -956,6 +972,7 @@ fn draw_tmux_dividers(
         bold: false,
         italic: false,
         underline: false,
+        hyperlink: None,
         width: 1,
         combining: Vec::new(),
     };
@@ -1083,6 +1100,7 @@ fn draw_status_bar(
                 bold: false,
                 italic: false,
                 underline: false,
+                hyperlink: None,
                 width: 1,
                 combining: Vec::new(),
             };
@@ -1103,6 +1121,7 @@ fn draw_status_bar(
                 bold: true,
                 italic: false,
                 underline: false,
+                hyperlink: None,
                 width: 1,
                 combining: Vec::new(),
             };
@@ -1121,6 +1140,7 @@ fn draw_status_bar(
                 bold: false,
                 italic: false,
                 underline: false,
+                hyperlink: None,
                 width: 1,
                 combining: Vec::new(),
             };
@@ -1137,6 +1157,7 @@ fn draw_status_bar(
             bold: false,
             italic: false,
             underline: false,
+            hyperlink: None,
             width: 1,
             combining: Vec::new(),
         };
@@ -1157,6 +1178,7 @@ fn draw_status_bar(
                         bold: false,
                         italic: false,
                         underline: false,
+                        hyperlink: None,
                         width: 1,
                         combining: Vec::new(),
                     };
@@ -1217,6 +1239,7 @@ fn draw_status_bar(
                     bold: tab_bold,
                     italic: false,
                     underline: false,
+                    hyperlink: None,
                     width: 1,
                     combining: Vec::new(),
                 };
@@ -1270,6 +1293,7 @@ fn draw_status_bar(
                         bold: false,
                         italic: false,
                         underline: false,
+                        hyperlink: None,
                         width: 1,
                         combining: Vec::new(),
                     };

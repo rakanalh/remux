@@ -232,6 +232,11 @@ pub struct RenderCell {
     /// zero wire bytes so ASCII rendering is unchanged on the wire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub combining: Vec<char>,
+    /// OSC 8 hyperlink target URI for this cell, if any. Omitted on the wire in
+    /// the common (non-linked) case; older peers that predate the field decode
+    /// it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink: Option<String>,
 }
 
 impl Default for RenderCell {
@@ -245,6 +250,7 @@ impl Default for RenderCell {
             underline: false,
             width: 1,
             combining: Vec::new(),
+            hyperlink: None,
         }
     }
 }

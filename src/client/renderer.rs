@@ -74,6 +74,7 @@ impl Renderer {
             let mut last_bold = false;
             let mut last_italic = false;
             let mut last_underline = false;
+            let mut last_hyperlink: Option<String> = None;
 
             // Full SGR reset (SGR 0) so the terminal's real state matches the
             // per-row assumption that fg/bg are Default and bold/italic/underline
@@ -131,6 +132,13 @@ impl Renderer {
                     }
                     last_underline = cell.underline;
                 }
+                if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
+                    match &cell.hyperlink {
+                        Some(uri) => queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
+                    }
+                    last_hyperlink = cell.hyperlink.clone();
+                }
 
                 queue!(stdout, Print(cell.c))?;
                 // Combining marks are zero-width; the terminal composes them onto
@@ -140,6 +148,10 @@ impl Renderer {
                 }
             }
 
+            // Close any open hyperlink so links never span rows on the wire.
+            if last_hyperlink.is_some() {
+                queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
+            }
             queue!(stdout, ResetColor)?;
         }
 
@@ -218,10 +230,21 @@ impl Renderer {
                     queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
                 }
 
+                // Each change repositions the cursor, so there is no per-row
+                // hyperlink state to diff against. Wrap just this cell: open the
+                // link before Print and close it after so it can't leak to the
+                // next moved-cursor position.
+                if let Some(uri) = &change.cell.hyperlink {
+                    queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?;
+                }
+
                 queue!(stdout, Print(change.cell.c))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &change.cell.combining {
                     queue!(stdout, Print(*m))?;
+                }
+                if change.cell.hyperlink.is_some() {
+                    queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
                 }
                 queue!(stdout, ResetColor)?;
             }
@@ -355,6 +378,7 @@ impl Renderer {
             let mut last_bold = false;
             let mut last_italic = false;
             let mut last_underline = false;
+            let mut last_hyperlink: Option<String> = None;
 
             // Full SGR reset (SGR 0): see render_full. Matches the per-row
             // last_* = Default/false assumption so a non-underlined leading cell
@@ -416,6 +440,13 @@ impl Renderer {
                     }
                     last_underline = cell.underline;
                 }
+                if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
+                    match &cell.hyperlink {
+                        Some(uri) => queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
+                    }
+                    last_hyperlink = cell.hyperlink.clone();
+                }
                 queue!(stdout, Print(cell.c))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &cell.combining {
@@ -423,6 +454,10 @@ impl Renderer {
                 }
             }
 
+            // Close any open hyperlink so links never span rows on the wire.
+            if last_hyperlink.is_some() {
+                queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
+            }
             queue!(stdout, ResetColor)?;
         }
 
@@ -521,6 +556,7 @@ impl Renderer {
             let mut last_bold = false;
             let mut last_italic = false;
             let mut last_underline = false;
+            let mut last_hyperlink: Option<String> = None;
             for pane_x in 0..pane_w {
                 let screen_x = pane_ox as usize + pane_x;
                 if screen_x >= self.cols as usize || screen_x >= row.len() {
@@ -564,11 +600,22 @@ impl Renderer {
                     queue!(stdout, SetAttribute(attr))?;
                     last_underline = cell.underline;
                 }
+                if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
+                    match &cell.hyperlink {
+                        Some(uri) => queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
+                    }
+                    last_hyperlink = cell.hyperlink.clone();
+                }
                 queue!(stdout, Print(cell.c))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &cell.combining {
                     queue!(stdout, Print(*m))?;
                 }
+            }
+            // Close any open hyperlink so links never span rows on the wire.
+            if last_hyperlink.is_some() {
+                queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
             }
             queue!(stdout, ResetColor)?;
         }

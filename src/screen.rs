@@ -47,6 +47,9 @@ pub struct Cell {
     /// compose onto the base glyph `c`. Empty for the overwhelmingly common
     /// case of a plain glyph.
     pub combining: Vec<char>,
+    /// OSC 8 hyperlink target URI for this cell, if any. `None` for the common
+    /// case of a non-linked cell.
+    pub hyperlink: Option<String>,
 }
 
 impl Default for Cell {
@@ -56,6 +59,7 @@ impl Default for Cell {
             width: 1,
             attrs: CellAttrs::default(),
             combining: Vec::new(),
+            hyperlink: None,
         }
     }
 }
@@ -74,6 +78,9 @@ pub struct Screen {
     pub cursor_y: u16,
     /// The current text attributes applied to newly printed characters.
     pub current_attrs: CellAttrs,
+    /// The current OSC 8 hyperlink applied to newly printed characters, if a
+    /// link is open. Independent of SGR (not affected by `handle_sgr`).
+    pub current_hyperlink: Option<String>,
     /// Lines that have scrolled off the top of the visible area.
     pub scrollback: VecDeque<Vec<Cell>>,
     /// Maximum number of scrollback lines to retain.
@@ -89,6 +96,9 @@ pub struct Screen {
     saved_cursor_x: u16,
     saved_cursor_y: u16,
     saved_attrs: CellAttrs,
+    /// Saved hyperlink for alternate-screen switching (mode 1049), mirroring
+    /// `saved_attrs`.
+    saved_hyperlink: Option<String>,
     saved_scroll_top: u16,
     saved_scroll_bottom: u16,
     /// Whether we are currently on the alternate screen.
@@ -105,6 +115,8 @@ pub struct Screen {
     /// Saved graphic rendition for DECSC/DECRC (ESC 7 / ESC 8). Not touched by
     /// the SCO save/restore (CSI s/u), which is position-only by convention.
     scp_attrs: CellAttrs,
+    /// Saved hyperlink for DECSC/DECRC (ESC 7 / ESC 8), mirroring `scp_attrs`.
+    scp_hyperlink: Option<String>,
     /// Whether renders are locked (Synchronized Update mode, CSI ? 2026 h/l).
     pub lock_renders: bool,
     /// DECCKM: application cursor keys mode (CSI ? 1 h/l).
@@ -129,6 +141,7 @@ impl Screen {
             cursor_x: 0,
             cursor_y: 0,
             current_attrs: CellAttrs::default(),
+            current_hyperlink: None,
             scrollback: VecDeque::new(),
             scrollback_limit,
             scroll_top: 0,
@@ -138,6 +151,7 @@ impl Screen {
             saved_cursor_x: 0,
             saved_cursor_y: 0,
             saved_attrs: CellAttrs::default(),
+            saved_hyperlink: None,
             saved_scroll_top: 0,
             saved_scroll_bottom: rows.saturating_sub(1),
             alt_screen_active: false,
@@ -147,6 +161,7 @@ impl Screen {
             scp_cursor_x: 0,
             scp_cursor_y: 0,
             scp_attrs: CellAttrs::default(),
+            scp_hyperlink: None,
             lock_renders: false,
             application_cursor_keys: false,
             mouse_tracking: false,
@@ -371,6 +386,7 @@ impl Screen {
                 width,
                 attrs: self.current_attrs.clone(),
                 combining: Vec::new(),
+                hyperlink: self.current_hyperlink.clone(),
             };
 
             if width == 2 {
@@ -381,6 +397,7 @@ impl Screen {
                         width: 0,
                         attrs: self.current_attrs.clone(),
                         combining: Vec::new(),
+                        hyperlink: self.current_hyperlink.clone(),
                     };
                 }
             } else if old_width == 2 && col + 1 < self.grid[row].len() {
@@ -848,6 +865,7 @@ impl vte::Perform for Screen {
                                     self.saved_cursor_x = self.cursor_x;
                                     self.saved_cursor_y = self.cursor_y;
                                     self.saved_attrs = self.current_attrs.clone();
+                                    self.saved_hyperlink = self.current_hyperlink.clone();
                                     self.saved_scroll_top = self.scroll_top;
                                     self.saved_scroll_bottom = self.scroll_bottom;
                                     self.grid = Self::make_grid(self.cols, self.rows);
@@ -900,6 +918,7 @@ impl vte::Perform for Screen {
                                     self.cursor_x = self.saved_cursor_x;
                                     self.cursor_y = self.saved_cursor_y;
                                     self.current_attrs = self.saved_attrs.clone();
+                                    self.current_hyperlink = self.saved_hyperlink.clone();
                                     self.scroll_top = self.saved_scroll_top;
                                     self.scroll_bottom = self.saved_scroll_bottom;
                                     self.alt_screen_active = false;
@@ -986,12 +1005,14 @@ impl vte::Perform for Screen {
                 self.scp_cursor_x = self.cursor_x;
                 self.scp_cursor_y = self.cursor_y;
                 self.scp_attrs = self.current_attrs.clone();
+                self.scp_hyperlink = self.current_hyperlink.clone();
             }
             // DECRC - Restore Cursor (position + graphic rendition)
             b'8' => {
                 self.cursor_x = self.scp_cursor_x;
                 self.cursor_y = self.scp_cursor_y;
                 self.current_attrs = self.scp_attrs.clone();
+                self.current_hyperlink = self.scp_hyperlink.clone();
             }
             // RI - Reverse Index (move cursor up, scroll if at top)
             b'M' => {
@@ -1005,8 +1026,22 @@ impl vte::Perform for Screen {
         }
     }
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
-        // OSC sequences (e.g. title setting) are acknowledged but currently
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // OSC 8 hyperlinks: `OSC 8 ; params ; URI ST`. Empty URI closes the link.
+        if params.first().map(|p| *p == b"8").unwrap_or(false) {
+            // The URI is everything after the second `;`. vte splits on `;`, so a
+            // URI containing `;` arrives as multiple params — rejoin with `;`.
+            let uri: Vec<u8> = params
+                .get(2..)
+                .map(|rest| rest.join(&b';'))
+                .unwrap_or_default();
+            self.current_hyperlink = if uri.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&uri).into_owned())
+            };
+        }
+        // Other OSC sequences (e.g. title setting) are acknowledged but currently
         // ignored. A future version may store the window title.
     }
 
@@ -1693,5 +1728,32 @@ mod tests {
             (5, 2),
             "DECRC must restore the saved cursor position"
         );
+    }
+
+    #[test]
+    fn test_osc8_hyperlink_sets_cell() {
+        let mut s = Screen::new(40, 3, 100);
+        s.process_output(b"\x1b]8;;https://example.com\x1b\\LINK\x1b]8;;\x1b\\X");
+        // L,I,N,K carry the hyperlink; X does not.
+        assert_eq!(
+            s.grid[0][0].hyperlink.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            s.grid[0][3].hyperlink.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            s.grid[0][4].hyperlink, None,
+            "X after link close must have no hyperlink"
+        );
+    }
+
+    #[test]
+    fn test_osc8_bel_terminated() {
+        let mut s = Screen::new(40, 3, 100);
+        s.process_output(b"\x1b]8;;http://x\x07A\x1b]8;;\x07B");
+        assert_eq!(s.grid[0][0].hyperlink.as_deref(), Some("http://x"));
+        assert_eq!(s.grid[0][1].hyperlink, None);
     }
 }
