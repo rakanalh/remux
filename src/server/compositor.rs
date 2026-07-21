@@ -1204,7 +1204,7 @@ fn draw_status_bar(
         };
 
         let tab_str = if *is_active {
-            format!(" *{tab_name}* ")
+            format!(" {tab_name} ")
         } else if let Some((mark, _)) = marker {
             format!(" {mark} {tab_name} ")
         } else {
@@ -1271,7 +1271,6 @@ fn draw_status_bar(
         let right_x = cols.saturating_sub(right_len);
         // Only draw if it doesn't overlap with the left-side content.
         if right_x > x {
-            let mut rx = right_x;
             // For search info portion, use yellow colors; for layout, use grey.
             let search_info_len = if info.search_info.is_some() {
                 right_parts[0].len()
@@ -1279,7 +1278,7 @@ fn draw_status_bar(
                 0
             };
 
-            for (i, ch) in right_str.chars().enumerate() {
+            for (rx, (i, ch)) in (right_x..).zip(right_str.chars().enumerate()) {
                 if rx < cols && rx < buffer[bar_row].len() {
                     let (fg, bg) = if i < search_info_len {
                         (CellColor::Indexed(0), CellColor::Indexed(11)) // Black on bright yellow
@@ -1298,7 +1297,6 @@ fn draw_status_bar(
                         combining: Vec::new(),
                     };
                 }
-                rx += 1;
             }
         }
     }
@@ -2292,16 +2290,24 @@ mod tests {
 
         let bar: String = buffer[23].iter().map(|c| c.c).collect();
         // Each non-active tab shows its distinct marker glyph; the active tab
-        // shows the `*name*` styling with no marker.
+        // shows its plain name with no marker, distinguished by styling only.
         assert!(
             bar.contains('\u{25CF}'),
             "activity ● marker missing: {bar:?}"
         );
         assert!(bar.contains('!'), "bell ! marker missing: {bar:?}");
         assert!(bar.contains('\u{2713}'), "silent ✓ marker missing: {bar:?}");
+        // The active tab renders its plain name (no `*` markers) and is set
+        // apart purely by the active fg/bg/bold styling on its cells.
+        assert!(bar.contains("Tab 1"), "active tab name missing: {bar:?}");
+        let active_col = buffer[23]
+            .iter()
+            .position(|c| c.c == 'T' && c.bg == theme.tab_active_bg)
+            .expect("active tab styled cell present");
+        assert_eq!(buffer[23][active_col].fg, theme.tab_active_fg);
         assert!(
-            bar.contains("*Tab 1*"),
-            "active tab styling missing: {bar:?}"
+            buffer[23][active_col].bold,
+            "active tab should be bold: {bar:?}"
         );
 
         // The Activity marker cell must carry the attention color (bright yellow)
