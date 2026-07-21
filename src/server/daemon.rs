@@ -116,6 +116,11 @@ struct PaneData {
     screen: Screen,
     /// Receiving end for PTY output from the background reader task.
     pty_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// True once a PTY-forwarding task has been spawned for this pane.
+    /// start_pty_forwarding is called from many sites (attach, session/tab
+    /// switches); without this guard each call would spawn a competing task
+    /// and chunks could be processed out of order, corrupting the stream.
+    forwarding_started: bool,
 }
 
 // MouseSelection is imported from compositor.
@@ -2659,6 +2664,7 @@ async fn spawn_pane(
             pty: pty_instance,
             screen,
             pty_rx,
+            forwarding_started: false,
         },
     );
     Ok(())
@@ -3618,6 +3624,23 @@ async fn start_pty_forwarding(
     let session_name = session_name.to_string();
 
     for pane_id in pane_ids {
+        // Enforce exactly one forwarding task per pane. Check-and-set the
+        // guard under the panes lock before spawning: if a task already
+        // exists, skip this pane so we don't spawn a competing task that
+        // could process PTY chunks out of order.
+        {
+            let mut ps = panes.lock().await;
+            match ps.get_mut(&pane_id) {
+                Some(pane_data) => {
+                    if pane_data.forwarding_started {
+                        continue; // already has its forwarding task
+                    }
+                    pane_data.forwarding_started = true;
+                }
+                None => continue,
+            }
+        }
+
         let state = Arc::clone(state);
         let panes = Arc::clone(panes);
         let clients = Arc::clone(clients);
@@ -3891,6 +3914,20 @@ async fn materialize_session(
 
     // Start PTY forwarding for every pane.
     for pane_id in pane_ids {
+        // Enforce exactly one forwarding task per pane (see start_pty_forwarding).
+        {
+            let mut ps = panes.lock().await;
+            match ps.get_mut(&pane_id) {
+                Some(pane_data) => {
+                    if pane_data.forwarding_started {
+                        continue; // already has its forwarding task
+                    }
+                    pane_data.forwarding_started = true;
+                }
+                None => continue,
+            }
+        }
+
         let state = Arc::clone(state);
         let panes = Arc::clone(panes);
         let clients = Arc::clone(clients);
