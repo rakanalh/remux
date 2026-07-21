@@ -137,6 +137,10 @@ struct ClientConnection {
     scroll_offset: usize,
     /// Previous scroll_offset, for detecting scroll delta.
     prev_scroll_offset: usize,
+    /// Set when the client's scroll offset changed; forces the next broadcast
+    /// to send a FullRender so the diff baseline can't desync from the client's
+    /// screen across a scroll transition.
+    needs_full_render: bool,
 }
 
 /// The Remux server.
@@ -402,6 +406,7 @@ impl RemuxServer {
                     search_info: None,
                     scroll_offset: 0,
                     prev_scroll_offset: 0,
+                    needs_full_render: false,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -654,6 +659,7 @@ async fn handle_client_message(
                 if let Some(client) = cls.get_mut(&client_id) {
                     client.scroll_offset = 0;
                     client.prev_scroll_offset = 0;
+                    client.needs_full_render = true;
                 }
             }
             let session_name = {
@@ -2175,6 +2181,7 @@ async fn handle_scroll_delta(
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
             client.scroll_offset = clamped;
+            client.needs_full_render = true;
         }
     }
     // Only render if the offset actually changed (skip at boundary).
@@ -3066,25 +3073,31 @@ async fn broadcast_full_render(
     // avoids deadlock against `invalidate_session_baselines`. Scrolled clients
     // are excluded here; they get a FullRender via `send_full_render_to_client`
     // when they scroll and are refreshed when they return to the live view.
-    let targets: Vec<(u64, mpsc::UnboundedSender<ServerMessage>)> = {
-        let cls = clients.lock().await;
-        cls.iter()
+    let targets: Vec<(u64, mpsc::UnboundedSender<ServerMessage>, bool)> = {
+        let mut cls = clients.lock().await;
+        cls.iter_mut()
             .filter(|(_, c)| {
                 c.session_name.as_deref() == Some(session_name) && c.scroll_offset == 0
             })
-            .map(|(id, c)| (*id, c.tx.clone()))
+            .map(|(id, c)| {
+                let force_full = c.needs_full_render;
+                c.needs_full_render = false; // consume it
+                (*id, c.tx.clone(), force_full)
+            })
             .collect()
     };
 
     let threshold = cols as usize * rows as usize / 2;
     let mut pf = prev_frames.lock().await;
-    for (cid, tx) in targets {
+    for (cid, tx, force_full) in targets {
         // Force a full render when this client has no baseline yet, or when its
         // baseline's dimensions differ from the current frame (a size change,
         // e.g. after another client of a different size attached/detached).
         // compute_diff never clears cells that exist only in a larger prev
         // frame, so a diff across a size change would leave stale content.
-        let baseline = pf.get(&cid);
+        // A client that just returned from scrolling must get a full repaint;
+        // its diff baseline may not match its on-screen state.
+        let baseline = if force_full { None } else { pf.get(&cid) };
         let size_changed = baseline.is_some_and(|prev| {
             prev.len() != cells.len() || prev.first().map(Vec::len) != cells.first().map(Vec::len)
         });
