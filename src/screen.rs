@@ -128,6 +128,11 @@ pub struct Screen {
     /// Set when a BEL (`0x07`) is received; consumed via [`Screen::take_bell`].
     /// Used by the server for per-tab bell activity monitoring.
     pub bell_pending: bool,
+    /// Deferred line-wrap (DECAWM "last column") state. When a printable char
+    /// fills the last column, the cursor stays parked on that column and this
+    /// flag is set; the actual wrap to the next row happens only when the NEXT
+    /// printable char arrives. Any explicit cursor move cancels it.
+    pending_wrap: bool,
 }
 
 impl Screen {
@@ -167,6 +172,7 @@ impl Screen {
             mouse_tracking: false,
             mouse_sgr: false,
             bell_pending: false,
+            pending_wrap: false,
         }
     }
 
@@ -354,8 +360,11 @@ impl Screen {
         }
         let width: u8 = if display_width == Some(2) { 2 } else { 1 };
 
-        // Existing end-of-row wrap.
-        if self.cursor_x >= self.cols {
+        // Deferred (DECAWM) wrap: the previous char filled the last column and
+        // left the cursor pending at the row's edge; wrap now that another char
+        // arrives.
+        if self.pending_wrap {
+            self.pending_wrap = false;
             self.cursor_x = 0;
             self.cursor_y += 1;
             if self.cursor_y > self.scroll_bottom {
@@ -365,8 +374,11 @@ impl Screen {
         }
 
         // A wide glyph must never straddle the right edge. If it would not fit,
-        // wrap first and leave the last cell of the previous row blank.
+        // wrap first and leave the last cell of the previous row blank. This is
+        // based on the real edge (a wide glyph at the last free column can never
+        // be pending), so clear any stale pending-wrap here too.
         if width == 2 && self.cursor_x + 2 > self.cols {
+            self.pending_wrap = false;
             self.cursor_x = 0;
             self.cursor_y += 1;
             if self.cursor_y > self.scroll_bottom {
@@ -411,6 +423,11 @@ impl Screen {
         }
 
         self.cursor_x += width as u16;
+        if self.cursor_x >= self.cols {
+            // At/over the right edge: park on the last column and defer the wrap.
+            self.cursor_x = self.cols.saturating_sub(1);
+            self.pending_wrap = true;
+        }
     }
 
     /// Handle the SGR (Select Graphic Rendition) escape sequence.
@@ -578,10 +595,12 @@ impl vte::Perform for Screen {
         match byte {
             // Carriage return
             0x0D => {
+                self.pending_wrap = false;
                 self.cursor_x = 0;
             }
             // Line feed / vertical tab / form feed
             0x0A..=0x0C => {
+                self.pending_wrap = false;
                 if self.cursor_y >= self.scroll_bottom {
                     self.scroll_up_region();
                 } else {
@@ -590,12 +609,14 @@ impl vte::Perform for Screen {
             }
             // Backspace
             0x08 => {
+                self.pending_wrap = false;
                 if self.cursor_x > 0 {
                     self.cursor_x -= 1;
                 }
             }
             // Horizontal tab
             0x09 => {
+                self.pending_wrap = false;
                 // Advance to the next tab stop (every 8 columns).
                 let next_tab = ((self.cursor_x / 8) + 1) * 8;
                 self.cursor_x = std::cmp::min(next_tab, self.cols.saturating_sub(1));
@@ -623,6 +644,7 @@ impl vte::Perform for Screen {
         match action {
             // CUU - Cursor Up
             'A' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_y = self.cursor_y.saturating_sub(n);
                 if self.cursor_y < self.scroll_top {
@@ -631,27 +653,32 @@ impl vte::Perform for Screen {
             }
             // CUD - Cursor Down
             'B' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_y = std::cmp::min(self.cursor_y + n, self.scroll_bottom);
             }
             // CUF - Cursor Forward (Right)
             'C' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_x = std::cmp::min(self.cursor_x + n, self.cols.saturating_sub(1));
             }
             // CUB - Cursor Backward (Left)
             'D' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_x = self.cursor_x.saturating_sub(n);
             }
             // CNL - Cursor Next Line (move down n lines, column 1)
             'E' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_y = std::cmp::min(self.cursor_y + n, self.scroll_bottom);
                 self.cursor_x = 0;
             }
             // CPL - Cursor Previous Line (move up n lines, column 1)
             'F' => {
+                self.pending_wrap = false;
                 let n = Self::csi_param(params, 0, 1);
                 self.cursor_y = self.cursor_y.saturating_sub(n);
                 if self.cursor_y < self.scroll_top {
@@ -661,6 +688,7 @@ impl vte::Perform for Screen {
             }
             // CUP - Cursor Position (row;col, 1-based)
             'H' | 'f' => {
+                self.pending_wrap = false;
                 let row = Self::csi_param(params, 0, 1).saturating_sub(1);
                 let col = Self::csi_param(params, 1, 1).saturating_sub(1);
                 self.cursor_y = std::cmp::min(row, self.rows.saturating_sub(1));
@@ -668,11 +696,13 @@ impl vte::Perform for Screen {
             }
             // VPA - Vertical Position Absolute (1-based row)
             'd' => {
+                self.pending_wrap = false;
                 let row = Self::csi_param(params, 0, 1).saturating_sub(1);
                 self.cursor_y = std::cmp::min(row, self.rows.saturating_sub(1));
             }
             // HPA / CHA - Horizontal Position Absolute (1-based column)
             'G' => {
+                self.pending_wrap = false;
                 let col = Self::csi_param(params, 0, 1).saturating_sub(1);
                 self.cursor_x = std::cmp::min(col, self.cols.saturating_sub(1));
             }
@@ -816,6 +846,7 @@ impl vte::Perform for Screen {
             }
             // DECSTBM - Set Scroll Region (top;bottom, 1-based)
             'r' => {
+                self.pending_wrap = false;
                 let top = Self::csi_param(params, 0, 1).saturating_sub(1);
                 let bottom = Self::csi_param(params, 1, self.rows).saturating_sub(1);
                 let bottom = std::cmp::min(bottom, self.rows.saturating_sub(1));
@@ -834,6 +865,7 @@ impl vte::Perform for Screen {
             }
             // RCP - Restore Cursor Position (CSI u, no intermediates)
             'u' if _intermediates.is_empty() => {
+                self.pending_wrap = false;
                 self.cursor_x = self.scp_cursor_x;
                 self.cursor_y = self.scp_cursor_y;
             }
@@ -994,6 +1026,7 @@ impl vte::Perform for Screen {
             }
             // IND - Index (move cursor down, scroll if at bottom)
             b'D' => {
+                self.pending_wrap = false;
                 if self.cursor_y >= self.scroll_bottom {
                     self.scroll_up_region();
                 } else {
@@ -1009,6 +1042,7 @@ impl vte::Perform for Screen {
             }
             // DECRC - Restore Cursor (position + graphic rendition)
             b'8' => {
+                self.pending_wrap = false;
                 self.cursor_x = self.scp_cursor_x;
                 self.cursor_y = self.scp_cursor_y;
                 self.current_attrs = self.scp_attrs.clone();
@@ -1016,6 +1050,7 @@ impl vte::Perform for Screen {
             }
             // RI - Reverse Index (move cursor up, scroll if at top)
             b'M' => {
+                self.pending_wrap = false;
                 if self.cursor_y <= self.scroll_top {
                     self.scroll_down_region();
                 } else {
@@ -1068,6 +1103,43 @@ mod tests {
 
     fn make_screen() -> Screen {
         Screen::new(80, 24, 1000)
+    }
+
+    #[test]
+    fn test_pending_wrap_defers() {
+        // Fill an entire 5-column row. The cursor must stay parked on the last
+        // column of row 0 (deferred wrap), NOT advance to row 1.
+        let mut s = Screen::new(5, 3, 100);
+        s.process_output(b"ABCDE");
+        assert_eq!(s.cursor_y, 0, "cursor must stay on row 0 after filling it");
+        assert_eq!(
+            s.cursor_x, 4,
+            "cursor must be parked on the last column, not out of bounds"
+        );
+        let row0: String = s.grid[0].iter().map(|c| c.c).collect();
+        assert_eq!(row0, "ABCDE", "row 0 should hold all 5 chars");
+
+        // The NEXT printable char triggers the deferred wrap: it lands at the
+        // start of row 1.
+        s.process_output(b"F");
+        assert_eq!(s.cursor_y, 1, "next char must wrap to row 1");
+        assert_eq!(s.grid[1][0].c, 'F', "wrapped char lands at row 1, col 0");
+
+        // A cursor-move between the full row and the next char CANCELS the
+        // pending wrap: no spurious blank line / no wrap.
+        let mut s = Screen::new(5, 3, 100);
+        s.process_output(b"ABCDE");
+        assert_eq!(s.cursor_y, 0);
+        s.process_output(b"\x1b[5G"); // CHA to column 5 (last col) — cancels pending wrap
+        s.process_output(b"X");
+        assert_eq!(
+            s.cursor_y, 0,
+            "cursor-move must cancel pending wrap; char must not wrap to row 1"
+        );
+        assert_eq!(
+            s.grid[0][4].c, 'X',
+            "char lands on row 0 last column after the cursor-move cancelled the wrap"
+        );
     }
 
     #[test]
@@ -1484,10 +1556,16 @@ mod tests {
         s.process_output(b"\x1b[>4m");
         s.process_output(b"A");
         assert!(!s.current_attrs.underline, "CSI >4m must not set underline");
-        assert!(!s.grid[0][0].attrs.underline, "char after CSI >4m must not be underlined");
+        assert!(
+            !s.grid[0][0].attrs.underline,
+            "char after CSI >4m must not be underlined"
+        );
         // Plain SGR 4 still works.
         s.process_output(b"\x1b[4mB");
-        assert!(s.current_attrs.underline, "plain CSI 4m must still set underline");
+        assert!(
+            s.current_attrs.underline,
+            "plain CSI 4m must still set underline"
+        );
     }
 
     #[test]
