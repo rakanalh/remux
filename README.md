@@ -6,6 +6,8 @@
 |_| \_\_____|_|  |_|\___//_/\_\
 </pre>
 
+[![CI](https://github.com/rakanalh/remux/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/rakanalh/remux/actions/workflows/ci.yml)
+
 A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, a tree-view session manager, and first-class SSH remote sessions.
 
 Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Config changes hot-reload live — no restart needed.
@@ -119,6 +121,16 @@ Full-screen single pane — only the active pane is visible. Cycle through panes
 Manual splits created by you. No automatic redistribution — your exact arrangement is preserved.
 
 ## Install / build / run
+
+### Install with cargo
+
+```bash
+cargo install --git https://github.com/rakanalh/remux
+```
+
+This builds and installs the `remux` binary into `~/.cargo/bin` (make sure it's on your `PATH`).
+
+### Build from source
 
 ```bash
 cargo build --release
