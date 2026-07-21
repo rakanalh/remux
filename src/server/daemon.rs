@@ -749,7 +749,7 @@ async fn handle_attach(
     }
 
     // Resize panes to match the attaching client's terminal dimensions.
-    resize_session_panes(session_name, cols, rows, state, panes, config).await?;
+    resize_session_panes(session_name, state, panes, clients, config).await?;
 
     // Invalidate every attached client's baseline: this client's attach may
     // change the session render size (min over clients), so all clients must
@@ -854,7 +854,7 @@ async fn handle_resize(
     log::debug!("server: client_id={client_id} resize cols={cols} rows={rows}");
 
     if let Some(session_name) = session_name {
-        resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+        resize_session_panes(&session_name, state, panes, clients, config).await?;
         // Invalidate all attached clients' baselines: a resize changes the
         // session render size, so every client must re-render full at the new
         // size on the broadcast below.
@@ -916,7 +916,7 @@ async fn handle_command(
             // Resize the new tab's panes to the drawn content area (mirrors the
             // PaneSplit* path) so the child sees the same rows the compositor
             // draws — otherwise the footer is clipped.
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             // Tab switch: the whole displayed content changes, so invalidate
             // all clients' baselines to force a clean full render.
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
@@ -951,7 +951,7 @@ async fn handle_command(
             }
             // Resize the newly-active tab's panes to the drawn content area
             // before rendering so the footer isn't clipped.
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -969,7 +969,7 @@ async fn handle_command(
             }
             // Resize the newly-active tab's panes to the drawn content area
             // before rendering so the footer isn't clipped.
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -991,7 +991,7 @@ async fn handle_command(
             }
             // Resize the newly-active tab's panes to the drawn content area
             // before rendering so the footer isn't clipped.
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -1060,7 +1060,7 @@ async fn handle_command(
                 dormant,
             )
             .await;
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneSplitHorizontal => {
@@ -1114,7 +1114,7 @@ async fn handle_command(
                 dormant,
             )
             .await;
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneClose => {
@@ -1134,8 +1134,6 @@ async fn handle_command(
             close_pane(
                 closed_pane,
                 &session_name,
-                cols,
-                rows,
                 state,
                 panes,
                 clients,
@@ -1229,7 +1227,7 @@ async fn handle_command(
                     }
                 }
             }
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackAdd => {
@@ -1279,7 +1277,7 @@ async fn handle_command(
                 dormant,
             )
             .await;
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackNext => {
@@ -1351,7 +1349,7 @@ async fn handle_command(
                 }
                 tab.layout.resize(tab.focused_pane, direction, delta);
             }
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::ToggleStyle => {
@@ -1367,7 +1365,7 @@ async fn handle_command(
                 };
                 log::debug!("server: ToggleStyle new_style={:?}", sess.border_style);
             }
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionDetach => {
@@ -1481,7 +1479,7 @@ async fn handle_command(
                 dormant,
             )
             .await;
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::LayoutNext => {
@@ -1503,7 +1501,7 @@ async fn handle_command(
                         .build_tree(&tab.pane_order, tab.focused_pane);
                 }
             }
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SetMaster => {
@@ -1528,7 +1526,7 @@ async fn handle_command(
                 }
                 // No-op if not in Master mode
             }
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionSwitchTab { session, tab_index } => {
@@ -1556,7 +1554,7 @@ async fn handle_command(
                 dormant,
             )
             .await;
-            resize_session_panes(&session, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session, state, panes, clients, config).await?;
             // Invalidate all attached clients' baselines to force a fresh full
             // render (not a diff against stale content from a previous tab).
             invalidate_session_baselines(&session, clients, prev_frames).await;
@@ -1605,7 +1603,7 @@ async fn handle_command(
                 dormant,
             )
             .await;
-            resize_session_panes(&session, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session, state, panes, clients, config).await?;
             // Invalidate all attached clients' baselines to force a fresh full
             // render.
             invalidate_session_baselines(&session, clients, prev_frames).await;
@@ -1667,13 +1665,12 @@ async fn handle_command(
                                 .min();
                             cols.zip(rows)
                         };
-                        if let Some((t_cols, t_rows)) = target_dims {
+                        if target_dims.is_some() {
                             resize_session_panes(
                                 &target_session,
-                                t_cols,
-                                t_rows,
                                 state,
                                 panes,
+                                clients,
                                 config,
                             )
                             .await?;
@@ -1789,7 +1786,7 @@ async fn handle_command(
                     tab.zoomed_pane.is_some()
                 );
             }
-            resize_session_panes(&session_name, cols, rows, state, panes, config).await?;
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         _ => {
@@ -2658,12 +2655,12 @@ async fn spawn_pane(
 
 async fn resize_session_panes(
     session_name: &str,
-    cols: u16,
-    rows: u16,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     _config: &Arc<Config>,
 ) -> Result<()> {
+    let (cols, rows) = session_render_size(session_name, clients).await;
     let rects = {
         let st = state.lock().await;
         let sess = match st.sessions.get(session_name) {
@@ -3464,8 +3461,6 @@ fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellC
 async fn close_pane(
     pane_id: PaneId,
     session_name: &str,
-    cols: u16,
-    rows: u16,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -3540,7 +3535,7 @@ async fn close_pane(
     }
     match action {
         CloseAction::Broadcast => {
-            let _ = resize_session_panes(session_name, cols, rows, state, panes, config).await;
+            let _ = resize_session_panes(session_name, state, panes, clients, config).await;
             broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::SwitchSession(ref next) => {
@@ -3556,7 +3551,7 @@ async fn close_pane(
             // Clients now display a different session; invalidate their
             // baselines (from the old session) so they get a clean full render.
             invalidate_session_baselines(next, clients, prev_frames).await;
-            let _ = resize_session_panes(next, cols, rows, state, panes, config).await;
+            let _ = resize_session_panes(next, state, panes, clients, config).await;
             broadcast_full_render(next, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::Disconnect => {
@@ -3698,12 +3693,9 @@ async fn start_pty_forwarding(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name:?}"
                         );
                         // Close the pane automatically.
-                        let (cols, rows) = session_render_size(&session_name, &clients).await;
                         close_pane(
                             pane_id,
                             &session_name,
-                            cols,
-                            rows,
                             &state,
                             &panes,
                             &clients,
@@ -3942,12 +3934,9 @@ async fn materialize_session(
                         .await;
                     }
                     Some(Err(())) => {
-                        let (cols, rows) = session_render_size(&session_name, &clients).await;
                         close_pane(
                             pane_id,
                             &session_name,
-                            cols,
-                            rows,
                             &state,
                             &panes,
                             &clients,
