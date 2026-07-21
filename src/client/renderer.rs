@@ -60,6 +60,10 @@ impl Renderer {
         );
         let mut stdout = io::stdout().lock();
 
+        // Bracket the whole frame in synchronized output (DEC 2026) so the
+        // outer terminal displays it atomically instead of tearing.
+        queue!(stdout, Print("\x1b[?2026h"))?;
+
         // Hide cursor during rendering to avoid flicker.
         queue!(stdout, cursor::Hide)?;
 
@@ -170,6 +174,9 @@ impl Renderer {
         // Update front buffer.
         self.front = cells.to_vec();
 
+        // End synchronized output.
+        queue!(stdout, Print("\x1b[?2026l"))?;
+
         Ok(())
     }
 
@@ -189,6 +196,10 @@ impl Renderer {
             cursor_y
         );
         let mut stdout = io::stdout().lock();
+
+        // Bracket the whole frame in synchronized output (DEC 2026) so the
+        // outer terminal displays it atomically instead of tearing.
+        queue!(stdout, Print("\x1b[?2026h"))?;
 
         queue!(stdout, cursor::Hide)?;
 
@@ -269,6 +280,9 @@ impl Renderer {
             queue!(stdout, cursor::Hide)?;
         }
 
+        // End synchronized output.
+        queue!(stdout, Print("\x1b[?2026l"))?;
+
         Ok(())
     }
 
@@ -309,6 +323,11 @@ impl Renderer {
             // Nothing to shift or entire pane replaced — caller should use render_full
             return Ok(());
         }
+
+        // Bracket the whole frame in synchronized output (DEC 2026) so the
+        // outer terminal displays it atomically instead of tearing. Emitted
+        // after the early-return guard above so begin/end stay balanced.
+        queue!(stdout, Print("\x1b[?2026h"))?;
 
         // 1. Shift front buffer rows within the pane rect
         if delta > 0 {
@@ -473,6 +492,9 @@ impl Renderer {
             queue!(stdout, cursor::Hide)?;
         }
 
+        // End synchronized output.
+        queue!(stdout, Print("\x1b[?2026l"))?;
+
         Ok(())
     }
 
@@ -531,6 +553,11 @@ impl Renderer {
     /// to the pane bounds.
     pub fn render_visual_overlay(&self, visual_state: &VisualState) -> Result<()> {
         let mut stdout = io::stdout().lock();
+
+        // Bracket the whole frame in synchronized output (DEC 2026) so the
+        // outer terminal displays it atomically instead of tearing.
+        queue!(stdout, Print("\x1b[?2026h"))?;
+
         queue!(stdout, cursor::Hide)?;
 
         let pane_ox = visual_state.pane_offset_x;
@@ -737,6 +764,9 @@ impl Renderer {
                 }
             }
         }
+
+        // End synchronized output.
+        queue!(stdout, Print("\x1b[?2026l"))?;
 
         Ok(())
     }
