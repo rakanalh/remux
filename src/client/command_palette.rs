@@ -308,7 +308,7 @@ impl CommandPaletteState {
             let start = self.input.len() - (inner_width.saturating_sub(3));
             format!("> {}", &self.input[start..])
         } else {
-            format!("> {}", &self.input)
+            format!("> {}", self.input)
         };
         let padded_input = format!(
             "\u{2502}{:<width$}\u{2502}",

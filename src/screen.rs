@@ -918,19 +918,17 @@ impl vte::Perform for Screen {
                                     self.alt_screen_active = true;
                                 }
                             }
-                            1047 => {
+                            1047 if !self.alt_screen_active => {
                                 // Switch to alternate screen (no cursor save)
-                                if !self.alt_screen_active {
-                                    self.saved_grid = Some(self.grid.clone());
-                                    self.saved_scroll_top = self.scroll_top;
-                                    self.saved_scroll_bottom = self.scroll_bottom;
-                                    self.grid = Self::make_grid(self.cols, self.rows);
-                                    self.cursor_x = 0;
-                                    self.cursor_y = 0;
-                                    self.scroll_top = 0;
-                                    self.scroll_bottom = self.rows.saturating_sub(1);
-                                    self.alt_screen_active = true;
-                                }
+                                self.saved_grid = Some(self.grid.clone());
+                                self.saved_scroll_top = self.scroll_top;
+                                self.saved_scroll_bottom = self.scroll_bottom;
+                                self.grid = Self::make_grid(self.cols, self.rows);
+                                self.cursor_x = 0;
+                                self.cursor_y = 0;
+                                self.scroll_top = 0;
+                                self.scroll_bottom = self.rows.saturating_sub(1);
+                                self.alt_screen_active = true;
                             }
                             _ => {}
                         }
@@ -974,21 +972,19 @@ impl vte::Perform for Screen {
                                     self.mouse_sgr = false;
                                 }
                             }
-                            1047 => {
+                            1047 if self.alt_screen_active => {
                                 // Switch back to primary screen
-                                if self.alt_screen_active {
-                                    if let Some(grid) = self.saved_grid.take() {
-                                        self.grid = grid;
-                                    }
-                                    self.scroll_top = self.saved_scroll_top;
-                                    self.scroll_bottom = self.saved_scroll_bottom;
-                                    self.alt_screen_active = false;
-                                    // Safety: reset mouse flags on leaving the alt screen
-                                    // (see mode 1049 above) to recover the common
-                                    // "app gone, flag stuck" case.
-                                    self.mouse_tracking = false;
-                                    self.mouse_sgr = false;
+                                if let Some(grid) = self.saved_grid.take() {
+                                    self.grid = grid;
                                 }
+                                self.scroll_top = self.saved_scroll_top;
+                                self.scroll_bottom = self.saved_scroll_bottom;
+                                self.alt_screen_active = false;
+                                // Safety: reset mouse flags on leaving the alt screen
+                                // (see mode 1049 above) to recover the common
+                                // "app gone, flag stuck" case.
+                                self.mouse_tracking = false;
+                                self.mouse_sgr = false;
                             }
                             _ => {}
                         }

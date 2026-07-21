@@ -1940,8 +1940,7 @@ impl InputHandler {
                     } = sm.sub_mode
                     {
                         let folder_name = folders.get(selected).cloned();
-                        let folder =
-                            folder_name.and_then(|f| if f == "(none)" { None } else { Some(f) });
+                        let folder = folder_name.filter(|f| f != "(none)");
                         (name.clone(), folder)
                     } else {
                         (String::new(), None)
@@ -1998,8 +1997,7 @@ impl InputHandler {
                 }
                 KeyCode::Enter => {
                     let folder_name = folders.get(*selected).cloned();
-                    let folder =
-                        folder_name.and_then(|f| if f == "(none)" { None } else { Some(f) });
+                    let folder = folder_name.filter(|f| f != "(none)");
                     let session_name = session.clone();
                     sm.sub_mode = SubMode::Navigate;
                     let server = sm.sub_mode_server();
