@@ -143,20 +143,32 @@ pub enum SessionManagerAction {
         tab_index: usize,
         pane_id: u64,
     },
-    CreateFolder(String),
+    CreateFolder {
+        server: ConnId,
+        name: String,
+    },
     CreateSession {
+        server: ConnId,
         name: String,
         folder: Option<String>,
     },
     MoveSession {
+        server: ConnId,
         session: String,
         folder: Option<String>,
     },
-    DeleteSession(String),
-    DeleteFolder(String),
+    DeleteSession {
+        server: ConnId,
+        name: String,
+    },
+    DeleteFolder {
+        server: ConnId,
+        name: String,
+    },
     /// Resurrect a dormant (saved) session by name (Local server only).
     ResurrectSession(String),
     CloseTab {
+        server: ConnId,
         session: String,
         tab_index: usize,
     },
@@ -181,6 +193,10 @@ pub struct SessionManagerState {
     pub expanded: HashSet<String>,
     /// Current sub-mode.
     pub sub_mode: SubMode,
+    /// The server a structural sub-mode (create/delete/move) targets. Set from
+    /// the selected node's server when entering the sub-mode, and read when the
+    /// completed action is emitted so it is routed to the right connection.
+    sub_mode_server: ConnId,
     /// The name of the session the client is currently attached to.
     pub current_session: Option<String>,
     /// The foreground connection — a session row is "current" only when it is
@@ -264,6 +280,7 @@ impl SessionManagerState {
             selected: 0,
             expanded,
             sub_mode: SubMode::Navigate,
+            sub_mode_server: ConnId::Local,
             current_session,
             foreground: ConnId::Local,
             roster: vec![(ConnId::Local, "local".to_string(), RemoteState::Connected)],
@@ -586,11 +603,6 @@ impl SessionManagerState {
         }
     }
 
-    /// The server the currently-selected row belongs to (if any).
-    fn selected_server(&self) -> Option<ConnId> {
-        self.rows.get(self.selected).map(|r| r.node_type.server())
-    }
-
     // -----------------------------------------------------------------------
     // Actions
     // -----------------------------------------------------------------------
@@ -701,16 +713,13 @@ impl SessionManagerState {
 
     /// Handle 'd' key -- enter delete confirmation sub-mode.
     ///
-    /// Structural edits are Local-only: on a remote node this is a no-op.
+    /// Works on any connected server (Local or a connected remote). Panes,
+    /// server nodes, the saved group, and dormant sessions are never deletable.
     pub fn handle_delete_key(&mut self) -> SessionManagerAction {
         let row = match self.rows.get(self.selected) {
             Some(r) => r.clone(),
             None => return SessionManagerAction::None,
         };
-        // Guard: remote nodes cannot be structurally edited.
-        if row.node_type.server() != ConnId::Local {
-            return SessionManagerAction::None;
-        }
         let description = match &row.node_type {
             NodeType::Folder { name, .. } => format!("folder '{}'", name),
             NodeType::Session { name, .. } => format!("session '{}'", name),
@@ -726,6 +735,12 @@ impl SessionManagerState {
                 return SessionManagerAction::None;
             }
         };
+        // Guard: only connected servers can be structurally edited.
+        let server = row.node_type.server();
+        if !self.is_connected(&server) {
+            return SessionManagerAction::None;
+        }
+        self.sub_mode_server = server;
         self.sub_mode = SubMode::ConfirmDelete(description);
         SessionManagerAction::None
     }
@@ -746,16 +761,21 @@ impl SessionManagerState {
         };
         self.sub_mode = SubMode::Navigate;
 
-        // Guard: remote nodes cannot be structurally edited.
-        if row.node_type.server() != ConnId::Local {
-            return SessionManagerAction::None;
-        }
+        // Route the delete to the server captured when the sub-mode was entered.
+        let server = self.sub_mode_server.clone();
         match &row.node_type {
-            NodeType::Folder { name, .. } => SessionManagerAction::DeleteFolder(name.clone()),
-            NodeType::Session { name, .. } => SessionManagerAction::DeleteSession(name.clone()),
+            NodeType::Folder { name, .. } => SessionManagerAction::DeleteFolder {
+                server,
+                name: name.clone(),
+            },
+            NodeType::Session { name, .. } => SessionManagerAction::DeleteSession {
+                server,
+                name: name.clone(),
+            },
             NodeType::Tab {
                 session, tab_index, ..
             } => SessionManagerAction::CloseTab {
+                server,
                 session: session.clone(),
                 tab_index: *tab_index,
             },
@@ -766,20 +786,26 @@ impl SessionManagerState {
         }
     }
 
-    /// Handle 'c' key -- enter create-folder sub-mode. Local-only.
+    /// Handle 'c' key -- enter create-folder sub-mode on the selected node's
+    /// (connected) server.
     pub fn handle_create_folder_key(&mut self) -> SessionManagerAction {
-        if !self.selected_is_local() {
-            return SessionManagerAction::None;
-        }
+        let server = match self.structural_target_server() {
+            Some(s) => s,
+            None => return SessionManagerAction::None,
+        };
+        self.sub_mode_server = server;
         self.sub_mode = SubMode::CreateFolder(String::new());
         SessionManagerAction::None
     }
 
-    /// Handle 'n' key -- enter create-session sub-mode. Local-only.
+    /// Handle 'n' key -- enter create-session sub-mode on the selected node's
+    /// (connected) server.
     pub fn handle_create_session_key(&mut self) -> SessionManagerAction {
-        if !self.selected_is_local() {
-            return SessionManagerAction::None;
-        }
+        let server = match self.structural_target_server() {
+            Some(s) => s,
+            None => return SessionManagerAction::None,
+        };
+        self.sub_mode_server = server;
         self.sub_mode = SubMode::CreateSession {
             name: String::new(),
             phase: CreatePhase::EnterName,
@@ -787,20 +813,22 @@ impl SessionManagerState {
         SessionManagerAction::None
     }
 
-    /// Handle 'm' key -- enter move-session sub-mode. Local-only.
+    /// Handle 'm' key -- enter move-session sub-mode. Works on a session on any
+    /// connected server; the folder list is drawn from that server's tree.
     pub fn handle_move_key(&mut self) -> SessionManagerAction {
         let row = match self.rows.get(self.selected) {
             Some(r) => r.clone(),
             None => return SessionManagerAction::None,
         };
         if let NodeType::Session { server, name } = &row.node_type {
-            if server != &ConnId::Local {
+            if !self.is_connected(server) {
                 return SessionManagerAction::None;
             }
-            let mut folder_names = self.local_folder_names();
+            let mut folder_names = self.folder_names_for(server);
             folder_names.sort();
             // Add "(none)" option for top-level.
             folder_names.insert(0, "(none)".to_string());
+            self.sub_mode_server = server.clone();
             self.sub_mode = SubMode::MoveSession {
                 session: name.clone(),
                 folders: folder_names,
@@ -810,23 +838,48 @@ impl SessionManagerState {
         SessionManagerAction::None
     }
 
-    /// Whether the currently-selected row belongs to the Local server (used to
-    /// gate structural, Local-only edits).
-    fn selected_is_local(&self) -> bool {
-        self.selected_server()
-            .map(|s| s == ConnId::Local)
-            .unwrap_or(true)
+    /// Whether `server` is present in the roster and currently connected.
+    fn is_connected(&self, server: &ConnId) -> bool {
+        self.roster
+            .iter()
+            .any(|(id, _, state)| id == server && matches!(state, RemoteState::Connected))
     }
 
-    /// Get the list of Local folder names (for folder selection in sub-modes).
+    /// The server a structural edit (create folder/session) should target:
+    /// the selected node's server, but only if it is connected. Returns `None`
+    /// for the saved group, dormant sessions, and not-connected servers.
+    fn structural_target_server(&self) -> Option<ConnId> {
+        let row = self.rows.get(self.selected)?;
+        match &row.node_type {
+            NodeType::SavedGroup { .. } | NodeType::DormantSession { .. } => None,
+            _ => {
+                let server = row.node_type.server();
+                if self.is_connected(&server) {
+                    Some(server)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The server the current structural sub-mode targets. Read by the input
+    /// layer when it emits the completed create/move action so it is routed to
+    /// the right connection.
+    pub fn sub_mode_server(&self) -> ConnId {
+        self.sub_mode_server.clone()
+    }
+
+    /// Get the folder names of the sub-mode's target server (for folder
+    /// selection in the create-session flow).
     pub fn folder_names(&self) -> Vec<String> {
-        self.local_folder_names()
+        self.folder_names_for(&self.sub_mode_server)
     }
 
-    /// The Local server's folder names.
-    fn local_folder_names(&self) -> Vec<String> {
+    /// A given server's folder names.
+    fn folder_names_for(&self, server: &ConnId) -> Vec<String> {
         self.trees
-            .get(&ConnId::Local)
+            .get(server)
             .map(|(folders, _)| folders.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default()
     }
@@ -1254,7 +1307,10 @@ mod tests {
 
         // Confirm with 'y'.
         let action = state.handle_confirm_delete(true);
-        assert!(matches!(action, SessionManagerAction::DeleteSession(ref n) if n == "project-a"));
+        assert!(matches!(
+            action,
+            SessionManagerAction::DeleteSession { server: ConnId::Local, ref name } if name == "project-a"
+        ));
         assert!(matches!(state.sub_mode, SubMode::Navigate));
     }
 
@@ -1284,7 +1340,34 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_edit_guarded_on_remote() {
+    fn test_structural_edit_guarded_on_disconnected_remote() {
+        let mut state = SessionManagerState::new(None);
+        state.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Remote("pi".to_string()),
+                "pi".to_string(),
+                RemoteState::NotConnected,
+            ),
+        ]);
+
+        // Select the not-connected remote server node and try to create a
+        // folder -> no-op, no sub-mode (structural edits require a connection).
+        let remote_idx = state
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
+            })
+            .unwrap();
+        state.selected = remote_idx;
+        let action = state.handle_create_folder_key();
+        assert!(matches!(action, SessionManagerAction::None));
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    #[test]
+    fn test_create_session_key_on_connected_remote_targets_remote() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
             (ConnId::Local, "local".to_string(), RemoteState::Connected),
@@ -1303,7 +1386,52 @@ mod tests {
         );
         expand_server(&mut state, &ConnId::Remote("pi".to_string()));
 
-        // Select the remote's session and try to delete it -> no-op, no sub-mode.
+        // Select the remote server node and press 'n' -> enters create-session
+        // sub-mode, and the target server is the remote connection. This
+        // sub_mode_server value is exactly what the input layer reads to route
+        // the completed CreateSession action.
+        let remote_idx = state
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
+            })
+            .unwrap();
+        state.selected = remote_idx;
+        let action = state.handle_create_session_key();
+        assert!(matches!(action, SessionManagerAction::None));
+        assert!(matches!(
+            state.sub_mode,
+            SubMode::CreateSession {
+                phase: CreatePhase::EnterName,
+                ..
+            }
+        ));
+        assert_eq!(state.sub_mode_server(), ConnId::Remote("pi".to_string()));
+    }
+
+    #[test]
+    fn test_delete_on_connected_remote_session_targets_remote() {
+        let mut state = SessionManagerState::new(None);
+        state.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Remote("pi".to_string()),
+                "pi".to_string(),
+                RemoteState::Connected,
+            ),
+        ]);
+        let (folders, unfiled) = sample_tree();
+        state.update_tree(
+            ConnId::Remote("pi".to_string()),
+            folders,
+            unfiled,
+            Vec::new(),
+        );
+        expand_server(&mut state, &ConnId::Remote("pi".to_string()));
+
+        // Select the remote's session and delete it -> enters confirm, then the
+        // confirmed action carries the remote ConnId.
         let remote_session_idx = state
             .rows
             .iter()
@@ -1312,6 +1440,14 @@ mod tests {
         state.selected = remote_session_idx;
         let action = state.handle_delete_key();
         assert!(matches!(action, SessionManagerAction::None));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+
+        let action = state.handle_confirm_delete(true);
+        assert!(matches!(
+            action,
+            SessionManagerAction::DeleteSession { server: ConnId::Remote(ref s), ref name }
+                if s == "pi" && name == "project-a"
+        ));
         assert!(matches!(state.sub_mode, SubMode::Navigate));
     }
 

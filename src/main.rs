@@ -1354,34 +1354,35 @@ async fn run_client_loop(
                                         }
                                         record_switch(&mut current_attached, &mut previous_attached, server, session);
                                     }
-                                    // Structural edits are Local-only (guarded in the
-                                    // session manager) and always target the Local server,
-                                    // regardless of which connection is foreground.
-                                    SessionManagerAction::CreateFolder(name) => {
-                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderNew(name.clone()))).await?;
-                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                    // Structural edits target the server carried by the
+                                    // action (the selected node's connection), so the
+                                    // session manager can edit folders/sessions/tabs on
+                                    // any connected server, Local or remote.
+                                    SessionManagerAction::CreateFolder { server, name } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::FolderNew(name.clone()))).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
-                                    SessionManagerAction::CreateSession { name, folder } => {
-                                        mgr.send(&ConnId::Local, ClientMessage::CreateSession {
+                                    SessionManagerAction::CreateSession { server, name, folder } => {
+                                        mgr.send(&server, ClientMessage::CreateSession {
                                             name: name.clone(),
                                             folder: folder.clone(),
                                         }).await?;
-                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
-                                    SessionManagerAction::MoveSession { session, folder } => {
-                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderMoveSession {
+                                    SessionManagerAction::MoveSession { server, session, folder } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::FolderMoveSession {
                                             session: session.clone(),
                                             folder: folder.clone(),
                                         })).await?;
-                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
-                                    SessionManagerAction::DeleteSession(name) => {
-                                        mgr.send(&ConnId::Local, ClientMessage::KillSession { name: name.clone() }).await?;
-                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                    SessionManagerAction::DeleteSession { server, name } => {
+                                        mgr.send(&server, ClientMessage::KillSession { name: name.clone() }).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
-                                    SessionManagerAction::DeleteFolder(name) => {
-                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;
-                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                    SessionManagerAction::DeleteFolder { server, name } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::FolderDelete(name.clone()))).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
                                     // Resurrecting a dormant session is Local-only: it
                                     // materializes the saved session on the local server,
@@ -1390,12 +1391,12 @@ async fn run_client_loop(
                                         mgr.send(&ConnId::Local, ClientMessage::ResurrectSession { name: name.clone() }).await?;
                                         mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
                                     }
-                                    SessionManagerAction::CloseTab { session, tab_index } => {
-                                        mgr.send(&ConnId::Local, ClientMessage::Command(RemuxCommand::TabCloseByIndex {
+                                    SessionManagerAction::CloseTab { server, session, tab_index } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::TabCloseByIndex {
                                             session: session.clone(),
                                             tab_index,
                                         })).await?;
-                                        mgr.send(&ConnId::Local, ClientMessage::ListSessionTree).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
                                     SessionManagerAction::RefreshTree => {
                                         for id in mgr.connected_ids() {

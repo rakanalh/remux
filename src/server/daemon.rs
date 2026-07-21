@@ -893,9 +893,27 @@ async fn handle_command(
             None => return Ok(()),
         }
     };
+    // Most commands act on the requesting client's attached session and are
+    // ignored when it has none. A few structural commands operate on explicit
+    // targets instead (folder create/delete/move, close-tab-by-index), so they
+    // are allowed through even without an attached session. This lets the
+    // session manager edit folders/tabs on a remote the client has connected to
+    // but not switched to (attached). Their arms never read `session_name`.
     let session_name = match session_name {
         Some(s) => s,
-        None => return Ok(()),
+        None => {
+            if matches!(
+                cmd,
+                RemuxCommand::FolderNew(_)
+                    | RemuxCommand::FolderDelete(_)
+                    | RemuxCommand::FolderMoveSession { .. }
+                    | RemuxCommand::TabCloseByIndex { .. }
+            ) {
+                String::new()
+            } else {
+                return Ok(());
+            }
+        }
     };
 
     log::debug!("server: client_id={client_id} command={cmd:?} session={session_name:?}");
@@ -1531,8 +1549,7 @@ async fn handle_command(
                     tab.layout_mode = LayoutMode::Master(MasterLayout::default());
                 }
                 if let LayoutMode::Master(ref mut master_layout) = tab.layout_mode {
-                    if let Some(idx) =
-                        tab.pane_order.iter().position(|&id| id == tab.focused_pane)
+                    if let Some(idx) = tab.pane_order.iter().position(|&id| id == tab.focused_pane)
                     {
                         master_layout.master_idx = idx;
                     }
@@ -1681,14 +1698,8 @@ async fn handle_command(
                             cols.zip(rows)
                         };
                         if target_dims.is_some() {
-                            resize_session_panes(
-                                &target_session,
-                                state,
-                                panes,
-                                clients,
-                                config,
-                            )
-                            .await?;
+                            resize_session_panes(&target_session, state, panes, clients, config)
+                                .await?;
                         }
                         invalidate_session_baselines(&target_session, clients, prev_frames).await;
                         broadcast_full_render(

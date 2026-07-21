@@ -1627,12 +1627,13 @@ impl InputHandler {
                     KeyCode::Enter => {
                         if let SubMode::CreateFolder(name) = &sm.sub_mode {
                             let name = name.clone();
+                            let server = sm.sub_mode_server();
                             sm.sub_mode = SubMode::Navigate;
                             if name.is_empty() {
                                 InputAction::SessionManagerUpdate
                             } else {
                                 InputAction::SessionManagerAction(
-                                    SessionManagerAction::CreateFolder(name),
+                                    SessionManagerAction::CreateFolder { server, name },
                                 )
                             }
                         } else {
@@ -1854,8 +1855,10 @@ impl InputHandler {
                     } else {
                         (String::new(), None)
                     };
+                    let server = sm.sub_mode_server();
                     sm.sub_mode = SubMode::Navigate;
                     InputAction::SessionManagerAction(SessionManagerAction::CreateSession {
+                        server,
                         name: session_name,
                         folder,
                     })
@@ -1908,7 +1911,9 @@ impl InputHandler {
                         folder_name.and_then(|f| if f == "(none)" { None } else { Some(f) });
                     let session_name = session.clone();
                     sm.sub_mode = SubMode::Navigate;
+                    let server = sm.sub_mode_server();
                     InputAction::SessionManagerAction(SessionManagerAction::MoveSession {
+                        server,
                         session: session_name,
                         folder,
                     })
@@ -3607,6 +3612,51 @@ mod tests {
         // Overlay closed and mode restored.
         assert!(handler.session_switch.is_none());
         assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn session_manager_create_session_on_remote_carries_remote_server() {
+        use crate::client::registry::RemoteState;
+        use crate::client::session_manager::{NodeType, SessionManagerAction, SessionManagerState};
+
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::SessionManager;
+
+        let mut sm = SessionManagerState::new(None);
+        sm.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (remote("mini"), "mini".to_string(), RemoteState::Connected),
+        ]);
+        // Select the connected remote server node.
+        let idx = sm
+            .rows
+            .iter()
+            .position(
+                |r| matches!(&r.node_type, NodeType::Server { id, .. } if *id == remote("mini")),
+            )
+            .unwrap();
+        sm.selected = idx;
+        handler.session_manager = Some(sm);
+
+        // 'n' starts create-session; type a name; Enter -> folder select; Enter
+        // accepts "(none)" and emits the completed action.
+        let _ = handler.handle_session_manager_key(char_key('n'));
+        let _ = handler.handle_session_manager_key(char_key('s'));
+        let _ = handler.handle_session_manager_key(char_key('1'));
+        let _ = handler.handle_session_manager_key(enter_key());
+        let action = handler.handle_session_manager_key(enter_key());
+        match action {
+            InputAction::SessionManagerAction(SessionManagerAction::CreateSession {
+                server,
+                name,
+                folder,
+            }) => {
+                assert_eq!(server, remote("mini"));
+                assert_eq!(name, "s1");
+                assert_eq!(folder, None);
+            }
+            other => panic!("expected CreateSession on remote, got {other:?}"),
+        }
     }
 
     #[test]
