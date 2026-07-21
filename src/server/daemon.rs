@@ -833,9 +833,21 @@ async fn handle_input(
         data.len()
     );
 
-    let ps = panes.lock().await;
-    if let Some(pane_data) = ps.get(&active_pane) {
+    let mut ps = panes.lock().await;
+    if let Some(pane_data) = ps.get_mut(&active_pane) {
         pane_data.pty.write_input(data)?;
+
+        // Ctrl+L (0x0C / FF): shells' readline/zsh clear-screen typically emits
+        // only \e[H\e[2J (no \e[3J), so the scrollback would otherwise survive.
+        // Honor the user's expectation that Ctrl+L also drops the pane's
+        // scrollback. Gate on NOT being in alt-screen: full-screen apps like
+        // vim use Ctrl+L for their own redraw and keep no scrollback, so they
+        // must be unaffected. The shell repaints itself, so no render/broadcast
+        // is needed; handle_scroll_delta re-clamps any stale client offsets
+        // against the now-smaller total line count.
+        if data.contains(&0x0C) && !pane_data.screen.alt_screen_active {
+            pane_data.screen.scrollback.clear();
+        }
     }
     Ok(())
 }

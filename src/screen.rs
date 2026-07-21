@@ -737,9 +737,19 @@ impl vte::Perform for Screen {
                             }
                         }
                     }
-                    2 | 3 => {
+                    2 => {
                         // Erase entire display.
                         self.grid = Self::make_grid(self.cols, self.rows);
+                    }
+                    3 => {
+                        // xterm ED 3: erase the saved lines (scrollback).
+                        // The visible grid is left untouched; only remux's
+                        // scrollback buffer is cleared. This matches
+                        // xterm/Alacritty/tmux behavior and makes the `clear`
+                        // command (which emits \e[3J via the E3 capability)
+                        // truly drop remux's scrollback. total_lines() is
+                        // computed on demand, so no cached count to invalidate.
+                        self.scrollback.clear();
                     }
                     _ => {}
                 }
@@ -1608,6 +1618,28 @@ mod tests {
             s.process_output(b"XXXXX\n");
         }
         assert!(s.scrollback.len() <= 3);
+    }
+
+    #[test]
+    fn test_ed3_clears_scrollback_only() {
+        // Small screen so LF-scrolled lines spill into scrollback.
+        let mut s = Screen::new(5, 2, 100);
+        for i in 0..10 {
+            s.process_output(format!("L{i:03}\r\n").as_bytes());
+        }
+        assert!(!s.scrollback.is_empty(), "scrollback should be populated");
+
+        // Capture the visible grid so we can prove ED 3 does not touch it.
+        let grid_before = s.grid.clone();
+
+        // ED 3 (\e[3J): erase saved lines (scrollback) only.
+        s.process_output(b"\x1b[3J");
+
+        assert!(s.scrollback.is_empty(), "ED 3 must clear scrollback");
+        assert_eq!(
+            s.grid, grid_before,
+            "ED 3 must leave the visible grid untouched"
+        );
     }
 
     #[test]
