@@ -980,7 +980,7 @@ async fn handle_command(
                 }
             };
             log::debug!("server: TabClose session={session_name:?} tab_idx={tab_idx}");
-            let (pane_ids, _deleted) = {
+            let (pane_ids, deleted) = {
                 let mut st = state.lock().await;
                 st.close_tab(&session_name, tab_idx)?
             };
@@ -990,8 +990,17 @@ async fn handle_command(
                     ps.remove(&pid);
                 }
             }
-            invalidate_session_baselines(&session_name, clients, prev_frames).await;
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+            if deleted {
+                // Last tab closed -> the session was removed. Re-point attached
+                // clients onto another session (or notify them if none remain);
+                // don't broadcast the now-dead session.
+                handle_session_removed(&session_name, state, panes, clients, config, prev_frames)
+                    .await;
+            } else {
+                invalidate_session_baselines(&session_name, clients, prev_frames).await;
+                broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
+                    .await;
+            }
         }
         RemuxCommand::TabGoto(idx) => {
             {
@@ -1687,15 +1696,18 @@ async fn handle_command(
                         }
                     }
                     if session_deleted {
-                        let mut cls = clients.lock().await;
-                        for client in cls.values_mut() {
-                            if client.session_name.as_deref() == Some(&target_session) {
-                                client.session_name = None;
-                                let _ = client.tx.send(ServerMessage::Event(
-                                    SessionEvent::SessionDeleted(target_session.clone()),
-                                ));
-                            }
-                        }
+                        // Last tab of the target session closed -> it was
+                        // removed. Re-point its attached clients onto another
+                        // session (or notify them if none remain).
+                        handle_session_removed(
+                            &target_session,
+                            state,
+                            panes,
+                            clients,
+                            config,
+                            prev_frames,
+                        )
+                        .await;
                     } else {
                         // Closing a tab may switch the active tab. The requesting
                         // client (session manager) is generally viewing a
@@ -3830,6 +3842,61 @@ fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellC
 /// Close a pane, updating layout and session state. If the pane is the last
 /// pane in its tab, the tab is closed. If the last tab closes, the session is
 /// left empty.
+/// Handle the after-effects of a session being removed (its last tab/pane was
+/// closed and the session no longer exists in `state`).
+///
+/// Picks the next available session; if one exists, every client that was
+/// attached to `removed` is re-pointed onto it and given a fresh full render.
+/// If no sessions remain, those clients are detached and notified with a
+/// `SessionDeleted` event so they can fall back or exit.
+///
+/// This is the shared post-removal logic used by pane close, tab close, and
+/// close-tab-by-index.
+async fn handle_session_removed(
+    removed: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let next_session = {
+        let st = state.lock().await;
+        st.sessions.keys().next().cloned()
+    };
+    match next_session {
+        Some(next) => {
+            // Switch all clients that were on the removed session to the next one.
+            {
+                let mut cls = clients.lock().await;
+                for c in cls.values_mut() {
+                    if c.session_name.as_deref() == Some(removed) {
+                        c.session_name = Some(next.clone());
+                    }
+                }
+            }
+            // Clients now display a different session; invalidate their
+            // baselines (from the old session) so they get a clean full render.
+            invalidate_session_baselines(&next, clients, prev_frames).await;
+            let _ = resize_session_panes(&next, state, panes, clients, config).await;
+            broadcast_full_render(&next, state, panes, clients, config, prev_frames).await;
+        }
+        None => {
+            // No sessions left -- notify affected clients so they disconnect
+            // (or fall back to another server).
+            let mut cls = clients.lock().await;
+            for c in cls.values_mut() {
+                if c.session_name.as_deref() == Some(removed) {
+                    c.session_name = None;
+                    let _ = c.tx.send(ServerMessage::Event(SessionEvent::SessionDeleted(
+                        removed.to_string(),
+                    )));
+                }
+            }
+        }
+    }
+}
+
 async fn close_pane(
     pane_id: PaneId,
     session_name: &str,
@@ -3843,11 +3910,10 @@ async fn close_pane(
     enum CloseAction {
         /// Normal close -- broadcast a full render for the current session.
         Broadcast,
-        /// Last pane/tab in the session was closed; switch clients to another
-        /// session.
-        SwitchSession(String),
-        /// Last session was removed; disconnect affected clients.
-        Disconnect,
+        /// Last pane/tab in the session was closed and the session was removed
+        /// from `state`; run the shared post-removal logic (switch clients to
+        /// another session, or disconnect them if none remain).
+        SessionRemoved,
         /// Nothing to do (pane not found, etc.).
         NoBroadcast,
     }
@@ -3891,13 +3957,7 @@ async fn close_pane(
                 // Last tab in the session -- remove the session entirely.
                 let session_name_owned = session_name.to_string();
                 st.sessions.remove(&session_name_owned);
-
-                // Find the next available session to switch to.
-                let next_session = st.sessions.keys().next().cloned();
-                match next_session {
-                    Some(next) => CloseAction::SwitchSession(next),
-                    None => CloseAction::Disconnect,
-                }
+                CloseAction::SessionRemoved
             }
         }
     };
@@ -3910,33 +3970,8 @@ async fn close_pane(
             let _ = resize_session_panes(session_name, state, panes, clients, config).await;
             broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
         }
-        CloseAction::SwitchSession(ref next) => {
-            // Switch all clients that were on this session to the next one.
-            {
-                let mut cls = clients.lock().await;
-                for c in cls.values_mut() {
-                    if c.session_name.as_deref() == Some(session_name) {
-                        c.session_name = Some(next.clone());
-                    }
-                }
-            }
-            // Clients now display a different session; invalidate their
-            // baselines (from the old session) so they get a clean full render.
-            invalidate_session_baselines(next, clients, prev_frames).await;
-            let _ = resize_session_panes(next, state, panes, clients, config).await;
-            broadcast_full_render(next, state, panes, clients, config, prev_frames).await;
-        }
-        CloseAction::Disconnect => {
-            // No sessions left -- notify affected clients so they disconnect.
-            let mut cls = clients.lock().await;
-            for c in cls.values_mut() {
-                if c.session_name.as_deref() == Some(session_name) {
-                    c.session_name = None;
-                    let _ = c.tx.send(ServerMessage::Event(SessionEvent::SessionDeleted(
-                        session_name.to_string(),
-                    )));
-                }
-            }
+        CloseAction::SessionRemoved => {
+            handle_session_removed(session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::NoBroadcast => {}
     }

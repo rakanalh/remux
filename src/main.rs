@@ -551,6 +551,12 @@ async fn run_client_loop(
     // foreground-remote connection drops. Seeded from the pre-loop attach.
     let mut last_local_session: Option<String> = initial_local_session;
 
+    // Set when a foreground-remote session was deleted (e.g. its last tab was
+    // closed) and we've asked the local server for its session list to decide
+    // whether to fall back to a local session or exit. Consumed by the
+    // `SessionList` handler (gated on `src == Local`) to complete the fallback.
+    let mut pending_local_fallback = false;
+
     // Track the current and previously-attached (server, session) for the
     // "last session" toggle (Alt-o). Seeded with the initial local session as
     // `(ConnId::Local, name)` when known; `previous` starts empty so the first
@@ -2058,6 +2064,39 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionList { sessions }) => {
                         log::debug!("received session list with {} sessions", sessions.len());
+                        // Complete a pending local fallback: a foreground remote
+                        // session was deleted and we asked the local server for its
+                        // sessions to decide where to land.
+                        if pending_local_fallback && src == ConnId::Local {
+                            pending_local_fallback = false;
+                            if sessions.is_empty() {
+                                // No local sessions to fall back to -- exit.
+                                break;
+                            }
+                            // Prefer the last local session we were on if it still
+                            // exists; otherwise take the first available one.
+                            let target = last_local_session
+                                .as_ref()
+                                .filter(|name| sessions.iter().any(|s| &s.name == *name))
+                                .cloned()
+                                .unwrap_or_else(|| sessions[0].name.clone());
+                            // Standard switch dance (mirrors the session-manager
+                            // SwitchSession path) targeting the local server.
+                            input.session_manager = None;
+                            input.mode = Mode::Normal;
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_overlay(c, r)?;
+                            renderer.flush()?;
+                            switch_to_server(mgr, &ConnId::Local, c, r).await?;
+                            mgr.send(&ConnId::Local, ClientMessage::Attach {
+                                session_name: target.clone(),
+                            }).await?;
+                            mgr.send(&ConnId::Local, ClientMessage::ModeChanged {
+                                mode: "NORMAL".to_string(),
+                            }).await?;
+                            last_local_session = Some(target.clone());
+                            record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, target);
+                        }
                     }
                     Some(ServerMessage::Error { message }) => {
                         log::error!("Server error: {}", message);
@@ -2309,7 +2348,27 @@ async fn run_client_loop(
                                 for id in mgr.connected_ids() {
                                     mgr.send(&id, ClientMessage::ListSessionTree).await?;
                                 }
+                            } else if matches!(src, ConnId::Remote(_)) {
+                                // A foreground *remote* session was deleted. Don't
+                                // exit -- fall back to a local session instead. Ask
+                                // the local server for its sessions; the reply is
+                                // handled in the `SessionList` arm (gated on the
+                                // flag + src == Local) to complete the switch.
+                                //
+                                // The standalone `attach-remote` flow has no local
+                                // connection to fall back to -- exit gracefully
+                                // rather than send to a connection that isn't there.
+                                if mgr.connected_ids().contains(&ConnId::Local) {
+                                    pending_local_fallback = true;
+                                    mgr.send(&ConnId::Local, ClientMessage::ListSessions).await?;
+                                } else {
+                                    break;
+                                }
                             } else {
+                                // A foreground *local* session was deleted. The
+                                // server already switched us to another local
+                                // session if one remained, so a SessionDeleted here
+                                // means none are left -- shut down.
                                 break;
                             }
                         }
