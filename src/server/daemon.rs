@@ -2475,12 +2475,11 @@ async fn handle_scroll_delta(
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
     // Apply delta to server-owned scroll offset, clamp to valid range.
-    let (session_name, rows, old_offset) = {
+    let (session_name, old_offset) = {
         let cls = clients.lock().await;
         let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
-        let rows = cls.get(&client_id).map(|c| c.rows).unwrap_or(24);
         let so = cls.get(&client_id).map(|c| c.scroll_offset).unwrap_or(0);
-        (sn, rows, so)
+        (sn, so)
     };
     let new_offset = if delta > 0 {
         old_offset.saturating_add(delta as usize)
@@ -2499,9 +2498,14 @@ async fn handle_scroll_delta(
             let ps = panes.lock().await;
             ps.get(&fp)
                 .map(|p| {
+                    // Clamp against the focused pane's inner grid height
+                    // (screen.rows == grid.len()), which is exactly the number of
+                    // content rows blit_screen draws for the pane. Using the
+                    // client terminal rows here would over-subtract (it ignores
+                    // the status bar and pane borders), leaving the earliest
+                    // scrollback lines unreachable at max scroll.
                     let total = p.screen.total_lines();
-                    let content_rows = (rows as usize).saturating_sub(1);
-                    total.saturating_sub(content_rows)
+                    total.saturating_sub(p.screen.rows as usize)
                 })
                 .unwrap_or(0)
         } else {
@@ -3278,8 +3282,16 @@ async fn send_full_render_to_client(
         // (it expects the caller to fall back to a full repaint), so only use a
         // ScrollRender when the delta is strictly smaller than the focused
         // pane's content height; otherwise send a FullRender.
+        //
+        // At the very top of history (viewport_top == 0, i.e. scroll_offset has
+        // reached max_offset so the first scrollback line is the top visible
+        // row) force a FullRender instead of an incremental ScrollRender. This
+        // guarantees the client's on-screen buffer is repainted authoritatively
+        // at the scroll boundary rather than relying on an accumulated series of
+        // incremental shifts to have landed the earliest lines exactly right.
         let use_scroll_render = scroll_offset > 0
             && prev_so > 0
+            && viewport_top > 0
             && abs_delta > 0
             && abs_delta <= 10
             && focused_pane_rect.is_some_and(|r| abs_delta < r.height as usize);
