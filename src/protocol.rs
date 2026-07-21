@@ -429,6 +429,59 @@ pub enum RemuxCommand {
         session: String,
         tab_index: usize,
     },
+
+    // -- Explicit-target structural commands --------------------------------
+    // These operate on an arbitrary (named/indexed) target rather than the
+    // requesting client's attached session, so the session manager can edit
+    // sessions/folders/tabs/panes it is not currently attached to. Like the
+    // other explicit-target commands above (SessionSwitchTab, TabCloseByIndex)
+    // they are internal protocol commands issued by the session-manager UI and
+    // are deliberately NOT listed in `command_names()` / `parse_command` (a
+    // keybinding string cannot supply their structural arguments).
+    /// Rename session `old` to `new`. Fail-silently if `old` is missing or
+    /// `new` already exists.
+    SessionRenameByName {
+        old: String,
+        new: String,
+    },
+    /// Rename folder `old` to `new`. Fail-silently if `old` is missing or
+    /// `new` already exists.
+    FolderRename {
+        old: String,
+        new: String,
+    },
+    /// Create a new tab (with its default pane) in the named target session.
+    TabNewInSession {
+        session: String,
+    },
+    /// Set the name of a tab by index in the target session.
+    TabRenameByIndex {
+        session: String,
+        tab_index: usize,
+        name: String,
+    },
+    /// Add a pane to a tab (by index) in the target session.
+    PaneNewInTab {
+        session: String,
+        tab_index: usize,
+    },
+    /// Close a pane by id in the target session.
+    PaneCloseById {
+        session: String,
+        pane_id: u64,
+    },
+    /// Set the custom name of a pane by id in the target session.
+    PaneRenameById {
+        session: String,
+        pane_id: u64,
+        name: String,
+    },
+    /// Move a tab (by index) left/right by `delta` within the target session.
+    TabMoveByIndex {
+        session: String,
+        tab_index: usize,
+        delta: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +644,60 @@ mod tests {
         match decoded {
             ClientMessage::Command(RemuxCommand::TabNew) => {}
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_explicit_target_commands() {
+        // Each explicit-target command must survive a length-prefixed JSON
+        // round trip wrapped in a ClientMessage::Command, exactly as it travels
+        // on the wire between the session-manager client and the daemon.
+        let cases = vec![
+            RemuxCommand::SessionRenameByName {
+                old: "old".into(),
+                new: "new".into(),
+            },
+            RemuxCommand::FolderRename {
+                old: "work".into(),
+                new: "play".into(),
+            },
+            RemuxCommand::TabNewInSession {
+                session: "main".into(),
+            },
+            RemuxCommand::TabRenameByIndex {
+                session: "main".into(),
+                tab_index: 2,
+                name: "logs".into(),
+            },
+            RemuxCommand::PaneNewInTab {
+                session: "main".into(),
+                tab_index: 1,
+            },
+            RemuxCommand::PaneCloseById {
+                session: "main".into(),
+                pane_id: 42,
+            },
+            RemuxCommand::PaneRenameById {
+                session: "main".into(),
+                pane_id: 42,
+                name: "editor".into(),
+            },
+            RemuxCommand::TabMoveByIndex {
+                session: "main".into(),
+                tab_index: 3,
+                delta: -1,
+            },
+        ];
+
+        for cmd in cases {
+            let msg = ClientMessage::Command(cmd.clone());
+            let encoded = encode_message(&msg).unwrap();
+            let len = decode_message_length(encoded[..4].try_into().unwrap());
+            let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+            match decoded {
+                ClientMessage::Command(decoded_cmd) => assert_eq!(decoded_cmd, cmd),
+                other => panic!("unexpected variant: {other:?}"),
+            }
         }
     }
 

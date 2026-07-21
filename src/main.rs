@@ -490,7 +490,13 @@ async fn run_client_loop(
     let leader_key = config.leader_key();
     log::debug!("run_client_loop: leader_key={:?}", leader_key);
     let shortcut_bindings = config.shortcut_bindings();
-    let mut input = InputHandler::new(keybindings, leader_key, shortcut_bindings);
+    let session_manager_bindings = config.session_manager_bindings();
+    let mut input = InputHandler::new(
+        keybindings,
+        leader_key,
+        shortcut_bindings,
+        session_manager_bindings,
+    );
     let (cols, rows) = crossterm::terminal::size()?;
     log::debug!("run_client_loop: terminal size={}x{}", cols, rows);
     let mut renderer = Renderer::new(cols, rows);
@@ -1398,6 +1404,59 @@ async fn run_client_loop(
                                         })).await?;
                                         mgr.send(&server, ClientMessage::ListSessionTree).await?;
                                     }
+                                    SessionManagerAction::TabNew { server, session } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::TabNewInSession {
+                                            session: session.clone(),
+                                        })).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::TabMove { server, session, tab_index, delta } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::TabMoveByIndex {
+                                            session: session.clone(),
+                                            tab_index,
+                                            delta,
+                                        })).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::PaneNew { server, session, tab_index } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::PaneNewInTab {
+                                            session: session.clone(),
+                                            tab_index,
+                                        })).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::PaneClose { server, session, pane_id } => {
+                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::PaneCloseById {
+                                            session: session.clone(),
+                                            pane_id,
+                                        })).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                    }
+                                    SessionManagerAction::Rename { server, kind, new_name } => {
+                                        use crate::client::session_manager::RenameKind;
+                                        let cmd = match kind {
+                                            RenameKind::Session { name } => RemuxCommand::SessionRenameByName {
+                                                old: name.clone(),
+                                                new: new_name.clone(),
+                                            },
+                                            RenameKind::Folder { name } => RemuxCommand::FolderRename {
+                                                old: name.clone(),
+                                                new: new_name.clone(),
+                                            },
+                                            RenameKind::Tab { session, tab_index } => RemuxCommand::TabRenameByIndex {
+                                                session: session.clone(),
+                                                tab_index,
+                                                name: new_name.clone(),
+                                            },
+                                            RenameKind::Pane { session, pane_id } => RemuxCommand::PaneRenameById {
+                                                session: session.clone(),
+                                                pane_id,
+                                                name: new_name.clone(),
+                                            },
+                                        };
+                                        mgr.send(&server, ClientMessage::Command(cmd)).await?;
+                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                    }
                                     SessionManagerAction::RefreshTree => {
                                         for id in mgr.connected_ids() {
                                             mgr.send(&id, ClientMessage::ListSessionTree).await?;
@@ -1719,9 +1778,7 @@ async fn run_client_loop(
                                     } else {
                                         // Nothing to fall back to: open the session manager.
                                         input.mode = Mode::SessionManager;
-                                        input.session_manager = Some(
-                                            crate::client::session_manager::SessionManagerState::new(None),
-                                        );
+                                        input.session_manager = Some(input.new_session_manager(None));
                                         if let Some(sm) = input.session_manager.as_mut() {
                                             sm.set_foreground(mgr.foreground().clone());
                                             sm.set_roster(mgr.server_roster());
@@ -2283,6 +2340,7 @@ async fn run_client_loop(
                         new_config.keybinding_tree(),
                         new_config.leader_key(),
                         new_config.shortcut_bindings(),
+                        new_config.session_manager_bindings(),
                     );
 
                     // Update theme before any re-render so overlays repaint with

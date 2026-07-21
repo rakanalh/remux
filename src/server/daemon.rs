@@ -908,6 +908,14 @@ async fn handle_command(
                     | RemuxCommand::FolderDelete(_)
                     | RemuxCommand::FolderMoveSession { .. }
                     | RemuxCommand::TabCloseByIndex { .. }
+                    | RemuxCommand::SessionRenameByName { .. }
+                    | RemuxCommand::FolderRename { .. }
+                    | RemuxCommand::TabNewInSession { .. }
+                    | RemuxCommand::TabRenameByIndex { .. }
+                    | RemuxCommand::PaneNewInTab { .. }
+                    | RemuxCommand::PaneCloseById { .. }
+                    | RemuxCommand::PaneRenameById { .. }
+                    | RemuxCommand::TabMoveByIndex { .. }
             ) {
                 String::new()
             } else {
@@ -1814,6 +1822,292 @@ async fn handle_command(
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        // -- Explicit-target structural commands ----------------------------
+        // These act on a named/indexed target rather than the requester's
+        // attached session (the session manager may be attached elsewhere or
+        // nowhere). They never read the local `session_name`. On failure they
+        // fail silently (log + early return) rather than propagating an error,
+        // and after a successful mutation they refresh the *target* session's
+        // attached clients (if any) via `refresh_target_session`.
+        RemuxCommand::SessionRenameByName { old, new } => {
+            log::debug!("server: SessionRenameByName old={old:?} new={new:?}");
+            {
+                let mut st = state.lock().await;
+                if let Err(e) = st.rename_session(&old, &new) {
+                    log::info!("SessionRenameByName: {e}");
+                    return Ok(());
+                }
+            }
+            // Retarget any clients still attached under the old name so their
+            // input/render continues to resolve to the renamed session.
+            {
+                let mut cls = clients.lock().await;
+                for client in cls.values_mut() {
+                    if client.session_name.as_deref() == Some(&old) {
+                        client.session_name = Some(new.clone());
+                    }
+                }
+            }
+        }
+        RemuxCommand::FolderRename { old, new } => {
+            log::debug!("server: FolderRename old={old:?} new={new:?}");
+            let mut st = state.lock().await;
+            if let Err(e) = st.rename_folder(&old, &new) {
+                log::info!("FolderRename: {e}");
+            }
+        }
+        RemuxCommand::TabNewInSession { session } => {
+            // Mirror TabNew but on the named target session, using that
+            // session's own render dimensions (the requester may be attached
+            // elsewhere or nowhere).
+            let (tcols, trows) = session_render_size(&session, clients).await;
+            let pane_id = {
+                let mut st = state.lock().await;
+                let tab_count = match st.sessions.get(&session) {
+                    Some(s) => s.tabs.len(),
+                    None => {
+                        log::info!("TabNewInSession: session '{session}' not found");
+                        return Ok(());
+                    }
+                };
+                let tab_name = format!("Tab {}", tab_count + 1);
+                match st.create_tab(&session, &tab_name, LayoutMode::default()) {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        log::info!("TabNewInSession: {e}");
+                        return Ok(());
+                    }
+                }
+            };
+            log::debug!("server: TabNewInSession session={session:?} new pane_id={pane_id}");
+            spawn_pane(pane_id, tcols, trows, None, None, panes, config).await?;
+            // create_tab makes the new tab active, so forwarding starts for its
+            // pane here. (For a mutation on a non-active tab, forwarding would
+            // instead begin on the next SessionSwitchTab; the guard makes the
+            // repeat call safe.)
+            start_pty_forwarding(
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
+            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
+        }
+        RemuxCommand::TabRenameByIndex {
+            session,
+            tab_index,
+            name,
+        } => {
+            log::debug!(
+                "server: TabRenameByIndex session={session:?} idx={tab_index} name={name:?}"
+            );
+            {
+                let mut st = state.lock().await;
+                if let Err(e) = st.rename_tab(&session, tab_index, &name) {
+                    log::info!("TabRenameByIndex: {e}");
+                    return Ok(());
+                }
+            }
+            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
+        }
+        RemuxCommand::PaneNewInTab { session, tab_index } => {
+            // Mirror PaneNew's split/insert logic, but on tab `tab_index` of the
+            // named target session (PaneNew operates on the requester's focused
+            // tab).
+            let (tcols, trows) = session_render_size(&session, clients).await;
+            let (new_pane_id, focused_pane_id) = {
+                let mut st = state.lock().await;
+                let new_pane_id = st.next_pane_id();
+                let sess = match st.sessions.get_mut(&session) {
+                    Some(s) => s,
+                    None => {
+                        log::info!("PaneNewInTab: session '{session}' not found");
+                        return Ok(());
+                    }
+                };
+                let tab = match sess.tabs.get_mut(tab_index) {
+                    Some(t) => t,
+                    None => {
+                        log::info!("PaneNewInTab: tab index {tab_index} out of range");
+                        return Ok(());
+                    }
+                };
+                let prev_focused = tab.focused_pane;
+                tab.pane_order.push(new_pane_id);
+                if tab.layout_mode.is_automatic() {
+                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_pane_id);
+                    tab.focused_pane = new_pane_id;
+                } else {
+                    let focused = tab.focused_pane;
+                    tab.layout.split_vertical(focused, new_pane_id);
+                    tab.focused_pane = new_pane_id;
+                }
+                (new_pane_id, prev_focused)
+            };
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                panes_lock
+                    .get(&focused_pane_id)
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+            };
+            spawn_pane(
+                new_pane_id,
+                tcols,
+                trows,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
+            start_pty_forwarding(
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
+            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
+        }
+        RemuxCommand::PaneCloseById { session, pane_id } => {
+            log::debug!("server: PaneCloseById session={session:?} pane_id={pane_id}");
+            // If the pane is in the target session's active tab, reuse close_pane
+            // (which handles layout collapse, tab removal, last-session removal,
+            // client switch, and its own resize/broadcast). If it lives in a
+            // background tab, close_pane would silently no-op, so handle that
+            // path inline here.
+            let in_active_tab = {
+                let st = state.lock().await;
+                st.sessions
+                    .get(&session)
+                    .and_then(|s| s.tabs.get(s.active_tab))
+                    .map(|t| t.pane_order.contains(&pane_id))
+                    .unwrap_or(false)
+            };
+            if in_active_tab {
+                close_pane(
+                    pane_id,
+                    &session,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                )
+                .await;
+            } else {
+                // Background-tab path: mirror close_pane's non-active-tab-safe
+                // subset (layout collapse + pane_order retain + focus/rebuild,
+                // and tab removal if it became empty). A background tab implies
+                // at least the active tab also exists, so the session can never
+                // be emptied here — the last-session/switch/disconnect branch is
+                // unreachable and intentionally omitted.
+                {
+                    let mut st = state.lock().await;
+                    let sess = match st.sessions.get_mut(&session) {
+                        Some(s) => s,
+                        None => return Ok(()),
+                    };
+                    let tab_idx = match sess
+                        .tabs
+                        .iter()
+                        .position(|t| t.pane_order.contains(&pane_id))
+                    {
+                        Some(i) => i,
+                        None => {
+                            log::info!(
+                                "PaneCloseById: pane {pane_id} not found in session '{session}'"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let tab = &mut sess.tabs[tab_idx];
+                    let new_focus = tab.layout.close_pane(pane_id);
+                    tab.pane_order.retain(|&id| id != pane_id);
+                    match new_focus {
+                        Some(nf) => {
+                            tab.focused_pane = nf;
+                            if tab.layout_mode.is_automatic() {
+                                tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
+                            }
+                        }
+                        None => {
+                            // Last pane in this background tab -> remove the tab.
+                            // Adjust active_tab if it sat after the removed tab
+                            // (close_pane never does this — it only removes the
+                            // active tab itself).
+                            sess.tabs.remove(tab_idx);
+                            if tab_idx < sess.active_tab {
+                                sess.active_tab -= 1;
+                            }
+                        }
+                    }
+                }
+                {
+                    let mut ps = panes.lock().await;
+                    ps.remove(&pane_id);
+                }
+                refresh_target_session(&session, state, panes, clients, config, prev_frames)
+                    .await?;
+            }
+        }
+        RemuxCommand::PaneRenameById {
+            session,
+            pane_id,
+            name,
+        } => {
+            log::debug!(
+                "server: PaneRenameById session={session:?} pane_id={pane_id} name={name:?}"
+            );
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session) {
+                    Some(s) => s,
+                    None => {
+                        log::info!("PaneRenameById: session '{session}' not found");
+                        return Ok(());
+                    }
+                };
+                // Locate the tab owning this pane (any tab, not just the active
+                // one) and set its custom name, mirroring PaneRename.
+                let mut found = false;
+                for tab in sess.tabs.iter_mut() {
+                    if tab.pane_order.contains(&pane_id) {
+                        layout::set_pane_custom_name(&mut tab.layout, pane_id, &name);
+                        layout::set_pane_name(&mut tab.layout, pane_id, &name);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    log::info!("PaneRenameById: pane {pane_id} not found in session '{session}'");
+                    return Ok(());
+                }
+            }
+            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
+        }
+        RemuxCommand::TabMoveByIndex {
+            session,
+            tab_index,
+            delta,
+        } => {
+            log::debug!("server: TabMoveByIndex session={session:?} idx={tab_index} delta={delta}");
+            {
+                let mut st = state.lock().await;
+                if let Err(e) = st.move_tab(&session, tab_index, delta) {
+                    log::info!("TabMoveByIndex: {e}");
+                    return Ok(());
+                }
+            }
+            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
         }
         _ => {
             log::debug!("unhandled command: {cmd:?}");
@@ -2785,6 +3079,38 @@ async fn session_render_size(
         .min()
         .unwrap_or(24);
     (cols, rows)
+}
+
+/// Refresh a target session after a structural mutation performed on behalf of
+/// a client that may be attached to a *different* session (or to none) -- e.g.
+/// the session manager editing a session it is not viewing.
+///
+/// If the target session has any attached clients, this resizes its active
+/// tab's panes to those clients' dimensions, invalidates their render
+/// baselines, and broadcasts a fresh full render. When no client is attached,
+/// there is nothing to display, so it is a no-op (the mutation is still
+/// persisted by the caller via `save_if_enabled`). Mirrors the
+/// `target_dims.is_some()` guard used by the `TabCloseByIndex` handler.
+async fn refresh_target_session(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let has_clients = {
+        let cls = clients.lock().await;
+        cls.values()
+            .any(|c| c.session_name.as_deref() == Some(session_name))
+    };
+    if !has_clients {
+        return Ok(());
+    }
+    resize_session_panes(session_name, state, panes, clients, config).await?;
+    invalidate_session_baselines(session_name, clients, prev_frames).await;
+    broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    Ok(())
 }
 
 /// Invalidate the previous-frame baselines of every client attached to a

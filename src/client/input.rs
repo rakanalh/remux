@@ -5,7 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::client::command_palette::CommandPaletteState;
 use crate::client::registry::ConnId;
 use crate::config::keybindings::{
-    parse_command, InterceptAction, KeyNode, KeybindingTree, ShortcutBindings,
+    parse_command, InterceptAction, KeyNode, KeybindingTree, SessionManagerBindings,
+    ShortcutBindings,
 };
 use crate::protocol::RemuxCommand;
 
@@ -497,6 +498,9 @@ pub struct InputHandler {
     pub rename_overlay: Option<RenameOverlay>,
     /// Modifier shortcut bindings for Normal mode (e.g. Alt-h, Alt-p).
     shortcut_bindings: ShortcutBindings,
+    /// Chord bindings for the session-manager overlay (injected into the
+    /// overlay state when it is opened).
+    session_manager_bindings: SessionManagerBindings,
     /// Command palette state. When `Some`, the palette overlay is active.
     pub command_palette: Option<CommandPaletteState>,
     /// State for Search mode.
@@ -907,6 +911,7 @@ impl InputHandler {
         keybinding_tree: KeybindingTree,
         leader_key: KeyEvent,
         shortcut_bindings: ShortcutBindings,
+        session_manager_bindings: SessionManagerBindings,
     ) -> Self {
         Self {
             mode: Mode::Normal,
@@ -917,6 +922,7 @@ impl InputHandler {
             pending_g: false,
             rename_overlay: None,
             shortcut_bindings,
+            session_manager_bindings,
             command_palette: None,
             search_state: None,
             session_manager: None,
@@ -941,6 +947,7 @@ impl InputHandler {
             KeybindingTree::default(),
             leader,
             ShortcutBindings::default(),
+            SessionManagerBindings::default(),
         )
     }
 
@@ -953,11 +960,25 @@ impl InputHandler {
         keybinding_tree: KeybindingTree,
         leader_key: KeyEvent,
         shortcut_bindings: ShortcutBindings,
+        session_manager_bindings: SessionManagerBindings,
     ) {
         self.keybinding_tree = keybinding_tree;
         self.leader_key = leader_key;
         self.shortcut_bindings = shortcut_bindings;
+        self.session_manager_bindings = session_manager_bindings;
         self.keybinding_state.reset();
+    }
+
+    /// Construct a session-manager overlay state with the effective chord
+    /// bindings injected. Used by every site that opens the overlay so user
+    /// chord overrides consistently apply.
+    pub(crate) fn new_session_manager(
+        &self,
+        current_session: Option<String>,
+    ) -> crate::client::session_manager::SessionManagerState {
+        let mut sm = crate::client::session_manager::SessionManagerState::new(current_session);
+        sm.set_bindings(self.session_manager_bindings.clone());
+        sm
     }
 
     /// Process a key event and return the appropriate action.
@@ -1076,9 +1097,7 @@ impl InputHandler {
         // Intercept mode-changing shortcuts before parsing to RemuxCommand.
         if actions.len() == 1 && actions[0] == "OpenSessionManager" {
             self.mode = Mode::SessionManager;
-            self.session_manager = Some(crate::client::session_manager::SessionManagerState::new(
-                None,
-            ));
+            self.session_manager = Some(self.new_session_manager(None));
             return InputAction::SessionManagerOpen;
         }
 
@@ -1241,18 +1260,14 @@ impl InputHandler {
                         }
                         RemuxCommand::OpenSessionManager => {
                             self.mode = Mode::SessionManager;
-                            self.session_manager = Some(
-                                crate::client::session_manager::SessionManagerState::new(None),
-                            );
+                            self.session_manager = Some(self.new_session_manager(None));
                             return InputAction::SessionManagerOpen;
                         }
                         RemuxCommand::RemoteConnect(dest) => {
                             // Open the session manager (same as OpenSessionManager),
                             // then request the connect via a dedicated action.
                             self.mode = Mode::SessionManager;
-                            self.session_manager = Some(
-                                crate::client::session_manager::SessionManagerState::new(None),
-                            );
+                            self.session_manager = Some(self.new_session_manager(None));
                             return InputAction::RemoteConnect(dest.clone());
                         }
                         RemuxCommand::SessionMoveToFolder => {
@@ -1661,7 +1676,83 @@ impl InputHandler {
             SubMode::MoveSession { .. } => {
                 return self.handle_session_manager_move_key(key);
             }
-            SubMode::Navigate => {} // Fall through to navigation keys.
+            SubMode::Rename { .. } => {
+                // Text input for a rename, mirroring CreateFolder's editing.
+                return match key.code {
+                    KeyCode::Esc => {
+                        sm.sub_mode = SubMode::Navigate;
+                        InputAction::SessionManagerUpdate
+                    }
+                    KeyCode::Enter => {
+                        let action = sm.confirm_rename();
+                        match action {
+                            SessionManagerAction::None => InputAction::SessionManagerUpdate,
+                            _ => InputAction::SessionManagerAction(action),
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let SubMode::Rename { ref mut buffer, .. } = sm.sub_mode {
+                            buffer.pop();
+                        }
+                        InputAction::SessionManagerUpdate
+                    }
+                    KeyCode::Char(c) => {
+                        if let SubMode::Rename { ref mut buffer, .. } = sm.sub_mode {
+                            buffer.push(c);
+                        }
+                        InputAction::SessionManagerUpdate
+                    }
+                    _ => InputAction::None,
+                };
+            }
+            SubMode::Navigate => {} // Fall through to chord/navigation keys.
+        }
+
+        // Chord engine (Navigate mode): configured chords are checked before
+        // the legacy hardcoded keys. Only plain chars (no Ctrl/Alt) participate.
+        let is_plain_char = matches!(key.code, KeyCode::Char(_))
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
+
+        if sm.pending_chord().is_some() {
+            // Mid-chord: a plain char may complete it; anything else cancels.
+            if let KeyCode::Char(c) = key.code {
+                if is_plain_char {
+                    use crate::client::session_manager::ChordOutcome;
+                    return match sm.feed_chord(c) {
+                        ChordOutcome::Binding(b) => {
+                            let action = sm.apply_binding(b);
+                            match action {
+                                SessionManagerAction::None => InputAction::SessionManagerUpdate,
+                                _ => InputAction::SessionManagerAction(action),
+                            }
+                        }
+                        // Unmatched second key -> pending cleared, consume.
+                        _ => InputAction::SessionManagerUpdate,
+                    };
+                }
+            }
+            // Non-char key while pending: cancel the chord and consume the key.
+            sm.clear_pending_chord();
+            return InputAction::SessionManagerUpdate;
+        }
+
+        if let KeyCode::Char(c) = key.code {
+            if is_plain_char {
+                use crate::client::session_manager::ChordOutcome;
+                match sm.feed_chord(c) {
+                    ChordOutcome::Pending => return InputAction::SessionManagerUpdate,
+                    ChordOutcome::Binding(b) => {
+                        let action = sm.apply_binding(b);
+                        return match action {
+                            SessionManagerAction::None => InputAction::SessionManagerUpdate,
+                            _ => InputAction::SessionManagerAction(action),
+                        };
+                    }
+                    ChordOutcome::Cleared => return InputAction::SessionManagerUpdate,
+                    // Fall through to the legacy hardcoded keys below.
+                    ChordOutcome::NoMatch => {}
+                }
+            }
         }
 
         match key.code {
@@ -2143,9 +2234,7 @@ impl InputHandler {
                             // request the connect via a dedicated action rather
                             // than forwarding the command to the server.
                             self.mode = Mode::SessionManager;
-                            self.session_manager = Some(
-                                crate::client::session_manager::SessionManagerState::new(None),
-                            );
+                            self.session_manager = Some(self.new_session_manager(None));
                             return InputAction::RemoteConnect(dest.clone());
                         }
                         _ => {}
@@ -2356,7 +2445,12 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         let value: toml::Value = "\"Alt-p\" = \"@p\"".parse().unwrap();
         let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
-        handler.reload_keybindings(KeybindingTree::default(), ctrl_key('a'), shortcuts);
+        handler.reload_keybindings(
+            KeybindingTree::default(),
+            ctrl_key('a'),
+            shortcuts,
+            SessionManagerBindings::default(),
+        );
         handler
     }
 
@@ -3435,7 +3529,12 @@ mod tests {
         let new_tree = KeybindingTree { root };
         let new_leader = ctrl_key('b');
 
-        handler.reload_keybindings(new_tree, new_leader, ShortcutBindings::default());
+        handler.reload_keybindings(
+            new_tree,
+            new_leader,
+            ShortcutBindings::default(),
+            SessionManagerBindings::default(),
+        );
 
         // The tree actually changed: 'z' now resolves at root.
         assert!(handler.keybinding_tree.lookup(&['z']).is_some());
@@ -3465,6 +3564,7 @@ mod tests {
             KeybindingTree::default(),
             handler.leader_key,
             ShortcutBindings::default(),
+            SessionManagerBindings::default(),
         );
 
         // The stale chord path was reset so it can't misfire on the new tree.
@@ -3657,6 +3757,114 @@ mod tests {
             }
             other => panic!("expected CreateSession on remote, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_manager_tab_rename_chord_on_remote_carries_remote() {
+        use crate::client::registry::RemoteState;
+        use crate::client::session_manager::{
+            NodeType, RenameKind, SessionManagerAction, SessionManagerState,
+        };
+        use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::SessionManager;
+
+        let mut sm = SessionManagerState::new(None);
+        sm.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (remote("pi"), "pi".to_string(), RemoteState::Connected),
+        ]);
+        let folders = vec![FolderTreeEntry {
+            name: "work".to_string(),
+            sessions: vec![SessionTreeEntry {
+                name: "proj".to_string(),
+                tabs: vec![TabTreeEntry {
+                    id: 1,
+                    name: "Tab 1".to_string(),
+                    panes: vec![PaneTreeEntry {
+                        id: 10,
+                        name: "zsh".to_string(),
+                        is_focused: true,
+                    }],
+                }],
+                client_count: 0,
+                is_current: false,
+            }],
+        }];
+        sm.update_tree(remote("pi"), folders, Vec::new(), Vec::new());
+        // Expand the remote server node so its session/tab rows appear.
+        let sidx = sm
+            .rows
+            .iter()
+            .position(
+                |r| matches!(&r.node_type, NodeType::Server { id, .. } if *id == remote("pi")),
+            )
+            .unwrap();
+        sm.selected = sidx;
+        sm.expand_selected();
+        // Select the remote tab row.
+        let tidx = sm
+            .rows
+            .iter()
+            .position(
+                |r| matches!(&r.node_type, NodeType::Tab { server, .. } if *server == remote("pi")),
+            )
+            .unwrap();
+        sm.selected = tidx;
+        handler.session_manager = Some(sm);
+
+        // Chord t,r -> rename sub-mode; type "x"; Enter confirms and emits the
+        // Rename action carrying the remote server + Tab target.
+        let _ = handler.handle_session_manager_key(char_key('t'));
+        let _ = handler.handle_session_manager_key(char_key('r'));
+        let _ = handler.handle_session_manager_key(char_key('x'));
+        let action = handler.handle_session_manager_key(enter_key());
+        match action {
+            InputAction::SessionManagerAction(SessionManagerAction::Rename {
+                server,
+                kind,
+                new_name,
+            }) => {
+                assert_eq!(server, remote("pi"));
+                assert!(
+                    matches!(kind, RenameKind::Tab { ref session, tab_index: 0 } if session == "proj")
+                );
+                assert_eq!(new_name, "x");
+            }
+            other => panic!("expected Rename on remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_manager_chord_prefix_then_esc_cancels() {
+        use crate::client::registry::RemoteState;
+        use crate::client::session_manager::SessionManagerState;
+
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::SessionManager;
+        let mut sm = SessionManagerState::new(None);
+        sm.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+        )]);
+        handler.session_manager = Some(sm);
+
+        // 't' starts a pending chord; Esc cancels it WITHOUT closing the overlay.
+        let a1 = handler.handle_session_manager_key(char_key('t'));
+        assert!(matches!(a1, InputAction::SessionManagerUpdate));
+        assert_eq!(
+            handler.session_manager.as_ref().unwrap().pending_chord(),
+            Some('t')
+        );
+        let a2 = handler.handle_session_manager_key(esc_key());
+        assert!(matches!(a2, InputAction::SessionManagerUpdate));
+        assert!(handler.session_manager.is_some());
+        assert_eq!(
+            handler.session_manager.as_ref().unwrap().pending_chord(),
+            None
+        );
     }
 
     #[test]

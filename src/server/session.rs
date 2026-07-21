@@ -607,6 +607,57 @@ impl ServerState {
         Ok(())
     }
 
+    /// Move a tab (identified by `tab_idx`) left/right by `delta` positions
+    /// within its session's tab vector.
+    ///
+    /// The destination index is clamped to `[0, len - 1]`, so out-of-range
+    /// deltas saturate at the ends rather than erroring. `active_tab` is
+    /// preserved to keep pointing at the *same* tab it did before the move
+    /// (tracked by tab id), regardless of whether the moved tab was the active
+    /// one. A no-op move (destination == source) returns `Ok(())` unchanged.
+    pub fn move_tab(&mut self, session: &str, tab_idx: usize, delta: i32) -> Result<()> {
+        log::debug!(
+            "session: move_tab index={}, delta={}, session={:?}",
+            tab_idx,
+            delta,
+            session
+        );
+        let sess = self
+            .sessions
+            .get_mut(session)
+            .ok_or_else(|| anyhow::anyhow!("session '{}' not found", session))?;
+
+        let len = sess.tabs.len();
+        if tab_idx >= len {
+            bail!(
+                "tab index {} out of range (session has {} tabs)",
+                tab_idx,
+                len
+            );
+        }
+
+        // Clamp the destination to the valid range so large deltas saturate.
+        let dest = (tab_idx as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        if dest == tab_idx {
+            return Ok(());
+        }
+
+        // Remember which tab is active by identity so we can restore the index
+        // after the reorder (the active tab may or may not be the moved one).
+        let active_id = sess.tabs.get(sess.active_tab).map(|t| t.id);
+
+        let tab = sess.tabs.remove(tab_idx);
+        sess.tabs.insert(dest, tab);
+
+        if let Some(active_id) = active_id {
+            if let Some(pos) = sess.tabs.iter().position(|t| t.id == active_id) {
+                sess.active_tab = pos;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Navigate to a tab by index.
     pub fn goto_tab(&mut self, session: &str, tab_idx: usize) -> Result<()> {
         log::debug!("session: goto_tab index={}, session={:?}", tab_idx, session);
@@ -904,6 +955,78 @@ mod tests {
             dormant.next_pane_id
         );
         assert!(next > 2);
+    }
+
+    /// Build a session named `s` with `n` tabs and return the ordered list of
+    /// their tab ids. `create_tab` leaves `active_tab` pointing at the last tab.
+    fn state_with_tabs(n: usize) -> (ServerState, Vec<TabId>) {
+        let mut state = ServerState::new();
+        state
+            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .unwrap();
+        for i in 1..n {
+            state
+                .create_tab("s", &format!("Tab {}", i + 1), LayoutMode::default())
+                .unwrap();
+        }
+        let ids: Vec<TabId> = state.sessions["s"].tabs.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), n);
+        (state, ids)
+    }
+
+    fn tab_order(state: &ServerState) -> Vec<TabId> {
+        state.sessions["s"].tabs.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn test_move_tab_clamps_high_delta() {
+        let (mut state, ids) = state_with_tabs(4);
+        // Move the first tab far right; destination saturates at the last slot.
+        state.move_tab("s", 0, 100).unwrap();
+        assert_eq!(tab_order(&state), vec![ids[1], ids[2], ids[3], ids[0]]);
+    }
+
+    #[test]
+    fn test_move_tab_clamps_low_delta() {
+        let (mut state, ids) = state_with_tabs(4);
+        // Move the last tab far left; destination saturates at the first slot.
+        state.move_tab("s", 3, -100).unwrap();
+        assert_eq!(tab_order(&state), vec![ids[3], ids[0], ids[1], ids[2]]);
+    }
+
+    #[test]
+    fn test_move_tab_preserves_active_by_identity() {
+        let (mut state, ids) = state_with_tabs(4);
+        // Make tab index 1 the active one.
+        state.sessions.get_mut("s").unwrap().active_tab = 1;
+        // Move a *different* (non-active) tab across it: index 3 -> front.
+        state.move_tab("s", 3, -3).unwrap();
+        assert_eq!(tab_order(&state), vec![ids[3], ids[0], ids[1], ids[2]]);
+        // active_tab must still point at the same tab (ids[1]), now at index 2.
+        assert_eq!(state.sessions["s"].active_tab, 2);
+        assert_eq!(state.sessions["s"].tabs[2].id, ids[1]);
+    }
+
+    #[test]
+    fn test_move_tab_noop_leaves_state_unchanged() {
+        let (mut state, ids) = state_with_tabs(4);
+        state.sessions.get_mut("s").unwrap().active_tab = 2;
+        // delta 0 is a no-op.
+        state.move_tab("s", 1, 0).unwrap();
+        assert_eq!(tab_order(&state), ids);
+        assert_eq!(state.sessions["s"].active_tab, 2);
+    }
+
+    #[test]
+    fn test_move_tab_out_of_range_index_errors() {
+        let (mut state, _ids) = state_with_tabs(3);
+        assert!(state.move_tab("s", 10, 1).is_err());
+    }
+
+    #[test]
+    fn test_move_tab_missing_session_errors() {
+        let mut state = ServerState::new();
+        assert!(state.move_tab("nope", 0, 1).is_err());
     }
 
     #[test]

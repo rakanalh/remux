@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
@@ -1076,6 +1076,225 @@ pub fn parse_leader_key(table: &toml::map::Map<String, toml::Value>) -> KeyEvent
 }
 
 // ---------------------------------------------------------------------------
+// Session-manager chord bindings
+// ---------------------------------------------------------------------------
+
+/// The set of actions a session-manager chord can trigger. Each maps to one of
+/// the phase-1 explicit-target structural commands or an existing overlay flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionManagerBinding {
+    TabNew,
+    TabClose,
+    TabRename,
+    TabMoveLeft,
+    TabMoveRight,
+    PaneNew,
+    PaneClose,
+    PaneRename,
+    SessionNew,
+    SessionClose,
+    SessionRename,
+    SessionMove,
+    FolderNew,
+    FolderDelete,
+    FolderRename,
+}
+
+impl SessionManagerBinding {
+    /// Parse an action name (as written in the config) into a binding.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "TabNew" => Self::TabNew,
+            "TabClose" => Self::TabClose,
+            "TabRename" => Self::TabRename,
+            "TabMoveLeft" => Self::TabMoveLeft,
+            "TabMoveRight" => Self::TabMoveRight,
+            "PaneNew" => Self::PaneNew,
+            "PaneClose" => Self::PaneClose,
+            "PaneRename" => Self::PaneRename,
+            "SessionNew" => Self::SessionNew,
+            "SessionClose" => Self::SessionClose,
+            "SessionRename" => Self::SessionRename,
+            "SessionMove" => Self::SessionMove,
+            "FolderNew" => Self::FolderNew,
+            "FolderDelete" => Self::FolderDelete,
+            "FolderRename" => Self::FolderRename,
+            _ => return None,
+        })
+    }
+}
+
+/// The default session-manager chord map (also used when the config section is
+/// absent). Chord string -> action.
+fn default_session_manager_chords() -> Vec<(&'static str, SessionManagerBinding)> {
+    use SessionManagerBinding::*;
+    vec![
+        ("tn", TabNew),
+        ("tx", TabClose),
+        ("tr", TabRename),
+        ("th", TabMoveLeft),
+        ("tl", TabMoveRight),
+        ("pn", PaneNew),
+        ("px", PaneClose),
+        ("pr", PaneRename),
+        ("sn", SessionNew),
+        ("sx", SessionClose),
+        ("sr", SessionRename),
+        ("sm", SessionMove),
+        ("fn", FolderNew),
+        ("fx", FolderDelete),
+        ("fr", FolderRename),
+    ]
+}
+
+/// Whether `s` is a valid chord: 1 or 2 characters, each printable (not
+/// whitespace, not a control char).
+fn is_valid_chord(s: &str) -> bool {
+    let count = s.chars().count();
+    if count == 0 || count > 2 {
+        return false;
+    }
+    s.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// Configurable one- or two-key chord bindings for the session-manager overlay.
+///
+/// Two-char chords take priority: if a char begins any 2-char chord it is a
+/// "prefix", and any single-char binding using that same char is dropped
+/// (prefix wins). This is computed over the *merged* (defaults + user) map so
+/// user additions/overrides are reflected.
+#[derive(Debug, Clone)]
+pub struct SessionManagerBindings {
+    /// Full chord string (1 or 2 chars) -> action.
+    map: HashMap<String, SessionManagerBinding>,
+    /// First chars of any configured 2-char chord (a pending prefix).
+    prefixes: HashSet<char>,
+}
+
+impl SessionManagerBindings {
+    /// Build from a chord->action map. Computes the prefix set and drops any
+    /// single-char binding shadowed by a 2-char prefix (logging the conflict).
+    fn from_map(mut map: HashMap<String, SessionManagerBinding>) -> Self {
+        let mut prefixes = HashSet::new();
+        for chord in map.keys() {
+            let mut chars = chord.chars();
+            if let (Some(first), Some(_)) = (chars.next(), chars.next()) {
+                prefixes.insert(first);
+            }
+        }
+        // Prefix wins: drop single-char chords shadowed by a 2-char prefix.
+        map.retain(|chord, _| {
+            let mut chars = chord.chars();
+            let first = chars.next();
+            let is_single = first.is_some() && chars.next().is_none();
+            if is_single {
+                if let Some(c) = first {
+                    if prefixes.contains(&c) {
+                        log::warn!(
+                            "session_manager keybinding '{c}' is shadowed by a 2-char chord \
+                             starting with '{c}'; ignoring the single-key binding"
+                        );
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        Self { map, prefixes }
+    }
+
+    /// Whether `c` begins a configured 2-char chord (a pending prefix).
+    pub fn is_prefix(&self, c: char) -> bool {
+        self.prefixes.contains(&c)
+    }
+
+    /// Look up a single-char binding. Only meaningful when `c` is not a prefix.
+    pub fn single(&self, c: char) -> Option<SessionManagerBinding> {
+        let mut buf = [0u8; 4];
+        self.map.get(c.encode_utf8(&mut buf) as &str).copied()
+    }
+
+    /// Look up a full 2-char chord.
+    pub fn chord(&self, first: char, second: char) -> Option<SessionManagerBinding> {
+        let mut s = String::with_capacity(first.len_utf8() + second.len_utf8());
+        s.push(first);
+        s.push(second);
+        self.map.get(&s).copied()
+    }
+
+    /// Number of bindings (after prefix-shadow pruning). Test helper.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether there are no bindings.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Parse the `[keybindings.session_manager]` table, starting from the
+    /// defaults and applying user entries on top. Invalid chords (not 1-2
+    /// printable chars) and unknown action names are logged and skipped. An
+    /// empty action string unbinds a (possibly default) chord.
+    pub fn from_toml(value: &toml::Value) -> Self {
+        let mut chords: HashMap<String, SessionManagerBinding> = default_session_manager_chords()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+
+        if let Some(table) = value.as_table() {
+            for (chord, val) in table {
+                if !is_valid_chord(chord) {
+                    log::warn!(
+                        "session_manager keybinding '{chord}': chord must be 1-2 printable \
+                         characters, skipping"
+                    );
+                    continue;
+                }
+                let action_name = match val.as_str() {
+                    Some(s) => s,
+                    None => {
+                        log::warn!(
+                            "session_manager keybinding '{chord}': value must be an action \
+                             name string, skipping"
+                        );
+                        continue;
+                    }
+                };
+                // An empty action string unbinds the chord.
+                if action_name.is_empty() {
+                    chords.remove(chord);
+                    continue;
+                }
+                match SessionManagerBinding::from_name(action_name) {
+                    Some(binding) => {
+                        chords.insert(chord.clone(), binding);
+                    }
+                    None => {
+                        log::warn!(
+                            "session_manager keybinding '{chord}': unknown action \
+                             '{action_name}', skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        Self::from_map(chords)
+    }
+}
+
+impl Default for SessionManagerBindings {
+    fn default() -> Self {
+        let map = default_session_manager_chords()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        Self::from_map(map)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2053,5 +2272,119 @@ mod tests {
             )),
             "Ctrl-b"
         );
+    }
+
+    // -- SessionManagerBindings tests -----------------------------------------
+
+    #[test]
+    fn session_manager_bindings_defaults() {
+        let b = SessionManagerBindings::default();
+        // All 15 default chords are present.
+        assert_eq!(b.len(), 15);
+        assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
+        assert_eq!(b.chord('t', 'r'), Some(SessionManagerBinding::TabRename));
+        assert_eq!(b.chord('s', 'x'), Some(SessionManagerBinding::SessionClose));
+        assert_eq!(b.chord('f', 'r'), Some(SessionManagerBinding::FolderRename));
+        // First chars of the 2-char chords are prefixes.
+        assert!(b.is_prefix('t'));
+        assert!(b.is_prefix('p'));
+        assert!(b.is_prefix('s'));
+        assert!(b.is_prefix('f'));
+        // Legacy nav keys are NOT prefixes (so they still fall through).
+        assert!(!b.is_prefix('j'));
+        assert!(!b.is_prefix('d'));
+        assert!(!b.is_prefix('q'));
+    }
+
+    #[test]
+    fn session_manager_bindings_absent_section_is_defaults() {
+        // An empty table (section absent) yields exactly the defaults.
+        let value = toml::Value::Table(toml::map::Map::new());
+        let b = SessionManagerBindings::from_toml(&value);
+        assert_eq!(b.len(), 15);
+        assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
+    }
+
+    #[test]
+    fn session_manager_bindings_user_override_and_extend() {
+        // Override an existing chord and add a brand-new one.
+        let toml_str = r#"
+            tn = "SessionNew"
+            gg = "FolderNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let b = SessionManagerBindings::from_toml(&value);
+        // Overridden.
+        assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::SessionNew));
+        // Extended.
+        assert_eq!(b.chord('g', 'g'), Some(SessionManagerBinding::FolderNew));
+        assert!(b.is_prefix('g'));
+        // Other defaults still present.
+        assert_eq!(b.chord('p', 'x'), Some(SessionManagerBinding::PaneClose));
+    }
+
+    #[test]
+    fn session_manager_bindings_invalid_chord_skipped() {
+        // A 3-char chord is invalid and must be skipped, leaving defaults intact.
+        let toml_str = r#"
+            abc = "TabNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let b = SessionManagerBindings::from_toml(&value);
+        assert_eq!(b.len(), 15);
+        assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
+    }
+
+    #[test]
+    fn session_manager_bindings_unknown_action_skipped() {
+        // Unknown action name -> the chord keeps its default binding.
+        let toml_str = r#"
+            tn = "NotARealAction"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let b = SessionManagerBindings::from_toml(&value);
+        assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
+    }
+
+    #[test]
+    fn session_manager_bindings_prefix_shadows_single_char() {
+        // 't' begins the default 2-char chords, so a single-char 't' binding is
+        // dropped (prefix wins).
+        let toml_str = r#"
+            t = "SessionNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let b = SessionManagerBindings::from_toml(&value);
+        assert!(b.is_prefix('t'));
+        // The single-char 't' binding was pruned.
+        assert_eq!(b.single('t'), None);
+        // 2-char 't' chords still resolve.
+        assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
+    }
+
+    #[test]
+    fn session_manager_bindings_empty_value_unbinds() {
+        let toml_str = r#"
+            tn = ""
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let b = SessionManagerBindings::from_toml(&value);
+        assert_eq!(b.chord('t', 'n'), None);
+        // Other 't' chords remain, so 't' is still a prefix.
+        assert!(b.is_prefix('t'));
+        assert_eq!(b.chord('t', 'r'), Some(SessionManagerBinding::TabRename));
+    }
+
+    #[test]
+    fn session_manager_bindings_single_char_binding_fires() {
+        // A single-char chord whose char is NOT a prefix survives and resolves
+        // via `single`.
+        let toml_str = r#"
+            z = "SessionNew"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let b = SessionManagerBindings::from_toml(&value);
+        assert!(!b.is_prefix('z'));
+        assert_eq!(b.single('z'), Some(SessionManagerBinding::SessionNew));
     }
 }

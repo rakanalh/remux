@@ -312,6 +312,48 @@
 # [keybindings.visual]
 
 
+# -----------------------------------------------------------------------------
+# Keybindings — Session Manager
+# -----------------------------------------------------------------------------
+# Two-key (vim-style) chords for the session-manager overlay. Each entry maps a
+# chord string (1-2 printable chars) to one of the actions below. The chord's
+# target is decided by the currently selected tree row (e.g. `tr` renames the
+# selected tab, `sx` closes the selected session).
+#
+# The values below are also the DEFAULTS when this section is absent. Entries
+# you add here override or extend the defaults. Existing hardcoded overlay keys
+# (Enter, arrows, j/k, h/l, n/c/m/d, q) are preserved — chords are checked first
+# and fall through to those on no match.
+#
+# Rules:
+#   • A chord is 1-2 printable characters; invalid chords are skipped (warned).
+#   • Unknown action names are skipped (warned).
+#   • If a char begins any 2-char chord it is a "prefix"; a single-char binding
+#     using that same char is dropped (prefix wins).
+#   • An empty value ("") unbinds a (possibly default) chord.
+#
+# Actions: TabNew, TabClose, TabRename, TabMoveLeft, TabMoveRight, PaneNew,
+#          PaneClose, PaneRename, SessionNew, SessionClose, SessionRename,
+#          SessionMove, FolderNew, FolderDelete, FolderRename.
+#
+# [keybindings.session_manager]
+# tn = "TabNew"
+# tx = "TabClose"
+# tr = "TabRename"
+# th = "TabMoveLeft"
+# tl = "TabMoveRight"
+# pn = "PaneNew"
+# px = "PaneClose"
+# pr = "PaneRename"
+# sn = "SessionNew"
+# sx = "SessionClose"
+# sr = "SessionRename"
+# sm = "SessionMove"
+# fn = "FolderNew"
+# fx = "FolderDelete"
+# fr = "FolderRename"
+
+
 # =============================================================================
 # Available Commands Reference
 # =============================================================================

@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::whichkey::DrawCommand;
+use crate::config::keybindings::{SessionManagerBinding, SessionManagerBindings};
 use crate::config::theme::Theme;
 use crate::protocol::{FolderTreeEntry, SessionTreeEntry};
 
@@ -90,6 +91,17 @@ pub struct TreeRow {
 // SubMode / CreatePhase
 // ---------------------------------------------------------------------------
 
+/// The target of a rename sub-mode. Captures which structural entity (and the
+/// data needed to address it) is being renamed. The server it lives on is
+/// recorded separately in `sub_mode_server`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RenameKind {
+    Session { name: String },
+    Folder { name: String },
+    Tab { session: String, tab_index: usize },
+    Pane { session: String, pane_id: u64 },
+}
+
 /// Sub-modes within the session manager for multi-step actions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubMode {
@@ -107,6 +119,23 @@ pub enum SubMode {
         folders: Vec<String>,
         selected: usize,
     },
+    /// Renaming a structural entity -- text buffer for the new name. The target
+    /// is captured in `kind`; the server in `sub_mode_server`.
+    Rename { kind: RenameKind, buffer: String },
+}
+
+/// Outcome of feeding a key char to the chord engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordOutcome {
+    /// A prefix char was consumed; waiting for the second key.
+    Pending,
+    /// A chord (single- or two-key) resolved to a binding.
+    Binding(SessionManagerBinding),
+    /// A pending prefix was cleared by an unmatched second key (consumed).
+    Cleared,
+    /// The char matched neither a prefix nor a binding; the caller should fall
+    /// through to legacy (hardcoded) key handling.
+    NoMatch,
 }
 
 /// Phase of the create-session flow.
@@ -172,6 +201,36 @@ pub enum SessionManagerAction {
         session: String,
         tab_index: usize,
     },
+    /// Create a new tab (with its default pane) in the target session.
+    TabNew {
+        server: ConnId,
+        session: String,
+    },
+    /// Move a tab left/right within its session (delta -1 / +1).
+    TabMove {
+        server: ConnId,
+        session: String,
+        tab_index: usize,
+        delta: i32,
+    },
+    /// Add a pane to the given tab of the target session.
+    PaneNew {
+        server: ConnId,
+        session: String,
+        tab_index: usize,
+    },
+    /// Close a pane by id in the target session.
+    PaneClose {
+        server: ConnId,
+        session: String,
+        pane_id: u64,
+    },
+    /// Rename a structural entity (session/folder/tab/pane) on `server`.
+    Rename {
+        server: ConnId,
+        kind: RenameKind,
+        new_name: String,
+    },
     RefreshTree,
     Close,
     None,
@@ -210,6 +269,11 @@ pub struct SessionManagerState {
     /// rendered as a "Saved (resurrect)" group. Dormant sessions are a
     /// Local-server concept for now.
     dormant: Vec<String>,
+    /// Configured chord bindings for the overlay (defaults unless injected from
+    /// config via `set_bindings`).
+    bindings: SessionManagerBindings,
+    /// The first char of an in-progress 2-char chord, awaiting completion.
+    pending_chord: Option<char>,
 }
 
 /// Pad or truncate a string to exactly `target_width` display columns,
@@ -286,7 +350,15 @@ impl SessionManagerState {
             roster: vec![(ConnId::Local, "local".to_string(), RemoteState::Connected)],
             trees: HashMap::new(),
             dormant: Vec::new(),
+            bindings: SessionManagerBindings::default(),
+            pending_chord: None,
         }
+    }
+
+    /// Inject the effective chord bindings (built from config). Called by the
+    /// input layer when it constructs the overlay so user overrides apply.
+    pub fn set_bindings(&mut self, bindings: SessionManagerBindings) {
+        self.bindings = bindings;
     }
 
     /// Set the foreground connection (drives which server's sessions render as
@@ -885,6 +957,242 @@ impl SessionManagerState {
     }
 
     // -----------------------------------------------------------------------
+    // Chord engine
+    // -----------------------------------------------------------------------
+
+    /// The in-progress chord prefix, if any (for the render's pending hint).
+    pub fn pending_chord(&self) -> Option<char> {
+        self.pending_chord
+    }
+
+    /// Cancel any in-progress chord prefix.
+    pub fn clear_pending_chord(&mut self) {
+        self.pending_chord = None;
+    }
+
+    /// Feed a single key char to the chord engine.
+    ///
+    /// - If a prefix is pending, this is the completing key: resolves to a
+    ///   [`ChordOutcome::Binding`] on match, or [`ChordOutcome::Cleared`] on an
+    ///   unmatched second key (the pending prefix is always cleared here).
+    /// - Otherwise, if `c` begins a 2-char chord it becomes pending
+    ///   ([`ChordOutcome::Pending`]); if `c` is a lone single-char binding it
+    ///   fires immediately; else [`ChordOutcome::NoMatch`] (fall through to the
+    ///   legacy hardcoded keys).
+    pub fn feed_chord(&mut self, c: char) -> ChordOutcome {
+        if let Some(first) = self.pending_chord.take() {
+            return match self.bindings.chord(first, c) {
+                Some(b) => ChordOutcome::Binding(b),
+                None => ChordOutcome::Cleared,
+            };
+        }
+        if self.bindings.is_prefix(c) {
+            self.pending_chord = Some(c);
+            return ChordOutcome::Pending;
+        }
+        if let Some(b) = self.bindings.single(c) {
+            return ChordOutcome::Binding(b);
+        }
+        ChordOutcome::NoMatch
+    }
+
+    /// Apply a resolved chord binding against the currently selected row.
+    ///
+    /// The selected node decides the target; every emitted action carries the
+    /// node's `server` and is gated on that server being connected. Bindings
+    /// whose node type does not match the selected row are no-ops. Rename
+    /// bindings enter a text-input sub-mode and return [`SessionManagerAction::None`].
+    pub fn apply_binding(&mut self, binding: SessionManagerBinding) -> SessionManagerAction {
+        use SessionManagerBinding::*;
+        let node = match self.rows.get(self.selected) {
+            Some(r) => r.node_type.clone(),
+            None => return SessionManagerAction::None,
+        };
+        match binding {
+            TabNew => {
+                // Session node -> its own session; Tab node -> its session.
+                let (server, session) = match &node {
+                    NodeType::Session { server, name } => (server.clone(), name.clone()),
+                    NodeType::Tab {
+                        server, session, ..
+                    } => (server.clone(), session.clone()),
+                    _ => return SessionManagerAction::None,
+                };
+                if !self.is_connected(&server) {
+                    return SessionManagerAction::None;
+                }
+                SessionManagerAction::TabNew { server, session }
+            }
+            TabClose => match &node {
+                NodeType::Tab {
+                    server,
+                    session,
+                    tab_index,
+                } if self.is_connected(server) => SessionManagerAction::CloseTab {
+                    server: server.clone(),
+                    session: session.clone(),
+                    tab_index: *tab_index,
+                },
+                _ => SessionManagerAction::None,
+            },
+            TabRename => match &node {
+                NodeType::Tab {
+                    server,
+                    session,
+                    tab_index,
+                } if self.is_connected(server) => {
+                    self.enter_rename(
+                        server.clone(),
+                        RenameKind::Tab {
+                            session: session.clone(),
+                            tab_index: *tab_index,
+                        },
+                    );
+                    SessionManagerAction::None
+                }
+                _ => SessionManagerAction::None,
+            },
+            TabMoveLeft | TabMoveRight => match &node {
+                NodeType::Tab {
+                    server,
+                    session,
+                    tab_index,
+                } if self.is_connected(server) => {
+                    let delta = if matches!(binding, TabMoveLeft) {
+                        -1
+                    } else {
+                        1
+                    };
+                    SessionManagerAction::TabMove {
+                        server: server.clone(),
+                        session: session.clone(),
+                        tab_index: *tab_index,
+                        delta,
+                    }
+                }
+                _ => SessionManagerAction::None,
+            },
+            PaneNew => {
+                // Tab node -> its tab; Pane node -> its containing tab.
+                let (server, session, tab_index) = match &node {
+                    NodeType::Tab {
+                        server,
+                        session,
+                        tab_index,
+                    } => (server.clone(), session.clone(), *tab_index),
+                    NodeType::Pane {
+                        server,
+                        session,
+                        tab_index,
+                        ..
+                    } => (server.clone(), session.clone(), *tab_index),
+                    _ => return SessionManagerAction::None,
+                };
+                if !self.is_connected(&server) {
+                    return SessionManagerAction::None;
+                }
+                SessionManagerAction::PaneNew {
+                    server,
+                    session,
+                    tab_index,
+                }
+            }
+            PaneClose => match &node {
+                NodeType::Pane {
+                    server,
+                    session,
+                    pane_id,
+                    ..
+                } if self.is_connected(server) => SessionManagerAction::PaneClose {
+                    server: server.clone(),
+                    session: session.clone(),
+                    pane_id: *pane_id,
+                },
+                _ => SessionManagerAction::None,
+            },
+            PaneRename => match &node {
+                NodeType::Pane {
+                    server,
+                    session,
+                    pane_id,
+                    ..
+                } if self.is_connected(server) => {
+                    self.enter_rename(
+                        server.clone(),
+                        RenameKind::Pane {
+                            session: session.clone(),
+                            pane_id: *pane_id,
+                        },
+                    );
+                    SessionManagerAction::None
+                }
+                _ => SessionManagerAction::None,
+            },
+            SessionNew => self.handle_create_session_key(),
+            SessionClose => match &node {
+                // Reuse the delete-confirmation flow, but only for Session nodes.
+                NodeType::Session { .. } => self.handle_delete_key(),
+                _ => SessionManagerAction::None,
+            },
+            SessionRename => match &node {
+                NodeType::Session { server, name } if self.is_connected(server) => {
+                    self.enter_rename(server.clone(), RenameKind::Session { name: name.clone() });
+                    SessionManagerAction::None
+                }
+                _ => SessionManagerAction::None,
+            },
+            SessionMove => match &node {
+                NodeType::Session { .. } => self.handle_move_key(),
+                _ => SessionManagerAction::None,
+            },
+            FolderNew => self.handle_create_folder_key(),
+            FolderDelete => match &node {
+                // Reuse the delete-confirmation flow, but only for Folder nodes.
+                NodeType::Folder { .. } => self.handle_delete_key(),
+                _ => SessionManagerAction::None,
+            },
+            FolderRename => match &node {
+                NodeType::Folder { server, name } if self.is_connected(server) => {
+                    self.enter_rename(server.clone(), RenameKind::Folder { name: name.clone() });
+                    SessionManagerAction::None
+                }
+                _ => SessionManagerAction::None,
+            },
+        }
+    }
+
+    /// Enter a rename sub-mode targeting `kind` on `server`.
+    fn enter_rename(&mut self, server: ConnId, kind: RenameKind) {
+        self.sub_mode_server = server;
+        self.sub_mode = SubMode::Rename {
+            kind,
+            buffer: String::new(),
+        };
+    }
+
+    /// Confirm the current rename sub-mode, emitting a [`SessionManagerAction::Rename`]
+    /// carrying the recorded server + target. An empty buffer is a no-op.
+    /// Always returns to Navigate.
+    pub fn confirm_rename(&mut self) -> SessionManagerAction {
+        let server = self.sub_mode_server.clone();
+        let action = if let SubMode::Rename { kind, buffer } = &self.sub_mode {
+            if buffer.is_empty() {
+                SessionManagerAction::None
+            } else {
+                SessionManagerAction::Rename {
+                    server,
+                    kind: kind.clone(),
+                    new_name: buffer.clone(),
+                }
+            }
+        } else {
+            SessionManagerAction::None
+        };
+        self.sub_mode = SubMode::Navigate;
+        action
+    }
+
+    // -----------------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------------
 
@@ -1039,7 +1347,20 @@ impl SessionManagerState {
 
         // Sub-mode prompt (if applicable).
         let prompt_line = match &self.sub_mode {
-            SubMode::Navigate => String::new(),
+            SubMode::Navigate => match self.pending_chord {
+                // Subtle pending-chord hint, e.g. " [t-] ".
+                Some(c) => format!(" [{c}-] "),
+                None => String::new(),
+            },
+            SubMode::Rename { kind, buffer } => {
+                let label = match kind {
+                    RenameKind::Session { name } => format!("session '{name}'"),
+                    RenameKind::Folder { name } => format!("folder '{name}'"),
+                    RenameKind::Tab { .. } => "tab".to_string(),
+                    RenameKind::Pane { .. } => "pane".to_string(),
+                };
+                format!(" Rename {label}: {buffer}_ ")
+            }
             SubMode::ConfirmDelete(desc) => {
                 format!(" Delete {}? (y/n) ", desc)
             }
@@ -1670,5 +1991,337 @@ mod tests {
             .rows
             .iter()
             .any(|r| matches!(&r.node_type, NodeType::SavedGroup { .. })));
+    }
+
+    // -----------------------------------------------------------------------
+    // Chord engine + binding dispatch
+    // -----------------------------------------------------------------------
+
+    /// Index of the first Tab row for the named local session.
+    fn tab_row(state: &SessionManagerState, session: &str) -> usize {
+        state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { session: s, .. } if s == session))
+            .unwrap()
+    }
+
+    /// A connected-remote ("pi") state with the sample tree loaded + expanded.
+    fn remote_state_with_tree() -> SessionManagerState {
+        let mut state = SessionManagerState::new(None);
+        state.set_roster(vec![
+            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Remote("pi".to_string()),
+                "pi".to_string(),
+                RemoteState::Connected,
+            ),
+        ]);
+        let (folders, unfiled) = sample_tree();
+        state.update_tree(
+            ConnId::Remote("pi".to_string()),
+            folders,
+            unfiled,
+            Vec::new(),
+        );
+        expand_server(&mut state, &ConnId::Remote("pi".to_string()));
+        state
+    }
+
+    #[test]
+    fn test_feed_chord_pending_then_complete() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = tab_row(&state, "project-a");
+
+        // 't' begins the default 2-char chords -> pending.
+        assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
+        assert_eq!(state.pending_chord(), Some('t'));
+
+        // 'r' completes -> TabRename binding, pending cleared.
+        assert_eq!(
+            state.feed_chord('r'),
+            ChordOutcome::Binding(SessionManagerBinding::TabRename)
+        );
+        assert_eq!(state.pending_chord(), None);
+
+        // Applying enters a Rename sub-mode targeting the tab.
+        let action = state.apply_binding(SessionManagerBinding::TabRename);
+        assert!(matches!(action, SessionManagerAction::None));
+        assert!(matches!(
+            state.sub_mode,
+            SubMode::Rename {
+                kind: RenameKind::Tab { tab_index: 0, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_feed_chord_unmatched_second_key_clears() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
+        // 'z' completes no 't' chord -> Cleared, pending reset.
+        assert_eq!(state.feed_chord('z'), ChordOutcome::Cleared);
+        assert_eq!(state.pending_chord(), None);
+    }
+
+    #[test]
+    fn test_feed_chord_nomatch_falls_through() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        // 'j' is neither a prefix nor a binding -> NoMatch (legacy nav survives).
+        assert_eq!(state.feed_chord('j'), ChordOutcome::NoMatch);
+        assert_eq!(state.pending_chord(), None);
+    }
+
+    #[test]
+    fn test_clear_pending_chord() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.feed_chord('t');
+        assert_eq!(state.pending_chord(), Some('t'));
+        state.clear_pending_chord();
+        assert_eq!(state.pending_chord(), None);
+    }
+
+    #[test]
+    fn test_tab_new_on_session_node() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = session_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::TabNew);
+        assert!(matches!(
+            action,
+            SessionManagerAction::TabNew { server: ConnId::Local, ref session }
+                if session == "project-a"
+        ));
+    }
+
+    #[test]
+    fn test_tab_close_is_immediate_no_confirm() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = tab_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::TabClose);
+        assert!(matches!(
+            action,
+            SessionManagerAction::CloseTab {
+                server: ConnId::Local,
+                tab_index: 0,
+                ..
+            }
+        ));
+        // TabClose does NOT route through a confirm sub-mode.
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    #[test]
+    fn test_tab_move_left_and_right() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = tab_row(&state, "project-a");
+        let right = state.apply_binding(SessionManagerBinding::TabMoveRight);
+        assert!(matches!(
+            right,
+            SessionManagerAction::TabMove {
+                delta: 1,
+                tab_index: 0,
+                ..
+            }
+        ));
+        let left = state.apply_binding(SessionManagerBinding::TabMoveLeft);
+        assert!(matches!(
+            left,
+            SessionManagerAction::TabMove {
+                delta: -1,
+                tab_index: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_pane_new_on_tab_node() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = tab_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::PaneNew);
+        assert!(matches!(
+            action,
+            SessionManagerAction::PaneNew {
+                server: ConnId::Local,
+                tab_index: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_tab_new_on_tab_node_uses_its_session() {
+        // TabNew on a Tab node targets that tab's session.
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = tab_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::TabNew);
+        assert!(matches!(
+            action,
+            SessionManagerAction::TabNew { server: ConnId::Local, ref session }
+                if session == "project-a"
+        ));
+    }
+
+    #[test]
+    fn test_pane_new_on_pane_node_uses_its_tab() {
+        // PaneNew on a Pane node targets that pane's containing tab.
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        // Expand the tab to reveal its pane, then select the pane.
+        state.selected = tab_row(&state, "project-a");
+        state.expand_selected();
+        let pane_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Pane { .. }))
+            .unwrap();
+        state.selected = pane_idx;
+        let action = state.apply_binding(SessionManagerBinding::PaneNew);
+        assert!(matches!(
+            action,
+            SessionManagerAction::PaneNew {
+                server: ConnId::Local,
+                tab_index: 0,
+                ref session,
+            } if session == "project-a"
+        ));
+    }
+
+    #[test]
+    fn test_pane_close_on_session_node_is_noop() {
+        // A direct action on the wrong node type is a no-op.
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = session_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::PaneClose);
+        assert!(matches!(action, SessionManagerAction::None));
+    }
+
+    #[test]
+    fn test_session_close_on_session_enters_confirm() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = session_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::SessionClose);
+        assert!(matches!(action, SessionManagerAction::None));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+    }
+
+    #[test]
+    fn test_session_close_on_folder_is_noop() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        let folder_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Folder { .. }))
+            .unwrap();
+        state.selected = folder_idx;
+        let action = state.apply_binding(SessionManagerBinding::SessionClose);
+        assert!(matches!(action, SessionManagerAction::None));
+        // No confirm sub-mode was entered — the folder is untouched.
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    #[test]
+    fn test_folder_delete_on_session_is_noop() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.selected = session_row(&state, "project-a");
+        let action = state.apply_binding(SessionManagerBinding::FolderDelete);
+        assert!(matches!(action, SessionManagerAction::None));
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    #[test]
+    fn test_tab_rename_on_remote_tab_carries_remote() {
+        let mut state = remote_state_with_tree();
+        let idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { server: ConnId::Remote(s), session, .. } if s == "pi" && session == "project-a"))
+            .unwrap();
+        state.selected = idx;
+
+        // Chord: t, r.
+        assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
+        assert_eq!(
+            state.feed_chord('r'),
+            ChordOutcome::Binding(SessionManagerBinding::TabRename)
+        );
+        let action = state.apply_binding(SessionManagerBinding::TabRename);
+        assert!(matches!(action, SessionManagerAction::None));
+
+        // Type a new name and confirm -> Rename carrying the remote server.
+        if let SubMode::Rename { ref mut buffer, .. } = state.sub_mode {
+            buffer.push_str("newtab");
+        }
+        let action = state.confirm_rename();
+        assert!(matches!(
+            action,
+            SessionManagerAction::Rename {
+                server: ConnId::Remote(ref s),
+                kind: RenameKind::Tab { ref session, tab_index: 0 },
+                ref new_name,
+            } if s == "pi" && session == "project-a" && new_name == "newtab"
+        ));
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    #[test]
+    fn test_pane_close_on_remote_pane_carries_remote() {
+        let mut state = remote_state_with_tree();
+        // Reveal the pane by expanding its (remote) tab.
+        let tab_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { server: ConnId::Remote(s), .. } if s == "pi"))
+            .unwrap();
+        state.selected = tab_idx;
+        state.expand_selected();
+
+        let pane_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Pane { server: ConnId::Remote(s), .. } if s == "pi"))
+            .unwrap();
+        state.selected = pane_idx;
+
+        // Chord: p, x.
+        assert_eq!(state.feed_chord('p'), ChordOutcome::Pending);
+        assert_eq!(
+            state.feed_chord('x'),
+            ChordOutcome::Binding(SessionManagerBinding::PaneClose)
+        );
+        let action = state.apply_binding(SessionManagerBinding::PaneClose);
+        assert!(matches!(
+            action,
+            SessionManagerAction::PaneClose {
+                server: ConnId::Remote(ref s),
+                ref session,
+                pane_id: 10,
+            } if s == "pi" && session == "project-a"
+        ));
+    }
+
+    #[test]
+    fn test_rename_pending_chord_shown_in_render() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        // A pending prefix should surface a subtle hint in the rendered popup.
+        state.feed_chord('t');
+        let theme = Theme::default();
+        let cmds = state.render(80, 24, &theme);
+        assert!(cmds.iter().any(|c| c.text.contains("[t-]")));
     }
 }

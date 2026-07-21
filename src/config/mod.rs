@@ -243,6 +243,9 @@ pub struct KeybindingsConfig {
     pub visual: toml::Value,
     /// Deprecated: `[keybindings.normal]` is accepted as an alias for `command`.
     pub normal: toml::Value,
+    /// Session-manager chord overrides (`chord = "ActionName"`). Absent = the
+    /// built-in defaults; user entries override/extend them.
+    pub session_manager: toml::Value,
 }
 
 impl Default for KeybindingsConfig {
@@ -251,6 +254,7 @@ impl Default for KeybindingsConfig {
             command: toml::Value::Table(toml::map::Map::new()),
             visual: toml::Value::Table(toml::map::Map::new()),
             normal: toml::Value::Table(toml::map::Map::new()),
+            session_manager: toml::Value::Table(toml::map::Map::new()),
         }
     }
 }
@@ -354,6 +358,13 @@ impl Config {
             }
         }
         bindings
+    }
+
+    /// Build the effective session-manager chord bindings, starting from the
+    /// built-in defaults and applying any `[keybindings.session_manager]`
+    /// overrides. When the section is absent this yields the defaults.
+    pub fn session_manager_bindings(&self) -> keybindings::SessionManagerBindings {
+        keybindings::SessionManagerBindings::from_toml(&self.keybindings.session_manager)
     }
 
     /// Validate cross-references between config sections.
