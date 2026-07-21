@@ -306,6 +306,81 @@ fn pad_to_display_width(text: &str, target_width: usize) -> String {
     }
 }
 
+/// Short human label for a session-manager chord binding, shown in the popup
+/// help footer. Kept terse so several fit per line.
+fn binding_label(b: SessionManagerBinding) -> &'static str {
+    use SessionManagerBinding::*;
+    match b {
+        TabNew => "tab new",
+        TabClose => "tab close",
+        TabRename => "tab rename",
+        TabMoveLeft => "tab \u{2190}",
+        TabMoveRight => "tab \u{2192}",
+        PaneNew => "pane new",
+        PaneClose => "pane close",
+        PaneRename => "pane rename",
+        SessionNew => "session new",
+        SessionClose => "session close",
+        SessionRename => "session rename",
+        SessionMove => "session move",
+        FolderNew => "folder new",
+        FolderDelete => "folder del",
+        FolderRename => "folder rename",
+    }
+}
+
+/// Group ordering for footer chords: session (s*), folder (f*), tab (t*),
+/// pane (p*), then anything else. Gives a stable, readable grouping.
+fn chord_group_rank(chord: &str) -> u8 {
+    match chord.chars().next() {
+        Some('s') => 0,
+        Some('f') => 1,
+        Some('t') => 2,
+        Some('p') => 3,
+        _ => 4,
+    }
+}
+
+/// Separator between footer cells (matches the box-drawing style used across
+/// the popups).
+const FOOTER_SEP: &str = " \u{2502} ";
+
+/// Pack `(key, label)` cells into up to `max_lines` footer lines that each fit
+/// within `inner_width` display columns. Cells are placed greedily; any that do
+/// not fit within `max_lines` are dropped (clean truncation).
+fn pack_footer_lines(
+    cells: &[(String, String)],
+    inner_width: usize,
+    max_lines: usize,
+) -> Vec<Vec<(String, String)>> {
+    let sep_w = UnicodeWidthStr::width(FOOTER_SEP);
+    let mut lines: Vec<Vec<(String, String)>> = Vec::new();
+    let mut cur: Vec<(String, String)> = Vec::new();
+    let mut cur_w = 0usize;
+    for cell in cells {
+        let cell_w = UnicodeWidthStr::width(format!("{} {}", cell.0, cell.1).as_str());
+        if cur.is_empty() {
+            cur.push(cell.clone());
+            cur_w = cell_w;
+        } else if cur_w + sep_w + cell_w <= inner_width {
+            cur.push(cell.clone());
+            cur_w += sep_w + cell_w;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            cur.push(cell.clone());
+            cur_w = cell_w;
+        }
+    }
+    if !cur.is_empty() && lines.len() < max_lines {
+        lines.push(cur);
+    }
+    lines.truncate(max_lines);
+    lines
+}
+
 /// Expansion key for a server node.
 fn server_key(id: &ConnId) -> String {
     format!("server:{}", id.key())
@@ -1196,6 +1271,44 @@ impl SessionManagerState {
     // Rendering
     // -----------------------------------------------------------------------
 
+    /// Build the ordered `(key, label)` cells for the help footer. When a chord
+    /// prefix is pending, only chords beginning with that prefix are shown (a
+    /// mini which-key); otherwise the full chord list (built from the effective
+    /// bindings, so user overrides are reflected) plus the fixed navigation keys
+    /// are shown.
+    fn footer_cells(&self) -> Vec<(String, String)> {
+        let pending = self.pending_chord;
+        let mut chords: Vec<(String, SessionManagerBinding)> = self
+            .bindings
+            .iter()
+            .map(|(c, b)| (c.to_string(), b))
+            .collect();
+        if let Some(p) = pending {
+            chords.retain(|(c, _)| c.starts_with(p));
+        }
+        chords.sort_by(|(a, _), (b, _)| {
+            chord_group_rank(a)
+                .cmp(&chord_group_rank(b))
+                .then_with(|| a.cmp(b))
+        });
+        let mut cells: Vec<(String, String)> = chords
+            .into_iter()
+            .map(|(c, b)| (c, binding_label(b).to_string()))
+            .collect();
+        // Fixed navigation keys are only shown in the full (non-pending) view.
+        if pending.is_none() {
+            for (k, l) in [
+                ("Enter", "open"),
+                ("d", "delete"),
+                ("Esc", "close"),
+                ("j/k", "nav"),
+            ] {
+                cells.push((k.to_string(), l.to_string()));
+            }
+        }
+        cells
+    }
+
     /// Render the session manager overlay as a list of draw commands.
     pub fn render(&self, screen_cols: u16, screen_rows: u16, theme: &Theme) -> Vec<DrawCommand> {
         let mut commands = Vec::new();
@@ -1250,8 +1363,16 @@ impl SessionManagerState {
             bg,
         });
 
-        // Content area (rows).
-        let content_height = (popup_height - 4) as usize; // -2 for borders, -2 for help
+        // Help footer: the dynamic chord list (or, when a chord prefix is
+        // pending, a mini which-key of that prefix's chords), packed into up to
+        // 3 lines that fit the popup width.
+        let footer_cells = self.footer_cells();
+        let footer_lines = pack_footer_lines(&footer_cells, inner_width, 3);
+        let footer_n = footer_lines.len().max(1);
+
+        // Content area (rows): popup height minus the top border (1), the
+        // separator line (1), the footer lines, and the bottom border (1).
+        let content_height = (popup_height as usize).saturating_sub(3 + footer_n);
         let scroll_offset = if self.selected >= content_height {
             self.selected - content_height + 1
         } else {
@@ -1419,34 +1540,79 @@ impl SessionManagerState {
             });
         }
 
-        // Help line.
-        let help_y = sep_y + 1;
-        let help_text = " j/k:nav  Enter:select  d:delete  c:folder  n:session  m:move  q:quit ";
-        let help_content = pad_to_display_width(help_text, inner_width);
-        commands.push(DrawCommand {
-            x: start_x,
-            y: help_y,
-            text: "\u{2502}".to_string(),
-            fg: border_fg,
-            bg,
-        });
-        commands.push(DrawCommand {
-            x: start_x + 1,
-            y: help_y,
-            text: help_content,
-            fg: theme.separator_fg,
-            bg,
-        });
-        commands.push(DrawCommand {
-            x: start_x + 1 + inner_width as u16,
-            y: help_y,
-            text: "\u{2502}".to_string(),
-            fg: border_fg,
-            bg,
-        });
+        // Help footer lines (bound chord list, or a pending-prefix mini
+        // which-key). Each line's chord keys are overlaid in the highlight
+        // color, mirroring the which-key popup.
+        let footer_y0 = sep_y + 1;
+        for i in 0..footer_n {
+            let y = footer_y0 + i as u16;
+
+            // Left border.
+            commands.push(DrawCommand {
+                x: start_x,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+
+            // Build the line text and record each chord key's column offset so
+            // it can be re-drawn in the highlight color afterwards.
+            let mut line_text = String::new();
+            let mut w = 0usize;
+            let mut key_cols: Vec<(usize, String)> = Vec::new();
+            if let Some(line) = footer_lines.get(i) {
+                for (idx, (key, label)) in line.iter().enumerate() {
+                    if idx > 0 {
+                        line_text.push_str(FOOTER_SEP);
+                        w += UnicodeWidthStr::width(FOOTER_SEP);
+                    }
+                    key_cols.push((w, key.clone()));
+                    let cell = format!("{key} {label}");
+                    w += UnicodeWidthStr::width(cell.as_str());
+                    line_text.push_str(&cell);
+                }
+            }
+            let content = pad_to_display_width(&line_text, inner_width);
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y,
+                text: content,
+                fg: theme.separator_fg,
+                bg,
+            });
+
+            // Overlay each chord key in the highlight color (clipped to width).
+            for (col, key) in key_cols {
+                if col >= inner_width {
+                    continue;
+                }
+                let avail = inner_width - col;
+                let key_disp: String = key.chars().take(avail).collect();
+                if key_disp.is_empty() {
+                    continue;
+                }
+                commands.push(DrawCommand {
+                    x: start_x + 1 + col as u16,
+                    y,
+                    text: key_disp,
+                    fg: current_fg,
+                    bg,
+                });
+            }
+
+            // Right border.
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+        }
 
         // Bottom border.
-        let bottom_y = help_y + 1;
+        let bottom_y = footer_y0 + footer_n as u16;
         let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
         commands.push(DrawCommand {
             x: start_x,
@@ -2323,5 +2489,70 @@ mod tests {
         let theme = Theme::default();
         let cmds = state.render(80, 24, &theme);
         assert!(cmds.iter().any(|c| c.text.contains("[t-]")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Help footer (bound-chord hints)
+    // -----------------------------------------------------------------------
+
+    /// (a) The footer lists a configured chord alongside its short label.
+    #[test]
+    fn test_footer_lists_configured_chord_and_label() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        let cells = state.footer_cells();
+        // Default binding tn -> TabNew, labelled "tab new".
+        assert!(cells.contains(&("tn".to_string(), "tab new".to_string())));
+        // Fixed navigation keys are present in the full (non-pending) view.
+        assert!(cells.iter().any(|(k, l)| k == "Enter" && l == "open"));
+    }
+
+    /// (a') End-to-end: a surviving chord's label and highlighted key both make
+    /// it into the rendered draw commands. `sn` sorts into the first footer line
+    /// even at the default 80x24 popup width.
+    #[test]
+    fn test_footer_chord_rendered() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        let theme = Theme::default();
+        let cmds = state.render(80, 24, &theme);
+        // The label appears in a footer line's text...
+        assert!(cmds.iter().any(|c| c.text.contains("session new")));
+        // ...and the chord key is overlaid as its own (highlighted) command.
+        assert!(cmds.iter().any(|c| c.text == "sn"));
+    }
+
+    /// (b) A user override is reflected: the overridden chord (and not the
+    /// replaced default) appears for the action.
+    #[test]
+    fn test_footer_reflects_user_override() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+
+        // Rebind TabNew to "zt" and unbind the default "tn".
+        let toml_str = "zt = \"TabNew\"\ntn = \"\"\n";
+        let value: toml::Value = toml_str.parse().unwrap();
+        state.set_bindings(SessionManagerBindings::from_toml(&value));
+
+        let cells = state.footer_cells();
+        // The overridden chord carries the "tab new" label.
+        assert!(cells.contains(&("zt".to_string(), "tab new".to_string())));
+        // The default "tn" chord is gone.
+        assert!(!cells.iter().any(|(k, _)| k == "tn"));
+    }
+
+    /// (c) With a pending chord prefix the footer is a mini which-key: only
+    /// chords beginning with that prefix (e.g. "tab new", never "pane new").
+    #[test]
+    fn test_footer_pending_prefix_filters() {
+        let mut state = SessionManagerState::new(None);
+        local_tree(&mut state);
+        state.feed_chord('t');
+
+        let cells = state.footer_cells();
+        // Only t-chords remain (fixed keys are suppressed too).
+        assert!(cells.iter().all(|(k, _)| k.starts_with('t')));
+        assert!(cells.iter().any(|(_, l)| l == "tab new"));
+        assert!(!cells.iter().any(|(_, l)| l == "pane new"));
     }
 }

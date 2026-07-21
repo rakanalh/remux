@@ -1232,6 +1232,14 @@ impl SessionManagerBindings {
         self.map.is_empty()
     }
 
+    /// Iterate the effective chord bindings as `(chord, binding)` pairs. Order
+    /// is unspecified (backed by a hash map); callers that need a stable order
+    /// must sort. Used by the session-manager overlay to render its help footer
+    /// so that user overrides are reflected.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, SessionManagerBinding)> + '_ {
+        self.map.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
     /// Parse the `[keybindings.session_manager]` table, starting from the
     /// defaults and applying user entries on top. Invalid chords (not 1-2
     /// printable chars) and unknown action names are logged and skipped. An
