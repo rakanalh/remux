@@ -79,11 +79,11 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('n', leaf_chain("new", &["PaneNew", "EnterNormal"])),
                 ('x', leaf_chain("close", &["PaneClose", "EnterNormal"])),
                 (
-                    's',
+                    'v',
                     leaf_chain("split vertical", &["PaneSplitVertical", "EnterNormal"]),
                 ),
                 (
-                    'S',
+                    's',
                     leaf_chain("split horizontal", &["PaneSplitHorizontal", "EnterNormal"]),
                 ),
                 (

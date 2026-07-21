@@ -184,8 +184,8 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 |-----|--------|
 | `n` | New pane *(→ Normal)* |
 | `x` | Close pane *(→ Normal)* |
-| `s` | Split vertical *(→ Normal)* |
-| `S` | Split horizontal *(→ Normal)* |
+| `v` | Split vertical *(→ Normal)* |
+| `s` | Split horizontal *(→ Normal)* |
 | `h` / `j` / `k` / `l` | Focus left / down / up / right *(→ Normal)* |
 | `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right *(→ Normal)* |
 | `z` | Toggle zoom *(→ Normal)* |
