@@ -10,6 +10,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
+use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue, terminal};
 
 use crate::client::input::{SelectionMode, VisualState};
@@ -157,6 +158,28 @@ impl Renderer {
                 queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
             }
             queue!(stdout, ResetColor)?;
+
+            // The composite frame may be narrower than this client's terminal
+            // (frame is sized to the MIN across attached clients). A larger
+            // client would otherwise leave stale content to the right of the
+            // frame. The cursor is already positioned after the last painted
+            // cell; ResetColor above ensures the cleared area uses the default
+            // background, then clear to end of line.
+            if (row.len() as u16) < self.cols {
+                queue!(stdout, Clear(ClearType::UntilNewLine))?;
+            }
+        }
+
+        // Clear any terminal rows below the frame. When the composite frame has
+        // fewer rows than this client's terminal, stale content (e.g. a doubled
+        // status bar) would otherwise persist at the true bottom of the screen.
+        if cells.len() < self.rows as usize {
+            queue!(
+                stdout,
+                ResetColor,
+                MoveTo(0, cells.len() as u16),
+                Clear(ClearType::FromCursorDown),
+            )?;
         }
 
         // Update cursor.
