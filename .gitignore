@@ -2,3 +2,5 @@
 **/*.rs.bk
 *.pdb
 bug*.png
+openspec/
+docs/superpowers/
