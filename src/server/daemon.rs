@@ -24,7 +24,7 @@ use crate::screen::Screen;
 use crate::server::compositor::{
     composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
 };
-use crate::server::layout::{self, CustomLayout, LayoutMode, PaneId, Rect};
+use crate::server::layout::{self, CustomLayout, LayoutMode, MasterLayout, PaneId, Rect};
 use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, Pty};
 use crate::server::session::{Folder, ServerState};
@@ -1521,16 +1521,20 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                // Switch to Master layout if not already in it.
+                if !matches!(tab.layout_mode, LayoutMode::Master(_)) {
+                    tab.layout_mode = LayoutMode::Master(MasterLayout::default());
+                }
                 if let LayoutMode::Master(ref mut master_layout) = tab.layout_mode {
-                    if let Some(idx) = tab.pane_order.iter().position(|&id| id == tab.focused_pane)
+                    if let Some(idx) =
+                        tab.pane_order.iter().position(|&id| id == tab.focused_pane)
                     {
                         master_layout.master_idx = idx;
-                        tab.layout = tab
-                            .layout_mode
-                            .build_tree(&tab.pane_order, tab.focused_pane);
                     }
+                    tab.layout = tab
+                        .layout_mode
+                        .build_tree(&tab.pane_order, tab.focused_pane);
                 }
-                // No-op if not in Master mode
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;

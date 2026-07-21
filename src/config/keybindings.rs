@@ -113,6 +113,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     leaf_chain("move right", &["PaneMoveRight", "EnterNormal"]),
                 ),
                 ('z', leaf_chain("zoom", &["PaneToggleZoom", "EnterNormal"])),
+                ('m', leaf_chain("set master", &["SetMaster", "EnterNormal"])),
                 ('r', leaf("rename", "PaneRename")),
                 (
                     'a',
@@ -623,6 +624,7 @@ pub fn humanize_command(command: &str) -> String {
         "SessionQuickSwitch" => return "switch session".to_string(),
         "SessionSwitchLast" => return "last session".to_string(),
         "LayoutNext" => return "next layout".to_string(),
+        "SetMaster" => return "set master".to_string(),
         _ => {}
     }
 
@@ -694,6 +696,7 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('o'), cmd("SessionSwitchLast"));
         bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
         bindings.insert(alt_key(' '), cmd("LayoutNext"));
+        bindings.insert(alt_key('m'), cmd("SetMaster"));
 
         Self { bindings }
     }
