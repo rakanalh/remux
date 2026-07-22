@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 380" width="1280" height="380" font-family="ui-monospace, &#39;JetBrains Mono&#39;, &#39;SF Mono&#39;, Menlo, Consolas, monospace">
+  <defs>
+    <clipPath id="win"><rect x="28" y="28" width="1224" height="324" rx="12"></rect></clipPath>
+    <linearGradient id="glow" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#cba6f7" stop-opacity="0.05"></stop>
+      <stop offset="0.6" stop-color="#cba6f7" stop-opacity="0"></stop>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="380" fill="#181825"></rect>
+
+  
+  <rect x="28" y="28" width="1224" height="324" rx="12" fill="#1e1e2e" stroke="#313244" stroke-width="1"></rect>
+
+  <g clip-path="url(#win)">
+    
+    <rect x="28" y="28" width="1224" height="44" fill="#11111b"></rect>
+    <rect x="28" y="71" width="1224" height="1" fill="#313244"></rect>
+    <circle cx="55" cy="50" r="6" fill="#f38ba8"></circle>
+    <circle cx="77" cy="50" r="6" fill="#f9e2af"></circle>
+    <circle cx="99" cy="50" r="6" fill="#a6e3a1"></circle>
+    <text x="126" y="55" font-size="13" fill="#6c7086">remux — main</text>
+    <text x="1236" y="55" font-size="12" fill="#45475a" text-anchor="end">bsp · zellij-style</text>
+
+    
+    <rect x="40" y="84" width="779" height="224" rx="9" fill="url(#glow)" stroke="#45475a" stroke-width="1"></rect>
+    <text x="56" y="105" font-size="12" fill="#cba6f7">▍pane 1</text>
+    <text x="90" y="242" font-size="40" font-weight="700" fill="#6c7086">$</text>
+    <text x="122" y="248" font-size="78" font-weight="800" letter-spacing="-1">
+      <tspan fill="#cdd6f4">re</tspan><tspan fill="#cba6f7">mux</tspan>
+    </text>
+    <rect x="368" y="192" width="22" height="62" fill="#a6e3a1">
+      
+    </rect>
+    <text x="90" y="298" font-size="20" fill="#a6adc8">A modern terminal multiplexer written in <tspan fill="#fab387" font-weight="500">Rust</tspan></text>
+
+    
+    <rect x="829" y="84" width="411" height="116" rx="9" fill="none" stroke="#45475a" stroke-width="1"></rect>
+    <text x="845" y="105" font-size="11" fill="#89b4fa">▍pane 2</text>
+    <text x="849" y="140" font-size="14" fill="#6c7086">◆ <tspan fill="#89dceb">session persistence</tspan></text>
+    <text x="849" y="166" font-size="14" fill="#6c7086">◆ <tspan fill="#f9e2af">modal &amp; which-key</tspan></text>
+    <text x="849" y="192" font-size="14" fill="#6c7086">◆ <tspan fill="#f38ba8">pane stacking</tspan></text>
+
+    
+    <rect x="829" y="210" width="411" height="98" rx="9" fill="none" stroke="#45475a" stroke-width="1"></rect>
+    <text x="845" y="231" font-size="11" fill="#a6e3a1">▍pane 3</text>
+    <text x="849" y="266" font-size="14" fill="#a6e3a1">$ cargo install</text>
+    <text x="865" y="288" font-size="13" fill="#6c7086">--git .../remux</text>
+
+    
+    <rect x="28" y="320" width="1224" height="32" fill="#cba6f7"></rect>
+    <rect x="44" y="326" width="66" height="20" rx="4" fill="#1e1e2e"></rect>
+    <text x="52" y="340" font-size="12" font-weight="700" fill="#cba6f7" letter-spacing="1">NORMAL</text>
+    <text x="124" y="340" font-size="12" font-weight="700" fill="#1e1e2e">1:main*</text>
+    <text x="196" y="340" font-size="12" font-weight="500" fill="#1e1e2e" opacity="0.7">2:build</text>
+    <text x="1236" y="340" font-size="12" font-weight="700" fill="#1e1e2e" text-anchor="end">tmux ⊕ zellij</text>
+  </g>
+</svg>

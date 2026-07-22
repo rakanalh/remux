@@ -1,10 +1,6 @@
-<pre>
- ____  _____ __  __ _   ___  __
-|  _ \| ____|  \/  | | | \ \/ /
-| |_) |  _| | |\/| | | | |\  /
-|  _ <| |___| |  | | |_| |/  \
-|_| \_\_____|_|  |_|\___//_/\_\
-</pre>
+<p align="center">
+  <img src="./docs/remux-banner.svg" alt="Remux — a modern terminal multiplexer written in Rust" width="820">
+</p>
 
 [![CI](https://github.com/rakanalh/remux/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/rakanalh/remux/actions/workflows/ci.yml)
 
