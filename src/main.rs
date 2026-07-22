@@ -2280,14 +2280,18 @@ async fn run_client_loop(
                         // (not just the foreground) and tags each with `src`,
                         // including the current session (marked, not filtered).
                         if input.session_switch.is_some() {
-                            let mut sessions: Vec<(String, bool)> = Vec::new();
+                            let mut sessions: Vec<(String, bool, Option<String>)> = Vec::new();
                             for f in &folders {
                                 for s in &f.sessions {
-                                    sessions.push((s.name.clone(), s.is_current));
+                                    sessions.push((
+                                        s.name.clone(),
+                                        s.is_current,
+                                        Some(f.name.clone()),
+                                    ));
                                 }
                             }
                             for s in &unfiled {
-                                sessions.push((s.name.clone(), s.is_current));
+                                sessions.push((s.name.clone(), s.is_current, None));
                             }
                             // Replace this server's rows (a re-received tree for
                             // the same `src` overwrites rather than duplicates).

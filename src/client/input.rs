@@ -720,6 +720,9 @@ pub struct SessionSwitchEntry {
     pub name: String,
     /// Whether this is the currently-attached session on `server`.
     pub is_current: bool,
+    /// Folder this session lives in, if any; display-only prefix — NOT part of
+    /// the switch target.
+    pub folder: Option<String>,
 }
 
 /// Session quick-switch overlay for rapidly switching between sessions across
@@ -728,8 +731,9 @@ pub struct SessionSwitchEntry {
 pub struct SessionSwitchOverlay {
     /// Per-server session groups keyed by [`ConnId`]. Kept so a re-received
     /// tree for one server REPLACES that server's rows rather than duplicating
-    /// them. Each value is `(name, is_current)` in tree order.
-    groups: HashMap<ConnId, Vec<(String, bool)>>,
+    /// them. Each value is `(name, is_current, folder)` in tree order, where
+    /// `folder` is the display-only folder prefix (if any).
+    groups: HashMap<ConnId, Vec<(String, bool, Option<String>)>>,
     /// Flattened, ordered rows rebuilt from `groups` on every merge: Local
     /// first, then remotes by name; tree order preserved within a server.
     pub entries: Vec<SessionSwitchEntry>,
@@ -750,7 +754,7 @@ impl SessionSwitchOverlay {
     /// flat, ordered `entries` list. Re-merging the same server replaces its
     /// prior rows instead of appending, so per-server trees arriving
     /// asynchronously never duplicate.
-    pub fn merge_server(&mut self, server: ConnId, sessions: Vec<(String, bool)>) {
+    pub fn merge_server(&mut self, server: ConnId, sessions: Vec<(String, bool, Option<String>)>) {
         self.groups.insert(server, sessions);
         self.rebuild();
     }
@@ -760,11 +764,12 @@ impl SessionSwitchOverlay {
     fn rebuild(&mut self) {
         let mut entries = Vec::new();
         if let Some(sessions) = self.groups.get(&ConnId::Local) {
-            for (name, is_current) in sessions {
+            for (name, is_current, folder) in sessions {
                 entries.push(SessionSwitchEntry {
                     server: ConnId::Local,
                     name: name.clone(),
                     is_current: *is_current,
+                    folder: folder.clone(),
                 });
             }
         }
@@ -780,11 +785,12 @@ impl SessionSwitchOverlay {
         for name in remote_names {
             let server = ConnId::Remote(name.clone());
             if let Some(sessions) = self.groups.get(&server) {
-                for (sname, is_current) in sessions {
+                for (sname, is_current, folder) in sessions {
                     entries.push(SessionSwitchEntry {
                         server: server.clone(),
                         name: sname.clone(),
                         is_current: *is_current,
+                        folder: folder.clone(),
                     });
                 }
             }
@@ -805,11 +811,15 @@ impl SessionSwitchOverlay {
         }
     }
 
-    /// The label shown for an entry: just the session name for both local and
-    /// remote sessions. Remote sessions are grouped under a labeled separator
-    /// row instead of carrying a `server: ` prefix.
+    /// The label shown for an entry: the session name, prefixed with its
+    /// folder (`folder/name`) when it lives in one. Remote sessions are grouped
+    /// under a labeled separator row instead of carrying a `server: ` prefix.
+    /// The folder prefix is display-only and is NOT part of the switch target.
     fn entry_label(entry: &SessionSwitchEntry) -> String {
-        entry.name.clone()
+        match &entry.folder {
+            Some(f) if !f.is_empty() => format!("{f}/{}", entry.name),
+            _ => entry.name.clone(),
+        }
     }
 
     /// Whether a group-separator header must be drawn *before* the entry whose
@@ -2276,7 +2286,11 @@ impl InputHandler {
 
     /// Merge one server's sessions (tagged with its [`ConnId`]) into the session
     /// switch overlay, replacing any prior rows for that server.
-    pub fn merge_session_switch(&mut self, server: ConnId, sessions: Vec<(String, bool)>) {
+    pub fn merge_session_switch(
+        &mut self,
+        server: ConnId,
+        sessions: Vec<(String, bool, Option<String>)>,
+    ) {
         if let Some(ref mut ss) = self.session_switch {
             ss.merge_server(server, sessions);
         }
@@ -3802,16 +3816,21 @@ mod tests {
         let mut overlay = SessionSwitchOverlay::new();
         overlay.merge_server(
             ConnId::Local,
-            vec![("alpha".to_string(), true), ("beta".to_string(), false)],
+            vec![
+                ("alpha".to_string(), true, None),
+                ("beta".to_string(), false, None),
+                ("api".to_string(), false, Some("work".to_string())),
+            ],
         );
 
-        assert_eq!(overlay.entries.len(), 2);
+        assert_eq!(overlay.entries.len(), 3);
         assert_eq!(
             overlay.entries[0],
             SessionSwitchEntry {
                 server: ConnId::Local,
                 name: "alpha".to_string(),
                 is_current: true,
+                folder: None,
             }
         );
         assert_eq!(
@@ -3820,8 +3839,91 @@ mod tests {
                 server: ConnId::Local,
                 name: "beta".to_string(),
                 is_current: false,
+                folder: None,
             }
         );
+        // The foldered row carries its folder through to the entry.
+        assert_eq!(
+            overlay.entries[2],
+            SessionSwitchEntry {
+                server: ConnId::Local,
+                name: "api".to_string(),
+                is_current: false,
+                folder: Some("work".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn session_switch_entry_label_prefixes_folder_display_only() {
+        // A foldered entry renders as `folder/name`; an unfoldered one renders
+        // just the bare name. The folder is display-only.
+        let foldered = SessionSwitchEntry {
+            server: ConnId::Local,
+            name: "api".to_string(),
+            is_current: false,
+            folder: Some("work".to_string()),
+        };
+        let unfoldered = SessionSwitchEntry {
+            server: ConnId::Local,
+            name: "api".to_string(),
+            is_current: false,
+            folder: None,
+        };
+        let empty_folder = SessionSwitchEntry {
+            server: ConnId::Local,
+            name: "api".to_string(),
+            is_current: false,
+            folder: Some(String::new()),
+        };
+        assert_eq!(SessionSwitchOverlay::entry_label(&foldered), "work/api");
+        assert_eq!(SessionSwitchOverlay::entry_label(&unfoldered), "api");
+        // An empty folder string is treated as no folder (no leading slash).
+        assert_eq!(SessionSwitchOverlay::entry_label(&empty_folder), "api");
+    }
+
+    #[test]
+    fn session_switch_render_shows_folder_prefix_confirm_returns_bare_name() {
+        use crate::config::theme::Theme;
+
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![
+                ("api".to_string(), true, Some("work".to_string())),
+                ("scratch".to_string(), false, None),
+            ],
+        );
+
+        // (a) The rendered popup shows the folder-prefixed label for the
+        //     foldered session and the bare name for the unfiled one.
+        let theme = Theme::default();
+        let commands = overlay.render(80, 24, &theme);
+        assert!(
+            commands.iter().any(|c| c.text.contains("work/api")),
+            "foldered session should render with its folder prefix"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.text.contains("scratch") && !c.text.contains('/')),
+            "unfiled session should render with just its bare name"
+        );
+
+        handler.session_switch = Some(overlay);
+
+        // (b) Selecting the foldered session and confirming returns the BARE
+        //     session name, never the folder-prefixed display label.
+        let action = handler.handle_session_switch_key(enter_key());
+        match action {
+            InputAction::SessionSwitchConfirm { server, session } => {
+                assert_eq!(server, ConnId::Local);
+                assert_eq!(session, "api");
+            }
+            other => panic!("expected SessionSwitchConfirm, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3836,7 +3938,7 @@ mod tests {
         // panic when the cut lands mid-UTF-8.
         overlay.merge_server(
             remote("srv"),
-            vec![("日本語のセッション名前がとても長い".to_string(), true)],
+            vec![("日本語のセッション名前がとても長い".to_string(), true, None)],
         );
 
         let theme = Theme::default();
@@ -3867,15 +3969,15 @@ mod tests {
         overlay.merge_server(
             ConnId::Local,
             vec![
-                ("Session 1".to_string(), false),
-                ("Session 2".to_string(), true),
+                ("Session 1".to_string(), false, None),
+                ("Session 2".to_string(), true, None),
             ],
         );
         overlay.merge_server(
             remote("mini"),
             vec![
-                ("Session 1".to_string(), false),
-                ("Session 2".to_string(), false),
+                ("Session 1".to_string(), false, None),
+                ("Session 2".to_string(), false, None),
             ],
         );
 
@@ -3909,8 +4011,8 @@ mod tests {
         overlay.merge_server(
             ConnId::Local,
             vec![
-                ("Session 1".to_string(), true),
-                ("Session 2".to_string(), false),
+                ("Session 1".to_string(), true, None),
+                ("Session 2".to_string(), false, None),
             ],
         );
 
@@ -3936,11 +4038,17 @@ mod tests {
         let mut overlay = SessionSwitchOverlay::new();
         overlay.merge_server(
             ConnId::Local,
-            vec![("l1".to_string(), false), ("l2".to_string(), true)],
+            vec![
+                ("l1".to_string(), false, None),
+                ("l2".to_string(), true, None),
+            ],
         );
         overlay.merge_server(
             remote("mini"),
-            vec![("r1".to_string(), false), ("r2".to_string(), false)],
+            vec![
+                ("r1".to_string(), false, None),
+                ("r2".to_string(), false, None),
+            ],
         );
 
         // One separator for the single remote group.
@@ -3960,9 +4068,9 @@ mod tests {
     fn session_switch_orders_local_first_then_remotes_by_name() {
         let mut overlay = SessionSwitchOverlay::new();
         // Merge out of order: a remote first, then local, then another remote.
-        overlay.merge_server(remote("zulu"), vec![("z1".to_string(), false)]);
-        overlay.merge_server(ConnId::Local, vec![("l1".to_string(), true)]);
-        overlay.merge_server(remote("alpha"), vec![("a1".to_string(), true)]);
+        overlay.merge_server(remote("zulu"), vec![("z1".to_string(), false, None)]);
+        overlay.merge_server(ConnId::Local, vec![("l1".to_string(), true, None)]);
+        overlay.merge_server(remote("alpha"), vec![("a1".to_string(), true, None)]);
 
         let servers: Vec<&ConnId> = overlay.entries.iter().map(|e| &e.server).collect();
         assert_eq!(
@@ -3977,9 +4085,9 @@ mod tests {
         overlay.merge_server(
             remote("mini"),
             vec![
-                ("build".to_string(), false),
-                ("test".to_string(), true),
-                ("deploy".to_string(), false),
+                ("build".to_string(), false, None),
+                ("test".to_string(), true, None),
+                ("deploy".to_string(), false, None),
             ],
         );
         let names: Vec<&str> = overlay.entries.iter().map(|e| e.name.as_str()).collect();
@@ -3991,14 +4099,17 @@ mod tests {
         let mut overlay = SessionSwitchOverlay::new();
         overlay.merge_server(
             ConnId::Local,
-            vec![("a".to_string(), true), ("b".to_string(), false)],
+            vec![
+                ("a".to_string(), true, None),
+                ("b".to_string(), false, None),
+            ],
         );
-        overlay.merge_server(remote("mini"), vec![("x".to_string(), true)]);
+        overlay.merge_server(remote("mini"), vec![("x".to_string(), true, None)]);
         assert_eq!(overlay.entries.len(), 3);
 
         // A re-received tree for Local with a changed list replaces the two
         // prior Local rows rather than appending.
-        overlay.merge_server(ConnId::Local, vec![("c".to_string(), false)]);
+        overlay.merge_server(ConnId::Local, vec![("c".to_string(), false, None)]);
         assert_eq!(overlay.entries.len(), 2);
         let local: Vec<&str> = overlay
             .entries
@@ -4014,8 +4125,11 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
         let mut overlay = SessionSwitchOverlay::new();
-        overlay.merge_server(ConnId::Local, vec![("local-sess".to_string(), true)]);
-        overlay.merge_server(remote("mini"), vec![("remote-sess".to_string(), false)]);
+        overlay.merge_server(ConnId::Local, vec![("local-sess".to_string(), true, None)]);
+        overlay.merge_server(
+            remote("mini"),
+            vec![("remote-sess".to_string(), false, None)],
+        );
         handler.session_switch = Some(overlay);
 
         // Move down to the second (remote) entry, then confirm.
@@ -4209,7 +4323,7 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::Command;
         let mut overlay = SessionSwitchOverlay::new();
-        overlay.merge_server(ConnId::Local, vec![("cur".to_string(), true)]);
+        overlay.merge_server(ConnId::Local, vec![("cur".to_string(), true, None)]);
         handler.session_switch = Some(overlay);
 
         let action = handler.handle_session_switch_key(enter_key());
@@ -4230,9 +4344,9 @@ mod tests {
         overlay.merge_server(
             ConnId::Local,
             vec![
-                ("first".to_string(), false),
-                ("cur".to_string(), true),
-                ("third".to_string(), false),
+                ("first".to_string(), false, None),
+                ("cur".to_string(), true, None),
+                ("third".to_string(), false, None),
             ],
         );
         assert_eq!(overlay.selected, 1);
@@ -4249,9 +4363,9 @@ mod tests {
         overlay.merge_server(
             ConnId::Local,
             vec![
-                ("a".to_string(), false),
-                ("cur".to_string(), true),
-                ("c".to_string(), false),
+                ("a".to_string(), false, None),
+                ("cur".to_string(), true, None),
+                ("c".to_string(), false, None),
             ],
         );
         handler.session_switch = Some(overlay);
@@ -4262,7 +4376,7 @@ mod tests {
 
         // A second async merge arrives (rebuild re-runs). It must NOT yank the
         // highlight back to the current entry.
-        handler.merge_session_switch(remote("mini"), vec![("x".to_string(), true)]);
+        handler.merge_session_switch(remote("mini"), vec![("x".to_string(), true, None)]);
         assert_eq!(handler.session_switch.as_ref().unwrap().selected, 2);
     }
 
@@ -4272,7 +4386,10 @@ mod tests {
         // A remote tree with no current session arrives first.
         overlay.merge_server(
             remote("mini"),
-            vec![("x".to_string(), false), ("y".to_string(), false)],
+            vec![
+                ("x".to_string(), false, None),
+                ("y".to_string(), false, None),
+            ],
         );
         assert!(!overlay.selection_initialized);
         assert_eq!(overlay.selected, 0);
@@ -4280,7 +4397,10 @@ mod tests {
         // A later tree carrying the current session then snaps to it.
         overlay.merge_server(
             ConnId::Local,
-            vec![("first".to_string(), false), ("cur".to_string(), true)],
+            vec![
+                ("first".to_string(), false, None),
+                ("cur".to_string(), true, None),
+            ],
         );
         assert!(overlay.selection_initialized);
         let sel = &overlay.entries[overlay.selected];
