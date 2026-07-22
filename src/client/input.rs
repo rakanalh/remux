@@ -805,13 +805,44 @@ impl SessionSwitchOverlay {
         }
     }
 
-    /// The label shown for an entry: remote sessions are prefixed with the
-    /// server name (e.g. `mini: build`); local sessions show just the name.
+    /// The label shown for an entry: just the session name for both local and
+    /// remote sessions. Remote sessions are grouped under a labeled separator
+    /// row instead of carrying a `server: ` prefix.
     fn entry_label(entry: &SessionSwitchEntry) -> String {
-        match &entry.server {
-            ConnId::Remote(server) => format!("{server}: {}", entry.name),
-            ConnId::Local => entry.name.clone(),
+        entry.name.clone()
+    }
+
+    /// Whether a group-separator header must be drawn *before* the entry whose
+    /// server is `cur`, given the previous entry's server (`None` for the first
+    /// entry). A remote-only list labels its first group; a Local-first list
+    /// does not (Local is shown headerless). A header is drawn on every
+    /// group boundary thereafter.
+    fn separator_before(prev: Option<&ConnId>, cur: &ConnId) -> bool {
+        match prev {
+            None => matches!(cur, ConnId::Remote(_)),
+            Some(prev) => prev != cur,
         }
+    }
+
+    /// Display name for a group-separator header.
+    fn server_display(server: &ConnId) -> String {
+        match server {
+            ConnId::Remote(name) => name.clone(),
+            ConnId::Local => "Local".to_string(),
+        }
+    }
+
+    /// The number of group-separator header rows the current `entries` produce.
+    fn separator_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut prev: Option<&ConnId> = None;
+        for entry in &self.entries {
+            if Self::separator_before(prev, &entry.server) {
+                count += 1;
+            }
+            prev = Some(&entry.server);
+        }
+        count
     }
 
     /// Render the session switch popup as draw commands.
@@ -825,7 +856,10 @@ impl SessionSwitchOverlay {
         let mut commands = Vec::new();
 
         let popup_width = 40u16.min(screen_cols);
-        let popup_height = (self.entries.len() as u16 + 2).min(screen_rows);
+        // Height accounts for the two borders, every session row, and one row
+        // per group-separator header interleaved between the groups.
+        let separator_count = self.separator_count();
+        let popup_height = ((self.entries.len() + separator_count + 2) as u16).min(screen_rows);
         let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
         let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
 
@@ -865,12 +899,57 @@ impl SessionSwitchOverlay {
             bg,
         });
 
-        // Session list
+        // Session list, with a labeled separator header preceding each remote
+        // group. `row_offset` is the running screen row under the top border;
+        // separators consume a row of their own, so we cannot derive the row
+        // from the entry index alone.
+        let mut row_offset: u16 = 1;
+        let mut prev_server: Option<&ConnId> = None;
         for (i, entry) in self.entries.iter().enumerate() {
-            let y = start_y + 1 + i as u16;
-            if y >= start_y + popup_height - 1 {
+            // Draw a group-separator header when the server group changes.
+            if Self::separator_before(prev_server, &entry.server) {
+                // Stop at/below the bottom border.
+                if row_offset >= popup_height - 1 {
+                    break;
+                }
+                let label = format!("\u{2500} {} ", Self::server_display(&entry.server));
+                let label_chars = label.chars().count();
+                let sep_text = if label_chars >= inner_width {
+                    label.chars().take(inner_width).collect::<String>()
+                } else {
+                    format!("{label}{}", "\u{2500}".repeat(inner_width - label_chars))
+                };
+                let sep_y = start_y + row_offset;
+                commands.push(DrawCommand {
+                    x: start_x,
+                    y: sep_y,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
+                commands.push(DrawCommand {
+                    x: start_x + 1,
+                    y: sep_y,
+                    text: sep_text,
+                    fg: border_fg,
+                    bg,
+                });
+                commands.push(DrawCommand {
+                    x: start_x + 1 + inner_width as u16,
+                    y: sep_y,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
+                row_offset += 1;
+            }
+            prev_server = Some(&entry.server);
+
+            // Stop at/below the bottom border.
+            if row_offset >= popup_height - 1 {
                 break;
             }
+            let y = start_y + row_offset;
             let is_selected = i == self.selected;
             // Mark the currently-attached session on its server with a leading
             // '*' (one per connected server may be marked).
@@ -909,6 +988,7 @@ impl SessionSwitchOverlay {
                 fg: border_fg,
                 bg,
             });
+            row_offset += 1;
         }
 
         // Bottom border
@@ -3749,11 +3829,14 @@ mod tests {
         use crate::config::theme::Theme;
 
         let mut overlay = SessionSwitchOverlay::new();
-        // A remote session whose label ("server: name") is long and multibyte,
-        // so the truncation width lands mid-UTF-8 with a byte slice.
+        // A remote session whose name is long and multibyte, so that even
+        // without the old `server: ` prefix the SESSION ROW itself (marker +
+        // name) overflows inner_width and hits the truncation branch. This
+        // guards against reintroducing a byte-slice truncation that would
+        // panic when the cut lands mid-UTF-8.
         overlay.merge_server(
             remote("srv"),
-            vec![("日本語のセッション名前".to_string(), true)],
+            vec![("日本語のセッション名前がとても長い".to_string(), true)],
         );
 
         let theme = Theme::default();
@@ -3762,17 +3845,115 @@ mod tests {
         let commands = overlay.render(20, 24, &theme);
         assert!(!commands.is_empty());
 
-        // The truncated content row is drawn at x = start_x + 1 (start_x = 0
-        // when popup_width == screen_cols). It must be truncated on a char
-        // boundary to exactly inner_width columns.
+        // The truncated session row is drawn at x = start_x + 1 (start_x = 0
+        // when popup_width == screen_cols) and begins with the current-session
+        // marker `* ` (which the separator header never does). It must be
+        // truncated on a char boundary to exactly inner_width columns.
         let inner_width = 18usize;
-        let truncated = commands
-            .iter()
-            .find(|c| c.x == 1 && c.text.chars().count() == inner_width);
+        let truncated = commands.iter().find(|c| {
+            c.x == 1 && c.text.starts_with("* ") && c.text.chars().count() == inner_width
+        });
         assert!(
             truncated.is_some(),
-            "expected a content row truncated to {inner_width} chars"
+            "expected the session row truncated to {inner_width} chars"
         );
+    }
+
+    #[test]
+    fn session_switch_render_groups_remotes_under_labeled_separator() {
+        use crate::config::theme::Theme;
+
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![
+                ("Session 1".to_string(), false),
+                ("Session 2".to_string(), true),
+            ],
+        );
+        overlay.merge_server(
+            remote("mini"),
+            vec![
+                ("Session 1".to_string(), false),
+                ("Session 2".to_string(), false),
+            ],
+        );
+
+        let theme = Theme::default();
+        // Comfortable size so nothing is clamped or truncated.
+        let commands = overlay.render(80, 24, &theme);
+
+        // (a) A separator header for the remote "mini" group is drawn: its text
+        //     names the server and is filled with the box-drawing dash.
+        let separator = commands
+            .iter()
+            .find(|c| c.text.contains("mini") && c.text.contains('\u{2500}'));
+        assert!(
+            separator.is_some(),
+            "expected a labeled separator row for the remote group"
+        );
+
+        // (b) No session row carries the old `mini: ` prefix. (The separator
+        //     legitimately contains "mini", so match the colon-suffixed form.)
+        assert!(
+            commands.iter().all(|c| !c.text.contains("mini:")),
+            "no row should carry the old `mini: ` prefix"
+        );
+    }
+
+    #[test]
+    fn session_switch_render_local_only_has_no_separator() {
+        use crate::config::theme::Theme;
+
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![
+                ("Session 1".to_string(), true),
+                ("Session 2".to_string(), false),
+            ],
+        );
+
+        let theme = Theme::default();
+        let commands = overlay.render(80, 24, &theme);
+
+        // No group-separator header should appear for a Local-only list: the
+        // only rows starting with the box-drawing dash are the top and bottom
+        // borders (which begin with the rounded corners, not a bare dash).
+        assert_eq!(overlay.separator_count(), 0);
+        let mid_dash_rows = commands
+            .iter()
+            .filter(|c| c.x == 1 && c.text.starts_with('\u{2500}'))
+            .count();
+        assert_eq!(mid_dash_rows, 0, "Local-only list must render no separator");
+    }
+
+    #[test]
+    fn session_switch_popup_height_accounts_for_separator() {
+        use crate::config::theme::Theme;
+        use std::collections::BTreeSet;
+
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![("l1".to_string(), false), ("l2".to_string(), true)],
+        );
+        overlay.merge_server(
+            remote("mini"),
+            vec![("r1".to_string(), false), ("r2".to_string(), false)],
+        );
+
+        // One separator for the single remote group.
+        assert_eq!(overlay.separator_count(), 1);
+
+        let theme = Theme::default();
+        // Screen tall enough that the popup is not clamped.
+        let commands = overlay.render(80, 24, &theme);
+
+        // Distinct screen rows drawn == popup height == 2 borders + 4 sessions
+        // + 1 separator = 7.
+        let rows: BTreeSet<u16> = commands.iter().map(|c| c.y).collect();
+        assert_eq!(rows.len(), 7, "height must include the separator row");
     }
 
     #[test]
