@@ -57,13 +57,25 @@ fn get_process_name(pid: i32) -> String {
         .unwrap_or_else(|_| "shell".to_string())
 }
 
+/// Return the runtime directory used for the socket and pid files.
+fn runtime_dir() -> PathBuf {
+    dirs::runtime_dir()
+        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Return the path to the Unix domain socket used for client-server
 /// communication.
 pub fn socket_path() -> PathBuf {
-    let runtime_dir = dirs::runtime_dir()
-        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    runtime_dir.join("remux.sock")
+    runtime_dir().join("remux.sock")
+}
+
+/// Return the path to the pid file recording the running server's PID.
+///
+/// Written on startup and removed on graceful shutdown; used by `remux stop`
+/// to signal the server (SIGTERM) for a clean save-and-exit.
+pub fn pid_path() -> PathBuf {
+    runtime_dir().join("remux.pid")
 }
 
 /// Write a length-prefixed JSON message to an async writer.
@@ -241,6 +253,14 @@ impl RemuxServer {
         let listener = UnixListener::bind(&path).context("binding Unix listener")?;
         log::info!("server listening on {}", path.display());
 
+        // Record our PID so `remux stop` can signal us for a graceful save-and-
+        // exit. Best-effort: a write failure here must not abort startup.
+        let pid_file = pid_path();
+        match std::fs::write(&pid_file, std::process::id().to_string()) {
+            Ok(()) => log::info!("wrote pid file {}", pid_file.display()),
+            Err(e) => log::warn!("failed to write pid file {}: {e}", pid_file.display()),
+        }
+
         // Set up signal handlers for graceful shutdown.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .context("registering SIGTERM handler")?;
@@ -307,6 +327,7 @@ impl RemuxServer {
         if !self.config.general.save_sessions {
             log::info!("save_sessions disabled: skipping state save on shutdown");
             let _ = std::fs::remove_file(socket_path);
+            let _ = std::fs::remove_file(pid_path());
             log::info!("shutdown complete");
             return;
         }
@@ -344,8 +365,9 @@ impl RemuxServer {
         drop(state);
         drop(panes);
 
-        // Remove socket file.
+        // Remove socket and pid files.
         let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(pid_path());
         log::info!("shutdown complete");
     }
 

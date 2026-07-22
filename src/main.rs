@@ -26,7 +26,7 @@ use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::{Config, RemoteConfig};
 use crate::protocol::{ClientMessage, RemuxCommand, ServerMessage};
-use crate::server::daemon::{socket_path, RemuxServer};
+use crate::server::daemon::{self, socket_path, RemuxServer};
 
 /// Data captured while computing search matches, used to transition from
 /// Search into Visual mode positioned at the current match.
@@ -72,6 +72,12 @@ enum Commands {
         /// Session name to kill
         name: String,
     },
+
+    /// Stop the running server, saving session state first
+    Stop,
+
+    /// Restart the server (stop, then start), preserving saved sessions
+    Restart,
 
     /// Attach to a session on a remote machine over SSH
     AttachRemote {
@@ -338,6 +344,16 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Stop) => {
+            log::debug!("cmd: stop server");
+            stop_server().await?;
+        }
+        Some(Commands::Restart) => {
+            log::debug!("cmd: restart server");
+            let _ = stop_server().await?;
+            ensure_server_running().await?;
+            println!("Server restarted.");
+        }
     }
 
     Ok(())
@@ -395,6 +411,70 @@ async fn ensure_server_running() -> Result<()> {
 
     log::debug!("ensure_server_running: timed out waiting for socket");
     anyhow::bail!("timed out waiting for server to start")
+}
+
+/// Gracefully stop the running server via SIGTERM.
+///
+/// Returns `Ok(true)` if a running server was stopped, `Ok(false)` if none was
+/// running (or only stale files existed). The SIGTERM triggers the server's
+/// existing graceful path, which saves session state before removing the socket
+/// and pid files.
+async fn stop_server() -> Result<bool> {
+    let sock = socket_path();
+    let pid_file = daemon::pid_path();
+
+    if !sock.exists() && !pid_file.exists() {
+        println!("No server running.");
+        return Ok(false);
+    }
+
+    // Read and parse the PID. Without a valid pid file we can't signal a live
+    // server, and we must not force-remove a live socket out from under it.
+    let pid = match std::fs::read_to_string(&pid_file) {
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            Ok(pid) => pid,
+            Err(_) => {
+                println!(
+                    "Server socket exists but pid file is unreadable; cannot signal the server."
+                );
+                return Ok(false);
+            }
+        },
+        Err(_) => {
+            println!("Server socket exists but pid file is missing; cannot signal the server.");
+            return Ok(false);
+        }
+    };
+
+    // Send SIGTERM to trigger the graceful save-and-exit path.
+    match nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    ) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {
+            // No such process: the pid file is stale. Clean up leftover files.
+            let _ = std::fs::remove_file(&sock);
+            let _ = std::fs::remove_file(&pid_file);
+            println!("No server running (removed stale files).");
+            return Ok(false);
+        }
+        Err(e) => {
+            return Err(e).context("sending SIGTERM to server");
+        }
+    }
+
+    // Poll for the socket to disappear (the server removes it on shutdown).
+    for _ in 0..50 {
+        if !sock.exists() {
+            println!("Server stopped.");
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    println!("Warning: server did not exit within 5s.");
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
