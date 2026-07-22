@@ -69,6 +69,10 @@ pub enum Incoming {
 struct RemoteEntry {
     config: RemoteConfig,
     state: RemoteState,
+    /// The `remux_version` this remote's server reported during the handshake,
+    /// set when the entry becomes `Connected`. Compared against this binary's
+    /// [`crate::protocol::build_version`] to detect version skew.
+    server_version: Option<String>,
     /// Keeps the ssh child alive; dropping it triggers `kill_on_drop`.
     _child: Option<Child>,
     /// Whether this entry originates from the `[remotes]` config map (vs. an
@@ -96,6 +100,10 @@ pub struct ConnectionManager {
     tx: mpsc::UnboundedSender<Incoming>,
     /// The paired receiver drained by [`ConnectionManager::recv`].
     rx: mpsc::UnboundedReceiver<Incoming>,
+    /// The `remux_version` the local server reported during the handshake. The
+    /// local `ConnId::Local` connection has no [`RemoteEntry`], so its reported
+    /// version is tracked here for version-skew detection.
+    local_server_version: Option<String>,
 }
 
 impl ConnectionManager {
@@ -103,6 +111,8 @@ impl ConnectionManager {
     /// (all `NotConnected`) from config.
     pub fn new(local: RemuxClient, remotes: &HashMap<String, RemoteConfig>) -> Self {
         let mut mgr = Self::empty(remotes, ConnId::Local);
+        // Capture the reported version before `into_split` consumes the client.
+        mgr.local_server_version = Some(local.server_version().to_string());
         let (reader, writer, _child) = local.into_split();
         mgr.writers.insert(ConnId::Local, writer);
         mgr.spawn_reader(ConnId::Local, reader);
@@ -114,12 +124,15 @@ impl ConnectionManager {
     pub fn new_foreground_remote(name: &str, client: RemuxClient) -> Self {
         let id = ConnId::Remote(name.to_string());
         let mut mgr = Self::empty(&HashMap::new(), id.clone());
+        // Capture the reported version before `into_split` consumes the client.
+        let server_version = Some(client.server_version().to_string());
         // Record the remote as already Connected so the roster reflects it.
         mgr.remotes.insert(
             name.to_string(),
             RemoteEntry {
                 config: RemoteConfig::default(),
                 state: RemoteState::Connected,
+                server_version,
                 _child: None,
                 from_config: false,
             },
@@ -145,6 +158,7 @@ impl ConnectionManager {
                     RemoteEntry {
                         config: config.clone(),
                         state: RemoteState::NotConnected,
+                        server_version: None,
                         _child: None,
                         from_config: true,
                     },
@@ -157,6 +171,7 @@ impl ConnectionManager {
             foreground,
             tx,
             rx,
+            local_server_version: None,
         }
     }
 
@@ -198,6 +213,7 @@ impl ConnectionManager {
         self.remotes.entry(name).or_insert_with(|| RemoteEntry {
             config,
             state: RemoteState::NotConnected,
+            server_version: None,
             _child: None,
             from_config: false,
         });
@@ -237,6 +253,7 @@ impl ConnectionManager {
                         RemoteEntry {
                             config: config.clone(),
                             state: RemoteState::NotConnected,
+                            server_version: None,
                             _child: None,
                             from_config: true,
                         },
@@ -296,11 +313,14 @@ impl ConnectionManager {
         match result {
             Ok(Ok(client)) => {
                 let id = ConnId::Remote(name.to_string());
+                // Capture the reported version before `into_split` consumes it.
+                let server_version = client.server_version().to_string();
                 let (reader, writer, child) = client.into_split();
                 self.writers.insert(id.clone(), writer);
                 if let Some(entry) = self.remotes.get_mut(name) {
                     entry._child = child;
                     entry.state = RemoteState::Connected;
+                    entry.server_version = Some(server_version);
                 }
                 self.spawn_reader(id, reader);
                 log::info!("registry: remote '{name}' connected");
@@ -421,19 +441,46 @@ impl ConnectionManager {
         ids
     }
 
+    /// Version skew for a connected server: `Some(server_version)` when the
+    /// connected server reported a `remux_version` that differs from this
+    /// binary's own [`crate::protocol::build_version`], else `None`.
+    ///
+    /// Only `Connected` servers are considered — a `NotConnected`/`Failed`
+    /// remote (or one whose version was never captured) reports `None`. The
+    /// local server is always treated as connected. Comparison is on the full
+    /// string, so a differing git hash counts as a mismatch.
+    pub fn version_mismatch(&self, id: &ConnId) -> Option<String> {
+        let ours = crate::protocol::build_version();
+        let reported = match id {
+            ConnId::Local => self.local_server_version.as_ref(),
+            ConnId::Remote(name) => match self.remotes.get(name) {
+                Some(entry) if entry.state == RemoteState::Connected => {
+                    entry.server_version.as_ref()
+                }
+                _ => None,
+            },
+        };
+        reported.filter(|v| **v != ours).cloned()
+    }
+
     /// Ordered roster of servers for the session-manager tree: Local first
-    /// (labelled `"local"`), then remotes sorted by name with their state.
-    pub fn server_roster(&self) -> Vec<(ConnId, String, RemoteState)> {
-        let mut roster = vec![(ConnId::Local, "local".to_string(), RemoteState::Connected)];
+    /// (labelled `"local"`), then remotes sorted by name with their state and
+    /// any version-skew (`Some(server_version)` when the server is outdated
+    /// relative to this binary, else `None`).
+    pub fn server_roster(&self) -> Vec<(ConnId, String, RemoteState, Option<String>)> {
+        let mut roster = vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            self.version_mismatch(&ConnId::Local),
+        )];
         let mut names: Vec<&String> = self.remotes.keys().collect();
         names.sort();
         for name in names {
             let entry = &self.remotes[name];
-            roster.push((
-                ConnId::Remote(name.clone()),
-                name.clone(),
-                entry.state.clone(),
-            ));
+            let id = ConnId::Remote(name.clone());
+            let mismatch = self.version_mismatch(&id);
+            roster.push((id, name.clone(), entry.state.clone(), mismatch));
         }
         roster
     }
@@ -663,6 +710,65 @@ mod tests {
         mgr.update_remotes(&new_map);
 
         assert!(mgr.has_remote("adhoc"));
+    }
+
+    #[test]
+    fn version_mismatch_reports_only_for_differing_connected_servers() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        let ours = crate::protocol::build_version();
+
+        // Local: no version captured yet -> no mismatch.
+        assert_eq!(mgr.version_mismatch(&ConnId::Local), None);
+
+        // Local reporting an identical version -> no mismatch.
+        mgr.local_server_version = Some(ours.clone());
+        assert_eq!(mgr.version_mismatch(&ConnId::Local), None);
+
+        // Local reporting a different version -> mismatch surfaced.
+        mgr.local_server_version = Some("0.1.0+deadbeef".to_string());
+        assert_eq!(
+            mgr.version_mismatch(&ConnId::Local),
+            Some("0.1.0+deadbeef".to_string())
+        );
+
+        // Remote connected with a differing version -> mismatch.
+        let alpha = ConnId::Remote("alpha".to_string());
+        mgr.set_state("alpha", RemoteState::Connected);
+        mgr.remotes.get_mut("alpha").unwrap().server_version = Some("0.1.0+stale".to_string());
+        assert_eq!(
+            mgr.version_mismatch(&alpha),
+            Some("0.1.0+stale".to_string())
+        );
+
+        // Remote connected with the same version -> no mismatch.
+        mgr.remotes.get_mut("alpha").unwrap().server_version = Some(ours.clone());
+        assert_eq!(mgr.version_mismatch(&alpha), None);
+
+        // A differing version but NotConnected -> no mismatch.
+        mgr.set_state("alpha", RemoteState::NotConnected);
+        mgr.remotes.get_mut("alpha").unwrap().server_version = Some("0.1.0+stale".to_string());
+        assert_eq!(mgr.version_mismatch(&alpha), None);
+
+        // A differing version but Failed -> no mismatch.
+        mgr.fail_remote("alpha", "boom".to_string());
+        mgr.remotes.get_mut("alpha").unwrap().server_version = Some("0.1.0+stale".to_string());
+        assert_eq!(mgr.version_mismatch(&alpha), None);
+
+        // Unknown remote -> no mismatch.
+        assert_eq!(mgr.version_mismatch(&ConnId::Remote("ghost".into())), None);
+    }
+
+    #[test]
+    fn server_roster_carries_version_mismatch() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.local_server_version = Some("0.1.0+stale".to_string());
+        let roster = mgr.server_roster();
+        // Local is first and now carries the mismatch as the 4th tuple element.
+        assert_eq!(roster[0].0, ConnId::Local);
+        assert_eq!(roster[0].3, Some("0.1.0+stale".to_string()));
+        // Idle remotes never report a mismatch.
+        assert_eq!(roster[1].3, None);
+        assert_eq!(roster[2].3, None);
     }
 
     #[test]

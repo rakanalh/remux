@@ -4043,8 +4043,18 @@ mod tests {
 
         let mut sm = SessionManagerState::new(None);
         sm.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
-            (remote("mini"), "mini".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
+            (
+                remote("mini"),
+                "mini".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
         ]);
         // Select the connected remote server node.
         let idx = sm
@@ -4091,8 +4101,13 @@ mod tests {
 
         let mut sm = SessionManagerState::new(None);
         sm.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
-            (remote("pi"), "pi".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
+            (remote("pi"), "pi".to_string(), RemoteState::Connected, None),
         ]);
         let folders = vec![FolderTreeEntry {
             name: "work".to_string(),
@@ -4167,6 +4182,7 @@ mod tests {
             ConnId::Local,
             "local".to_string(),
             RemoteState::Connected,
+            None,
         )]);
         handler.session_manager = Some(sm);
 

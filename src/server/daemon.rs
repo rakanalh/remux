@@ -376,7 +376,7 @@ impl RemuxServer {
             }
             let welcome = Welcome {
                 protocol_version: PROTOCOL_VERSION,
-                remux_version: env!("CARGO_PKG_VERSION").to_string(),
+                remux_version: crate::protocol::build_version(),
             };
             write_message(&mut write_half, &welcome).await?;
             anyhow::Ok(())

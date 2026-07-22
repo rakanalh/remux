@@ -14,6 +14,13 @@ pub type PaneId = u64;
 /// framed message shapes exchanged between client and server.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
+/// version skew between rebuilt binaries is detectable. Falls back to
+/// "<version>+unknown" when git metadata is unavailable (e.g. crates.io build).
+pub fn build_version() -> String {
+    format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("REMUX_GIT_HASH"))
+}
+
 /// First frame sent by a connecting client, announcing its protocol/build.
 ///
 /// FROZEN WIRE SHAPE — never rename/remove/retype existing fields; only add
@@ -892,6 +899,18 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_version_has_git_suffix() {
+        let v = build_version();
+        // The version carries a "+<build-id>" suffix so rebuilds are distinguishable.
+        assert!(v.contains('+'), "build_version must contain '+': {v}");
+        let suffix = v.split_once('+').map(|(_, s)| s).unwrap_or("");
+        assert!(
+            !suffix.is_empty(),
+            "build id after '+' must be non-empty: {v}"
+        );
     }
 
     #[test]

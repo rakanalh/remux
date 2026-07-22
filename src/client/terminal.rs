@@ -62,6 +62,10 @@ pub struct RemuxClient {
     /// Keeps the ssh child process alive for remote connections. `None` for
     /// local (Unix socket) connections.
     _child: Option<Child>,
+    /// The `remux_version` the server reported in its `Welcome` during the
+    /// handshake. Used to detect version skew against this binary's own
+    /// [`crate::protocol::build_version`].
+    server_version: String,
 }
 
 impl RemuxClient {
@@ -83,13 +87,14 @@ impl RemuxClient {
         let (reader, writer) = stream.into_split();
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(writer);
-        handshake(&mut reader, &mut writer)
+        let server_version = handshake(&mut reader, &mut writer)
             .await
             .context("handshake with local server")?;
         Ok(Self {
             reader,
             writer,
             _child: None,
+            server_version,
         })
     }
 
@@ -143,7 +148,7 @@ impl RemuxClient {
 
         let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(stdout);
         let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(stdin);
-        handshake(&mut reader, &mut writer)
+        let server_version = handshake(&mut reader, &mut writer)
             .await
             .with_context(|| format!("handshake with remote server via {dest}"))?;
 
@@ -152,6 +157,7 @@ impl RemuxClient {
             reader,
             writer,
             _child: Some(child),
+            server_version,
         })
     }
 
@@ -159,6 +165,12 @@ impl RemuxClient {
     pub async fn send(&mut self, msg: ClientMessage) -> Result<()> {
         log::debug!("terminal: send {}", client_message_summary(&msg));
         write_message(&mut self.writer, &msg).await
+    }
+
+    /// The `remux_version` the server reported during the handshake. Compared
+    /// against [`crate::protocol::build_version`] to surface version skew.
+    pub fn server_version(&self) -> &str {
+        &self.server_version
     }
 
     /// Receive a message from the server.
@@ -187,15 +199,17 @@ impl RemuxClient {
 /// the peer speaks an incompatible protocol version.
 ///
 /// This is the first exchange on every connection, sent via the normal framed
-/// message helpers, before any `ClientMessage`/`ServerMessage` traffic.
-async fn handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+/// message helpers, before any `ClientMessage`/`ServerMessage` traffic. On
+/// success returns the server's reported `remux_version` so callers can detect
+/// build skew against this binary's own [`crate::protocol::build_version`].
+async fn handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<String>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
-        remux_version: env!("CARGO_PKG_VERSION").to_string(),
+        remux_version: crate::protocol::build_version(),
     };
     write_message(writer, &hello)
         .await
@@ -219,7 +233,7 @@ where
             welcome.remux_version
         );
     }
-    Ok(())
+    Ok(welcome.remux_version)
 }
 
 /// Produce a concise summary of a `ClientMessage` for debug logging.

@@ -262,7 +262,10 @@ pub struct SessionManagerState {
     /// the attached session of the foreground server.
     foreground: ConnId,
     /// Ordered roster of servers: `(id, label, state)`.
-    roster: Vec<(ConnId, String, RemoteState)>,
+    /// Ordered server roster: `(id, label, state, version_mismatch)`. The last
+    /// element is `Some(server_version)` when the server is outdated relative to
+    /// this client (drives the "outdated" suffix), else `None`.
+    roster: Vec<(ConnId, String, RemoteState, Option<String>)>,
     /// Per-server raw tree data: `(folders, unfiled)`.
     trees: HashMap<ConnId, (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>)>,
     /// Names of the Local server's dormant (saved-but-not-live) sessions,
@@ -422,7 +425,12 @@ impl SessionManagerState {
             sub_mode_server: ConnId::Local,
             current_session,
             foreground: ConnId::Local,
-            roster: vec![(ConnId::Local, "local".to_string(), RemoteState::Connected)],
+            roster: vec![(
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            )],
             trees: HashMap::new(),
             dormant: Vec::new(),
             bindings: SessionManagerBindings::default(),
@@ -444,9 +452,9 @@ impl SessionManagerState {
     }
 
     /// Replace the server roster (order + labels + states) and rebuild rows.
-    pub fn set_roster(&mut self, roster: Vec<(ConnId, String, RemoteState)>) {
+    pub fn set_roster(&mut self, roster: Vec<(ConnId, String, RemoteState, Option<String>)>) {
         // Ensure Local is always expanded by default the first time we see it.
-        for (id, _, _) in &roster {
+        for (id, _, _, _) in &roster {
             if matches!(id, ConnId::Local) {
                 self.expanded.insert(server_key(id));
             }
@@ -523,16 +531,22 @@ impl SessionManagerState {
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
 
-        for (id, label, state) in &self.roster {
+        for (id, label, state, mismatch) in &self.roster {
             let skey = server_key(id);
             let server_expanded = self.expanded.contains(&skey);
             let connected = matches!(state, RemoteState::Connected);
-            let suffix = match state {
+            let mut suffix = match state {
                 RemoteState::Connected => String::new(),
                 RemoteState::NotConnected => " (offline)".to_string(),
                 RemoteState::Connecting => " (connecting…)".to_string(),
                 RemoteState::Failed(msg) => format!(" (failed: {msg})"),
             };
+            // A connected-but-outdated server (e.g. the local daemon still
+            // running an older binary after a rebuild) is flagged so the user
+            // knows to restart it rather than silently hitting version skew.
+            if mismatch.is_some() {
+                suffix.push_str(" (outdated: restart remux server)");
+            }
             rows.push(TreeRow {
                 indent: 0,
                 node_type: NodeType::Server {
@@ -989,7 +1003,7 @@ impl SessionManagerState {
     fn is_connected(&self, server: &ConnId) -> bool {
         self.roster
             .iter()
-            .any(|(id, _, state)| id == server && matches!(state, RemoteState::Connected))
+            .any(|(id, _, state, _)| id == server && matches!(state, RemoteState::Connected))
     }
 
     /// The server a structural edit (create folder/session) should target:
@@ -1805,11 +1819,17 @@ mod tests {
     fn test_remote_server_node_lazy_connect() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::NotConnected,
+                None,
             ),
         ]);
 
@@ -1830,11 +1850,17 @@ mod tests {
     fn test_structural_edit_guarded_on_disconnected_remote() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::NotConnected,
+                None,
             ),
         ]);
 
@@ -1857,11 +1883,17 @@ mod tests {
     fn test_create_session_key_on_connected_remote_targets_remote() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::Connected,
+                None,
             ),
         ]);
         let (folders, unfiled) = sample_tree();
@@ -1901,11 +1933,17 @@ mod tests {
     fn test_delete_on_connected_remote_session_targets_remote() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::Connected,
+                None,
             ),
         ]);
         let (folders, unfiled) = sample_tree();
@@ -1943,11 +1981,17 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         state.set_foreground(ConnId::Local);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::Connected,
+                None,
             ),
         ]);
         // Remote reports an is_current session, but it is not the foreground.
@@ -2023,11 +2067,17 @@ mod tests {
     fn test_handle_expand_remote_server_triggers_lazy_connect() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::NotConnected,
+                None,
             ),
         ]);
 
@@ -2138,11 +2188,17 @@ mod tests {
     fn test_dormant_only_for_local_server() {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::Connected,
+                None,
             ),
         ]);
         // A remote server reporting dormant names must not create a Saved group.
@@ -2176,11 +2232,17 @@ mod tests {
     fn remote_state_with_tree() -> SessionManagerState {
         let mut state = SessionManagerState::new(None);
         state.set_roster(vec![
-            (ConnId::Local, "local".to_string(), RemoteState::Connected),
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
             (
                 ConnId::Remote("pi".to_string()),
                 "pi".to_string(),
                 RemoteState::Connected,
+                None,
             ),
         ]);
         let (folders, unfiled) = sample_tree();
