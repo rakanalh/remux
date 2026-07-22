@@ -831,6 +831,27 @@ async fn run_client_loop(
                                 renderer.render_whichkey_overlay(&commands)?;
                                 renderer.flush()?;
                             }
+                            InputAction::ExecuteAndShowWhichKey {
+                                command,
+                                label,
+                                entries,
+                                shortcuts,
+                            } => {
+                                log::debug!("input: ExecuteAndShowWhichKey cmd={:?}", command);
+                                // Send the command (a sticky-group leaf, e.g. a
+                                // resize) to the foreground server. These are
+                                // never SessionDetach/SendKey and the mode stays
+                                // Command, so no ModeChanged is needed.
+                                mgr.send_foreground(ClientMessage::Command(command)).await?;
+                                // Keep the which-key popup open so the user can
+                                // keep resizing.
+                                let (c, r) = crossterm::terminal::size()?;
+                                whichkey.show(label, entries, shortcuts);
+                                renderer.clear_overlay(c, r)?;
+                                let commands = whichkey.render(c, r, &theme, which_key_position.clone());
+                                renderer.render_whichkey_overlay(&commands)?;
+                                renderer.flush()?;
+                            }
                             InputAction::HideWhichKey => {
                                 whichkey.hide();
                                 renderer.clear_overlay(cols, rows)?;

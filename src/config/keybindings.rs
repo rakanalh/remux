@@ -16,6 +16,11 @@ pub enum KeyNode {
     Group {
         label: String,
         children: HashMap<char, KeyNode>,
+        /// When true, executing a leaf inside this group keeps the which-key
+        /// menu open (the state drops back to this group) so the user can keep
+        /// triggering the group's actions (e.g. the Resize submenu). Only ESC
+        /// or an unmatched key exits.
+        sticky: bool,
     },
     /// A terminal binding that maps to an action chain.
     Leaf {
@@ -59,11 +64,22 @@ pub fn leaf_chain(label: &str, actions: &[&str]) -> KeyNode {
     }
 }
 
-/// Helper to build a group node.
+/// Helper to build a group node (non-sticky).
 fn group(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
     KeyNode::Group {
         label: label.to_string(),
         children: children.into_iter().collect(),
+        sticky: false,
+    }
+}
+
+/// Helper to build a sticky group node. Executing a leaf in a sticky group
+/// keeps the which-key menu open so the user can keep triggering actions.
+fn group_sticky(label: &str, children: Vec<(char, KeyNode)>) -> KeyNode {
+    KeyNode::Group {
+        label: label.to_string(),
+        children: children.into_iter().collect(),
+        sticky: true,
     }
 }
 
@@ -129,7 +145,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ),
                 (
                     'R',
-                    group(
+                    group_sticky(
                         "Resize",
                         vec![
                             ('h', leaf("left", "ResizeLeft 5")),
@@ -307,14 +323,21 @@ fn merge_maps(base: &mut HashMap<char, KeyNode>, overrides: &HashMap<char, KeyNo
             Some(KeyNode::Group {
                 label: base_label,
                 children: base_children,
+                sticky: base_sticky,
             }) => {
                 if let KeyNode::Group {
                     label,
                     children: override_children,
+                    sticky: override_sticky,
                 } = override_node
                 {
                     // Both are groups: update label and merge children.
                     *base_label = label.clone();
+                    // Preserve stickiness: an override that re-declares a group
+                    // should not silently unstick it (a user config that
+                    // re-opens the group leaves `sticky` at its false default),
+                    // so the group stays sticky if either side declares it.
+                    *base_sticky = *base_sticky || *override_sticky;
                     merge_maps(base_children, override_children);
                 } else {
                     // Override is a leaf replacing a group.
@@ -754,6 +777,10 @@ fn parse_toml_table(table: &toml::map::Map<String, toml::Value>) -> HashMap<char
                 KeyNode::Group {
                     label: sub_label,
                     children,
+                    // User-defined groups are non-sticky. Stickiness is a
+                    // built-in property (e.g. Resize); the `sticky` merge rule
+                    // preserves it when a user re-declares such a group.
+                    sticky: false,
                 }
             }
             _ => continue,
@@ -1798,6 +1825,7 @@ mod tests {
                             action: vec![String::new()],
                         },
                     )]),
+                    sticky: false,
                 },
             )]),
         };
@@ -1860,6 +1888,7 @@ mod tests {
                             action: vec!["TabNew".into()],
                         },
                     )]),
+                    sticky: false,
                 },
             )]),
         };

@@ -351,6 +351,15 @@ pub enum InputAction {
         entries: Vec<(char, String)>,
         shortcuts: Vec<(String, String)>,
     },
+    /// Execute a command AND keep/show the which-key popup for a (sticky)
+    /// group, so the user can keep triggering the group's actions (e.g. the
+    /// Resize submenu).
+    ExecuteAndShowWhichKey {
+        command: RemuxCommand,
+        label: String,
+        entries: Vec<(char, String)>,
+        shortcuts: Vec<(String, String)>,
+    },
     /// Hide the which-key popup.
     HideWhichKey,
     /// Yank (copy) the selected text to the clipboard.
@@ -1194,8 +1203,41 @@ impl InputHandler {
         match self.keybinding_tree.lookup(path) {
             Some(KeyNode::Leaf { action, .. }) => {
                 let actions = action.clone();
-                self.keybinding_state.reset();
-                self.execute_action_chain(&actions)
+                // If the parent group is sticky, stay in the menu after
+                // executing: drop the state back to the parent group path so
+                // the next key resolves against the same submenu again.
+                let parent: Vec<char> = path[..path.len().saturating_sub(1)].to_vec();
+                let parent_sticky = matches!(
+                    self.keybinding_tree.lookup(&parent),
+                    Some(KeyNode::Group { sticky: true, .. })
+                );
+                if parent_sticky {
+                    self.keybinding_state.set_path(&parent);
+                    let inner = self.execute_action_chain(&actions);
+                    // Only a single plain command (the normal resize case) keeps
+                    // the menu open. Any other outcome (chain, overlay-opening
+                    // action, mode change) is returned as-is.
+                    if let InputAction::Execute(command) = inner {
+                        let label = match self.keybinding_tree.lookup(&parent) {
+                            Some(KeyNode::Group { label, .. }) => label.clone(),
+                            _ => String::new(),
+                        };
+                        let entries = self
+                            .keybinding_tree
+                            .children_at(&parent)
+                            .unwrap_or_default();
+                        return InputAction::ExecuteAndShowWhichKey {
+                            command,
+                            label,
+                            entries,
+                            shortcuts: Vec::new(),
+                        };
+                    }
+                    inner
+                } else {
+                    self.keybinding_state.reset();
+                    self.execute_action_chain(&actions)
+                }
             }
             Some(KeyNode::Group { label, .. }) => {
                 // We have entered a group -- show which-key popup.
@@ -3514,6 +3556,85 @@ mod tests {
         let action = handler.handle_key(n);
         assert_eq!(action, InputAction::Execute(RemuxCommand::PaneNew));
         assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    // -- Sticky group (Resize submenu) --------------------------------------
+
+    #[test]
+    fn resize_group_is_sticky_keeps_menu_open() {
+        let mut handler = InputHandler::with_defaults();
+        // Enter command mode and navigate Prefix > p > R (Resize).
+        handler.handle_key(ctrl_key('a'));
+        handler.handle_key(char_key('p'));
+        let enter_resize = handler.handle_key(char_key('R'));
+        match enter_resize {
+            InputAction::ShowWhichKey { label, .. } => assert_eq!(label, "Resize"),
+            other => panic!("expected ShowWhichKey for Resize, got {other:?}"),
+        }
+        assert_eq!(handler.mode, Mode::Command);
+
+        // First 'l' resizes right AND keeps the Resize menu open.
+        let first = handler.handle_key(char_key('l'));
+        match first {
+            InputAction::ExecuteAndShowWhichKey {
+                command,
+                label,
+                entries,
+                ..
+            } => {
+                assert_eq!(command, RemuxCommand::ResizeRight(5));
+                assert_eq!(label, "Resize");
+                let keys: Vec<char> = entries.iter().map(|(k, _)| *k).collect();
+                assert!(keys.contains(&'h'));
+                assert!(keys.contains(&'l'));
+            }
+            other => panic!("expected ExecuteAndShowWhichKey, got {other:?}"),
+        }
+        // The state dropped back to the parent group path ['p','R'] and we're
+        // still in Command mode.
+        assert_eq!(handler.keybinding_state.path(), ['p', 'R']);
+        assert_eq!(handler.mode, Mode::Command);
+
+        // A second 'l' resolves to the resize leaf again (still sticky).
+        let second = handler.handle_key(char_key('l'));
+        match second {
+            InputAction::ExecuteAndShowWhichKey { command, .. } => {
+                assert_eq!(command, RemuxCommand::ResizeRight(5));
+            }
+            other => panic!("expected ExecuteAndShowWhichKey on second resize, got {other:?}"),
+        }
+        assert_eq!(handler.keybinding_state.path(), ['p', 'R']);
+        assert_eq!(handler.mode, Mode::Command);
+    }
+
+    #[test]
+    fn non_sticky_group_leaf_executes_and_resets() {
+        // Tab > new is a non-sticky group leaf: it must still return a plain
+        // command and reset the tree state to root.
+        let mut handler = InputHandler::with_defaults();
+        handler.handle_key(ctrl_key('a'));
+        handler.handle_key(char_key('t'));
+        let action = handler.handle_key(char_key('n'));
+        assert_eq!(action, InputAction::Execute(RemuxCommand::TabNew));
+        assert_eq!(handler.mode, Mode::Normal);
+        assert!(handler.keybinding_state.is_at_root());
+    }
+
+    #[test]
+    fn escape_from_sticky_resize_group_returns_to_normal() {
+        let mut handler = InputHandler::with_defaults();
+        handler.handle_key(ctrl_key('a'));
+        handler.handle_key(char_key('p'));
+        handler.handle_key(char_key('R'));
+        // Perform one resize; the menu stays open at ['p','R'].
+        handler.handle_key(char_key('l'));
+        assert_eq!(handler.keybinding_state.path(), ['p', 'R']);
+
+        // ESC exits the sticky menu back to Normal and resets the state.
+        let action = handler.handle_key(esc_key());
+        assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
+        assert_eq!(handler.mode, Mode::Normal);
+        assert!(handler.keybinding_state.is_at_root());
     }
 
     // -- reload_keybindings (config hot-reload) -----------------------------
