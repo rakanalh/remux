@@ -1836,6 +1836,70 @@ mod tests {
         assert!(base.lookup(&['t', 'x']).is_some());
     }
 
+    #[test]
+    fn merge_unbinds_key_from_toml_override() {
+        // The default Pane group binds `p s` (split horizontal) and `p v`
+        // (split vertical) to leaves.
+        let mut base = KeybindingTree::default();
+        assert!(matches!(
+            base.lookup(&['p', 's']),
+            Some(KeyNode::Leaf { .. })
+        ));
+        assert!(matches!(
+            base.lookup(&['p', 'v']),
+            Some(KeyNode::Leaf { .. })
+        ));
+
+        // A user override that maps `p s` to an empty string unbinds it. The
+        // TOML here is the `[keybindings.command]` sub-table that `from_toml`
+        // parses: top-level keys are root chars, so `p` is the Pane group and
+        // `s = ""` is an empty-action leaf inside it.
+        let toml_str = r#"
+            [p]
+            s = ""
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let overrides = KeybindingTree::from_toml(&value).unwrap();
+        base.merge(&overrides);
+
+        // `p s` is gone; the sibling `p v` (and other Pane children) survive.
+        assert!(
+            base.lookup(&['p', 's']).is_none(),
+            "'p s' should have been unbound by the empty-string override"
+        );
+        assert!(
+            base.lookup(&['p', 'v']).is_some(),
+            "sibling 'p v' must remain bound after unbinding 'p s'"
+        );
+        assert!(base.lookup(&['p', 'n']).is_some());
+    }
+
+    #[test]
+    fn merge_nonempty_toml_override_replaces_not_removes() {
+        // A non-empty override replaces the leaf rather than removing it.
+        let mut base = KeybindingTree::default();
+        assert!(base.lookup(&['p', 's']).is_some());
+
+        let toml_str = r#"
+            [p]
+            s = "PaneNew; EnterNormal"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let overrides = KeybindingTree::from_toml(&value).unwrap();
+        base.merge(&overrides);
+
+        // Still resolves, now to the replacement action chain.
+        match base.lookup(&['p', 's']) {
+            Some(KeyNode::Leaf { action, .. }) => {
+                assert_eq!(
+                    action,
+                    &vec!["PaneNew".to_string(), "EnterNormal".to_string()]
+                );
+            }
+            other => panic!("expected replaced leaf for 'p s', got {other:?}"),
+        }
+    }
+
     // -- Merge tests ----------------------------------------------------------
 
     #[test]

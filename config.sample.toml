@@ -241,6 +241,10 @@
 # "]" = "PaneStackNext; EnterNormal"
 # "[" = "PaneStackPrev; EnterNormal"
 
+# Unbind a default key by mapping it to an empty string:
+# [keybindings.command.p]
+# s = ""     # removes the default Prefix+p s binding (split horizontal)
+
 # --- Resize (p -> R) ---
 # [keybindings.command.p.R]
 # _label = "Resize"
