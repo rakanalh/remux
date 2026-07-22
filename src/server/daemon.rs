@@ -940,18 +940,42 @@ async fn handle_command(
 
     match cmd {
         RemuxCommand::TabNew => {
-            let pane_id = {
+            // Capture the source pane (active tab's focused pane) BEFORE
+            // create_tab, which flips active_tab to the new empty tab. The new
+            // tab inherits the source pane's cwd.
+            let (pane_id, source_pane_id) = {
                 let mut st = state.lock().await;
+                let source_pane_id = st
+                    .sessions
+                    .get(&session_name)
+                    .and_then(|s| s.tabs.get(s.active_tab))
+                    .map(|t| t.focused_pane);
                 let tab_count = st
                     .sessions
                     .get(&session_name)
                     .map(|s| s.tabs.len())
                     .unwrap_or(0);
                 let tab_name = format!("Tab {}", tab_count + 1);
-                st.create_tab(&session_name, &tab_name, LayoutMode::default())?
+                let pane_id = st.create_tab(&session_name, &tab_name, LayoutMode::default())?;
+                (pane_id, source_pane_id)
+            };
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                source_pane_id
+                    .and_then(|id| panes_lock.get(&id))
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
             };
             log::debug!("server: TabNew session={session_name:?} new pane_id={pane_id}");
-            spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
+            spawn_pane(
+                pane_id,
+                cols,
+                rows,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
             start_pty_forwarding(
                 &session_name,
                 state,
@@ -1886,8 +1910,15 @@ async fn handle_command(
             // session's own render dimensions (the requester may be attached
             // elsewhere or nowhere).
             let (tcols, trows) = session_render_size(&session, clients).await;
-            let pane_id = {
+            // Capture the target session's source pane (its active tab's focused
+            // pane) BEFORE create_tab flips active_tab to the new empty tab.
+            let (pane_id, source_pane_id) = {
                 let mut st = state.lock().await;
+                let source_pane_id = st
+                    .sessions
+                    .get(&session)
+                    .and_then(|s| s.tabs.get(s.active_tab))
+                    .map(|t| t.focused_pane);
                 let tab_count = match st.sessions.get(&session) {
                     Some(s) => s.tabs.len(),
                     None => {
@@ -1897,15 +1928,30 @@ async fn handle_command(
                 };
                 let tab_name = format!("Tab {}", tab_count + 1);
                 match st.create_tab(&session, &tab_name, LayoutMode::default()) {
-                    Ok(pid) => pid,
+                    Ok(pid) => (pid, source_pane_id),
                     Err(e) => {
                         log::info!("TabNewInSession: {e}");
                         return Ok(());
                     }
                 }
             };
+            let focused_cwd = {
+                let panes_lock = panes.lock().await;
+                source_pane_id
+                    .and_then(|id| panes_lock.get(&id))
+                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+            };
             log::debug!("server: TabNewInSession session={session:?} new pane_id={pane_id}");
-            spawn_pane(pane_id, tcols, trows, None, None, panes, config).await?;
+            spawn_pane(
+                pane_id,
+                tcols,
+                trows,
+                None,
+                focused_cwd.as_deref().map(std::path::Path::new),
+                panes,
+                config,
+            )
+            .await?;
             // create_tab makes the new tab active, so forwarding starts for its
             // pane here. (For a mutation on a non-active tab, forwarding would
             // instead begin on the next SessionSwitchTab; the guard makes the

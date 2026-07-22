@@ -29,3 +29,8 @@ env_logger = "0.11"
 tempfile = "3"
 base64 = "0.22"
 notify = "7"
+
+# macOS has no /proc, so we read a foreign process's cwd via sysinfo. Scoped to
+# macOS targets only so Linux builds don't pull it in.
+[target.'cfg(target_os = "macos")'.dependencies]
+sysinfo = { version = "0.35", default-features = false, features = ["system"] }

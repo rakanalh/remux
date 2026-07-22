@@ -40,15 +40,45 @@ impl PersistedState {
     }
 }
 
-/// Read the current working directory of a process by reading the
-/// `/proc/{pid}/cwd` symlink.
+/// Read the current working directory of a process.
 ///
-/// Returns `None` if the symlink cannot be read (e.g., the process has
+/// On Linux this reads the `/proc/{pid}/cwd` symlink (zero dependencies, the
+/// hot path). On macOS it queries the process table via the `sysinfo` crate,
+/// which is the only portable way to read a foreign process's cwd there.
+///
+/// Returns `None` if the cwd cannot be determined (e.g., the process has
 /// exited or permission is denied).
+#[cfg(target_os = "linux")]
 pub fn get_pane_cwd(pid: nix::unistd::Pid) -> Option<String> {
     std::fs::read_link(format!("/proc/{}/cwd", pid))
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+/// See the Linux variant for documentation. macOS reads the cwd through
+/// `sysinfo` because there is no `/proc` filesystem.
+#[cfg(target_os = "macos")]
+pub fn get_pane_cwd(pid: nix::unistd::Pid) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let spid = Pid::from_u32(pid.as_raw() as u32);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    system
+        .process(spid)
+        .and_then(|p| p.cwd())
+        .and_then(|c| c.to_str().map(String::from))
+}
+
+/// Fallback for platforms without a known mechanism to read a foreign
+/// process's cwd. Always returns `None`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn get_pane_cwd(_pid: nix::unistd::Pid) -> Option<String> {
+    None
 }
 
 /// Return the path to the persistence data directory (`$XDG_DATA_HOME/remux`
@@ -192,5 +222,18 @@ mod tests {
     #[test]
     fn test_save_command_constant() {
         assert_eq!(SAVE_COMMAND, "session_save");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_get_pane_cwd_self() {
+        // Reading our own process's cwd should match the current directory.
+        let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
+        let cwd = get_pane_cwd(pid).expect("should read own cwd");
+        let expected = std::env::current_dir().unwrap();
+        // Canonicalize both sides so symlinked temp/working dirs compare equal.
+        let got = std::fs::canonicalize(&cwd).unwrap();
+        let expected = std::fs::canonicalize(&expected).unwrap();
+        assert_eq!(got, expected);
     }
 }
