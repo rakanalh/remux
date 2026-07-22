@@ -726,6 +726,9 @@ pub struct SessionSwitchOverlay {
     pub entries: Vec<SessionSwitchEntry>,
     /// Currently highlighted entry index.
     pub selected: usize,
+    /// Whether `selected` has been snapped to the current session (or moved by
+    /// the user) yet. Once set, later async merges never re-snap the highlight.
+    pub selection_initialized: bool,
 }
 
 impl SessionSwitchOverlay {
@@ -778,6 +781,16 @@ impl SessionSwitchOverlay {
             }
         }
         self.entries = entries;
+        // On the first merge that carries the current session, snap the
+        // highlight to it so the popup opens showing which session is current.
+        // If no current entry has arrived yet, leave `selection_initialized`
+        // false so a later tree carrying it can still snap.
+        if !self.selection_initialized {
+            if let Some(idx) = self.entries.iter().position(|e| e.is_current) {
+                self.selected = idx;
+                self.selection_initialized = true;
+            }
+        }
         if self.selected >= self.entries.len() {
             self.selected = 0;
         }
@@ -2104,6 +2117,9 @@ impl InputHandler {
                 if !overlay.entries.is_empty() {
                     overlay.selected = (overlay.selected + 1) % overlay.entries.len();
                 }
+                // The user is now driving the highlight; freeze it against
+                // re-snapping when later async trees merge in.
+                overlay.selection_initialized = true;
                 InputAction::SessionSwitchUpdate
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -2114,6 +2130,9 @@ impl InputHandler {
                         overlay.selected -= 1;
                     }
                 }
+                // The user is now driving the highlight; freeze it against
+                // re-snapping when later async trees merge in.
+                overlay.selection_initialized = true;
                 InputAction::SessionSwitchUpdate
             }
             KeyCode::Enter | KeyCode::Char('l') => {
@@ -3883,5 +3902,71 @@ mod tests {
             }
             other => panic!("expected SessionSwitchConfirm, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_switch_preselects_current_on_first_merge() {
+        // The current session is deliberately NOT first, so a `selected` of its
+        // index proves the preselect is real (not coincidentally 0).
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            ConnId::Local,
+            vec![
+                ("first".to_string(), false),
+                ("cur".to_string(), true),
+                ("third".to_string(), false),
+            ],
+        );
+        assert_eq!(overlay.selected, 1);
+        assert_eq!(overlay.entries[overlay.selected].name, "cur");
+        assert!(overlay.selection_initialized);
+    }
+
+    #[test]
+    fn session_switch_does_not_resnap_after_user_moves() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        // Current session preselected at index 1.
+        overlay.merge_server(
+            ConnId::Local,
+            vec![
+                ("a".to_string(), false),
+                ("cur".to_string(), true),
+                ("c".to_string(), false),
+            ],
+        );
+        handler.session_switch = Some(overlay);
+
+        // User moves down to index 2.
+        let _ = handler.handle_session_switch_key(char_key('j'));
+        assert_eq!(handler.session_switch.as_ref().unwrap().selected, 2);
+
+        // A second async merge arrives (rebuild re-runs). It must NOT yank the
+        // highlight back to the current entry.
+        handler.merge_session_switch(remote("mini"), vec![("x".to_string(), true)]);
+        assert_eq!(handler.session_switch.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn session_switch_no_current_defers_initialization() {
+        let mut overlay = SessionSwitchOverlay::new();
+        // A remote tree with no current session arrives first.
+        overlay.merge_server(
+            remote("mini"),
+            vec![("x".to_string(), false), ("y".to_string(), false)],
+        );
+        assert!(!overlay.selection_initialized);
+        assert_eq!(overlay.selected, 0);
+
+        // A later tree carrying the current session then snaps to it.
+        overlay.merge_server(
+            ConnId::Local,
+            vec![("first".to_string(), false), ("cur".to_string(), true)],
+        );
+        assert!(overlay.selection_initialized);
+        let sel = &overlay.entries[overlay.selected];
+        assert_eq!(sel.name, "cur");
+        assert!(sel.is_current);
     }
 }
