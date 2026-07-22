@@ -1132,6 +1132,7 @@ async fn handle_command(
                 let focused = tab.focused_pane;
                 tab.layout.split_vertical(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
+                tab.zoomed_pane = None;
                 tab.pane_order.push(new_pane_id);
                 log::debug!(
                     "server: PaneSplitVertical new_pane_id={new_pane_id} from focused={focused}"
@@ -1186,6 +1187,7 @@ async fn handle_command(
                 let focused = tab.focused_pane;
                 tab.layout.split_horizontal(focused, new_pane_id);
                 tab.focused_pane = new_pane_id;
+                tab.zoomed_pane = None;
                 tab.pane_order.push(new_pane_id);
                 log::debug!(
                     "server: PaneSplitHorizontal new_pane_id={new_pane_id} from focused={focused}"
@@ -1555,6 +1557,7 @@ async fn handle_command(
                     tab.layout.split_vertical(focused, new_pane_id);
                     tab.focused_pane = new_pane_id;
                 }
+                tab.zoomed_pane = None;
                 (new_pane_id, prev_focused)
             };
             let focused_cwd = {
@@ -1879,7 +1882,7 @@ async fn handle_command(
                 if matches!(tab.layout_mode, LayoutMode::Monocle(_)) {
                     return Ok(());
                 }
-                if tab.zoomed_pane == Some(tab.focused_pane) {
+                if tab.zoomed_pane.is_some() {
                     tab.zoomed_pane = None;
                 } else {
                     tab.zoomed_pane = Some(tab.focused_pane);
@@ -2039,6 +2042,7 @@ async fn handle_command(
                     tab.layout.split_vertical(focused, new_pane_id);
                     tab.focused_pane = new_pane_id;
                 }
+                tab.zoomed_pane = None;
                 (new_pane_id, prev_focused)
             };
             let focused_cwd = {
@@ -3096,8 +3100,8 @@ async fn resize_session_panes(
             width: cols,
             height: content_rows,
         };
-        let pane_rects = if let Some(zoomed_id) = tab.zoomed_pane {
-            vec![(zoomed_id, area)]
+        let pane_rects = if tab.zoomed_pane.is_some() {
+            vec![(tab.focused_pane, area)]
         } else {
             layout::compute_layout(&tab.layout, area, 0)
         };
@@ -3718,8 +3722,8 @@ async fn build_composite(
 
     let ps = panes.lock().await;
     let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
-    let pane_rects = if let Some(zoomed_id) = tab.zoomed_pane {
-        vec![(zoomed_id, area)]
+    let pane_rects = if tab.zoomed_pane.is_some() {
+        vec![(tab.focused_pane, area)]
     } else {
         layout::compute_layout(&tab.layout, area, 0)
     };
