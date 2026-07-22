@@ -113,6 +113,12 @@ impl Pty {
                 // Set TERM to match the escape sequences Remux generates.
                 std::env::set_var("TERM", "xterm-256color");
 
+                // Mark the environment so a `remux` launched inside this pane
+                // can detect it is nested and refuse (mirrors tmux's $TMUX and
+                // zellij's $ZELLIJ). Set here in the child, alongside TERM, so it
+                // is inherited by the pane's shell and its descendants.
+                std::env::set_var("REMUX", "1");
+
                 // Determine which shell/command to execute.
                 let shell = match command {
                     Some(cmd) => cmd.to_string(),

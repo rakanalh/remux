@@ -133,6 +133,25 @@ async fn main() -> Result<()> {
     };
     log::info!("remux starting as {role}, log={}", log_path.display());
 
+    // Refuse to launch an interactive client inside an existing remux pane
+    // (mirrors tmux's $TMUX guard). Only the interactive attach/create flows
+    // are guarded; management subcommands (ls, kill, stop, restart, and the
+    // internal server/relay) are unaffected. Override with REMUX_ALLOW_NESTED.
+    if matches!(
+        cli.command,
+        None | Some(Commands::New { .. })
+            | Some(Commands::Attach { .. })
+            | Some(Commands::AttachRemote { .. })
+    ) && std::env::var_os("REMUX").is_some()
+        && std::env::var_os("REMUX_ALLOW_NESTED").is_none()
+    {
+        eprintln!(
+            "remux: refusing to launch inside an existing remux session.\n\
+             Detach first, use a different terminal, or set REMUX_ALLOW_NESTED=1 to override."
+        );
+        std::process::exit(1);
+    }
+
     match cli.command {
         Some(Commands::Server) => {
             log::debug!("launching server daemon");
