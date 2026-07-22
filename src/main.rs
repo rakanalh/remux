@@ -481,6 +481,33 @@ async fn stop_server() -> Result<bool> {
 // Client event loop
 // ---------------------------------------------------------------------------
 
+/// Connect any remotes configured with `auto_connect = true` at startup.
+///
+/// Runs before raw mode so SSH prompts are visible. A failed auto-connect is
+/// non-fatal: it logs a warning and continues so client startup is never
+/// aborted by an unreachable remote. Names are visited in sorted order for
+/// stable output.
+async fn connect_auto_remotes(mgr: &mut ConnectionManager, config: &Config) {
+    let mut names: Vec<&String> = config
+        .remotes
+        .iter()
+        .filter(|(_, rc)| rc.auto_connect)
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+
+    for name in names {
+        log::info!("auto-connecting remote '{name}'");
+        match mgr.connect_remote(name).await {
+            Ok(()) => log::info!("auto-connect to remote '{name}' succeeded"),
+            Err(e) => {
+                log::warn!("auto-connect to remote '{name}' failed: {e}");
+                eprintln!("remux: auto-connect to remote '{name}' failed: {e}");
+            }
+        }
+    }
+}
+
 /// Run the client event loop with terminal setup/restore.
 ///
 /// `initial_local_session` is the local session attached before the loop
@@ -491,6 +518,10 @@ async fn client_event_loop(
     config: &Config,
     initial_local_session: Option<String>,
 ) -> Result<()> {
+    // Auto-connect any remotes flagged `auto_connect` before entering raw mode,
+    // so SSH host-key/password prompts render normally.
+    connect_auto_remotes(mgr, config).await;
+
     log::debug!("client_event_loop: setting up terminal");
     setup_terminal()?;
 

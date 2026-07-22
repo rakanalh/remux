@@ -46,6 +46,9 @@ pub struct RemoteConfig {
     pub remux_path: String,
     /// Extra arguments passed to `ssh` before the destination.
     pub extra_args: Vec<String>,
+    /// When true, connect this remote automatically at client startup (instead
+    /// of lazily on demand).
+    pub auto_connect: bool,
 }
 
 impl Default for RemoteConfig {
@@ -56,6 +59,7 @@ impl Default for RemoteConfig {
             identity: None,
             remux_path: "remux".to_string(),
             extra_args: Vec::new(),
+            auto_connect: false,
         }
     }
 }

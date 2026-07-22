@@ -451,10 +451,13 @@
 #   port        — optional SSH port passed as `-p` (default: unset).
 #   identity    — optional identity file passed as `-i` (default: unset).
 #   extra_args  — extra ssh arguments placed before the destination (default: []).
+#   auto_connect — connect this remote automatically at client startup instead
+#                  of lazily on demand (default: false).
 #
 # [remotes.pi]
 # ssh = "pi@raspberrypi.local"
 # remux_path = "/usr/local/bin/remux"
+# auto_connect = true                 # auto-resume this connection on start
 #
 # [remotes.server]
 # ssh = "user@example.com"
