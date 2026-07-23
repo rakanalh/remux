@@ -64,15 +64,19 @@ impl LayoutAlgorithm for BspLayout {
 /// Master layout: one master pane in the center with secondary panes
 /// in left/right columns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MasterLayout {
-    pub master_idx: usize,
+    /// The pane that occupies the master slot. `None` means "use the first
+    /// pane". Tracked by id (not index) so closing or adding panes can never
+    /// silently hand the master slot to a different pane.
+    pub master_pane: Option<PaneId>,
     pub master_ratio: f32,
 }
 
 impl Default for MasterLayout {
     fn default() -> Self {
         Self {
-            master_idx: 0,
+            master_pane: None,
             master_ratio: 0.6,
         }
     }
@@ -91,14 +95,17 @@ impl LayoutAlgorithm for MasterLayout {
             return LayoutNode::new_stack(panes[0]);
         }
 
-        let master_idx = self.master_idx.min(panes.len() - 1);
         let master_ratio = self.master_ratio;
-        let master_pane = panes[master_idx];
+        // Fall back to the first pane when the master is unset or has been
+        // closed, so the master slot is always deterministic.
+        let master_pane = self
+            .master_pane
+            .filter(|id| panes.contains(id))
+            .unwrap_or(panes[0]);
         let others: Vec<PaneId> = panes
             .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != master_idx)
-            .map(|(_, &p)| p)
+            .copied()
+            .filter(|&p| p != master_pane)
             .collect();
 
         if others.len() == 1 {
@@ -1882,7 +1889,7 @@ mod tests {
     fn test_master_stacks_are_atomic() {
         let panes = vec![10, 20, 30, 40];
         let layout = MasterLayout {
-            master_idx: 0,
+            master_pane: None,
             master_ratio: 0.6,
         };
         let tree = layout.build_tree(&panes, 10);
@@ -1917,7 +1924,7 @@ mod tests {
     #[test]
     fn test_master_incremental_pane_add() {
         let layout = MasterLayout {
-            master_idx: 0,
+            master_pane: None,
             master_ratio: 0.6,
         };
         let mut pane_order = vec![1];
@@ -1940,6 +1947,102 @@ mod tests {
         pane_order.push(4);
         let tree4 = layout.build_tree(&pane_order, 4);
         assert_eq!(active_pane_ids(&tree4).len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Master slot identity: the master is tracked by pane id, so adding or
+    // closing panes must never hand the master slot to a different pane.
+    // -----------------------------------------------------------------------
+
+    /// Extract the pane occupying the master slot of a Master-layout tree.
+    ///
+    /// For 2 panes the master is the root split's `first`; for 3+ panes the
+    /// root's `second` is itself a split whose `first` is the master (the
+    /// center column between the left and right side columns).
+    fn master_slot_pane(tree: &LayoutNode, pane_count: usize) -> PaneId {
+        fn stack_pane(node: &LayoutNode) -> PaneId {
+            match node {
+                LayoutNode::Stack { panes, active, .. } => panes[*active],
+                LayoutNode::Split { .. } => panic!("expected a stack in the master slot"),
+            }
+        }
+        match tree {
+            LayoutNode::Stack { .. } => stack_pane(tree),
+            LayoutNode::Split { first, second, .. } => {
+                if pane_count <= 2 {
+                    stack_pane(first)
+                } else {
+                    match second.as_ref() {
+                        LayoutNode::Split { first: inner, .. } => stack_pane(inner),
+                        LayoutNode::Stack { .. } => panic!("expected inner split for 3+ panes"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_master_new_pane_does_not_become_master() {
+        let layout = MasterLayout {
+            master_pane: Some(2),
+            master_ratio: 0.6,
+        };
+        let mut pane_order = vec![1, 2, 3];
+        let tree = layout.build_tree(&pane_order, 2);
+        assert_eq!(master_slot_pane(&tree, pane_order.len()), 2);
+
+        // A newly created pane is appended; the master slot must not move.
+        pane_order.push(4);
+        let tree = layout.build_tree(&pane_order, 4);
+        assert_eq!(master_slot_pane(&tree, pane_order.len()), 2);
+    }
+
+    #[test]
+    fn test_master_survives_close_then_add() {
+        // Regression: SetMaster on the last pane, then close a pane, then
+        // create a new one. The new pane used to inherit the master slot
+        // because the master was tracked by index.
+        let layout = MasterLayout {
+            master_pane: Some(30),
+            master_ratio: 0.6,
+        };
+        let pane_order = vec![10, 20, 30];
+        let tree = layout.build_tree(&pane_order, 30);
+        assert_eq!(master_slot_pane(&tree, pane_order.len()), 30);
+
+        // Close pane 10.
+        let pane_order = vec![20, 30];
+        let tree = layout.build_tree(&pane_order, 30);
+        assert_eq!(master_slot_pane(&tree, pane_order.len()), 30);
+
+        // Create a new pane 40.
+        let pane_order = vec![20, 30, 40];
+        let tree = layout.build_tree(&pane_order, 40);
+        let master = master_slot_pane(&tree, pane_order.len());
+        assert_eq!(master, 30);
+        assert_ne!(master, 40, "the new pane must not become master");
+    }
+
+    #[test]
+    fn test_master_falls_back_when_master_closed() {
+        // The master pane is gone: fall back to the first pane deterministically.
+        let layout = MasterLayout {
+            master_pane: Some(99),
+            master_ratio: 0.6,
+        };
+        let pane_order = vec![1, 2, 3];
+        let tree = layout.build_tree(&pane_order, 1);
+        assert_eq!(master_slot_pane(&tree, pane_order.len()), 1);
+    }
+
+    #[test]
+    fn test_master_layout_deserializes_legacy_state() {
+        // Sessions persisted before the master became id-tracked still carry
+        // `master_idx`; it is ignored and `master_pane` defaults to `None`.
+        let old: MasterLayout =
+            serde_json::from_str(r#"{"master_idx":2,"master_ratio":0.6}"#).expect("deserialize");
+        assert_eq!(old.master_pane, None);
+        assert!((old.master_ratio - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]

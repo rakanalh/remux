@@ -1627,10 +1627,7 @@ async fn handle_command(
                     tab.layout_mode = LayoutMode::Master(MasterLayout::default());
                 }
                 if let LayoutMode::Master(ref mut master_layout) = tab.layout_mode {
-                    if let Some(idx) = tab.pane_order.iter().position(|&id| id == tab.focused_pane)
-                    {
-                        master_layout.master_idx = idx;
-                    }
+                    master_layout.master_pane = Some(tab.focused_pane);
                     tab.layout = tab
                         .layout_mode
                         .build_tree(&tab.pane_order, tab.focused_pane);
