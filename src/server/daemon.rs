@@ -24,7 +24,9 @@ use crate::screen::Screen;
 use crate::server::compositor::{
     composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
 };
-use crate::server::layout::{self, CustomLayout, LayoutMode, MasterLayout, PaneId, Rect};
+use crate::server::layout::{
+    self, BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
+};
 use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, Pty};
 use crate::server::session::{Folder, ServerState};
@@ -1749,12 +1751,30 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
-                tab.layout_mode = tab.layout_mode.next();
+                // Snapshot the current custom arrangement *before* touching the
+                // tree, so the cycle can return to it later. Order matters: a
+                // rebuild below would otherwise overwrite `tab.layout`.
+                if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
+                    tab.saved_custom_layout = Some(tab.layout.clone());
+                }
+                // Monocle (the last automatic before wrap) returns to Custom only
+                // when the saved tree is still restorable (its pane set matches
+                // the live panes); otherwise the cycle stays automatic.
+                let restorable =
+                    saved_custom_is_restorable(&tab.saved_custom_layout, &tab.pane_order);
+                tab.layout_mode = next_layout_mode(&tab.layout_mode, restorable);
                 log::debug!("server: LayoutNext new_mode={}", tab.layout_mode.name());
                 if tab.layout_mode.is_automatic() {
                     tab.layout = tab
                         .layout_mode
                         .build_tree(&tab.pane_order, tab.focused_pane);
+                } else if let Some(saved) = tab.saved_custom_layout.clone() {
+                    // Custom: restore the remembered arrangement. Adopt its own
+                    // active-pane markers so the focused pane stays visible.
+                    tab.layout = saved;
+                    if let Some(active) = tab.layout.active_pane() {
+                        tab.focused_pane = active;
+                    }
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
@@ -3005,6 +3025,37 @@ async fn handle_mouse_click(
     }
 
     Ok(())
+}
+
+/// Pure decision for the layout cycle's next mode, factored out for testing.
+///
+/// The automatic cycle is `Bsp -> Master -> Monocle -> Bsp`. Two custom-aware
+/// detours ride on top: leaving `Custom` starts the automatic cycle at `Bsp`,
+/// and reaching `Monocle` (the last automatic before wrap) returns to `Custom`
+/// when a restorable custom layout was remembered (`has_saved_custom`).
+fn next_layout_mode(current: &LayoutMode, has_saved_custom: bool) -> LayoutMode {
+    match current {
+        LayoutMode::Custom(_) => LayoutMode::Bsp(BspLayout),
+        LayoutMode::Monocle(_) if has_saved_custom => LayoutMode::Custom(CustomLayout),
+        other => other.next(),
+    }
+}
+
+/// Return true if `saved` can be restored as the current custom layout, i.e.
+/// it exists and its leaf pane-id set exactly equals the live `pane_order`.
+///
+/// The comparison is order-independent: the saved tree's traversal order need
+/// not match `pane_order`'s insertion order. A mismatch (panes added/removed
+/// while in an automatic layout) makes the snapshot stale and non-restorable.
+fn saved_custom_is_restorable(saved: &Option<LayoutNode>, pane_order: &[PaneId]) -> bool {
+    let Some(tree) = saved else {
+        return false;
+    };
+    let mut saved_ids = layout::all_pane_ids(tree);
+    saved_ids.sort_unstable();
+    let mut live_ids = pane_order.to_vec();
+    live_ids.sort_unstable();
+    saved_ids == live_ids
 }
 
 /// Activate a specific pane within its stack in the layout tree.
@@ -5039,9 +5090,13 @@ async fn handle_resurrect_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrow_report, compute_diff, merge_dormant_into, take_dormant_session, wheel_report,
+        arrow_report, compute_diff, merge_dormant_into, next_layout_mode,
+        saved_custom_is_restorable, take_dormant_session, wheel_report,
     };
     use crate::protocol::RenderCell;
+    use crate::server::layout::{
+        BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, MonocleLayout,
+    };
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
     use std::collections::HashMap;
@@ -5247,5 +5302,77 @@ mod tests {
         assert_eq!(arrow_report(false, false), vec![0x1b, b'[', b'B']);
         assert_eq!(arrow_report(true, true), vec![0x1b, b'O', b'A']);
         assert_eq!(arrow_report(true, false), vec![0x1b, b'O', b'B']);
+    }
+
+    // -- Layout cycle (Alt+Space) -------------------------------------------
+
+    #[test]
+    fn next_layout_mode_automatic_cycle() {
+        // Bsp -> Master -> Monocle regardless of the saved-custom flag.
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Bsp(BspLayout), false),
+            LayoutMode::Master(_)
+        ));
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Master(MasterLayout::default()), false),
+            LayoutMode::Monocle(_)
+        ));
+    }
+
+    #[test]
+    fn next_layout_mode_custom_starts_cycle_at_bsp() {
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Custom(CustomLayout), false),
+            LayoutMode::Bsp(_)
+        ));
+    }
+
+    #[test]
+    fn next_layout_mode_monocle_returns_to_custom_only_when_saved() {
+        // With a restorable saved custom layout, Monocle wraps back to Custom.
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), true),
+            LayoutMode::Custom(_)
+        ));
+        // Without one, Monocle wraps to Bsp as usual.
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), false),
+            LayoutMode::Bsp(_)
+        ));
+    }
+
+    /// A two-pane custom stack whose traversal order differs from the caller's
+    /// `pane_order` (panes `[2, 1]` vs insertion order `[1, 2]`).
+    fn custom_stack_2_1() -> LayoutNode {
+        LayoutNode::Stack {
+            panes: vec![2, 1],
+            names: vec![],
+            custom_names: vec![],
+            active: 0,
+        }
+    }
+
+    #[test]
+    fn saved_custom_restorable_ignores_pane_order() {
+        // Same set, different order -> restorable.
+        let saved = Some(custom_stack_2_1());
+        assert!(saved_custom_is_restorable(&saved, &[1, 2]));
+    }
+
+    #[test]
+    fn saved_custom_not_restorable_when_pane_added() {
+        let saved = Some(custom_stack_2_1());
+        assert!(!saved_custom_is_restorable(&saved, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn saved_custom_not_restorable_when_pane_removed() {
+        let saved = Some(custom_stack_2_1());
+        assert!(!saved_custom_is_restorable(&saved, &[1]));
+    }
+
+    #[test]
+    fn saved_custom_not_restorable_when_none() {
+        assert!(!saved_custom_is_restorable(&None, &[1, 2]));
     }
 }

@@ -104,6 +104,11 @@ pub struct Tab {
     pub pane_order: Vec<PaneId>,
     #[serde(default)]
     pub zoomed_pane: Option<PaneId>,
+    /// The user's last manually-arranged (`Custom`) layout tree, snapshotted
+    /// when the automatic-layout cycle moves away from it so the cycle can
+    /// return to it later. `None` until the user has a custom arrangement.
+    #[serde(default)]
+    pub saved_custom_layout: Option<LayoutNode>,
     /// Runtime-only background activity state. Not persisted: activity is a
     /// live-session concern, meaningless once a session is dormant/restored.
     #[serde(skip)]
@@ -283,6 +288,7 @@ impl ServerState {
             layout_mode,
             pane_order: vec![pane_id],
             zoomed_pane: None,
+            saved_custom_layout: None,
             activity: TabActivity::None,
             last_output: None,
         };
@@ -517,6 +523,7 @@ impl ServerState {
             layout_mode,
             pane_order: vec![pane_id],
             zoomed_pane: None,
+            saved_custom_layout: None,
             activity: TabActivity::None,
             last_output: None,
         };
