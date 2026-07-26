@@ -431,6 +431,24 @@ pub enum InputAction {
     /// entirely client-side by the event loop, which tracks the current and
     /// previous attached `(server, session)`.
     SessionSwitchLast,
+    // -- Views (client-only virtual tabs; never forwarded to the server) --
+    /// Create a new empty view with the given name and activate it.
+    NewView(String),
+    /// Open the view-picker overlay to add the current focused pane to a view.
+    ViewAddPaneOpen,
+    /// Remove the focused cell from the active view.
+    ViewRemovePane,
+    /// Cycle the active view's layout (Grid -> Monocle -> ...).
+    ViewLayoutNext,
+    /// Close (deactivate) the active view, returning to the server frame.
+    ViewClose,
+    /// The view-picker highlight moved (re-render needed).
+    ViewPickerUpdate,
+    /// The view picker was confirmed: `Some(i)` = add to existing view `i`,
+    /// `None` = create a new auto-named view and add to it.
+    ViewPickerConfirm { view: Option<usize> },
+    /// The view picker was cancelled.
+    ViewPickerClose,
     /// No action to take.
     None,
 }
@@ -522,6 +540,8 @@ pub struct InputHandler {
     pub folder_select: Option<FolderSelectOverlay>,
     /// State for the session quick-switch overlay.
     pub session_switch: Option<SessionSwitchOverlay>,
+    /// State for the view-picker overlay (choose which View to add a pane to).
+    pub view_picker: Option<ViewPickerOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
 }
@@ -546,6 +566,8 @@ pub enum RenameTarget {
     Tab,
     Session,
     NewSession,
+    /// Naming a brand-new client-side View (prompted before it is created).
+    NewView,
 }
 
 /// Folder selection overlay for moving the current session to a different folder.
@@ -702,6 +724,158 @@ impl FolderSelectOverlay {
             x: start_x,
             y: help_line_y,
             text: bottom_line,
+            fg: border_fg,
+            bg,
+        });
+
+        commands
+    }
+}
+
+/// View-picker overlay: choose which View to add the current focused pane to.
+///
+/// Row 0 is always the "New view" sentinel; existing views occupy rows
+/// `1..=names.len()`. Modeled on [`FolderSelectOverlay`] for its simple
+/// single-column list rendering.
+#[derive(Debug, Clone)]
+pub struct ViewPickerOverlay {
+    /// Existing view names, parallel to the event loop's `views` vector.
+    pub names: Vec<String>,
+    /// Highlighted row (0 = "New view"; `i+1` = existing view `i`).
+    pub selected: usize,
+}
+
+impl ViewPickerOverlay {
+    /// Create a picker listing the given existing views. The highlight starts
+    /// on the "New view" sentinel row.
+    pub fn new(names: Vec<String>) -> Self {
+        Self { names, selected: 0 }
+    }
+
+    /// Total selectable rows including the "New view" sentinel.
+    fn row_count(&self) -> usize {
+        self.names.len() + 1
+    }
+
+    /// Resolve the current selection to a confirm target: `None` for the
+    /// "New view" sentinel, `Some(i)` for existing view `i`.
+    pub fn target(&self) -> Option<usize> {
+        if self.selected == 0 {
+            None
+        } else {
+            Some(self.selected - 1)
+        }
+    }
+
+    /// The label shown for a row: index 0 is the sentinel, the rest are views.
+    fn row_label(&self, row: usize) -> String {
+        if row == 0 {
+            "\u{FF0B} New view".to_string()
+        } else {
+            format!("  {}", self.names[row - 1])
+        }
+    }
+
+    /// Render the view picker as draw commands (mirrors `FolderSelectOverlay`).
+    pub fn render(
+        &self,
+        screen_cols: u16,
+        screen_rows: u16,
+        theme: &crate::config::theme::Theme,
+    ) -> Vec<crate::client::whichkey::DrawCommand> {
+        use crate::client::whichkey::DrawCommand;
+        let mut commands = Vec::new();
+
+        let rows = self.row_count();
+        let popup_width = 40u16.min(screen_cols);
+        let popup_height = (rows as u16 + 2).min(screen_rows);
+        let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
+        let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
+
+        let fg = theme.whichkey_fg;
+        let bg = theme.whichkey_bg;
+        let sel_fg = theme.whichkey_bg;
+        let sel_bg = theme.whichkey_fg;
+        let border_fg = theme.separator_fg;
+        let inner_width = (popup_width - 2) as usize;
+
+        // Fill background.
+        for row in 0..popup_height {
+            commands.push(DrawCommand {
+                x: start_x,
+                y: start_y + row,
+                text: " ".repeat(popup_width as usize),
+                fg,
+                bg,
+            });
+        }
+
+        // Top border with title.
+        let title = " Add Pane to View ";
+        let border_len = inner_width.saturating_sub(title.len());
+        let left_b = border_len / 2;
+        let right_b = border_len - left_b;
+        commands.push(DrawCommand {
+            x: start_x,
+            y: start_y,
+            text: format!(
+                "\u{256D}{}{}{}\u{256E}",
+                "\u{2500}".repeat(left_b),
+                title,
+                "\u{2500}".repeat(right_b)
+            ),
+            fg: border_fg,
+            bg,
+        });
+
+        // Rows.
+        for row in 0..rows {
+            let y = start_y + 1 + row as u16;
+            if y >= start_y + popup_height - 1 {
+                break;
+            }
+            let is_selected = row == self.selected;
+            let text = self.row_label(row);
+            let text_len = text.chars().count();
+            let padded = if text_len >= inner_width {
+                text.chars().take(inner_width).collect::<String>()
+            } else {
+                format!("{}{}", text, " ".repeat(inner_width - text_len))
+            };
+            let (row_fg, row_bg) = if is_selected {
+                (sel_fg, sel_bg)
+            } else {
+                (fg, bg)
+            };
+            commands.push(DrawCommand {
+                x: start_x,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y,
+                text: padded,
+                fg: row_fg,
+                bg: row_bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+        }
+
+        // Bottom border.
+        let bottom_y = start_y + popup_height - 1;
+        commands.push(DrawCommand {
+            x: start_x,
+            y: bottom_y,
+            text: format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width)),
             fg: border_fg,
             bg,
         });
@@ -1041,6 +1215,7 @@ impl InputHandler {
             application_cursor_keys: false,
             folder_select: None,
             session_switch: None,
+            view_picker: None,
             pending_editor_open: false,
         }
     }
@@ -1104,6 +1279,11 @@ impl InputHandler {
         // If the session switch overlay is active, capture keystrokes for it.
         if self.session_switch.is_some() {
             return self.handle_session_switch_key(key);
+        }
+
+        // If the view picker overlay is active, capture keystrokes for it.
+        if self.view_picker.is_some() {
+            return self.handle_view_picker_key(key);
         }
 
         // If the folder select overlay is active, capture keystrokes for it.
@@ -1380,6 +1560,36 @@ impl InputHandler {
                 self.mode = Mode::Command;
                 self.session_switch = Some(SessionSwitchOverlay::new());
                 return InputAction::SessionSwitchOpen;
+            }
+
+            // View commands are client-only: they never map to a RemuxCommand
+            // and are never forwarded to the server (mirrors SessionQuickSwitch).
+            if action_str == "ViewNew" {
+                // Prompt for a name via the rename overlay; the confirm maps to
+                // InputAction::NewView(name), handled in the main loop.
+                self.mode = Mode::Normal;
+                self.rename_overlay = Some(RenameOverlay {
+                    buffer: String::new(),
+                    cursor: 0,
+                    target: RenameTarget::NewView,
+                });
+                return InputAction::ActivateRenameOverlay;
+            }
+            if action_str == "ViewAddPane" {
+                self.mode = Mode::Normal;
+                return InputAction::ViewAddPaneOpen;
+            }
+            if action_str == "ViewRemovePane" {
+                self.mode = Mode::Normal;
+                return InputAction::ViewRemovePane;
+            }
+            if action_str == "ViewLayoutNext" {
+                self.mode = Mode::Normal;
+                return InputAction::ViewLayoutNext;
+            }
+            if action_str == "ViewClose" {
+                self.mode = Mode::Normal;
+                return InputAction::ViewClose;
             }
 
             match parse_command(action_str) {
@@ -2284,6 +2494,41 @@ impl InputHandler {
         }
     }
 
+    /// Handle a keystroke while the view-picker overlay is open.
+    fn handle_view_picker_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.view_picker.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+        let rows = overlay.row_count();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.view_picker = None;
+                self.mode = Mode::Normal;
+                InputAction::ViewPickerClose
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                overlay.selected = (overlay.selected + 1) % rows;
+                InputAction::ViewPickerUpdate
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                overlay.selected = if overlay.selected == 0 {
+                    rows - 1
+                } else {
+                    overlay.selected - 1
+                };
+                InputAction::ViewPickerUpdate
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                let target = overlay.target();
+                self.view_picker = None;
+                self.mode = Mode::Normal;
+                InputAction::ViewPickerConfirm { view: target }
+            }
+            _ => InputAction::None,
+        }
+    }
+
     /// Merge one server's sessions (tagged with its [`ConnId`]) into the session
     /// switch overlay, replacing any prior rows for that server.
     pub fn merge_session_switch(
@@ -2322,12 +2567,13 @@ impl InputHandler {
                 self.mode = Mode::Normal;
                 match target {
                     RenameTarget::NewSession => InputAction::NewSession(name),
+                    RenameTarget::NewView => InputAction::NewView(name),
                     _ => {
                         let cmd = match target {
                             RenameTarget::Pane => RemuxCommand::PaneRename(name),
                             RenameTarget::Tab => RemuxCommand::TabRename(name),
                             RenameTarget::Session => RemuxCommand::SessionRename(name),
-                            RenameTarget::NewSession => unreachable!(),
+                            RenameTarget::NewSession | RenameTarget::NewView => unreachable!(),
                         };
                         InputAction::Execute(cmd)
                     }

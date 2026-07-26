@@ -220,6 +220,23 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
     // Visual mode binding.
     root.insert('v', leaf("visual mode", "EnterVisualMode"));
 
+    // w: View (client-only virtual tabs). `v` is taken by visual mode, so the
+    // view group lives on `w` ("view/window"). Every action here is client-only
+    // and intercepted in the input handler before command parsing.
+    root.insert(
+        'w',
+        group(
+            "View",
+            vec![
+                ('n', leaf("new view", "ViewNew")),
+                ('a', leaf("add pane", "ViewAddPane")),
+                ('x', leaf("remove cell", "ViewRemovePane")),
+                (' ', leaf("layout next", "ViewLayoutNext")),
+                ('q', leaf("close view", "ViewClose")),
+            ],
+        ),
+    );
+
     // Layout toggle bindings.
     root.insert(
         'g',

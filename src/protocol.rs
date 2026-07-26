@@ -106,6 +106,24 @@ pub enum ClientMessage {
     ScrollReset,
     /// Request scrollback info (total line count) for the active pane.
     RequestScrollbackInfo,
+    /// Subscribe to a pane's rendered content, streamed regardless of which
+    /// session/tab this client has in the foreground. Used by View cells that
+    /// alias a real pane. `cols`/`rows` are the subscribing cell's desired size;
+    /// they are currently stored per-subscriber but NOT yet folded into pane
+    /// sizing (the Model A min-across-viewers resize is a later step).
+    SubscribePane {
+        pane_id: PaneId,
+        cols: u16,
+        rows: u16,
+    },
+    /// Stop receiving `PaneContent` for a previously subscribed pane.
+    UnsubscribePane { pane_id: PaneId },
+    /// Route raw input bytes to a pane by identity, independent of this
+    /// client's foreground session/tab. Mirrors `Input`, but instead of
+    /// resolving the target from the foreground focus it targets `pane_id`
+    /// explicitly -- this is what a focused View cell uses to type into the
+    /// real pane it aliases, wherever that pane actually lives.
+    InputToPane { pane_id: PaneId, data: Vec<u8> },
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +210,15 @@ pub enum ServerMessage {
         /// optional on the wire for back-compat with older peers.
         #[serde(default)]
         dormant: Vec<String>,
+    },
+    /// A full snapshot of one pane's rendered screen, pushed to every client
+    /// subscribed to `pane_id`. Independent of the client's foreground
+    /// session/tab. Full snapshot each change for now (no diffing).
+    PaneContent {
+        pane_id: PaneId,
+        cols: u16,
+        rows: u16,
+        cells: Vec<Vec<RenderCell>>,
     },
 }
 

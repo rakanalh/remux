@@ -1063,6 +1063,32 @@ fn blit_screen(buffer: &mut [Vec<RenderCell>], screen: &Screen, rect: Rect, scro
     }
 }
 
+/// Snapshot a single pane's rendered screen into a standalone cell buffer.
+///
+/// The buffer is sized to the pane's *own* current dimensions and blitted at
+/// scroll_offset 0 (the live view) -- no resize is performed here, since
+/// View-cell size negotiation (min-across-viewers) is a later step. Returns
+/// `(cols, rows, cells)`; when `cols == 0 || rows == 0` the buffer is empty,
+/// which callers treat as a no-content snapshot.
+pub(crate) fn render_pane_snapshot(screen: &Screen) -> (u16, u16, Vec<Vec<RenderCell>>) {
+    let cols = screen.cols;
+    let rows = screen.rows;
+    let mut buffer: Vec<Vec<RenderCell>> =
+        vec![vec![RenderCell::default(); cols as usize]; rows as usize];
+    blit_screen(
+        &mut buffer,
+        screen,
+        Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: rows,
+        },
+        0,
+    );
+    (cols, rows, buffer)
+}
+
 /// Safely set a cell in the buffer (bounds-checked).
 fn set_cell(buffer: &mut [Vec<RenderCell>], row: usize, col: usize, cell: RenderCell) {
     if row < buffer.len() && col < buffer[row].len() {

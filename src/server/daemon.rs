@@ -184,6 +184,13 @@ struct ClientConnection {
     /// `None` disarms the timer -- set at construction, on click, on release, and
     /// whenever the scroll reaches its bound.
     autoscroll_repeat: Option<(u16, u16, u16, u16)>,
+    /// Panes this client has subscribed to via `SubscribePane`, mapped to the
+    /// subscribing cell's desired `(cols, rows)`. It receives a `PaneContent`
+    /// snapshot for each on subscribe and on every change, regardless of which
+    /// session/tab it has in the foreground (View cells). The stored size is
+    /// forward-compat wiring for Model A min-across-viewers sizing and is not
+    /// yet folded into pane sizing.
+    subscribed_panes: std::collections::HashMap<PaneId, (u16, u16)>,
 }
 
 /// The Remux server.
@@ -462,6 +469,7 @@ impl RemuxServer {
                     needs_full_render: false,
                     drag: None,
                     autoscroll_repeat: None,
+                    subscribed_panes: std::collections::HashMap::new(),
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -816,6 +824,63 @@ async fn handle_client_message(
                     let _ = client
                         .tx
                         .send(ServerMessage::ScrollbackInfo { total_lines });
+                }
+            }
+            Ok(())
+        }
+        ClientMessage::SubscribePane {
+            pane_id,
+            cols,
+            rows,
+        } => {
+            // Snapshot the pane (if it exists) under the panes lock, then release
+            // it before touching clients -- this codebase keeps the panes->clients
+            // ordering unnested, so we never hold both locks at once.
+            //
+            // DEFERRED (Model A sizing): we record the subscriber's desired
+            // (cols, rows) but snapshot the pane at its CURRENT size -- folding
+            // the min-across-viewers size into the pane resize touches
+            // broadcast_full_render's size math and is a later step.
+            let snapshot = {
+                let ps = panes.lock().await;
+                ps.get(&pane_id)
+                    .map(|pd| crate::server::compositor::render_pane_snapshot(&pd.screen))
+            };
+            let mut cls = clients.lock().await;
+            if let Some(conn) = cls.get_mut(&client_id) {
+                conn.subscribed_panes.insert(pane_id, (cols, rows));
+                // Send an immediate snapshot so the subscriber has content before
+                // the next PTY change fans one out.
+                if let Some((cols, rows, cells)) = snapshot {
+                    let _ = conn.tx.send(ServerMessage::PaneContent {
+                        pane_id,
+                        cols,
+                        rows,
+                        cells,
+                    });
+                }
+            }
+            Ok(())
+        }
+        ClientMessage::UnsubscribePane { pane_id } => {
+            let mut cls = clients.lock().await;
+            if let Some(conn) = cls.get_mut(&client_id) {
+                conn.subscribed_panes.remove(&pane_id);
+            }
+            Ok(())
+        }
+        ClientMessage::InputToPane { pane_id, data } => {
+            // Route input to a pane by identity (View cell), independent of this
+            // client's foreground session/tab. No focus lookup -- the target is
+            // explicit. We deliberately do NOT replicate handle_input's Ctrl+L
+            // scrollback-clearing special case: that is foreground-clear-screen
+            // UX and is not wanted for targeted cell input. The pane's own PTY
+            // output will trigger the existing forwarding task, which fans out
+            // PaneContent to subscribers, so no explicit broadcast is needed.
+            let ps = panes.lock().await;
+            if let Some(pane_data) = ps.get(&pane_id) {
+                if let Err(e) = pane_data.pty.write_input(&data) {
+                    log::warn!("server: InputToPane pane_id={pane_id} write failed: {e}");
                 }
             }
             Ok(())
@@ -4320,6 +4385,15 @@ async fn close_pane(
         let mut ps = panes.lock().await;
         ps.remove(&pane_id);
     }
+    // Drop any lingering subscriptions to the now-closed pane so a subscription
+    // to a dead pane can't linger. Taken under `clients` alone (the panes lock
+    // above is already released) to keep the locks unnested.
+    {
+        let mut cls = clients.lock().await;
+        for conn in cls.values_mut() {
+            conn.subscribed_panes.remove(&pane_id);
+        }
+    }
     match action {
         CloseAction::Broadcast => {
             let _ = resize_session_panes(session_name, state, panes, clients, config).await;
@@ -4453,6 +4527,39 @@ async fn start_pty_forwarding(
                             if let Some(pane_data) = ps.get(&pane_id) {
                                 for resp in &responses {
                                     let _ = pane_data.pty.write_input(resp);
+                                }
+                            }
+                        }
+                        // Only snapshot + stream if at least one client subscribes
+                        // to this pane; rendering a full grid on every PTY batch
+                        // for zero subscribers would be a needless per-keystroke
+                        // cost on every pane. Check the (cheap) subscriber set
+                        // first under the clients lock, drop it, THEN snapshot
+                        // under panes -- keeping the clients->panes order
+                        // broadcast_full_render already uses (never nested).
+                        let has_subscriber = {
+                            let cls = clients.lock().await;
+                            cls.values()
+                                .any(|c| c.subscribed_panes.contains_key(&pane_id))
+                        };
+                        if has_subscriber {
+                            let pane_snapshot = {
+                                let ps = panes.lock().await;
+                                ps.get(&pane_id).map(|pd| {
+                                    crate::server::compositor::render_pane_snapshot(&pd.screen)
+                                })
+                            };
+                            if let Some((cols, rows, cells)) = pane_snapshot {
+                                let cls = clients.lock().await;
+                                for conn in cls.values() {
+                                    if conn.subscribed_panes.contains_key(&pane_id) {
+                                        let _ = conn.tx.send(ServerMessage::PaneContent {
+                                            pane_id,
+                                            cols,
+                                            rows,
+                                            cells: cells.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -4713,6 +4820,41 @@ async fn materialize_session(
                             if let Some(pane_data) = ps.get(&pane_id) {
                                 for resp in &responses {
                                     let _ = pane_data.pty.write_input(resp);
+                                }
+                            }
+                        }
+                        // Only snapshot + stream if at least one client subscribes
+                        // to this pane; rendering a full grid on every PTY batch
+                        // for zero subscribers would be a needless per-keystroke
+                        // cost on every pane. This resurrect path is a second
+                        // per-pane forwarding loop; subscribers to a materialized
+                        // session must stream here too. Check the (cheap)
+                        // subscriber set first under the clients lock, drop it,
+                        // THEN snapshot under panes -- keeping the clients->panes
+                        // order broadcast_full_render already uses (never nested).
+                        let has_subscriber = {
+                            let cls = clients.lock().await;
+                            cls.values()
+                                .any(|c| c.subscribed_panes.contains_key(&pane_id))
+                        };
+                        if has_subscriber {
+                            let pane_snapshot = {
+                                let ps = panes.lock().await;
+                                ps.get(&pane_id).map(|pd| {
+                                    crate::server::compositor::render_pane_snapshot(&pd.screen)
+                                })
+                            };
+                            if let Some((cols, rows, cells)) = pane_snapshot {
+                                let cls = clients.lock().await;
+                                for conn in cls.values() {
+                                    if conn.subscribed_panes.contains_key(&pane_id) {
+                                        let _ = conn.tx.send(ServerMessage::PaneContent {
+                                            pane_id,
+                                            cols,
+                                            rows,
+                                            cells: cells.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }

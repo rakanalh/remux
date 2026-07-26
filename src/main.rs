@@ -605,6 +605,199 @@ fn record_switch(
     *current = Some(new_attached);
 }
 
+/// Re-render whichever transient overlay is currently active on top of the
+/// freshly-painted base frame. Extracted from the (previously triplicated)
+/// FullRender/RenderDiff/ScrollRender arms so the View compositor (PaneContent
+/// arm) can reuse the exact same overlay layering. The caller paints the base
+/// frame and flushes; this only lays the overlays between those two steps.
+///
+/// Note the deliberate asymmetry preserved from the original arms: the
+/// which-key popup is drawn at the loop's cached `cols`/`rows` while every other
+/// overlay re-queries `terminal::size()`. Kept verbatim to avoid changing
+/// behavior during the extraction.
+#[allow(clippy::too_many_arguments)]
+fn relay_overlays(
+    renderer: &mut Renderer,
+    input: &InputHandler,
+    whichkey: &WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    // Re-render visual overlay on top if in visual mode
+    if let Some(ref vs) = input.visual_state {
+        renderer.render_visual_overlay(vs)?;
+    }
+    // Re-render rename popup on top if active
+    if let Some(ref overlay) = input.rename_overlay {
+        let target_str = match overlay.target {
+            RenameTarget::Tab => "Tab",
+            RenameTarget::Pane => "Pane",
+            RenameTarget::Session => "Session",
+            RenameTarget::NewSession => "New Session",
+            RenameTarget::NewView => "New View",
+        };
+        let (c, r) = crossterm::terminal::size()?;
+        renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
+    }
+    // Re-render command palette on top if active
+    else if let Some(ref palette) = input.command_palette {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = palette.render(c, r, theme);
+        renderer.render_command_palette_overlay(&draw_cmds)?;
+    }
+    // Re-render search prompt and highlights on top if in search mode
+    else if let Some(ref ss) = input.search_state {
+        let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
+        let match_info = if ss.matches.is_empty() {
+            None
+        } else {
+            Some((ss.current_match, ss.matches.len()))
+        };
+        let (c, r) = crossterm::terminal::size()?;
+        renderer.render_search_highlight(
+            &ss.matches,
+            ss.current_match,
+            query.len(),
+            viewport_top,
+            focused_pane_rect,
+            theme,
+        )?;
+        renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+    }
+    // Re-render session switch overlay on top if active
+    else if let Some(ref ss) = input.session_switch {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = ss.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
+    }
+    // Re-render view picker overlay on top if active
+    else if let Some(ref vp) = input.view_picker {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = vp.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
+    }
+    // Re-render folder select overlay on top if active
+    else if let Some(ref fs) = input.folder_select {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = fs.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
+    }
+    // Re-render session manager on top if active
+    else if let Some(ref sm) = input.session_manager {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = sm.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
+    }
+    // Re-render popup on top if visible
+    else if whichkey.visible {
+        let commands = whichkey.render(cols, rows, theme, which_key_position.clone());
+        renderer.render_whichkey_overlay(&commands)?;
+    }
+    Ok(())
+}
+
+/// Composite the given active View into a full-screen frame and paint it,
+/// re-laying any active overlay on top. Used by every code path that changes
+/// what a live view shows (a fresh `PaneContent` snapshot, focus movement,
+/// layout change, add/remove cell, terminal resize).
+///
+/// `PaneContent` carries no cursor, so the hardware cursor is hidden while a
+/// view is up (a known limitation). The composite area is the full terminal —
+/// a view has no status-bar row of its own (also a known limitation).
+#[allow(clippy::too_many_arguments)]
+fn paint_view(
+    renderer: &mut Renderer,
+    view: &crate::client::view::ClientView,
+    input: &InputHandler,
+    whichkey: &WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+) -> Result<()> {
+    let (c, r) = crossterm::terminal::size()?;
+    let area = crate::server::layout::Rect {
+        x: 0,
+        y: 0,
+        width: c,
+        height: r,
+    };
+    let composed = crate::client::view::composite(view, area);
+    renderer.render_full(&composed, 0, 0, false, 0)?;
+    relay_overlays(
+        renderer,
+        input,
+        whichkey,
+        theme,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        c,
+        r,
+    )?;
+    renderer.flush()?;
+    Ok(())
+}
+
+/// Subscribe every cell of `view` to its source pane, sizing each subscription
+/// to the cell's interior (the box border steals one row/column on each side).
+/// Idempotent: re-calling updates the per-subscriber size on the server, so it
+/// doubles as the "cells changed" re-subscribe. Cells whose interior collapses
+/// to zero in either axis are skipped.
+async fn subscribe_view_cells(
+    mgr: &mut ConnectionManager,
+    view: &crate::client::view::ClientView,
+) -> Result<()> {
+    let (c, r) = crossterm::terminal::size()?;
+    let area = crate::server::layout::Rect {
+        x: 0,
+        y: 0,
+        width: c,
+        height: r,
+    };
+    let rects = crate::client::view::cell_rects(view.layout, view.cells.len(), area);
+    for (i, cell) in view.cells.iter().enumerate() {
+        if let Some(rect) = rects.get(i) {
+            let cols = rect.width.saturating_sub(2);
+            let rows = rect.height.saturating_sub(2);
+            if cols > 0 && rows > 0 {
+                mgr.send(
+                    &cell.conn,
+                    ClientMessage::SubscribePane {
+                        pane_id: cell.pane_id,
+                        cols,
+                        rows,
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unsubscribe every cell of `view` from its source pane (view leave / cell
+/// removal). Best-effort per cell.
+async fn unsubscribe_view_cells(
+    mgr: &mut ConnectionManager,
+    view: &crate::client::view::ClientView,
+) -> Result<()> {
+    for cell in &view.cells {
+        mgr.send(
+            &cell.conn,
+            ClientMessage::UnsubscribePane {
+                pane_id: cell.pane_id,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// The inner client event loop.
 async fn run_client_loop(
     mgr: &mut ConnectionManager,
@@ -696,6 +889,20 @@ async fn run_client_loop(
         .map(|name| (ConnId::Local, name.clone()));
     let mut previous_attached: Option<(ConnId, String)> = None;
 
+    // Client-side Views: virtual tabs whose cells alias real panes and are
+    // composited from streamed `PaneContent` snapshots. `active_view` is the
+    // index into `views` currently owning the screen (None = the normal
+    // server-driven frame is shown). Views are purely client-side; the server
+    // knows nothing about them.
+    let mut views: Vec<crate::client::view::ClientView> = Vec::new();
+    let mut active_view: Option<usize> = None;
+    // Pending "add focused pane to a view" flow (see the `w a` handler): we ask
+    // the foreground server for its session tree, resolve the focused pane into
+    // `pending_pane` when the tree arrives, and complete the add once the user
+    // picks a target view in the picker overlay.
+    let mut pending_view_add = false;
+    let mut pending_pane: Option<(ConnId, crate::protocol::PaneId)> = None;
+
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
     let mut last_drag_send: Instant = Instant::now();
@@ -728,16 +935,59 @@ async fn run_client_loop(
                         match action {
                             InputAction::SendToPty(data) => {
                                 log::debug!("input: SendToPty {} bytes", data.len());
-                                // Reset scroll when user types (sends PTY input)
-                                if is_scrolled {
-                                    scroll_offset = 0;
-                                    is_scrolled = false;
-                                    mgr.send_foreground(ClientMessage::ScrollReset).await?;
+                                if let Some(av) = active_view {
+                                    // In view mode, route keystrokes to the focused
+                                    // cell's pane by identity (independent of the
+                                    // server's foreground focus). No cells => drop.
+                                    let view = &views[av];
+                                    if let Some(cell) = view.cells.get(view.focused) {
+                                        let conn = cell.conn.clone();
+                                        let pane_id = cell.pane_id;
+                                        mgr.send(&conn, ClientMessage::InputToPane { pane_id, data }).await?;
+                                    }
+                                } else {
+                                    // Reset scroll when user types (sends PTY input)
+                                    if is_scrolled {
+                                        scroll_offset = 0;
+                                        is_scrolled = false;
+                                        mgr.send_foreground(ClientMessage::ScrollReset).await?;
+                                    }
+                                    mgr.send_foreground(ClientMessage::Input { data }).await?;
                                 }
-                                mgr.send_foreground(ClientMessage::Input { data }).await?;
                             }
                             InputAction::Execute(cmd) => {
                                 log::debug!("input: Execute cmd={:?}", cmd);
+                                // In view mode, PaneFocus moves the view's focused
+                                // cell client-side and is NOT forwarded to the
+                                // server. Everything else falls through unchanged.
+                                if let Some(av) = active_view {
+                                    let dir = match cmd {
+                                        RemuxCommand::PaneFocusLeft => Some(crate::server::layout::FocusDirection::Left),
+                                        RemuxCommand::PaneFocusRight => Some(crate::server::layout::FocusDirection::Right),
+                                        RemuxCommand::PaneFocusUp => Some(crate::server::layout::FocusDirection::Up),
+                                        RemuxCommand::PaneFocusDown => Some(crate::server::layout::FocusDirection::Down),
+                                        _ => None,
+                                    };
+                                    if let Some(dir) = dir {
+                                        if whichkey.visible {
+                                            whichkey.hide();
+                                            renderer.clear_overlay(cols, rows)?;
+                                        }
+                                        if views[av].move_focus(dir) {
+                                            paint_view(
+                                                &mut renderer,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        }
+                                        continue;
+                                    }
+                                }
                                 // Hide which-key popup when executing a command
                                 if whichkey.visible {
                                     whichkey.hide();
@@ -793,6 +1043,32 @@ async fn run_client_loop(
                                 for cmd in cmds {
                                     if matches!(cmd, RemuxCommand::SessionDetach) {
                                         return Ok(());
+                                    }
+                                    // In view mode, PaneFocus moves the view's
+                                    // focused cell instead of being forwarded.
+                                    if let Some(av) = active_view {
+                                        let dir = match cmd {
+                                            RemuxCommand::PaneFocusLeft => Some(crate::server::layout::FocusDirection::Left),
+                                            RemuxCommand::PaneFocusRight => Some(crate::server::layout::FocusDirection::Right),
+                                            RemuxCommand::PaneFocusUp => Some(crate::server::layout::FocusDirection::Up),
+                                            RemuxCommand::PaneFocusDown => Some(crate::server::layout::FocusDirection::Down),
+                                            _ => None,
+                                        };
+                                        if let Some(dir) = dir {
+                                            if views[av].move_focus(dir) {
+                                                paint_view(
+                                                    &mut renderer,
+                                                    &views[av],
+                                                    &input,
+                                                    &whichkey,
+                                                    &theme,
+                                                    &which_key_position,
+                                                    viewport_top,
+                                                    focused_pane_rect.as_ref(),
+                                                )?;
+                                            }
+                                            continue;
+                                        }
                                     }
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
@@ -937,6 +1213,7 @@ async fn run_client_loop(
                                     Some(RenameTarget::Pane) => "Pane",
                                     Some(RenameTarget::Session) => "Session",
                                     Some(RenameTarget::NewSession) => "New Session",
+                                    Some(RenameTarget::NewView) => "New View",
                                     None => "Pane",
                                 };
                                 let (c, r) = crossterm::terminal::size()?;
@@ -1002,6 +1279,7 @@ async fn run_client_loop(
                                     RenameTarget::Pane => "Pane",
                                     RenameTarget::Session => "Session",
                                     RenameTarget::NewSession => "New Session",
+                                    RenameTarget::NewView => "New View",
                                 };
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.render_rename_popup(text, target_str, c, r)?;
@@ -1772,6 +2050,219 @@ async fn run_client_loop(
                                 let fg = mgr.foreground().clone();
                                 record_switch(&mut current_attached, &mut previous_attached, fg, name.clone());
                             }
+                            // -- Views --------------------------------------------------
+                            InputAction::NewView(ref name) => {
+                                // Create a new empty view and activate it. Empty
+                                // until panes are added via `w a`.
+                                let name = if name.trim().is_empty() {
+                                    format!("View {}", views.len() + 1)
+                                } else {
+                                    name.clone()
+                                };
+                                views.push(crate::client::view::ClientView::new(name));
+                                let idx = views.len() - 1;
+                                active_view = Some(idx);
+                                // No cells yet, so nothing to subscribe. Force a
+                                // clean frame and paint the (empty) view.
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.resize(c, r);
+                                paint_view(
+                                    &mut renderer,
+                                    &views[idx],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            }
+                            InputAction::ViewAddPaneOpen => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // Resolve the current focused pane asynchronously
+                                // (the client doesn't track it): ask the foreground
+                                // server for its tree, then open the picker. The
+                                // tree round-trip beats the human pressing Enter, so
+                                // `pending_pane` is resolved before ViewPickerConfirm.
+                                pending_view_add = true;
+                                pending_pane = None;
+                                mgr.send_foreground(ClientMessage::ListSessionTree).await?;
+                                let names: Vec<String> = views.iter().map(|v| v.name.clone()).collect();
+                                input.mode = Mode::Command;
+                                input.view_picker = Some(crate::client::input::ViewPickerOverlay::new(names));
+                                if let Some(ref vp) = input.view_picker {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = vp.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::ViewPickerUpdate => {
+                                if let Some(ref vp) = input.view_picker {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = vp.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::ViewPickerClose => {
+                                pending_view_add = false;
+                                pending_pane = None;
+                                let (c, r) = crossterm::terminal::size()?;
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else {
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::ViewPickerConfirm { view } => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                pending_view_add = false;
+                                match pending_pane.take() {
+                                    Some((conn, pane_id)) => {
+                                        // Resolve the target view: an existing one,
+                                        // or a freshly created + activated one.
+                                        let target_idx = match view {
+                                            Some(i) if i < views.len() => i,
+                                            _ => {
+                                                let name = format!("View {}", views.len() + 1);
+                                                views.push(crate::client::view::ClientView::new(name));
+                                                let idx = views.len() - 1;
+                                                active_view = Some(idx);
+                                                idx
+                                            }
+                                        };
+                                        views[target_idx].cells.push(crate::client::view::ViewCell {
+                                            conn,
+                                            pane_id,
+                                            snapshot: None,
+                                        });
+                                        views[target_idx].clamp_focus();
+                                        if active_view == Some(target_idx) {
+                                            // (Re)subscribe every cell at its new
+                                            // size and repaint the live view.
+                                            subscribe_view_cells(mgr, &views[target_idx]).await?;
+                                            paint_view(
+                                                &mut renderer,
+                                                &views[target_idx],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        } else {
+                                            // Added to a background view: just clear
+                                            // the picker popup off the server frame.
+                                            renderer.clear_overlay(c, r)?;
+                                            renderer.flush()?;
+                                        }
+                                    }
+                                    None => {
+                                        // The focused pane never resolved (no tree,
+                                        // or no focused pane in the current session).
+                                        log::warn!("view: add-pane confirmed but focused pane unresolved; ignoring");
+                                        if let Some(av) = active_view {
+                                            paint_view(
+                                                &mut renderer,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        } else {
+                                            renderer.clear_overlay(c, r)?;
+                                            renderer.flush()?;
+                                        }
+                                    }
+                                }
+                            }
+                            InputAction::ViewRemovePane => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                if let Some(av) = active_view {
+                                    if !views[av].cells.is_empty() {
+                                        let focused = views[av].focused;
+                                        let cell = views[av].cells.remove(focused);
+                                        mgr.send(&cell.conn, ClientMessage::UnsubscribePane {
+                                            pane_id: cell.pane_id,
+                                        }).await?;
+                                        views[av].clamp_focus();
+                                        // Remaining cells changed size: re-subscribe.
+                                        subscribe_view_cells(mgr, &views[av]).await?;
+                                        paint_view(
+                                            &mut renderer,
+                                            &views[av],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
+                                    }
+                                }
+                            }
+                            InputAction::ViewLayoutNext => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                if let Some(av) = active_view {
+                                    views[av].layout = views[av].layout.next();
+                                    // Note: cells are not re-subscribed at the new
+                                    // per-cell size here (re-subscribe-on-layout is
+                                    // deferred); the next snapshot still composites.
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                }
+                            }
+                            InputAction::ViewClose => {
+                                // Deactivate the active view (kept in `views`, not
+                                // deleted — closing hides it). Unsubscribe its cells
+                                // and hand the screen back to the foreground session
+                                // by forcing a fresh server FullRender via Resize.
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                if let Some(av) = active_view {
+                                    unsubscribe_view_cells(mgr, &views[av]).await?;
+                                    active_view = None;
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.resize(c, r);
+                                    mgr.send_foreground(ClientMessage::Resize { cols: c, rows: r }).await?;
+                                }
+                            }
                             InputAction::None => {}
                         }
                     }
@@ -1879,6 +2370,20 @@ async fn run_client_loop(
                         log::debug!("resize: {}x{}", new_cols, new_rows);
                         renderer.resize(new_cols, new_rows);
                         mgr.send_foreground(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
+                        // A live view owns the screen; recomposite it at the new
+                        // size so it doesn't stay blank until the next snapshot.
+                        if let Some(av) = active_view {
+                            paint_view(
+                                &mut renderer,
+                                &views[av],
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                            )?;
+                        }
                     }
                     Some(Ok(crossterm::event::Event::Paste(text))) => {
                         // Wrap pasted text in bracketed paste sequences.
@@ -2003,67 +2508,24 @@ async fn run_client_loop(
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
-                        renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
-                        // Re-render visual overlay on top if in visual mode
-                        if let Some(ref vs) = input.visual_state {
-                            renderer.render_visual_overlay(vs)?;
-                        }
-                        // Re-render rename popup on top if active
-                        if let Some(ref overlay) = input.rename_overlay {
-                            let target_str = match overlay.target {
-                                RenameTarget::Tab => "Tab",
-                                RenameTarget::Pane => "Pane",
-                                RenameTarget::Session => "Session",
-                                RenameTarget::NewSession => "New Session",
-                            };
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
-                        }
-                        // Re-render command palette on top if active
-                        else if let Some(ref palette) = input.command_palette {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = palette.render(c, r, &theme);
-                            renderer.render_command_palette_overlay(&draw_cmds)?;
-                        }
-                        // Re-render search prompt and highlights on top if in search mode
-                        else if let Some(ref ss) = input.search_state {
-                            let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
-                            let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.render_search_highlight(
-                                &ss.matches,
-                                ss.current_match,
-                                query.len(),
+                        // A View owns the screen while active: keep all the
+                        // bookkeeping above (so state is fresh when the view
+                        // closes) but skip painting the server's frame.
+                        if active_view.is_none() {
+                            renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            relay_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                &theme,
+                                cols,
+                                rows,
                             )?;
-                            renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                            renderer.flush()?;
                         }
-                        // Re-render session switch overlay on top if active
-                        else if let Some(ref ss) = input.session_switch {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = ss.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render folder select overlay on top if active
-                        else if let Some(ref fs) = input.folder_select {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = fs.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render session manager on top if active
-                        else if let Some(ref sm) = input.session_manager {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = sm.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render popup on top if visible
-                        else if whichkey.visible {
-                            let commands = whichkey.render(cols, rows, &theme, which_key_position.clone());
-                            renderer.render_whichkey_overlay(&commands)?;
-                        }
-                        renderer.flush()?;
                     }
                     Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) scroll_offset={}", changes.len(), cursor_x, cursor_y, so);
@@ -2077,67 +2539,22 @@ async fn run_client_loop(
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
-                        renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
-                        // Re-render visual overlay on top if in visual mode
-                        if let Some(ref vs) = input.visual_state {
-                            renderer.render_visual_overlay(vs)?;
-                        }
-                        // Re-render rename popup on top if active
-                        if let Some(ref overlay) = input.rename_overlay {
-                            let target_str = match overlay.target {
-                                RenameTarget::Tab => "Tab",
-                                RenameTarget::Pane => "Pane",
-                                RenameTarget::Session => "Session",
-                                RenameTarget::NewSession => "New Session",
-                            };
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
-                        }
-                        // Re-render command palette on top if active
-                        else if let Some(ref palette) = input.command_palette {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = palette.render(c, r, &theme);
-                            renderer.render_command_palette_overlay(&draw_cmds)?;
-                        }
-                        // Re-render search prompt and highlights on top if in search mode
-                        else if let Some(ref ss) = input.search_state {
-                            let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
-                            let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.render_search_highlight(
-                                &ss.matches,
-                                ss.current_match,
-                                query.len(),
+                        // See the FullRender arm: a View suppresses the paint.
+                        if active_view.is_none() {
+                            renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            relay_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                &theme,
+                                cols,
+                                rows,
                             )?;
-                            renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                            renderer.flush()?;
                         }
-                        // Re-render session switch overlay on top if active
-                        else if let Some(ref ss) = input.session_switch {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = ss.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render folder select overlay on top if active
-                        else if let Some(ref fs) = input.folder_select {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = fs.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render session manager on top if active
-                        else if let Some(ref sm) = input.session_manager {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = sm.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render popup on top if visible
-                        else if whichkey.visible {
-                            let commands = whichkey.render(cols, rows, &theme, which_key_position.clone());
-                            renderer.render_whichkey_overlay(&commands)?;
-                        }
-                        renderer.flush()?;
                     }
                     Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
                         log::debug!("srv: ScrollRender delta={} pane=({},{} {}x{}) scroll_offset={}", delta, pane_x, pane_y, pane_width, pane_height, so);
@@ -2151,67 +2568,22 @@ async fn run_client_loop(
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
-                        renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
-                        // Re-render visual overlay on top if in visual mode
-                        if let Some(ref vs) = input.visual_state {
-                            renderer.render_visual_overlay(vs)?;
-                        }
-                        // Re-render rename popup on top if active
-                        if let Some(ref overlay) = input.rename_overlay {
-                            let target_str = match overlay.target {
-                                RenameTarget::Tab => "Tab",
-                                RenameTarget::Pane => "Pane",
-                                RenameTarget::Session => "Session",
-                                RenameTarget::NewSession => "New Session",
-                            };
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
-                        }
-                        // Re-render command palette on top if active
-                        else if let Some(ref palette) = input.command_palette {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = palette.render(c, r, &theme);
-                            renderer.render_command_palette_overlay(&draw_cmds)?;
-                        }
-                        // Re-render search prompt and highlights on top if in search mode
-                        else if let Some(ref ss) = input.search_state {
-                            let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
-                            let match_info = if ss.matches.is_empty() { None } else { Some((ss.current_match, ss.matches.len())) };
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.render_search_highlight(
-                                &ss.matches,
-                                ss.current_match,
-                                query.len(),
+                        // See the FullRender arm: a View suppresses the paint.
+                        if active_view.is_none() {
+                            renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            relay_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
-                                &theme,
+                                cols,
+                                rows,
                             )?;
-                            renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+                            renderer.flush()?;
                         }
-                        // Re-render session switch overlay on top if active
-                        else if let Some(ref ss) = input.session_switch {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = ss.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render folder select overlay on top if active
-                        else if let Some(ref fs) = input.folder_select {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = fs.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render session manager on top if active
-                        else if let Some(ref sm) = input.session_manager {
-                            let (c, r) = crossterm::terminal::size()?;
-                            let draw_cmds = sm.render(c, r, &theme);
-                            renderer.render_whichkey_overlay(&draw_cmds)?;
-                        }
-                        // Re-render popup on top if visible
-                        else if whichkey.visible {
-                            let commands = whichkey.render(cols, rows, &theme, which_key_position.clone());
-                            renderer.render_whichkey_overlay(&commands)?;
-                        }
-                        renderer.flush()?;
                     }
                     Some(ServerMessage::SessionList { sessions }) => {
                         log::debug!("received session list with {} sessions", sessions.len());
@@ -2405,6 +2777,43 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
+                        // Resolve a pending "add focused pane to a view" request
+                        // BEFORE `folders`/`unfiled` are moved into the session
+                        // manager below. `is_focused` is per-tab (every tab reports
+                        // its focused pane), and this message carries no active-tab
+                        // marker, so within the current session we take the first
+                        // focused pane found (multi-tab active-tab disambiguation is
+                        // a known limitation).
+                        if pending_view_add && mgr.is_foreground(&src) {
+                            let want = current_attached.as_ref().map(|(_, s)| s.clone());
+                            let mut found: Option<crate::protocol::PaneId> = None;
+                            'find: for s in folders
+                                .iter()
+                                .flat_map(|f| f.sessions.iter())
+                                .chain(unfiled.iter())
+                            {
+                                let is_target = match &want {
+                                    Some(name) => &s.name == name,
+                                    None => s.is_current,
+                                };
+                                if !is_target {
+                                    continue;
+                                }
+                                for tab in &s.tabs {
+                                    for p in &tab.panes {
+                                        if p.is_focused {
+                                            found = Some(p.id);
+                                            break 'find;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(pid) = found {
+                                pending_pane = Some((src.clone(), pid));
+                            }
+                            // Consumed: don't let a later tree re-resolve it.
+                            pending_view_add = false;
+                        }
                         // The session-switch popup aggregates every connected
                         // server's tree, so it accepts trees from ANY source
                         // (not just the foreground) and tags each with `src`,
@@ -2533,6 +2942,46 @@ async fn run_client_loop(
                         // Update visual state with accurate total line count.
                         if let Some(ref mut vs) = input.visual_state {
                             vs.total_lines = total_lines;
+                        }
+                    }
+                    Some(ServerMessage::PaneContent { pane_id, cols: pane_cols, rows: pane_rows, cells: pane_cells }) => {
+                        // Note: `pane_cols`/`pane_rows` are the PANE's size, not
+                        // the terminal's; do not confuse them with the loop's
+                        // `cols`/`rows`. Fold this snapshot into every view cell
+                        // that aliases (src, pane_id), then repaint if the change
+                        // touched the currently-active view.
+                        log::debug!("srv: PaneContent pane_id={pane_id} {pane_cols}x{pane_rows}");
+                        let snap = crate::client::view::PaneSnapshot {
+                            cols: pane_cols,
+                            rows: pane_rows,
+                            cells: pane_cells,
+                        };
+                        let mut active_touched = false;
+                        for (vi, view) in views.iter_mut().enumerate() {
+                            for cell in view.cells.iter_mut() {
+                                if cell.conn == src && cell.pane_id == pane_id {
+                                    // Clone per match: the same pane can be
+                                    // aliased by more than one cell/view.
+                                    cell.snapshot = Some(snap.clone());
+                                    if active_view == Some(vi) {
+                                        active_touched = true;
+                                    }
+                                }
+                            }
+                        }
+                        if active_touched {
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            }
                         }
                     }
                     // Unreachable: `Closed` is handled in the preamble above, so
