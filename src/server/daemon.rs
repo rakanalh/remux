@@ -137,6 +137,22 @@ struct PaneData {
 
 // MouseSelection is imported from compositor.
 
+/// An in-progress mouse drag-selection gesture for a client.
+///
+/// The gesture's anchor (where the drag started) is stored in *absolute*,
+/// eviction-stable coordinates ([`Screen::abs_of_row`]) rather than viewport
+/// rows, so that when the view auto-scrolls into scrollback during the drag the
+/// anchor stays pinned to the same logical buffer line instead of drifting. The
+/// viewport-relative `MouseSelection` is re-derived from this each event.
+struct DragSession {
+    /// Pane the gesture belongs to; a drag into a different pane starts fresh.
+    pane_id: PaneId,
+    /// Anchor column in the pane's content area.
+    anchor_col: u16,
+    /// Anchor row as a stable absolute line id.
+    anchor_abs: usize,
+}
+
 /// A connected client with metadata about which session it is attached to.
 struct ClientConnection {
     session_name: Option<String>,
@@ -158,6 +174,16 @@ struct ClientConnection {
     /// to send a FullRender so the diff baseline can't desync from the client's
     /// screen across a scroll transition.
     needs_full_render: bool,
+    /// In-progress mouse drag-selection gesture, if any. Tracks the drag anchor
+    /// in eviction-stable absolute coordinates so edge auto-scroll doesn't drift.
+    drag: Option<DragSession>,
+    /// Armed when a drag is resting on a scrollable content edge: stores the last
+    /// drag coordinates `(start_x, start_y, end_x, end_y)` so the per-client
+    /// reader loop can replay the edge-scroll step on a repeating timer while the
+    /// pointer is held still (terminals stop emitting drag events without motion).
+    /// `None` disarms the timer -- set at construction, on click, on release, and
+    /// whenever the scroll reaches its bound.
+    autoscroll_repeat: Option<(u16, u16, u16, u16)>,
 }
 
 /// The Remux server.
@@ -434,6 +460,8 @@ impl RemuxServer {
                     scroll_offset: 0,
                     prev_scroll_offset: 0,
                     needs_full_render: false,
+                    drag: None,
+                    autoscroll_repeat: None,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -458,6 +486,13 @@ impl RemuxServer {
         let config = Arc::clone(&self.config);
         let prev_frames = Arc::clone(&self.prev_frames);
         let dormant = Arc::clone(&self.dormant);
+
+        // Clones for the drag-autoscroll ticker task (see below).
+        let ts_state = Arc::clone(&self.state);
+        let ts_panes = Arc::clone(&self.panes);
+        let ts_clients = Arc::clone(&self.clients);
+        let ts_config = Arc::clone(&self.config);
+        let ts_prev_frames = Arc::clone(&self.prev_frames);
 
         tokio::spawn(async move {
             let mut reader = read_half;
@@ -494,6 +529,55 @@ impl RemuxServer {
                         log::error!("error reading from client {client_id}: {e}");
                         handle_client_disconnect(client_id, &clients, &prev_frames).await;
                         break;
+                    }
+                }
+            }
+        });
+
+        // Spawn the drag-autoscroll ticker task. When a drag rests still on a
+        // scrollable content edge, terminals stop sending drag events, so nothing
+        // in the reader loop would advance the scroll. This timer replays the
+        // edge-scroll step at a constant rate while `autoscroll_repeat` is armed
+        // (set/cleared by `handle_mouse_drag` / `handle_mouse_click`).
+        //
+        // This lives in its own task rather than a `tokio::select!` arm of the
+        // reader loop on purpose: `read_message` reads a frame's header and
+        // payload into locals across two awaits and is NOT cancel-safe, so if a
+        // timer tick cancelled a partially-read frame the consumed bytes would be
+        // lost and the protocol stream would desync. A separate task keeps the
+        // reader loop's read future alive to completion. The task self-terminates
+        // when the client is removed from the map on disconnect.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(40));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // Read (and drop the lock before calling into handle_mouse_drag,
+                // which locks `clients` itself). Break when the client is gone.
+                let armed = {
+                    let cls = ts_clients.lock().await;
+                    match cls.get(&client_id) {
+                        Some(c) => c.autoscroll_repeat,
+                        None => break,
+                    }
+                };
+                if let Some((sx, sy, ex, ey)) = armed {
+                    if let Err(e) = handle_mouse_drag(
+                        client_id,
+                        sx,
+                        sy,
+                        ex,
+                        ey,
+                        false,
+                        &ts_state,
+                        &ts_panes,
+                        &ts_clients,
+                        &ts_config,
+                        &ts_prev_frames,
+                    )
+                    .await
+                    {
+                        log::error!("autoscroll drag error: {e}");
                     }
                 }
             }
@@ -2565,17 +2649,14 @@ async fn handle_scroll_delta(
         };
         if let Some(fp) = focused_pane_id {
             let ps = panes.lock().await;
+            // Clamp against the focused pane's inner grid height
+            // (screen.rows == grid.len()), which is exactly the number of content
+            // rows blit_screen draws for the pane. Using the client terminal rows
+            // here would over-subtract (it ignores the status bar and pane
+            // borders), leaving the earliest scrollback lines unreachable at max
+            // scroll.
             ps.get(&fp)
-                .map(|p| {
-                    // Clamp against the focused pane's inner grid height
-                    // (screen.rows == grid.len()), which is exactly the number of
-                    // content rows blit_screen draws for the pane. Using the
-                    // client terminal rows here would over-subtract (it ignores
-                    // the status bar and pane borders), leaving the earliest
-                    // scrollback lines unreachable at max scroll.
-                    let total = p.screen.total_lines();
-                    total.saturating_sub(p.screen.rows as usize)
-                })
+                .map(|p| p.screen.max_scroll_offset())
                 .unwrap_or(0)
         } else {
             0
@@ -2745,6 +2826,18 @@ async fn handle_mouse_scroll(
     }
 }
 
+/// Disarm the drag-autoscroll repeat timer for a client. Called from the early
+/// returns in [`handle_mouse_drag`] that can be reached while a drag is armed
+/// (the target pane's process exited, the drag no longer hits a pane, etc.), so
+/// the ticker task stops re-invoking a drag that can never make progress instead
+/// of spinning at the tick rate.
+async fn disarm_autoscroll(clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>, client_id: u64) {
+    let mut cls = clients.lock().await;
+    if let Some(c) = cls.get_mut(&client_id) {
+        c.autoscroll_repeat = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_mouse_click(
     client_id: u64,
@@ -2762,8 +2855,13 @@ async fn handle_mouse_click(
             Some(c) => c,
             None => return Ok(()),
         };
-        // Clear any active selection on click.
+        // Clear any active selection on click. Also end any in-progress drag
+        // gesture so the next drag starts a fresh anchor (a click always begins
+        // a new selection in the same or a different pane).
         client.mouse_selection = None;
+        client.drag = None;
+        // A click ends any in-progress edge auto-scroll.
+        client.autoscroll_repeat = None;
         (
             client.session_name.clone(),
             client.cols,
@@ -2891,7 +2989,10 @@ async fn handle_mouse_drag(
     };
     let session_name = match session_name {
         Some(s) => s,
-        None => return Ok(()),
+        None => {
+            disarm_autoscroll(clients, client_id).await;
+            return Ok(());
+        }
     };
 
     // Build composite to get pane rects for coordinate mapping.
@@ -2915,13 +3016,19 @@ async fn handle_mouse_drag(
     let start_target = hit_test(start_x, start_y, &hit_regions, &pane_rects);
     let target_pane = match start_target {
         ClickTarget::Pane(id) => id,
-        _ => return Ok(()),
+        _ => {
+            disarm_autoscroll(clients, client_id).await;
+            return Ok(());
+        }
     };
 
     // Find the pane's rect for coordinate mapping.
     let pane_rect = match pane_rects.iter().find(|(id, _)| *id == target_pane) {
         Some((_, r)) => *r,
-        None => return Ok(()),
+        None => {
+            disarm_autoscroll(clients, client_id).await;
+            return Ok(());
+        }
     };
 
     // Compute border offset based on style.
@@ -2932,41 +3039,178 @@ async fn handle_mouse_drag(
     let content_width = pane_rect.width.saturating_sub(border_offset * 2);
     let content_height = pane_rect.height.saturating_sub(border_offset * 2);
 
-    // Map screen coordinates to pane-local coordinates (relative to content area).
-    let local_start_x = start_x.saturating_sub(pane_rect.x + border_offset);
-    let local_start_y = start_y.saturating_sub(pane_rect.y + border_offset);
+    // Map screen coordinates to pane-local coordinates (relative to content
+    // area). Columns clamp to the content width; the start row clamps into the
+    // content area too, but the end row is kept both raw (for edge detection)
+    // and as a clamped display row.
+    let local_start_x = start_x
+        .saturating_sub(pane_rect.x + border_offset)
+        .min(content_width.saturating_sub(1));
+    let local_start_y = start_y
+        .saturating_sub(pane_rect.y + border_offset)
+        .min(content_height.saturating_sub(1));
     let local_end_x = end_x
         .saturating_sub(pane_rect.x + border_offset)
         .min(content_width.saturating_sub(1));
-    let local_end_y = end_y
-        .saturating_sub(pane_rect.y + border_offset)
-        .min(content_height.saturating_sub(1));
+    let raw_end_row = end_y.saturating_sub(pane_rect.y + border_offset);
+    let end_row = raw_end_row.min(content_height.saturating_sub(1));
 
-    // Always update selection state so highlighting renders during drag.
+    // Edge detection: is the drag end on the top or bottom content row?
+    let at_top = end_row == 0;
+    let at_bottom = content_height > 0 && end_row == content_height - 1;
+
+    // Auto-scroll only applies when the drag target is the client's FOCUSED
+    // pane -- the per-client scroll_offset belongs to that pane. A non-focused
+    // target always renders at the live view (offset 0).
+    let focused_pane = {
+        let st = state.lock().await;
+        st.sessions
+            .get(&session_name)
+            .and_then(|s| s.tabs.get(s.active_tab).map(|t| t.focused_pane))
+    };
+    let is_focused = focused_pane == Some(target_pane);
+
+    // Read the client's current scroll offset and the state of any in-progress
+    // drag gesture.
+    let (scroll_offset, gesture) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => (
+                c.scroll_offset,
+                c.drag
+                    .as_ref()
+                    .map(|d| (d.pane_id, d.anchor_col, d.anchor_abs)),
+            ),
+            None => return Ok(()),
+        }
+    };
+    // A drag into a different pane (or with no active gesture) starts fresh.
+    let new_gesture = match gesture {
+        Some((pid, _, _)) => pid != target_pane,
+        None => true,
+    };
+    let base_offset = if is_focused { scroll_offset } else { 0 };
+
+    // Compute the new scroll offset (focused pane only), the anchor in absolute
+    // coordinates, the end point in absolute coordinates, and the anchor's row
+    // projected back into the current viewport. abs_of_row / row_of_abs are pure
+    // over (scrollback len, eviction count, rows), so this is one lock scope.
+    // Yields `None` (via labeled break) if the target pane vanished, so the
+    // panes lock is released before we disarm autoscroll (which locks `clients`)
+    // -- avoids nesting the two locks.
+    let computed = 'compute: {
+        let ps = panes.lock().await;
+        let screen = match ps.get(&target_pane) {
+            Some(p) => &p.screen,
+            None => break 'compute None,
+        };
+
+        // Max scroll offset (top of scrollback); also gates whether edge
+        // auto-scroll should keep repeating (see `autoscroll_repeat` below).
+        let screen_max_scroll_offset = screen.max_scroll_offset();
+
+        // Anchor: reuse the stored one, or capture a fresh anchor from the drag
+        // start (in the pre-scroll view) for a new gesture.
+        let (anchor_col, anchor_abs) = if new_gesture {
+            (local_start_x, screen.abs_of_row(base_offset, local_start_y))
+        } else {
+            let (_, col, abs) = gesture.unwrap();
+            (col, abs)
+        };
+
+        // Edge auto-scroll, focused pane only.
+        let new_offset = if is_focused {
+            if at_top {
+                (scroll_offset + 1).min(screen_max_scroll_offset)
+            } else if at_bottom {
+                scroll_offset.saturating_sub(1)
+            } else {
+                scroll_offset
+            }
+        } else {
+            scroll_offset
+        };
+        let new_base = if is_focused { new_offset } else { 0 };
+
+        let end_abs = screen.abs_of_row(new_base, end_row);
+        let anchor_row_i64 = screen.row_of_abs(new_base, anchor_abs);
+        Some((
+            new_offset,
+            anchor_col,
+            anchor_abs,
+            end_abs,
+            anchor_row_i64,
+            screen_max_scroll_offset,
+        ))
+    };
+    let (new_offset, anchor_col, anchor_abs, end_abs, anchor_row_i64, screen_max_scroll_offset) =
+        match computed {
+            Some(v) => v,
+            None => {
+                disarm_autoscroll(clients, client_id).await;
+                return Ok(());
+            }
+        };
+
+    // Project the anchor into the current viewport for the (viewport-relative)
+    // MouseSelection: an anchor scrolled above the viewport clamps to row 0,
+    // one scrolled below clamps to the last content row.
+    let anchor_row = anchor_row_i64.clamp(0, content_height.saturating_sub(1) as i64) as u16;
+    let end_col = local_end_x;
+
+    // Commit the gesture, the new scroll offset, and the derived selection.
+    let offset_changed = is_focused && new_offset != scroll_offset;
     {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
+            if new_gesture {
+                client.drag = Some(DragSession {
+                    pane_id: target_pane,
+                    anchor_col,
+                    anchor_abs,
+                });
+            }
+            if is_focused {
+                client.scroll_offset = new_offset;
+                if offset_changed {
+                    client.needs_full_render = true;
+                }
+            }
             client.mouse_selection = Some(MouseSelection {
                 pane_id: target_pane,
-                start: (local_start_x, local_start_y),
-                end: (local_end_x, local_end_y),
+                start: (anchor_col, anchor_row),
+                end: (end_col, end_row),
             });
+            // Arm/disarm the repeating edge-scroll timer. Keep firing only while
+            // resting on a focused-pane edge that still has room to scroll;
+            // disarm exactly at the scrollback top / live bottom so the timer
+            // stops instead of spinning. A final drag never arms.
+            client.autoscroll_repeat = if is_focused
+                && !is_final
+                && ((at_top && new_offset < screen_max_scroll_offset)
+                    || (at_bottom && new_offset > 0))
+            {
+                Some((start_x, start_y, end_x, end_y))
+            } else {
+                None
+            };
         }
     }
 
     if is_final {
         // Mouse button released -- decide based on mouse_auto_yank config.
         if config.general.mouse_auto_yank {
-            // Extract text from the pane's screen.
+            // Extract text over the absolute selection range so the yank is
+            // correct even when it spans scrollback.
             let selected_text = {
                 let ps = panes.lock().await;
                 if let Some(pane_data) = ps.get(&target_pane) {
                     extract_selection_text(
                         &pane_data.screen,
-                        local_start_x,
-                        local_start_y,
-                        local_end_x,
-                        local_end_y,
+                        anchor_col,
+                        anchor_abs,
+                        end_col,
+                        end_abs,
                     )
                 } else {
                     String::new()
@@ -2992,48 +3236,78 @@ async fn handle_mouse_drag(
         }
         // When mouse_auto_yank is false, selection stays visible for keyboard
         // adjustment in visual mode. No copy, no clear.
+
+        // Always end the drag gesture on release.
+        {
+            let mut cls = clients.lock().await;
+            if let Some(client) = cls.get_mut(&client_id) {
+                client.drag = None;
+            }
+        }
     }
 
-    // Trigger re-render to show/update/clear selection highlighting.
-    broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+    // Re-render for THIS client so its scrolled view + selection show. Use the
+    // per-client path (like handle_scroll_delta): broadcast_full_render renders
+    // at offset 0 and would not reflect this client's auto-scrolled viewport.
+    send_full_render_to_client(
+        client_id,
+        &session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+    )
+    .await;
 
     Ok(())
 }
 
-/// Extract text from a pane's screen buffer within the given pane-local
-/// coordinate range.
+/// Extract text from a pane's screen buffer between two selection endpoints
+/// given in absolute, eviction-stable line coordinates (see
+/// [`Screen::abs_of_row`]). Working in absolute space means the yank is correct
+/// even when the selection spans scrollback that has scrolled out of the
+/// viewport during a drag.
 fn extract_selection_text(
     screen: &Screen,
-    start_x: u16,
-    start_y: u16,
-    end_x: u16,
-    end_y: u16,
+    anchor_col: u16,
+    anchor_abs: usize,
+    end_col: u16,
+    end_abs: usize,
 ) -> String {
-    // Normalize so start <= end.
-    let (sy, sx, ey, ex) = if (start_y, start_x) <= (end_y, end_x) {
-        (start_y, start_x, end_y, end_x)
-    } else {
-        (end_y, end_x, start_y, start_x)
-    };
+    // Normalize so the earlier point (in reading order) comes first.
+    let (first_abs, first_col, last_abs, last_col) =
+        if (anchor_abs, anchor_col) <= (end_abs, end_col) {
+            (anchor_abs, anchor_col, end_abs, end_col)
+        } else {
+            (end_abs, end_col, anchor_abs, anchor_col)
+        };
 
     let mut result = String::new();
-    for row in sy..=ey {
-        let r = row as usize;
-        if r >= screen.grid.len() {
-            break;
-        }
-        let row_data = &screen.grid[r];
-        let col_start = if row == sy { sx as usize } else { 0 };
-        let col_end = if row == ey {
-            (ex as usize + 1).min(row_data.len())
+    let mut first_line = true;
+    for abs in first_abs..=last_abs {
+        let row_data = match screen.line_at(screen.array_index_of_abs(abs)) {
+            Some(r) => r,
+            None => continue,
+        };
+        let col_start = if abs == first_abs {
+            first_col as usize
+        } else {
+            0
+        };
+        let col_end = if abs == last_abs {
+            (last_col as usize + 1).min(row_data.len())
         } else {
             row_data.len()
         };
+        let col_start = col_start.min(row_data.len());
+        let col_end = col_end.max(col_start);
 
         let text: String = row_data[col_start..col_end].iter().map(|c| c.c).collect();
-        if row > sy {
+        if !first_line {
             result.push('\n');
         }
+        first_line = false;
         result.push_str(text.trim_end());
     }
     result

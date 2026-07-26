@@ -154,6 +154,13 @@ pub struct Screen {
     pub scrollback: VecDeque<Row>,
     /// Maximum number of scrollback lines to retain.
     pub scrollback_limit: usize,
+    /// Total number of lines that have been permanently evicted off the top of
+    /// scrollback (via `scrollback.pop_front()`) over the screen's lifetime.
+    /// Combined with the current combined-buffer index it yields an
+    /// eviction-stable absolute line id, so a captured selection anchor keeps
+    /// pointing at the same content line even as older lines are dropped. See
+    /// [`Screen::abs_of_row`] / [`Screen::row_of_abs`].
+    pub lines_evicted: usize,
     /// Top of the scroll region (0-based, inclusive).
     pub scroll_top: u16,
     /// Bottom of the scroll region (0-based, inclusive).
@@ -218,6 +225,7 @@ impl Screen {
             current_hyperlink: None,
             scrollback: VecDeque::new(),
             scrollback_limit,
+            lines_evicted: 0,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             parser: vte::Parser::new(),
@@ -421,6 +429,38 @@ impl Screen {
         } else {
             self.grid.get(index - self.scrollback.len())
         }
+    }
+
+    /// Maximum scroll offset: how many lines the view can be scrolled back
+    /// before the oldest scrollback line sits on the top row. Clamps against the
+    /// inner grid height (`rows`), exactly the number of content rows a pane
+    /// draws — using the client terminal rows would over-subtract and leave the
+    /// earliest scrollback lines unreachable at max scroll.
+    pub fn max_scroll_offset(&self) -> usize {
+        self.total_lines().saturating_sub(self.rows as usize)
+    }
+
+    /// Map a viewport row (`0..rows`, top-down) at a given `scroll_offset` to a
+    /// stable absolute line id. The id survives scrollback eviction: as older
+    /// lines are dropped, `lines_evicted` grows while `scrollback.len()` shrinks,
+    /// so the id of a fixed content line is unchanged. Inverse of
+    /// [`Screen::row_of_abs`].
+    pub fn abs_of_row(&self, scroll_offset: usize, row: u16) -> usize {
+        self.lines_evicted + self.scrollback.len().saturating_sub(scroll_offset) + row as usize
+    }
+
+    /// Map a stable absolute line id back to a viewport row at the given
+    /// `scroll_offset`. The result may be `< 0` (the line is scrolled above the
+    /// viewport) or `>= rows` (below it). Inverse of [`Screen::abs_of_row`].
+    pub fn row_of_abs(&self, scroll_offset: usize, abs: usize) -> i64 {
+        abs as i64 - self.lines_evicted as i64 - self.scrollback.len() as i64 + scroll_offset as i64
+    }
+
+    /// Convert a stable absolute line id into an index for [`Screen::line_at`]
+    /// (an index into the combined scrollback+grid buffer). An id older than the
+    /// current eviction watermark saturates to 0 (the oldest retained line).
+    pub fn array_index_of_abs(&self, abs: usize) -> usize {
+        abs.saturating_sub(self.lines_evicted)
     }
 
     // -- Private helpers ----------------------------------------------------
@@ -637,6 +677,7 @@ impl Screen {
         }
         while scrollback.len() > self.scrollback_limit {
             scrollback.pop_front();
+            self.lines_evicted += 1;
         }
 
         self.cols = cols;
@@ -677,6 +718,7 @@ impl Screen {
             self.scrollback.push_back(evicted);
             while self.scrollback.len() > self.scrollback_limit {
                 self.scrollback.pop_front();
+                self.lines_evicted += 1;
             }
         }
 
@@ -1520,6 +1562,95 @@ mod tests {
 
     fn make_screen() -> Screen {
         Screen::new(80, 24, 1000)
+    }
+
+    #[test]
+    fn test_abs_row_roundtrip() {
+        // Build a screen with some scrollback so the mapping is non-trivial.
+        let mut s = Screen::new(10, 5, 1000);
+        for i in 0..30 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(
+            s.scrollback.len() >= 5,
+            "need scrollback for the round-trip"
+        );
+
+        // For several scroll offsets, abs_of_row and row_of_abs must invert each
+        // other for every in-range viewport row.
+        for &scroll in &[0usize, 1, 3, s.max_scroll_offset()] {
+            for row in 0..s.rows {
+                let abs = s.abs_of_row(scroll, row);
+                assert_eq!(
+                    s.row_of_abs(scroll, abs),
+                    row as i64,
+                    "row_of_abs(abs_of_row(r)) must equal r (scroll={scroll}, row={row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_abs_of_row_increases_by_one_per_row() {
+        let mut s = Screen::new(10, 5, 1000);
+        for i in 0..30 {
+            s.process_output(format!("line{i}\r\n").as_bytes());
+        }
+        for &scroll in &[0usize, 2, s.max_scroll_offset()] {
+            for row in 1..s.rows {
+                assert_eq!(
+                    s.abs_of_row(scroll, row),
+                    s.abs_of_row(scroll, row - 1) + 1,
+                    "abs id must advance by exactly one per viewport row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_eviction_keeps_abs_pointing_at_same_line() {
+        // Scrollback limit forces eviction; a captured abs must keep resolving to
+        // the same content line via array_index_of_abs after older lines drop.
+        // Retained window = scrollback_limit (5) + grid rows (3) = 8 lines, so a
+        // line captured then followed by only two more output lines survives.
+        let mut s = Screen::new(10, 3, 5);
+        for i in 0..8 {
+            s.process_output(format!("L{i}\r\n").as_bytes());
+        }
+        let evicted_before = s.lines_evicted;
+
+        // Find the combined-buffer index of the line reading "L6" and turn it
+        // into a stable absolute id.
+        let idx = (0..s.total_lines())
+            .find(|&i| {
+                let text: String = s.line_at(i).unwrap().iter().map(|c| c.c).collect();
+                text.trim_end() == "L6"
+            })
+            .expect("L6 must still be present");
+        let abs = s.lines_evicted + idx;
+
+        // Produce two more lines, forcing further eviction from the front while
+        // keeping "L6" inside the retained window.
+        for i in 8..10 {
+            s.process_output(format!("L{i}\r\n").as_bytes());
+        }
+        assert!(
+            s.lines_evicted > evicted_before,
+            "further output must evict lines and bump lines_evicted"
+        );
+
+        // The same abs id must still resolve to the same content line.
+        let after: String = s
+            .line_at(s.array_index_of_abs(abs))
+            .unwrap()
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert_eq!(
+            after.trim_end(),
+            "L6",
+            "a captured abs id must keep pointing at the same content line across eviction"
+        );
     }
 
     #[test]
