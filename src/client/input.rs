@@ -2362,7 +2362,12 @@ impl InputHandler {
         match key.code {
             KeyCode::Esc => {
                 self.command_palette = None;
-                self.mode = Mode::Command;
+                // The palette is opened from Command mode via `:`, but Esc
+                // should return to Normal (not the which-key COMMAND popup).
+                // Clear any pending which-key chord so the next keystroke is
+                // handled as a normal key rather than a group binding.
+                self.mode = Mode::Normal;
+                self.keybinding_state.reset();
                 InputAction::CommandPaletteClose
             }
             KeyCode::Enter => {
@@ -2658,6 +2663,26 @@ mod tests {
         // 'o' resolves the leaf.
         let action = handler.handle_key(char_key('o'));
         assert_eq!(action, InputAction::SessionSwitchLast);
+    }
+
+    #[test]
+    fn command_palette_esc_returns_to_normal() {
+        // The palette is opened from Command mode via `:`. Esc must land in
+        // NORMAL (not the which-key COMMAND popup), and the pending chord must
+        // be cleared so the next key is a plain keystroke rather than a group
+        // binding (regression: Esc then `s` used to enter search).
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::CommandPalette;
+        handler.command_palette = Some(CommandPaletteState::new());
+
+        let action = handler.handle_key(esc_key());
+        assert_eq!(handler.mode, Mode::Normal);
+        assert_eq!(action, InputAction::CommandPaletteClose);
+        assert!(handler.command_palette.is_none());
+
+        // A following `s` is now a normal keystroke, not a which-key group.
+        let next = handler.handle_key(char_key('s'));
+        assert!(!matches!(next, InputAction::ShowWhichKey { .. }));
     }
 
     #[test]
