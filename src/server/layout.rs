@@ -208,6 +208,66 @@ impl LayoutAlgorithm for MonocleLayout {
     }
 }
 
+/// Grid layout: all panes arranged in a balanced grid of equal-size cells.
+///
+/// Panes are laid out row-major into a `cols x rows` grid where
+/// `cols = ceil(sqrt(n))`. The last row may hold fewer panes, in which case
+/// its cells are wider (each row is split only among the panes assigned to it).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GridLayout;
+
+impl LayoutAlgorithm for GridLayout {
+    fn name(&self) -> &str {
+        "grid"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        if panes.is_empty() {
+            return LayoutNode::new_stack(active_pane);
+        }
+        if panes.len() == 1 {
+            return LayoutNode::new_stack(panes[0]);
+        }
+
+        // Fold a non-empty list of nodes into equal-size splits along
+        // `direction`, using the same right-folded `1.0 / remaining` ratios as
+        // MasterLayout's `build_col` so ratios match the codebase convention.
+        let fold_equal = |mut nodes: Vec<LayoutNode>, direction: Direction| -> LayoutNode {
+            let mut node = nodes
+                .pop()
+                .expect("fold_equal requires a non-empty node list");
+            let mut remaining = 1usize;
+            while let Some(first) = nodes.pop() {
+                remaining += 1;
+                node = LayoutNode::Split {
+                    direction: direction.clone(),
+                    ratio: 1.0 / remaining as f32,
+                    first: Box::new(first),
+                    second: Box::new(node),
+                };
+            }
+            node
+        };
+
+        // cols = ceil(sqrt(n)); rows follow from row-major chunking below.
+        let cols = (panes.len() as f64).sqrt().ceil() as usize;
+
+        // Each row is an inner Vertical split of its panes (columns, left to
+        // right); the rows are stacked by an outer Horizontal split (top to
+        // bottom). A short final row splits among fewer panes, so its cells
+        // are wider -- that falls out of chunking naturally.
+        let rows: Vec<LayoutNode> = panes
+            .chunks(cols)
+            .map(|row| {
+                let cells: Vec<LayoutNode> =
+                    row.iter().map(|&p| LayoutNode::new_stack(p)).collect();
+                fold_equal(cells, Direction::Vertical)
+            })
+            .collect();
+        fold_equal(rows, Direction::Horizontal)
+    }
+}
+
 /// Custom layout: the user has manually arranged splits; no automatic rebuild.
 ///
 /// The `build_tree` method is a fallback that delegates to BSP. In normal
@@ -245,6 +305,8 @@ pub enum LayoutMode {
     Master(MasterLayout),
     /// Monocle: all panes in a single full-screen stack.
     Monocle(MonocleLayout),
+    /// Grid: all panes in a balanced grid of equal-size cells.
+    Grid(GridLayout),
     /// Custom: the user has manually arranged splits; no automatic rebuild.
     Custom(CustomLayout),
 }
@@ -257,6 +319,7 @@ impl LayoutMode {
             LayoutMode::Bsp(l) => l.build_tree(panes, active_pane),
             LayoutMode::Master(l) => l.build_tree(panes, active_pane),
             LayoutMode::Monocle(l) => l.build_tree(panes, active_pane),
+            LayoutMode::Grid(l) => l.build_tree(panes, active_pane),
             LayoutMode::Custom(l) => l.build_tree(panes, active_pane),
         }
     }
@@ -267,17 +330,19 @@ impl LayoutMode {
             LayoutMode::Bsp(l) => l.name(),
             LayoutMode::Master(l) => l.name(),
             LayoutMode::Monocle(l) => l.name(),
+            LayoutMode::Grid(l) => l.name(),
             LayoutMode::Custom(l) => l.name(),
         }
     }
 
     /// Cycle to the next automatic layout mode.
-    /// Order: Bsp -> Master -> Monocle -> Bsp (Custom also goes to Bsp).
+    /// Order: Bsp -> Master -> Monocle -> Grid -> Bsp (Custom also goes to Bsp).
     pub fn next(&self) -> LayoutMode {
         match self {
             LayoutMode::Bsp(_) => LayoutMode::Master(MasterLayout::default()),
             LayoutMode::Master(_) => LayoutMode::Monocle(MonocleLayout),
-            LayoutMode::Monocle(_) => LayoutMode::Bsp(BspLayout),
+            LayoutMode::Monocle(_) => LayoutMode::Grid(GridLayout),
+            LayoutMode::Grid(_) => LayoutMode::Bsp(BspLayout),
             LayoutMode::Custom(_) => LayoutMode::Bsp(BspLayout),
         }
     }
@@ -1847,6 +1912,9 @@ mod tests {
         assert!(matches!(mode, LayoutMode::Monocle(_)));
 
         let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Grid(_)));
+
+        let mode = mode.next();
         assert!(matches!(mode, LayoutMode::Bsp(_)));
     }
 
@@ -1863,6 +1931,149 @@ mod tests {
         assert!(LayoutMode::Master(MasterLayout::default()).is_automatic());
         assert!(LayoutMode::Monocle(MonocleLayout).is_automatic());
         assert!(!LayoutMode::Custom(CustomLayout).is_automatic());
+    }
+
+    // Grid layout tests
+
+    /// Count the leaf stacks and collect their panes.
+    fn grid_leaves(node: &LayoutNode) -> Vec<PaneId> {
+        // Every Grid cell is a single-pane stack, so `all_pane_ids` yields one
+        // id per leaf and its length equals the leaf count.
+        all_pane_ids(node)
+    }
+
+    #[test]
+    fn test_grid_pane_counts() {
+        for n in 1..=9usize {
+            let panes: Vec<PaneId> = (1..=n as PaneId).collect();
+            let tree = GridLayout.build_tree(&panes, panes[0]);
+
+            let leaves = grid_leaves(&tree);
+            assert_eq!(leaves.len(), n, "n={n}: leaf count must equal pane count");
+
+            let mut got = leaves.clone();
+            got.sort_unstable();
+            let mut want = panes.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "n={n}: every pane must appear exactly once");
+        }
+    }
+
+    #[test]
+    fn test_grid_shape() {
+        // n=2 -> single row of two columns: one Vertical split of two stacks.
+        let tree = GridLayout.build_tree(&[1, 2], 1);
+        match &tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(*direction, Direction::Vertical);
+                assert!(matches!(first.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[1]));
+                assert!(
+                    matches!(second.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[2])
+                );
+            }
+            _ => panic!("n=2: expected a single Vertical split"),
+        }
+
+        // n=4 -> 2x2: outer Horizontal split of two rows, each an inner
+        // Vertical split of two stacks.
+        let tree = GridLayout.build_tree(&[1, 2, 3, 4], 1);
+        match &tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(
+                    *direction,
+                    Direction::Horizontal,
+                    "n=4: rows split Horizontal"
+                );
+                for (row, expected) in [(first, [1, 2]), (second, [3, 4])] {
+                    match row.as_ref() {
+                        LayoutNode::Split {
+                            direction,
+                            first,
+                            second,
+                            ..
+                        } => {
+                            assert_eq!(
+                                *direction,
+                                Direction::Vertical,
+                                "n=4: columns split Vertical"
+                            );
+                            assert!(
+                                matches!(first.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[expected[0]])
+                            );
+                            assert!(
+                                matches!(second.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[expected[1]])
+                            );
+                        }
+                        _ => panic!("n=4: each row must be a Vertical split"),
+                    }
+                }
+            }
+            _ => panic!("n=4: expected an outer Horizontal split"),
+        }
+
+        // n=3 -> two rows (2 then 1): outer Horizontal split, first row a
+        // Vertical split of two, second row a single stack.
+        let tree = GridLayout.build_tree(&[1, 2, 3], 1);
+        match &tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(
+                    *direction,
+                    Direction::Horizontal,
+                    "n=3: rows split Horizontal"
+                );
+                match first.as_ref() {
+                    LayoutNode::Split {
+                        direction,
+                        first,
+                        second,
+                        ..
+                    } => {
+                        assert_eq!(*direction, Direction::Vertical);
+                        assert!(
+                            matches!(first.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[1])
+                        );
+                        assert!(
+                            matches!(second.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[2])
+                        );
+                    }
+                    _ => panic!("n=3: first row must be a Vertical split of two"),
+                }
+                assert!(
+                    matches!(second.as_ref(), LayoutNode::Stack { panes, .. } if panes == &[3]),
+                    "n=3: second row must be a single-pane stack"
+                );
+            }
+            _ => panic!("n=3: expected an outer Horizontal split"),
+        }
+    }
+
+    #[test]
+    fn test_grid_is_automatic() {
+        assert!(LayoutMode::Grid(GridLayout).is_automatic());
+    }
+
+    #[test]
+    fn test_layout_next_includes_grid() {
+        // Cycling forward from Monocle reaches Grid, and Grid returns to Bsp.
+        let mode = LayoutMode::Monocle(MonocleLayout).next();
+        assert!(matches!(mode, LayoutMode::Grid(_)));
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Bsp(_)));
     }
 
     // -----------------------------------------------------------------------
