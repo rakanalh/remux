@@ -434,6 +434,9 @@ pub enum InputAction {
     // -- Views (client-only virtual tabs; never forwarded to the server) --
     /// Create a new empty view with the given name and activate it.
     NewView(String),
+    /// Activate an existing view by index (selected from the session switcher's
+    /// Views section). Mirrors `NewView` activation but for an existing view.
+    ViewActivate { index: usize },
     /// Open the view-picker overlay to add the current focused pane to a view.
     ViewAddPaneOpen,
     /// Remove the focused cell from the active view.
@@ -911,7 +914,12 @@ pub struct SessionSwitchOverlay {
     /// Flattened, ordered rows rebuilt from `groups` on every merge: Local
     /// first, then remotes by name; tree order preserved within a server.
     pub entries: Vec<SessionSwitchEntry>,
-    /// Currently highlighted entry index.
+    /// Client-only view names, in the event loop's `views` order. Set ONCE at
+    /// open (views are not populated asynchronously), so their indices are
+    /// stable. The combined selectable list is views FIRST, then session
+    /// `entries`: `[views (0..views.len())] ++ [entries (views.len()..)]`.
+    pub views: Vec<String>,
+    /// Currently highlighted index in the combined `[views ++ entries]` space.
     pub selected: usize,
     /// Whether `selected` has been snapped to the current session (or moved by
     /// the user) yet. Once set, later async merges never re-snap the highlight.
@@ -922,6 +930,14 @@ impl SessionSwitchOverlay {
     /// Create an empty overlay (no sessions known yet).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the client-only view names shown at the top of the switcher. Called
+    /// ONCE by the open handler; views have stable indices in the combined
+    /// `[views ++ entries]` selection space so later async session-tree merges
+    /// never shift them.
+    pub fn set_views(&mut self, names: Vec<String>) {
+        self.views = names;
     }
 
     /// Merge (replacing) one server's sessions into the overlay and rebuild the
@@ -976,11 +992,13 @@ impl SessionSwitchOverlay {
         // false so a later tree carrying it can still snap.
         if !self.selection_initialized {
             if let Some(idx) = self.entries.iter().position(|e| e.is_current) {
-                self.selected = idx;
+                // Selection lives in combined `[views ++ entries]` space, so the
+                // current session's row is offset past the leading view rows.
+                self.selected = self.views.len() + idx;
                 self.selection_initialized = true;
             }
         }
-        if self.selected >= self.entries.len() {
+        if self.selected >= self.views.len() + self.entries.len() {
             self.selected = 0;
         }
     }
@@ -1041,9 +1059,16 @@ impl SessionSwitchOverlay {
 
         let popup_width = 40u16.min(screen_cols);
         // Height accounts for the two borders, every session row, and one row
-        // per group-separator header interleaved between the groups.
+        // per group-separator header interleaved between the groups. When views
+        // are present they add their own "Views" header row plus one row each.
         let separator_count = self.separator_count();
-        let popup_height = ((self.entries.len() + separator_count + 2) as u16).min(screen_rows);
+        let views_block = if self.views.is_empty() {
+            0
+        } else {
+            self.views.len() + 1
+        };
+        let popup_height =
+            ((self.entries.len() + separator_count + views_block + 2) as u16).min(screen_rows);
         let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
         let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
 
@@ -1088,6 +1113,84 @@ impl SessionSwitchOverlay {
         // separators consume a row of their own, so we cannot derive the row
         // from the entry index alone.
         let mut row_offset: u16 = 1;
+
+        // Views section (client-only virtual tabs) is rendered FIRST, above the
+        // session groups, under a labeled "Views" header. Selection indices
+        // `0..views.len()` map to these rows.
+        if !self.views.is_empty() && row_offset < popup_height - 1 {
+            let label = "\u{2500} Views ".to_string();
+            let label_chars = label.chars().count();
+            let sep_text = if label_chars >= inner_width {
+                label.chars().take(inner_width).collect::<String>()
+            } else {
+                format!("{label}{}", "\u{2500}".repeat(inner_width - label_chars))
+            };
+            let sep_y = start_y + row_offset;
+            commands.push(DrawCommand {
+                x: start_x,
+                y: sep_y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1,
+                y: sep_y,
+                text: sep_text,
+                fg: border_fg,
+                bg,
+            });
+            commands.push(DrawCommand {
+                x: start_x + 1 + inner_width as u16,
+                y: sep_y,
+                text: "\u{2502}".to_string(),
+                fg: border_fg,
+                bg,
+            });
+            row_offset += 1;
+
+            for (i, name) in self.views.iter().enumerate() {
+                if row_offset >= popup_height - 1 {
+                    break;
+                }
+                let y = start_y + row_offset;
+                let is_selected = i == self.selected;
+                let text = format!("  {name}");
+                let padded = if text.len() >= inner_width {
+                    text.chars().take(inner_width).collect::<String>()
+                } else {
+                    format!("{}{}", text, " ".repeat(inner_width - text.len()))
+                };
+                let (row_fg, row_bg) = if is_selected {
+                    (sel_fg, sel_bg)
+                } else {
+                    (fg, bg)
+                };
+                commands.push(DrawCommand {
+                    x: start_x,
+                    y,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
+                commands.push(DrawCommand {
+                    x: start_x + 1,
+                    y,
+                    text: padded,
+                    fg: row_fg,
+                    bg: row_bg,
+                });
+                commands.push(DrawCommand {
+                    x: start_x + 1 + inner_width as u16,
+                    y,
+                    text: "\u{2502}".to_string(),
+                    fg: border_fg,
+                    bg,
+                });
+                row_offset += 1;
+            }
+        }
+
         let mut prev_server: Option<&ConnId> = None;
         for (i, entry) in self.entries.iter().enumerate() {
             // Draw a group-separator header when the server group changes.
@@ -1134,7 +1237,9 @@ impl SessionSwitchOverlay {
                 break;
             }
             let y = start_y + row_offset;
-            let is_selected = i == self.selected;
+            // Session entries occupy the combined-index region after the views,
+            // so entry `i` is highlighted when `selected == views.len() + i`.
+            let is_selected = self.views.len() + i == self.selected;
             // Mark the currently-attached session on its server with a leading
             // '*' (one per connected server may be marked).
             let marker = if entry.is_current { "* " } else { "  " };
@@ -2116,6 +2221,13 @@ impl InputHandler {
                 self.mode = Mode::Normal;
                 InputAction::SessionManagerClose
             }
+            // Space toggles a pane mark for the "add to view" multi-select.
+            // Whitespace can't be a chord (rejected by `is_valid_chord`), so the
+            // chord engine returns `NoMatch` and we land here.
+            KeyCode::Char(' ') => {
+                sm.toggle_mark();
+                InputAction::SessionManagerUpdate
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 sm.select_next();
                 InputAction::SessionManagerUpdate
@@ -2456,8 +2568,12 @@ impl InputHandler {
                 InputAction::SessionSwitchClose
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if !overlay.entries.is_empty() {
-                    overlay.selected = (overlay.selected + 1) % overlay.entries.len();
+                // Navigation wraps over the WHOLE combined list (views first,
+                // then sessions), so with views-only (no entries yet) j/k still
+                // works — hence the guard is `total`, not `entries.is_empty()`.
+                let total = overlay.views.len() + overlay.entries.len();
+                if total != 0 {
+                    overlay.selected = (overlay.selected + 1) % total;
                 }
                 // The user is now driving the highlight; freeze it against
                 // re-snapping when later async trees merge in.
@@ -2465,9 +2581,10 @@ impl InputHandler {
                 InputAction::SessionSwitchUpdate
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if !overlay.entries.is_empty() {
+                let total = overlay.views.len() + overlay.entries.len();
+                if total != 0 {
                     if overlay.selected == 0 {
-                        overlay.selected = overlay.entries.len() - 1;
+                        overlay.selected = total - 1;
                     } else {
                         overlay.selected -= 1;
                     }
@@ -2478,16 +2595,31 @@ impl InputHandler {
                 InputAction::SessionSwitchUpdate
             }
             KeyCode::Enter | KeyCode::Char('l') => {
-                let selected = overlay.entries.get(overlay.selected).cloned();
-                self.session_switch = None;
-                self.mode = Mode::Normal;
-                if let Some(entry) = selected {
-                    InputAction::SessionSwitchConfirm {
-                        server: entry.server,
-                        session: entry.name,
-                    }
-                } else {
+                // Views occupy `0..views.len()`; sessions follow. Resolve the
+                // combined index to the region it lands in.
+                let view_count = overlay.views.len();
+                let total = view_count + overlay.entries.len();
+                let selected = overlay.selected;
+                if total == 0 {
+                    self.session_switch = None;
+                    self.mode = Mode::Normal;
                     InputAction::SessionSwitchClose
+                } else if selected < view_count {
+                    self.session_switch = None;
+                    self.mode = Mode::Normal;
+                    InputAction::ViewActivate { index: selected }
+                } else {
+                    let entry = overlay.entries.get(selected - view_count).cloned();
+                    self.session_switch = None;
+                    self.mode = Mode::Normal;
+                    if let Some(entry) = entry {
+                        InputAction::SessionSwitchConfirm {
+                            server: entry.server,
+                            session: entry.name,
+                        }
+                    } else {
+                        InputAction::SessionSwitchClose
+                    }
                 }
             }
             _ => InputAction::None,
@@ -4677,5 +4809,112 @@ mod tests {
         let sel = &overlay.entries[overlay.selected];
         assert_eq!(sel.name, "cur");
         assert!(sel.is_current);
+    }
+
+    // -- Views folded into the switcher --------------------------------------
+
+    #[test]
+    fn session_switch_render_shows_views_header_and_names() {
+        use crate::config::theme::Theme;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.set_views(vec!["Alpha".to_string(), "Beta".to_string()]);
+        // Views-only (no session entries yet, as at open before trees arrive).
+        let theme = Theme::default();
+        let cmds = overlay.render(80, 24, &theme);
+        let text: String = cmds.iter().map(|c| c.text.as_str()).collect();
+        assert!(text.contains("Views"), "missing Views header: {text:?}");
+        assert!(text.contains("Alpha"), "missing view Alpha");
+        assert!(text.contains("Beta"), "missing view Beta");
+    }
+
+    #[test]
+    fn session_switch_snap_offset_past_views() {
+        // Snap to the current session must offset by the leading view rows:
+        // combined index = views.len() + entry_index.
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.set_views(vec!["V1".to_string(), "V2".to_string()]);
+        overlay.merge_server(
+            ConnId::Local,
+            vec![
+                ("first".to_string(), false, None),
+                ("cur".to_string(), true, None),
+            ],
+        );
+        // Current session is entry index 1; with 2 views ahead, combined = 3.
+        assert_eq!(overlay.selected, 3);
+        assert!(overlay.selection_initialized);
+    }
+
+    #[test]
+    fn session_switch_nav_wraps_over_views_only() {
+        // With views but no entries, j/k must still wrap over the views.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.set_views(vec!["V1".to_string(), "V2".to_string()]);
+        handler.session_switch = Some(overlay);
+
+        assert_eq!(handler.session_switch.as_ref().unwrap().selected, 0);
+        let _ = handler.handle_session_switch_key(char_key('j'));
+        assert_eq!(handler.session_switch.as_ref().unwrap().selected, 1);
+        let _ = handler.handle_session_switch_key(char_key('j'));
+        assert_eq!(handler.session_switch.as_ref().unwrap().selected, 0);
+        let _ = handler.handle_session_switch_key(char_key('k'));
+        assert_eq!(handler.session_switch.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn session_switch_enter_on_view_returns_view_activate() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.set_views(vec!["V1".to_string(), "V2".to_string()]);
+        overlay.merge_server(ConnId::Local, vec![("s".to_string(), false, None)]);
+        overlay.selected = 1; // second view
+        handler.session_switch = Some(overlay);
+
+        let action = handler.handle_session_switch_key(enter_key());
+        match action {
+            InputAction::ViewActivate { index } => assert_eq!(index, 1),
+            other => panic!("expected ViewActivate, got {other:?}"),
+        }
+        // Overlay closed and mode reset.
+        assert!(handler.session_switch.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn session_switch_enter_at_boundary_returns_session_confirm() {
+        // The index just past the last view lands on the first session entry.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.set_views(vec!["V1".to_string(), "V2".to_string()]);
+        overlay.merge_server(ConnId::Local, vec![("sess".to_string(), false, None)]);
+        overlay.selected = 2; // == views.len(); first session entry
+        handler.session_switch = Some(overlay);
+
+        let action = handler.handle_session_switch_key(enter_key());
+        match action {
+            InputAction::SessionSwitchConfirm { server, session } => {
+                assert_eq!(server, ConnId::Local);
+                assert_eq!(session, "sess");
+            }
+            other => panic!("expected SessionSwitchConfirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_switch_views_only_enter_activates_not_close() {
+        // Views present but zero sessions: Enter on a view still activates it
+        // (total != 0), it does not fall through to a close.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.set_views(vec!["Only".to_string()]);
+        handler.session_switch = Some(overlay);
+
+        let action = handler.handle_session_switch_key(enter_key());
+        assert!(matches!(action, InputAction::ViewActivate { index: 0 }));
     }
 }

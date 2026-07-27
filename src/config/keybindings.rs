@@ -1142,6 +1142,8 @@ pub enum SessionManagerBinding {
     FolderNew,
     FolderDelete,
     FolderRename,
+    /// Add the marked panes (or the highlighted pane) to a client-only view.
+    AddToView,
 }
 
 impl SessionManagerBinding {
@@ -1163,6 +1165,7 @@ impl SessionManagerBinding {
             "FolderNew" => Self::FolderNew,
             "FolderDelete" => Self::FolderDelete,
             "FolderRename" => Self::FolderRename,
+            "AddToView" => Self::AddToView,
             _ => return None,
         })
     }
@@ -1188,6 +1191,7 @@ fn default_session_manager_chords() -> Vec<(&'static str, SessionManagerBinding)
         ("fn", FolderNew),
         ("fx", FolderDelete),
         ("fr", FolderRename),
+        ("va", AddToView),
     ]
 }
 
@@ -2397,17 +2401,19 @@ mod tests {
     #[test]
     fn session_manager_bindings_defaults() {
         let b = SessionManagerBindings::default();
-        // All 15 default chords are present.
-        assert_eq!(b.len(), 15);
+        // All 16 default chords are present.
+        assert_eq!(b.len(), 16);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
         assert_eq!(b.chord('t', 'r'), Some(SessionManagerBinding::TabRename));
         assert_eq!(b.chord('s', 'x'), Some(SessionManagerBinding::SessionClose));
         assert_eq!(b.chord('f', 'r'), Some(SessionManagerBinding::FolderRename));
+        assert_eq!(b.chord('v', 'a'), Some(SessionManagerBinding::AddToView));
         // First chars of the 2-char chords are prefixes.
         assert!(b.is_prefix('t'));
         assert!(b.is_prefix('p'));
         assert!(b.is_prefix('s'));
         assert!(b.is_prefix('f'));
+        assert!(b.is_prefix('v'));
         // Legacy nav keys are NOT prefixes (so they still fall through).
         assert!(!b.is_prefix('j'));
         assert!(!b.is_prefix('d'));
@@ -2419,7 +2425,7 @@ mod tests {
         // An empty table (section absent) yields exactly the defaults.
         let value = toml::Value::Table(toml::map::Map::new());
         let b = SessionManagerBindings::from_toml(&value);
-        assert_eq!(b.len(), 15);
+        assert_eq!(b.len(), 16);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
     }
 
@@ -2449,7 +2455,7 @@ mod tests {
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let b = SessionManagerBindings::from_toml(&value);
-        assert_eq!(b.len(), 15);
+        assert_eq!(b.len(), 16);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
     }
 

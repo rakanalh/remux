@@ -919,10 +919,14 @@ async fn run_client_loop(
     let mut active_view: Option<usize> = None;
     // Pending "add focused pane to a view" flow (see the `w a` handler): we ask
     // the foreground server for its session tree, resolve the focused pane into
-    // `pending_pane` when the tree arrives, and complete the add once the user
+    // `pending_panes` when the tree arrives, and complete the add once the user
     // picks a target view in the picker overlay.
     let mut pending_view_add = false;
-    let mut pending_pane: Option<(ConnId, crate::protocol::PaneId)> = None;
+    // Panes waiting to be added to a view once the user picks a target in the
+    // picker. The `w a` path resolves exactly one (the focused pane, via a tree
+    // round-trip); the session-manager "add to view" path fills it directly with
+    // the marked/highlighted panes.
+    let mut pending_panes: Vec<(ConnId, crate::protocol::PaneId)> = Vec::new();
 
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
@@ -1927,6 +1931,26 @@ async fn run_client_loop(
                                             mgr.send(&id, ClientMessage::ListSessionTree).await?;
                                         }
                                     }
+                                    SessionManagerAction::AddToView { panes } => {
+                                        // Close the manager and open the view picker
+                                        // seeded with the marked/highlighted panes.
+                                        // Explicitly clear `pending_view_add` so a
+                                        // stale `w a` tree round-trip can't also push
+                                        // into `pending_panes` behind our back.
+                                        input.session_manager = None;
+                                        pending_view_add = false;
+                                        pending_panes = panes;
+                                        input.mode = Mode::Command;
+                                        let names: Vec<String> = views.iter().map(|v| v.name.clone()).collect();
+                                        input.view_picker = Some(crate::client::input::ViewPickerOverlay::new(names));
+                                        if let Some(ref vp) = input.view_picker {
+                                            let (c, r) = crossterm::terminal::size()?;
+                                            renderer.clear_overlay(c, r)?;
+                                            let draw_cmds = vp.render(c, r, &theme);
+                                            renderer.render_whichkey_overlay(&draw_cmds)?;
+                                            renderer.flush()?;
+                                        }
+                                    }
                                     SessionManagerAction::Close => {
                                         let has_sessions = input.session_manager.as_ref()
                                             .map(|sm| sm.rows.iter().any(|r| matches!(r.node_type, NodeType::Session { .. })))
@@ -1999,17 +2023,60 @@ async fn run_client_loop(
                                     mgr.send(&id, ClientMessage::ListSessionTree).await?;
                                 }
                                 input.mode = Mode::Command;
-                                input.session_switch = Some(SessionSwitchOverlay::new());
-                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
-                            }
-                            InputAction::SessionSwitchUpdate => {
-                                if let Some(ref ss) = input.session_switch {
-                                    let (c, r) = crossterm::terminal::size()?;
+                                // Fold the client-only views into the switcher:
+                                // seed their names ONCE here (they are not
+                                // populated asynchronously) so they occupy stable
+                                // leading indices while session trees merge in.
+                                let mut overlay = SessionSwitchOverlay::new();
+                                overlay.set_views(views.iter().map(|v| v.name.clone()).collect());
+                                input.session_switch = Some(overlay);
+                                // Render immediately so the Views section is
+                                // visible before any session tree arrives.
+                                // View-aware: over a live view, composite it and
+                                // re-lay the switcher on top via `paint_view`.
+                                let (c, r) = crossterm::terminal::size()?;
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else if let Some(ref ss) = input.session_switch {
                                     renderer.clear_overlay(c, r)?;
                                     let draw_cmds = ss.render(c, r, &theme);
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
                                 }
-                                renderer.flush()?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                            }
+                            InputAction::SessionSwitchUpdate => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                // View-aware: over a live view, `paint_view` both
+                                // composites the view and re-lays the switcher.
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else {
+                                    if let Some(ref ss) = input.session_switch {
+                                        renderer.clear_overlay(c, r)?;
+                                        let draw_cmds = ss.render(c, r, &theme);
+                                        renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    }
+                                    renderer.flush()?;
+                                }
                             }
                             InputAction::SessionSwitchConfirm { server, session } => {
                                 input.session_switch = None;
@@ -2113,6 +2180,36 @@ async fn run_client_loop(
                                     focused_pane_rect.as_ref(),
                                 )?;
                             }
+                            InputAction::ViewActivate { index } => {
+                                // Selected from the switcher's Views section. The
+                                // input handler already cleared the switcher
+                                // overlay and reset mode to Normal. Mirror the
+                                // NewView activation for an existing view.
+                                let (c, r) = crossterm::terminal::size()?;
+                                if index < views.len() {
+                                    // Cleanly leave any current view/session first
+                                    // (unsubscribe its cells) so the switch shows.
+                                    leave_active_view(mgr, &views, &mut active_view).await?;
+                                    active_view = Some(index);
+                                    renderer.resize(c, r);
+                                    subscribe_view_cells(mgr, &views[index]).await?;
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[index],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else {
+                                    // Stale index (view removed under us): just
+                                    // clear the switcher popup.
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.flush()?;
+                                }
+                            }
                             InputAction::ViewAddPaneOpen => {
                                 if whichkey.visible {
                                     whichkey.hide();
@@ -2122,9 +2219,9 @@ async fn run_client_loop(
                                 // (the client doesn't track it): ask the foreground
                                 // server for its tree, then open the picker. The
                                 // tree round-trip beats the human pressing Enter, so
-                                // `pending_pane` is resolved before ViewPickerConfirm.
+                                // `pending_panes` is resolved before ViewPickerConfirm.
                                 pending_view_add = true;
-                                pending_pane = None;
+                                pending_panes.clear();
                                 mgr.send_foreground(ClientMessage::ListSessionTree).await?;
                                 let names: Vec<String> = views.iter().map(|v| v.name.clone()).collect();
                                 input.mode = Mode::Command;
@@ -2148,7 +2245,7 @@ async fn run_client_loop(
                             }
                             InputAction::ViewPickerClose => {
                                 pending_view_add = false;
-                                pending_pane = None;
+                                pending_panes.clear();
                                 let (c, r) = crossterm::terminal::size()?;
                                 if let Some(av) = active_view {
                                     paint_view(
@@ -2169,66 +2266,76 @@ async fn run_client_loop(
                             InputAction::ViewPickerConfirm { view } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 pending_view_add = false;
-                                match pending_pane.take() {
-                                    Some((conn, pane_id)) => {
-                                        // Resolve the target view: an existing one,
-                                        // or a freshly created + activated one.
-                                        let target_idx = match view {
-                                            Some(i) if i < views.len() => i,
-                                            _ => {
-                                                let name = format!("View {}", views.len() + 1);
-                                                views.push(crate::client::view::ClientView::new(name));
-                                                let idx = views.len() - 1;
-                                                active_view = Some(idx);
-                                                idx
-                                            }
-                                        };
+                                let panes = std::mem::take(&mut pending_panes);
+                                if panes.is_empty() {
+                                    // Nothing resolved (no tree / no focused pane, or
+                                    // an empty session-manager selection). Warn and
+                                    // repaint whatever was underneath.
+                                    log::warn!("view: add-pane confirmed but no panes resolved; ignoring");
+                                    if let Some(av) = active_view {
+                                        paint_view(
+                                            &mut renderer,
+                                            &views[av],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
+                                    } else {
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
+                                    }
+                                } else {
+                                    // Resolve the target view: an existing one, or a
+                                    // freshly created + activated one.
+                                    let target_idx = match view {
+                                        Some(i) if i < views.len() => i,
+                                        _ => {
+                                            let name = format!("View {}", views.len() + 1);
+                                            views.push(crate::client::view::ClientView::new(name));
+                                            let idx = views.len() - 1;
+                                            active_view = Some(idx);
+                                            idx
+                                        }
+                                    };
+                                    // Add each pane, skipping any already present in
+                                    // the target view (dedupe by (conn, pane_id)).
+                                    for (conn, pane_id) in panes {
+                                        let already = views[target_idx]
+                                            .cells
+                                            .iter()
+                                            .any(|cell| cell.conn == conn && cell.pane_id == pane_id);
+                                        if already {
+                                            continue;
+                                        }
                                         views[target_idx].cells.push(crate::client::view::ViewCell {
                                             conn,
                                             pane_id,
                                             snapshot: None,
                                         });
-                                        views[target_idx].clamp_focus();
-                                        if active_view == Some(target_idx) {
-                                            // (Re)subscribe every cell at its new
-                                            // size and repaint the live view.
-                                            subscribe_view_cells(mgr, &views[target_idx]).await?;
-                                            paint_view(
-                                                &mut renderer,
-                                                &views[target_idx],
-                                                &input,
-                                                &whichkey,
-                                                &theme,
-                                                &which_key_position,
-                                                viewport_top,
-                                                focused_pane_rect.as_ref(),
-                                            )?;
-                                        } else {
-                                            // Added to a background view: just clear
-                                            // the picker popup off the server frame.
-                                            renderer.clear_overlay(c, r)?;
-                                            renderer.flush()?;
-                                        }
                                     }
-                                    None => {
-                                        // The focused pane never resolved (no tree,
-                                        // or no focused pane in the current session).
-                                        log::warn!("view: add-pane confirmed but focused pane unresolved; ignoring");
-                                        if let Some(av) = active_view {
-                                            paint_view(
-                                                &mut renderer,
-                                                &views[av],
-                                                &input,
-                                                &whichkey,
-                                                &theme,
-                                                &which_key_position,
-                                                viewport_top,
-                                                focused_pane_rect.as_ref(),
-                                            )?;
-                                        } else {
-                                            renderer.clear_overlay(c, r)?;
-                                            renderer.flush()?;
-                                        }
+                                    views[target_idx].clamp_focus();
+                                    if active_view == Some(target_idx) {
+                                        // (Re)subscribe every cell at its new size and
+                                        // repaint the live view.
+                                        subscribe_view_cells(mgr, &views[target_idx]).await?;
+                                        paint_view(
+                                            &mut renderer,
+                                            &views[target_idx],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
+                                    } else {
+                                        // Added to a background view: just clear the
+                                        // picker popup off the server frame.
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
                                     }
                                 }
                             }
@@ -2845,7 +2952,7 @@ async fn run_client_loop(
                                 }
                             }
                             if let Some(pid) = found {
-                                pending_pane = Some((src.clone(), pid));
+                                pending_panes.push((src.clone(), pid));
                             }
                             // Consumed: don't let a later tree re-resolve it.
                             pending_view_add = false;
@@ -2871,8 +2978,23 @@ async fn run_client_loop(
                             // Replace this server's rows (a re-received tree for
                             // the same `src` overwrites rather than duplicates).
                             input.merge_session_switch(src.clone(), sessions);
-                            // Render the popup
-                            if let Some(ref ss) = input.session_switch {
+                            // Render the popup. View-aware: over a live view,
+                            // `paint_view` composites the view AND re-lays the
+                            // switcher overlay (via `relay_overlays`), so the
+                            // popup draws on top of the composite, not a stale
+                            // server frame.
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            } else if let Some(ref ss) = input.session_switch {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 let draw_cmds = ss.render(c, r, &theme);

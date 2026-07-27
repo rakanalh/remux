@@ -232,6 +232,12 @@ pub enum SessionManagerAction {
         new_name: String,
     },
     RefreshTree,
+    /// Add one or more existing panes (marked, or the highlighted pane) to a
+    /// client-only view. Handled entirely client-side (opens the view picker);
+    /// never forwarded to the server.
+    AddToView {
+        panes: Vec<(ConnId, u64)>,
+    },
     Close,
     None,
 }
@@ -277,6 +283,11 @@ pub struct SessionManagerState {
     bindings: SessionManagerBindings,
     /// The first char of an in-progress 2-char chord, awaiting completion.
     pending_chord: Option<char>,
+    /// Panes marked (via Space) for a multi-select "add to view" action, keyed
+    /// by `(server, pane_id)` so a mark survives `rebuild_rows` (row indices are
+    /// not stable across tree refreshes). Insertion order is preserved so the
+    /// resulting view cell order is deterministic; inserts dedupe.
+    marked: Vec<(ConnId, u64)>,
 }
 
 /// Pad or truncate a string to exactly `target_width` display columns,
@@ -329,6 +340,7 @@ fn binding_label(b: SessionManagerBinding) -> &'static str {
         FolderNew => "folder new",
         FolderDelete => "folder del",
         FolderRename => "folder rename",
+        AddToView => "add to view",
     }
 }
 
@@ -435,6 +447,45 @@ impl SessionManagerState {
             dormant: Vec::new(),
             bindings: SessionManagerBindings::default(),
             pending_chord: None,
+            marked: Vec::new(),
+        }
+    }
+
+    /// Toggle the mark on the selected row when it is a pane. Marks are keyed by
+    /// `(server, pane_id)` so they survive tree rebuilds. Returns true when a
+    /// pane row was toggled (marked or unmarked), false for non-pane rows.
+    pub fn toggle_mark(&mut self) -> bool {
+        let key = match self.rows.get(self.selected).map(|r| &r.node_type) {
+            Some(NodeType::Pane {
+                server, pane_id, ..
+            }) => (server.clone(), *pane_id),
+            _ => return false,
+        };
+        if let Some(pos) = self.marked.iter().position(|m| *m == key) {
+            self.marked.remove(pos);
+        } else {
+            self.marked.push(key);
+        }
+        true
+    }
+
+    /// Number of currently marked panes.
+    pub fn marked_count(&self) -> usize {
+        self.marked.len()
+    }
+
+    /// Take the panes to add to a view: the marked set (drained) if non-empty,
+    /// else the single highlighted pane (if the selected row is a pane), else
+    /// empty. Draining clears the marks so a subsequent action starts fresh.
+    pub fn take_marked_or_highlighted_panes(&mut self) -> Vec<(ConnId, u64)> {
+        if !self.marked.is_empty() {
+            return std::mem::take(&mut self.marked);
+        }
+        match self.rows.get(self.selected).map(|r| &r.node_type) {
+            Some(NodeType::Pane {
+                server, pane_id, ..
+            }) => vec![(server.clone(), *pane_id)],
+            _ => Vec::new(),
         }
     }
 
@@ -1247,6 +1298,18 @@ impl SessionManagerState {
                 }
                 _ => SessionManagerAction::None,
             },
+            AddToView => {
+                // Marked panes (or the highlighted pane) are added to a view.
+                // Drop any whose server is no longer connected so a stale mark
+                // from a since-disconnected remote can't be added.
+                let mut panes = self.take_marked_or_highlighted_panes();
+                panes.retain(|(server, _)| self.is_connected(server));
+                if panes.is_empty() {
+                    SessionManagerAction::None
+                } else {
+                    SessionManagerAction::AddToView { panes }
+                }
+            }
         }
     }
 
@@ -1358,8 +1421,15 @@ impl SessionManagerState {
             });
         }
 
-        // Top border with title.
-        let title = " Session Manager ";
+        // Top border with title. When panes are marked, surface the count so it
+        // is visible even if the marked rows are scrolled off or in a collapsed
+        // tab (also a stable string for the PTY harness to assert).
+        let marked_n = self.marked_count();
+        let title = if marked_n > 0 {
+            format!(" Session Manager ({marked_n} marked) ")
+        } else {
+            " Session Manager ".to_string()
+        };
         let border_len = inner_width.saturating_sub(title.len());
         let left_border = border_len / 2;
         let right_border = border_len - left_border;
@@ -1401,7 +1471,18 @@ impl SessionManagerState {
                 let is_selected = tree_idx == self.selected;
                 let indent = "  ".repeat(row.indent);
 
+                // Is this a pane marked for "add to view"? Keyed by identity so
+                // the highlight survives tree rebuilds.
+                let is_marked = matches!(
+                    &row.node_type,
+                    NodeType::Pane { server, pane_id, .. }
+                        if self.marked.iter().any(|(s, p)| s == server && p == pane_id)
+                );
+
+                // A marked pane gets a distinct leading glyph (a filled circle,
+                // NOT the '*' focus/current marker) in place of its blank indent.
                 let expand_marker = match &row.node_type {
+                    NodeType::Pane { .. } if is_marked => "\u{25CF} ",
                     NodeType::Pane { .. } | NodeType::DormantSession { .. } => "  ",
                     _ => {
                         if row.is_expanded {
@@ -1422,7 +1503,9 @@ impl SessionManagerState {
 
                 let (row_fg, row_bg) = if is_selected {
                     (sel_fg, sel_bg)
-                } else if row.is_current {
+                } else if is_marked || row.is_current {
+                    // Marked (and current) rows use the accent color so they
+                    // stand out even when not the highlighted row.
                     (current_fg, bg)
                 } else {
                     (fg, bg)
@@ -2616,5 +2699,180 @@ mod tests {
         assert!(cells.iter().all(|(k, _)| k.starts_with('t')));
         assert!(cells.iter().any(|(_, l)| l == "tab new"));
         assert!(!cells.iter().any(|(_, l)| l == "pane new"));
+    }
+
+    // -- Pane multi-select marking ("add to view") ---------------------------
+
+    /// A single-session, two-pane local state with the tab expanded so both
+    /// pane rows are present. Pane ids are 10 and 11.
+    fn two_pane_state() -> SessionManagerState {
+        let mut state = SessionManagerState::new(None);
+        let folders = vec![FolderTreeEntry {
+            name: "work".to_string(),
+            sessions: vec![SessionTreeEntry {
+                name: "multi".to_string(),
+                tabs: vec![TabTreeEntry {
+                    id: 1,
+                    name: "Tab 1".to_string(),
+                    panes: vec![
+                        PaneTreeEntry {
+                            id: 10,
+                            name: "p10".to_string(),
+                            is_focused: true,
+                        },
+                        PaneTreeEntry {
+                            id: 11,
+                            name: "p11".to_string(),
+                            is_focused: false,
+                        },
+                    ],
+                }],
+                client_count: 1,
+                is_current: false,
+            }],
+        }];
+        state.update_tree(ConnId::Local, folders, Vec::new(), Vec::new());
+        let tab_idx = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
+            .unwrap();
+        state.selected = tab_idx;
+        state.expand_selected();
+        state
+    }
+
+    fn pane_row_by_id(state: &SessionManagerState, id: u64) -> usize {
+        state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Pane { pane_id, .. } if *pane_id == id))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_toggle_mark_only_on_pane() {
+        let mut state = two_pane_state();
+        // On a non-pane row (the tab), toggle is a no-op.
+        assert!(!state.toggle_mark());
+        assert_eq!(state.marked_count(), 0);
+
+        // On a pane row, toggle marks it; toggling again unmarks.
+        state.selected = pane_row_by_id(&state, 10);
+        assert!(state.toggle_mark());
+        assert_eq!(state.marked_count(), 1);
+        assert!(state.toggle_mark());
+        assert_eq!(state.marked_count(), 0);
+    }
+
+    #[test]
+    fn test_take_marked_returns_drained_set() {
+        let mut state = two_pane_state();
+        state.selected = pane_row_by_id(&state, 10);
+        state.toggle_mark();
+        state.selected = pane_row_by_id(&state, 11);
+        state.toggle_mark();
+        assert_eq!(state.marked_count(), 2);
+
+        let panes = state.take_marked_or_highlighted_panes();
+        assert_eq!(panes, vec![(ConnId::Local, 10u64), (ConnId::Local, 11u64)]);
+        // Draining clears the marks.
+        assert_eq!(state.marked_count(), 0);
+    }
+
+    #[test]
+    fn test_take_falls_back_to_highlighted_pane() {
+        let mut state = two_pane_state();
+        state.selected = pane_row_by_id(&state, 11);
+        // No marks: the single highlighted pane is returned.
+        let panes = state.take_marked_or_highlighted_panes();
+        assert_eq!(panes, vec![(ConnId::Local, 11u64)]);
+    }
+
+    #[test]
+    fn test_take_empty_on_non_pane_with_no_marks() {
+        let mut state = two_pane_state();
+        // Highlight the tab (not a pane), no marks -> empty.
+        state.selected = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
+            .unwrap();
+        assert!(state.take_marked_or_highlighted_panes().is_empty());
+    }
+
+    #[test]
+    fn test_mark_survives_rebuild_rows() {
+        let mut state = two_pane_state();
+        state.selected = pane_row_by_id(&state, 10);
+        state.toggle_mark();
+        assert_eq!(state.marked_count(), 1);
+
+        // A fresh tree (e.g. an async refresh) rebuilds all rows; the mark is
+        // keyed by (server, pane_id), so it must survive.
+        let folders = vec![FolderTreeEntry {
+            name: "work".to_string(),
+            sessions: vec![SessionTreeEntry {
+                name: "multi".to_string(),
+                tabs: vec![TabTreeEntry {
+                    id: 1,
+                    name: "Tab 1".to_string(),
+                    panes: vec![PaneTreeEntry {
+                        id: 10,
+                        name: "p10".to_string(),
+                        is_focused: true,
+                    }],
+                }],
+                client_count: 1,
+                is_current: false,
+            }],
+        }];
+        state.update_tree(ConnId::Local, folders, Vec::new(), Vec::new());
+        assert_eq!(state.marked_count(), 1);
+    }
+
+    #[test]
+    fn test_add_to_view_binding_emits_marked_panes() {
+        let mut state = two_pane_state();
+        state.selected = pane_row_by_id(&state, 10);
+        state.toggle_mark();
+        state.selected = pane_row_by_id(&state, 11);
+        state.toggle_mark();
+
+        let action = state.apply_binding(SessionManagerBinding::AddToView);
+        match action {
+            SessionManagerAction::AddToView { panes } => {
+                assert_eq!(panes, vec![(ConnId::Local, 10u64), (ConnId::Local, 11u64)]);
+            }
+            other => panic!("expected AddToView, got {other:?}"),
+        }
+        // Marks consumed.
+        assert_eq!(state.marked_count(), 0);
+    }
+
+    #[test]
+    fn test_add_to_view_binding_noop_on_non_pane_without_marks() {
+        let mut state = two_pane_state();
+        state.selected = state
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Session { .. }))
+            .unwrap();
+        let action = state.apply_binding(SessionManagerBinding::AddToView);
+        assert!(matches!(action, SessionManagerAction::None));
+    }
+
+    #[test]
+    fn test_marked_count_shows_in_title() {
+        let mut state = two_pane_state();
+        state.selected = pane_row_by_id(&state, 10);
+        state.toggle_mark();
+        let theme = Theme::default();
+        let cmds = state.render(100, 30, &theme);
+        let text: String = cmds.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            text.contains("(1 marked)"),
+            "title should show marked count: {text:?}"
+        );
     }
 }
