@@ -1475,8 +1475,9 @@ async fn handle_command(
                 // Focus stays on the moved pane (its id is unchanged; only its
                 // slot in the tree changes).
                 if let Some(neighbor) =
-                    layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction, 0)
+                    layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction.clone(), 0)
                 {
+                    // Adjacent reorder: swap with the neighbor in `direction`.
                     if layout::swap_panes(&mut tab.layout, tab.focused_pane, neighbor)
                         && tab.layout_mode.is_automatic()
                     {
@@ -1484,6 +1485,14 @@ async fn handle_command(
                         // from `pane_order` doesn't revert the swap.
                         tab.layout_mode = LayoutMode::Custom(CustomLayout);
                     }
+                } else if let Some(new_tree) =
+                    layout::relocate_pane_to_edge(&tab.layout, tab.focused_pane, direction)
+                {
+                    // No neighbor in `direction`: the focused pane is at that
+                    // edge. Relocate it, restructuring the layout, and always
+                    // eject to Custom so it isn't rebuilt away.
+                    tab.layout = new_tree;
+                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;

@@ -1175,6 +1175,83 @@ fn swap_panes_inner(node: &mut LayoutNode, a: PaneId, b: PaneId) {
     }
 }
 
+/// Relocate the focused pane to the given edge of the tab, restructuring the
+/// layout tree.
+///
+/// Used by `PaneMove*` when the focused pane has no spatial neighbor in `dir`
+/// (it is already at that edge). Rather than a no-op, the pane's leaf is lifted
+/// out of the tree (the remainder collapses as usual) and the whole remaining
+/// tree `R` and the focused pane `P` are wrapped in a fresh 0.5-ratio split:
+///
+/// - `Down`  -> `Split { Horizontal, first: R, second: P }` (P on the bottom)
+/// - `Up`    -> `Split { Horizontal, first: P, second: R }` (P on the top)
+/// - `Right` -> `Split { Vertical,   first: R, second: P }` (P on the right)
+/// - `Left`  -> `Split { Vertical,   first: P, second: R }` (P on the left)
+///
+/// Returns the restructured tree, or `None` when nothing can be restructured:
+/// the pane is not present, is the tab's only pane, or shares a leaf stack with
+/// other panes (a multi-pane stack such as Monocle is left untouched).
+pub fn relocate_pane_to_edge(
+    root: &LayoutNode,
+    pane: PaneId,
+    dir: FocusDirection,
+) -> Option<LayoutNode> {
+    // Only relocate a pane that is alone in its leaf stack. Sharing a stack
+    // with other panes (e.g. Monocle) must not be exploded into a split.
+    let (name, custom_name) = leaf_solo_pane_name(root, pane)?;
+
+    let mut remaining = root.clone();
+    // Lift the focused pane out; the remaining tree collapses as usual. If the
+    // tree becomes empty the pane was the only one -- nothing to restructure.
+    remaining.close_pane(pane)?;
+
+    // Rebuild the moved pane's leaf, preserving its display and custom names.
+    let moved = LayoutNode::Stack {
+        panes: vec![pane],
+        names: vec![name],
+        custom_names: vec![custom_name],
+        active: 0,
+    };
+
+    let (direction, first, second) = match dir {
+        FocusDirection::Down => (Direction::Horizontal, remaining, moved),
+        FocusDirection::Up => (Direction::Horizontal, moved, remaining),
+        FocusDirection::Right => (Direction::Vertical, remaining, moved),
+        FocusDirection::Left => (Direction::Vertical, moved, remaining),
+    };
+
+    Some(LayoutNode::Split {
+        direction,
+        ratio: 0.5,
+        first: Box::new(first),
+        second: Box::new(second),
+    })
+}
+
+/// If `pane` is alone in its leaf stack, return its `(name, custom_name)`;
+/// otherwise `None` (pane not found, or it shares a stack with other panes).
+fn leaf_solo_pane_name(node: &LayoutNode, pane: PaneId) -> Option<(String, Option<String>)> {
+    match node {
+        LayoutNode::Stack {
+            panes,
+            names,
+            custom_names,
+            ..
+        } => {
+            if panes.len() == 1 && panes[0] == pane {
+                let name = names.first().cloned().unwrap_or_default();
+                let custom = custom_names.first().cloned().unwrap_or(None);
+                Some((name, custom))
+            } else {
+                None
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            leaf_solo_pane_name(first, pane).or_else(|| leaf_solo_pane_name(second, pane))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Automatic layout builders
 // ---------------------------------------------------------------------------
@@ -2423,5 +2500,186 @@ mod tests {
         // The lone left leaf now holds P3; the stack holds [2, 1].
         assert_eq!(find_stack_for_pane(&node, 3), Some(vec![3]));
         assert_eq!(find_stack_for_pane(&node, 1), Some(vec![2, 1]));
+    }
+
+    /// Two panes side by side: pane 1 (A) on the left, pane 2 (B) on the right.
+    fn side_by_side() -> LayoutNode {
+        LayoutNode::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::new_stack(1)),
+            second: Box::new(LayoutNode::new_stack(2)),
+        }
+    }
+
+    #[test]
+    fn test_relocate_down_stacks_below() {
+        // Move pane 2 (B, right) Down -> horizontal split, A on top, B below.
+        let tree = relocate_pane_to_edge(&side_by_side(), 2, FocusDirection::Down)
+            .expect("relocate should restructure");
+        match tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, Direction::Horizontal);
+                assert!(matches!(*first, LayoutNode::Stack { ref panes, .. } if panes == &[1]));
+                assert!(matches!(*second, LayoutNode::Stack { ref panes, .. } if panes == &[2]));
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_relocate_up_stacks_above() {
+        // Move pane 2 (B) Up -> horizontal split, B on top, A below.
+        let tree = relocate_pane_to_edge(&side_by_side(), 2, FocusDirection::Up)
+            .expect("relocate should restructure");
+        match tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, Direction::Horizontal);
+                assert!(matches!(*first, LayoutNode::Stack { ref panes, .. } if panes == &[2]));
+                assert!(matches!(*second, LayoutNode::Stack { ref panes, .. } if panes == &[1]));
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_relocate_right_moves_to_right_edge() {
+        // Move pane 1 (A, left) Right -> vertical split, remaining (2) first,
+        // relocated pane 1 on the right.
+        let tree = relocate_pane_to_edge(&side_by_side(), 1, FocusDirection::Right)
+            .expect("relocate should restructure");
+        match tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, Direction::Vertical);
+                assert!(matches!(*first, LayoutNode::Stack { ref panes, .. } if panes == &[2]));
+                assert!(matches!(*second, LayoutNode::Stack { ref panes, .. } if panes == &[1]));
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_relocate_left_moves_to_left_edge() {
+        // Move pane 2 (B, right) Left -> vertical split, relocated pane 2 first,
+        // remaining (1) on the right.
+        let tree = relocate_pane_to_edge(&side_by_side(), 2, FocusDirection::Left)
+            .expect("relocate should restructure");
+        match tree {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, Direction::Vertical);
+                assert!(matches!(*first, LayoutNode::Stack { ref panes, .. } if panes == &[2]));
+                assert!(matches!(*second, LayoutNode::Stack { ref panes, .. } if panes == &[1]));
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_relocate_three_pane_right_edge() {
+        // Split { Vertical, 1, Split { Horizontal, 2, 3 } }; move pane 3 Right.
+        let tree = LayoutNode::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::new_stack(1)),
+            second: Box::new(LayoutNode::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::new_stack(2)),
+                second: Box::new(LayoutNode::new_stack(3)),
+            }),
+        };
+        let out = relocate_pane_to_edge(&tree, 3, FocusDirection::Right)
+            .expect("relocate should restructure");
+        match out {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, Direction::Vertical);
+                // Pane 3 sits alone on the right edge.
+                assert!(matches!(*second, LayoutNode::Stack { ref panes, .. } if panes == &[3]));
+                // The left subtree still contains both 1 and 2.
+                let left_ids = active_pane_ids(&first);
+                assert!(left_ids.contains(&1));
+                assert!(left_ids.contains(&2));
+                assert!(!left_ids.contains(&3));
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn test_relocate_single_pane_returns_none() {
+        let tree = LayoutNode::new_stack(1);
+        assert!(relocate_pane_to_edge(&tree, 1, FocusDirection::Down).is_none());
+        assert!(relocate_pane_to_edge(&tree, 1, FocusDirection::Up).is_none());
+        assert!(relocate_pane_to_edge(&tree, 1, FocusDirection::Left).is_none());
+        assert!(relocate_pane_to_edge(&tree, 1, FocusDirection::Right).is_none());
+    }
+
+    #[test]
+    fn test_relocate_multi_pane_stack_returns_none() {
+        // A Monocle-like multi-pane stack must not be exploded into a split.
+        let tree = LayoutNode::Stack {
+            panes: vec![1, 2],
+            names: vec![String::new(); 2],
+            custom_names: vec![None; 2],
+            active: 0,
+        };
+        assert!(relocate_pane_to_edge(&tree, 1, FocusDirection::Down).is_none());
+    }
+
+    #[test]
+    fn test_relocate_preserves_custom_name() {
+        // Pane 2 carries a custom name; after relocation the moved leaf keeps it.
+        let tree = LayoutNode::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::new_stack(1)),
+            second: Box::new(LayoutNode::Stack {
+                panes: vec![2],
+                names: vec![String::new()],
+                custom_names: vec![Some("mine".to_string())],
+                active: 0,
+            }),
+        };
+        let out = relocate_pane_to_edge(&tree, 2, FocusDirection::Up)
+            .expect("relocate should restructure");
+        match out {
+            LayoutNode::Split { first, .. } => match *first {
+                LayoutNode::Stack {
+                    panes,
+                    custom_names,
+                    ..
+                } => {
+                    assert_eq!(panes, vec![2]);
+                    assert_eq!(custom_names, vec![Some("mine".to_string())]);
+                }
+                _ => panic!("expected moved leaf as first"),
+            },
+            _ => panic!("expected Split"),
+        }
     }
 }
