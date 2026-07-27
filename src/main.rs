@@ -706,9 +706,10 @@ fn relay_overlays(
 /// what a live view shows (a fresh `PaneContent` snapshot, focus movement,
 /// layout change, add/remove cell, terminal resize).
 ///
-/// `PaneContent` carries no cursor, so the hardware cursor is hidden while a
-/// view is up (a known limitation). The composite area is the full terminal —
-/// a view has no status-bar row of its own (also a known limitation).
+/// The focused cell's source cursor is shown at its mapped position (or hidden
+/// when unavailable). The bottom row is reserved for a client-side status bar
+/// (view name, focused cell title, input mode, layout name); cells are laid out
+/// above it so they never overwrite it.
 #[allow(clippy::too_many_arguments)]
 fn paint_view(
     renderer: &mut Renderer,
@@ -716,6 +717,7 @@ fn paint_view(
     input: &InputHandler,
     whichkey: &WhichKeyPopup,
     theme: &crate::config::theme::Theme,
+    compositor_theme: &crate::config::theme::CompositorTheme,
     which_key_position: &crate::config::WhichKeyPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
@@ -727,7 +729,30 @@ fn paint_view(
         width: c,
         height: r,
     };
-    let composed = crate::client::view::composite(view, area);
+    let mut composed = crate::client::view::composite(view, area);
+    // Draw the client-side status bar on the reserved bottom row, mirroring the
+    // normal (server) bar's left/right layout with the same theme colors.
+    let mode = match input.mode {
+        Mode::Normal => "NORMAL",
+        Mode::Command => "COMMAND",
+        Mode::Visual => "VISUAL",
+        Mode::CommandPalette => "PALETTE",
+        Mode::Search => "SEARCH",
+        Mode::SessionManager => "SESSION_MANAGER",
+    };
+    let cell_title = view
+        .cells
+        .get(view.focused)
+        .and_then(|c| c.title.as_deref());
+    crate::client::view::draw_status_bar(
+        &mut composed,
+        area,
+        mode,
+        &view.name,
+        cell_title,
+        view.layout.name(),
+        compositor_theme,
+    );
     // Show the terminal cursor at the focused cell's source cursor position (if
     // visible and in view); unfocused cells and hidden/clipped cursors leave it
     // off. This lets a mirrored interactive app (vim, claude) show a live cursor.
@@ -773,9 +798,16 @@ async fn subscribe_view_cells(
         width: c,
         height: r,
     };
-    let rects = crate::client::view::cell_rects(view.layout, view.cells.len(), area);
+    let inner = crate::client::view::cells_area(area);
+    let rects = crate::client::view::cell_rects(&view.layout, view.focused, view.cells.len(), area);
     for (i, cell) in view.cells.iter().enumerate() {
-        if let Some(rect) = rects.get(i) {
+        // Visible cells subscribe at their rect's interior. Cells hidden by the
+        // current layout (e.g. Monocle's unfocused cells) still get a
+        // subscription -- at the full cell area with NO size demand -- so a
+        // cell that was just focused releases its Model-B size clamp instead of
+        // staying pinned to the old cell size forever.
+        {
+            let rect = rects.get(i).copied().flatten().unwrap_or(inner);
             let cols = rect.width.saturating_sub(2);
             let rows = rect.height.saturating_sub(2);
             if cols > 0 && rows > 0 {
@@ -835,6 +867,177 @@ async fn unsubscribe_view_cells(
     Ok(())
 }
 
+/// While a view is active, decide what a `RemuxCommand` does client-side and
+/// apply it, returning `true` when the command was consumed (the caller should
+/// `continue` and forward nothing) or `false` when it must fall through to the
+/// normal path.
+///
+/// This is the single interception point used by both `InputAction::Execute`
+/// and each command of `InputAction::ExecuteChain`. It fixes a crash: without
+/// it, a structural command like `PaneClose` (`Prefix p x`) was forwarded to the
+/// masked foreground server, which is not the pane the user sees.
+///
+/// - `PaneFocus{Left,Right,Up,Down}` -> move the view's focused cell (Model-B
+///   size demand follows focus via a re-subscribe), repaint.
+/// - `LayoutNext` -> cycle the view's layout, re-subscribe, repaint.
+/// - `PaneClose` -> eject the focused cell from the view (unsubscribe it, drop
+///   it, clamp focus, re-subscribe the rest); the real pane is untouched.
+/// - `SessionDetach` -> NOT consumed (returns `false`) so the caller's detach
+///   path runs and the client exits.
+/// - `SendKey(bytes)` -> route the raw bytes to the focused cell's pane by
+///   identity (best-effort), never to the foreground.
+/// - every other structural / server command -> NO-OP: consumed, nothing sent
+///   (the which-key popup is hidden like the normal path).
+#[allow(clippy::too_many_arguments)]
+async fn handle_view_command(
+    cmd: &RemuxCommand,
+    mgr: &mut ConnectionManager,
+    views: &mut [crate::client::view::ClientView],
+    av: usize,
+    renderer: &mut Renderer,
+    input: &InputHandler,
+    whichkey: &mut WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    compositor_theme: &crate::config::theme::CompositorTheme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    cols: u16,
+    rows: u16,
+) -> Result<bool> {
+    use crate::server::layout::FocusDirection;
+
+    // Common "hide the which-key popup" step shared by the consuming branches.
+    macro_rules! hide_whichkey {
+        () => {
+            if whichkey.visible {
+                whichkey.hide();
+                renderer.clear_overlay(cols, rows)?;
+            }
+        };
+    }
+    // Common "repaint the active view" step.
+    macro_rules! repaint {
+        () => {
+            paint_view(
+                renderer,
+                &views[av],
+                input,
+                whichkey,
+                theme,
+                compositor_theme,
+                which_key_position,
+                viewport_top,
+                focused_pane_rect,
+            )?;
+        };
+    }
+
+    let dir = match cmd {
+        RemuxCommand::PaneFocusLeft => Some(FocusDirection::Left),
+        RemuxCommand::PaneFocusRight => Some(FocusDirection::Right),
+        RemuxCommand::PaneFocusUp => Some(FocusDirection::Up),
+        RemuxCommand::PaneFocusDown => Some(FocusDirection::Down),
+        _ => None,
+    };
+    if let Some(dir) = dir {
+        hide_whichkey!();
+        if views[av].move_focus(dir) {
+            // Model B: focus moved, so the size demand must swap -- re-subscribe
+            // every cell (new focus demands its size; the old focus releases its
+            // demand so its pane grows back).
+            subscribe_view_cells(mgr, &views[av]).await?;
+        }
+        repaint!();
+        return Ok(true);
+    }
+
+    match cmd {
+        RemuxCommand::LayoutNext => {
+            hide_whichkey!();
+            views[av].layout = views[av].layout.next();
+            subscribe_view_cells(mgr, &views[av]).await?;
+            repaint!();
+            Ok(true)
+        }
+        RemuxCommand::PaneClose => {
+            // Eject the focused cell from the view -- do NOT close the real pane.
+            hide_whichkey!();
+            if !views[av].cells.is_empty() {
+                let focused = views[av].focused;
+                let cell = views[av].cells.remove(focused);
+                // Best-effort: a torn-down source connection must not abort here.
+                if let Err(e) = mgr
+                    .send(
+                        &cell.conn,
+                        ClientMessage::UnsubscribePane {
+                            pane_id: cell.pane_id,
+                        },
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "view: UnsubscribePane (eject) to {:?} pane {} failed: {e}",
+                        cell.conn,
+                        cell.pane_id
+                    );
+                }
+                views[av].clamp_focus();
+                // Remaining cells changed size: re-subscribe.
+                subscribe_view_cells(mgr, &views[av]).await?;
+            }
+            repaint!();
+            Ok(true)
+        }
+        // Let the caller's detach path run (it exits the client).
+        RemuxCommand::SessionDetach => Ok(false),
+        RemuxCommand::SendKey(bytes) => {
+            // Route raw bytes to the focused cell by identity (never the
+            // foreground). Best-effort, matching the crash-safe input path.
+            let focused = views[av].focused;
+            let target = views[av]
+                .cells
+                .get(focused)
+                .filter(|c| !c.disconnected)
+                .map(|c| (c.conn.clone(), c.pane_id));
+            if let Some((conn, pane_id)) = target {
+                if let Err(e) = mgr
+                    .send(
+                        &conn,
+                        ClientMessage::InputToPane {
+                            pane_id,
+                            data: bytes.clone(),
+                        },
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "view: SendKey InputToPane to {:?} pane {} failed: {e}; marking cell disconnected",
+                        conn,
+                        pane_id
+                    );
+                    if let Some(c) = views[av].cells.get_mut(focused) {
+                        c.disconnected = true;
+                    }
+                    repaint!();
+                }
+            }
+            Ok(true)
+        }
+        // Every other structural / server command is a NO-OP while in a view:
+        // consume it, forward nothing. Hide the which-key popup (as the normal
+        // path does) and repaint so the view is left clean.
+        _ => {
+            if whichkey.visible {
+                whichkey.hide();
+                renderer.clear_overlay(cols, rows)?;
+                repaint!();
+            }
+            Ok(true)
+        }
+    }
+}
+
 /// Tear down the active view (if any) before switching the foreground
 /// session/server. A live view's `paint_view` overrides the screen and masks
 /// the switched-to session, so every switch entry point must leave the view
@@ -883,6 +1086,9 @@ async fn run_client_loop(
     let mut renderer = Renderer::new(cols, rows);
     let mut whichkey = WhichKeyPopup::new();
     let mut theme = config.theme();
+    // `CompositorTheme` (CellColor) mirror of the client `Theme`, used to draw
+    // the client-side view status bar with the same colors as the normal bar.
+    let mut compositor_theme = config.compositor_theme();
     let mut which_key_position = config.appearance.which_key_position.clone();
 
     // Spawn the config-file watcher for live hot-reload. This is best-effort:
@@ -1049,6 +1255,7 @@ async fn run_client_loop(
                                                 &input,
                                                 &whichkey,
                                                 &theme,
+                                                &compositor_theme,
                                                 &which_key_position,
                                                 viewport_top,
                                                 focused_pane_rect.as_ref(),
@@ -1067,40 +1274,41 @@ async fn run_client_loop(
                             }
                             InputAction::Execute(cmd) => {
                                 log::debug!("input: Execute cmd={:?}", cmd);
-                                // In view mode, PaneFocus moves the view's focused
-                                // cell client-side and is NOT forwarded to the
-                                // server. Everything else falls through unchanged.
+                                // Clear command palette overlay if it was just
+                                // closed. Done BEFORE the view interception so a
+                                // command run from `:` while in a view (which the
+                                // interception consumes) still tears the palette
+                                // down instead of leaving it on screen.
+                                if was_in_palette && input.command_palette.is_none() {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_command_palette_overlay(c, r)?;
+                                }
+                                // While a view is active, structural pane/tab
+                                // commands are intercepted client-side (focus
+                                // move, layout cycle, eject cell, or no-op) and
+                                // NEVER forwarded to the (masked) foreground
+                                // server -- forwarding e.g. PaneClose there would
+                                // crash the client. `SessionDetach` is the one
+                                // command allowed to fall through (to exit).
                                 if let Some(av) = active_view {
-                                    let dir = match cmd {
-                                        RemuxCommand::PaneFocusLeft => Some(crate::server::layout::FocusDirection::Left),
-                                        RemuxCommand::PaneFocusRight => Some(crate::server::layout::FocusDirection::Right),
-                                        RemuxCommand::PaneFocusUp => Some(crate::server::layout::FocusDirection::Up),
-                                        RemuxCommand::PaneFocusDown => Some(crate::server::layout::FocusDirection::Down),
-                                        _ => None,
-                                    };
-                                    if let Some(dir) = dir {
-                                        if whichkey.visible {
-                                            whichkey.hide();
-                                            renderer.clear_overlay(cols, rows)?;
-                                        }
-                                        if views[av].move_focus(dir) {
-                                            // Model B: focus moved, so the size
-                                            // demand must swap -- re-subscribe every
-                                            // cell (new focus demands its size; the
-                                            // old focus releases its demand so its
-                                            // pane grows back). Then repaint.
-                                            subscribe_view_cells(mgr, &views[av]).await?;
-                                            paint_view(
-                                                &mut renderer,
-                                                &views[av],
-                                                &input,
-                                                &whichkey,
-                                                &theme,
-                                                &which_key_position,
-                                                viewport_top,
-                                                focused_pane_rect.as_ref(),
-                                            )?;
-                                        }
+                                    if handle_view_command(
+                                        &cmd,
+                                        mgr,
+                                        &mut views,
+                                        av,
+                                        &mut renderer,
+                                        &input,
+                                        &mut whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                        cols,
+                                        rows,
+                                    )
+                                    .await?
+                                    {
                                         continue;
                                     }
                                 }
@@ -1108,11 +1316,6 @@ async fn run_client_loop(
                                 if whichkey.visible {
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
-                                }
-                                // Clear command palette overlay if it was just closed.
-                                if was_in_palette && input.command_palette.is_none() {
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_command_palette_overlay(c, r)?;
                                 }
                                 renderer.flush()?;
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
@@ -1160,32 +1363,30 @@ async fn run_client_loop(
                                     if matches!(cmd, RemuxCommand::SessionDetach) {
                                         return Ok(());
                                     }
-                                    // In view mode, PaneFocus moves the view's
-                                    // focused cell instead of being forwarded.
+                                    // While a view is active, intercept structural
+                                    // commands client-side (focus / layout / eject
+                                    // / no-op); nothing structural is forwarded to
+                                    // the masked foreground server. See the
+                                    // single-command `Execute` path above.
                                     if let Some(av) = active_view {
-                                        let dir = match cmd {
-                                            RemuxCommand::PaneFocusLeft => Some(crate::server::layout::FocusDirection::Left),
-                                            RemuxCommand::PaneFocusRight => Some(crate::server::layout::FocusDirection::Right),
-                                            RemuxCommand::PaneFocusUp => Some(crate::server::layout::FocusDirection::Up),
-                                            RemuxCommand::PaneFocusDown => Some(crate::server::layout::FocusDirection::Down),
-                                            _ => None,
-                                        };
-                                        if let Some(dir) = dir {
-                                            if views[av].move_focus(dir) {
-                                                // Focus moved: swap the size demand
-                                                // (see the single-command path).
-                                                subscribe_view_cells(mgr, &views[av]).await?;
-                                                paint_view(
-                                                    &mut renderer,
-                                                    &views[av],
-                                                    &input,
-                                                    &whichkey,
-                                                    &theme,
-                                                    &which_key_position,
-                                                    viewport_top,
-                                                    focused_pane_rect.as_ref(),
-                                                )?;
-                                            }
+                                        if handle_view_command(
+                                            &cmd,
+                                            mgr,
+                                            &mut views,
+                                            av,
+                                            &mut renderer,
+                                            &input,
+                                            &mut whichkey,
+                                            &theme,
+                                            &compositor_theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                            cols,
+                                            rows,
+                                        )
+                                        .await?
+                                        {
                                             continue;
                                         }
                                     }
@@ -2138,6 +2339,7 @@ async fn run_client_loop(
                                         &input,
                                         &whichkey,
                                         &theme,
+                                        &compositor_theme,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2161,6 +2363,7 @@ async fn run_client_loop(
                                         &input,
                                         &whichkey,
                                         &theme,
+                                        &compositor_theme,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2271,6 +2474,7 @@ async fn run_client_loop(
                                     &input,
                                     &whichkey,
                                     &theme,
+                                    &compositor_theme,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -2307,6 +2511,7 @@ async fn run_client_loop(
                                         &input,
                                         &whichkey,
                                         &theme,
+                                        &compositor_theme,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2362,6 +2567,7 @@ async fn run_client_loop(
                                         &input,
                                         &whichkey,
                                         &theme,
+                                        &compositor_theme,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2387,6 +2593,7 @@ async fn run_client_loop(
                                             &input,
                                             &whichkey,
                                             &theme,
+                                            &compositor_theme,
                                             &which_key_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
@@ -2433,6 +2640,7 @@ async fn run_client_loop(
                                             &input,
                                             &whichkey,
                                             &theme,
+                                            &compositor_theme,
                                             &which_key_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
@@ -2446,31 +2654,29 @@ async fn run_client_loop(
                                 }
                             }
                             InputAction::ViewRemovePane => {
-                                if whichkey.visible {
-                                    whichkey.hide();
-                                    renderer.clear_overlay(cols, rows)?;
-                                }
+                                // `w x` ejects the focused cell -- the SAME
+                                // crash-safe eject as `Prefix p x` in a view, so
+                                // route it through the one helper (best-effort
+                                // unsubscribe: a dead source must not exit the
+                                // client).
                                 if let Some(av) = active_view {
-                                    if !views[av].cells.is_empty() {
-                                        let focused = views[av].focused;
-                                        let cell = views[av].cells.remove(focused);
-                                        mgr.send(&cell.conn, ClientMessage::UnsubscribePane {
-                                            pane_id: cell.pane_id,
-                                        }).await?;
-                                        views[av].clamp_focus();
-                                        // Remaining cells changed size: re-subscribe.
-                                        subscribe_view_cells(mgr, &views[av]).await?;
-                                        paint_view(
-                                            &mut renderer,
-                                            &views[av],
-                                            &input,
-                                            &whichkey,
-                                            &theme,
-                                            &which_key_position,
-                                            viewport_top,
-                                            focused_pane_rect.as_ref(),
-                                        )?;
-                                    }
+                                    handle_view_command(
+                                        &RemuxCommand::PaneClose,
+                                        mgr,
+                                        &mut views,
+                                        av,
+                                        &mut renderer,
+                                        &input,
+                                        &mut whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                        cols,
+                                        rows,
+                                    )
+                                    .await?;
                                 }
                             }
                             InputAction::ViewLayoutNext => {
@@ -2480,15 +2686,18 @@ async fn run_client_loop(
                                 }
                                 if let Some(av) = active_view {
                                     views[av].layout = views[av].layout.next();
-                                    // Note: cells are not re-subscribed at the new
-                                    // per-cell size here (re-subscribe-on-layout is
-                                    // deferred); the next snapshot still composites.
+                                    // Re-subscribe so each cell demands its new
+                                    // per-cell size (the layout changed the rects,
+                                    // and the focused cell's Model-B demand must
+                                    // follow); then repaint.
+                                    subscribe_view_cells(mgr, &views[av]).await?;
                                     paint_view(
                                         &mut renderer,
                                         &views[av],
                                         &input,
                                         &whichkey,
                                         &theme,
+                                        &compositor_theme,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2545,6 +2754,7 @@ async fn run_client_loop(
                                             &input,
                                             &whichkey,
                                             &theme,
+                                            &compositor_theme,
                                             &which_key_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
@@ -2666,6 +2876,7 @@ async fn run_client_loop(
                                 &input,
                                 &whichkey,
                                 &theme,
+                                &compositor_theme,
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
@@ -2726,6 +2937,7 @@ async fn run_client_loop(
                                     &input,
                                     &whichkey,
                                     &theme,
+                                    &compositor_theme,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -3164,6 +3376,7 @@ async fn run_client_loop(
                                     &input,
                                     &whichkey,
                                     &theme,
+                                    &compositor_theme,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -3342,6 +3555,7 @@ async fn run_client_loop(
                                     &input,
                                     &whichkey,
                                     &theme,
+                                    &compositor_theme,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -3374,6 +3588,7 @@ async fn run_client_loop(
                     // Update theme before any re-render so overlays repaint with
                     // the new colors.
                     theme = new_config.theme();
+                    compositor_theme = new_config.compositor_theme();
 
                     // Update which-key placement so it changes live too.
                     which_key_position = new_config.appearance.which_key_position.clone();

@@ -7,7 +7,17 @@
 //! server streams for those panes into a single grid. The event loop owns the
 //! list of views and feeds fresh snapshots in as they arrive; everything in
 //! this module is pure geometry + buffer composition so it can be unit-tested
-//! headlessly (no terminal, no sockets, no `Theme`).
+//! headlessly (no terminal, no sockets). The one exception is
+//! [`draw_status_bar`], which takes an already-resolved
+//! [`CompositorTheme`](crate::config::theme::CompositorTheme) of `CellColor`s so
+//! the bottom bar mirrors the normal (server) status bar.
+//!
+//! Layout note: a view arranges its cells with the SAME automatic layout engine
+//! the server uses ([`LayoutMode`]: Bsp / Master / Monocle / Grid). Each cell is
+//! treated as a pseudo-pane whose id is its index, so the engine's `build_tree`
+//! and `compute_layout` place the cells; Monocle shows only the focused cell.
+//! The bottom row of the terminal is reserved for the view's status bar (see
+//! [`cells_area`]), so cell rects never overwrite it.
 //!
 //! Sizing note: cells render a pane's snapshot clipped and letterboxed into the
 //! cell rect, bottom-anchored so the latest output is visible. Under Model B
@@ -17,8 +27,9 @@
 //! never reflows the shared pane.
 
 use crate::client::registry::ConnId;
+use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, PaneId, RenderCell};
-use crate::server::layout::{FocusDirection, Rect};
+use crate::server::layout::{compute_layout, FocusDirection, GridLayout, LayoutMode, Rect};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -79,35 +90,15 @@ impl ViewCell {
     }
 }
 
-/// How a view arranges its cells.
-///
-/// The MVP supports two arrangements. Full parity with the server's
-/// [`LayoutMode`](crate::server::layout::LayoutMode) (Bsp / Master) is
-/// deferred; only `Grid` and `Monocle` exist here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewLayout {
-    /// All cells in a balanced grid of (roughly) equal-size cells.
-    Grid,
-    /// The focused cell fills the whole area; the others are hidden.
-    Monocle,
-}
-
-impl ViewLayout {
-    /// Cycle to the next layout: Grid -> Monocle -> Grid.
-    pub fn next(self) -> Self {
-        match self {
-            ViewLayout::Grid => ViewLayout::Monocle,
-            ViewLayout::Monocle => ViewLayout::Grid,
-        }
-    }
-}
-
 /// A client-side virtual tab compositing several panes.
 #[derive(Debug, Clone)]
 pub struct ClientView {
     pub name: String,
     pub cells: Vec<ViewCell>,
-    pub layout: ViewLayout,
+    /// How the cells are arranged. Reuses the server's automatic layout engine
+    /// (Bsp / Master / Monocle / Grid); [`LayoutMode::next`] cycles through them
+    /// (Custom is excluded). Defaults to Grid.
+    pub layout: LayoutMode,
     /// Index into `cells` of the focused cell. Always clamped to a valid index
     /// (or 0 when there are no cells) by the mutators below.
     pub focused: usize,
@@ -119,7 +110,7 @@ impl ClientView {
         Self {
             name,
             cells: Vec::new(),
-            layout: ViewLayout::Grid,
+            layout: LayoutMode::Grid(GridLayout),
             focused: 0,
         }
     }
@@ -134,18 +125,21 @@ impl ClientView {
     }
 
     /// Move focus in the given direction using the same `cols = ceil(sqrt(n))`
-    /// geometry as [`cell_rects`], so focus tracks the visible grid. Returns
-    /// `true` if the focused cell actually changed.
+    /// geometry as the Grid layout, so focus tracks a grid regardless of the
+    /// active layout. Returns `true` if the focused cell actually changed.
     ///
-    /// Monocle has only one visible cell, but focus still moves through the
-    /// underlying cell list (left/up = previous, right/down = next) so the user
-    /// can page between panes; that keeps the two layouts consistent.
+    /// This is deliberately layout-agnostic: under Bsp/Master the geometric
+    /// neighbor may not be the grid neighbor, but keeping one predictable
+    /// paging model across layouts is simpler and matches the previous
+    /// behavior. Monocle has only one visible cell, but focus still moves
+    /// through the underlying cell list (left/up = previous, right/down = next)
+    /// so the user can page between panes.
     pub fn move_focus(&mut self, dir: FocusDirection) -> bool {
         let n = self.cells.len();
         if n == 0 {
             return false;
         }
-        if self.layout == ViewLayout::Monocle {
+        if matches!(self.layout, LayoutMode::Monocle(_)) {
             let new = match dir {
                 FocusDirection::Left | FocusDirection::Up => self.focused.saturating_sub(1),
                 FocusDirection::Right | FocusDirection::Down => (self.focused + 1).min(n - 1),
@@ -206,69 +200,44 @@ fn grid_cols(n: usize) -> usize {
     }
 }
 
-/// Compute the outer rectangle for each of `n` cells within `area`.
-///
-/// - `Grid`: rows stacked top-to-bottom, each row spanning the full width; the
-///   cells within a row partition that width equally. `cols = ceil(sqrt(n))`
-///   cells per row, with the last (possibly short) row's cells spread across
-///   the full width. Remainder pixels go to the first rows / first columns, so
-///   the rects fully tile `area` with no gaps and no overlap.
-/// - `Monocle`: every rect equals `area` (only the focused one is drawn).
-///
-/// Returns exactly `n` rects (empty when `n == 0`).
-pub fn cell_rects(layout: ViewLayout, n: usize, area: Rect) -> Vec<Rect> {
-    if n == 0 {
-        return Vec::new();
-    }
-    match layout {
-        ViewLayout::Monocle => vec![area; n],
-        ViewLayout::Grid => grid_rects(n, area),
+/// The sub-rectangle of `area` available to cells: `area` minus the bottom row,
+/// which is reserved for the view's status bar. Everything that positions cells
+/// ([`cell_rects`], and therefore [`composite`], [`cell_at`],
+/// [`focused_cursor`] and the subscription sizing) goes through this, so cells
+/// can never overwrite the status row.
+pub fn cells_area(area: Rect) -> Rect {
+    Rect {
+        height: area.height.saturating_sub(1),
+        ..area
     }
 }
 
-/// Grid tiling: see [`cell_rects`].
-fn grid_rects(n: usize, area: Rect) -> Vec<Rect> {
-    if n == 1 {
-        return vec![area];
+/// Compute the outer rectangle for each of `n` cells within `area` (minus the
+/// reserved status row), using the automatic layout engine.
+///
+/// Each cell index `i` is treated as a pseudo-[`PaneId`] (`i as PaneId`); the
+/// layout's `build_tree` places those pseudo-panes and [`compute_layout`] turns
+/// the tree into rects. The result is indexed by cell: `out[i]` is `Some(rect)`
+/// when cell `i` is visible in the current layout, or `None` when it is hidden
+/// (Monocle hides every cell except the focused one).
+///
+/// Returns a vector of exactly `n` entries (empty when `n == 0`).
+pub fn cell_rects(layout: &LayoutMode, focused: usize, n: usize, area: Rect) -> Vec<Option<Rect>> {
+    if n == 0 {
+        return Vec::new();
     }
-    let cols = grid_cols(n);
-    let rows = n.div_ceil(cols);
-
-    let base_h = area.height / rows as u16;
-    let rem_h = area.height % rows as u16;
-
-    let mut rects = Vec::with_capacity(n);
-    let mut placed = 0usize;
-    let mut y = area.y;
-    for r in 0..rows {
-        let h = base_h + if (r as u16) < rem_h { 1 } else { 0 };
-        // Cells in this row: `cols` for every full row, whatever remains for
-        // the last row (always between 1 and `cols`).
-        let cells_in_row = if r == rows - 1 {
-            n - cols * (rows - 1)
-        } else {
-            cols
-        };
-        let base_w = area.width / cells_in_row as u16;
-        let rem_w = area.width % cells_in_row as u16;
-        let mut x = area.x;
-        for c in 0..cells_in_row {
-            let w = base_w + if (c as u16) < rem_w { 1 } else { 0 };
-            rects.push(Rect {
-                x,
-                y,
-                width: w,
-                height: h,
-            });
-            x += w;
-            placed += 1;
-            if placed == n {
-                break;
-            }
+    let inner = cells_area(area);
+    let ids: Vec<PaneId> = (0..n).map(|i| i as PaneId).collect();
+    let tree = layout.build_tree(&ids, focused as PaneId);
+    let placed = compute_layout(&tree, inner, 0);
+    let mut out = vec![None; n];
+    for (pid, rect) in placed {
+        let idx = pid as usize;
+        if idx < n {
+            out[idx] = Some(rect);
         }
-        y += h;
     }
-    rects
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -286,11 +255,13 @@ const UNFOCUSED_BORDER: CellColor = CellColor::Indexed(8);
 /// [`RenderCell`]s, ready to hand to
 /// [`Renderer::render_full`](crate::client::renderer::Renderer::render_full).
 ///
-/// Each cell gets a box border (the focused cell's border is drawn bold in a
-/// distinct color) and its snapshot is blitted bottom-anchored into the box's
-/// interior, clipped to the interior's width/height. Cells with no snapshot yet
-/// show a centered placeholder label. In `Monocle` only the focused cell is
-/// drawn, filling `area`.
+/// Cells are placed within [`cells_area`] (the terminal minus the reserved
+/// status row); the status row itself is drawn separately by
+/// [`draw_status_bar`]. Each cell gets a box border (the focused cell's border
+/// is drawn bold in a distinct color) and its snapshot is blitted
+/// bottom-anchored into the box's interior, clipped to the interior's
+/// width/height. Cells with no snapshot yet show a centered placeholder label.
+/// In `Monocle` only the focused cell is drawn.
 ///
 /// `area` is expected to have its origin at the buffer origin in normal use
 /// (the full terminal, `x = y = 0`); rect coordinates are translated back to
@@ -302,46 +273,49 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
     if w == 0 || h == 0 {
         return buf;
     }
+    let inner = cells_area(area);
     // A view with no cells (freshly created, or all removed) shows a centered
     // hint rather than a blank screen. `draw_centered` clamps the label to the
-    // available width, so it degrades gracefully on a tiny terminal.
+    // available width, so it degrades gracefully on a tiny terminal. Keep it
+    // within the cell region so it never lands on the status row.
     if view.cells.is_empty() {
-        draw_centered(&mut buf, 0, 0, w, h, "Add panes to this view");
+        let ih = (inner.height as usize).max(1);
+        draw_centered(
+            &mut buf,
+            0,
+            0,
+            inner.width as usize,
+            ih,
+            "Add panes to this view",
+        );
         return buf;
     }
 
-    match view.layout {
-        ViewLayout::Grid => {
-            let rects = cell_rects(ViewLayout::Grid, view.cells.len(), area);
-            for (i, cell) in view.cells.iter().enumerate() {
-                if let Some(rect) = rects.get(i) {
-                    draw_cell(&mut buf, area, *rect, cell, i == view.focused);
-                }
-            }
-        }
-        ViewLayout::Monocle => {
-            if let Some(cell) = view.cells.get(view.focused) {
-                draw_cell(&mut buf, area, area, cell, true);
-            }
+    let rects = cell_rects(&view.layout, view.focused, view.cells.len(), area);
+    for (i, cell) in view.cells.iter().enumerate() {
+        if let Some(Some(rect)) = rects.get(i) {
+            draw_cell(&mut buf, area, *rect, cell, i == view.focused);
         }
     }
     buf
 }
 
 /// Index of the cell whose rect contains the point `(x, y)`, for mouse-click
-/// focus. `None` when the view is empty or the click lands outside every cell.
-/// In `Monocle` only the focused cell is visible, so any in-bounds click keeps
-/// the current focus.
+/// focus. `None` when the view is empty or the click lands outside every cell
+/// (including a click on the reserved status row). In `Monocle` only the
+/// focused cell has a rect, so any in-bounds click resolves to it (keeping the
+/// current focus).
 pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
     if view.cells.is_empty() {
         return None;
     }
-    match view.layout {
-        ViewLayout::Monocle => Some(view.focused),
-        ViewLayout::Grid => cell_rects(ViewLayout::Grid, view.cells.len(), area)
-            .iter()
-            .position(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height),
-    }
+    let rects = cell_rects(&view.layout, view.focused, view.cells.len(), area);
+    rects.iter().position(|r| match r {
+        Some(rect) => {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        }
+        None => false,
+    })
 }
 
 /// Buffer position `(x, y)` of the FOCUSED cell's terminal cursor, if it
@@ -364,10 +338,8 @@ pub fn focused_cursor(view: &ClientView, area: Rect) -> Option<(u16, u16)> {
     if !snap.cursor_visible {
         return None;
     }
-    let rect = match view.layout {
-        ViewLayout::Monocle => area,
-        ViewLayout::Grid => *cell_rects(ViewLayout::Grid, n, area).get(view.focused)?,
-    };
+    let rects = cell_rects(&view.layout, view.focused, n, area);
+    let rect = rects.get(view.focused).copied().flatten()?;
     // Rect and interior, in buffer-local coordinates (area origin subtracted),
     // matching draw_cell.
     let rx = (rect.x as usize).saturating_sub(area.x as usize);
@@ -547,12 +519,143 @@ fn draw_centered(
 }
 
 // ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+/// Write `s` into `row` starting at column `x` (clamped to `cols`), styled with
+/// `fg`/`bg`/`bold`. Returns the column just past the written text.
+fn put_str(
+    row: &mut [RenderCell],
+    mut x: usize,
+    cols: usize,
+    s: &str,
+    fg: &CellColor,
+    bg: &CellColor,
+    bold: bool,
+) -> usize {
+    for ch in s.chars() {
+        if x < cols && x < row.len() {
+            row[x] = RenderCell {
+                c: ch,
+                fg: fg.clone(),
+                bg: bg.clone(),
+                bold,
+                ..RenderCell::default()
+            };
+        }
+        x += 1;
+    }
+    x
+}
+
+/// Draw the view's status bar on the LAST row of `area` (the row reserved by
+/// [`cells_area`]). Mirrors the normal (server) status bar's left/right layout:
+/// the input `mode` (`[NORMAL]`, themed like the real bar), the `view_name`,
+/// the focused `cell_title` (`session / tab`, host-prefixed for remotes), and
+/// the `layout_name` (bsp/master/monocle/grid) right-aligned.
+///
+/// Takes an already-resolved [`CompositorTheme`] so the colors match the normal
+/// bar exactly (built from the same `ThemeConfig`).
+pub fn draw_status_bar(
+    buf: &mut [Vec<RenderCell>],
+    area: Rect,
+    mode: &str,
+    view_name: &str,
+    cell_title: Option<&str>,
+    layout_name: &str,
+    theme: &CompositorTheme,
+) {
+    let cols = area.width as usize;
+    if cols == 0 || area.height == 0 {
+        return;
+    }
+    let bar_row = (area.height - 1) as usize;
+    let row = match buf.get_mut(bar_row) {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Fill the bar background.
+    let end = cols.min(row.len());
+    for slot in row.iter_mut().take(end) {
+        *slot = RenderCell {
+            c: ' ',
+            fg: theme.status_bar_fg.clone(),
+            bg: theme.status_bar_bg.clone(),
+            ..RenderCell::default()
+        };
+    }
+
+    // Left side: [MODE] view_name │ cell_title
+    let (mode_fg, mode_bg) = theme.mode_colors(mode);
+    let mut x = 0;
+    x = put_str(
+        row,
+        x,
+        cols,
+        &format!(" [{mode}] "),
+        &mode_fg,
+        &mode_bg,
+        true,
+    );
+    x = put_str(
+        row,
+        x,
+        cols,
+        &format!(" {view_name} "),
+        &theme.session_name_fg,
+        &theme.status_bar_bg,
+        false,
+    );
+    x = put_str(
+        row,
+        x,
+        cols,
+        "\u{2502}",
+        &theme.separator_fg,
+        &theme.status_bar_bg,
+        false,
+    );
+    if let Some(title) = cell_title {
+        x = put_str(
+            row,
+            x,
+            cols,
+            &format!(" {title} "),
+            &theme.status_bar_fg,
+            &theme.status_bar_bg,
+            false,
+        );
+    }
+
+    // Right side: the layout name, right-aligned when there is room; otherwise
+    // just appended after the left content.
+    let layout_seg = format!(" {layout_name} ");
+    let lw = layout_seg.chars().count();
+    let start = if cols > lw && cols - lw > x {
+        cols - lw
+    } else {
+        x
+    };
+    put_str(
+        row,
+        start,
+        cols,
+        &layout_seg,
+        &theme.session_name_fg,
+        &theme.status_bar_bg,
+        true,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::layout::MonocleLayout;
 
     fn area(w: u16, h: u16) -> Rect {
         Rect {
@@ -561,6 +664,14 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    fn gridv() -> LayoutMode {
+        LayoutMode::Grid(GridLayout)
+    }
+
+    fn monoclev() -> LayoutMode {
+        LayoutMode::Monocle(MonocleLayout)
     }
 
     /// A snapshot filled with a single marker char.
@@ -591,21 +702,30 @@ mod tests {
     }
 
     #[test]
-    fn cell_rects_returns_n_rects() {
+    fn cells_area_reserves_status_row() {
+        assert_eq!(cells_area(area(80, 24)), area(80, 23));
+        // Degenerate heights never underflow.
+        assert_eq!(cells_area(area(80, 1)).height, 0);
+        assert_eq!(cells_area(area(80, 0)).height, 0);
+    }
+
+    #[test]
+    fn cell_rects_returns_n_entries() {
         for n in 0..=5 {
-            assert_eq!(cell_rects(ViewLayout::Grid, n, area(80, 24)).len(), n);
-            assert_eq!(cell_rects(ViewLayout::Monocle, n, area(80, 24)).len(), n);
+            assert_eq!(cell_rects(&gridv(), 0, n, area(80, 24)).len(), n);
+            assert_eq!(cell_rects(&monoclev(), 0, n, area(80, 24)).len(), n);
         }
     }
 
     #[test]
-    fn cell_rects_within_area() {
+    fn cell_rects_within_cells_area() {
         let a = area(80, 24);
+        let inner = cells_area(a);
         for n in 1..=5 {
-            for r in cell_rects(ViewLayout::Grid, n, a) {
-                assert!(r.x >= a.x && r.y >= a.y);
-                assert!(r.x + r.width <= a.x + a.width);
-                assert!(r.y + r.height <= a.y + a.height);
+            for r in cell_rects(&gridv(), 0, n, a).into_iter().flatten() {
+                assert!(r.x >= inner.x && r.y >= inner.y);
+                assert!(r.x + r.width <= inner.x + inner.width);
+                assert!(r.y + r.height <= inner.y + inner.height);
                 assert!(r.width > 0 && r.height > 0);
             }
         }
@@ -613,11 +733,13 @@ mod tests {
 
     #[test]
     fn cell_rects_grid_tiles_without_gaps_or_overlap() {
-        // Paint a coverage grid; every pixel must be covered exactly once.
+        // With gap 0 the layout engine tiles the cell area exactly. Paint a
+        // coverage grid over `cells_area`; every pixel must be covered once.
         let a = area(37, 19); // deliberately not divisible, exercises remainder
+        let inner = cells_area(a);
         for n in 1..=5 {
-            let mut cover = vec![vec![0u8; a.width as usize]; a.height as usize];
-            for r in cell_rects(ViewLayout::Grid, n, a) {
+            let mut cover = vec![vec![0u8; inner.width as usize]; inner.height as usize];
+            for r in cell_rects(&gridv(), 0, n, a).into_iter().flatten() {
                 for y in r.y..r.y + r.height {
                     for x in r.x..r.x + r.width {
                         cover[y as usize][x as usize] += 1;
@@ -633,11 +755,32 @@ mod tests {
     }
 
     #[test]
-    fn monocle_rects_all_equal_area() {
+    fn monocle_only_focused_has_rect() {
         let a = area(80, 24);
-        for r in cell_rects(ViewLayout::Monocle, 4, a) {
-            assert_eq!(r, a);
+        let rects = cell_rects(&monoclev(), 2, 4, a);
+        assert_eq!(rects.len(), 4);
+        // Only the focused cell (index 2) is placed; it fills the cell area.
+        assert_eq!(rects[2], Some(cells_area(a)));
+        for (i, r) in rects.iter().enumerate() {
+            if i != 2 {
+                assert!(r.is_none(), "cell {i} should be hidden in monocle");
+            }
         }
+    }
+
+    #[test]
+    fn grid_two_cells_split_left_right() {
+        // The n=2 Grid case must remain a left/right split (the PTY harnesses
+        // rely on it): cell 0 on the left half, cell 1 on the right half.
+        let a = area(120, 40);
+        let rects = cell_rects(&gridv(), 0, 2, a);
+        let r0 = rects[0].expect("cell 0 placed");
+        let r1 = rects[1].expect("cell 1 placed");
+        assert_eq!(r0.x, 0);
+        assert!(r1.x >= r0.width, "cell 1 must start at/after the split");
+        // Both roughly half the width.
+        assert!(r0.width >= 58 && r0.width <= 62);
+        assert!(r1.width >= 58 && r1.width <= 62);
     }
 
     #[test]
@@ -649,15 +792,15 @@ mod tests {
                 cell_with(1, Some(snap_filled(40, 24, 'A'))),
                 cell_with(2, Some(snap_filled(40, 24, 'B'))),
             ],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
-        let rects = cell_rects(ViewLayout::Grid, 2, a);
+        let rects = cell_rects(&gridv(), 0, 2, a);
 
         // Interior center of cell 0 must be 'A', cell 1 must be 'B'.
-        for (rect, marker) in [(rects[0], 'A'), (rects[1], 'B')] {
+        for (rect, marker) in [(rects[0].unwrap(), 'A'), (rects[1].unwrap(), 'B')] {
             let cx = (rect.x + rect.width / 2) as usize;
             let cy = (rect.y + rect.height / 2) as usize;
             assert_eq!(buf[cy][cx].c, marker, "cell marker mismatch at ({cx},{cy})");
@@ -672,21 +815,21 @@ mod tests {
                 cell_with(1, Some(snap_filled(40, 24, 'A'))),
                 cell_with(2, Some(snap_filled(40, 24, 'B'))),
             ],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 1,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
-        let rects = cell_rects(ViewLayout::Grid, 2, a);
+        let rects = cell_rects(&gridv(), 1, 2, a);
 
         // Focused cell (index 1) top-left corner is bold + focused color.
-        let f = rects[1];
+        let f = rects[1].unwrap();
         let fc = &buf[f.y as usize][f.x as usize];
         assert_eq!(fc.fg, FOCUSED_BORDER);
         assert!(fc.bold);
 
         // Unfocused cell (index 0) corner is not.
-        let u = rects[0];
+        let u = rects[0].unwrap();
         let uc = &buf[u.y as usize][u.x as usize];
         assert_eq!(uc.fg, UNFOCUSED_BORDER);
         assert!(!uc.bold);
@@ -728,14 +871,15 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap))],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
 
-        // Interior bottom row (just above the box border) must be 'L'.
-        let inner_bottom = a.height as usize - 2;
+        // The single cell fills the cell area (area minus the status row); its
+        // interior bottom row (just above the box border) must be 'L'.
+        let inner_bottom = cells_area(a).height as usize - 2;
         assert_eq!(buf[inner_bottom][2].c, 'L');
         // 'X' (the snapshot's very top row) must have scrolled off the top.
         let has_x = buf.iter().any(|row| row.iter().any(|c| c.c == 'X'));
@@ -753,7 +897,7 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap))],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let a = area(80, 24);
@@ -767,7 +911,7 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(42, None)],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let buf = composite(&view, area(80, 24));
@@ -783,7 +927,7 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let buf = composite(&view, area(80, 24));
@@ -801,7 +945,7 @@ mod tests {
                 cell_with(1, Some(snap_filled(78, 24, 'A'))),
                 cell_with(2, Some(snap_filled(78, 24, 'B'))),
             ],
-            layout: ViewLayout::Monocle,
+            layout: monoclev(),
             focused: 1,
         };
         let buf = composite(&view, area(80, 24));
@@ -819,17 +963,20 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, None), cell_with(2, None)],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let a = area(80, 24);
-        let rects = cell_rects(ViewLayout::Grid, 2, a);
+        let rects = cell_rects(&gridv(), 0, 2, a);
         // A point inside each rect resolves to that index.
         for (i, r) in rects.iter().enumerate() {
+            let r = r.unwrap();
             let x = r.x + r.width / 2;
             let y = r.y + r.height / 2;
             assert_eq!(cell_at(&view, a, x, y), Some(i));
         }
+        // A click on the reserved status row hits nothing.
+        assert_eq!(cell_at(&view, a, 10, a.height - 1), None);
         // Empty view: no hit.
         let empty = ClientView::new("e".into());
         assert_eq!(cell_at(&empty, a, 10, 10), None);
@@ -840,7 +987,7 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, None), cell_with(2, None)],
-            layout: ViewLayout::Monocle,
+            layout: monoclev(),
             focused: 1,
         };
         assert_eq!(cell_at(&view, area(80, 24), 5, 5), Some(1));
@@ -855,14 +1002,14 @@ mod tests {
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap.clone())), cell_with(2, Some(snap))],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         let a = area(80, 24);
         // Focused cell 0: interior origin (ix=1, iy=1); snapshot (10 rows) fits in
         // the interior so start=0 -> cursor row = iy + 9, col = ix + 3.
-        let rects = cell_rects(ViewLayout::Grid, 2, a);
-        let f = rects[0];
+        let rects = cell_rects(&gridv(), 0, 2, a);
+        let f = rects[0].unwrap();
         let got = focused_cursor(&view, a).expect("cursor shown");
         assert_eq!(got, (f.x + 1 + 3, f.y + 1 + 9));
 
@@ -872,7 +1019,7 @@ mod tests {
         let view2 = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, Some(hidden))],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         assert_eq!(focused_cursor(&view2, a), None);
@@ -886,16 +1033,25 @@ mod tests {
         let view3 = ClientView {
             name: "v".into(),
             cells: vec![cell],
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         assert_eq!(focused_cursor(&view3, a), None);
     }
 
     #[test]
-    fn layout_next_cycles() {
-        assert_eq!(ViewLayout::Grid.next(), ViewLayout::Monocle);
-        assert_eq!(ViewLayout::Monocle.next(), ViewLayout::Grid);
+    fn layout_next_cycles_through_all_automatic_modes() {
+        // Default Grid; next() walks the automatic modes and never yields Custom.
+        let names: Vec<String> = {
+            let mut m = LayoutMode::Grid(GridLayout);
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                m = m.next();
+                out.push(m.name().to_string());
+            }
+            out
+        };
+        assert_eq!(names, vec!["bsp", "master", "monocle", "grid"]);
     }
 
     #[test]
@@ -904,7 +1060,7 @@ mod tests {
         let mut view = ClientView {
             name: "v".into(),
             cells: (1..=4).map(|id| cell_with(id, None)).collect(),
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 0,
         };
         assert!(view.move_focus(FocusDirection::Right));
@@ -923,6 +1079,23 @@ mod tests {
     }
 
     #[test]
+    fn move_focus_monocle_pages_through_cells() {
+        let mut view = ClientView {
+            name: "v".into(),
+            cells: (1..=3).map(|id| cell_with(id, None)).collect(),
+            layout: monoclev(),
+            focused: 0,
+        };
+        assert!(view.move_focus(FocusDirection::Right));
+        assert_eq!(view.focused, 1);
+        assert!(view.move_focus(FocusDirection::Right));
+        assert_eq!(view.focused, 2);
+        assert!(!view.move_focus(FocusDirection::Right)); // at the end
+        assert!(view.move_focus(FocusDirection::Left));
+        assert_eq!(view.focused, 1);
+    }
+
+    #[test]
     fn move_focus_empty_is_noop() {
         let mut view = ClientView::new("v".into());
         assert!(!view.move_focus(FocusDirection::Right));
@@ -934,7 +1107,7 @@ mod tests {
         let mut view = ClientView {
             name: "v".into(),
             cells: (1..=3).map(|id| cell_with(id, None)).collect(),
-            layout: ViewLayout::Grid,
+            layout: gridv(),
             focused: 2,
         };
         view.cells.pop();
@@ -953,7 +1126,7 @@ mod tests {
         // (session manager, view picker) render on top of an empty view:
         // `paint_view` blits this buffer, then lays the overlay over it. Both
         // Grid and Monocle must hold.
-        for layout in [ViewLayout::Grid, ViewLayout::Monocle] {
+        for layout in [gridv(), monoclev()] {
             let view = ClientView {
                 name: "empty".into(),
                 cells: vec![],
@@ -962,15 +1135,15 @@ mod tests {
             };
             let a = area(80, 24);
             let buf = composite(&view, a);
-            assert_eq!(buf.len(), a.height as usize, "row count for {layout:?}");
+            assert_eq!(buf.len(), a.height as usize, "row count");
             assert!(
                 buf.iter().all(|row| row.len() == a.width as usize),
-                "col count for {layout:?}"
+                "col count"
             );
             let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
             assert!(
                 joined.contains("Add panes to this view"),
-                "empty-view hint missing for {layout:?}"
+                "empty-view hint missing"
             );
         }
     }
@@ -985,5 +1158,38 @@ mod tests {
             assert_eq!(buf.len(), h as usize);
             assert!(buf.iter().all(|row| row.len() == w as usize));
         }
+    }
+
+    #[test]
+    fn status_bar_shows_name_and_layout() {
+        let a = area(80, 24);
+        let mut buf = vec![vec![RenderCell::default(); a.width as usize]; a.height as usize];
+        let theme = CompositorTheme::default();
+        draw_status_bar(
+            &mut buf,
+            a,
+            "NORMAL",
+            "MyView",
+            Some("alpha / Tab 1"),
+            "grid",
+            &theme,
+        );
+        let bar: String = buf[a.height as usize - 1].iter().map(|c| c.c).collect();
+        assert!(bar.contains("[NORMAL]"), "mode missing: {bar:?}");
+        assert!(bar.contains("MyView"), "view name missing: {bar:?}");
+        assert!(bar.contains("alpha / Tab 1"), "title missing: {bar:?}");
+        assert!(bar.contains("grid"), "layout name missing: {bar:?}");
+    }
+
+    #[test]
+    fn status_bar_handles_no_title() {
+        // An empty view (no focused cell title) must not panic.
+        let a = area(40, 10);
+        let mut buf = vec![vec![RenderCell::default(); a.width as usize]; a.height as usize];
+        let theme = CompositorTheme::default();
+        draw_status_bar(&mut buf, a, "NORMAL", "Empty", None, "grid", &theme);
+        let bar: String = buf[a.height as usize - 1].iter().map(|c| c.c).collect();
+        assert!(bar.contains("Empty"));
+        assert!(bar.contains("grid"));
     }
 }
