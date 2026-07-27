@@ -639,6 +639,7 @@ fn relay_overlays(
             RenameTarget::Session => "Session",
             RenameTarget::NewSession => "New Session",
             RenameTarget::NewView => "New View",
+            RenameTarget::ViewRename => "Rename View",
         };
         let (c, r) = crossterm::terminal::size()?;
         renderer.render_rename_popup(&overlay.buffer, target_str, c, r)?;
@@ -727,7 +728,14 @@ fn paint_view(
         height: r,
     };
     let composed = crate::client::view::composite(view, area);
-    renderer.render_full(&composed, 0, 0, false, 0)?;
+    // Show the terminal cursor at the focused cell's source cursor position (if
+    // visible and in view); unfocused cells and hidden/clipped cursors leave it
+    // off. This lets a mirrored interactive app (vim, claude) show a live cursor.
+    let (cur_x, cur_y, cur_vis) = match crate::client::view::focused_cursor(view, area) {
+        Some((x, y)) => (x, y, true),
+        None => (0, 0, false),
+    };
+    renderer.render_full(&composed, cur_x, cur_y, cur_vis, 0)?;
     relay_overlays(
         renderer,
         input,
@@ -745,9 +753,15 @@ fn paint_view(
 
 /// Subscribe every cell of `view` to its source pane, sizing each subscription
 /// to the cell's interior (the box border steals one row/column on each side).
-/// Idempotent: re-calling updates the per-subscriber size on the server, so it
-/// doubles as the "cells changed" re-subscribe. Cells whose interior collapses
-/// to zero in either axis are skipped.
+/// Idempotent: re-calling updates each subscription on the server, so it doubles
+/// as the "cells changed" / "focus moved" re-subscribe. Cells whose interior
+/// collapses to zero in either axis are skipped.
+///
+/// Model B (focus-to-zoom): only the FOCUSED cell carries a real size demand
+/// (`size_demand = true`), so its source pane reflows to fit the cell. Every
+/// other cell subscribes with `size_demand = false` -- it watches read-only,
+/// clipped, and imposes no size constraint, so merely watching never reflows
+/// the shared pane.
 async fn subscribe_view_cells(
     mgr: &mut ConnectionManager,
     view: &crate::client::view::ClientView,
@@ -765,15 +779,28 @@ async fn subscribe_view_cells(
             let cols = rect.width.saturating_sub(2);
             let rows = rect.height.saturating_sub(2);
             if cols > 0 && rows > 0 {
-                mgr.send(
-                    &cell.conn,
-                    ClientMessage::SubscribePane {
-                        pane_id: cell.pane_id,
-                        cols,
-                        rows,
-                    },
-                )
-                .await?;
+                // Best-effort: a torn-down connection must not abort the whole
+                // subscribe pass (nor exit the client). Log and move on -- the
+                // cell simply never receives snapshots and, on the next
+                // keystroke/close, is marked disconnected.
+                if let Err(e) = mgr
+                    .send(
+                        &cell.conn,
+                        ClientMessage::SubscribePane {
+                            pane_id: cell.pane_id,
+                            cols,
+                            rows,
+                            size_demand: i == view.focused,
+                        },
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "view: SubscribePane to {:?} pane {} failed: {e}",
+                        cell.conn,
+                        cell.pane_id
+                    );
+                }
             }
         }
     }
@@ -787,13 +814,23 @@ async fn unsubscribe_view_cells(
     view: &crate::client::view::ClientView,
 ) -> Result<()> {
     for cell in &view.cells {
-        mgr.send(
-            &cell.conn,
-            ClientMessage::UnsubscribePane {
-                pane_id: cell.pane_id,
-            },
-        )
-        .await?;
+        // Best-effort per cell: a gone connection must not abort the leave/close
+        // path or exit the client.
+        if let Err(e) = mgr
+            .send(
+                &cell.conn,
+                ClientMessage::UnsubscribePane {
+                    pane_id: cell.pane_id,
+                },
+            )
+            .await
+        {
+            log::warn!(
+                "view: UnsubscribePane to {:?} pane {} failed: {e}",
+                cell.conn,
+                cell.pane_id
+            );
+        }
     }
     Ok(())
 }
@@ -949,7 +986,26 @@ async fn run_client_loop(
                     {
                         let was_renaming = input.rename_overlay.is_some();
                         let was_in_palette = input.command_palette.is_some();
+                        // Inside a view, arrow/nav keys must be encoded with the
+                        // FOCUSED cell's DECCKM (application-cursor-keys) state, not
+                        // the foreground session's -- so arrows/Home/End work inside
+                        // a mirrored interactive app. Override the field just around
+                        // `handle_key` (which does the encoding), then restore the
+                        // foreground value so leaving the view is unaffected.
+                        let saved_ack = input.application_cursor_keys;
+                        if let Some(av) = active_view {
+                            let v = &views[av];
+                            if let Some(ack) = v
+                                .cells
+                                .get(v.focused)
+                                .and_then(|c| c.snapshot.as_ref())
+                                .map(|s| s.application_cursor_keys)
+                            {
+                                input.application_cursor_keys = ack;
+                            }
+                        }
                         let action = input.handle_key(key);
+                        input.application_cursor_keys = saved_ack;
 
                         // If rename popup was dismissed, clear overlay
                         if was_renaming && input.rename_overlay.is_none() && !matches!(action, InputAction::RenameUpdate(_)) {
@@ -964,11 +1020,40 @@ async fn run_client_loop(
                                     // In view mode, route keystrokes to the focused
                                     // cell's pane by identity (independent of the
                                     // server's foreground focus). No cells => drop.
-                                    let view = &views[av];
-                                    if let Some(cell) = view.cells.get(view.focused) {
-                                        let conn = cell.conn.clone();
-                                        let pane_id = cell.pane_id;
-                                        mgr.send(&conn, ClientMessage::InputToPane { pane_id, data }).await?;
+                                    // A disconnected cell drops input; a send that
+                                    // fails (torn-down remote writer) is best-effort:
+                                    // mark the cell disconnected and repaint, never
+                                    // propagate -- a keystroke must never exit the
+                                    // client.
+                                    let focused = views[av].focused;
+                                    let target = views[av]
+                                        .cells
+                                        .get(focused)
+                                        .filter(|c| !c.disconnected)
+                                        .map(|c| (c.conn.clone(), c.pane_id));
+                                    if let Some((conn, pane_id)) = target {
+                                        if let Err(e) = mgr
+                                            .send(&conn, ClientMessage::InputToPane { pane_id, data })
+                                            .await
+                                        {
+                                            log::warn!(
+                                                "view: InputToPane to {:?} pane {} failed: {e}; marking cell disconnected",
+                                                conn, pane_id
+                                            );
+                                            if let Some(cell) = views[av].cells.get_mut(focused) {
+                                                cell.disconnected = true;
+                                            }
+                                            paint_view(
+                                                &mut renderer,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        }
                                     }
                                 } else {
                                     // Reset scroll when user types (sends PTY input)
@@ -999,6 +1084,12 @@ async fn run_client_loop(
                                             renderer.clear_overlay(cols, rows)?;
                                         }
                                         if views[av].move_focus(dir) {
+                                            // Model B: focus moved, so the size
+                                            // demand must swap -- re-subscribe every
+                                            // cell (new focus demands its size; the
+                                            // old focus releases its demand so its
+                                            // pane grows back). Then repaint.
+                                            subscribe_view_cells(mgr, &views[av]).await?;
                                             paint_view(
                                                 &mut renderer,
                                                 &views[av],
@@ -1081,6 +1172,9 @@ async fn run_client_loop(
                                         };
                                         if let Some(dir) = dir {
                                             if views[av].move_focus(dir) {
+                                                // Focus moved: swap the size demand
+                                                // (see the single-command path).
+                                                subscribe_view_cells(mgr, &views[av]).await?;
                                                 paint_view(
                                                     &mut renderer,
                                                     &views[av],
@@ -1239,6 +1333,7 @@ async fn run_client_loop(
                                     Some(RenameTarget::Session) => "Session",
                                     Some(RenameTarget::NewSession) => "New Session",
                                     Some(RenameTarget::NewView) => "New View",
+                                    Some(RenameTarget::ViewRename) => "Rename View",
                                     None => "Pane",
                                 };
                                 let (c, r) = crossterm::terminal::size()?;
@@ -1305,6 +1400,7 @@ async fn run_client_loop(
                                     RenameTarget::Session => "Session",
                                     RenameTarget::NewSession => "New Session",
                                     RenameTarget::NewView => "New View",
+                                    RenameTarget::ViewRename => "Rename View",
                                 };
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.render_rename_popup(text, target_str, c, r)?;
@@ -2180,6 +2276,18 @@ async fn run_client_loop(
                                     focused_pane_rect.as_ref(),
                                 )?;
                             }
+                            InputAction::ViewRename(ref name) => {
+                                // Rename the active view. Empty name = no-op (the
+                                // user dismissed without typing). The switcher's
+                                // Views section is rebuilt from `views`, so the new
+                                // name shows the next time it opens.
+                                let name = name.trim();
+                                if let Some(av) = active_view {
+                                    if !name.is_empty() {
+                                        views[av].name = name.to_string();
+                                    }
+                                }
+                            }
                             InputAction::ViewActivate { index } => {
                                 // Selected from the switcher's Views section. The
                                 // input handler already cleared the switcher
@@ -2310,11 +2418,9 @@ async fn run_client_loop(
                                         if already {
                                             continue;
                                         }
-                                        views[target_idx].cells.push(crate::client::view::ViewCell {
-                                            conn,
-                                            pane_id,
-                                            snapshot: None,
-                                        });
+                                        views[target_idx]
+                                            .cells
+                                            .push(crate::client::view::ViewCell::new(conn, pane_id));
                                     }
                                     views[target_idx].clamp_focus();
                                     if active_view == Some(target_idx) {
@@ -2410,6 +2516,44 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
+                        // A live view owns the screen: mouse events target its
+                        // cells, not the (masked) foreground session. A left click
+                        // hit-tests the cell rects and focuses the clicked cell
+                        // (re-subscribing so the size demand follows focus). Other
+                        // mouse events are swallowed (no foreground pane to drive).
+                        if let Some(av) = active_view {
+                            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                                let (c, r) = crossterm::terminal::size()?;
+                                let area = crate::server::layout::Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width: c,
+                                    height: r,
+                                };
+                                if let Some(idx) = crate::client::view::cell_at(
+                                    &views[av],
+                                    area,
+                                    mouse.column,
+                                    mouse.row,
+                                ) {
+                                    if views[av].focused != idx {
+                                        views[av].focused = idx;
+                                        subscribe_view_cells(mgr, &views[av]).await?;
+                                        paint_view(
+                                            &mut renderer,
+                                            &views[av],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
                                 log::debug!("mouse: click at ({}, {})", mouse.column, mouse.row);
@@ -2558,6 +2702,36 @@ async fn run_client_loop(
                     Incoming::Message(src, m) => (src, Some(m)),
                     Incoming::Closed(src) => {
                         log::debug!("srv: connection closed src={:?}", src);
+                        // Mark every view cell (across ALL views) that aliases a
+                        // pane on the dropped connection as disconnected. Done at
+                        // the very top of the arm, before the several early
+                        // returns/continues below, so no drop path skips it. If
+                        // the active view was touched, repaint so the label shows.
+                        let mut active_view_touched = false;
+                        for (vi, view) in views.iter_mut().enumerate() {
+                            for cell in view.cells.iter_mut() {
+                                if cell.conn == src && !cell.disconnected {
+                                    cell.disconnected = true;
+                                    if active_view == Some(vi) {
+                                        active_view_touched = true;
+                                    }
+                                }
+                            }
+                        }
+                        if active_view_touched {
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            }
+                        }
                         if mgr.is_foreground(&src) {
                             match &src {
                                 // Local foreground drop: exit the client (unchanged).
@@ -3102,7 +3276,18 @@ async fn run_client_loop(
                             vs.total_lines = total_lines;
                         }
                     }
-                    Some(ServerMessage::PaneContent { pane_id, cols: pane_cols, rows: pane_rows, cells: pane_cells }) => {
+                    Some(ServerMessage::PaneContent {
+                        pane_id,
+                        cols: pane_cols,
+                        rows: pane_rows,
+                        cells: pane_cells,
+                        cursor_x,
+                        cursor_y,
+                        cursor_visible,
+                        application_cursor_keys,
+                        session_name: pc_session,
+                        tab_name: pc_tab,
+                    }) => {
                         // Note: `pane_cols`/`pane_rows` are the PANE's size, not
                         // the terminal's; do not confuse them with the loop's
                         // `cols`/`rows`. Fold this snapshot into every view cell
@@ -3113,14 +3298,36 @@ async fn run_client_loop(
                             cols: pane_cols,
                             rows: pane_rows,
                             cells: pane_cells,
+                            cursor_x,
+                            cursor_y,
+                            cursor_visible,
+                            application_cursor_keys,
+                        };
+                        // Cell title = `session / tab`, host-prefixed for a remote
+                        // source (`host: session / tab`). Empty session ⇒ the pane
+                        // couldn't be resolved server-side; leave the title unset so
+                        // the cell keeps showing `waiting…`.
+                        let title = if pc_session.is_empty() {
+                            None
+                        } else {
+                            let base = format!("{pc_session} / {pc_tab}");
+                            Some(match &src {
+                                ConnId::Remote(host) => format!("{host}: {base}"),
+                                ConnId::Local => base,
+                            })
                         };
                         let mut active_touched = false;
                         for (vi, view) in views.iter_mut().enumerate() {
                             for cell in view.cells.iter_mut() {
                                 if cell.conn == src && cell.pane_id == pane_id {
                                     // Clone per match: the same pane can be
-                                    // aliased by more than one cell/view.
+                                    // aliased by more than one cell/view. A fresh
+                                    // snapshot means the source is live again.
                                     cell.snapshot = Some(snap.clone());
+                                    cell.disconnected = false;
+                                    if title.is_some() {
+                                        cell.title = title.clone();
+                                    }
                                     if active_view == Some(vi) {
                                         active_touched = true;
                                     }

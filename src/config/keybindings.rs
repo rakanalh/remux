@@ -230,6 +230,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
             vec![
                 ('n', leaf("new view", "ViewNew")),
                 ('a', leaf("add pane", "ViewAddPane")),
+                ('r', leaf("rename view", "ViewRename")),
                 ('x', leaf("remove cell", "ViewRemovePane")),
                 (' ', leaf("layout next", "ViewLayoutNext")),
                 ('q', leaf("close view", "ViewClose")),

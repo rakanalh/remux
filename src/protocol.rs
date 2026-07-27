@@ -108,13 +108,24 @@ pub enum ClientMessage {
     RequestScrollbackInfo,
     /// Subscribe to a pane's rendered content, streamed regardless of which
     /// session/tab this client has in the foreground. Used by View cells that
-    /// alias a real pane. `cols`/`rows` are the subscribing cell's desired size;
-    /// they are currently stored per-subscriber but NOT yet folded into pane
-    /// sizing (the Model A min-across-viewers resize is a later step).
+    /// alias a real pane. `cols`/`rows` are the subscribing cell's desired size.
+    ///
+    /// `size_demand` distinguishes the two viewing models:
+    /// - `true` (Model A, or a Model-B *focused* cell): the cell demands the
+    ///   pane reflow to `(cols, rows)` — it is folded into the pane's
+    ///   min-across-viewers effective size.
+    /// - `false` (a Model-B *unfocused*, watch-only cell): the cell renders the
+    ///   pane clipped and imposes NO size constraint, so merely watching never
+    ///   reflows the source pane.
+    ///
+    /// `#[serde(default)]` on `size_demand` means an older peer that omits it
+    /// decodes as `false` (no constraint) — the safe direction.
     SubscribePane {
         pane_id: PaneId,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        size_demand: bool,
     },
     /// Stop receiving `PaneContent` for a previously subscribed pane.
     UnsubscribePane { pane_id: PaneId },
@@ -219,6 +230,26 @@ pub enum ServerMessage {
         cols: u16,
         rows: u16,
         cells: Vec<Vec<RenderCell>>,
+        /// Source pane's cursor position (already clamped to `cols`/`rows`) and
+        /// visibility, so a focused View cell can render the real cursor.
+        #[serde(default)]
+        cursor_x: u16,
+        #[serde(default)]
+        cursor_y: u16,
+        #[serde(default)]
+        cursor_visible: bool,
+        /// The source pane's DECCKM (application cursor keys) state, so a focused
+        /// cell encodes arrows/nav for THAT pane, not the foreground session's.
+        #[serde(default)]
+        application_cursor_keys: bool,
+        /// The pane's session and tab names, for the cell's border title
+        /// (`session / tab`, host-prefixed for remotes by the client). Kept live
+        /// so a rename updates the label. `#[serde(default)]` keeps the message
+        /// decodable from an older peer that omits them.
+        #[serde(default)]
+        session_name: String,
+        #[serde(default)]
+        tab_name: String,
     },
 }
 

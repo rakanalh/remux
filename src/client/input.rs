@@ -441,6 +441,8 @@ pub enum InputAction {
     ViewAddPaneOpen,
     /// Remove the focused cell from the active view.
     ViewRemovePane,
+    /// Rename the active view to the given name (empty = no-op).
+    ViewRename(String),
     /// Cycle the active view's layout (Grid -> Monocle -> ...).
     ViewLayoutNext,
     /// Close (deactivate) the active view, returning to the server frame.
@@ -571,6 +573,8 @@ pub enum RenameTarget {
     NewSession,
     /// Naming a brand-new client-side View (prompted before it is created).
     NewView,
+    /// Renaming the currently-active client-side View.
+    ViewRename,
 }
 
 /// Folder selection overlay for moving the current session to a different folder.
@@ -1016,12 +1020,14 @@ impl SessionSwitchOverlay {
 
     /// Whether a group-separator header must be drawn *before* the entry whose
     /// server is `cur`, given the previous entry's server (`None` for the first
-    /// entry). A remote-only list labels its first group; a Local-first list
-    /// does not (Local is shown headerless). A header is drawn on every
-    /// group boundary thereafter.
-    fn separator_before(prev: Option<&ConnId>, cur: &ConnId) -> bool {
+    /// entry). A remote-only list labels its first group; a Local-first list is
+    /// normally headerless (Local sits directly under the title). BUT when a
+    /// Views section precedes the session list, the first group MUST be labeled
+    /// too -- otherwise the Local rows appear to sit under the "Views" header.
+    /// A header is drawn on every group boundary thereafter regardless.
+    fn separator_before(prev: Option<&ConnId>, cur: &ConnId, views_present: bool) -> bool {
         match prev {
-            None => matches!(cur, ConnId::Remote(_)),
+            None => views_present || matches!(cur, ConnId::Remote(_)),
             Some(prev) => prev != cur,
         }
     }
@@ -1036,10 +1042,11 @@ impl SessionSwitchOverlay {
 
     /// The number of group-separator header rows the current `entries` produce.
     fn separator_count(&self) -> usize {
+        let views_present = !self.views.is_empty();
         let mut count = 0usize;
         let mut prev: Option<&ConnId> = None;
         for entry in &self.entries {
-            if Self::separator_before(prev, &entry.server) {
+            if Self::separator_before(prev, &entry.server, views_present) {
                 count += 1;
             }
             prev = Some(&entry.server);
@@ -1191,10 +1198,13 @@ impl SessionSwitchOverlay {
             }
         }
 
+        let views_present = !self.views.is_empty();
         let mut prev_server: Option<&ConnId> = None;
         for (i, entry) in self.entries.iter().enumerate() {
-            // Draw a group-separator header when the server group changes.
-            if Self::separator_before(prev_server, &entry.server) {
+            // Draw a group-separator header when the server group changes (and,
+            // when a Views section precedes the list, before the first group so
+            // the Local rows are clearly under their own "Local" header).
+            if Self::separator_before(prev_server, &entry.server, views_present) {
                 // Stop at/below the bottom border.
                 if row_offset >= popup_height - 1 {
                     break;
@@ -1683,6 +1693,19 @@ impl InputHandler {
             if action_str == "ViewAddPane" {
                 self.mode = Mode::Normal;
                 return InputAction::ViewAddPaneOpen;
+            }
+            if action_str == "ViewRename" {
+                // Prompt for a new name via the rename overlay (empty buffer;
+                // reuses the NewView/CreateFolder text sub-mode). Confirm maps to
+                // InputAction::ViewRename(name), applied to the active view in the
+                // main loop.
+                self.mode = Mode::Normal;
+                self.rename_overlay = Some(RenameOverlay {
+                    buffer: String::new(),
+                    cursor: 0,
+                    target: RenameTarget::ViewRename,
+                });
+                return InputAction::ActivateRenameOverlay;
             }
             if action_str == "ViewRemovePane" {
                 self.mode = Mode::Normal;
@@ -2700,12 +2723,15 @@ impl InputHandler {
                 match target {
                     RenameTarget::NewSession => InputAction::NewSession(name),
                     RenameTarget::NewView => InputAction::NewView(name),
+                    RenameTarget::ViewRename => InputAction::ViewRename(name),
                     _ => {
                         let cmd = match target {
                             RenameTarget::Pane => RemuxCommand::PaneRename(name),
                             RenameTarget::Tab => RemuxCommand::TabRename(name),
                             RenameTarget::Session => RemuxCommand::SessionRename(name),
-                            RenameTarget::NewSession | RenameTarget::NewView => unreachable!(),
+                            RenameTarget::NewSession
+                            | RenameTarget::NewView
+                            | RenameTarget::ViewRename => unreachable!(),
                         };
                         InputAction::Execute(cmd)
                     }

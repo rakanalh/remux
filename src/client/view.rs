@@ -9,10 +9,12 @@
 //! this module is pure geometry + buffer composition so it can be unit-tested
 //! headlessly (no terminal, no sockets, no `Theme`).
 //!
-//! Sizing note: cells render a pane's *current-size* snapshot, clipped and
-//! letterboxed into the cell rect and bottom-anchored (so the latest output is
-//! visible). True "smallest-viewer-wins" pane sizing (Model A) is deferred, so
-//! a cell does not yet demand a size from its source pane.
+//! Sizing note: cells render a pane's snapshot clipped and letterboxed into the
+//! cell rect, bottom-anchored so the latest output is visible. Under Model B
+//! (focus-to-zoom) only the FOCUSED cell demands a size from its source pane
+//! (the pane reflows to fit it, via the server's min-across-viewers sizing);
+//! unfocused cells watch read-only and impose no size demand, so merely watching
+//! never reflows the shared pane.
 
 use crate::client::registry::ConnId;
 use crate::protocol::{CellColor, PaneId, RenderCell};
@@ -29,16 +31,52 @@ pub struct PaneSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Vec<RenderCell>>,
+    /// Source pane's cursor position (clamped into `cols`/`rows`) and
+    /// visibility. Only the focused cell renders it.
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_visible: bool,
+    /// The source pane's DECCKM state, used to encode input to a focused cell.
+    pub application_cursor_keys: bool,
 }
 
 /// One cell of a view: a reference to a real pane on a specific connection,
 /// plus the most recent snapshot received for it (`None` until the first
 /// `PaneContent` arrives).
+///
+/// A cell has three observable states, distinguished without a separate enum:
+/// - **waiting**: `snapshot == None && !disconnected` — subscribed but no
+///   `PaneContent` has arrived yet (shows `waiting for <title>…`).
+/// - **live**: `snapshot == Some(_)` — compositing the latest snapshot.
+/// - **disconnected**: `disconnected == true` — the source connection dropped
+///   (or a send to it failed); shows `disconnected` and takes no more input.
 #[derive(Debug, Clone)]
 pub struct ViewCell {
     pub conn: ConnId,
     pub pane_id: PaneId,
     pub snapshot: Option<PaneSnapshot>,
+    /// Set when the cell's source connection is gone (a send failed or the
+    /// connection closed). A disconnected cell renders a `disconnected` label
+    /// and silently drops keystrokes instead of crashing the client.
+    pub disconnected: bool,
+    /// `session / tab` title for the cell's source pane, learned from
+    /// `PaneContent`. `None` until the first snapshot; kept live so a rename on
+    /// the source updates the border label. Remote cells are host-prefixed by
+    /// the compositor, not here.
+    pub title: Option<String>,
+}
+
+impl ViewCell {
+    /// A fresh cell aliasing `(conn, pane_id)`, waiting for its first snapshot.
+    pub fn new(conn: ConnId, pane_id: PaneId) -> Self {
+        Self {
+            conn,
+            pane_id,
+            snapshot: None,
+            disconnected: false,
+            title: None,
+        }
+    }
 }
 
 /// How a view arranges its cells.
@@ -261,7 +299,14 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
     let w = area.width as usize;
     let h = area.height as usize;
     let mut buf = vec![vec![RenderCell::default(); w]; h];
-    if w == 0 || h == 0 || view.cells.is_empty() {
+    if w == 0 || h == 0 {
+        return buf;
+    }
+    // A view with no cells (freshly created, or all removed) shows a centered
+    // hint rather than a blank screen. `draw_centered` clamps the label to the
+    // available width, so it degrades gracefully on a tiny terminal.
+    if view.cells.is_empty() {
+        draw_centered(&mut buf, 0, 0, w, h, "Add panes to this view");
         return buf;
     }
 
@@ -281,6 +326,77 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
         }
     }
     buf
+}
+
+/// Index of the cell whose rect contains the point `(x, y)`, for mouse-click
+/// focus. `None` when the view is empty or the click lands outside every cell.
+/// In `Monocle` only the focused cell is visible, so any in-bounds click keeps
+/// the current focus.
+pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
+    if view.cells.is_empty() {
+        return None;
+    }
+    match view.layout {
+        ViewLayout::Monocle => Some(view.focused),
+        ViewLayout::Grid => cell_rects(ViewLayout::Grid, view.cells.len(), area)
+            .iter()
+            .position(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height),
+    }
+}
+
+/// Buffer position `(x, y)` of the FOCUSED cell's terminal cursor, if it
+/// should be shown. Only the focused cell shows a cursor, and only when its
+/// snapshot's cursor is visible and falls within the (clipped, bottom-anchored)
+/// interior. Returns `None` (cursor hidden) otherwise -- unfocused cells,
+/// disconnected cells, no snapshot, a hidden source cursor, or a cursor
+/// scrolled/clipped out of view. Mirrors [`draw_cell`]'s geometry exactly so
+/// the cursor lands on the character it addresses.
+pub fn focused_cursor(view: &ClientView, area: Rect) -> Option<(u16, u16)> {
+    let n = view.cells.len();
+    if n == 0 {
+        return None;
+    }
+    let cell = view.cells.get(view.focused)?;
+    if cell.disconnected {
+        return None;
+    }
+    let snap = cell.snapshot.as_ref()?;
+    if !snap.cursor_visible {
+        return None;
+    }
+    let rect = match view.layout {
+        ViewLayout::Monocle => area,
+        ViewLayout::Grid => *cell_rects(ViewLayout::Grid, n, area).get(view.focused)?,
+    };
+    // Rect and interior, in buffer-local coordinates (area origin subtracted),
+    // matching draw_cell.
+    let rx = (rect.x as usize).saturating_sub(area.x as usize);
+    let ry = (rect.y as usize).saturating_sub(area.y as usize);
+    let rw = rect.width as usize;
+    let rh = rect.height as usize;
+    if rw == 0 || rh == 0 {
+        return None;
+    }
+    let draw_border = rw >= 2 && rh >= 2;
+    let (ix, iy, iw, ih) = if draw_border {
+        (rx + 1, ry + 1, rw - 2, rh - 2)
+    } else {
+        (rx, ry, rw, rh)
+    };
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    // Bottom-anchoring: the shown window is rows `start..sr` of the snapshot.
+    let sr = snap.cells.len();
+    let start = sr.saturating_sub(ih);
+    let cy = snap.cursor_y as usize;
+    let cx = snap.cursor_x as usize;
+    if cy < start || cy >= sr || cx >= iw {
+        return None; // scrolled above, off the bottom, or clipped right
+    }
+    let buf_x = ix + cx;
+    let buf_y = iy + (cy - start);
+    Some((buf_x as u16, buf_y as u16))
 }
 
 /// Write a single cell into the buffer if the coordinates are in range.
@@ -346,8 +462,9 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
             put(buf, y, rx, border_cell('│', focused));
             put(buf, y, last_x, border_cell('│', focused));
         }
-        // Label the top border with the pane identity, clipped to fit.
-        let label = format!(" pane {} ", cell.pane_id);
+        // Label the top border with the cell's title (session / tab, learned
+        // from PaneContent), or `waiting…` until the first snapshot arrives.
+        let label = format!(" {} ", cell_title(cell));
         let max = rw.saturating_sub(2);
         for (i, ch) in label.chars().take(max).enumerate() {
             put(buf, ry, rx + 1 + i, border_cell(ch, focused));
@@ -355,6 +472,13 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
     }
 
     if iw == 0 || ih == 0 {
+        return;
+    }
+
+    // A disconnected cell shows a centered `disconnected` label instead of a
+    // (now stale) snapshot -- its source is gone.
+    if cell.disconnected {
+        draw_centered(buf, ix, iy, iw, ih, "disconnected");
         return;
     }
 
@@ -379,23 +503,46 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
             }
         }
         None => {
-            // No snapshot yet: centered placeholder so the cell isn't blank.
-            let label = format!("… pane {} …", cell.pane_id);
-            let text: Vec<char> = label.chars().take(iw).collect();
-            let start_x = ix + (iw - text.len()) / 2;
-            let mid_y = iy + ih / 2;
-            for (i, ch) in text.into_iter().enumerate() {
-                put(
-                    buf,
-                    mid_y,
-                    start_x + i,
-                    RenderCell {
-                        c: ch,
-                        ..RenderCell::default()
-                    },
-                );
-            }
+            // No snapshot yet: centered `waiting for <title>…` placeholder.
+            let label = format!("waiting for {}…", cell_title(cell));
+            draw_centered(buf, ix, iy, iw, ih, &label);
         }
+    }
+}
+
+/// The cell's border/label title: its `session / tab` (host-prefixed for
+/// remotes) once known, else `waiting…` before the first snapshot.
+fn cell_title(cell: &ViewCell) -> String {
+    cell.title.clone().unwrap_or_else(|| "waiting…".to_string())
+}
+
+/// Draw `text` centered (horizontally and vertically) inside the interior
+/// rect `(ix, iy, iw, ih)`, clipped to the interior width. Used for the
+/// waiting / disconnected / empty-view placeholders.
+fn draw_centered(
+    buf: &mut [Vec<RenderCell>],
+    ix: usize,
+    iy: usize,
+    iw: usize,
+    ih: usize,
+    text: &str,
+) {
+    if iw == 0 || ih == 0 {
+        return;
+    }
+    let chars: Vec<char> = text.chars().take(iw).collect();
+    let start_x = ix + (iw - chars.len()) / 2;
+    let mid_y = iy + ih / 2;
+    for (i, ch) in chars.into_iter().enumerate() {
+        put(
+            buf,
+            mid_y,
+            start_x + i,
+            RenderCell {
+                c: ch,
+                ..RenderCell::default()
+            },
+        );
     }
 }
 
@@ -426,6 +573,10 @@ mod tests {
             cols,
             rows,
             cells: vec![vec![cell; cols as usize]; rows as usize],
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            application_cursor_keys: false,
         }
     }
 
@@ -434,6 +585,8 @@ mod tests {
             conn: ConnId::Local,
             pane_id,
             snapshot,
+            disconnected: false,
+            title: None,
         }
     }
 
@@ -563,7 +716,15 @@ mod tests {
         for cell in cells.first_mut().unwrap() {
             cell.c = 'X';
         }
-        let snap = PaneSnapshot { cols, rows, cells };
+        let snap = PaneSnapshot {
+            cols,
+            rows,
+            cells,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            application_cursor_keys: false,
+        };
         let view = ClientView {
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap))],
@@ -610,9 +771,26 @@ mod tests {
             focused: 0,
         };
         let buf = composite(&view, area(80, 24));
-        // The pane id appears somewhere in the placeholder label.
+        // A cell with no snapshot yet shows a `waiting…` placeholder.
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
-        assert!(joined.contains("42"));
+        assert!(joined.contains("waiting"));
+    }
+
+    #[test]
+    fn composite_disconnected_cell_shows_label() {
+        let mut cell = cell_with(1, Some(snap_filled(40, 20, 'A')));
+        cell.disconnected = true;
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![cell],
+            layout: ViewLayout::Grid,
+            focused: 0,
+        };
+        let buf = composite(&view, area(80, 24));
+        let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
+        assert!(joined.contains("disconnected"));
+        // The stale snapshot content must NOT bleed through.
+        assert!(!joined.contains('A'));
     }
 
     #[test]
@@ -633,6 +811,85 @@ mod tests {
             !joined.contains('A'),
             "monocle must hide the unfocused cell"
         );
+    }
+
+    #[test]
+    fn cell_at_hit_tests_grid() {
+        // 2 cells side-by-side across an 80-wide area: left half -> 0, right -> 1.
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![cell_with(1, None), cell_with(2, None)],
+            layout: ViewLayout::Grid,
+            focused: 0,
+        };
+        let a = area(80, 24);
+        let rects = cell_rects(ViewLayout::Grid, 2, a);
+        // A point inside each rect resolves to that index.
+        for (i, r) in rects.iter().enumerate() {
+            let x = r.x + r.width / 2;
+            let y = r.y + r.height / 2;
+            assert_eq!(cell_at(&view, a, x, y), Some(i));
+        }
+        // Empty view: no hit.
+        let empty = ClientView::new("e".into());
+        assert_eq!(cell_at(&empty, a, 10, 10), None);
+    }
+
+    #[test]
+    fn cell_at_monocle_keeps_focus() {
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![cell_with(1, None), cell_with(2, None)],
+            layout: ViewLayout::Monocle,
+            focused: 1,
+        };
+        assert_eq!(cell_at(&view, area(80, 24), 5, 5), Some(1));
+    }
+
+    #[test]
+    fn focused_cursor_only_when_visible_and_focused() {
+        let mut snap = snap_filled(40, 10, 'A');
+        snap.cursor_visible = true;
+        snap.cursor_x = 3;
+        snap.cursor_y = 9; // last row of the snapshot
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![cell_with(1, Some(snap.clone())), cell_with(2, Some(snap))],
+            layout: ViewLayout::Grid,
+            focused: 0,
+        };
+        let a = area(80, 24);
+        // Focused cell 0: interior origin (ix=1, iy=1); snapshot (10 rows) fits in
+        // the interior so start=0 -> cursor row = iy + 9, col = ix + 3.
+        let rects = cell_rects(ViewLayout::Grid, 2, a);
+        let f = rects[0];
+        let got = focused_cursor(&view, a).expect("cursor shown");
+        assert_eq!(got, (f.x + 1 + 3, f.y + 1 + 9));
+
+        // A hidden source cursor -> no cursor.
+        let mut hidden = snap_filled(40, 10, 'A');
+        hidden.cursor_visible = false;
+        let view2 = ClientView {
+            name: "v".into(),
+            cells: vec![cell_with(1, Some(hidden))],
+            layout: ViewLayout::Grid,
+            focused: 0,
+        };
+        assert_eq!(focused_cursor(&view2, a), None);
+
+        // A disconnected focused cell -> no cursor.
+        let mut cell = cell_with(1, Some(snap_filled(40, 10, 'A')));
+        if let Some(s) = cell.snapshot.as_mut() {
+            s.cursor_visible = true;
+        }
+        cell.disconnected = true;
+        let view3 = ClientView {
+            name: "v".into(),
+            cells: vec![cell],
+            layout: ViewLayout::Grid,
+            focused: 0,
+        };
+        assert_eq!(focused_cursor(&view3, a), None);
     }
 
     #[test]
@@ -689,12 +946,13 @@ mod tests {
     }
 
     #[test]
-    fn composite_empty_view_returns_blank_full_buffer() {
+    fn composite_empty_view_shows_hint_full_size() {
         // A view with zero cells (e.g. a freshly-created `w n` view) must
-        // composite to a full-size blank buffer without panicking. This is the
-        // invariant that lets an overlay (session manager, view picker) render
-        // on top of an empty view: `paint_view` blits this buffer, then lays
-        // the overlay over it. Both Grid and Monocle must hold.
+        // composite to a full-size buffer without panicking, and show a centered
+        // "Add panes to this view" hint. The full-size invariant lets an overlay
+        // (session manager, view picker) render on top of an empty view:
+        // `paint_view` blits this buffer, then lays the overlay over it. Both
+        // Grid and Monocle must hold.
         for layout in [ViewLayout::Grid, ViewLayout::Monocle] {
             let view = ClientView {
                 name: "empty".into(),
@@ -709,10 +967,23 @@ mod tests {
                 buf.iter().all(|row| row.len() == a.width as usize),
                 "col count for {layout:?}"
             );
+            let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
             assert!(
-                buf.iter().flatten().all(|c| *c == RenderCell::default()),
-                "every cell blank for {layout:?}"
+                joined.contains("Add panes to this view"),
+                "empty-view hint missing for {layout:?}"
             );
+        }
+    }
+
+    #[test]
+    fn composite_empty_view_hint_clamps_on_tiny_area() {
+        // On an area too small for the full label it must not panic and must
+        // stay within bounds (clamped).
+        let view = ClientView::new("empty".into());
+        for (w, h) in [(1u16, 1u16), (5, 1), (10, 3), (0, 0)] {
+            let buf = composite(&view, area(w, h));
+            assert_eq!(buf.len(), h as usize);
+            assert!(buf.iter().all(|row| row.len() == w as usize));
         }
     }
 }

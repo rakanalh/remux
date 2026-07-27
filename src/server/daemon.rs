@@ -187,12 +187,14 @@ struct ClientConnection {
     /// whenever the scroll reaches its bound.
     autoscroll_repeat: Option<(u16, u16, u16, u16)>,
     /// Panes this client has subscribed to via `SubscribePane`, mapped to the
-    /// subscribing cell's desired `(cols, rows)`. It receives a `PaneContent`
-    /// snapshot for each on subscribe and on every change, regardless of which
-    /// session/tab it has in the foreground (View cells). The stored size is
-    /// forward-compat wiring for Model A min-across-viewers sizing and is not
-    /// yet folded into pane sizing.
-    subscribed_panes: std::collections::HashMap<PaneId, (u16, u16)>,
+    /// subscribing cell's size demand: `Some((cols, rows))` for a cell that
+    /// demands the pane reflow to it (Model A, or a Model-B focused cell), or
+    /// `None` for a watch-only cell that imposes no size constraint (Model-B
+    /// unfocused). Folded into the pane's min-across-viewers effective size by
+    /// [`recompute_pane_size`]. Each subscribed pane receives a `PaneContent`
+    /// snapshot on subscribe and on every change, regardless of which
+    /// session/tab this client has in the foreground.
+    subscribed_panes: std::collections::HashMap<PaneId, Option<(u16, u16)>>,
 }
 
 /// The Remux server.
@@ -834,41 +836,41 @@ async fn handle_client_message(
             pane_id,
             cols,
             rows,
+            size_demand,
         } => {
-            // Snapshot the pane (if it exists) under the panes lock, then release
-            // it before touching clients -- this codebase keeps the panes->clients
-            // ordering unnested, so we never hold both locks at once.
-            //
-            // DEFERRED (Model A sizing): we record the subscriber's desired
-            // (cols, rows) but snapshot the pane at its CURRENT size -- folding
-            // the min-across-viewers size into the pane resize touches
-            // broadcast_full_render's size math and is a later step.
-            let snapshot = {
-                let ps = panes.lock().await;
-                ps.get(&pane_id)
-                    .map(|pd| crate::server::compositor::render_pane_snapshot(&pd.screen))
-            };
-            let mut cls = clients.lock().await;
-            if let Some(conn) = cls.get_mut(&client_id) {
-                conn.subscribed_panes.insert(pane_id, (cols, rows));
-                // Send an immediate snapshot so the subscriber has content before
-                // the next PTY change fans one out.
-                if let Some((cols, rows, cells)) = snapshot {
-                    let _ = conn.tx.send(ServerMessage::PaneContent {
-                        pane_id,
-                        cols,
-                        rows,
-                        cells,
-                    });
+            // Record the subscriber's size demand (Model A/B min-across-viewers
+            // sizing), fold it into the pane's effective size, and send an
+            // immediate snapshot. `build_pane_content` acquires panes/state
+            // independently so we never nest locks.
+            let snapshot = build_pane_content(pane_id, state, panes).await;
+            {
+                let mut cls = clients.lock().await;
+                if let Some(conn) = cls.get_mut(&client_id) {
+                    let demand = if size_demand {
+                        Some((cols, rows))
+                    } else {
+                        None
+                    };
+                    conn.subscribed_panes.insert(pane_id, demand);
+                    if let Some(msg) = snapshot {
+                        let _ = conn.tx.send(msg);
+                    }
                 }
             }
+            // The new/updated demand may shrink (or release) the pane's effective
+            // size; recompute and re-stream if it changed.
+            recompute_pane_size(pane_id, state, panes, clients, config).await;
             Ok(())
         }
         ClientMessage::UnsubscribePane { pane_id } => {
-            let mut cls = clients.lock().await;
-            if let Some(conn) = cls.get_mut(&client_id) {
-                conn.subscribed_panes.remove(&pane_id);
+            {
+                let mut cls = clients.lock().await;
+                if let Some(conn) = cls.get_mut(&client_id) {
+                    conn.subscribed_panes.remove(&pane_id);
+                }
             }
+            // Dropping a viewer may let the pane grow back; recompute.
+            recompute_pane_size(pane_id, state, panes, clients, config).await;
             Ok(())
         }
         ClientMessage::InputToPane { pane_id, data } => {
@@ -3470,65 +3472,37 @@ async fn resize_session_panes(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     _config: &Arc<Config>,
 ) -> Result<()> {
-    let (cols, rows) = session_render_size(session_name, clients).await;
-    let rects = {
-        let st = state.lock().await;
-        let sess = match st.sessions.get(session_name) {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let tab = match sess.tabs.get(sess.active_tab) {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-        let content_rows = rows.saturating_sub(1);
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: cols,
-            height: content_rows,
-        };
-        let pane_rects = if tab.zoomed_pane.is_some() {
-            vec![(tab.focused_pane, area)]
-        } else {
-            layout::compute_layout(&tab.layout, area, 0)
-        };
-
-        // Compute the content dimensions (what blit_screen actually renders)
-        // based on border style, so the PTY/screen match the visible area.
-        let mut content_rects = Vec::new();
-        for &(pane_id, rect) in &pane_rects {
-            let (content_cols, content_rows) = match sess.border_style {
-                BorderStyle::ZellijStyle => {
-                    if rect.width >= 3 && rect.height >= 3 {
-                        (rect.width - 2, rect.height - 2)
-                    } else {
-                        (rect.width, rect.height)
-                    }
-                }
-                BorderStyle::TmuxStyle => {
-                    let stack_info = layout::find_stack_names(&tab.layout, pane_id);
-                    let is_multi = stack_info
-                        .as_ref()
-                        .map(|(_, panes, _)| panes.len() > 1)
-                        .unwrap_or(false);
-                    if is_multi && rect.height >= 2 {
-                        (rect.width, rect.height - 1)
-                    } else {
-                        (rect.width, rect.height)
-                    }
-                }
-            };
-            content_rects.push((pane_id, content_cols, content_rows));
+    // Home allotments from the session's active-tab layout (the size the panes
+    // get from attached clients viewing this session).
+    let rects = active_tab_content_sizes(session_name, state, clients).await;
+    if rects.is_empty() {
+        return Ok(());
+    }
+    // Fold in every View-cell size demand BEFORE touching the panes lock, so we
+    // never nest clients under panes. A subscribed cell smaller than the home
+    // allotment shrinks the pane to it (Model A: the honest shared pane reflows
+    // everywhere it is shown).
+    let sub_mins = {
+        let cls = clients.lock().await;
+        let mut m: HashMap<PaneId, (u16, u16)> = HashMap::new();
+        for (pane_id, _, _) in &rects {
+            if let Some(d) = subscriber_min_demand_locked(&cls, *pane_id) {
+                m.insert(*pane_id, d);
+            }
         }
-        content_rects
+        m
     };
 
     let mut ps = panes.lock().await;
     for (pane_id, content_cols, content_rows) in rects {
         if let Some(pane_data) = ps.get_mut(&pane_id) {
-            let inner_cols = content_cols.max(1);
-            let inner_rows = content_rows.max(1);
+            let (mut cols, mut rows) = (content_cols, content_rows);
+            if let Some((sc, sr)) = sub_mins.get(&pane_id) {
+                cols = cols.min(*sc);
+                rows = rows.min(*sr);
+            }
+            let inner_cols = cols.max(1);
+            let inner_rows = rows.max(1);
             log::debug!(
                 "resize_session_panes: pane_id={}, content={}x{}, pty/screen resize to cols={} rows={}",
                 pane_id, content_cols, content_rows, inner_cols, inner_rows
@@ -3538,6 +3512,192 @@ async fn resize_session_panes(
         }
     }
     Ok(())
+}
+
+/// The content (blit) size each pane in a session's active tab gets from the
+/// clients attached to that session -- the pane's "home allotment". Empty when
+/// the session is unknown, has no active tab, or (via `session_render_size`'s
+/// 80x24 fallback) would be meaningless. Border-style aware, mirroring the
+/// composite render path so the PTY/screen match the visible content area.
+async fn active_tab_content_sizes(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Vec<(PaneId, u16, u16)> {
+    let (cols, rows) = session_render_size(session_name, clients).await;
+    let st = state.lock().await;
+    let sess = match st.sessions.get(session_name) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let tab = match sess.tabs.get(sess.active_tab) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let content_rows = rows.saturating_sub(1);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: content_rows,
+    };
+    let pane_rects = if tab.zoomed_pane.is_some() {
+        vec![(tab.focused_pane, area)]
+    } else {
+        layout::compute_layout(&tab.layout, area, 0)
+    };
+
+    let mut content_rects = Vec::new();
+    for &(pane_id, rect) in &pane_rects {
+        let (content_cols, content_rows) = match sess.border_style {
+            BorderStyle::ZellijStyle => {
+                if rect.width >= 3 && rect.height >= 3 {
+                    (rect.width - 2, rect.height - 2)
+                } else {
+                    (rect.width, rect.height)
+                }
+            }
+            BorderStyle::TmuxStyle => {
+                let stack_info = layout::find_stack_names(&tab.layout, pane_id);
+                let is_multi = stack_info
+                    .as_ref()
+                    .map(|(_, panes, _)| panes.len() > 1)
+                    .unwrap_or(false);
+                if is_multi && rect.height >= 2 {
+                    (rect.width, rect.height - 1)
+                } else {
+                    (rect.width, rect.height)
+                }
+            }
+        };
+        content_rects.push((pane_id, content_cols, content_rows));
+    }
+    content_rects
+}
+
+/// The minimum `(cols, rows)` demanded across every client's *sized*
+/// (`Some`) subscription to `pane_id`. `None` when no client demands a size
+/// (either unsubscribed, or only watch-only cells). Takes the already-held
+/// clients guard to keep lock ordering explicit at the call sites.
+fn subscriber_min_demand_locked(
+    cls: &HashMap<u64, ClientConnection>,
+    pane_id: PaneId,
+) -> Option<(u16, u16)> {
+    let mut out: Option<(u16, u16)> = None;
+    for conn in cls.values() {
+        if let Some(Some((c, r))) = conn.subscribed_panes.get(&pane_id) {
+            out = Some(match out {
+                Some((oc, or)) => (oc.min(*c), or.min(*r)),
+                None => (*c, *r),
+            });
+        }
+    }
+    out
+}
+
+/// The pane's home allotment (its size from any attached client viewing the
+/// session's active tab), or `None` when the pane is not visible on any
+/// attached client (background tab, or a session with no attached client). Such
+/// a pane has NO home constraint, so a watch-only View cell never reflows it.
+async fn pane_home_allotment(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Option<(u16, u16)> {
+    // Which session owns the pane, and does any client have it attached?
+    let session_name = {
+        let st = state.lock().await;
+        let mut found = None;
+        for sess in st.sessions.values() {
+            if sess
+                .tabs
+                .get(sess.active_tab)
+                .map(|t| t.pane_order.contains(&pane_id))
+                .unwrap_or(false)
+            {
+                found = Some(sess.name.clone());
+                break;
+            }
+        }
+        found
+    }?;
+    let has_client = {
+        let cls = clients.lock().await;
+        cls.values()
+            .any(|c| c.session_name.as_deref() == Some(session_name.as_str()))
+    };
+    if !has_client {
+        return None;
+    }
+    active_tab_content_sizes(&session_name, state, clients)
+        .await
+        .into_iter()
+        .find(|(pid, _, _)| *pid == pane_id)
+        .map(|(_, c, r)| (c, r))
+}
+
+/// Recompute a single pane's effective size = componentwise min of its home
+/// allotment and every sized View-cell demand, then resize the PTY/screen and
+/// re-stream a fresh `PaneContent` to subscribers if it changed. When nothing
+/// constrains the pane (no home, no sized subscriber) it is left untouched --
+/// so merely watching a pane (Model B unfocused, `None` demand) never reflows
+/// it. Called on subscribe/unsubscribe (the home path uses `resize_session_panes`).
+async fn recompute_pane_size(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    _config: &Arc<Config>,
+) {
+    let home = pane_home_allotment(pane_id, state, clients).await;
+    let sub = {
+        let cls = clients.lock().await;
+        subscriber_min_demand_locked(&cls, pane_id)
+    };
+    let effective = match (home, sub) {
+        (Some((hc, hr)), Some((sc, sr))) => Some((hc.min(sc), hr.min(sr))),
+        (Some(h), None) => Some(h),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    };
+    let (ec, er) = match effective {
+        Some(e) => (e.0.max(1), e.1.max(1)),
+        None => return,
+    };
+    // Resize only if it actually changed, to avoid needless PTY churn / SIGWINCH.
+    let changed = {
+        let mut ps = panes.lock().await;
+        match ps.get_mut(&pane_id) {
+            Some(pd) => {
+                if pd.screen.cols == ec && pd.screen.rows == er {
+                    false
+                } else {
+                    log::debug!(
+                        "recompute_pane_size: pane_id={pane_id} {}x{} -> {ec}x{er}",
+                        pd.screen.cols,
+                        pd.screen.rows
+                    );
+                    let _ = pd.pty.resize(ec, er);
+                    pd.screen.resize(ec, er);
+                    true
+                }
+            }
+            None => false,
+        }
+    };
+    if changed {
+        // Re-stream the reflowed snapshot to every subscriber right away, so a
+        // cell that shrank a pane sees the rewrapped content without waiting for
+        // the next PTY output.
+        if let Some(msg) = build_pane_content(pane_id, state, panes).await {
+            let cls = clients.lock().await;
+            for conn in cls.values() {
+                if conn.subscribed_panes.contains_key(&pane_id) {
+                    let _ = conn.tx.send(msg.clone());
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3567,6 +3727,53 @@ async fn session_render_size(
         .min()
         .unwrap_or(24);
     (cols, rows)
+}
+
+/// Resolve the `(session_name, tab_name)` a pane belongs to, for a View cell's
+/// border title. Scans every session's tabs for the one whose `pane_order`
+/// contains `pane_id`. Returns empty strings when the pane can't be located
+/// (already closed): the client then falls back to `waiting…`.
+fn pane_labels(st: &ServerState, pane_id: PaneId) -> (String, String) {
+    for sess in st.sessions.values() {
+        for tab in &sess.tabs {
+            if tab.pane_order.contains(&pane_id) {
+                return (sess.name.clone(), tab.name.clone());
+            }
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Build a `PaneContent` message for `pane_id`: render its screen snapshot
+/// (cells + cursor + DECCKM) and resolve its session/tab title. Returns `None`
+/// when the pane no longer exists. Acquires the panes and state locks
+/// independently (never nested), honoring the codebase's lock ordering.
+async fn build_pane_content(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Option<ServerMessage> {
+    let snap = {
+        let ps = panes.lock().await;
+        ps.get(&pane_id)
+            .map(|pd| crate::server::compositor::render_pane_snapshot(&pd.screen))
+    }?;
+    let (session_name, tab_name) = {
+        let st = state.lock().await;
+        pane_labels(&st, pane_id)
+    };
+    Some(ServerMessage::PaneContent {
+        pane_id,
+        cols: snap.cols,
+        rows: snap.rows,
+        cells: snap.cells,
+        cursor_x: snap.cursor_x,
+        cursor_y: snap.cursor_y,
+        cursor_visible: snap.cursor_visible,
+        application_cursor_keys: snap.application_cursor_keys,
+        session_name,
+        tab_name,
+    })
 }
 
 /// Refresh a target session after a structural mutation performed on behalf of
@@ -4595,22 +4802,11 @@ async fn start_pty_forwarding(
                                 .any(|c| c.subscribed_panes.contains_key(&pane_id))
                         };
                         if has_subscriber {
-                            let pane_snapshot = {
-                                let ps = panes.lock().await;
-                                ps.get(&pane_id).map(|pd| {
-                                    crate::server::compositor::render_pane_snapshot(&pd.screen)
-                                })
-                            };
-                            if let Some((cols, rows, cells)) = pane_snapshot {
+                            if let Some(msg) = build_pane_content(pane_id, &state, &panes).await {
                                 let cls = clients.lock().await;
                                 for conn in cls.values() {
                                     if conn.subscribed_panes.contains_key(&pane_id) {
-                                        let _ = conn.tx.send(ServerMessage::PaneContent {
-                                            pane_id,
-                                            cols,
-                                            rows,
-                                            cells: cells.clone(),
-                                        });
+                                        let _ = conn.tx.send(msg.clone());
                                     }
                                 }
                             }
@@ -4890,22 +5086,11 @@ async fn materialize_session(
                                 .any(|c| c.subscribed_panes.contains_key(&pane_id))
                         };
                         if has_subscriber {
-                            let pane_snapshot = {
-                                let ps = panes.lock().await;
-                                ps.get(&pane_id).map(|pd| {
-                                    crate::server::compositor::render_pane_snapshot(&pd.screen)
-                                })
-                            };
-                            if let Some((cols, rows, cells)) = pane_snapshot {
+                            if let Some(msg) = build_pane_content(pane_id, &state, &panes).await {
                                 let cls = clients.lock().await;
                                 for conn in cls.values() {
                                     if conn.subscribed_panes.contains_key(&pane_id) {
-                                        let _ = conn.tx.send(ServerMessage::PaneContent {
-                                            pane_id,
-                                            cols,
-                                            rows,
-                                            cells: cells.clone(),
-                                        });
+                                        let _ = conn.tx.send(msg.clone());
                                     }
                                 }
                             }

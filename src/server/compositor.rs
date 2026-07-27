@@ -1063,14 +1063,29 @@ fn blit_screen(buffer: &mut [Vec<RenderCell>], screen: &Screen, rect: Rect, scro
     }
 }
 
+/// A single pane's rendered screen plus the cursor/DECCKM state a View cell
+/// needs to render the cursor and encode input. Returned by
+/// [`render_pane_snapshot`].
+pub(crate) struct PaneRenderSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<Vec<RenderCell>>,
+    /// Cursor position, clamped into `cols`/`rows`.
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_visible: bool,
+    /// The pane's DECCKM (application cursor keys) state.
+    pub application_cursor_keys: bool,
+}
+
 /// Snapshot a single pane's rendered screen into a standalone cell buffer.
 ///
 /// The buffer is sized to the pane's *own* current dimensions and blitted at
-/// scroll_offset 0 (the live view) -- no resize is performed here, since
-/// View-cell size negotiation (min-across-viewers) is a later step. Returns
-/// `(cols, rows, cells)`; when `cols == 0 || rows == 0` the buffer is empty,
-/// which callers treat as a no-content snapshot.
-pub(crate) fn render_pane_snapshot(screen: &Screen) -> (u16, u16, Vec<Vec<RenderCell>>) {
+/// scroll_offset 0 (the live view). The cursor position is clamped into the
+/// pane's bounds so a focused View cell can place the terminal cursor. When
+/// `cols == 0 || rows == 0` the buffer is empty, which callers treat as a
+/// no-content snapshot.
+pub(crate) fn render_pane_snapshot(screen: &Screen) -> PaneRenderSnapshot {
     let cols = screen.cols;
     let rows = screen.rows;
     let mut buffer: Vec<Vec<RenderCell>> =
@@ -1086,7 +1101,15 @@ pub(crate) fn render_pane_snapshot(screen: &Screen) -> (u16, u16, Vec<Vec<Render
         },
         0,
     );
-    (cols, rows, buffer)
+    PaneRenderSnapshot {
+        cols,
+        rows,
+        cells: buffer,
+        cursor_x: screen.cursor_x.min(cols.saturating_sub(1)),
+        cursor_y: screen.cursor_y.min(rows.saturating_sub(1)),
+        cursor_visible: screen.cursor_visible,
+        application_cursor_keys: screen.application_cursor_keys,
+    }
 }
 
 /// Safely set a cell in the buffer (bounds-checked).
