@@ -744,13 +744,20 @@ fn paint_view(
         .cells
         .get(view.focused)
         .and_then(|c| c.title.as_deref());
+    // Mirror a normal tab's zoom marker (`format!("{} Z", name)` in the server
+    // status bar): append ` Z` to the view name while a cell is zoomed.
+    let view_name = if view.zoomed {
+        format!("{} Z", view.name)
+    } else {
+        view.name.clone()
+    };
     crate::client::view::draw_status_bar(
         &mut composed,
         area,
         mode,
-        &view.name,
+        &view_name,
         cell_title,
-        view.layout.name(),
+        view.layout_name(),
         compositor_theme,
     );
     // Show the terminal cursor at the focused cell's source cursor position (if
@@ -799,7 +806,7 @@ async fn subscribe_view_cells(
         height: r,
     };
     let inner = crate::client::view::cells_area(area);
-    let rects = crate::client::view::cell_rects(&view.layout, view.focused, view.cells.len(), area);
+    let rects = crate::client::view::cell_rects(view, area);
     for (i, cell) in view.cells.iter().enumerate() {
         // Visible cells subscribe at their rect's interior. Cells hidden by the
         // current layout (e.g. Monocle's unfocused cells) still get a
@@ -956,7 +963,118 @@ async fn handle_view_command(
         RemuxCommand::LayoutNext => {
             hide_whichkey!();
             views[av].layout = views[av].layout.next();
+            // Return to an automatic layout: drop any manual arrangement so the
+            // status bar reverts from `custom`. `zoomed` is left as-is.
+            views[av].custom_tree = None;
             subscribe_view_cells(mgr, &views[av]).await?;
+            repaint!();
+            Ok(true)
+        }
+        RemuxCommand::ResizeLeft(amount)
+        | RemuxCommand::ResizeRight(amount)
+        | RemuxCommand::ResizeUp(amount)
+        | RemuxCommand::ResizeDown(amount) => {
+            hide_whichkey!();
+            // Mirror the server's sign/axis convention verbatim (daemon.rs):
+            // Left/Right adjust a Vertical split, Up/Down a Horizontal one; the
+            // amount is a percentage of the split.
+            use crate::server::layout::Direction;
+            let (direction, delta) = match cmd {
+                RemuxCommand::ResizeLeft(_) => (Direction::Vertical, -(*amount as f32) / 100.0),
+                RemuxCommand::ResizeRight(_) => (Direction::Vertical, *amount as f32 / 100.0),
+                RemuxCommand::ResizeUp(_) => (Direction::Horizontal, -(*amount as f32) / 100.0),
+                RemuxCommand::ResizeDown(_) => (Direction::Horizontal, *amount as f32 / 100.0),
+                _ => unreachable!(),
+            };
+            if !views[av].cells.is_empty() {
+                let focused_id = views[av].focused_id();
+                // Seed a custom tree from the current automatic layout on the
+                // first manual resize. If the resize changes nothing (e.g. a
+                // Monocle view is a single stack with no split to adjust), undo
+                // the seeding so the view stays automatic rather than flipping
+                // to `custom` with no visible effect.
+                let had_tree = views[av].custom_tree.is_some();
+                if !had_tree {
+                    views[av].custom_tree = Some(views[av].auto_tree());
+                }
+                let changed = views[av]
+                    .custom_tree
+                    .as_mut()
+                    .map(|t| t.resize(focused_id, direction, delta))
+                    .unwrap_or(false);
+                if changed {
+                    subscribe_view_cells(mgr, &views[av]).await?;
+                } else if !had_tree {
+                    views[av].custom_tree = None;
+                }
+            }
+            repaint!();
+            Ok(true)
+        }
+        RemuxCommand::PaneMoveLeft
+        | RemuxCommand::PaneMoveRight
+        | RemuxCommand::PaneMoveUp
+        | RemuxCommand::PaneMoveDown => {
+            hide_whichkey!();
+            let dir = match cmd {
+                RemuxCommand::PaneMoveLeft => FocusDirection::Left,
+                RemuxCommand::PaneMoveRight => FocusDirection::Right,
+                RemuxCommand::PaneMoveUp => FocusDirection::Up,
+                RemuxCommand::PaneMoveDown => FocusDirection::Down,
+                _ => unreachable!(),
+            };
+            if !views[av].cells.is_empty() {
+                let focused_id = views[av].focused_id();
+                let area = crate::client::view::cells_area(crate::server::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: cols,
+                    height: rows,
+                });
+                let had_tree = views[av].custom_tree.is_some();
+                if !had_tree {
+                    views[av].custom_tree = Some(views[av].auto_tree());
+                }
+                // Same semantics as the server's PaneMove: swap with the spatial
+                // neighbor in `dir` if one exists, else relocate the focused cell
+                // to that edge. Focus stays on the moved cell (its index in
+                // `cells` is unchanged; only its slot in the tree moves).
+                let moved = {
+                    let tree = views[av].custom_tree.as_ref().unwrap();
+                    if let Some(neighbor) =
+                        crate::server::layout::find_neighbor(tree, area, focused_id, dir.clone(), 0)
+                    {
+                        crate::server::layout::swap_panes(
+                            views[av].custom_tree.as_mut().unwrap(),
+                            focused_id,
+                            neighbor,
+                        )
+                    } else if let Some(new_tree) =
+                        crate::server::layout::relocate_pane_to_edge(tree, focused_id, dir)
+                    {
+                        views[av].custom_tree = Some(new_tree);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if moved {
+                    subscribe_view_cells(mgr, &views[av]).await?;
+                } else if !had_tree {
+                    views[av].custom_tree = None;
+                }
+            }
+            repaint!();
+            Ok(true)
+        }
+        RemuxCommand::PaneToggleZoom => {
+            hide_whichkey!();
+            if !views[av].cells.is_empty() {
+                views[av].zoomed = !views[av].zoomed;
+                // Zoom changes which cells are visible (only the focused one),
+                // so the Model-B size demand set moves with it: re-subscribe.
+                subscribe_view_cells(mgr, &views[av]).await?;
+            }
             repaint!();
             Ok(true)
         }
@@ -966,6 +1084,9 @@ async fn handle_view_command(
             if !views[av].cells.is_empty() {
                 let focused = views[av].focused;
                 let cell = views[av].cells.remove(focused);
+                // Keep any manual arrangement consistent: drop the ejected cell's
+                // leaf from the custom tree (clearing the tree if it empties).
+                views[av].prune_from_tree(cell.id);
                 // Best-effort: a torn-down source connection must not abort here.
                 if let Err(e) = mgr
                     .send(
@@ -1566,14 +1687,43 @@ async fn run_client_loop(
                                 shortcuts,
                             } => {
                                 log::debug!("input: ExecuteAndShowWhichKey cmd={:?}", command);
-                                // Send the command (a sticky-group leaf, e.g. a
-                                // resize) to the foreground server. These are
-                                // never SessionDetach/SendKey and the mode stays
-                                // Command, so no ModeChanged is needed.
-                                mgr.send_foreground(ClientMessage::Command(command)).await?;
-                                // Keep the which-key popup open so the user can
-                                // keep resizing.
+                                // Sticky-group leaves (e.g. the `p R h/j/k/l`
+                                // resize group) arrive here, NOT via `Execute`.
+                                // While a view is active they must be intercepted
+                                // client-side just like `Execute`/`ExecuteChain`
+                                // -- otherwise a resize would be forwarded to the
+                                // masked foreground server (resizing the wrong
+                                // panes) instead of the view's cells.
                                 let (c, r) = crossterm::terminal::size()?;
+                                let mut consumed = false;
+                                if let Some(av) = active_view {
+                                    consumed = handle_view_command(
+                                        &command,
+                                        mgr,
+                                        &mut views,
+                                        av,
+                                        &mut renderer,
+                                        &input,
+                                        &mut whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                        cols,
+                                        rows,
+                                    )
+                                    .await?;
+                                }
+                                if !consumed {
+                                    // Not in a view: send to the foreground server.
+                                    // These are never SessionDetach/SendKey and the
+                                    // mode stays Command, so no ModeChanged is needed.
+                                    mgr.send_foreground(ClientMessage::Command(command)).await?;
+                                }
+                                // Keep the which-key popup open so the user can
+                                // keep resizing (re-shown over the repainted view
+                                // when a view consumed the command).
                                 whichkey.show(label, entries, shortcuts);
                                 renderer.clear_overlay(c, r)?;
                                 let commands = whichkey.render(c, r, &theme, which_key_position.clone());
@@ -2625,9 +2775,10 @@ async fn run_client_loop(
                                         if already {
                                             continue;
                                         }
-                                        views[target_idx]
-                                            .cells
-                                            .push(crate::client::view::ViewCell::new(conn, pane_id));
+                                        // `add_cell` assigns the stable id and, when a
+                                        // `custom_tree` is active, splices the new cell
+                                        // into it (splitting the focused leaf).
+                                        views[target_idx].add_cell(conn, pane_id);
                                     }
                                     views[target_idx].clamp_focus();
                                     if active_view == Some(target_idx) {
@@ -2686,6 +2837,12 @@ async fn run_client_loop(
                                 }
                                 if let Some(av) = active_view {
                                     views[av].layout = views[av].layout.next();
+                                    // Returning to an automatic layout discards any
+                                    // manual arrangement (the status bar name reverts
+                                    // from `custom` to the automatic mode). `zoomed`
+                                    // is deliberately left untouched — like the
+                                    // server, zoom is independent of layout.
+                                    views[av].custom_tree = None;
                                     // Re-subscribe so each cell demands its new
                                     // per-cell size (the layout changed the rects,
                                     // and the focused cell's Model-B demand must

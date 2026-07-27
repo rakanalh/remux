@@ -29,7 +29,9 @@
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, PaneId, RenderCell};
-use crate::server::layout::{compute_layout, FocusDirection, GridLayout, LayoutMode, Rect};
+use crate::server::layout::{
+    compute_layout, FocusDirection, GridLayout, LayoutMode, LayoutNode, Rect,
+};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -63,6 +65,13 @@ pub struct PaneSnapshot {
 ///   (or a send to it failed); shows `disconnected` and takes no more input.
 #[derive(Debug, Clone)]
 pub struct ViewCell {
+    /// Stable, per-view identity for this cell, assigned by
+    /// [`ClientView::add_cell`] from a monotonic counter. Used as the
+    /// pseudo-[`PaneId`] in the layout tree so that adding or removing cells
+    /// (which shifts array indices) never invalidates a persistent
+    /// `custom_tree`. Everything index-based (`focused`, `move_focus`,
+    /// `cell_at`) keeps using the array index; only the tree keys off `id`.
+    pub id: u64,
     pub conn: ConnId,
     pub pane_id: PaneId,
     pub snapshot: Option<PaneSnapshot>,
@@ -79,8 +88,13 @@ pub struct ViewCell {
 
 impl ViewCell {
     /// A fresh cell aliasing `(conn, pane_id)`, waiting for its first snapshot.
+    ///
+    /// The `id` is left 0 here; [`ClientView::add_cell`] is the sole owner of id
+    /// assignment and stamps a unique id when it takes the cell. Construct cells
+    /// only through `add_cell` so ids stay unique per view.
     pub fn new(conn: ConnId, pane_id: PaneId) -> Self {
         Self {
+            id: 0,
             conn,
             pane_id,
             snapshot: None,
@@ -102,6 +116,20 @@ pub struct ClientView {
     /// Index into `cells` of the focused cell. Always clamped to a valid index
     /// (or 0 when there are no cells) by the mutators below.
     pub focused: usize,
+    /// A persistent, mutable arrangement of the cells, keyed by cell [`id`](ViewCell::id).
+    /// `Some` once the user has manually resized ([`ResizeLeft`](crate::protocol::RemuxCommand::ResizeLeft) …)
+    /// or moved ([`PaneMoveLeft`](crate::protocol::RemuxCommand::PaneMoveLeft) …) a
+    /// cell; while `Some` the layout name reads `custom` and rects come from this
+    /// tree instead of a fresh automatic build. `LayoutNext` resets it to `None`.
+    pub custom_tree: Option<LayoutNode>,
+    /// When `true`, only the focused cell is shown (filling the whole cell area);
+    /// every other cell is hidden. Mirrors a normal tab's zoom. Independent of
+    /// `layout`/`custom_tree`, exactly as the server's `zoomed_pane` is
+    /// independent of `layout_mode`.
+    pub zoomed: bool,
+    /// Monotonic source for [`ViewCell::id`]. Only ever increments, so a removed
+    /// cell's id is never reused within the view's lifetime.
+    next_cell_id: u64,
 }
 
 impl ClientView {
@@ -112,6 +140,78 @@ impl ClientView {
             cells: Vec::new(),
             layout: LayoutMode::Grid(GridLayout),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1,
+        }
+    }
+
+    /// Append a cell aliasing `(conn, pane_id)`, assigning it a fresh stable
+    /// [`id`](ViewCell::id). When a `custom_tree` is active, the new cell is
+    /// spliced into it by splitting the focused (or, if none, the last) leaf —
+    /// the same way a normal tab splits when a pane is added — so the manual
+    /// arrangement survives the add. With no `custom_tree` the automatic layout
+    /// simply recomputes on the next render. Returns the new cell's id.
+    pub fn add_cell(&mut self, conn: ConnId, pane_id: PaneId) -> u64 {
+        let id = self.next_cell_id;
+        self.next_cell_id += 1;
+        let mut cell = ViewCell::new(conn, pane_id);
+        cell.id = id;
+        // Choose the leaf to split BEFORE pushing (so `focused` still indexes an
+        // existing cell). Splitting the focused cell's leaf mirrors a tab split.
+        let target = self
+            .cells
+            .get(self.focused)
+            .or_else(|| self.cells.last())
+            .map(|c| c.id);
+        self.cells.push(cell);
+        if let (Some(tree), Some(target_id)) = (self.custom_tree.as_mut(), target) {
+            // Split the target leaf; the new cell becomes the split's second
+            // child. Vertical (left/right) matches `LayoutNode::split_vertical`'s
+            // default orientation for a fresh split.
+            tree.split_vertical(target_id, id);
+        }
+        id
+    }
+
+    /// Build the automatic layout tree over the current cells (keyed by stable
+    /// id, with the focused cell as the active pane). Used both to place cells
+    /// when there is no `custom_tree` and to seed a `custom_tree` on the first
+    /// manual resize/move.
+    pub fn auto_tree(&self) -> LayoutNode {
+        let ids: Vec<PaneId> = self.cells.iter().map(|c| c.id).collect();
+        let focused_id = self.focused_id();
+        self.layout.build_tree(&ids, focused_id)
+    }
+
+    /// The stable id of the focused cell, or `0` when the view is empty.
+    pub fn focused_id(&self) -> u64 {
+        self.cells.get(self.focused).map(|c| c.id).unwrap_or(0)
+    }
+
+    /// The array index of the cell with stable `id`, if present.
+    pub fn index_of_id(&self, id: u64) -> Option<usize> {
+        self.cells.iter().position(|c| c.id == id)
+    }
+
+    /// The layout name shown in the status bar: `custom` while a `custom_tree`
+    /// is active, otherwise the automatic mode's name.
+    pub fn layout_name(&self) -> &str {
+        if self.custom_tree.is_some() {
+            "custom"
+        } else {
+            self.layout.name()
+        }
+    }
+
+    /// Prune the cell with stable `id` from `custom_tree` (if one is active),
+    /// collapsing the tree via the normal close path. When the tree becomes
+    /// empty it is cleared to `None` so the view falls back to automatic layout.
+    pub fn prune_from_tree(&mut self, id: u64) {
+        if let Some(tree) = self.custom_tree.as_mut() {
+            if tree.close_pane(id).is_none() {
+                self.custom_tree = None;
+            }
         }
     }
 
@@ -218,8 +318,15 @@ pub fn cells_area(area: Rect) -> Rect {
 /// for a cell area too short to host both the strip and a cell below it
 /// (`cells_area().height < 2`). The focused cell renders BELOW this strip; see
 /// [`cell_rects`], which subtracts it so the focused cell never overwrites it.
-pub fn monocle_strip_rect(layout: &LayoutMode, area: Rect) -> Option<Rect> {
-    if !matches!(layout, LayoutMode::Monocle(_)) {
+pub fn monocle_strip_rect(view: &ClientView, area: Rect) -> Option<Rect> {
+    // No strip when zoomed (the focused cell fills everything) or when a manual
+    // `custom_tree` is active (cells are tiled, not stacked). Keeping the guard
+    // here means `cell_rects`, `composite` and `cell_at` can never disagree
+    // about whether the strip row exists.
+    if view.zoomed || view.custom_tree.is_some() {
+        return None;
+    }
+    if !matches!(view.layout, LayoutMode::Monocle(_)) {
         return None;
     }
     let inner = cells_area(area);
@@ -238,25 +345,44 @@ pub fn monocle_strip_rect(layout: &LayoutMode, area: Rect) -> Option<Rect> {
 /// when cell `i` is visible in the current layout, or `None` when it is hidden
 /// (Monocle hides every cell except the focused one).
 ///
-/// Returns a vector of exactly `n` entries (empty when `n == 0`).
-pub fn cell_rects(layout: &LayoutMode, focused: usize, n: usize, area: Rect) -> Vec<Option<Rect>> {
+/// Returns a vector of exactly `n` entries (empty when the view has no cells).
+///
+/// The cells are keyed by their stable [`ViewCell::id`], so an active
+/// `custom_tree` (built once and mutated by resize/move) survives cell add/remove
+/// without index shifts corrupting it. When `zoomed`, only the focused cell is
+/// placed (filling the whole cell area); when a `custom_tree` is present it drives
+/// the rects; otherwise a fresh automatic tree is built from the current ids.
+pub fn cell_rects(view: &ClientView, area: Rect) -> Vec<Option<Rect>> {
+    let n = view.cells.len();
     if n == 0 {
         return Vec::new();
+    }
+    // Zoom: the focused cell fills the entire cell area, everything else hidden.
+    // The strip is suppressed while zoomed (see `monocle_strip_rect`), so the
+    // focused cell gets the full `cells_area`.
+    if view.zoomed {
+        let mut out = vec![None; n];
+        if view.focused < n {
+            out[view.focused] = Some(cells_area(area));
+        }
+        return out;
     }
     let mut inner = cells_area(area);
     // Monocle reserves the top row of the cell area for the title strip, so the
     // focused cell tiles the region BELOW it (never overwriting the strip).
-    if let Some(strip) = monocle_strip_rect(layout, area) {
+    if let Some(strip) = monocle_strip_rect(view, area) {
         inner.y = inner.y.saturating_add(strip.height);
         inner.height = inner.height.saturating_sub(strip.height);
     }
-    let ids: Vec<PaneId> = (0..n).map(|i| i as PaneId).collect();
-    let tree = layout.build_tree(&ids, focused as PaneId);
+    // Persistent manual arrangement wins; otherwise recompute automatically.
+    let tree = match &view.custom_tree {
+        Some(t) => std::borrow::Cow::Borrowed(t),
+        None => std::borrow::Cow::Owned(view.auto_tree()),
+    };
     let placed = compute_layout(&tree, inner, 0);
     let mut out = vec![None; n];
-    for (pid, rect) in placed {
-        let idx = pid as usize;
-        if idx < n {
+    for (id, rect) in placed {
+        if let Some(idx) = view.index_of_id(id) {
             out[idx] = Some(rect);
         }
     }
@@ -314,7 +440,7 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
         return buf;
     }
 
-    let rects = cell_rects(&view.layout, view.focused, view.cells.len(), area);
+    let rects = cell_rects(view, area);
     for (i, cell) in view.cells.iter().enumerate() {
         if let Some(Some(rect)) = rects.get(i) {
             draw_cell(&mut buf, area, *rect, cell, i == view.focused);
@@ -324,7 +450,7 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
     // cell's title (like a regular Monocle tab's stacked-pane strip) to reveal
     // the panes the user can page to. Drawn LAST so it always wins the reserved
     // row even if the cell geometry above ever regressed.
-    if let Some(strip) = monocle_strip_rect(&view.layout, area) {
+    if let Some(strip) = monocle_strip_rect(view, area) {
         draw_monocle_strip(&mut buf, area, strip, view);
     }
     buf
@@ -343,7 +469,7 @@ pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
     // Monocle title strip: a click on a strip entry focuses that cell. The strip
     // (row `strip.y`) and the focused cell rect (below it) never overlap, so
     // checking it first is unambiguous.
-    if let Some(strip) = monocle_strip_rect(&view.layout, area) {
+    if let Some(strip) = monocle_strip_rect(view, area) {
         if y == strip.y && x >= strip.x && x < strip.x + strip.width {
             let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
             let rel = (x - strip.x) as usize;
@@ -355,7 +481,7 @@ pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
             }
         }
     }
-    let rects = cell_rects(&view.layout, view.focused, view.cells.len(), area);
+    let rects = cell_rects(view, area);
     rects.iter().position(|r| match r {
         Some(rect) => {
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
@@ -384,7 +510,7 @@ pub fn focused_cursor(view: &ClientView, area: Rect) -> Option<(u16, u16)> {
     if !snap.cursor_visible {
         return None;
     }
-    let rects = cell_rects(&view.layout, view.focused, n, area);
+    let rects = cell_rects(view, area);
     let rect = rects.get(view.focused).copied().flatten()?;
     // Rect and interior, in buffer-local coordinates (area origin subtracted),
     // matching draw_cell.
@@ -534,30 +660,44 @@ fn cell_title(cell: &ViewCell) -> String {
     cell.title.clone().unwrap_or_else(|| "waiting…".to_string())
 }
 
-/// Lay out the Monocle title strip's tab entries within `width` columns.
+/// Background block behind an inactive Monocle-strip tab, mirroring the regular
+/// stacked-pane strip's inactive-tab background (`CellColor::Indexed(237)` in
+/// [`build_top_border_content`](crate::server::compositor)).
+const STRIP_INACTIVE_BG: CellColor = CellColor::Indexed(237);
+
+/// Fixed per-tab width for the Monocle strip: the longest title plus one padding
+/// column on each side (as the regular strip does: `max_name_len + 2`), capped
+/// to the strip width. `0` when there are no titles.
+fn strip_tab_width(titles: &[String], width: usize) -> usize {
+    let max_name = titles.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+    (max_name + 2).min(width)
+}
+
+/// Lay out the Monocle title strip's tab entries within `width` columns,
+/// mirroring the regular stacked-pane strip: a leading space, then equal-width
+/// tabs (`strip_tab_width`) separated by a 3-column `" | "` separator.
 /// Returns `(cell_index, start, end)` column offsets (relative to the strip's
-/// left edge, `end` exclusive) for every entry that is at least partially
-/// visible; entries past the right edge are dropped and the last visible one is
-/// clipped. Each entry renders as ` {title} ` with a single separator column
-/// between entries. Shared by [`draw_monocle_strip`] (rendering) and
-/// [`cell_at`] (hit-testing) so a click always lands on the entry drawn there.
+/// left edge, `end` exclusive) for every entry at least partially visible;
+/// entries past the right edge are dropped and the last visible one is clipped.
+/// Shared by [`draw_monocle_strip`] (rendering) and [`cell_at`] (hit-testing) so
+/// a click always lands on the tab drawn there.
 fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)> {
     let mut segs = Vec::new();
-    let mut x = 0usize;
-    for (i, title) in titles.iter().enumerate() {
+    let tab_width = strip_tab_width(titles, width);
+    if tab_width == 0 {
+        return segs;
+    }
+    let mut x = 1usize; // leading space before the first tab
+    for i in 0..titles.len() {
         if i > 0 {
-            // Separator column between entries.
-            if x >= width {
-                break;
-            }
-            x += 1;
+            // 3-column " | " separator between tabs.
+            x += 3;
         }
         if x >= width {
             break;
         }
-        let label_len = title.chars().count() + 2; // one padding space each side
         let start = x;
-        let end = (x + label_len).min(width);
+        let end = (x + tab_width).min(width);
         segs.push((i, start, end));
         x = end;
     }
@@ -565,10 +705,13 @@ fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)>
 }
 
 /// Draw the Monocle title strip on `strip` (the reserved top row of the cell
-/// area): a tab-like list of EVERY cell's title, with the focused cell's entry
-/// highlighted in the focused-border style so it matches the rest of the UI.
-/// Theme-free by design (like the rest of [`composite`]); only reuses the
-/// `FOCUSED_BORDER`/`UNFOCUSED_BORDER` colors the cell borders already use.
+/// area): a tab-like list of EVERY cell's title, styled to match a regular
+/// Monocle tab's stacked-pane strip (equal-width centered tabs, `" | "`
+/// separators with an ASCII pipe, inactive tabs on a grey background block, the
+/// focused tab highlighted + bold). Theme-free like the rest of [`composite`]:
+/// the active/inactive treatment reuses the `FOCUSED_BORDER`/`UNFOCUSED_BORDER`
+/// colors plus [`STRIP_INACTIVE_BG`], rather than threading a compositor theme
+/// through the pure geometry code.
 fn draw_monocle_strip(buf: &mut [Vec<RenderCell>], area: Rect, strip: Rect, view: &ClientView) {
     let by = (strip.y as usize).saturating_sub(area.y as usize);
     let bx = (strip.x as usize).saturating_sub(area.x as usize);
@@ -577,19 +720,55 @@ fn draw_monocle_strip(buf: &mut [Vec<RenderCell>], area: Rect, strip: Rect, view
         return;
     }
     let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+    let tab_width = strip_tab_width(&titles, width);
     let segs = strip_segments(&titles, width);
     for (idx, start, end) in segs {
         let focused = idx == view.focused;
-        // Separator before every entry but the first.
-        if start > 0 {
-            put(buf, by, bx + start - 1, border_cell('\u{2502}', false));
+        // The " | " separator sits in the three columns before this tab (only
+        // for tabs after the first). The pipe uses the unfocused border color;
+        // the flanking spaces carry no background block.
+        if idx > 0 && start >= 3 {
+            put(buf, by, bx + start - 3, border_cell(' ', false));
+            put(buf, by, bx + start - 2, border_cell('|', false));
+            put(buf, by, bx + start - 1, border_cell(' ', false));
         }
-        let label = format!(" {} ", titles[idx]);
+        // Center the (possibly clipped) title within the fixed tab width, like
+        // the regular strip.
+        let name = &titles[idx];
+        let name_len = name.chars().count().min(tab_width);
+        let pad_total = tab_width.saturating_sub(name_len);
+        let pad_left = pad_total / 2;
+        let (fg, bg, bold) = if focused {
+            (FOCUSED_BORDER, CellColor::Default, true)
+        } else {
+            (UNFOCUSED_BORDER, STRIP_INACTIVE_BG, false)
+        };
+        let mut label = String::with_capacity(tab_width);
+        for _ in 0..pad_left {
+            label.push(' ');
+        }
+        for ch in name.chars().take(name_len) {
+            label.push(ch);
+        }
+        while label.chars().count() < tab_width {
+            label.push(' ');
+        }
         for (i, ch) in label.chars().enumerate() {
             if start + i >= end {
                 break;
             }
-            put(buf, by, bx + start + i, border_cell(ch, focused));
+            put(
+                buf,
+                by,
+                bx + start + i,
+                RenderCell {
+                    c: ch,
+                    fg: fg.clone(),
+                    bg: bg.clone(),
+                    bold,
+                    ..RenderCell::default()
+                },
+            );
         }
     }
 }
@@ -761,7 +940,9 @@ pub fn draw_status_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::layout::MonocleLayout;
+    use crate::server::layout::{
+        all_pane_ids, find_neighbor, relocate_pane_to_edge, Direction, MonocleLayout,
+    };
 
     fn area(w: u16, h: u16) -> Rect {
         Rect {
@@ -798,13 +979,244 @@ mod tests {
     }
 
     fn cell_with(pane_id: PaneId, snapshot: Option<PaneSnapshot>) -> ViewCell {
+        // In tests the stable id mirrors the pane id (tests use distinct pane
+        // ids), so tree keys stay unique.
         ViewCell {
+            id: pane_id,
             conn: ConnId::Local,
             pane_id,
             snapshot,
             disconnected: false,
             title: None,
         }
+    }
+
+    /// Build a `ClientView` directly from a list of cells (test-only). Cells keep
+    /// their own `id`s (see `cell_with`), so `custom_tree` stays `None` and rects
+    /// come from the automatic layout.
+    fn view_of(cells: Vec<ViewCell>, layout: LayoutMode, focused: usize) -> ClientView {
+        ClientView {
+            name: "v".into(),
+            cells,
+            layout,
+            focused,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
+        }
+    }
+
+    /// A view of `n` fresh cells (pane ids `1..=n`) in `layout`, focused on
+    /// `focused`. Used by the geometry tests that previously called `cell_rects`
+    /// with a bare `(layout, focused, n)`.
+    fn view_n(n: usize, layout: LayoutMode, focused: usize) -> ClientView {
+        let cells: Vec<ViewCell> = (1..=n as PaneId).map(|id| cell_with(id, None)).collect();
+        view_of(cells, layout, focused)
+    }
+
+    // -- Prerequisite refactor: stable ids, custom_tree, layout_name ---------
+
+    #[test]
+    fn layout_name_is_custom_while_tree_present() {
+        let mut v = view_n(2, gridv(), 0);
+        assert_eq!(v.layout_name(), "grid");
+        v.custom_tree = Some(v.auto_tree());
+        assert_eq!(v.layout_name(), "custom");
+    }
+
+    #[test]
+    fn cell_rects_maps_ids_after_index_shift() {
+        // Stable ids mean a custom tree survives removing an earlier cell: the
+        // remaining cells still resolve to rects by id, not by array position.
+        let mut v = view_n(3, gridv(), 0);
+        v.custom_tree = Some(v.auto_tree());
+        let removed = v.cells.remove(0).id; // array indices now shift
+        v.prune_from_tree(removed);
+        v.clamp_focus();
+        let rects = cell_rects(&v, area(120, 40));
+        assert_eq!(rects.len(), 2);
+        assert!(rects.iter().all(|r| r.is_some()), "both cells still placed");
+    }
+
+    // -- #3 Resize (custom_tree divider) -------------------------------------
+
+    #[test]
+    fn custom_tree_resize_moves_divider_and_flags_custom() {
+        // 2-cell grid => vertical split, focused cell (id 1) is the first child.
+        let mut v = view_n(2, gridv(), 0);
+        let a = area(120, 40);
+        let before = cell_rects(&v, a)[0].unwrap().width;
+        // Seed a custom tree and apply the server's ResizeRight convention:
+        // Vertical axis, +delta grows the focused (first) child.
+        v.custom_tree = Some(v.auto_tree());
+        let fid = v.focused_id();
+        let changed = v
+            .custom_tree
+            .as_mut()
+            .unwrap()
+            .resize(fid, Direction::Vertical, 0.1);
+        assert!(changed, "a grid split must be resizable");
+        let after = cell_rects(&v, a)[0].unwrap().width;
+        assert!(after > before, "divider moved right: {before} -> {after}");
+        assert_eq!(v.layout_name(), "custom");
+    }
+
+    #[test]
+    fn monocle_view_has_no_resizable_split() {
+        // A Monocle view is a single stack: seeding a tree and resizing changes
+        // nothing (so handle_view_command reverts the seed and stays automatic).
+        let mut v = view_n(3, monoclev(), 1);
+        v.custom_tree = Some(v.auto_tree());
+        let fid = v.focused_id();
+        let changed = v
+            .custom_tree
+            .as_mut()
+            .unwrap()
+            .resize(fid, Direction::Vertical, 0.1);
+        assert!(!changed, "monocle stack has no split to resize");
+    }
+
+    // -- #4 Move (swap / relocate) -------------------------------------------
+
+    #[test]
+    fn custom_tree_relocate_flips_divider_down() {
+        // 2 cells left/right; PaneMoveDown on the focused cell (no Down neighbor)
+        // relocates it to the bottom edge, flipping the split vertical->horizontal.
+        let mut v = view_n(2, gridv(), 0);
+        v.custom_tree = Some(v.auto_tree());
+        let fid = v.focused_id();
+        let inner = cells_area(area(120, 40));
+        assert!(
+            find_neighbor(
+                v.custom_tree.as_ref().unwrap(),
+                inner,
+                fid,
+                FocusDirection::Down,
+                0
+            )
+            .is_none(),
+            "a left/right split has no Down neighbor"
+        );
+        let nt = relocate_pane_to_edge(v.custom_tree.as_ref().unwrap(), fid, FocusDirection::Down)
+            .unwrap();
+        v.custom_tree = Some(nt);
+        let rects = cell_rects(&v, area(120, 40));
+        let (r0, r1) = (rects[0].unwrap(), rects[1].unwrap());
+        assert!(r0.y > r1.y, "focused cell (index 0) moved to the bottom");
+        assert_eq!(r0.x, r1.x, "now a top/bottom split, same column");
+    }
+
+    #[test]
+    fn custom_tree_move_swaps_with_neighbor() {
+        // 2 cells left/right; PaneMoveRight on the left (focused) cell swaps it
+        // with its right neighbor -> the cells trade rectangles.
+        let mut v = view_n(2, gridv(), 0);
+        v.custom_tree = Some(v.auto_tree());
+        let fid = v.focused_id();
+        let inner = cells_area(area(120, 40));
+        let neighbor = find_neighbor(
+            v.custom_tree.as_ref().unwrap(),
+            inner,
+            fid,
+            FocusDirection::Right,
+            0,
+        )
+        .expect("right neighbor exists");
+        assert!(crate::server::layout::swap_panes(
+            v.custom_tree.as_mut().unwrap(),
+            fid,
+            neighbor
+        ));
+        let rects = cell_rects(&v, area(120, 40));
+        // Focused cell (index 0, id `fid`) is now on the RIGHT.
+        assert!(rects[0].unwrap().x > rects[1].unwrap().x);
+    }
+
+    // -- #2 Zoom -------------------------------------------------------------
+
+    #[test]
+    fn zoom_shows_only_focused_full_cell_area() {
+        let mut v = view_n(3, gridv(), 1);
+        v.zoomed = true;
+        let a = area(80, 24);
+        let rects = cell_rects(&v, a);
+        assert_eq!(rects[1], Some(cells_area(a)), "focused fills the cell area");
+        assert!(rects[0].is_none() && rects[2].is_none(), "others hidden");
+        // Only the focused snapshot is composited.
+        let mut v2 = view_n(2, gridv(), 0);
+        v2.cells[0].snapshot = Some(snap_filled(40, 10, 'A'));
+        v2.cells[1].snapshot = Some(snap_filled(40, 10, 'B'));
+        v2.zoomed = true;
+        let buf = composite(&v2, a);
+        let joined: String = buf.iter().flat_map(|r| r.iter().map(|c| c.c)).collect();
+        assert!(joined.contains('A') && !joined.contains('B'));
+    }
+
+    #[test]
+    fn zoom_suppresses_monocle_strip() {
+        let mut v = view_n(3, monoclev(), 1);
+        v.zoomed = true;
+        assert!(monocle_strip_rect(&v, area(80, 24)).is_none());
+    }
+
+    // -- add_cell / prune tree maintenance -----------------------------------
+
+    #[test]
+    fn add_cell_splices_into_custom_tree() {
+        let mut v = view_n(2, gridv(), 0);
+        v.custom_tree = Some(v.auto_tree());
+        let before = all_pane_ids(v.custom_tree.as_ref().unwrap()).len();
+        let id = v.add_cell(ConnId::Local, 99);
+        let ids = all_pane_ids(v.custom_tree.as_ref().unwrap());
+        assert_eq!(ids.len(), before + 1);
+        assert!(ids.contains(&id), "new cell id spliced into the tree");
+        let rects = cell_rects(&v, area(120, 40));
+        assert!(rects.iter().all(|r| r.is_some()), "all cells placed");
+    }
+
+    #[test]
+    fn prune_from_tree_removes_then_clears() {
+        let mut v = view_n(2, gridv(), 0);
+        v.custom_tree = Some(v.auto_tree());
+        let (id0, id1) = (v.cells[0].id, v.cells[1].id);
+        v.prune_from_tree(id0);
+        let ids = all_pane_ids(v.custom_tree.as_ref().unwrap());
+        assert!(!ids.contains(&id0) && ids.contains(&id1));
+        v.prune_from_tree(id1);
+        assert!(v.custom_tree.is_none(), "emptied tree clears to automatic");
+    }
+
+    // -- #1 Monocle strip matches the regular stacked-pane strip -------------
+
+    #[test]
+    fn monocle_strip_uses_ascii_pipe_separator() {
+        let mut cells: Vec<ViewCell> = (0..2).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("aa".into());
+        cells[1].title = Some("bb".into());
+        let view = view_of(cells, monoclev(), 0);
+        let buf = composite(&view, area(80, 24));
+        let row0: String = buf[0].iter().map(|c| c.c).collect();
+        // The regular strip separates tabs with an ASCII " | " (space pipe space),
+        // NOT the box-drawing vertical bar the old view strip used.
+        assert!(row0.contains(" | "), "ascii pipe separator: {row0:?}");
+        assert!(
+            !row0.contains('\u{2502}'),
+            "strip must not use box-drawing '│': {row0:?}"
+        );
+    }
+
+    #[test]
+    fn monocle_strip_inactive_tab_has_background_block() {
+        // Mirrors the regular strip's inactive-tab grey background (Indexed 237).
+        let mut cells: Vec<ViewCell> = (0..2).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("aa".into());
+        cells[1].title = Some("bb".into());
+        let view = view_of(cells, monoclev(), 0); // cell 0 focused/active
+        let buf = composite(&view, area(80, 24));
+        let row0 = &buf[0];
+        let bpos = row0.iter().position(|c| c.c == 'b').unwrap();
+        assert_eq!(row0[bpos].bg, STRIP_INACTIVE_BG);
+        assert_eq!(row0[bpos].fg, UNFOCUSED_BORDER);
     }
 
     #[test]
@@ -818,8 +1230,8 @@ mod tests {
     #[test]
     fn cell_rects_returns_n_entries() {
         for n in 0..=5 {
-            assert_eq!(cell_rects(&gridv(), 0, n, area(80, 24)).len(), n);
-            assert_eq!(cell_rects(&monoclev(), 0, n, area(80, 24)).len(), n);
+            assert_eq!(cell_rects(&view_n(n, gridv(), 0), area(80, 24)).len(), n);
+            assert_eq!(cell_rects(&view_n(n, monoclev(), 0), area(80, 24)).len(), n);
         }
     }
 
@@ -828,7 +1240,7 @@ mod tests {
         let a = area(80, 24);
         let inner = cells_area(a);
         for n in 1..=5 {
-            for r in cell_rects(&gridv(), 0, n, a).into_iter().flatten() {
+            for r in cell_rects(&view_n(n, gridv(), 0), a).into_iter().flatten() {
                 assert!(r.x >= inner.x && r.y >= inner.y);
                 assert!(r.x + r.width <= inner.x + inner.width);
                 assert!(r.y + r.height <= inner.y + inner.height);
@@ -845,7 +1257,7 @@ mod tests {
         let inner = cells_area(a);
         for n in 1..=5 {
             let mut cover = vec![vec![0u8; inner.width as usize]; inner.height as usize];
-            for r in cell_rects(&gridv(), 0, n, a).into_iter().flatten() {
+            for r in cell_rects(&view_n(n, gridv(), 0), a).into_iter().flatten() {
                 for y in r.y..r.y + r.height {
                     for x in r.x..r.x + r.width {
                         cover[y as usize][x as usize] += 1;
@@ -863,11 +1275,12 @@ mod tests {
     #[test]
     fn monocle_only_focused_has_rect() {
         let a = area(80, 24);
-        let rects = cell_rects(&monoclev(), 2, 4, a);
+        let v = view_n(4, monoclev(), 2);
+        let rects = cell_rects(&v, a);
         assert_eq!(rects.len(), 4);
         // Only the focused cell (index 2) is placed; it fills the cell area
         // BELOW the reserved title strip (top row), never on the strip row.
-        let strip = monocle_strip_rect(&monoclev(), a).unwrap();
+        let strip = monocle_strip_rect(&v, a).unwrap();
         let below = Rect {
             y: strip.y + strip.height,
             height: cells_area(a).height - strip.height,
@@ -884,22 +1297,25 @@ mod tests {
 
     #[test]
     fn monocle_strip_rect_reserves_top_row() {
+        let mv = view_n(1, monoclev(), 0);
+        let gv = view_n(1, gridv(), 0);
         // Monocle: a 1-row strip at the top of the cell area.
-        assert_eq!(
-            monocle_strip_rect(&monoclev(), area(80, 24)),
-            Some(area(80, 1))
-        );
+        assert_eq!(monocle_strip_rect(&mv, area(80, 24)), Some(area(80, 1)));
         // Non-Monocle layouts have no strip.
-        assert_eq!(monocle_strip_rect(&gridv(), area(80, 24)), None);
+        assert_eq!(monocle_strip_rect(&gv, area(80, 24)), None);
         // Height 3: cell area is 2 rows -> strip (1) + a cell row (1).
-        assert_eq!(
-            monocle_strip_rect(&monoclev(), area(80, 3)),
-            Some(area(80, 1))
-        );
+        assert_eq!(monocle_strip_rect(&mv, area(80, 3)), Some(area(80, 1)));
         // No room (cell area height < 2) -> no strip, so a cell can still show.
-        assert_eq!(monocle_strip_rect(&monoclev(), area(80, 2)), None);
-        assert_eq!(monocle_strip_rect(&monoclev(), area(80, 1)), None);
-        assert_eq!(monocle_strip_rect(&monoclev(), area(80, 0)), None);
+        assert_eq!(monocle_strip_rect(&mv, area(80, 2)), None);
+        assert_eq!(monocle_strip_rect(&mv, area(80, 1)), None);
+        assert_eq!(monocle_strip_rect(&mv, area(80, 0)), None);
+        // Zoom and custom_tree both suppress the strip even in Monocle.
+        let mut zoomed = view_n(2, monoclev(), 0);
+        zoomed.zoomed = true;
+        assert_eq!(monocle_strip_rect(&zoomed, area(80, 24)), None);
+        let mut custom = view_n(2, monoclev(), 0);
+        custom.custom_tree = Some(custom.auto_tree());
+        assert_eq!(monocle_strip_rect(&custom, area(80, 24)), None);
     }
 
     #[test]
@@ -913,6 +1329,9 @@ mod tests {
             cells,
             layout: monoclev(),
             focused: 1,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
@@ -957,6 +1376,9 @@ mod tests {
             cells: vec![waiting, disconnected],
             layout: monoclev(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
@@ -985,6 +1407,9 @@ mod tests {
             ],
             layout: monoclev(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
@@ -1008,12 +1433,15 @@ mod tests {
             cells,
             layout: monoclev(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         // Locate beta's entry on the strip via the same segment layout used to
         // draw it, then hit-test its middle column.
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let strip = monocle_strip_rect(&monoclev(), a).unwrap();
+        let strip = monocle_strip_rect(&view, a).unwrap();
         let segs = strip_segments(&titles, strip.width as usize);
         let (_, s, e) = segs.iter().copied().find(|(i, _, _)| *i == 1).unwrap();
         let mid = strip.x + ((s + e) / 2) as u16;
@@ -1035,6 +1463,9 @@ mod tests {
             ],
             layout: monoclev(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 2), (10, 3), (0, 0)] {
             let buf = composite(&view, area(w, h));
@@ -1048,7 +1479,7 @@ mod tests {
         // The n=2 Grid case must remain a left/right split (the PTY harnesses
         // rely on it): cell 0 on the left half, cell 1 on the right half.
         let a = area(120, 40);
-        let rects = cell_rects(&gridv(), 0, 2, a);
+        let rects = cell_rects(&view_n(2, gridv(), 0), a);
         let r0 = rects[0].expect("cell 0 placed");
         let r1 = rects[1].expect("cell 1 placed");
         assert_eq!(r0.x, 0);
@@ -1069,10 +1500,13 @@ mod tests {
             ],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
-        let rects = cell_rects(&gridv(), 0, 2, a);
+        let rects = cell_rects(&view, a);
 
         // Interior center of cell 0 must be 'A', cell 1 must be 'B'.
         for (rect, marker) in [(rects[0].unwrap(), 'A'), (rects[1].unwrap(), 'B')] {
@@ -1092,10 +1526,13 @@ mod tests {
             ],
             layout: gridv(),
             focused: 1,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
-        let rects = cell_rects(&gridv(), 1, 2, a);
+        let rects = cell_rects(&view, a);
 
         // Focused cell (index 1) top-left corner is bold + focused color.
         let f = rects[1].unwrap();
@@ -1148,6 +1585,9 @@ mod tests {
             cells: vec![cell_with(1, Some(snap))],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
@@ -1174,6 +1614,9 @@ mod tests {
             cells: vec![cell_with(1, Some(snap))],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a);
@@ -1188,6 +1631,9 @@ mod tests {
             cells: vec![cell_with(42, None)],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let buf = composite(&view, area(80, 24));
         // A cell with no snapshot yet shows a `waiting…` placeholder.
@@ -1204,6 +1650,9 @@ mod tests {
             cells: vec![cell],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let buf = composite(&view, area(80, 24));
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
@@ -1222,6 +1671,9 @@ mod tests {
             ],
             layout: monoclev(),
             focused: 1,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let buf = composite(&view, area(80, 24));
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
@@ -1240,9 +1692,12 @@ mod tests {
             cells: vec![cell_with(1, None), cell_with(2, None)],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let rects = cell_rects(&gridv(), 0, 2, a);
+        let rects = cell_rects(&view, a);
         // A point inside each rect resolves to that index.
         for (i, r) in rects.iter().enumerate() {
             let r = r.unwrap();
@@ -1264,6 +1719,9 @@ mod tests {
             cells: vec![cell_with(1, None), cell_with(2, None)],
             layout: monoclev(),
             focused: 1,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         assert_eq!(cell_at(&view, area(80, 24), 5, 5), Some(1));
     }
@@ -1279,11 +1737,14 @@ mod tests {
             cells: vec![cell_with(1, Some(snap.clone())), cell_with(2, Some(snap))],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         let a = area(80, 24);
         // Focused cell 0: interior origin (ix=1, iy=1); snapshot (10 rows) fits in
         // the interior so start=0 -> cursor row = iy + 9, col = ix + 3.
-        let rects = cell_rects(&gridv(), 0, 2, a);
+        let rects = cell_rects(&view, a);
         let f = rects[0].unwrap();
         let got = focused_cursor(&view, a).expect("cursor shown");
         assert_eq!(got, (f.x + 1 + 3, f.y + 1 + 9));
@@ -1296,6 +1757,9 @@ mod tests {
             cells: vec![cell_with(1, Some(hidden))],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         assert_eq!(focused_cursor(&view2, a), None);
 
@@ -1310,6 +1774,9 @@ mod tests {
             cells: vec![cell],
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         assert_eq!(focused_cursor(&view3, a), None);
     }
@@ -1337,6 +1804,9 @@ mod tests {
             cells: (1..=4).map(|id| cell_with(id, None)).collect(),
             layout: gridv(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         assert!(view.move_focus(FocusDirection::Right));
         assert_eq!(view.focused, 1);
@@ -1360,6 +1830,9 @@ mod tests {
             cells: (1..=3).map(|id| cell_with(id, None)).collect(),
             layout: monoclev(),
             focused: 0,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         assert!(view.move_focus(FocusDirection::Right));
         assert_eq!(view.focused, 1);
@@ -1384,6 +1857,9 @@ mod tests {
             cells: (1..=3).map(|id| cell_with(id, None)).collect(),
             layout: gridv(),
             focused: 2,
+            custom_tree: None,
+            zoomed: false,
+            next_cell_id: 1000,
         };
         view.cells.pop();
         view.clamp_focus();
@@ -1407,6 +1883,9 @@ mod tests {
                 cells: vec![],
                 layout,
                 focused: 0,
+                custom_tree: None,
+                zoomed: false,
+                next_cell_id: 1000,
             };
             let a = area(80, 24);
             let buf = composite(&view, a);
