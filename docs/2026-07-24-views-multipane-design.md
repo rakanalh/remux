@@ -106,3 +106,36 @@ input-by-identity are independently useful.
 
 ## Guardrail
 Per user: build without committing until the user has tested and decided to keep it.
+
+---
+
+## CORRECTED UX (2026-07-27) — supersedes the command/nav sections above
+
+Real-world testing showed the first cut missed the point: `w a` added the
+*currently focused* pane (and did nothing sensible from inside a view), the
+"pick existing panes" flow was never built, and there was NO way to re-enter
+a view. Corrected, user-approved model:
+
+### Views are first-class switch targets, folded into the session switcher
+- The existing quick-switch popup (`SessionSwitchOverlay`) gains a **"Views"
+  section** listing every named view alongside sessions. One "jump anywhere"
+  surface. Selecting a view **activates/enters** it; selecting a session
+  switches to it. This is the ONLY re-entry mechanism (no separate `w w`).
+- Entering a view from the switcher must first `leave_active_view` (if one is
+  active) / detach the current session, then activate: set `active_view`,
+  subscribe cells, paint. Leaving a view = pick a session in the switcher, or
+  `w q` to exit to the last session.
+
+### Populate a view by SELECTING EXISTING panes in the session manager
+- Primary flow: in the session manager tree (server → session → tab → pane),
+  **multi-select** one or more existing panes (mark with Space), then a `va`
+  chord → view-picker (choose target view or "New view") → the selected
+  existing panes are aliased into that view as cells.
+- `w a` (add currently-focused real pane) stays only as a secondary shortcut,
+  meaningful when working in a real session (not inside a view).
+
+### Unchanged
+- `w n <name>` create named view; inside a view `Alt+hjkl` move between cells,
+  type into focused cell (read/write), `w x` remove cell, `w space` layout,
+  `w q` leave to last session. Grid default. Model A sizing / Model B still
+  pending.
