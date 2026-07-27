@@ -798,6 +798,27 @@ async fn unsubscribe_view_cells(
     Ok(())
 }
 
+/// Tear down the active view (if any) before switching the foreground
+/// session/server. A live view's `paint_view` overrides the screen and masks
+/// the switched-to session, so every switch entry point must leave the view
+/// first: unsubscribe its cells and clear `active_view`. A no-op when no view is
+/// active.
+///
+/// Unlike the `ViewClose` handler, this deliberately does NOT resize/re-render:
+/// the switch that follows sends its own `Resize` (via `switch_to_server`) or
+/// `Attach`, and the resulting server `FullRender` repaints the screen.
+async fn leave_active_view(
+    mgr: &mut ConnectionManager,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+) -> Result<()> {
+    if let Some(av) = *active_view {
+        unsubscribe_view_cells(mgr, &views[av]).await?;
+        *active_view = None;
+    }
+    Ok(())
+}
+
 /// The inner client event loop.
 async fn run_client_loop(
     mgr: &mut ConnectionManager,
@@ -1744,6 +1765,9 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
+                                        // A live view masks the switched-to session:
+                                        // tear it down before handing off the screen.
+                                        leave_active_view(mgr, &views, &mut active_view).await?;
                                         switch_to_server(mgr, &server, c, r).await?;
                                         mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                         mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -1758,6 +1782,9 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
+                                        // A live view masks the switched-to session:
+                                        // tear it down before handing off the screen.
+                                        leave_active_view(mgr, &views, &mut active_view).await?;
                                         switch_to_server(mgr, &server, c, r).await?;
                                         // The server's handle_command ignores commands from a
                                         // client with no attached session, so a remote tab switch
@@ -1779,6 +1806,9 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
+                                        // A live view masks the switched-to session:
+                                        // tear it down before handing off the screen.
+                                        leave_active_view(mgr, &views, &mut active_view).await?;
                                         switch_to_server(mgr, &server, c, r).await?;
                                         // The server's handle_command ignores commands from a
                                         // client with no attached session, so a remote pane switch
@@ -1991,6 +2021,9 @@ async fn run_client_loop(
                                 // already foreground) and attach. Re-attaching to
                                 // the current session is harmless. Mirrors the
                                 // session-manager SwitchSession path.
+                                // A live view masks the switched-to session: tear it
+                                // down first so the switch actually shows.
+                                leave_active_view(mgr, &views, &mut active_view).await?;
                                 switch_to_server(mgr, &server, c, r).await?;
                                 mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                 mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -2015,6 +2048,9 @@ async fn run_client_loop(
                                 renderer.flush()?;
                                 if let Some((server, session)) = previous_attached.clone() {
                                     // Mirror the SessionSwitchConfirm path.
+                                    // A live view masks the switched-to session: tear
+                                    // it down before handing off the screen.
+                                    leave_active_view(mgr, &views, &mut active_view).await?;
                                     switch_to_server(mgr, &server, c, r).await?;
                                     mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                     mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;

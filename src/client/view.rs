@@ -687,4 +687,32 @@ mod tests {
         view.clamp_focus();
         assert_eq!(view.focused, 0);
     }
+
+    #[test]
+    fn composite_empty_view_returns_blank_full_buffer() {
+        // A view with zero cells (e.g. a freshly-created `w n` view) must
+        // composite to a full-size blank buffer without panicking. This is the
+        // invariant that lets an overlay (session manager, view picker) render
+        // on top of an empty view: `paint_view` blits this buffer, then lays
+        // the overlay over it. Both Grid and Monocle must hold.
+        for layout in [ViewLayout::Grid, ViewLayout::Monocle] {
+            let view = ClientView {
+                name: "empty".into(),
+                cells: vec![],
+                layout,
+                focused: 0,
+            };
+            let a = area(80, 24);
+            let buf = composite(&view, a);
+            assert_eq!(buf.len(), a.height as usize, "row count for {layout:?}");
+            assert!(
+                buf.iter().all(|row| row.len() == a.width as usize),
+                "col count for {layout:?}"
+            );
+            assert!(
+                buf.iter().flatten().all(|c| *c == RenderCell::default()),
+                "every cell blank for {layout:?}"
+            );
+        }
+    }
 }

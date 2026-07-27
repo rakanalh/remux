@@ -1757,7 +1757,7 @@ async fn handle_command(
                 if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
                     tab.saved_custom_layout = Some(tab.layout.clone());
                 }
-                // Monocle (the last automatic before wrap) returns to Custom only
+                // Grid (the last automatic before wrap) returns to Custom only
                 // when the saved tree is still restorable (its pane set matches
                 // the live panes); otherwise the cycle stays automatic.
                 let restorable =
@@ -3029,14 +3029,15 @@ async fn handle_mouse_click(
 
 /// Pure decision for the layout cycle's next mode, factored out for testing.
 ///
-/// The automatic cycle is `Bsp -> Master -> Monocle -> Bsp`. Two custom-aware
-/// detours ride on top: leaving `Custom` starts the automatic cycle at `Bsp`,
-/// and reaching `Monocle` (the last automatic before wrap) returns to `Custom`
-/// when a restorable custom layout was remembered (`has_saved_custom`).
+/// The automatic cycle is `Bsp -> Master -> Monocle -> Grid -> Bsp`. Two
+/// custom-aware detours ride on top: leaving `Custom` starts the automatic
+/// cycle at `Bsp`, and reaching `Grid` (the last automatic before wrap) returns
+/// to `Custom` when a restorable custom layout was remembered
+/// (`has_saved_custom`).
 fn next_layout_mode(current: &LayoutMode, has_saved_custom: bool) -> LayoutMode {
     match current {
         LayoutMode::Custom(_) => LayoutMode::Bsp(BspLayout),
-        LayoutMode::Monocle(_) if has_saved_custom => LayoutMode::Custom(CustomLayout),
+        LayoutMode::Grid(_) if has_saved_custom => LayoutMode::Custom(CustomLayout),
         other => other.next(),
     }
 }
@@ -5095,7 +5096,7 @@ mod tests {
     };
     use crate::protocol::RenderCell;
     use crate::server::layout::{
-        BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, MonocleLayout,
+        BspLayout, CustomLayout, GridLayout, LayoutMode, LayoutNode, MasterLayout, MonocleLayout,
     };
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
@@ -5308,7 +5309,7 @@ mod tests {
 
     #[test]
     fn next_layout_mode_automatic_cycle() {
-        // Bsp -> Master -> Monocle regardless of the saved-custom flag.
+        // Bsp -> Master -> Monocle -> Grid regardless of the saved-custom flag.
         assert!(matches!(
             next_layout_mode(&LayoutMode::Bsp(BspLayout), false),
             LayoutMode::Master(_)
@@ -5316,6 +5317,15 @@ mod tests {
         assert!(matches!(
             next_layout_mode(&LayoutMode::Master(MasterLayout::default()), false),
             LayoutMode::Monocle(_)
+        ));
+        // Monocle now always advances to Grid, even with a saved custom layout.
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), false),
+            LayoutMode::Grid(_)
+        ));
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), true),
+            LayoutMode::Grid(_)
         ));
     }
 
@@ -5328,15 +5338,16 @@ mod tests {
     }
 
     #[test]
-    fn next_layout_mode_monocle_returns_to_custom_only_when_saved() {
-        // With a restorable saved custom layout, Monocle wraps back to Custom.
+    fn next_layout_mode_grid_returns_to_custom_only_when_saved() {
+        // Grid is the last automatic before wrap. With a restorable saved custom
+        // layout, it wraps back to Custom.
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), true),
+            next_layout_mode(&LayoutMode::Grid(GridLayout), true),
             LayoutMode::Custom(_)
         ));
-        // Without one, Monocle wraps to Bsp as usual.
+        // Without one, Grid wraps to Bsp as usual.
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), false),
+            next_layout_mode(&LayoutMode::Grid(GridLayout), false),
             LayoutMode::Bsp(_)
         ));
     }
