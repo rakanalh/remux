@@ -212,6 +212,23 @@ pub fn cells_area(area: Rect) -> Rect {
     }
 }
 
+/// The 1-row strip at the TOP of the cell area reserved, in `Monocle` only, for
+/// a tab-like list of every cell's title (mirroring a regular Monocle tab's
+/// stacked-pane strip). Returns that rect, or `None` for non-Monocle layouts and
+/// for a cell area too short to host both the strip and a cell below it
+/// (`cells_area().height < 2`). The focused cell renders BELOW this strip; see
+/// [`cell_rects`], which subtracts it so the focused cell never overwrites it.
+pub fn monocle_strip_rect(layout: &LayoutMode, area: Rect) -> Option<Rect> {
+    if !matches!(layout, LayoutMode::Monocle(_)) {
+        return None;
+    }
+    let inner = cells_area(area);
+    if inner.height < 2 {
+        return None;
+    }
+    Some(Rect { height: 1, ..inner })
+}
+
 /// Compute the outer rectangle for each of `n` cells within `area` (minus the
 /// reserved status row), using the automatic layout engine.
 ///
@@ -226,7 +243,13 @@ pub fn cell_rects(layout: &LayoutMode, focused: usize, n: usize, area: Rect) -> 
     if n == 0 {
         return Vec::new();
     }
-    let inner = cells_area(area);
+    let mut inner = cells_area(area);
+    // Monocle reserves the top row of the cell area for the title strip, so the
+    // focused cell tiles the region BELOW it (never overwriting the strip).
+    if let Some(strip) = monocle_strip_rect(layout, area) {
+        inner.y = inner.y.saturating_add(strip.height);
+        inner.height = inner.height.saturating_sub(strip.height);
+    }
     let ids: Vec<PaneId> = (0..n).map(|i| i as PaneId).collect();
     let tree = layout.build_tree(&ids, focused as PaneId);
     let placed = compute_layout(&tree, inner, 0);
@@ -297,17 +320,40 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
             draw_cell(&mut buf, area, *rect, cell, i == view.focused);
         }
     }
+    // Monocle shows only the focused cell, so draw a top strip listing EVERY
+    // cell's title (like a regular Monocle tab's stacked-pane strip) to reveal
+    // the panes the user can page to. Drawn LAST so it always wins the reserved
+    // row even if the cell geometry above ever regressed.
+    if let Some(strip) = monocle_strip_rect(&view.layout, area) {
+        draw_monocle_strip(&mut buf, area, strip, view);
+    }
     buf
 }
 
 /// Index of the cell whose rect contains the point `(x, y)`, for mouse-click
 /// focus. `None` when the view is empty or the click lands outside every cell
 /// (including a click on the reserved status row). In `Monocle` only the
-/// focused cell has a rect, so any in-bounds click resolves to it (keeping the
-/// current focus).
+/// focused cell has a rect below the strip, but a click landing on a title in
+/// the top strip resolves to THAT cell, so clicking a strip entry pages to it;
+/// any other in-bounds click resolves to the focused cell.
 pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
     if view.cells.is_empty() {
         return None;
+    }
+    // Monocle title strip: a click on a strip entry focuses that cell. The strip
+    // (row `strip.y`) and the focused cell rect (below it) never overlap, so
+    // checking it first is unambiguous.
+    if let Some(strip) = monocle_strip_rect(&view.layout, area) {
+        if y == strip.y && x >= strip.x && x < strip.x + strip.width {
+            let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+            let rel = (x - strip.x) as usize;
+            if let Some((idx, _, _)) = strip_segments(&titles, strip.width as usize)
+                .into_iter()
+                .find(|(_, s, e)| rel >= *s && rel < *e)
+            {
+                return Some(idx);
+            }
+        }
     }
     let rects = cell_rects(&view.layout, view.focused, view.cells.len(), area);
     rects.iter().position(|r| match r {
@@ -486,6 +532,66 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
 /// remotes) once known, else `waiting…` before the first snapshot.
 fn cell_title(cell: &ViewCell) -> String {
     cell.title.clone().unwrap_or_else(|| "waiting…".to_string())
+}
+
+/// Lay out the Monocle title strip's tab entries within `width` columns.
+/// Returns `(cell_index, start, end)` column offsets (relative to the strip's
+/// left edge, `end` exclusive) for every entry that is at least partially
+/// visible; entries past the right edge are dropped and the last visible one is
+/// clipped. Each entry renders as ` {title} ` with a single separator column
+/// between entries. Shared by [`draw_monocle_strip`] (rendering) and
+/// [`cell_at`] (hit-testing) so a click always lands on the entry drawn there.
+fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)> {
+    let mut segs = Vec::new();
+    let mut x = 0usize;
+    for (i, title) in titles.iter().enumerate() {
+        if i > 0 {
+            // Separator column between entries.
+            if x >= width {
+                break;
+            }
+            x += 1;
+        }
+        if x >= width {
+            break;
+        }
+        let label_len = title.chars().count() + 2; // one padding space each side
+        let start = x;
+        let end = (x + label_len).min(width);
+        segs.push((i, start, end));
+        x = end;
+    }
+    segs
+}
+
+/// Draw the Monocle title strip on `strip` (the reserved top row of the cell
+/// area): a tab-like list of EVERY cell's title, with the focused cell's entry
+/// highlighted in the focused-border style so it matches the rest of the UI.
+/// Theme-free by design (like the rest of [`composite`]); only reuses the
+/// `FOCUSED_BORDER`/`UNFOCUSED_BORDER` colors the cell borders already use.
+fn draw_monocle_strip(buf: &mut [Vec<RenderCell>], area: Rect, strip: Rect, view: &ClientView) {
+    let by = (strip.y as usize).saturating_sub(area.y as usize);
+    let bx = (strip.x as usize).saturating_sub(area.x as usize);
+    let width = strip.width as usize;
+    if width == 0 {
+        return;
+    }
+    let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+    let segs = strip_segments(&titles, width);
+    for (idx, start, end) in segs {
+        let focused = idx == view.focused;
+        // Separator before every entry but the first.
+        if start > 0 {
+            put(buf, by, bx + start - 1, border_cell('\u{2502}', false));
+        }
+        let label = format!(" {} ", titles[idx]);
+        for (i, ch) in label.chars().enumerate() {
+            if start + i >= end {
+                break;
+            }
+            put(buf, by, bx + start + i, border_cell(ch, focused));
+        }
+    }
 }
 
 /// Draw `text` centered (horizontally and vertically) inside the interior
@@ -759,12 +865,181 @@ mod tests {
         let a = area(80, 24);
         let rects = cell_rects(&monoclev(), 2, 4, a);
         assert_eq!(rects.len(), 4);
-        // Only the focused cell (index 2) is placed; it fills the cell area.
-        assert_eq!(rects[2], Some(cells_area(a)));
+        // Only the focused cell (index 2) is placed; it fills the cell area
+        // BELOW the reserved title strip (top row), never on the strip row.
+        let strip = monocle_strip_rect(&monoclev(), a).unwrap();
+        let below = Rect {
+            y: strip.y + strip.height,
+            height: cells_area(a).height - strip.height,
+            ..cells_area(a)
+        };
+        assert_eq!(rects[2], Some(below));
+        assert!(below.y > strip.y, "focused cell sits below the strip");
         for (i, r) in rects.iter().enumerate() {
             if i != 2 {
                 assert!(r.is_none(), "cell {i} should be hidden in monocle");
             }
+        }
+    }
+
+    #[test]
+    fn monocle_strip_rect_reserves_top_row() {
+        // Monocle: a 1-row strip at the top of the cell area.
+        assert_eq!(
+            monocle_strip_rect(&monoclev(), area(80, 24)),
+            Some(area(80, 1))
+        );
+        // Non-Monocle layouts have no strip.
+        assert_eq!(monocle_strip_rect(&gridv(), area(80, 24)), None);
+        // Height 3: cell area is 2 rows -> strip (1) + a cell row (1).
+        assert_eq!(
+            monocle_strip_rect(&monoclev(), area(80, 3)),
+            Some(area(80, 1))
+        );
+        // No room (cell area height < 2) -> no strip, so a cell can still show.
+        assert_eq!(monocle_strip_rect(&monoclev(), area(80, 2)), None);
+        assert_eq!(monocle_strip_rect(&monoclev(), area(80, 1)), None);
+        assert_eq!(monocle_strip_rect(&monoclev(), area(80, 0)), None);
+    }
+
+    #[test]
+    fn monocle_strip_lists_every_title_focused_distinct() {
+        let mut cells: Vec<ViewCell> = (0..3).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("alpha / Tab 1".into());
+        cells[1].title = Some("beta / Tab 1".into());
+        cells[2].title = Some("gamma / Tab 1".into());
+        let view = ClientView {
+            name: "v".into(),
+            cells,
+            layout: monoclev(),
+            focused: 1,
+        };
+        let a = area(80, 24);
+        let buf = composite(&view, a);
+        // Row 0 is the strip: it lists ALL three titles.
+        let row0: String = buf[0].iter().map(|c| c.c).collect();
+        assert!(
+            row0.contains("alpha / Tab 1"),
+            "strip missing alpha: {row0:?}"
+        );
+        assert!(
+            row0.contains("beta / Tab 1"),
+            "strip missing beta: {row0:?}"
+        );
+        assert!(
+            row0.contains("gamma / Tab 1"),
+            "strip missing gamma: {row0:?}"
+        );
+        // The strip carries no box-drawing cell corners (it is not a cell).
+        assert!(!row0.contains('┌') && !row0.contains('┐'));
+        // The focused entry (beta) is drawn in the focused-border style; an
+        // unfocused entry (alpha) is not -> visually distinct.
+        let bpos = row0.find("beta").unwrap();
+        let apos = row0.find("alpha").unwrap();
+        assert_eq!(buf[0][bpos].fg, FOCUSED_BORDER);
+        assert!(buf[0][bpos].bold);
+        assert_eq!(buf[0][apos].fg, UNFOCUSED_BORDER);
+        assert!(!buf[0][apos].bold);
+    }
+
+    #[test]
+    fn monocle_strip_lists_titles_even_when_focused_waiting() {
+        // Focused cell has no snapshot yet (waiting) and an unfocused cell is
+        // disconnected: the strip still lists every cell by title, and the
+        // focused area shows the waiting placeholder (below the strip).
+        let mut waiting = cell_with(0, None); // focused, no snapshot
+        waiting.title = Some("alpha / Tab 1".into());
+        let mut disconnected = cell_with(1, Some(snap_filled(40, 10, 'B')));
+        disconnected.title = Some("beta / Tab 1".into());
+        disconnected.disconnected = true;
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![waiting, disconnected],
+            layout: monoclev(),
+            focused: 0,
+        };
+        let a = area(80, 24);
+        let buf = composite(&view, a);
+        let row0: String = buf[0].iter().map(|c| c.c).collect();
+        assert!(row0.contains("alpha / Tab 1"));
+        assert!(row0.contains("beta / Tab 1"));
+        // The focused (waiting) cell's placeholder shows BELOW the strip.
+        let below: String = buf[1..]
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.c))
+            .collect();
+        assert!(
+            below.contains("waiting"),
+            "focused waiting placeholder missing"
+        );
+    }
+
+    #[test]
+    fn monocle_content_below_strip_not_on_it() {
+        // The focused snapshot must never land on the strip row (row 0).
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![
+                cell_with(1, Some(snap_filled(78, 24, 'A'))),
+                cell_with(2, Some(snap_filled(78, 24, 'B'))),
+            ],
+            layout: monoclev(),
+            focused: 0,
+        };
+        let a = area(80, 24);
+        let buf = composite(&view, a);
+        // Row 0 is the strip; the focused snapshot char 'A' appears only below.
+        assert!(
+            !buf[0].iter().any(|c| c.c == 'A'),
+            "content leaked onto strip"
+        );
+        let below_has_a = buf[1..].iter().any(|row| row.iter().any(|c| c.c == 'A'));
+        assert!(below_has_a, "focused content missing below the strip");
+    }
+
+    #[test]
+    fn monocle_strip_click_focuses_that_cell() {
+        let mut cells: Vec<ViewCell> = (0..3).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("alpha / Tab 1".into());
+        cells[1].title = Some("beta / Tab 1".into());
+        cells[2].title = Some("gamma / Tab 1".into());
+        let view = ClientView {
+            name: "v".into(),
+            cells,
+            layout: monoclev(),
+            focused: 0,
+        };
+        let a = area(80, 24);
+        // Locate beta's entry on the strip via the same segment layout used to
+        // draw it, then hit-test its middle column.
+        let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+        let strip = monocle_strip_rect(&monoclev(), a).unwrap();
+        let segs = strip_segments(&titles, strip.width as usize);
+        let (_, s, e) = segs.iter().copied().find(|(i, _, _)| *i == 1).unwrap();
+        let mid = strip.x + ((s + e) / 2) as u16;
+        assert_eq!(cell_at(&view, a, mid, strip.y), Some(1));
+        // A click below the strip resolves to the focused cell (0).
+        assert_eq!(cell_at(&view, a, 5, 5), Some(0));
+    }
+
+    #[test]
+    fn monocle_composite_tiny_area_with_cells_no_panic() {
+        // Mirrors the empty-view tiny-area guard, but with cells: Monocle must
+        // not panic on degenerate heights. Height 2 is the interesting case
+        // (strip row 0, focused rect height 1 -> no border).
+        let view = ClientView {
+            name: "v".into(),
+            cells: vec![
+                cell_with(1, Some(snap_filled(10, 3, 'A'))),
+                cell_with(2, None),
+            ],
+            layout: monoclev(),
+            focused: 0,
+        };
+        for (w, h) in [(1u16, 1u16), (5, 1), (10, 2), (10, 3), (0, 0)] {
+            let buf = composite(&view, area(w, h));
+            assert_eq!(buf.len(), h as usize);
+            assert!(buf.iter().all(|row| row.len() == w as usize));
         }
     }
 
