@@ -729,7 +729,6 @@ fn paint_view(
         width: c,
         height: r,
     };
-    let mut composed = crate::client::view::composite(view, area);
     // Draw the client-side status bar on the reserved bottom row, mirroring the
     // normal (server) bar's left/right layout with the same theme colors.
     let mode = match input.mode {
@@ -740,6 +739,7 @@ fn paint_view(
         Mode::Search => "SEARCH",
         Mode::SessionManager => "SESSION_MANAGER",
     };
+    let mut composed = crate::client::view::composite(view, area, compositor_theme, mode);
     let cell_title = view
         .cells
         .get(view.focused)
@@ -949,7 +949,13 @@ async fn handle_view_command(
     };
     if let Some(dir) = dir {
         hide_whichkey!();
-        if views[av].move_focus(dir) {
+        let cells = crate::client::view::cells_area(crate::server::layout::Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: rows,
+        });
+        if views[av].move_focus(dir, cells) {
             // Model B: focus moved, so the size demand must swap -- re-subscribe
             // every cell (new focus demands its size; the old focus releases its
             // demand so its pane grows back).

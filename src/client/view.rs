@@ -29,8 +29,9 @@
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, PaneId, RenderCell};
+use crate::server::compositor::build_top_border_content;
 use crate::server::layout::{
-    compute_layout, FocusDirection, GridLayout, LayoutMode, LayoutNode, Rect,
+    compute_layout, focus_in_direction, FocusDirection, GridLayout, LayoutMode, LayoutNode, Rect,
 };
 
 // ---------------------------------------------------------------------------
@@ -224,17 +225,22 @@ impl ClientView {
         }
     }
 
-    /// Move focus in the given direction using the same `cols = ceil(sqrt(n))`
-    /// geometry as the Grid layout, so focus tracks a grid regardless of the
-    /// active layout. Returns `true` if the focused cell actually changed.
+    /// Move focus in the given direction. Returns `true` if the focused cell
+    /// actually changed.
     ///
-    /// This is deliberately layout-agnostic: under Bsp/Master the geometric
-    /// neighbor may not be the grid neighbor, but keeping one predictable
-    /// paging model across layouts is simpler and matches the previous
-    /// behavior. Monocle has only one visible cell, but focus still moves
-    /// through the underlying cell list (left/up = previous, right/down = next)
-    /// so the user can page between panes.
-    pub fn move_focus(&mut self, dir: FocusDirection) -> bool {
+    /// `cells` is the already-reduced cell area (`cells_area(terminal)`), the
+    /// SAME rect the cell rects are laid out in, so the neighbor search runs on
+    /// the geometry the user sees.
+    ///
+    /// Monocle keeps a paging model: only the focused cell is visible, so
+    /// left/up = previous cell, right/down = next cell through the underlying
+    /// list. Every other layout (grid/bsp/master/custom) is geometry-driven via
+    /// the server's [`focus_in_direction`] over the view's current cell tree
+    /// (its `custom_tree` when set, else a fresh automatic tree over the cell
+    /// pseudo-ids), so focus stays correct after a move/resize restructures the
+    /// tree. The tree is cloned for the query so focus movement never mutates a
+    /// persisted arrangement.
+    pub fn move_focus(&mut self, dir: FocusDirection, cells: Rect) -> bool {
         let n = self.cells.len();
         if n == 0 {
             return false;
@@ -248,57 +254,26 @@ impl ClientView {
             self.focused = new;
             return changed;
         }
-        let cols = grid_cols(n);
-        let row = self.focused / cols;
-        let col = self.focused % cols;
-        let new = match dir {
-            FocusDirection::Left => {
-                if col > 0 {
-                    self.focused - 1
-                } else {
-                    self.focused
-                }
-            }
-            FocusDirection::Right => {
-                if col + 1 < cols && self.focused + 1 < n {
-                    self.focused + 1
-                } else {
-                    self.focused
-                }
-            }
-            FocusDirection::Up => {
-                if row > 0 {
-                    self.focused - cols
-                } else {
-                    self.focused
-                }
-            }
-            FocusDirection::Down => {
-                if self.focused + cols < n {
-                    self.focused + cols
-                } else {
-                    self.focused
-                }
-            }
+        // Geometry-driven: resolve the spatial neighbor on the real cell tree.
+        let mut tree = match &self.custom_tree {
+            Some(t) => t.clone(),
+            None => self.auto_tree(),
         };
-        let changed = new != self.focused;
-        self.focused = new;
-        changed
+        let focused_id = self.focused_id();
+        if let Some(new_id) = focus_in_direction(&mut tree, cells, focused_id, dir, 0) {
+            if let Some(idx) = self.index_of_id(new_id) {
+                let changed = idx != self.focused;
+                self.focused = idx;
+                return changed;
+            }
+        }
+        false
     }
 }
 
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
-
-/// Number of columns per full grid row for `n` cells: `ceil(sqrt(n))`.
-fn grid_cols(n: usize) -> usize {
-    if n <= 1 {
-        1
-    } else {
-        (n as f64).sqrt().ceil() as usize
-    }
-}
 
 /// The sub-rectangle of `area` available to cells: `area` minus the bottom row,
 /// which is reserved for the view's status bar. Everything that positions cells
@@ -415,7 +390,12 @@ const UNFOCUSED_BORDER: CellColor = CellColor::Indexed(8);
 /// `area` is expected to have its origin at the buffer origin in normal use
 /// (the full terminal, `x = y = 0`); rect coordinates are translated back to
 /// buffer-local space so a non-zero origin still composites correctly.
-pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
+pub fn composite(
+    view: &ClientView,
+    area: Rect,
+    theme: &CompositorTheme,
+    mode: &str,
+) -> Vec<Vec<RenderCell>> {
     let w = area.width as usize;
     let h = area.height as usize;
     let mut buf = vec![vec![RenderCell::default(); w]; h];
@@ -451,7 +431,7 @@ pub fn composite(view: &ClientView, area: Rect) -> Vec<Vec<RenderCell>> {
     // the panes the user can page to. Drawn LAST so it always wins the reserved
     // row even if the cell geometry above ever regressed.
     if let Some(strip) = monocle_strip_rect(view, area) {
-        draw_monocle_strip(&mut buf, area, strip, view);
+        draw_monocle_strip(&mut buf, area, strip, view, theme, mode);
     }
     buf
 }
@@ -660,14 +640,15 @@ fn cell_title(cell: &ViewCell) -> String {
     cell.title.clone().unwrap_or_else(|| "waiting…".to_string())
 }
 
-/// Background block behind an inactive Monocle-strip tab, mirroring the regular
-/// stacked-pane strip's inactive-tab background (`CellColor::Indexed(237)` in
-/// [`build_top_border_content`](crate::server::compositor)).
-const STRIP_INACTIVE_BG: CellColor = CellColor::Indexed(237);
-
 /// Fixed per-tab width for the Monocle strip: the longest title plus one padding
 /// column on each side (as the regular strip does: `max_name_len + 2`), capped
 /// to the strip width. `0` when there are no titles.
+///
+/// This mirrors the `tab_width` computed inside
+/// [`build_top_border_content`](crate::server::compositor::build_top_border_content):
+/// `draw_monocle_strip` renders via that shared function while [`cell_at`]
+/// hit-tests via [`strip_segments`], so both must derive tab boundaries from the
+/// identical formula over the identical titles (`cell_title`, never empty).
 fn strip_tab_width(titles: &[String], width: usize) -> usize {
     let max_name = titles.iter().map(|t| t.chars().count()).max().unwrap_or(0);
     (max_name + 2).min(width)
@@ -679,8 +660,11 @@ fn strip_tab_width(titles: &[String], width: usize) -> usize {
 /// Returns `(cell_index, start, end)` column offsets (relative to the strip's
 /// left edge, `end` exclusive) for every entry at least partially visible;
 /// entries past the right edge are dropped and the last visible one is clipped.
-/// Shared by [`draw_monocle_strip`] (rendering) and [`cell_at`] (hit-testing) so
-/// a click always lands on the tab drawn there.
+/// Used by [`cell_at`] for hit-testing; its boundaries match the columns
+/// [`build_top_border_content`](crate::server::compositor::build_top_border_content)
+/// paints in [`draw_monocle_strip`] (same leading space, same `" | "` 3-column
+/// separator, same `strip_tab_width`), so a click always lands on the tab drawn
+/// there.
 fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)> {
     let mut segs = Vec::new();
     let tab_width = strip_tab_width(titles, width);
@@ -705,71 +689,53 @@ fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)>
 }
 
 /// Draw the Monocle title strip on `strip` (the reserved top row of the cell
-/// area): a tab-like list of EVERY cell's title, styled to match a regular
-/// Monocle tab's stacked-pane strip (equal-width centered tabs, `" | "`
-/// separators with an ASCII pipe, inactive tabs on a grey background block, the
-/// focused tab highlighted + bold). Theme-free like the rest of [`composite`]:
-/// the active/inactive treatment reuses the `FOCUSED_BORDER`/`UNFOCUSED_BORDER`
-/// colors plus [`STRIP_INACTIVE_BG`], rather than threading a compositor theme
-/// through the pure geometry code.
-fn draw_monocle_strip(buf: &mut [Vec<RenderCell>], area: Rect, strip: Rect, view: &ClientView) {
+/// area): a tab-like list of EVERY cell's title, rendered by the SAME server
+/// function a normal stacked pane's top border uses
+/// ([`build_top_border_content`](crate::server::compositor::build_top_border_content)),
+/// so the strip is pixel-identical to a normal Monocle tab's — fixed tab width,
+/// the active tab filled with `theme.mode_colors(mode)`, inactive tabs on
+/// `CellColor::Indexed(237)`, `" | "` separators.
+///
+/// The cells' [`ViewCell::id`]s serve as the pseudo-pane ids and the focused
+/// cell index as the active index. `border_fg` is the focused-frame color
+/// (`frame_active_fg`): the whole strip belongs to the focused view, exactly as
+/// a focused pane's border does.
+fn draw_monocle_strip(
+    buf: &mut [Vec<RenderCell>],
+    area: Rect,
+    strip: Rect,
+    view: &ClientView,
+    theme: &CompositorTheme,
+    mode: &str,
+) {
     let by = (strip.y as usize).saturating_sub(area.y as usize);
     let bx = (strip.x as usize).saturating_sub(area.x as usize);
     let width = strip.width as usize;
     if width == 0 {
         return;
     }
+    // Same titles vector `cell_at`/`strip_segments` hit-test against, so the
+    // rendered tab boundaries and the click boundaries derive from identical
+    // inputs. `cell_title` is never empty, so the pseudo-id fallback inside
+    // `build_top_border_content` never fires and both `max_name_len`
+    // computations provably agree.
     let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-    let tab_width = strip_tab_width(&titles, width);
-    let segs = strip_segments(&titles, width);
-    for (idx, start, end) in segs {
-        let focused = idx == view.focused;
-        // The " | " separator sits in the three columns before this tab (only
-        // for tabs after the first). The pipe uses the unfocused border color;
-        // the flanking spaces carry no background block.
-        if idx > 0 && start >= 3 {
-            put(buf, by, bx + start - 3, border_cell(' ', false));
-            put(buf, by, bx + start - 2, border_cell('|', false));
-            put(buf, by, bx + start - 1, border_cell(' ', false));
+    let pseudo_ids: Vec<PaneId> = view.cells.iter().map(|c| c.id).collect();
+    let stack_info = Some((titles, pseudo_ids, view.focused));
+    let border_fg = theme.frame_active_fg.clone();
+    let cells = build_top_border_content(
+        &stack_info,
+        view.focused_id(),
+        &border_fg,
+        mode,
+        width,
+        theme,
+    );
+    for (i, cell) in cells.into_iter().enumerate() {
+        if i >= width {
+            break;
         }
-        // Center the (possibly clipped) title within the fixed tab width, like
-        // the regular strip.
-        let name = &titles[idx];
-        let name_len = name.chars().count().min(tab_width);
-        let pad_total = tab_width.saturating_sub(name_len);
-        let pad_left = pad_total / 2;
-        let (fg, bg, bold) = if focused {
-            (FOCUSED_BORDER, CellColor::Default, true)
-        } else {
-            (UNFOCUSED_BORDER, STRIP_INACTIVE_BG, false)
-        };
-        let mut label = String::with_capacity(tab_width);
-        for _ in 0..pad_left {
-            label.push(' ');
-        }
-        for ch in name.chars().take(name_len) {
-            label.push(ch);
-        }
-        while label.chars().count() < tab_width {
-            label.push(' ');
-        }
-        for (i, ch) in label.chars().enumerate() {
-            if start + i >= end {
-                break;
-            }
-            put(
-                buf,
-                by,
-                bx + start + i,
-                RenderCell {
-                    c: ch,
-                    fg: fg.clone(),
-                    bg: bg.clone(),
-                    bold,
-                    ..RenderCell::default()
-                },
-            );
-        }
+        put(buf, by, bx + i, cell);
     }
 }
 
@@ -951,6 +917,12 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    /// Default compositor theme + `NORMAL` mode, for the tests that don't care
+    /// about the strip's active-tab color.
+    fn tt() -> CompositorTheme {
+        CompositorTheme::default()
     }
 
     fn gridv() -> LayoutMode {
@@ -1147,7 +1119,7 @@ mod tests {
         v2.cells[0].snapshot = Some(snap_filled(40, 10, 'A'));
         v2.cells[1].snapshot = Some(snap_filled(40, 10, 'B'));
         v2.zoomed = true;
-        let buf = composite(&v2, a);
+        let buf = composite(&v2, a, &tt(), "NORMAL");
         let joined: String = buf.iter().flat_map(|r| r.iter().map(|c| c.c)).collect();
         assert!(joined.contains('A') && !joined.contains('B'));
     }
@@ -1194,10 +1166,10 @@ mod tests {
         cells[0].title = Some("aa".into());
         cells[1].title = Some("bb".into());
         let view = view_of(cells, monoclev(), 0);
-        let buf = composite(&view, area(80, 24));
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         let row0: String = buf[0].iter().map(|c| c.c).collect();
-        // The regular strip separates tabs with an ASCII " | " (space pipe space),
-        // NOT the box-drawing vertical bar the old view strip used.
+        // The shared strip function separates tabs with an ASCII " | " (space
+        // pipe space), NOT a box-drawing vertical bar.
         assert!(row0.contains(" | "), "ascii pipe separator: {row0:?}");
         assert!(
             !row0.contains('\u{2502}'),
@@ -1206,17 +1178,90 @@ mod tests {
     }
 
     #[test]
-    fn monocle_strip_inactive_tab_has_background_block() {
-        // Mirrors the regular strip's inactive-tab grey background (Indexed 237).
+    fn monocle_strip_active_tab_has_mode_color_bg() {
+        // The strip is rendered by the SAME `build_top_border_content` a normal
+        // stacked pane uses: the ACTIVE (focused) tab is a mode-colored block
+        // (bold, `theme.mode_colors(mode)` bg/fg), NOT a border/underline.
+        let theme = tt();
         let mut cells: Vec<ViewCell> = (0..2).map(|id| cell_with(id, None)).collect();
         cells[0].title = Some("aa".into());
         cells[1].title = Some("bb".into());
         let view = view_of(cells, monoclev(), 0); // cell 0 focused/active
-        let buf = composite(&view, area(80, 24));
+        let buf = composite(&view, area(80, 24), &theme, "NORMAL");
+        let row0 = &buf[0];
+        let (mode_fg, mode_bg) = theme.mode_colors("NORMAL");
+        let apos = row0.iter().position(|c| c.c == 'a').unwrap();
+        assert_eq!(row0[apos].bg, mode_bg, "active tab bg = mode color block");
+        assert_eq!(row0[apos].fg, mode_fg, "active tab fg = mode color");
+        assert!(row0[apos].bold, "active tab is bold");
+        assert!(
+            !row0[apos].underline,
+            "active tab is a block, not an underline"
+        );
+    }
+
+    #[test]
+    fn monocle_strip_inactive_tab_has_background_block() {
+        // Mirrors the regular strip's inactive-tab grey background (Indexed 237)
+        // and inactive-tab fg (`theme.tab_inactive_fg`).
+        let theme = tt();
+        let mut cells: Vec<ViewCell> = (0..2).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("aa".into());
+        cells[1].title = Some("bb".into());
+        let view = view_of(cells, monoclev(), 0); // cell 0 focused/active
+        let buf = composite(&view, area(80, 24), &theme, "NORMAL");
         let row0 = &buf[0];
         let bpos = row0.iter().position(|c| c.c == 'b').unwrap();
-        assert_eq!(row0[bpos].bg, STRIP_INACTIVE_BG);
-        assert_eq!(row0[bpos].fg, UNFOCUSED_BORDER);
+        assert_eq!(row0[bpos].bg, CellColor::Indexed(237));
+        assert_eq!(row0[bpos].fg, theme.tab_inactive_fg);
+        assert!(!row0[bpos].bold, "inactive tab is not bold");
+    }
+
+    #[test]
+    fn monocle_strip_render_matches_strip_segments() {
+        // Hit-testing (`cell_at` via `strip_segments`) must agree with what
+        // `build_top_border_content` actually paints. Assert each tab's rendered
+        // start column (first cell whose bg is a tab block, i.e. NOT the strip's
+        // default-bg leading space / separator) equals `strip_segments`' start.
+        let theme = tt();
+        let mut cells: Vec<ViewCell> = (0..3).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("alpha".into());
+        cells[1].title = Some("bb".into());
+        cells[2].title = Some("gamma".into());
+        let view = view_of(cells, monoclev(), 1); // middle cell focused
+        let a = area(80, 24);
+        let buf = composite(&view, a, &theme, "NORMAL");
+        let strip = monocle_strip_rect(&view, a).unwrap();
+        let width = strip.width as usize;
+        let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+        let segs = strip_segments(&titles, width);
+        assert_eq!(segs.len(), 3, "three visible tabs");
+        let (_, mode_bg) = theme.mode_colors("NORMAL");
+        for (idx, start, end) in segs {
+            // Every column of the tab carries a tab background block (mode color
+            // for the focused tab, Indexed(237) otherwise) rather than the
+            // default-bg spaces used for the leading space and " | " separators.
+            let expect_bg = if idx == view.focused {
+                mode_bg.clone()
+            } else {
+                CellColor::Indexed(237)
+            };
+            for (col, cell) in buf[0].iter().enumerate().take(end).skip(start) {
+                assert_eq!(
+                    cell.bg, expect_bg,
+                    "tab {idx} col {col} bg mismatch (start={start}, end={end})"
+                );
+            }
+            // The column just before `start` is NOT a tab block (leading space or
+            // separator), proving `start` is the true left edge.
+            if start > 0 {
+                assert_ne!(
+                    buf[0][start - 1].bg,
+                    expect_bg,
+                    "column before tab {idx} start must not be part of the block"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1333,8 +1378,9 @@ mod tests {
             zoomed: false,
             next_cell_id: 1000,
         };
+        let theme = tt();
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &theme, "NORMAL");
         // Row 0 is the strip: it lists ALL three titles.
         let row0: String = buf[0].iter().map(|c| c.c).collect();
         assert!(
@@ -1351,13 +1397,17 @@ mod tests {
         );
         // The strip carries no box-drawing cell corners (it is not a cell).
         assert!(!row0.contains('┌') && !row0.contains('┐'));
-        // The focused entry (beta) is drawn in the focused-border style; an
-        // unfocused entry (alpha) is not -> visually distinct.
+        // Shared-function style: the focused entry (beta) is a mode-colored
+        // bold block; an unfocused entry (alpha) is on the Indexed(237) inactive
+        // background -> visually distinct.
+        let (mode_fg, mode_bg) = theme.mode_colors("NORMAL");
         let bpos = row0.find("beta").unwrap();
         let apos = row0.find("alpha").unwrap();
-        assert_eq!(buf[0][bpos].fg, FOCUSED_BORDER);
+        assert_eq!(buf[0][bpos].fg, mode_fg);
+        assert_eq!(buf[0][bpos].bg, mode_bg);
         assert!(buf[0][bpos].bold);
-        assert_eq!(buf[0][apos].fg, UNFOCUSED_BORDER);
+        assert_eq!(buf[0][apos].fg, theme.tab_inactive_fg);
+        assert_eq!(buf[0][apos].bg, CellColor::Indexed(237));
         assert!(!buf[0][apos].bold);
     }
 
@@ -1381,7 +1431,7 @@ mod tests {
             next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &tt(), "NORMAL");
         let row0: String = buf[0].iter().map(|c| c.c).collect();
         assert!(row0.contains("alpha / Tab 1"));
         assert!(row0.contains("beta / Tab 1"));
@@ -1412,7 +1462,7 @@ mod tests {
             next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &tt(), "NORMAL");
         // Row 0 is the strip; the focused snapshot char 'A' appears only below.
         assert!(
             !buf[0].iter().any(|c| c.c == 'A'),
@@ -1468,7 +1518,7 @@ mod tests {
             next_cell_id: 1000,
         };
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 2), (10, 3), (0, 0)] {
-            let buf = composite(&view, area(w, h));
+            let buf = composite(&view, area(w, h), &tt(), "NORMAL");
             assert_eq!(buf.len(), h as usize);
             assert!(buf.iter().all(|row| row.len() == w as usize));
         }
@@ -1505,7 +1555,7 @@ mod tests {
             next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &tt(), "NORMAL");
         let rects = cell_rects(&view, a);
 
         // Interior center of cell 0 must be 'A', cell 1 must be 'B'.
@@ -1531,7 +1581,7 @@ mod tests {
             next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &tt(), "NORMAL");
         let rects = cell_rects(&view, a);
 
         // Focused cell (index 1) top-left corner is bold + focused color.
@@ -1590,7 +1640,7 @@ mod tests {
             next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &tt(), "NORMAL");
 
         // The single cell fills the cell area (area minus the status row); its
         // interior bottom row (just above the box border) must be 'L'.
@@ -1619,7 +1669,7 @@ mod tests {
             next_cell_id: 1000,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a);
+        let buf = composite(&view, a, &tt(), "NORMAL");
         // Interior starts at row 1 (under the top border).
         assert_eq!(buf[1][2].c, 'S');
     }
@@ -1635,7 +1685,7 @@ mod tests {
             zoomed: false,
             next_cell_id: 1000,
         };
-        let buf = composite(&view, area(80, 24));
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         // A cell with no snapshot yet shows a `waiting…` placeholder.
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("waiting"));
@@ -1654,7 +1704,7 @@ mod tests {
             zoomed: false,
             next_cell_id: 1000,
         };
-        let buf = composite(&view, area(80, 24));
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("disconnected"));
         // The stale snapshot content must NOT bleed through.
@@ -1675,7 +1725,7 @@ mod tests {
             zoomed: false,
             next_cell_id: 1000,
         };
-        let buf = composite(&view, area(80, 24));
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains('B'));
         assert!(
@@ -1798,8 +1848,12 @@ mod tests {
 
     #[test]
     fn move_focus_grid_navigation() {
-        // 4 cells => 2x2 grid (cols=2). Focus starts at 0 (top-left).
-        let mut view = ClientView {
+        // Geometry-driven: 4 cells in a grid. Neighbor relations come from the
+        // real cell rects, not index arithmetic. Assertions below are validated
+        // against the actual `cell_rects` geometry (see the guard block).
+        let a = area(80, 24);
+        let cells = cells_area(a);
+        let mk = || ClientView {
             name: "v".into(),
             cells: (1..=4).map(|id| cell_with(id, None)).collect(),
             layout: gridv(),
@@ -1808,23 +1862,80 @@ mod tests {
             zoomed: false,
             next_cell_id: 1000,
         };
-        assert!(view.move_focus(FocusDirection::Right));
-        assert_eq!(view.focused, 1);
-        assert!(view.move_focus(FocusDirection::Down));
-        assert_eq!(view.focused, 3);
-        assert!(view.move_focus(FocusDirection::Left));
-        assert_eq!(view.focused, 2);
-        assert!(view.move_focus(FocusDirection::Up));
-        assert_eq!(view.focused, 0);
+        // Sanity: confirm the grid lays 4 cells as a 2x2 (two rows of two), so
+        // the neighbor expectations below are the geometric truth.
+        let rects: Vec<Rect> = cell_rects(&mk(), a).into_iter().flatten().collect();
+        assert_eq!(rects.len(), 4);
+        let xs: std::collections::BTreeSet<u16> = rects.iter().map(|r| r.x).collect();
+        let ys: std::collections::BTreeSet<u16> = rects.iter().map(|r| r.y).collect();
+        assert_eq!(xs.len(), 2, "two distinct columns: {rects:?}");
+        assert_eq!(ys.len(), 2, "two distinct rows: {rects:?}");
+
+        let mut view = mk();
+        // From top-left: right -> top-right neighbor.
+        assert!(view.move_focus(FocusDirection::Right, cells));
+        let after_right = view.focused;
+        assert_ne!(after_right, 0, "right moved off the top-left cell");
+        // Down from there -> the cell below it.
+        assert!(view.move_focus(FocusDirection::Down, cells));
+        let after_down = view.focused;
+        assert_ne!(after_down, after_right, "down moved to another row");
+        // Left -> back to the left column (bottom-left).
+        assert!(view.move_focus(FocusDirection::Left, cells));
+        let after_left = view.focused;
+        assert_ne!(after_left, after_down, "left moved off the right column");
+        // Up -> back to the top-left where we started.
+        assert!(view.move_focus(FocusDirection::Up, cells));
+        assert_eq!(view.focused, 0, "up returns to the top-left cell");
         // At an edge: no movement, returns false.
-        assert!(!view.move_focus(FocusDirection::Left));
+        assert!(!view.move_focus(FocusDirection::Left, cells));
         assert_eq!(view.focused, 0);
-        assert!(!view.move_focus(FocusDirection::Up));
+        assert!(!view.move_focus(FocusDirection::Up, cells));
         assert_eq!(view.focused, 0);
     }
 
     #[test]
+    fn move_focus_grid_geometry_after_restructure() {
+        // The bug fix: two side-by-side cells A|B; move B down so A is on top and
+        // B on the bottom; focus-up from B must land on A (index-based grid math
+        // used to make this a no-op). Drive it through a `custom_tree` that
+        // encodes the restructured A-top/B-bottom split.
+        use crate::server::layout::{Direction, LayoutNode};
+        let a = area(80, 24);
+        let cells = cells_area(a);
+        // Build the A(top)/B(bottom) tree over cell ids 1 (A) and 2 (B).
+        let tree = LayoutNode::Split {
+            direction: Direction::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::new_stack(1)),
+            second: Box::new(LayoutNode::new_stack(2)),
+        };
+        let mut view = ClientView {
+            name: "v".into(),
+            cells: (1..=2).map(|id| cell_with(id, None)).collect(),
+            layout: gridv(),
+            focused: 1, // B (bottom) focused
+            custom_tree: Some(tree),
+            zoomed: false,
+            next_cell_id: 1000,
+        };
+        // Focus UP from the bottom cell must reach the TOP cell (index 0 = A).
+        assert!(
+            view.move_focus(FocusDirection::Up, cells),
+            "focus-up after a down-move must move"
+        );
+        assert_eq!(
+            view.focused, 0,
+            "focus-up from bottom lands on the top cell"
+        );
+        // And back down returns to B.
+        assert!(view.move_focus(FocusDirection::Down, cells));
+        assert_eq!(view.focused, 1);
+    }
+
+    #[test]
     fn move_focus_monocle_pages_through_cells() {
+        let cells = cells_area(area(80, 24));
         let mut view = ClientView {
             name: "v".into(),
             cells: (1..=3).map(|id| cell_with(id, None)).collect(),
@@ -1834,19 +1945,20 @@ mod tests {
             zoomed: false,
             next_cell_id: 1000,
         };
-        assert!(view.move_focus(FocusDirection::Right));
+        assert!(view.move_focus(FocusDirection::Right, cells));
         assert_eq!(view.focused, 1);
-        assert!(view.move_focus(FocusDirection::Right));
+        assert!(view.move_focus(FocusDirection::Right, cells));
         assert_eq!(view.focused, 2);
-        assert!(!view.move_focus(FocusDirection::Right)); // at the end
-        assert!(view.move_focus(FocusDirection::Left));
+        assert!(!view.move_focus(FocusDirection::Right, cells)); // at the end
+        assert!(view.move_focus(FocusDirection::Left, cells));
         assert_eq!(view.focused, 1);
     }
 
     #[test]
     fn move_focus_empty_is_noop() {
+        let cells = cells_area(area(80, 24));
         let mut view = ClientView::new("v".into());
-        assert!(!view.move_focus(FocusDirection::Right));
+        assert!(!view.move_focus(FocusDirection::Right, cells));
         assert_eq!(view.focused, 0);
     }
 
@@ -1888,7 +2000,7 @@ mod tests {
                 next_cell_id: 1000,
             };
             let a = area(80, 24);
-            let buf = composite(&view, a);
+            let buf = composite(&view, a, &tt(), "NORMAL");
             assert_eq!(buf.len(), a.height as usize, "row count");
             assert!(
                 buf.iter().all(|row| row.len() == a.width as usize),
@@ -1908,7 +2020,7 @@ mod tests {
         // stay within bounds (clamped).
         let view = ClientView::new("empty".into());
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 3), (0, 0)] {
-            let buf = composite(&view, area(w, h));
+            let buf = composite(&view, area(w, h), &tt(), "NORMAL");
             assert_eq!(buf.len(), h as usize);
             assert!(buf.iter().all(|row| row.len() == w as usize));
         }

@@ -522,7 +522,11 @@ fn draw_zellij_panes(
 ///
 /// For single-pane stacks: ` name ` (space-padded name).
 /// For multi-pane stacks: equal-width tabs with mode-based coloring.
-fn build_top_border_content(
+///
+/// Public so the client-side view compositor can render a Monocle cell strip
+/// with byte-for-byte the same tab styling as a normal stacked pane's top
+/// border (fixed tab width, mode-colored active block, `Indexed(237)` inactive).
+pub fn build_top_border_content(
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
     pane_id: PaneId,
     border_fg: &CellColor,
