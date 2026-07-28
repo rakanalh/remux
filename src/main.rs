@@ -1271,6 +1271,14 @@ async fn run_client_loop(
     // `SessionList` handler (gated on `src == Local`) to complete the fallback.
     let mut pending_local_fallback = false;
 
+    // Set when a foreground *local* session was deleted while the session
+    // manager is open. It arms a one-shot check: when the LOCAL server's tree
+    // reply comes back (gated on `src == Local`), the client exits iff no local
+    // sessions remain — mirroring the manager-closed "last session closed ->
+    // exit" behavior. Only a genuine deletion arms it, so merely opening or
+    // refreshing the manager (including with a remote connected) never exits.
+    let mut pending_manager_exit_check = false;
+
     // Track the current and previously-attached (server, session) for the
     // "last session" toggle (Alt-o). Seeded with the initial local session as
     // `(ConnId::Local, name)` when known; `previous` starts empty so the first
@@ -3586,19 +3594,38 @@ async fn run_client_loop(
                         else if let Some(sm) = input.session_manager.as_mut() {
                             sm.set_foreground(mgr.foreground().clone());
                             sm.set_roster(mgr.server_roster());
+                            // Whether this is the LOCAL server's reply, and whether
+                            // it reports zero sessions. Computed from the just-
+                            // received tree (before it is moved into `update_tree`)
+                            // and scoped to the local server, so a remote's (possibly
+                            // collapsed/empty) subtree never counts. Dormant sessions
+                            // are intentionally ignored — they never kept the client
+                            // alive before either.
+                            let is_local = matches!(src, ConnId::Local);
+                            let local_now_empty = is_local
+                                && unfiled.is_empty()
+                                && folders.iter().all(|f| f.sessions.is_empty());
                             sm.update_tree(src, folders, unfiled, dormant);
-                            // If, after merging, no server has any session and the
-                            // foreground is local, the last session was closed —
-                            // exit as before. A remote-only empty tree must not
-                            // exit the client.
-                            let has_any = sm
-                                .rows
-                                .iter()
-                                .any(|r| matches!(r.node_type, NodeType::Session { .. }));
-                            if !has_any && mgr.is_foreground(&ConnId::Local) {
-                                input.session_manager = None;
-                                input.mode = Mode::Normal;
-                                break;
+                            // A plain tree refresh only updates and re-renders — it
+                            // must never exit the client (an earlier version broke
+                            // out here on an empty aggregate, which misfired when a
+                            // remote reply was processed before the local one and
+                            // silently exited the client on `Prefix x m`). The one
+                            // exception is the last-local-session lifecycle: a
+                            // foreground-local `SessionDeleted` arms
+                            // `pending_manager_exit_check`, and only the ensuing LOCAL
+                            // tree reply resolves it — exiting iff local now has no
+                            // sessions and the foreground is still local. This is
+                            // event-driven and order-independent (remote replies are
+                            // ignored), so opening/refreshing the manager — even with
+                            // a remote connected — can never trip it.
+                            if pending_manager_exit_check && is_local {
+                                pending_manager_exit_check = false;
+                                if local_now_empty && mgr.is_foreground(&ConnId::Local) {
+                                    input.session_manager = None;
+                                    input.mode = Mode::Normal;
+                                    break;
+                                }
                             }
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.clear_overlay(c, r)?;
@@ -3614,9 +3641,15 @@ async fn run_client_loop(
                         if mgr.is_foreground(&src)
                             && matches!(event, crate::protocol::SessionEvent::SessionDeleted(_))
                         {
-                            // If session manager is open, just refresh the tree
-                            // instead of breaking out of the event loop.
+                            // If session manager is open, refresh the tree instead
+                            // of breaking out of the event loop. A foreground
+                            // *local* deletion additionally arms a one-shot check
+                            // so the refreshed LOCAL tree can exit iff it was the
+                            // last local session (see `pending_manager_exit_check`).
                             if input.session_manager.is_some() {
+                                if matches!(src, ConnId::Local) {
+                                    pending_manager_exit_check = true;
+                                }
                                 for id in mgr.connected_ids() {
                                     mgr.send(&id, ClientMessage::ListSessionTree).await?;
                                 }
