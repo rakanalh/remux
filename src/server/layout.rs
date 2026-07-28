@@ -1024,8 +1024,16 @@ pub fn find_stack_names(
 
 /// Find the neighbor pane when moving in `direction` from `current_pane`.
 ///
-/// Computes all pane rectangles, locates the current pane, then finds the
-/// nearest pane in the requested direction based on center-point distance.
+/// Computes all pane rectangles, locates the current pane, then applies the
+/// standard i3/sway directional rule: a candidate must lie strictly in the
+/// pressed direction, and candidates whose perpendicular extent OVERLAPS the
+/// current pane are always preferred over merely diagonal ones. This ensures an
+/// aligned neighbor beats a perpendicular-offset one -- a pure center-distance
+/// (euclidean) ranking would instead let a wide/tall diagonal neighbor win.
+///
+/// Ranking works entirely in doubled integer coordinates: `2 * center =
+/// 2*origin + size`, so the gate and the distance comparisons are exact and
+/// avoid floating point while preserving the same ordering as center math.
 pub fn find_neighbor(
     layout: &LayoutNode,
     area: Rect,
@@ -1036,51 +1044,75 @@ pub fn find_neighbor(
     let rects = compute_layout(layout, area, gap_size);
 
     let current_rect = rects.iter().find(|(id, _)| *id == current_pane)?.1;
-    let (cx, cy) = rect_center(current_rect);
+    // Doubled centers: dc = 2 * center = 2*origin + size (exact integers).
+    let dcx = 2 * i32::from(current_rect.x) + i32::from(current_rect.width);
+    let dcy = 2 * i32::from(current_rect.y) + i32::from(current_rect.height);
 
-    let mut best: Option<(PaneId, f64)> = None;
+    // Rank key per candidate: (overlap_rank, primary_dist, perp_dist, pane_id).
+    // `overlap_rank` is 0 for perpendicular-overlapping candidates and 1
+    // otherwise, so overlapping neighbors sort first. Within a group we rank by
+    // primary-axis distance, tie-break by perpendicular-axis distance, then by
+    // pane id for determinism. The tuple is `Ord`, so `min` picks the winner.
+    let winner = rects
+        .iter()
+        .filter(|(id, _)| *id != current_pane)
+        .filter_map(|&(pane_id, rect)| {
+            let dpx = 2 * i32::from(rect.x) + i32::from(rect.width);
+            let dpy = 2 * i32::from(rect.y) + i32::from(rect.height);
 
-    for &(pane_id, rect) in &rects {
-        if pane_id == current_pane {
-            continue;
-        }
+            // Gate: candidate center must be strictly beyond the current center
+            // in the pressed direction.
+            let in_direction = match direction {
+                FocusDirection::Left => dpx < dcx,
+                FocusDirection::Right => dpx > dcx,
+                FocusDirection::Up => dpy < dcy,
+                FocusDirection::Down => dpy > dcy,
+            };
+            if !in_direction {
+                return None;
+            }
 
-        let (px, py) = rect_center(rect);
+            // Perpendicular overlap uses rect edges: for Left/Right the
+            // perpendicular axis is vertical, for Up/Down it is horizontal.
+            let overlaps = match direction {
+                FocusDirection::Left | FocusDirection::Right => {
+                    rect.y < current_rect.y.saturating_add(current_rect.height)
+                        && current_rect.y < rect.y.saturating_add(rect.height)
+                }
+                FocusDirection::Up | FocusDirection::Down => {
+                    rect.x < current_rect.x.saturating_add(current_rect.width)
+                        && current_rect.x < rect.x.saturating_add(rect.width)
+                }
+            };
 
-        let is_candidate = match direction {
-            FocusDirection::Left => px < cx,
-            FocusDirection::Right => px > cx,
-            FocusDirection::Up => py < cy,
-            FocusDirection::Down => py > cy,
-        };
+            // Primary axis = the pressed direction; perpendicular = the other.
+            let (primary, perp) = match direction {
+                FocusDirection::Left | FocusDirection::Right => {
+                    ((dpx - dcx).abs(), (dpy - dcy).abs())
+                }
+                FocusDirection::Up | FocusDirection::Down => ((dpy - dcy).abs(), (dpx - dcx).abs()),
+            };
 
-        if !is_candidate {
-            continue;
-        }
+            let overlap_rank: u8 = if overlaps { 0 } else { 1 };
+            Some((overlap_rank, primary, perp, pane_id))
+        })
+        .min();
 
-        let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-
-        if best.is_none() || dist < best.as_ref().map(|b| b.1).unwrap_or(f64::MAX) {
-            best = Some((pane_id, dist));
-        }
-    }
-
-    let result = best.map(|(id, _)| id);
+    let result = winner.map(|(_, _, _, id)| id);
+    // Log the winning candidate's ranking factors so the "why this pane"
+    // decision is debuggable: `overlap=true` means it perpendicular-overlaps the
+    // current pane (always preferred); `primary`/`perp` are the doubled-integer
+    // primary- and perpendicular-axis distances used to rank within a group.
     log::debug!(
-        "layout: find_neighbor current_pane={}, direction={:?}, result={:?}",
+        "layout: find_neighbor current_pane={}, direction={:?}, result={:?} (overlap={:?}, primary={:?}, perp={:?})",
         current_pane,
         direction,
-        result
+        result,
+        winner.map(|(rank, ..)| rank == 0),
+        winner.map(|(_, primary, ..)| primary),
+        winner.map(|(_, _, perp, _)| perp),
     );
     result
-}
-
-/// Compute the center point of a rectangle as (x, y) in f64.
-fn rect_center(r: Rect) -> (f64, f64) {
-    (
-        f64::from(r.x) + f64::from(r.width) / 2.0,
-        f64::from(r.y) + f64::from(r.height) / 2.0,
-    )
 }
 
 /// Find the stack containing `pane_id`, returning `(stack_len, index_within_stack)`.
@@ -1628,6 +1660,140 @@ mod tests {
         assert_eq!(
             find_neighbor(&node, area, 2, FocusDirection::Up, 0),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn test_find_neighbor_grid_prefers_aligned_over_diagonal() {
+        // 3-cell Grid: cols = ceil(sqrt(3)) = 2, so the tree is
+        // Split{Horizontal, Split{Vertical, Stack0, Stack1}, Stack2}.
+        // Over 100x28 the cells are:
+        //   0 = TL (0,0,50,14), 1 = TR (50,0,50,14), 2 = BOTTOM (0,14,100,14).
+        // From TL going Right, the BOTTOM cell is euclidean-closer than TR, so a
+        // center-distance ranking would wrongly pick it. The aligned TR must win.
+        let node = GridLayout.build_tree(&[0, 1, 2], 0);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 28,
+        };
+
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Right, 0),
+            Some(1),
+            "Right from TL must reach TR, not the diagonally-closer BOTTOM"
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Down, 0),
+            Some(2)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 1, FocusDirection::Left, 0),
+            Some(0)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 1, FocusDirection::Down, 0),
+            Some(2)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 2, FocusDirection::Left, 0),
+            Some(0)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 2, FocusDirection::Right, 0),
+            Some(1)
+        );
+        // Up from BOTTOM (which overlaps both top cells) may land on either top
+        // cell; only membership is guaranteed.
+        let up = find_neighbor(&node, area, 2, FocusDirection::Up, 0);
+        assert!(
+            up == Some(0) || up == Some(1),
+            "Up from BOTTOM must reach a top cell, got {up:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_neighbor_2x2_grid() {
+        // 2x2 Grid [0,1,2,3]: TL, TR, BL, BR over 100x28.
+        //   0 = (0,0,50,14), 1 = (50,0,50,14), 2 = (0,14,50,14), 3 = (50,14,50,14).
+        let node = GridLayout.build_tree(&[0, 1, 2, 3], 0);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 28,
+        };
+
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Right, 0),
+            Some(1)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Down, 0),
+            Some(2)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 2, FocusDirection::Right, 0),
+            Some(3)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 3, FocusDirection::Up, 0),
+            Some(1)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 3, FocusDirection::Left, 0),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_find_neighbor_side_by_side_no_vertical_neighbor() {
+        // Two panes split left/right: no up/down neighbor exists.
+        let mut node = LayoutNode::new_stack(0);
+        node.split_vertical(0, 1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 28,
+        };
+
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Right, 0),
+            Some(1)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 1, FocusDirection::Left, 0),
+            Some(0)
+        );
+        assert_eq!(find_neighbor(&node, area, 0, FocusDirection::Down, 0), None);
+        assert_eq!(find_neighbor(&node, area, 0, FocusDirection::Up, 0), None);
+    }
+
+    #[test]
+    fn test_find_neighbor_stacked_no_horizontal_neighbor() {
+        // Two panes split top/bottom: no left/right neighbor exists.
+        let mut node = LayoutNode::new_stack(0);
+        node.split_horizontal(0, 1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 28,
+        };
+
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Down, 0),
+            Some(1)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 1, FocusDirection::Up, 0),
+            Some(0)
+        );
+        assert_eq!(
+            find_neighbor(&node, area, 0, FocusDirection::Right, 0),
+            None
         );
     }
 
