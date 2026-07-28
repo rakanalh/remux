@@ -2641,6 +2641,15 @@ async fn run_client_loop(
                                 views.push(crate::client::view::ClientView::new(name));
                                 let idx = views.len() - 1;
                                 active_view = Some(idx);
+                                // Entering a view detaches this connection's foreground
+                                // session so its panes stop self-counting as
+                                // "session-visible" (bug4): a cell later aliasing one of
+                                // them must stream content, not show the "Active in
+                                // session" placeholder. Guarded on a known session so the
+                                // `ViewClose` exit path can always re-attach.
+                                if current_attached.is_some() {
+                                    mgr.send_foreground(ClientMessage::Detach).await?;
+                                }
                                 // No cells yet, so nothing to subscribe. Force a
                                 // clean frame and paint the (empty) view.
                                 let (c, r) = crossterm::terminal::size()?;
@@ -2680,6 +2689,14 @@ async fn run_client_loop(
                                     // (unsubscribe its cells) so the switch shows.
                                     leave_active_view(mgr, &views, &mut active_view).await?;
                                     active_view = Some(index);
+                                    // Detach the foreground session before subscribing
+                                    // cells (bug4): otherwise a cell aliasing a pane in
+                                    // that session's active tab is counted session-
+                                    // visible by this very connection and shows the
+                                    // placeholder instead of live content.
+                                    if current_attached.is_some() {
+                                        mgr.send_foreground(ClientMessage::Detach).await?;
+                                    }
                                     renderer.resize(c, r);
                                     subscribe_view_cells(mgr, &views[index]).await?;
                                     paint_view(
@@ -2789,6 +2806,14 @@ async fn run_client_loop(
                                             views.push(crate::client::view::ClientView::new(name));
                                             let idx = views.len() - 1;
                                             active_view = Some(idx);
+                                            // Newly entering a view (the `w a` -> new
+                                            // view path): detach the foreground session
+                                            // so its panes don't self-count as
+                                            // session-visible (bug4). Guarded so
+                                            // `ViewClose` can re-attach.
+                                            if current_attached.is_some() {
+                                                mgr.send_foreground(ClientMessage::Detach).await?;
+                                            }
                                             idx
                                         }
                                     };
@@ -2902,6 +2927,16 @@ async fn run_client_loop(
                                     active_view = None;
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.resize(c, r);
+                                    // Entering the view detached the foreground session
+                                    // (bug4 fix); re-attach it now so the server resumes
+                                    // rendering it. `handle_resize` is a no-op for an
+                                    // unattached client, so without this re-attach the
+                                    // screen would stay blank on view exit.
+                                    if let Some((_, session)) = current_attached.clone() {
+                                        mgr.send_foreground(ClientMessage::Attach {
+                                            session_name: session,
+                                        }).await?;
+                                    }
                                     mgr.send_foreground(ClientMessage::Resize { cols: c, rows: r }).await?;
                                 }
                             }
