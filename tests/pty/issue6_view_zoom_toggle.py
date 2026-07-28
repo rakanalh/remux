@@ -17,6 +17,9 @@ def make_view(t):
     t.send(f"printf '{A}\\n'\r", 0.5)
     t.prefix(b"pv", 0.6)
     t.send(f"printf '{B}\\n'\r", 0.5)
+    # Background tab so A/B are NOT "session-visible" (else the cells show the
+    # "● Active in session" placeholder instead of the live A/B content).
+    t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
     t.prefix(b"xm", 0.7)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)
     t.send("j", 0.2); t.send(" ", 0.3)

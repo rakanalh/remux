@@ -14,6 +14,11 @@ def make_view(t):
     t.send(f"printf '{A}\\n'\r", 0.5)
     t.prefix(b"pv", 0.6)
     t.send(f"printf '{B}\\n'\r", 0.5)
+    # Move A/B into a BACKGROUND tab so they are NOT "session-visible" (their
+    # session's active tab becomes the new empty Tab 2). A session-visible pane
+    # renders the "● Active in session" placeholder in its cell instead of live
+    # content; this harness asserts live content, so the panes must be backgrounded.
+    t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
     t.prefix(b"xm", 0.7)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1
     t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 1

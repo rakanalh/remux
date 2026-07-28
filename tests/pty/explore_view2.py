@@ -7,6 +7,9 @@ t.send("clear\r", 0.4)
 t.send("printf 'AAAA_marker_one\\n'\r", 0.5)
 t.prefix(b"pv", 0.6)
 t.send("printf 'BBBB_marker_two\\n'\r", 0.5)
+# Background tab so A/B are not session-visible (cells show content, not the
+# "Active in session" placeholder).
+t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
 t.prefix(b"xm", 0.7)
 
 # Navigate to Tab 1 row and expand it. Selected starts on 'local' (row 0).

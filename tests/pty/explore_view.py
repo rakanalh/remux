@@ -14,6 +14,9 @@ t.dump("after A content")
 t.prefix(b"pv", 0.6)
 t.send("printf 'BBBB_marker_two\\n'\r", 0.5)
 t.dump("after split + B content")
+# Background tab so A/B are not session-visible (cells show content, not the
+# "Active in session" placeholder).
+t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
 
 # Open session manager (Ctrl-a x m).
 t.prefix(b"xm", 0.7)

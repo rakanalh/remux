@@ -38,6 +38,9 @@ def main():
     t.send("clear\r", 0.3)
     t.send("for i in $(seq 1 200); do echo LINE_$i; done\r", 1.2)
     t.pump(0.6)
+    # Background tab so the pane is NOT "session-visible" (else its cell shows the
+    # "● Active in session" placeholder instead of the live content dragged here).
+    t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
     # 1-cell view over this pane.
     t.prefix(b"xm", 0.7)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)

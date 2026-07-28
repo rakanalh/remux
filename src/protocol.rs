@@ -261,6 +261,15 @@ pub enum ServerMessage {
         session_name: String,
         #[serde(default)]
         tab_name: String,
+        /// Whether the source pane is currently "session-visible" -- shown in the
+        /// active tab of at least one attached client, so its real session drives
+        /// it at full size. A View cell whose pane is session-visible renders an
+        /// "Active in session" placeholder instead of the (full-size) streamed
+        /// content and imposes no size demand. `#[serde(default)]` (false) keeps
+        /// the message decodable from an older peer that omits it -- the safe
+        /// direction (treat as not-visible = stream content as before).
+        #[serde(default)]
+        session_visible: bool,
     },
 }
 

@@ -829,7 +829,13 @@ async fn subscribe_view_cells(
                             pane_id: cell.pane_id,
                             cols,
                             rows,
-                            size_demand: i == view.focused,
+                            // Only the focused cell demands a size (Model B), and
+                            // never when its pane is session-visible: that pane is
+                            // driven full-size by its real session and the cell
+                            // shows the "Active in session" placeholder, so it must
+                            // impose no constraint (matches the server, which
+                            // ignores the demand for a session-visible pane anyway).
+                            size_demand: i == view.focused && !cell.is_session_visible(),
                         },
                     )
                     .await
@@ -1121,11 +1127,15 @@ async fn handle_view_command(
         RemuxCommand::SendKey(bytes) => {
             // Route raw bytes to the focused cell by identity (never the
             // foreground). Best-effort, matching the crash-safe input path.
+            // A session-visible cell shows a placeholder, not the pane's live
+            // content, so raw input is suppressed (the pane is driven by its real
+            // session); view-management shortcuts still act on the view because
+            // they are separate commands handled above, not `SendKey`.
             let focused = views[av].focused;
             let target = views[av]
                 .cells
                 .get(focused)
-                .filter(|c| !c.disconnected)
+                .filter(|c| !c.disconnected && !c.is_session_visible())
                 .map(|c| (c.conn.clone(), c.pane_id));
             if let Some((conn, pane_id)) = target {
                 if let Err(e) = mgr
@@ -1365,12 +1375,15 @@ async fn run_client_loop(
                                     // fails (torn-down remote writer) is best-effort:
                                     // mark the cell disconnected and repaint, never
                                     // propagate -- a keystroke must never exit the
-                                    // client.
+                                    // client. A session-visible cell also drops raw
+                                    // text: it shows a placeholder and the pane is
+                                    // driven by its real session (view-management
+                                    // shortcuts go through the command path, not here).
                                     let focused = views[av].focused;
                                     let target = views[av]
                                         .cells
                                         .get(focused)
-                                        .filter(|c| !c.disconnected)
+                                        .filter(|c| !c.disconnected && !c.is_session_visible())
                                         .map(|c| (c.conn.clone(), c.pane_id));
                                     if let Some((conn, pane_id)) = target {
                                         if let Err(e) = mgr
@@ -3781,6 +3794,7 @@ async fn run_client_loop(
                         application_cursor_keys,
                         session_name: pc_session,
                         tab_name: pc_tab,
+                        session_visible,
                     }) => {
                         // Note: `pane_cols`/`pane_rows` are the PANE's size, not
                         // the terminal's; do not confuse them with the loop's
@@ -3796,6 +3810,7 @@ async fn run_client_loop(
                             cursor_y,
                             cursor_visible,
                             application_cursor_keys,
+                            session_visible,
                         };
                         // Cell title = `session / tab`, host-prefixed for a remote
                         // source (`host: session / tab`). Empty session ⇒ the pane
@@ -3811,9 +3826,16 @@ async fn run_client_loop(
                             })
                         };
                         let mut active_touched = false;
+                        // A cell in the active view whose session-visibility just
+                        // flipped needs a re-subscribe: entering visibility drops
+                        // its size demand, and LEAVING it must re-assert the demand
+                        // so the pane reflows to the cell (else the cell would show
+                        // clipped full-size content instead of cell-sized content).
+                        let mut active_visibility_flipped = false;
                         for (vi, view) in views.iter_mut().enumerate() {
                             for cell in view.cells.iter_mut() {
                                 if cell.conn == src && cell.pane_id == pane_id {
+                                    let was_visible = cell.is_session_visible();
                                     // Clone per match: the same pane can be
                                     // aliased by more than one cell/view. A fresh
                                     // snapshot means the source is live again.
@@ -3824,8 +3846,19 @@ async fn run_client_loop(
                                     }
                                     if active_view == Some(vi) {
                                         active_touched = true;
+                                        if was_visible != session_visible {
+                                            active_visibility_flipped = true;
+                                        }
                                     }
                                 }
+                            }
+                        }
+                        if active_visibility_flipped {
+                            if let Some(av) = active_view {
+                                // Re-subscribe the whole active view so the flipped
+                                // cell's size_demand is recomputed (see
+                                // `subscribe_view_cells`).
+                                subscribe_view_cells(mgr, &views[av]).await?;
                             }
                         }
                         if active_touched {

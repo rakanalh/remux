@@ -33,6 +33,11 @@ def main():
     t.send("for i in $(seq 1 200); do echo LINE_$i; done\r", 1.2)
     t.pump(0.6)
 
+    # Move this pane into a BACKGROUND tab so it is NOT "session-visible" (a
+    # session-visible pane renders the "● Active in session" placeholder in its
+    # cell instead of the live, cell-sized content this harness scrolls/asserts).
+    t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
+
     # Build a 1-cell view over this pane.
     t.prefix(b"xm", 0.7)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1

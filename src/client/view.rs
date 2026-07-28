@@ -52,18 +52,30 @@ pub struct PaneSnapshot {
     pub cursor_visible: bool,
     /// The source pane's DECCKM state, used to encode input to a focused cell.
     pub application_cursor_keys: bool,
+    /// Whether the source pane is currently "session-visible" -- shown in the
+    /// active tab of at least one attached client, so its real session drives it
+    /// at full size. When `true`, the cell renders an "Active in session"
+    /// placeholder instead of this (full-size) content, and sends no size demand.
+    pub session_visible: bool,
 }
 
 /// One cell of a view: a reference to a real pane on a specific connection,
 /// plus the most recent snapshot received for it (`None` until the first
 /// `PaneContent` arrives).
 ///
-/// A cell has three observable states, distinguished without a separate enum:
+/// A cell has four observable states, distinguished without a separate enum:
 /// - **waiting**: `snapshot == None && !disconnected` — subscribed but no
 ///   `PaneContent` has arrived yet (shows `waiting for <title>…`).
-/// - **live**: `snapshot == Some(_)` — compositing the latest snapshot.
+/// - **active-in-session**: latest snapshot's `session_visible == true` — the
+///   source pane is shown full-size in its real session, so the cell shows an
+///   `● Active in <title>` placeholder instead of the streamed content and sends
+///   no size demand (see [`ViewCell::is_session_visible`]).
+/// - **live**: `snapshot == Some(_)` and not session-visible — compositing the
+///   latest snapshot.
 /// - **disconnected**: `disconnected == true` — the source connection dropped
 ///   (or a send to it failed); shows `disconnected` and takes no more input.
+///
+/// No state ever renders blank: each has a placeholder or content.
 #[derive(Debug, Clone)]
 pub struct ViewCell {
     /// Stable, per-view identity for this cell, assigned by
@@ -102,6 +114,18 @@ impl ViewCell {
             disconnected: false,
             title: None,
         }
+    }
+
+    /// Whether the cell's source pane is currently session-visible (its latest
+    /// snapshot reports it shown full-size in its real session). Such a cell
+    /// renders the `● Active in <title>` placeholder, sends no size demand, and
+    /// suppresses raw text input to the pane (view-management shortcuts still
+    /// act on the view). `false` while `waiting` (no snapshot yet).
+    pub fn is_session_visible(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.session_visible)
+            .unwrap_or(false)
     }
 }
 
@@ -487,6 +511,11 @@ pub fn focused_cursor(view: &ClientView, area: Rect) -> Option<(u16, u16)> {
         return None;
     }
     let snap = cell.snapshot.as_ref()?;
+    // A session-visible cell renders a placeholder, not the pane's content, so it
+    // shows no terminal cursor.
+    if snap.session_visible {
+        return None;
+    }
     if !snap.cursor_visible {
         return None;
     }
@@ -607,6 +636,13 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
     }
 
     match &cell.snapshot {
+        // The source pane is shown full-size in its real session: don't render
+        // the (full-size, un-reflowed) streamed content into this smaller cell.
+        // Show a centered placeholder naming where it's active instead.
+        Some(snap) if snap.session_visible => {
+            let label = format!("● Active in {}", cell_title(cell));
+            draw_centered(buf, ix, iy, iw, ih, &label);
+        }
         Some(snap) => {
             // Bottom-anchor: when the snapshot is taller than the interior show
             // its LAST `ih` rows; when shorter, top-align from row 0.
@@ -947,6 +983,7 @@ mod tests {
             cursor_y: 0,
             cursor_visible: false,
             application_cursor_keys: false,
+            session_visible: false,
         }
     }
 
@@ -1629,6 +1666,7 @@ mod tests {
             cursor_y: 0,
             cursor_visible: false,
             application_cursor_keys: false,
+            session_visible: false,
         };
         let view = ClientView {
             name: "v".into(),

@@ -135,6 +135,12 @@ struct PaneData {
     /// switches); without this guard each call would spawn a competing task
     /// and chunks could be processed out of order, corrupting the stream.
     forwarding_started: bool,
+    /// The `session_visible` flag last streamed to this pane's View-cell
+    /// subscribers. Tracked so a visibility flip (tab switch / attach / detach)
+    /// that does NOT change the pane's size still pushes a fresh `PaneContent`
+    /// (so cells flip live between the "Active in session" placeholder and the
+    /// streamed content), while steady state stays quiet.
+    streamed_session_visible: bool,
 }
 
 // MouseSelection is imported from compositor.
@@ -549,11 +555,21 @@ impl RemuxServer {
                     Ok(None) => {
                         log::info!("client {client_id} disconnected");
                         handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        // A hard disconnect of the client that made a pane
+                        // session-visible must flip any View cell on that pane
+                        // from the "Active in session" placeholder to live
+                        // content; the two `handle_detach` sites don't cover this.
+                        refresh_subscribed_panes(&state, &panes, &clients, &config).await;
                         break;
                     }
                     Err(e) => {
                         log::error!("error reading from client {client_id}: {e}");
                         handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        // A hard disconnect of the client that made a pane
+                        // session-visible must flip any View cell on that pane
+                        // from the "Active in session" placeholder to live
+                        // content; the two `handle_detach` sites don't cover this.
+                        refresh_subscribed_panes(&state, &panes, &clients, &config).await;
                         break;
                     }
                 }
@@ -669,6 +685,10 @@ async fn handle_client_message(
         }
         ClientMessage::Detach => {
             handle_detach(client_id, clients).await;
+            // Detaching may make this client's active-tab panes no longer
+            // session-visible; re-evaluate subscribed panes so any View cell on
+            // them flips from the "Active in session" placeholder to live content.
+            refresh_subscribed_panes(state, panes, clients, config).await;
             Ok(())
         }
         ClientMessage::Input { data } => {
@@ -854,9 +874,9 @@ async fn handle_client_message(
         } => {
             // Record the subscriber's size demand (Model A/B min-across-viewers
             // sizing), fold it into the pane's effective size, and send an
-            // immediate snapshot. `build_pane_content` acquires panes/state
+            // immediate snapshot. `build_pane_content` acquires panes/state/clients
             // independently so we never nest locks.
-            let snapshot = build_pane_content(pane_id, state, panes).await;
+            let snapshot = build_pane_content(pane_id, state, panes, clients).await;
             {
                 let mut cls = clients.lock().await;
                 if let Some(conn) = cls.get_mut(&client_id) {
@@ -952,6 +972,7 @@ async fn handle_client_message(
                     let st = state.lock().await;
                     pane_labels(&st, pane_id)
                 };
+                let session_visible = pane_session_visible(pane_id, state, clients).await;
                 let msg = ServerMessage::PaneContent {
                     pane_id,
                     cols: snap.cols,
@@ -963,6 +984,7 @@ async fn handle_client_message(
                     application_cursor_keys: snap.application_cursor_keys,
                     session_name,
                     tab_name,
+                    session_visible,
                 };
                 let cls = clients.lock().await;
                 if let Some(conn) = cls.get(&client_id) {
@@ -3640,6 +3662,7 @@ async fn spawn_pane(
             screen,
             pty_rx,
             forwarding_started: false,
+            streamed_session_visible: false,
         },
     );
     Ok(())
@@ -3658,11 +3681,22 @@ async fn resize_session_panes(
     if rects.is_empty() {
         return Ok(());
     }
-    // Fold in every View-cell size demand BEFORE touching the panes lock, so we
-    // never nest clients under panes. A subscribed cell smaller than the home
-    // allotment shrinks the pane to it (Model A: the honest shared pane reflows
-    // everywhere it is shown).
-    let sub_mins = {
+    // Whether this session has an attached client viewing it. Its active-tab
+    // panes (the `rects` here) are then "session-visible": driven at full size by
+    // the real session, so View-cell size demands are IGNORED for them (a cell
+    // shows the "Active in session" placeholder instead of shrinking the pane).
+    // Only when NO client is attached does a View cell drive a background pane's
+    // size (the honest shared-pane reflow), so fold demands in only then.
+    let has_client = {
+        let cls = clients.lock().await;
+        cls.values()
+            .any(|c| c.session_name.as_deref() == Some(session_name))
+    };
+    let sub_mins = if has_client {
+        HashMap::new()
+    } else {
+        // Fold in every View-cell size demand BEFORE touching the panes lock, so
+        // we never nest clients under panes.
         let cls = clients.lock().await;
         let mut m: HashMap<PaneId, (u16, u16)> = HashMap::new();
         for (pane_id, _, _) in &rects {
@@ -3673,24 +3707,31 @@ async fn resize_session_panes(
         m
     };
 
-    let mut ps = panes.lock().await;
-    for (pane_id, content_cols, content_rows) in rects {
-        if let Some(pane_data) = ps.get_mut(&pane_id) {
-            let (mut cols, mut rows) = (content_cols, content_rows);
-            if let Some((sc, sr)) = sub_mins.get(&pane_id) {
-                cols = cols.min(*sc);
-                rows = rows.min(*sr);
+    {
+        let mut ps = panes.lock().await;
+        for (pane_id, content_cols, content_rows) in rects {
+            if let Some(pane_data) = ps.get_mut(&pane_id) {
+                let (mut cols, mut rows) = (content_cols, content_rows);
+                if let Some((sc, sr)) = sub_mins.get(&pane_id) {
+                    cols = cols.min(*sc);
+                    rows = rows.min(*sr);
+                }
+                let inner_cols = cols.max(1);
+                let inner_rows = rows.max(1);
+                log::debug!(
+                    "resize_session_panes: pane_id={}, content={}x{}, pty/screen resize to cols={} rows={}",
+                    pane_id, content_cols, content_rows, inner_cols, inner_rows
+                );
+                let _ = pane_data.pty.resize(inner_cols, inner_rows);
+                pane_data.screen.resize(inner_cols, inner_rows);
             }
-            let inner_cols = cols.max(1);
-            let inner_rows = rows.max(1);
-            log::debug!(
-                "resize_session_panes: pane_id={}, content={}x{}, pty/screen resize to cols={} rows={}",
-                pane_id, content_cols, content_rows, inner_cols, inner_rows
-            );
-            let _ = pane_data.pty.resize(inner_cols, inner_rows);
-            pane_data.screen.resize(inner_cols, inner_rows);
         }
     }
+    // A resize can change active-tab membership / attachment for this or other
+    // sessions (tab switch, attach), flipping which subscribed panes are
+    // session-visible; re-evaluate every subscribed pane so cells that just
+    // gained or lost visibility flip live. Cheap: only live View cells subscribe.
+    refresh_subscribed_panes(state, panes, clients, _config).await;
     Ok(())
 }
 
@@ -3775,6 +3816,42 @@ fn subscriber_min_demand_locked(
     out
 }
 
+/// Whether `pane_id` is "session-visible": present in the ACTIVE TAB of at least
+/// one attached client's session. View-cell subscriptions do NOT count -- they
+/// key off `subscribed_panes`, not `session_name`. A session-visible pane is
+/// driven at full size by its real session, so a View cell must neither shrink
+/// it nor render its streamed content (the cell shows an "Active in session"
+/// placeholder instead). This is the message-facing companion of
+/// [`pane_home_allotment`]: it uses the same active-tab-membership + attachment
+/// test, but is independent of layout rect availability (e.g. under zoom a
+/// non-focused active-tab pane has no home rect yet is still session-visible),
+/// so the two never disagree about visibility.
+async fn pane_session_visible(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> bool {
+    let session_name = {
+        let st = state.lock().await;
+        st.sessions
+            .values()
+            .find(|sess| {
+                sess.tabs
+                    .get(sess.active_tab)
+                    .map(|t| t.pane_order.contains(&pane_id))
+                    .unwrap_or(false)
+            })
+            .map(|s| s.name.clone())
+    };
+    let session_name = match session_name {
+        Some(s) => s,
+        None => return false,
+    };
+    let cls = clients.lock().await;
+    cls.values()
+        .any(|c| c.session_name.as_deref() == Some(session_name.as_str()))
+}
+
 /// The pane's home allotment (its size from any attached client viewing the
 /// session's active tab), or `None` when the pane is not visible on any
 /// attached client (background tab, or a session with no attached client). Such
@@ -3829,47 +3906,67 @@ async fn recompute_pane_size(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     _config: &Arc<Config>,
 ) {
+    // A session-visible pane is driven at full size by its real session, so its
+    // View-cell subscriptions are treated as size_demand:false regardless -- the
+    // cell shows an "Active in session" placeholder and imposes no constraint.
+    let session_visible = pane_session_visible(pane_id, state, clients).await;
     let home = pane_home_allotment(pane_id, state, clients).await;
-    let sub = {
+    let sub = if session_visible {
+        None
+    } else {
         let cls = clients.lock().await;
         subscriber_min_demand_locked(&cls, pane_id)
     };
+    // Effective size = home when session-visible (demand ignored), else the
+    // componentwise min of home and the sized demand. `None` when nothing
+    // constrains the pane (a non-visible watch-only cell, or a session-visible
+    // pane with no home rect under zoom) -- leave the pane untouched then.
     let effective = match (home, sub) {
         (Some((hc, hr)), Some((sc, sr))) => Some((hc.min(sc), hr.min(sr))),
         (Some(h), None) => Some(h),
         (None, Some(s)) => Some(s),
         (None, None) => None,
     };
-    let (ec, er) = match effective {
-        Some(e) => (e.0.max(1), e.1.max(1)),
-        None => return,
+    // Resize only if a size constraint exists and it actually changed, to avoid
+    // needless PTY churn / SIGWINCH.
+    let resized = if let Some((ec, er)) = effective.map(|(c, r)| (c.max(1), r.max(1))) {
+        let mut ps = panes.lock().await;
+        match ps.get_mut(&pane_id) {
+            Some(pd) if pd.screen.cols != ec || pd.screen.rows != er => {
+                log::debug!(
+                    "recompute_pane_size: pane_id={pane_id} {}x{} -> {ec}x{er}",
+                    pd.screen.cols,
+                    pd.screen.rows
+                );
+                let _ = pd.pty.resize(ec, er);
+                pd.screen.resize(ec, er);
+                true
+            }
+            _ => false,
+        }
+    } else {
+        false
     };
-    // Resize only if it actually changed, to avoid needless PTY churn / SIGWINCH.
-    let changed = {
+    // Detect a session-visibility flip since the last stream, so a tab
+    // switch / attach / detach that changes visibility WITHOUT changing size
+    // still pushes a fresh PaneContent and the cell flips live.
+    let visibility_changed = {
         let mut ps = panes.lock().await;
         match ps.get_mut(&pane_id) {
             Some(pd) => {
-                if pd.screen.cols == ec && pd.screen.rows == er {
-                    false
-                } else {
-                    log::debug!(
-                        "recompute_pane_size: pane_id={pane_id} {}x{} -> {ec}x{er}",
-                        pd.screen.cols,
-                        pd.screen.rows
-                    );
-                    let _ = pd.pty.resize(ec, er);
-                    pd.screen.resize(ec, er);
-                    true
-                }
+                let changed = pd.streamed_session_visible != session_visible;
+                pd.streamed_session_visible = session_visible;
+                changed
             }
             None => false,
         }
     };
-    if changed {
-        // Re-stream the reflowed snapshot to every subscriber right away, so a
-        // cell that shrank a pane sees the rewrapped content without waiting for
-        // the next PTY output.
-        if let Some(msg) = build_pane_content(pane_id, state, panes).await {
+    if resized || visibility_changed {
+        // Re-stream the snapshot (with the current session_visible flag) to every
+        // subscriber right away, so a cell that reflowed a pane -- or whose pane
+        // just flipped visibility -- updates without waiting for the next PTY
+        // output.
+        if let Some(msg) = build_pane_content(pane_id, state, panes, clients).await {
             let cls = clients.lock().await;
             for conn in cls.values() {
                 if conn.subscribed_panes.contains_key(&pane_id) {
@@ -3877,6 +3974,34 @@ async fn recompute_pane_size(
                 }
             }
         }
+    }
+}
+
+/// Re-evaluate every currently-subscribed pane's effective size and
+/// session-visibility, pushing a fresh `PaneContent` to its subscribers when
+/// either changed (via [`recompute_pane_size`]). Called after any event that can
+/// change active-tab membership or client attachment (tab switch, attach,
+/// detach, disconnect) but does NOT itself resize the pane -- so View cells flip
+/// promptly between live content and the "Active in session" placeholder. The
+/// subscribed set is only the live View cells, so this is cheap.
+async fn refresh_subscribed_panes(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) {
+    let pane_ids: Vec<PaneId> = {
+        let cls = clients.lock().await;
+        let mut set = std::collections::HashSet::new();
+        for conn in cls.values() {
+            for pid in conn.subscribed_panes.keys() {
+                set.insert(*pid);
+            }
+        }
+        set.into_iter().collect()
+    };
+    for pid in pane_ids {
+        recompute_pane_size(pid, state, panes, clients, config).await;
     }
 }
 
@@ -3932,6 +4057,7 @@ async fn build_pane_content(
     pane_id: PaneId,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 ) -> Option<ServerMessage> {
     let snap = {
         let ps = panes.lock().await;
@@ -3942,6 +4068,7 @@ async fn build_pane_content(
         let st = state.lock().await;
         pane_labels(&st, pane_id)
     };
+    let session_visible = pane_session_visible(pane_id, state, clients).await;
     Some(ServerMessage::PaneContent {
         pane_id,
         cols: snap.cols,
@@ -3953,6 +4080,7 @@ async fn build_pane_content(
         application_cursor_keys: snap.application_cursor_keys,
         session_name,
         tab_name,
+        session_visible,
     })
 }
 
@@ -4983,7 +5111,9 @@ async fn start_pty_forwarding(
                                 .any(|c| c.subscribed_panes.contains_key(&pane_id))
                         };
                         if has_subscriber {
-                            if let Some(msg) = build_pane_content(pane_id, &state, &panes).await {
+                            if let Some(msg) =
+                                build_pane_content(pane_id, &state, &panes, &clients).await
+                            {
                                 let cls = clients.lock().await;
                                 for conn in cls.values() {
                                     if conn.subscribed_panes.contains_key(&pane_id) {
@@ -5267,7 +5397,9 @@ async fn materialize_session(
                                 .any(|c| c.subscribed_panes.contains_key(&pane_id))
                         };
                         if has_subscriber {
-                            if let Some(msg) = build_pane_content(pane_id, &state, &panes).await {
+                            if let Some(msg) =
+                                build_pane_content(pane_id, &state, &panes, &clients).await
+                            {
                                 let cls = clients.lock().await;
                                 for conn in cls.values() {
                                     if conn.subscribed_panes.contains_key(&pane_id) {
