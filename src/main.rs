@@ -2932,6 +2932,91 @@ async fn run_client_loop(
                                         )?;
                                     }
                                 }
+                            } else if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown =
+                                mouse.kind
+                            {
+                                // The wheel scrolls the cell under the pointer (or the
+                                // focused cell if the pointer is off any cell) through
+                                // its source pane's scrollback, by identity -- NOT the
+                                // masked foreground session. The server keeps a
+                                // per-(client, pane) offset and streams a fresh
+                                // `PaneContent` rendered at it.
+                                let (c, r) = crossterm::terminal::size()?;
+                                let area = crate::server::layout::Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width: c,
+                                    height: r,
+                                };
+                                let target = crate::client::view::cell_at(
+                                    &views[av],
+                                    area,
+                                    mouse.column,
+                                    mouse.row,
+                                )
+                                .unwrap_or(views[av].focused);
+                                if let Some(cell) = views[av].cells.get(target) {
+                                    let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                                    mgr.send(
+                                        &cell.conn,
+                                        ClientMessage::ScrollPane {
+                                            pane_id: cell.pane_id,
+                                            up,
+                                            lines: 3,
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            } else if let MouseEventKind::Drag(MouseButton::Left) = mouse.kind {
+                                // Views have no server-side selection, but a drag
+                                // that reaches a cell's top/bottom content edge
+                                // autoscrolls that cell's source pane (like the
+                                // wheel in #2) so the user can pull history into
+                                // view while dragging -- the normal-session
+                                // drag-autoscroll analog for a View cell.
+                                let (c, r) = crossterm::terminal::size()?;
+                                let area = crate::server::layout::Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width: c,
+                                    height: r,
+                                };
+                                let rects = crate::client::view::cell_rects(&views[av], area);
+                                let idx = crate::client::view::cell_at(
+                                    &views[av],
+                                    area,
+                                    mouse.column,
+                                    mouse.row,
+                                )
+                                .unwrap_or(views[av].focused);
+                                if let (Some(Some(rect)), Some(cell)) =
+                                    (rects.get(idx), views[av].cells.get(idx))
+                                {
+                                    // Interior content rows (inside the 1-cell
+                                    // border). Only the top/bottom content edges
+                                    // trigger an autoscroll step.
+                                    let top_edge = rect.y.saturating_add(1);
+                                    let bot_edge =
+                                        rect.y.saturating_add(rect.height).saturating_sub(2);
+                                    let up = if mouse.row <= top_edge {
+                                        Some(true)
+                                    } else if mouse.row >= bot_edge {
+                                        Some(false)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(up) = up {
+                                        mgr.send(
+                                            &cell.conn,
+                                            ClientMessage::ScrollPane {
+                                                pane_id: cell.pane_id,
+                                                up,
+                                                lines: 1,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
                             continue;
                         }

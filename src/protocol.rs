@@ -12,7 +12,7 @@ pub type PaneId = u64;
 
 /// The wire protocol version. Bump when a breaking change is made to the
 /// framed message shapes exchanged between client and server.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -135,6 +135,17 @@ pub enum ClientMessage {
     /// explicitly -- this is what a focused View cell uses to type into the
     /// real pane it aliases, wherever that pane actually lives.
     InputToPane { pane_id: PaneId, data: Vec<u8> },
+    /// Scroll a subscribed pane's own scroll view by `lines` (per-subscriber,
+    /// by pane identity), independent of this client's foreground scroll. Used
+    /// by a View cell's mouse wheel: the server adjusts a per-(client, pane)
+    /// scroll offset, clamps it to the pane's scrollback, and streams a fresh
+    /// `PaneContent` rendered at that offset back to this client only. `up`
+    /// scrolls back into history, `!up` forward toward the live view.
+    ScrollPane {
+        pane_id: PaneId,
+        up: bool,
+        lines: u16,
+    },
 }
 
 // ---------------------------------------------------------------------------

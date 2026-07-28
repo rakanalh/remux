@@ -1,0 +1,95 @@
+"""Reusable real-PTY harness for the Remux client TUI.
+
+Drives the actual client binary through a pseudo-terminal (pexpect) and reads
+the rendered screen with pyte. Spins up an isolated throwaway server (the client
+auto-spawns it) with its own XDG dirs and a short socket path.
+"""
+import os, shutil, time, pexpect, pyte
+
+BIN = os.path.abspath("target/debug/remux")
+PREFIX = b"\x01"  # Ctrl-a
+
+
+class Tui:
+    def __init__(self, rundir, cols=120, rows=40):
+        self.rundir = rundir
+        self.cols = cols
+        self.rows = rows
+        self.child = None
+
+    def start(self):
+        shutil.rmtree(self.rundir, ignore_errors=True)
+        for s in ("run", "state", "data", "config"):
+            os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
+        env = {
+            **os.environ,
+            "XDG_RUNTIME_DIR": f"{self.rundir}/run",
+            "XDG_STATE_HOME": f"{self.rundir}/state",
+            "XDG_DATA_HOME": f"{self.rundir}/data",
+            "XDG_CONFIG_HOME": f"{self.rundir}/config",
+            "SHELL": "/bin/sh",
+            "ENV": "/dev/null",
+            "TERM": "xterm-256color",
+            "PS1": "$ ",
+            "REMUX_ALLOW_NESTED": "1",
+        }
+        self.screen = pyte.Screen(self.cols, self.rows)
+        self.stream = pyte.ByteStream(self.screen)
+        self.child = pexpect.spawn(
+            BIN, [], env=env, dimensions=(self.rows, self.cols), encoding=None,
+        )
+        self.pump(1.2)
+        return self
+
+    def pump(self, t=0.5):
+        end = time.time() + t
+        while time.time() < end:
+            try:
+                data = self.child.read_nonblocking(65536, 0.1)
+                if data:
+                    self.stream.feed(data)
+            except Exception:
+                pass
+
+    def rows_text(self):
+        return self.screen.display
+
+    def dump(self, label=""):
+        print(f"----- screen {label} -----")
+        for i, r in enumerate(self.rows_text()):
+            print(f"{i:2} |{r.rstrip()}")
+        print("-------------------------")
+
+    def send(self, data, t=0.4):
+        if isinstance(data, str):
+            data = data.encode()
+        self.child.send(data)
+        self.pump(t)
+
+    def prefix(self, keys, t=0.4):
+        """Send Ctrl-a then the given key bytes."""
+        self.child.send(PREFIX)
+        time.sleep(0.15)
+        self.send(keys, t)
+
+    def alive(self):
+        return self.child.isalive()
+
+    def kill(self):
+        try:
+            self.child.terminate(force=True)
+        except Exception:
+            pass
+
+    def log(self, which="client"):
+        p = f"{self.rundir}/state/remux/{which}.log"
+        return open(p).read() if os.path.exists(p) else ""
+
+    def find_row(self, needle):
+        for i, r in enumerate(self.rows_text()):
+            if needle in r:
+                return i
+        return -1
+
+    def has(self, needle):
+        return any(needle in r for r in self.rows_text())

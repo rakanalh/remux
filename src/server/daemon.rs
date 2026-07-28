@@ -153,6 +153,14 @@ struct DragSession {
     anchor_col: u16,
     /// Anchor row as a stable absolute line id.
     anchor_abs: usize,
+    /// The moving end of the selection, in the same absolute, eviction-stable
+    /// coordinates as the anchor. Persisted (unlike the old per-call local) so a
+    /// wheel-scroll during the drag can extend the selection to the newly
+    /// revealed edge without a fresh mouse event -- keeping the highlight and the
+    /// yankable range derived from one absolute range.
+    end_abs: usize,
+    /// The moving end's column in the pane's content area.
+    end_col: u16,
 }
 
 /// A connected client with metadata about which session it is attached to.
@@ -195,6 +203,11 @@ struct ClientConnection {
     /// snapshot on subscribe and on every change, regardless of which
     /// session/tab this client has in the foreground.
     subscribed_panes: std::collections::HashMap<PaneId, Option<(u16, u16)>>,
+    /// Per-(this client, pane) scroll offset into a subscribed pane's scrollback,
+    /// driven by `ScrollPane` (a View cell's mouse wheel). Independent of the
+    /// foreground `scroll_offset` and of other clients viewing the same pane.
+    /// `0`/absent = live view. Cleared on `UnsubscribePane` and pane close.
+    pane_scroll: std::collections::HashMap<PaneId, usize>,
 }
 
 /// The Remux server.
@@ -474,6 +487,7 @@ impl RemuxServer {
                     drag: None,
                     autoscroll_repeat: None,
                     subscribed_panes: std::collections::HashMap::new(),
+                    pane_scroll: std::collections::HashMap::new(),
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -852,6 +866,9 @@ async fn handle_client_message(
                         None
                     };
                     conn.subscribed_panes.insert(pane_id, demand);
+                    // A fresh (re)subscribe snaps the cell back to the live view;
+                    // the immediate snapshot below is rendered at offset 0.
+                    conn.pane_scroll.remove(&pane_id);
                     if let Some(msg) = snapshot {
                         let _ = conn.tx.send(msg);
                     }
@@ -867,6 +884,7 @@ async fn handle_client_message(
                 let mut cls = clients.lock().await;
                 if let Some(conn) = cls.get_mut(&client_id) {
                     conn.subscribed_panes.remove(&pane_id);
+                    conn.pane_scroll.remove(&pane_id);
                 }
             }
             // Dropping a viewer may let the pane grow back; recompute.
@@ -885,6 +903,70 @@ async fn handle_client_message(
             if let Some(pane_data) = ps.get(&pane_id) {
                 if let Err(e) = pane_data.pty.write_input(&data) {
                     log::warn!("server: InputToPane pane_id={pane_id} write failed: {e}");
+                }
+            }
+            Ok(())
+        }
+        ClientMessage::ScrollPane { pane_id, up, lines } => {
+            // Per-(client, pane) scrollback for a View cell. Clamp to the pane's
+            // max scroll offset, render a snapshot at the new offset, and send it
+            // to THIS client only -- the offset is per-subscriber.
+            let max_off = {
+                let ps = panes.lock().await;
+                match ps.get(&pane_id) {
+                    Some(pd) => pd.screen.max_scroll_offset(),
+                    // Pane gone: nothing to scroll.
+                    None => return Ok(()),
+                }
+            };
+            let new_off = {
+                let mut cls = clients.lock().await;
+                match cls.get_mut(&client_id) {
+                    // Only a subscribed client may scroll a pane it watches.
+                    Some(conn) if conn.subscribed_panes.contains_key(&pane_id) => {
+                        let cur = conn.pane_scroll.get(&pane_id).copied().unwrap_or(0);
+                        let next = if up {
+                            (cur + lines as usize).min(max_off)
+                        } else {
+                            cur.saturating_sub(lines as usize)
+                        };
+                        if next == 0 {
+                            conn.pane_scroll.remove(&pane_id);
+                        } else {
+                            conn.pane_scroll.insert(pane_id, next);
+                        }
+                        next
+                    }
+                    _ => return Ok(()),
+                }
+            };
+            // Render at the new offset and stream to this client only.
+            let snap = {
+                let ps = panes.lock().await;
+                ps.get(&pane_id).map(|pd| {
+                    crate::server::compositor::render_pane_snapshot_at(&pd.screen, new_off)
+                })
+            };
+            if let Some(snap) = snap {
+                let (session_name, tab_name) = {
+                    let st = state.lock().await;
+                    pane_labels(&st, pane_id)
+                };
+                let msg = ServerMessage::PaneContent {
+                    pane_id,
+                    cols: snap.cols,
+                    rows: snap.rows,
+                    cells: snap.cells,
+                    cursor_x: snap.cursor_x,
+                    cursor_y: snap.cursor_y,
+                    cursor_visible: snap.cursor_visible,
+                    application_cursor_keys: snap.application_cursor_keys,
+                    session_name,
+                    tab_name,
+                };
+                let cls = clients.lock().await;
+                if let Some(conn) = cls.get(&client_id) {
+                    let _ = conn.tx.send(msg);
                 }
             }
             Ok(())
@@ -2735,28 +2817,29 @@ async fn handle_scroll_delta(
     } else {
         old_offset.saturating_sub((-delta) as usize)
     };
-    // Clamp to max scrollable range
-    let max_offset = if let Some(ref sn) = session_name {
-        let focused_pane_id = {
+    // The focused pane owns this client's scroll offset (and any active
+    // selection). Resolved once, reused for the clamp and the selection-extend.
+    let focused_pane_id = match &session_name {
+        Some(sn) => {
             let st = state.lock().await;
             st.sessions
                 .get(sn)
                 .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
-        };
-        if let Some(fp) = focused_pane_id {
-            let ps = panes.lock().await;
-            // Clamp against the focused pane's inner grid height
-            // (screen.rows == grid.len()), which is exactly the number of content
-            // rows blit_screen draws for the pane. Using the client terminal rows
-            // here would over-subtract (it ignores the status bar and pane
-            // borders), leaving the earliest scrollback lines unreachable at max
-            // scroll.
-            ps.get(&fp)
-                .map(|p| p.screen.max_scroll_offset())
-                .unwrap_or(0)
-        } else {
-            0
         }
+        None => None,
+    };
+    // Clamp to max scrollable range
+    let max_offset = if let Some(fp) = focused_pane_id {
+        let ps = panes.lock().await;
+        // Clamp against the focused pane's inner grid height
+        // (screen.rows == grid.len()), which is exactly the number of content
+        // rows blit_screen draws for the pane. Using the client terminal rows
+        // here would over-subtract (it ignores the status bar and pane
+        // borders), leaving the earliest scrollback lines unreachable at max
+        // scroll.
+        ps.get(&fp)
+            .map(|p| p.screen.max_scroll_offset())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -2770,6 +2853,16 @@ async fn handle_scroll_delta(
         if let Some(client) = cls.get_mut(&client_id) {
             client.scroll_offset = clamped;
             client.needs_full_render = true;
+        }
+    }
+    // If a mouse drag-selection is active on the focused pane, extend it to the
+    // newly revealed edge so a scroll (mouse wheel or keyboard) grows the
+    // selection to cover the scrolled-into text -- mirroring drag-autoscroll. The
+    // anchor stays pinned in absolute coords; the moving end follows the scroll,
+    // and both the highlight and the yankable range derive from that one range.
+    if changed {
+        if let Some(fp) = focused_pane_id {
+            extend_selection_on_scroll(client_id, fp, delta > 0, clamped, panes, clients).await;
         }
     }
     // Only render if the offset actually changed (skip at boundary).
@@ -2788,6 +2881,74 @@ async fn handle_scroll_delta(
         }
     }
     Ok(())
+}
+
+/// Extend an active mouse drag-selection to the edge revealed by a scroll, so a
+/// wheel/keyboard scroll while a selection is live grows it to cover the
+/// scrolled-into text (mirroring drag-autoscroll). `up` is the scroll direction
+/// (`true` = back into history, revealing the TOP edge). The anchor is left
+/// pinned in absolute coords; only the moving end (`DragSession::end_abs`) and
+/// the re-projected `MouseSelection` are updated. A no-op unless the client has a
+/// drag gesture on `pane_id`. Locks `clients` then `panes` then `clients` again,
+/// never nested, matching the surrounding lock discipline.
+async fn extend_selection_on_scroll(
+    client_id: u64,
+    pane_id: PaneId,
+    up: bool,
+    new_offset: usize,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    // Read the anchor of any active drag on this pane.
+    let anchor = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id).and_then(|c| c.drag.as_ref()) {
+            Some(d) if d.pane_id == pane_id => Some((d.anchor_col, d.anchor_abs)),
+            _ => None,
+        }
+    };
+    let (anchor_col, anchor_abs) = match anchor {
+        Some(a) => a,
+        None => return,
+    };
+    // Project the anchor and the revealed edge into the new viewport using the
+    // pane's own geometry (rows/cols == the pane's content area).
+    let projected = {
+        let ps = panes.lock().await;
+        ps.get(&pane_id).map(|pd| {
+            let screen = &pd.screen;
+            let rows = screen.rows;
+            let cols = screen.cols;
+            // The moving end pins to the revealed edge: top row when scrolling
+            // back, bottom row when scrolling forward.
+            let end_row = if up { 0 } else { rows.saturating_sub(1) };
+            let end_col = if up { 0 } else { cols.saturating_sub(1) };
+            let end_abs = screen.abs_of_row(new_offset, end_row);
+            let anchor_row = screen
+                .row_of_abs(new_offset, anchor_abs)
+                .clamp(0, rows.saturating_sub(1) as i64) as u16;
+            (end_row, end_col, end_abs, anchor_row)
+        })
+    };
+    let (end_row, end_col, end_abs, anchor_row) = match projected {
+        Some(v) => v,
+        None => return,
+    };
+    // Commit the new end (absolute) and the re-projected viewport selection.
+    let mut cls = clients.lock().await;
+    if let Some(client) = cls.get_mut(&client_id) {
+        if let Some(d) = client.drag.as_mut() {
+            if d.pane_id == pane_id {
+                d.end_abs = end_abs;
+                d.end_col = end_col;
+            }
+        }
+        client.mouse_selection = Some(MouseSelection {
+            pane_id,
+            start: (anchor_col, anchor_row),
+            end: (end_col, end_row),
+        });
+    }
 }
 
 /// Route a mouse wheel event. If the pane under the cursor has mouse tracking
@@ -3246,8 +3407,11 @@ async fn handle_mouse_drag(
             (col, abs)
         };
 
-        // Edge auto-scroll, focused pane only.
-        let new_offset = if is_focused {
+        // Edge auto-scroll, focused pane only. A final drag (button release) never
+        // scrolls: the selection must end exactly where the user let go, so the
+        // yanked range matches the highlight shown at release instead of pulling
+        // in one extra edge line.
+        let new_offset = if is_focused && !is_final {
             if at_top {
                 (scroll_offset + 1).min(screen_max_scroll_offset)
             } else if at_bottom {
@@ -3296,7 +3460,14 @@ async fn handle_mouse_drag(
                     pane_id: target_pane,
                     anchor_col,
                     anchor_abs,
+                    end_abs,
+                    end_col,
                 });
+            } else if let Some(d) = client.drag.as_mut() {
+                // Continuing gesture: keep the moving end in absolute coords so a
+                // wheel-scroll (which has no mouse coords) can extend from it.
+                d.end_abs = end_abs;
+                d.end_col = end_col;
             }
             if is_focused {
                 client.scroll_offset = new_offset;
@@ -4660,6 +4831,7 @@ async fn close_pane(
         let mut cls = clients.lock().await;
         for conn in cls.values_mut() {
             conn.subscribed_panes.remove(&pane_id);
+            conn.pane_scroll.remove(&pane_id);
         }
     }
     match action {

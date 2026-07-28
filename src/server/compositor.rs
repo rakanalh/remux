@@ -1090,6 +1090,15 @@ pub(crate) struct PaneRenderSnapshot {
 /// `cols == 0 || rows == 0` the buffer is empty, which callers treat as a
 /// no-content snapshot.
 pub(crate) fn render_pane_snapshot(screen: &Screen) -> PaneRenderSnapshot {
+    render_pane_snapshot_at(screen, 0)
+}
+
+/// Like [`render_pane_snapshot`] but blitted at `scroll_offset` lines back into
+/// the pane's scrollback (0 = live view). Used by the per-subscriber `ScrollPane`
+/// path so a View cell can scroll its source pane's history independently. When
+/// scrolled (`scroll_offset > 0`) the cursor is reported hidden, mirroring the
+/// foreground scrollback view where the live cursor is not shown.
+pub(crate) fn render_pane_snapshot_at(screen: &Screen, scroll_offset: usize) -> PaneRenderSnapshot {
     let cols = screen.cols;
     let rows = screen.rows;
     let mut buffer: Vec<Vec<RenderCell>> =
@@ -1103,7 +1112,7 @@ pub(crate) fn render_pane_snapshot(screen: &Screen) -> PaneRenderSnapshot {
             width: cols,
             height: rows,
         },
-        0,
+        scroll_offset,
     );
     PaneRenderSnapshot {
         cols,
@@ -1111,7 +1120,7 @@ pub(crate) fn render_pane_snapshot(screen: &Screen) -> PaneRenderSnapshot {
         cells: buffer,
         cursor_x: screen.cursor_x.min(cols.saturating_sub(1)),
         cursor_y: screen.cursor_y.min(rows.saturating_sub(1)),
-        cursor_visible: screen.cursor_visible,
+        cursor_visible: screen.cursor_visible && scroll_offset == 0,
         application_cursor_keys: screen.application_cursor_keys,
     }
 }
@@ -1961,6 +1970,38 @@ mod tests {
             tab_row.contains("htop"),
             "expected 'htop' in tab bar, got: {tab_row}"
         );
+    }
+
+    #[test]
+    fn render_pane_snapshot_at_shows_scrollback_and_hides_cursor() {
+        // 4-col x 2-row grid; feed 6 lines so 4 fall into scrollback.
+        let mut s = Screen::new(4, 2, 100);
+        s.process_output(b"L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6");
+
+        // Live view (offset 0): shows the last two rows and a visible cursor.
+        let live = render_pane_snapshot_at(&s, 0);
+        let live_text: String = live.cells[live.rows as usize - 1]
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(
+            live_text.starts_with("L6"),
+            "live bottom row should be the newest line, got {live_text:?}"
+        );
+        assert!(live.cursor_visible, "cursor visible at offset 0");
+
+        // Scrolled back one line: the bottom row is now the previous line, and
+        // the cursor is reported hidden (matches the foreground scrollback view).
+        let back = render_pane_snapshot_at(&s, 1);
+        let back_text: String = back.cells[back.rows as usize - 1]
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(
+            back_text.starts_with("L5"),
+            "scrolled bottom row should be one line earlier, got {back_text:?}"
+        );
+        assert!(!back.cursor_visible, "cursor hidden while scrolled back");
     }
 
     #[test]
