@@ -25,7 +25,7 @@ use crate::client::session_manager::{NodeType, SessionManagerAction};
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::{Config, RemoteConfig};
-use crate::protocol::{ClientMessage, RemuxCommand, ServerMessage};
+use crate::protocol::{ClientMessage, ConnDescriptor, RemuxCommand, ServerMessage, ViewId};
 use crate::server::daemon::{self, socket_path, RemuxServer};
 
 /// Data captured while computing search matches, used to transition from
@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
             // First, ask the server for existing sessions
             client.send(ClientMessage::ListSessions).await?;
             let response = client
-                .recv()
+                .recv_skip_views()
                 .await?
                 .context("server disconnected unexpectedly")?;
 
@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
                             })
                             .await?;
                         // Wait for session creation event
-                        let _ = client.recv().await?;
+                        let _ = client.recv_skip_views().await?;
                         client
                             .send(ClientMessage::Attach {
                                 session_name: "main".to_string(),
@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             // Wait for creation event
-            let _ = client.recv().await?;
+            let _ = client.recv_skip_views().await?;
             client
                 .send(ClientMessage::Attach {
                     session_name: session.clone(),
@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
             let mut client = RemuxClient::connect().await?;
             client.send(ClientMessage::ListSessions).await?;
             let response = client
-                .recv()
+                .recv_skip_views()
                 .await?
                 .context("server disconnected unexpectedly")?;
 
@@ -349,7 +349,7 @@ async fn main() -> Result<()> {
                 .await?;
 
             // Wait for confirmation
-            match client.recv().await? {
+            match client.recv_skip_views().await? {
                 Some(ServerMessage::Event(crate::protocol::SessionEvent::SessionDeleted(
                     deleted,
                 ))) => {
@@ -880,27 +880,108 @@ async fn unsubscribe_view_cells(
     Ok(())
 }
 
-/// While a view is active, decide what a `RemuxCommand` does client-side and
-/// apply it, returning `true` when the command was consumed (the caller should
-/// `continue` and forward nothing) or `false` when it must fall through to the
-/// normal path.
+/// Map the client's [`ConnId`] to the wire [`ConnDescriptor`] carried in a
+/// view-management intent's cell list. This is the intent-side half of the
+/// descriptor mapping; the reverse (`ConnDescriptor → ConnId`, used when a
+/// `ViewInfo` is synced into the cache) is
+/// [`conn_from_descriptor`](crate::client::view::conn_from_descriptor).
+fn descriptor_of_conn(conn: &ConnId) -> ConnDescriptor {
+    match conn {
+        ConnId::Local => ConnDescriptor::Local,
+        ConnId::Remote(name) => ConnDescriptor::Remote(name.clone()),
+    }
+}
+
+/// Enter (start displaying) the view at cache index `target_idx`, mirroring the
+/// steps every enter path shares: leave any *other* currently-active view
+/// (unsubscribe its cells), record the active index + id, `Detach` the
+/// foreground session so its panes don't self-count as session-visible (bug4,
+/// commit 8af74aa), then subscribe the target's cells and paint it.
+///
+/// Phase 2: membership/layout/focus/zoom already live in `views[target_idx]`
+/// (synced from the server's `ViewList`); this only wires up *display* +
+/// subscriptions, which are per-terminal.
+#[allow(clippy::too_many_arguments)]
+async fn enter_view(
+    mgr: &mut ConnectionManager,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    target_idx: usize,
+    current_attached: &Option<(ConnId, String)>,
+    renderer: &mut Renderer,
+    input: &InputHandler,
+    whichkey: &WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    compositor_theme: &crate::config::theme::CompositorTheme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+) -> Result<()> {
+    if let Some(av) = *active_view {
+        if av != target_idx {
+            // Bounds-guard: `active_view` is always re-resolved against the
+            // current `views` before this runs, but never index blindly.
+            if let Some(v) = views.get(av) {
+                unsubscribe_view_cells(mgr, v).await?;
+            }
+        }
+    }
+    *active_view = Some(target_idx);
+    *active_view_id = Some(views[target_idx].id);
+    // bug4: detach the foreground session so a cell aliasing one of its
+    // active-tab panes streams content instead of showing the "Active in
+    // session" placeholder. Guarded on a known session so the leave-to-session
+    // exit path can always re-attach.
+    if current_attached.is_some() {
+        mgr.send_foreground(ClientMessage::Detach).await?;
+    }
+    let (c, r) = crossterm::terminal::size()?;
+    renderer.resize(c, r);
+    subscribe_view_cells(mgr, &views[target_idx]).await?;
+    paint_view(
+        renderer,
+        &views[target_idx],
+        input,
+        whichkey,
+        theme,
+        compositor_theme,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+    )?;
+    Ok(())
+}
+
+/// While a view is active, decide what a `RemuxCommand` does and apply it,
+/// returning `true` when the command was consumed (the caller should `continue`
+/// and forward nothing) or `false` when it must fall through to the normal path.
 ///
 /// This is the single interception point used by both `InputAction::Execute`
 /// and each command of `InputAction::ExecuteChain`. It fixes a crash: without
 /// it, a structural command like `PaneClose` (`Prefix p x`) was forwarded to the
 /// masked foreground server, which is not the pane the user sees.
 ///
-/// - `PaneFocus{Left,Right,Up,Down}` -> move the view's focused cell (Model-B
-///   size demand follows focus via a re-subscribe), repaint.
-/// - `LayoutNext` -> cycle the view's layout, re-subscribe, repaint.
-/// - `PaneClose` -> eject the focused cell from the view (unsubscribe it, drop
-///   it, clamp focus, re-subscribe the rest); the real pane is untouched.
+/// Phase 2: view-management commands no longer mutate the local view. They send
+/// an **intent** to the local server (which owns the shared-view registry); the
+/// resulting `ViewList` broadcast drives the repaint on every terminal. The one
+/// local decision made here is directional focus: which cell is the neighbor
+/// depends on this terminal's geometry, so it is resolved locally (a clone probe
+/// of `move_focus`) into a target `cell_id` and sent as `ViewSetFocus`.
+///
+/// - `PaneFocus{Left,Right,Up,Down}` -> resolve the neighbor cell locally, send
+///   `ViewSetFocus { cell_id }`.
+/// - `LayoutNext` -> `ViewCycleLayout`.
+/// - `Resize{Left,Right,Up,Down}` -> `ViewResizeCell { dir, amount }`.
+/// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
+/// - `PaneToggleZoom` -> `ViewToggleZoom`.
+/// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
+///   real pane is untouched; the resync unsubscribes it).
 /// - `SessionDetach` -> NOT consumed (returns `false`) so the caller's detach
 ///   path runs and the client exits.
 /// - `SendKey(bytes)` -> route the raw bytes to the focused cell's pane by
-///   identity (best-effort), never to the foreground.
-/// - every other structural / server command -> NO-OP: consumed, nothing sent
-///   (the which-key popup is hidden like the normal path).
+///   identity (best-effort), never to the foreground (per-terminal, unchanged).
+/// - every other structural / server command -> NO-OP: consumed, nothing sent.
 #[allow(clippy::too_many_arguments)]
 async fn handle_view_command(
     cmd: &RemuxCommand,
@@ -929,7 +1010,8 @@ async fn handle_view_command(
             }
         };
     }
-    // Common "repaint the active view" step.
+    // Repaint the (still-stale) active view so hiding the popup leaves no
+    // artifacts; the ensuing `ViewList` from the intent repaints authoritatively.
     macro_rules! repaint {
         () => {
             paint_view(
@@ -946,6 +1028,8 @@ async fn handle_view_command(
         };
     }
 
+    let view_id = views[av].id;
+
     let dir = match cmd {
         RemuxCommand::PaneFocusLeft => Some(FocusDirection::Left),
         RemuxCommand::PaneFocusRight => Some(FocusDirection::Right),
@@ -955,17 +1039,26 @@ async fn handle_view_command(
     };
     if let Some(dir) = dir {
         hide_whichkey!();
+        // Resolve the neighbor cell with THIS terminal's geometry (a clone probe
+        // so the cache isn't mutated), then intent the shared focus change. The
+        // repaint arrives via the resulting `ViewList`.
         let cells = crate::client::view::cells_area(crate::server::layout::Rect {
             x: 0,
             y: 0,
             width: cols,
             height: rows,
         });
-        if views[av].move_focus(dir, cells) {
-            // Model B: focus moved, so the size demand must swap -- re-subscribe
-            // every cell (new focus demands its size; the old focus releases its
-            // demand so its pane grows back).
-            subscribe_view_cells(mgr, &views[av]).await?;
+        let mut probe = views[av].clone();
+        if probe.move_focus(dir, cells) {
+            let cell_id = probe.focused_id();
+            mgr.send(
+                &ConnId::Local,
+                ClientMessage::ViewSetFocus {
+                    id: view_id,
+                    cell_id,
+                },
+            )
+            .await?;
         }
         repaint!();
         return Ok(true);
@@ -974,11 +1067,11 @@ async fn handle_view_command(
     match cmd {
         RemuxCommand::LayoutNext => {
             hide_whichkey!();
-            views[av].layout = views[av].layout.next();
-            // Return to an automatic layout: drop any manual arrangement so the
-            // status bar reverts from `custom`. `zoomed` is left as-is.
-            views[av].custom_tree = None;
-            subscribe_view_cells(mgr, &views[av]).await?;
+            mgr.send(
+                &ConnId::Local,
+                ClientMessage::ViewCycleLayout { id: view_id },
+            )
+            .await?;
             repaint!();
             Ok(true)
         }
@@ -987,38 +1080,25 @@ async fn handle_view_command(
         | RemuxCommand::ResizeUp(amount)
         | RemuxCommand::ResizeDown(amount) => {
             hide_whichkey!();
-            // Mirror the server's sign/axis convention verbatim (daemon.rs):
-            // Left/Right adjust a Vertical split, Up/Down a Horizontal one; the
-            // amount is a percentage of the split.
-            use crate::server::layout::Direction;
-            let (direction, delta) = match cmd {
-                RemuxCommand::ResizeLeft(_) => (Direction::Vertical, -(*amount as f32) / 100.0),
-                RemuxCommand::ResizeRight(_) => (Direction::Vertical, *amount as f32 / 100.0),
-                RemuxCommand::ResizeUp(_) => (Direction::Horizontal, -(*amount as f32) / 100.0),
-                RemuxCommand::ResizeDown(_) => (Direction::Horizontal, *amount as f32 / 100.0),
+            let dir = match cmd {
+                RemuxCommand::ResizeLeft(_) => FocusDirection::Left,
+                RemuxCommand::ResizeRight(_) => FocusDirection::Right,
+                RemuxCommand::ResizeUp(_) => FocusDirection::Up,
+                RemuxCommand::ResizeDown(_) => FocusDirection::Down,
                 _ => unreachable!(),
             };
             if !views[av].cells.is_empty() {
-                let focused_id = views[av].focused_id();
-                // Seed a custom tree from the current automatic layout on the
-                // first manual resize. If the resize changes nothing (e.g. a
-                // Monocle view is a single stack with no split to adjust), undo
-                // the seeding so the view stays automatic rather than flipping
-                // to `custom` with no visible effect.
-                let had_tree = views[av].custom_tree.is_some();
-                if !had_tree {
-                    views[av].custom_tree = Some(views[av].auto_tree());
-                }
-                let changed = views[av]
-                    .custom_tree
-                    .as_mut()
-                    .map(|t| t.resize(focused_id, direction, delta))
-                    .unwrap_or(false);
-                if changed {
-                    subscribe_view_cells(mgr, &views[av]).await?;
-                } else if !had_tree {
-                    views[av].custom_tree = None;
-                }
+                let cell_id = views[av].focused_id();
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewResizeCell {
+                        id: view_id,
+                        cell_id,
+                        dir,
+                        amount: *amount,
+                    },
+                )
+                .await?;
             }
             repaint!();
             Ok(true)
@@ -1036,45 +1116,16 @@ async fn handle_view_command(
                 _ => unreachable!(),
             };
             if !views[av].cells.is_empty() {
-                let focused_id = views[av].focused_id();
-                let area = crate::client::view::cells_area(crate::server::layout::Rect {
-                    x: 0,
-                    y: 0,
-                    width: cols,
-                    height: rows,
-                });
-                let had_tree = views[av].custom_tree.is_some();
-                if !had_tree {
-                    views[av].custom_tree = Some(views[av].auto_tree());
-                }
-                // Same semantics as the server's PaneMove: swap with the spatial
-                // neighbor in `dir` if one exists, else relocate the focused cell
-                // to that edge. Focus stays on the moved cell (its index in
-                // `cells` is unchanged; only its slot in the tree moves).
-                let moved = {
-                    let tree = views[av].custom_tree.as_ref().unwrap();
-                    if let Some(neighbor) =
-                        crate::server::layout::find_neighbor(tree, area, focused_id, dir.clone(), 0)
-                    {
-                        crate::server::layout::swap_panes(
-                            views[av].custom_tree.as_mut().unwrap(),
-                            focused_id,
-                            neighbor,
-                        )
-                    } else if let Some(new_tree) =
-                        crate::server::layout::relocate_pane_to_edge(tree, focused_id, dir)
-                    {
-                        views[av].custom_tree = Some(new_tree);
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if moved {
-                    subscribe_view_cells(mgr, &views[av]).await?;
-                } else if !had_tree {
-                    views[av].custom_tree = None;
-                }
+                let cell_id = views[av].focused_id();
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewMoveCell {
+                        id: view_id,
+                        cell_id,
+                        dir,
+                    },
+                )
+                .await?;
             }
             repaint!();
             Ok(true)
@@ -1082,42 +1133,29 @@ async fn handle_view_command(
         RemuxCommand::PaneToggleZoom => {
             hide_whichkey!();
             if !views[av].cells.is_empty() {
-                views[av].zoomed = !views[av].zoomed;
-                // Zoom changes which cells are visible (only the focused one),
-                // so the Model-B size demand set moves with it: re-subscribe.
-                subscribe_view_cells(mgr, &views[av]).await?;
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewToggleZoom { id: view_id },
+                )
+                .await?;
             }
             repaint!();
             Ok(true)
         }
         RemuxCommand::PaneClose => {
             // Eject the focused cell from the view -- do NOT close the real pane.
+            // The resync (ViewList) removes the cell and unsubscribes it.
             hide_whichkey!();
             if !views[av].cells.is_empty() {
-                let focused = views[av].focused;
-                let cell = views[av].cells.remove(focused);
-                // Keep any manual arrangement consistent: drop the ejected cell's
-                // leaf from the custom tree (clearing the tree if it empties).
-                views[av].prune_from_tree(cell.id);
-                // Best-effort: a torn-down source connection must not abort here.
-                if let Err(e) = mgr
-                    .send(
-                        &cell.conn,
-                        ClientMessage::UnsubscribePane {
-                            pane_id: cell.pane_id,
-                        },
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "view: UnsubscribePane (eject) to {:?} pane {} failed: {e}",
-                        cell.conn,
-                        cell.pane_id
-                    );
-                }
-                views[av].clamp_focus();
-                // Remaining cells changed size: re-subscribe.
-                subscribe_view_cells(mgr, &views[av]).await?;
+                let cell_id = views[av].focused_id();
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewRemoveCell {
+                        id: view_id,
+                        cell_id,
+                    },
+                )
+                .await?;
             }
             repaint!();
             Ok(true)
@@ -1188,10 +1226,12 @@ async fn leave_active_view(
     mgr: &mut ConnectionManager,
     views: &[crate::client::view::ClientView],
     active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
 ) -> Result<()> {
     if let Some(av) = *active_view {
         unsubscribe_view_cells(mgr, &views[av]).await?;
         *active_view = None;
+        *active_view_id = None;
     }
     Ok(())
 }
@@ -1298,13 +1338,36 @@ async fn run_client_loop(
         .map(|name| (ConnId::Local, name.clone()));
     let mut previous_attached: Option<(ConnId, String)> = None;
 
-    // Client-side Views: virtual tabs whose cells alias real panes and are
-    // composited from streamed `PaneContent` snapshots. `active_view` is the
-    // index into `views` currently owning the screen (None = the normal
-    // server-driven frame is shown). Views are purely client-side; the server
-    // knows nothing about them.
+    // Views: virtual tabs whose cells alias real panes and are composited from
+    // streamed `PaneContent` snapshots. Phase 2: the shared-view registry is
+    // SERVER-OWNED; `views` is a per-terminal CACHE rebuilt from every `ViewList`
+    // broadcast (see the `ViewList` arm), and all view-management actions send
+    // intents to the local server rather than mutating this list.
+    //
+    // `active_view` is the cache index this terminal is DISPLAYING (None = the
+    // normal server-driven frame is shown); `active_view_id` is the same view's
+    // stable [`ViewId`], used to re-resolve `active_view` after a `ViewList`
+    // rebuild shuffles indices and to detect a displayed view being deleted.
     let mut views: Vec<crate::client::view::ClientView> = Vec::new();
     let mut active_view: Option<usize> = None;
+    let mut active_view_id: Option<ViewId> = None;
+    // Seed the cache from the startup `ViewList` the server pushed on connect
+    // (captured during the handshake). Nothing is displayed yet, so this only
+    // populates the cache — enough for the switcher to list pre-existing shared
+    // views immediately.
+    if let Some(infos) = mgr.take_initial_view_infos() {
+        views = infos
+            .iter()
+            .map(|info| crate::client::view::ClientView::from_info(info, None))
+            .collect();
+    }
+    // A view this terminal created (via `w n` / `w a`→new) and should enter as
+    // soon as the resulting `ViewList` carries it. Set from the `ViewCreated`
+    // ack (creator-only), consumed by the `ViewList` sync.
+    let mut pending_enter_view: Option<ViewId> = None;
+    // Cells to add to a just-created view once its `ViewCreated` ack arrives (the
+    // `w a`/compose → new-view path: create, then add, then enter).
+    let mut pending_add_cells: Option<Vec<(ConnDescriptor, crate::protocol::PaneId)>> = None;
     // Pending "add focused pane to a view" flow (see the `w a` handler): we ask
     // the foreground server for its session tree, resolve the focused pane into
     // `pending_panes` when the tree arrives, and complete the add once the user
@@ -2245,7 +2308,7 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         // A live view masks the switched-to session:
                                         // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view).await?;
+                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
                                         switch_to_server(mgr, &server, c, r).await?;
                                         mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                         mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -2262,7 +2325,7 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         // A live view masks the switched-to session:
                                         // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view).await?;
+                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
                                         switch_to_server(mgr, &server, c, r).await?;
                                         // The server's handle_command ignores commands from a
                                         // client with no attached session, so a remote tab switch
@@ -2286,7 +2349,7 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         // A live view masks the switched-to session:
                                         // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view).await?;
+                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
                                         switch_to_server(mgr, &server, c, r).await?;
                                         // The server's handle_command ignores commands from a
                                         // client with no attached session, so a remote pane switch
@@ -2566,7 +2629,7 @@ async fn run_client_loop(
                                 // session-manager SwitchSession path.
                                 // A live view masks the switched-to session: tear it
                                 // down first so the switch actually shows.
-                                leave_active_view(mgr, &views, &mut active_view).await?;
+                                leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
                                 switch_to_server(mgr, &server, c, r).await?;
                                 mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                 mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -2593,7 +2656,7 @@ async fn run_client_loop(
                                     // Mirror the SessionSwitchConfirm path.
                                     // A live view masks the switched-to session: tear
                                     // it down before handing off the screen.
-                                    leave_active_view(mgr, &views, &mut active_view).await?;
+                                    leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
                                     switch_to_server(mgr, &server, c, r).await?;
                                     mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                     mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -2631,77 +2694,50 @@ async fn run_client_loop(
                             }
                             // -- Views --------------------------------------------------
                             InputAction::NewView(ref name) => {
-                                // Create a new empty view and activate it. Empty
-                                // until panes are added via `w a`.
+                                // Create a new shared view on the local server.
+                                // We enter it once its `ViewCreated` ack + the
+                                // ensuing `ViewList` arrive (see `pending_enter_view`).
                                 let name = if name.trim().is_empty() {
                                     format!("View {}", views.len() + 1)
                                 } else {
                                     name.clone()
                                 };
-                                views.push(crate::client::view::ClientView::new(name));
-                                let idx = views.len() - 1;
-                                active_view = Some(idx);
-                                // Entering a view detaches this connection's foreground
-                                // session so its panes stop self-counting as
-                                // "session-visible" (bug4): a cell later aliasing one of
-                                // them must stream content, not show the "Active in
-                                // session" placeholder. Guarded on a known session so the
-                                // `ViewClose` exit path can always re-attach.
-                                if current_attached.is_some() {
-                                    mgr.send_foreground(ClientMessage::Detach).await?;
-                                }
-                                // No cells yet, so nothing to subscribe. Force a
-                                // clean frame and paint the (empty) view.
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.resize(c, r);
-                                paint_view(
-                                    &mut renderer,
-                                    &views[idx],
-                                    &input,
-                                    &whichkey,
-                                    &theme,
-                                    &compositor_theme,
-                                    &which_key_position,
-                                    viewport_top,
-                                    focused_pane_rect.as_ref(),
-                                )?;
+                                mgr.send(&ConnId::Local, ClientMessage::ViewCreate { name })
+                                    .await?;
                             }
                             InputAction::ViewRename(ref name) => {
-                                // Rename the active view. Empty name = no-op (the
-                                // user dismissed without typing). The switcher's
-                                // Views section is rebuilt from `views`, so the new
-                                // name shows the next time it opens.
+                                // Rename the active view for EVERY terminal: intent
+                                // the local server; the `ViewList` broadcast applies
+                                // it. Empty name = no-op (dismissed without typing).
                                 let name = name.trim();
-                                if let Some(av) = active_view {
-                                    if !name.is_empty() {
-                                        views[av].name = name.to_string();
-                                    }
+                                if let (Some(av), false) = (active_view, name.is_empty()) {
+                                    let id = views[av].id;
+                                    mgr.send(
+                                        &ConnId::Local,
+                                        ClientMessage::ViewRename {
+                                            id,
+                                            name: name.to_string(),
+                                        },
+                                    )
+                                    .await?;
                                 }
                             }
                             InputAction::ViewActivate { index } => {
                                 // Selected from the switcher's Views section. The
-                                // input handler already cleared the switcher
-                                // overlay and reset mode to Normal. Mirror the
-                                // NewView activation for an existing view.
+                                // input handler already cleared the switcher overlay
+                                // and reset mode to Normal. Resolve the switcher
+                                // index against the (possibly-since-rebuilt) cache and
+                                // enter that view by id.
                                 let (c, r) = crossterm::terminal::size()?;
                                 if index < views.len() {
-                                    // Cleanly leave any current view/session first
-                                    // (unsubscribe its cells) so the switch shows.
-                                    leave_active_view(mgr, &views, &mut active_view).await?;
-                                    active_view = Some(index);
-                                    // Detach the foreground session before subscribing
-                                    // cells (bug4): otherwise a cell aliasing a pane in
-                                    // that session's active tab is counted session-
-                                    // visible by this very connection and shows the
-                                    // placeholder instead of live content.
-                                    if current_attached.is_some() {
-                                        mgr.send_foreground(ClientMessage::Detach).await?;
-                                    }
-                                    renderer.resize(c, r);
-                                    subscribe_view_cells(mgr, &views[index]).await?;
-                                    paint_view(
+                                    enter_view(
+                                        mgr,
+                                        &views,
+                                        &mut active_view,
+                                        &mut active_view_id,
+                                        index,
+                                        &current_attached,
                                         &mut renderer,
-                                        &views[index],
                                         &input,
                                         &whichkey,
                                         &theme,
@@ -2709,7 +2745,8 @@ async fn run_client_loop(
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
-                                    )?;
+                                    )
+                                    .await?;
                                 } else {
                                     // Stale index (view removed under us): just
                                     // clear the switcher popup.
@@ -2797,62 +2834,73 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                     }
                                 } else {
-                                    // Resolve the target view: an existing one, or a
-                                    // freshly created + activated one.
-                                    let target_idx = match view {
-                                        Some(i) if i < views.len() => i,
+                                    // Map each marked pane's connection (Local or a
+                                    // named remote) to its wire descriptor for the
+                                    // cell list.
+                                    let cells: Vec<(ConnDescriptor, crate::protocol::PaneId)> = panes
+                                        .iter()
+                                        .map(|(conn, pid)| (descriptor_of_conn(conn), *pid))
+                                        .collect();
+                                    match view {
+                                        // Existing view: dedupe against its current
+                                        // cells (by conn+pane), then intent an add.
+                                        // The resync repaints if it is displayed.
+                                        Some(i) if i < views.len() => {
+                                            let id = views[i].id;
+                                            let to_add: Vec<(ConnDescriptor, crate::protocol::PaneId)> =
+                                                panes
+                                                    .iter()
+                                                    .filter(|(conn, pid)| {
+                                                        !views[i].cells.iter().any(|cell| {
+                                                            cell.conn == *conn && cell.pane_id == *pid
+                                                        })
+                                                    })
+                                                    .map(|(conn, pid)| {
+                                                        (descriptor_of_conn(conn), *pid)
+                                                    })
+                                                    .collect();
+                                            if !to_add.is_empty() {
+                                                mgr.send(
+                                                    &ConnId::Local,
+                                                    ClientMessage::ViewAddCells {
+                                                        id,
+                                                        cells: to_add,
+                                                    },
+                                                )
+                                                .await?;
+                                            }
+                                            // Repaint underneath the (now dismissed)
+                                            // picker; the ViewList resync follows.
+                                            if let Some(av) = active_view {
+                                                paint_view(
+                                                    &mut renderer,
+                                                    &views[av],
+                                                    &input,
+                                                    &whichkey,
+                                                    &theme,
+                                                    &compositor_theme,
+                                                    &which_key_position,
+                                                    viewport_top,
+                                                    focused_pane_rect.as_ref(),
+                                                )?;
+                                            } else {
+                                                renderer.clear_overlay(c, r)?;
+                                                renderer.flush()?;
+                                            }
+                                        }
+                                        // New view: create it, stash the cells to add
+                                        // + enter once the `ViewCreated` ack arrives.
                                         _ => {
                                             let name = format!("View {}", views.len() + 1);
-                                            views.push(crate::client::view::ClientView::new(name));
-                                            let idx = views.len() - 1;
-                                            active_view = Some(idx);
-                                            // Newly entering a view (the `w a` -> new
-                                            // view path): detach the foreground session
-                                            // so its panes don't self-count as
-                                            // session-visible (bug4). Guarded so
-                                            // `ViewClose` can re-attach.
-                                            if current_attached.is_some() {
-                                                mgr.send_foreground(ClientMessage::Detach).await?;
-                                            }
-                                            idx
+                                            pending_add_cells = Some(cells);
+                                            mgr.send(
+                                                &ConnId::Local,
+                                                ClientMessage::ViewCreate { name },
+                                            )
+                                            .await?;
+                                            renderer.clear_overlay(c, r)?;
+                                            renderer.flush()?;
                                         }
-                                    };
-                                    // Add each pane, skipping any already present in
-                                    // the target view (dedupe by (conn, pane_id)).
-                                    for (conn, pane_id) in panes {
-                                        let already = views[target_idx]
-                                            .cells
-                                            .iter()
-                                            .any(|cell| cell.conn == conn && cell.pane_id == pane_id);
-                                        if already {
-                                            continue;
-                                        }
-                                        // `add_cell` assigns the stable id and, when a
-                                        // `custom_tree` is active, splices the new cell
-                                        // into it (splitting the focused leaf).
-                                        views[target_idx].add_cell(conn, pane_id);
-                                    }
-                                    views[target_idx].clamp_focus();
-                                    if active_view == Some(target_idx) {
-                                        // (Re)subscribe every cell at its new size and
-                                        // repaint the live view.
-                                        subscribe_view_cells(mgr, &views[target_idx]).await?;
-                                        paint_view(
-                                            &mut renderer,
-                                            &views[target_idx],
-                                            &input,
-                                            &whichkey,
-                                            &theme,
-                                            &compositor_theme,
-                                            &which_key_position,
-                                            viewport_top,
-                                            focused_pane_rect.as_ref(),
-                                        )?;
-                                    } else {
-                                        // Added to a background view: just clear the
-                                        // picker popup off the server frame.
-                                        renderer.clear_overlay(c, r)?;
-                                        renderer.flush()?;
                                     }
                                 }
                             }
@@ -2888,18 +2936,13 @@ async fn run_client_loop(
                                     renderer.clear_overlay(cols, rows)?;
                                 }
                                 if let Some(av) = active_view {
-                                    views[av].layout = views[av].layout.next();
-                                    // Returning to an automatic layout discards any
-                                    // manual arrangement (the status bar name reverts
-                                    // from `custom` to the automatic mode). `zoomed`
-                                    // is deliberately left untouched — like the
-                                    // server, zoom is independent of layout.
-                                    views[av].custom_tree = None;
-                                    // Re-subscribe so each cell demands its new
-                                    // per-cell size (the layout changed the rects,
-                                    // and the focused cell's Model-B demand must
-                                    // follow); then repaint.
-                                    subscribe_view_cells(mgr, &views[av]).await?;
+                                    // Cycle the SHARED layout: intent the local server;
+                                    // the `ViewList` resync repaints every terminal.
+                                    let id = views[av].id;
+                                    mgr.send(&ConnId::Local, ClientMessage::ViewCycleLayout { id })
+                                        .await?;
+                                    // Repaint the current (stale) view so hiding the
+                                    // popup leaves no artifacts; the resync follows.
                                     paint_view(
                                         &mut renderer,
                                         &views[av],
@@ -2914,10 +2957,10 @@ async fn run_client_loop(
                                 }
                             }
                             InputAction::ViewClose => {
-                                // Deactivate the active view (kept in `views`, not
-                                // deleted — closing hides it). Unsubscribe its cells
-                                // and hand the screen back to the foreground session
-                                // by forcing a fresh server FullRender via Resize.
+                                // Leave-to-session for THIS terminal only (the shared
+                                // view persists for other terminals — this is not a
+                                // ViewDelete). Unsubscribe our cells and hand the
+                                // screen back to the foreground session via Resize.
                                 if whichkey.visible {
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
@@ -2925,6 +2968,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     unsubscribe_view_cells(mgr, &views[av]).await?;
                                     active_view = None;
+                                    active_view_id = None;
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.resize(c, r);
                                     // Entering the view detached the foreground session
@@ -2938,6 +2982,22 @@ async fn run_client_loop(
                                         }).await?;
                                     }
                                     mgr.send_foreground(ClientMessage::Resize { cols: c, rows: r }).await?;
+                                }
+                            }
+                            InputAction::ViewDelete => {
+                                // Delete the active view for EVERYONE. We do NOT touch
+                                // `active_view` locally: the resulting `ViewList`
+                                // (view gone) drives this terminal's leave-to-session
+                                // via the deleted-view branch, and every other terminal
+                                // displaying it does the same.
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                if let Some(av) = active_view {
+                                    let id = views[av].id;
+                                    mgr.send(&ConnId::Local, ClientMessage::ViewDelete { id })
+                                        .await?;
                                 }
                             }
                             InputAction::None => {}
@@ -2964,20 +3024,20 @@ async fn run_client_loop(
                                     mouse.column,
                                     mouse.row,
                                 ) {
+                                    // Clicking a cell focuses it for EVERY terminal:
+                                    // intent the shared focus change; the resync
+                                    // repaints. (No local mutation.)
                                     if views[av].focused != idx {
-                                        views[av].focused = idx;
-                                        subscribe_view_cells(mgr, &views[av]).await?;
-                                        paint_view(
-                                            &mut renderer,
-                                            &views[av],
-                                            &input,
-                                            &whichkey,
-                                            &theme,
-                                            &compositor_theme,
-                                            &which_key_position,
-                                            viewport_top,
-                                            focused_pane_rect.as_ref(),
-                                        )?;
+                                        if let Some(cell_id) =
+                                            views[av].cells.get(idx).map(|c| c.id)
+                                        {
+                                            let id = views[av].id;
+                                            mgr.send(
+                                                &ConnId::Local,
+                                                ClientMessage::ViewSetFocus { id, cell_id },
+                                            )
+                                            .await?;
+                                        }
                                     }
                                 }
                             } else if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown =
@@ -3909,6 +3969,194 @@ async fn run_client_loop(
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
                                 )?;
+                            }
+                        }
+                    }
+                    // Direct ack to THIS client's `ViewCreate`. Finish the compose
+                    // -> new-view flow (add any queued cells) and arm the enter that
+                    // fires when the ensuing `ViewList` carries the new view.
+                    Some(ServerMessage::ViewCreated { id }) => {
+                        log::debug!("srv: ViewCreated id={id}");
+                        if matches!(src, ConnId::Local) {
+                            if let Some(cells) = pending_add_cells.take() {
+                                mgr.send(
+                                    &ConnId::Local,
+                                    ClientMessage::ViewAddCells { id, cells },
+                                )
+                                .await?;
+                            }
+                            pending_enter_view = Some(id);
+                        }
+                    }
+                    // The shared-view registry snapshot. Rebuild the per-terminal
+                    // cache from it (preserving each view's render state), then
+                    // reconcile what this terminal is displaying: enter a
+                    // just-created view, mirror focus/layout/zoom + cell adds/removes
+                    // into the live view, or leave to a session if the displayed view
+                    // was deleted. This is what makes views shared + live.
+                    Some(ServerMessage::ViewList { views: view_infos }) => {
+                        // Only the local server owns the registry this client drives.
+                        if matches!(src, ConnId::Local) {
+                            log::debug!("srv: ViewList {} view(s)", view_infos.len());
+                            // The displayed view's pane set BEFORE the rebuild, for
+                            // the subscribe/unsubscribe diff. Keyed by (conn, pane):
+                            // a pane still aliased by any surviving cell must keep its
+                            // subscription even if one aliasing cell was removed.
+                            let old_active_panes: Vec<(ConnId, crate::protocol::PaneId)> =
+                                active_view
+                                    .and_then(|av| views.get(av))
+                                    .map(|v| {
+                                        v.cells
+                                            .iter()
+                                            .map(|c| (c.conn.clone(), c.pane_id))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                            // Rebuild the cache, carrying each view's per-terminal
+                            // render state forward from the matching old entry.
+                            let old_views = std::mem::take(&mut views);
+                            views = view_infos
+                                .iter()
+                                .map(|info| {
+                                    let prev = old_views.iter().find(|v| v.id == info.id);
+                                    crate::client::view::ClientView::from_info(info, prev)
+                                })
+                                .collect();
+                            // Re-resolve the displayed cache index by stable id
+                            // IMMEDIATELY, so no stale (pre-rebuild) index can index
+                            // the new cache in any branch below (enter/leave/diff).
+                            active_view =
+                                active_view_id.and_then(|id| views.iter().position(|v| v.id == id));
+
+                            // A view this terminal just created: enter it now that the
+                            // snapshot carries it (takes precedence over plain sync).
+                            let entered = match pending_enter_view {
+                                Some(pid) => {
+                                    match views.iter().position(|v| v.id == pid) {
+                                        Some(idx) => {
+                                            pending_enter_view = None;
+                                            enter_view(
+                                                mgr,
+                                                &views,
+                                                &mut active_view,
+                                                &mut active_view_id,
+                                                idx,
+                                                &current_attached,
+                                                &mut renderer,
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &compositor_theme,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )
+                                            .await?;
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                }
+                                None => false,
+                            };
+
+                            if !entered {
+                                if active_view_id.is_some() && active_view.is_none() {
+                                    // The displayed view was deleted for everyone:
+                                    // leave to the foreground session (unsubscribe our
+                                    // cells, re-attach, resize). No `Detach`/`Attach`
+                                    // dance beyond the re-attach.
+                                    for (conn, pid) in &old_active_panes {
+                                        let _ = mgr
+                                            .send(
+                                                conn,
+                                                ClientMessage::UnsubscribePane {
+                                                    pane_id: *pid,
+                                                },
+                                            )
+                                            .await;
+                                    }
+                                    active_view = None;
+                                    active_view_id = None;
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.resize(c, r);
+                                    if let Some((_, session)) = current_attached.clone() {
+                                        mgr.send_foreground(ClientMessage::Attach {
+                                            session_name: session,
+                                        })
+                                        .await?;
+                                    }
+                                    mgr.send_foreground(ClientMessage::Resize {
+                                        cols: c,
+                                        rows: r,
+                                    })
+                                    .await?;
+                                } else if let Some(av) = active_view {
+                                    // Diff the pane set: unsubscribe panes fully gone,
+                                    // (re)subscribe the current set (adds the new ones,
+                                    // refreshes sizes for a layout/focus change). This
+                                    // never sends Detach/Attach — the bug4 fix belongs
+                                    // to the enter path only.
+                                    let new_panes: Vec<(ConnId, crate::protocol::PaneId)> = views
+                                        [av]
+                                        .cells
+                                        .iter()
+                                        .map(|c| (c.conn.clone(), c.pane_id))
+                                        .collect();
+                                    for (conn, pid) in &old_active_panes {
+                                        if !new_panes.iter().any(|(c, p)| c == conn && p == pid) {
+                                            let _ = mgr
+                                                .send(
+                                                    conn,
+                                                    ClientMessage::UnsubscribePane {
+                                                        pane_id: *pid,
+                                                    },
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                    subscribe_view_cells(mgr, &views[av]).await?;
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                }
+                            }
+
+                            // Live-update an OPEN switcher's Views section so another
+                            // terminal's create/rename shows without reopening it.
+                            if input.session_switch.is_some() {
+                                if let Some(ss) = input.session_switch.as_mut() {
+                                    ss.set_views(views.iter().map(|v| v.name.clone()).collect());
+                                }
+                                let (c, r) = crossterm::terminal::size()?;
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else {
+                                    renderer.clear_overlay(c, r)?;
+                                }
+                                if let Some(ref ss) = input.session_switch {
+                                    let draw_cmds = ss.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
                             }
                         }
                     }

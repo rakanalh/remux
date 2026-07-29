@@ -9,9 +9,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use super::layout::{self, LayoutMode, LayoutNode, PaneId};
+use super::layout::{
+    self, find_neighbor, relocate_pane_to_edge, swap_panes, Direction, FocusDirection, GridLayout,
+    LayoutMode, LayoutNode, PaneId, Rect,
+};
 use crate::config::BorderStyle;
-use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+use crate::protocol::{
+    CellId, ConnDescriptor, FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry, ViewId,
+};
 
 /// Unique identifier for a session (its name).
 pub type SessionId = String;
@@ -45,6 +50,102 @@ pub struct ServerState {
     pub sessions: HashMap<SessionId, Session>,
     next_pane_id: u64,
     next_tab_id: u64,
+    /// The server-owned shared-view registry. Runtime-only: views alias live
+    /// panes and are meaningless once a session is dormant/restored, so they are
+    /// never persisted (`#[serde(skip)]`) — a restarted server starts with none.
+    #[serde(skip)]
+    pub views: Vec<ServerView>,
+    /// Monotonic source for [`ViewId`]s. Runtime-only (see `views`); guarded to
+    /// stay 1-based even after a deserialize resets it to 0.
+    #[serde(skip)]
+    next_view_id: ViewId,
+}
+
+/// One cell of a [`ServerView`]: a reference to a real pane on a specific
+/// connection (from the client's perspective). The server stores the descriptor
+/// verbatim and never resolves it — resolution is the client's job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerViewCell {
+    /// Stable, per-view identity, also used as the pseudo-[`PaneId`] in the
+    /// view's layout tree (so add/remove never invalidates a `custom_tree`).
+    pub id: CellId,
+    pub conn: ConnDescriptor,
+    pub pane_id: PaneId,
+}
+
+/// A shared, server-owned View: a virtual tab whose cells alias real panes on
+/// any connection. Mirrors the client-side `ClientView` model (same layout
+/// engine, same stable-id cell keys, same custom-tree semantics) but lives on
+/// the server so every connected client sees one consistent arrangement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerView {
+    pub id: ViewId,
+    pub name: String,
+    pub cells: Vec<ServerViewCell>,
+    /// Automatic layout mode; defaults to Grid on create (matching the client).
+    pub layout: LayoutMode,
+    /// Persistent manual arrangement keyed by [`ServerViewCell::id`]; `Some`
+    /// once a cell has been resized/moved. While `Some`, `layout_name()` reads
+    /// `custom`. `ViewCycleLayout` resets it to `None`.
+    pub custom_tree: Option<LayoutNode>,
+    /// Index into `cells` of the focused cell.
+    pub focused: usize,
+    /// Whether only the focused cell is shown (zoom).
+    pub zoomed: bool,
+    /// Monotonic source for this view's [`CellId`]s.
+    next_cell_id: CellId,
+}
+
+impl ServerView {
+    /// A fresh empty view (Grid layout, no cells).
+    fn new(id: ViewId, name: String) -> Self {
+        ServerView {
+            id,
+            name,
+            cells: Vec::new(),
+            layout: LayoutMode::Grid(GridLayout),
+            custom_tree: None,
+            focused: 0,
+            zoomed: false,
+            next_cell_id: 1,
+        }
+    }
+
+    /// The layout name shown to clients: `custom` while a `custom_tree` is
+    /// active, else the automatic mode's name. Mirrors `ClientView::layout_name`.
+    pub fn layout_name(&self) -> &str {
+        if self.custom_tree.is_some() {
+            "custom"
+        } else {
+            self.layout.name()
+        }
+    }
+
+    /// The stable id of the focused cell, or `0` when the view is empty.
+    fn focused_id(&self) -> CellId {
+        self.cells.get(self.focused).map(|c| c.id).unwrap_or(0)
+    }
+
+    /// The array index of the cell with stable `id`, if present.
+    fn index_of_id(&self, id: CellId) -> Option<usize> {
+        self.cells.iter().position(|c| c.id == id)
+    }
+
+    /// Build the automatic layout tree over the current cells (keyed by stable
+    /// id, focused cell active). Mirrors `ClientView::auto_tree`.
+    fn auto_tree(&self) -> LayoutNode {
+        let ids: Vec<PaneId> = self.cells.iter().map(|c| c.id).collect();
+        self.layout.build_tree(&ids, self.focused_id())
+    }
+
+    /// Clamp `focused` into range after the cell list changed.
+    fn clamp_focus(&mut self) {
+        if self.cells.is_empty() {
+            self.focused = 0;
+        } else if self.focused >= self.cells.len() {
+            self.focused = self.cells.len() - 1;
+        }
+    }
 }
 
 /// A folder groups related sessions together.
@@ -150,6 +251,194 @@ impl ServerState {
             sessions: HashMap::new(),
             next_pane_id: 1,
             next_tab_id: 1,
+            views: Vec::new(),
+            next_view_id: 1,
+        }
+    }
+
+    // -- Shared view registry ------------------------------------------------
+    //
+    // Pure mutators over the runtime-only view registry. Each returns enough for
+    // the daemon to decide what to send; the daemon owns the `ViewList`
+    // broadcast. `find_view_mut` centralises the fail-silent "unknown id" path
+    // so every handler is index/id safe (no panics on a stale view/cell id).
+
+    /// Allocate the next [`ViewId`], guarding against a deserialize that reset
+    /// the counter to 0 so ids stay 1-based within a run.
+    fn next_view_id(&mut self) -> ViewId {
+        if self.next_view_id == 0 {
+            self.next_view_id = 1;
+        }
+        let id = self.next_view_id;
+        self.next_view_id += 1;
+        id
+    }
+
+    fn find_view_mut(&mut self, id: ViewId) -> Option<&mut ServerView> {
+        self.views.iter_mut().find(|v| v.id == id)
+    }
+
+    /// Create a new empty (Grid-default) view named `name`, returning its id.
+    pub fn view_create(&mut self, name: String) -> ViewId {
+        let id = self.next_view_id();
+        self.views.push(ServerView::new(id, name));
+        id
+    }
+
+    /// Delete view `id`. Fail-silent if absent.
+    pub fn view_delete(&mut self, id: ViewId) {
+        self.views.retain(|v| v.id != id);
+    }
+
+    /// Rename view `id`. Fail-silent if absent.
+    pub fn view_rename(&mut self, id: ViewId, name: String) {
+        if let Some(v) = self.find_view_mut(id) {
+            v.name = name;
+        }
+    }
+
+    /// Append cells aliasing the given `(conn, pane_id)` pairs to view `id`,
+    /// each assigned a fresh stable [`CellId`]. When a `custom_tree` is active,
+    /// each new cell is spliced into it by splitting the focused (else last)
+    /// leaf — mirroring `ClientView::add_cell` so the manual arrangement
+    /// survives the add. Fail-silent if the view is absent.
+    pub fn view_add_cells(&mut self, id: ViewId, cells: Vec<(ConnDescriptor, PaneId)>) {
+        if let Some(v) = self.find_view_mut(id) {
+            for (conn, pane_id) in cells {
+                let cell_id = v.next_cell_id;
+                v.next_cell_id += 1;
+                // Choose the split target BEFORE pushing, so `focused` still
+                // indexes an existing cell (mirrors the client).
+                let target = v
+                    .cells
+                    .get(v.focused)
+                    .or_else(|| v.cells.last())
+                    .map(|c| c.id);
+                v.cells.push(ServerViewCell {
+                    id: cell_id,
+                    conn,
+                    pane_id,
+                });
+                if let (Some(tree), Some(target_id)) = (v.custom_tree.as_mut(), target) {
+                    tree.split_vertical(target_id, cell_id);
+                }
+            }
+        }
+    }
+
+    /// Remove cell `cell_id` from view `id`, pruning it from any custom tree and
+    /// re-clamping focus. Fail-silent on unknown view/cell.
+    pub fn view_remove_cell(&mut self, id: ViewId, cell_id: CellId) {
+        if let Some(v) = self.find_view_mut(id) {
+            if let Some(idx) = v.index_of_id(cell_id) {
+                v.cells.remove(idx);
+                if let Some(tree) = v.custom_tree.as_mut() {
+                    if tree.close_pane(cell_id).is_none() {
+                        v.custom_tree = None;
+                    }
+                }
+                v.clamp_focus();
+            }
+        }
+    }
+
+    /// Focus cell `cell_id` within view `id`. Fail-silent on unknown view/cell.
+    pub fn view_set_focus(&mut self, id: ViewId, cell_id: CellId) {
+        if let Some(v) = self.find_view_mut(id) {
+            if let Some(idx) = v.index_of_id(cell_id) {
+                v.focused = idx;
+            }
+        }
+    }
+
+    /// Cycle view `id` to the next automatic layout, dropping any custom tree.
+    pub fn view_cycle_layout(&mut self, id: ViewId) {
+        if let Some(v) = self.find_view_mut(id) {
+            v.layout = v.layout.next();
+            v.custom_tree = None;
+        }
+    }
+
+    /// Toggle focus-cell zoom for view `id`.
+    pub fn view_toggle_zoom(&mut self, id: ViewId) {
+        if let Some(v) = self.find_view_mut(id) {
+            v.zoomed = !v.zoomed;
+        }
+    }
+
+    /// Resize cell `cell_id` in view `id` by `amount` percent toward `dir`.
+    /// Mirrors the client's convention verbatim: Left/Right adjust a Vertical
+    /// split, Up/Down a Horizontal one; a fresh custom tree is seeded on first
+    /// resize and reverted if the resize changes nothing. Area-independent
+    /// (`LayoutNode::resize` walks ratios, no geometry). Fail-silent otherwise.
+    pub fn view_resize_cell(
+        &mut self,
+        id: ViewId,
+        cell_id: CellId,
+        dir: FocusDirection,
+        amount: u16,
+    ) {
+        let v = match self.find_view_mut(id) {
+            Some(v) => v,
+            None => return,
+        };
+        if v.cells.is_empty() || v.index_of_id(cell_id).is_none() {
+            return;
+        }
+        let (direction, delta) = match dir {
+            FocusDirection::Left => (Direction::Vertical, -(amount as f32) / 100.0),
+            FocusDirection::Right => (Direction::Vertical, amount as f32 / 100.0),
+            FocusDirection::Up => (Direction::Horizontal, -(amount as f32) / 100.0),
+            FocusDirection::Down => (Direction::Horizontal, amount as f32 / 100.0),
+        };
+        let had_tree = v.custom_tree.is_some();
+        if !had_tree {
+            v.custom_tree = Some(v.auto_tree());
+        }
+        let changed = v
+            .custom_tree
+            .as_mut()
+            .map(|t| t.resize(cell_id, direction, delta))
+            .unwrap_or(false);
+        if !changed && !had_tree {
+            v.custom_tree = None;
+        }
+    }
+
+    /// Move cell `cell_id` in view `id` toward `dir`: swap with the spatial
+    /// neighbor in `dir` if one exists, else relocate to that edge. Mirrors the
+    /// client's `PaneMove` semantics. `area` is the reference geometry the
+    /// neighbor search runs in.
+    ///
+    /// Phase-2 TODO: `area` is supplied by the daemon from the min across
+    /// currently-connected clients, so the same `ViewMoveCell` can pick a
+    /// different neighbor depending on who is connected. A shared view needs its
+    /// own canonical area; wire that in when the client interaction is rebuilt.
+    pub fn view_move_cell(&mut self, id: ViewId, cell_id: CellId, dir: FocusDirection, area: Rect) {
+        let v = match self.find_view_mut(id) {
+            Some(v) => v,
+            None => return,
+        };
+        if v.cells.is_empty() || v.index_of_id(cell_id).is_none() {
+            return;
+        }
+        let had_tree = v.custom_tree.is_some();
+        if !had_tree {
+            v.custom_tree = Some(v.auto_tree());
+        }
+        let moved = {
+            let tree = v.custom_tree.as_ref().unwrap();
+            if let Some(neighbor) = find_neighbor(tree, area, cell_id, dir.clone(), 0) {
+                swap_panes(v.custom_tree.as_mut().unwrap(), cell_id, neighbor)
+            } else if let Some(new_tree) = relocate_pane_to_edge(tree, cell_id, dir) {
+                v.custom_tree = Some(new_tree);
+                true
+            } else {
+                false
+            }
+        };
+        if !moved && !had_tree {
+            v.custom_tree = None;
         }
     }
 
@@ -918,6 +1207,111 @@ mod tests {
         let state = ServerState::new();
         assert!(state.sessions.is_empty());
         assert!(state.folders.is_empty());
+    }
+
+    // -- Shared view registry (Phase 2: logic moved here from the client) -----
+
+    #[test]
+    fn view_add_cells_assigns_ids_and_splices_custom_tree() {
+        use super::super::layout::all_pane_ids;
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into());
+        // Two cells, then seed a custom tree, then add a third: the new cell's
+        // stable id is spliced into the manual arrangement (mirrors the old
+        // client `add_cell` test that moved to the server).
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+        }
+        let before = all_pane_ids(st.views[0].custom_tree.as_ref().unwrap()).len();
+        st.view_add_cells(id, vec![(ConnDescriptor::Local, 3)]);
+        let v = &st.views[0];
+        assert_eq!(v.cells.len(), 3);
+        let new_id = v.cells[2].id;
+        let ids = all_pane_ids(v.custom_tree.as_ref().unwrap());
+        assert_eq!(ids.len(), before + 1);
+        assert!(
+            ids.contains(&new_id),
+            "new cell id spliced into custom tree"
+        );
+    }
+
+    #[test]
+    fn view_remove_cell_prunes_tree_and_clamps_focus() {
+        use super::super::layout::all_pane_ids;
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into());
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        let (c0, c1) = (st.views[0].cells[0].id, st.views[0].cells[1].id);
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+            v.focused = 1;
+        }
+        st.view_remove_cell(id, c0);
+        let v = &st.views[0];
+        assert_eq!(v.cells.len(), 1);
+        let ids = all_pane_ids(v.custom_tree.as_ref().unwrap());
+        assert!(!ids.contains(&c0) && ids.contains(&c1));
+        assert_eq!(v.focused, 0, "focus clamped after removal");
+        // Removing the last cell clears the custom tree back to automatic.
+        st.view_remove_cell(id, c1);
+        assert!(st.views[0].cells.is_empty());
+        assert!(st.views[0].custom_tree.is_none());
+    }
+
+    #[test]
+    fn view_cycle_layout_and_zoom_toggle() {
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into());
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        assert_eq!(st.views[0].layout_name(), "grid");
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+        }
+        assert_eq!(st.views[0].layout_name(), "custom");
+        st.view_cycle_layout(id);
+        assert!(
+            st.views[0].custom_tree.is_none(),
+            "cycling layout drops the custom tree"
+        );
+        assert_ne!(st.views[0].layout_name(), "custom");
+        assert!(!st.views[0].zoomed);
+        st.view_toggle_zoom(id);
+        assert!(st.views[0].zoomed);
+        st.view_toggle_zoom(id);
+        assert!(!st.views[0].zoomed);
+    }
+
+    #[test]
+    fn view_set_focus_and_delete_are_id_safe() {
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into());
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        let c1 = st.views[0].cells[1].id;
+        st.view_set_focus(id, c1);
+        assert_eq!(st.views[0].focused, 1);
+        // Unknown view / cell ids are fail-silent (no panic).
+        st.view_set_focus(999, c1);
+        st.view_remove_cell(id, 999);
+        st.view_delete(999);
+        assert_eq!(st.views.len(), 1);
+        st.view_delete(id);
+        assert!(st.views.is_empty());
     }
 
     #[test]

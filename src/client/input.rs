@@ -445,8 +445,12 @@ pub enum InputAction {
     ViewRename(String),
     /// Cycle the active view's layout (Grid -> Monocle -> ...).
     ViewLayoutNext,
-    /// Close (deactivate) the active view, returning to the server frame.
+    /// Close (deactivate) the active view for THIS terminal only, returning to
+    /// the server frame; the shared view persists for other terminals.
     ViewClose,
+    /// Delete the active view for EVERYONE (a shared `ViewDelete`); every
+    /// terminal displaying it is dropped back to a session by the resync.
+    ViewDelete,
     /// The view-picker highlight moved (re-render needed).
     ViewPickerUpdate,
     /// The view picker was confirmed: `Some(i)` = add to existing view `i`,
@@ -1718,6 +1722,10 @@ impl InputHandler {
             if action_str == "ViewClose" {
                 self.mode = Mode::Normal;
                 return InputAction::ViewClose;
+            }
+            if action_str == "ViewDelete" {
+                self.mode = Mode::Normal;
+                return InputAction::ViewDelete;
             }
 
             match parse_command(action_str) {

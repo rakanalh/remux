@@ -28,10 +28,10 @@
 
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
-use crate::protocol::{CellColor, PaneId, RenderCell};
+use crate::protocol::{CellColor, ConnDescriptor, PaneId, RenderCell, ViewId, ViewInfo};
 use crate::server::compositor::build_top_border_content;
 use crate::server::layout::{
-    compute_layout, focus_in_direction, FocusDirection, GridLayout, LayoutMode, LayoutNode, Rect,
+    compute_layout, focus_in_direction, FocusDirection, LayoutMode, LayoutNode, Rect,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,12 +78,14 @@ pub struct PaneSnapshot {
 /// No state ever renders blank: each has a placeholder or content.
 #[derive(Debug, Clone)]
 pub struct ViewCell {
-    /// Stable, per-view identity for this cell, assigned by
-    /// [`ClientView::add_cell`] from a monotonic counter. Used as the
-    /// pseudo-[`PaneId`] in the layout tree so that adding or removing cells
-    /// (which shifts array indices) never invalidates a persistent
-    /// `custom_tree`. Everything index-based (`focused`, `move_focus`,
-    /// `cell_at`) keeps using the array index; only the tree keys off `id`.
+    /// Stable, per-view identity for this cell. Phase 2: assigned by the SERVER
+    /// (the [`CellId`](crate::protocol::CellId) of the corresponding
+    /// [`CellInfo`](crate::protocol::CellInfo)) and mirrored here via
+    /// [`ClientView::from_info`]. Used as the pseudo-[`PaneId`] in the layout
+    /// tree so that adding or removing cells (which shifts array indices) never
+    /// invalidates a persistent `custom_tree`. Everything index-based
+    /// (`focused`, `move_focus`, `cell_at`) keeps using the array index; only the
+    /// tree keys off `id`.
     pub id: u64,
     pub conn: ConnId,
     pub pane_id: PaneId,
@@ -100,22 +102,6 @@ pub struct ViewCell {
 }
 
 impl ViewCell {
-    /// A fresh cell aliasing `(conn, pane_id)`, waiting for its first snapshot.
-    ///
-    /// The `id` is left 0 here; [`ClientView::add_cell`] is the sole owner of id
-    /// assignment and stamps a unique id when it takes the cell. Construct cells
-    /// only through `add_cell` so ids stay unique per view.
-    pub fn new(conn: ConnId, pane_id: PaneId) -> Self {
-        Self {
-            id: 0,
-            conn,
-            pane_id,
-            snapshot: None,
-            disconnected: false,
-            title: None,
-        }
-    }
-
     /// Whether the cell's source pane is currently session-visible (its latest
     /// snapshot reports it shown full-size in its real session). Such a cell
     /// renders the `● Active in <title>` placeholder, sends no size demand, and
@@ -130,8 +116,22 @@ impl ViewCell {
 }
 
 /// A client-side virtual tab compositing several panes.
+///
+/// Phase 2: this is no longer the authoritative model. It is a per-terminal
+/// **render/view-model** rebuilt from the server's [`ViewInfo`] snapshot on every
+/// `ViewList` broadcast (see [`ClientView::from_info`]). Membership, `layout`,
+/// `custom_tree`, `focused` and `zoomed` all come FROM the server so every
+/// terminal mirrors one shared arrangement; only per-terminal render state (each
+/// cell's last [`PaneSnapshot`], title, disconnected flag) and pixel geometry are
+/// local. The geometry helpers ([`cell_rects`], the Monocle strip, hit-testing,
+/// [`ClientView::move_focus`]) stay here because geometry is per-terminal.
 #[derive(Debug, Clone)]
 pub struct ClientView {
+    /// The server-assigned [`ViewId`] this cache entry mirrors. The client keys
+    /// its view cache by this id, routes intents (`ViewSetFocus { id, .. }` …)
+    /// with it, and re-resolves which view it is displaying across `ViewList`
+    /// rebuilds by it.
+    pub id: ViewId,
     pub name: String,
     pub cells: Vec<ViewCell>,
     /// How the cells are arranged. Reuses the server's automatic layout engine
@@ -152,51 +152,85 @@ pub struct ClientView {
     /// `layout`/`custom_tree`, exactly as the server's `zoomed_pane` is
     /// independent of `layout_mode`.
     pub zoomed: bool,
-    /// Monotonic source for [`ViewCell::id`]. Only ever increments, so a removed
-    /// cell's id is never reused within the view's lifetime.
-    next_cell_id: u64,
+}
+
+/// Map a wire [`ConnDescriptor`] (as carried in a `ViewInfo` cell) to the
+/// client's [`ConnId`]. This is the sync-side half of the descriptor mapping;
+/// the reverse (`ConnId → ConnDescriptor`, used when a view-management intent is
+/// sent) lives at the intent call sites in `main.rs`.
+pub fn conn_from_descriptor(d: &ConnDescriptor) -> ConnId {
+    match d {
+        ConnDescriptor::Local => ConnId::Local,
+        ConnDescriptor::Remote(name) => ConnId::Remote(name.clone()),
+    }
 }
 
 impl ClientView {
     /// Create an empty view with the given name (Grid layout, no cells).
+    /// Test-only: in production a view is only ever built from a server
+    /// [`ViewInfo`] via [`ClientView::from_info`].
+    #[cfg(test)]
     pub fn new(name: String) -> Self {
         Self {
+            id: 0,
             name,
             cells: Vec::new(),
-            layout: LayoutMode::Grid(GridLayout),
+            layout: LayoutMode::Grid(crate::server::layout::GridLayout),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1,
         }
     }
 
-    /// Append a cell aliasing `(conn, pane_id)`, assigning it a fresh stable
-    /// [`id`](ViewCell::id). When a `custom_tree` is active, the new cell is
-    /// spliced into it by splitting the focused (or, if none, the last) leaf —
-    /// the same way a normal tab splits when a pane is added — so the manual
-    /// arrangement survives the add. With no `custom_tree` the automatic layout
-    /// simply recomputes on the next render. Returns the new cell's id.
-    pub fn add_cell(&mut self, conn: ConnId, pane_id: PaneId) -> u64 {
-        let id = self.next_cell_id;
-        self.next_cell_id += 1;
-        let mut cell = ViewCell::new(conn, pane_id);
-        cell.id = id;
-        // Choose the leaf to split BEFORE pushing (so `focused` still indexes an
-        // existing cell). Splitting the focused cell's leaf mirrors a tab split.
-        let target = self
+    /// Rebuild this per-terminal view-model from a server [`ViewInfo`] snapshot.
+    ///
+    /// Membership / `layout` / `custom_tree` / `focused` / `zoomed` are taken
+    /// verbatim from the server (the shared arrangement). Per-terminal render
+    /// state — each cell's last [`PaneSnapshot`], learned title, and disconnected
+    /// flag — is carried over from `prev` (this view's previous cache entry, if
+    /// any) so a resync never drops already-streamed content nor flashes
+    /// `waiting…`. Render state is matched first by the stable [`ViewCell::id`],
+    /// then by `(conn, pane_id)` so a freshly-added cell aliasing an
+    /// already-streaming pane shows its content immediately.
+    pub fn from_info(info: &ViewInfo, prev: Option<&ClientView>) -> ClientView {
+        let cells: Vec<ViewCell> = info
             .cells
-            .get(self.focused)
-            .or_else(|| self.cells.last())
-            .map(|c| c.id);
-        self.cells.push(cell);
-        if let (Some(tree), Some(target_id)) = (self.custom_tree.as_mut(), target) {
-            // Split the target leaf; the new cell becomes the split's second
-            // child. Vertical (left/right) matches `LayoutNode::split_vertical`'s
-            // default orientation for a fresh split.
-            tree.split_vertical(target_id, id);
+            .iter()
+            .map(|ci| {
+                let conn = conn_from_descriptor(&ci.conn);
+                let carried = prev.and_then(|p| {
+                    p.cells.iter().find(|c| c.id == ci.id).or_else(|| {
+                        p.cells
+                            .iter()
+                            .find(|c| c.conn == conn && c.pane_id == ci.pane_id)
+                    })
+                });
+                ViewCell {
+                    id: ci.id,
+                    conn,
+                    pane_id: ci.pane_id,
+                    snapshot: carried.and_then(|c| c.snapshot.clone()),
+                    disconnected: carried.map(|c| c.disconnected).unwrap_or(false),
+                    title: carried.and_then(|c| c.title.clone()),
+                }
+            })
+            .collect();
+        // Clamp the server's focus index into range (defensive; the server keeps
+        // it valid, but an empty view reports 0).
+        let focused = if cells.is_empty() {
+            0
+        } else {
+            info.focused.min(cells.len() - 1)
+        };
+        ClientView {
+            id: info.id,
+            name: info.name.clone(),
+            cells,
+            layout: info.layout.clone(),
+            focused,
+            custom_tree: info.custom_tree.clone(),
+            zoomed: info.zoomed,
         }
-        id
     }
 
     /// Build the automatic layout tree over the current cells (keyed by stable
@@ -232,6 +266,12 @@ impl ClientView {
     /// Prune the cell with stable `id` from `custom_tree` (if one is active),
     /// collapsing the tree via the normal close path. When the tree becomes
     /// empty it is cleared to `None` so the view falls back to automatic layout.
+    ///
+    /// Phase 2: tree maintenance is owned by the server
+    /// ([`ServerState::view_remove_cell`](crate::server::session::ServerState));
+    /// the client only mirrors the resulting `custom_tree`. Kept as a test-only
+    /// helper for the geometry tests below.
+    #[cfg(test)]
     pub fn prune_from_tree(&mut self, id: u64) {
         if let Some(tree) = self.custom_tree.as_mut() {
             if tree.close_pane(id).is_none() {
@@ -241,6 +281,10 @@ impl ClientView {
     }
 
     /// Clamp `focused` into range after the cell list changed.
+    ///
+    /// Phase 2: focus is server-owned and clamped in [`ClientView::from_info`];
+    /// kept as a test-only helper.
+    #[cfg(test)]
     pub fn clamp_focus(&mut self) {
         if self.cells.is_empty() {
             self.focused = 0;
@@ -943,7 +987,7 @@ pub fn draw_status_bar(
 mod tests {
     use super::*;
     use crate::server::layout::{
-        all_pane_ids, find_neighbor, relocate_pane_to_edge, Direction, MonocleLayout,
+        all_pane_ids, find_neighbor, relocate_pane_to_edge, Direction, GridLayout, MonocleLayout,
     };
 
     fn area(w: u16, h: u16) -> Rect {
@@ -1005,13 +1049,13 @@ mod tests {
     /// come from the automatic layout.
     fn view_of(cells: Vec<ViewCell>, layout: LayoutMode, focused: usize) -> ClientView {
         ClientView {
+            id: 0,
             name: "v".into(),
             cells,
             layout,
             focused,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         }
     }
 
@@ -1168,20 +1212,7 @@ mod tests {
         assert!(monocle_strip_rect(&v, area(80, 24)).is_none());
     }
 
-    // -- add_cell / prune tree maintenance -----------------------------------
-
-    #[test]
-    fn add_cell_splices_into_custom_tree() {
-        let mut v = view_n(2, gridv(), 0);
-        v.custom_tree = Some(v.auto_tree());
-        let before = all_pane_ids(v.custom_tree.as_ref().unwrap()).len();
-        let id = v.add_cell(ConnId::Local, 99);
-        let ids = all_pane_ids(v.custom_tree.as_ref().unwrap());
-        assert_eq!(ids.len(), before + 1);
-        assert!(ids.contains(&id), "new cell id spliced into the tree");
-        let rects = cell_rects(&v, area(120, 40));
-        assert!(rects.iter().all(|r| r.is_some()), "all cells placed");
-    }
+    // -- prune tree maintenance (test-only helper; splice/prune now server-owned)
 
     #[test]
     fn prune_from_tree_removes_then_clears() {
@@ -1407,13 +1438,13 @@ mod tests {
         cells[1].title = Some("beta / Tab 1".into());
         cells[2].title = Some("gamma / Tab 1".into());
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells,
             layout: monoclev(),
             focused: 1,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let theme = tt();
         let a = area(80, 24);
@@ -1459,13 +1490,13 @@ mod tests {
         disconnected.title = Some("beta / Tab 1".into());
         disconnected.disconnected = true;
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![waiting, disconnected],
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL");
@@ -1487,6 +1518,7 @@ mod tests {
     fn monocle_content_below_strip_not_on_it() {
         // The focused snapshot must never land on the strip row (row 0).
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![
                 cell_with(1, Some(snap_filled(78, 24, 'A'))),
@@ -1496,7 +1528,6 @@ mod tests {
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL");
@@ -1516,13 +1547,13 @@ mod tests {
         cells[1].title = Some("beta / Tab 1".into());
         cells[2].title = Some("gamma / Tab 1".into());
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells,
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         // Locate beta's entry on the strip via the same segment layout used to
@@ -1543,6 +1574,7 @@ mod tests {
         // not panic on degenerate heights. Height 2 is the interesting case
         // (strip row 0, focused rect height 1 -> no border).
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![
                 cell_with(1, Some(snap_filled(10, 3, 'A'))),
@@ -1552,7 +1584,6 @@ mod tests {
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 2), (10, 3), (0, 0)] {
             let buf = composite(&view, area(w, h), &tt(), "NORMAL");
@@ -1580,6 +1611,7 @@ mod tests {
     fn composite_places_each_snapshot_in_its_cell() {
         // Two side-by-side cells; each snapshot filled with a distinct marker.
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![
                 cell_with(1, Some(snap_filled(40, 24, 'A'))),
@@ -1589,7 +1621,6 @@ mod tests {
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL");
@@ -1606,6 +1637,7 @@ mod tests {
     #[test]
     fn composite_draws_distinct_focused_border() {
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![
                 cell_with(1, Some(snap_filled(40, 24, 'A'))),
@@ -1615,7 +1647,6 @@ mod tests {
             focused: 1,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL");
@@ -1669,13 +1700,13 @@ mod tests {
             session_visible: false,
         };
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap))],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL");
@@ -1698,13 +1729,13 @@ mod tests {
         // interior (row iy), not be pushed to the bottom.
         let snap = snap_filled(78, 3, 'S');
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap))],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let buf = composite(&view, a, &tt(), "NORMAL");
@@ -1715,13 +1746,13 @@ mod tests {
     #[test]
     fn composite_empty_snapshot_shows_placeholder() {
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(42, None)],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         // A cell with no snapshot yet shows a `waiting…` placeholder.
@@ -1734,13 +1765,13 @@ mod tests {
         let mut cell = cell_with(1, Some(snap_filled(40, 20, 'A')));
         cell.disconnected = true;
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
@@ -1752,6 +1783,7 @@ mod tests {
     #[test]
     fn monocle_draws_only_focused_cell() {
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![
                 cell_with(1, Some(snap_filled(78, 24, 'A'))),
@@ -1761,7 +1793,6 @@ mod tests {
             focused: 1,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
@@ -1776,13 +1807,13 @@ mod tests {
     fn cell_at_hit_tests_grid() {
         // 2 cells side-by-side across an 80-wide area: left half -> 0, right -> 1.
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(1, None), cell_with(2, None)],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         let rects = cell_rects(&view, a);
@@ -1803,13 +1834,13 @@ mod tests {
     #[test]
     fn cell_at_monocle_keeps_focus() {
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(1, None), cell_with(2, None)],
             layout: monoclev(),
             focused: 1,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         assert_eq!(cell_at(&view, area(80, 24), 5, 5), Some(1));
     }
@@ -1821,13 +1852,13 @@ mod tests {
         snap.cursor_x = 3;
         snap.cursor_y = 9; // last row of the snapshot
         let view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(1, Some(snap.clone())), cell_with(2, Some(snap))],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         let a = area(80, 24);
         // Focused cell 0: interior origin (ix=1, iy=1); snapshot (10 rows) fits in
@@ -1841,13 +1872,13 @@ mod tests {
         let mut hidden = snap_filled(40, 10, 'A');
         hidden.cursor_visible = false;
         let view2 = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell_with(1, Some(hidden))],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         assert_eq!(focused_cursor(&view2, a), None);
 
@@ -1858,13 +1889,13 @@ mod tests {
         }
         cell.disconnected = true;
         let view3 = ClientView {
+            id: 0,
             name: "v".into(),
             cells: vec![cell],
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         assert_eq!(focused_cursor(&view3, a), None);
     }
@@ -1892,13 +1923,13 @@ mod tests {
         let a = area(80, 24);
         let cells = cells_area(a);
         let mk = || ClientView {
+            id: 0,
             name: "v".into(),
             cells: (1..=4).map(|id| cell_with(id, None)).collect(),
             layout: gridv(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         // Sanity: confirm the grid lays 4 cells as a 2x2 (two rows of two), so
         // the neighbor expectations below are the geometric truth.
@@ -1949,13 +1980,13 @@ mod tests {
             second: Box::new(LayoutNode::new_stack(2)),
         };
         let mut view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: (1..=2).map(|id| cell_with(id, None)).collect(),
             layout: gridv(),
             focused: 1, // B (bottom) focused
             custom_tree: Some(tree),
             zoomed: false,
-            next_cell_id: 1000,
         };
         // Focus UP from the bottom cell must reach the TOP cell (index 0 = A).
         assert!(
@@ -1975,13 +2006,13 @@ mod tests {
     fn move_focus_monocle_pages_through_cells() {
         let cells = cells_area(area(80, 24));
         let mut view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: (1..=3).map(|id| cell_with(id, None)).collect(),
             layout: monoclev(),
             focused: 0,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         assert!(view.move_focus(FocusDirection::Right, cells));
         assert_eq!(view.focused, 1);
@@ -2003,13 +2034,13 @@ mod tests {
     #[test]
     fn clamp_focus_after_removal() {
         let mut view = ClientView {
+            id: 0,
             name: "v".into(),
             cells: (1..=3).map(|id| cell_with(id, None)).collect(),
             layout: gridv(),
             focused: 2,
             custom_tree: None,
             zoomed: false,
-            next_cell_id: 1000,
         };
         view.cells.pop();
         view.clamp_focus();
@@ -2029,13 +2060,13 @@ mod tests {
         // Grid and Monocle must hold.
         for layout in [gridv(), monoclev()] {
             let view = ClientView {
+                id: 0,
                 name: "empty".into(),
                 cells: vec![],
                 layout,
                 focused: 0,
                 custom_tree: None,
                 zoomed: false,
-                next_cell_id: 1000,
             };
             let a = area(80, 24);
             let buf = composite(&view, a, &tt(), "NORMAL");

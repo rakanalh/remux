@@ -1,10 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+use crate::server::layout::FocusDirection;
+
 /// Unique identifier for a pane within the server.
 ///
-/// This is defined here to avoid a circular dependency on `server::layout::PaneId`
-/// while other modules are still being developed.
+/// This is a plain `u64` alias (kept in sync with `server::layout::PaneId`) so
+/// the wire types don't have to name that type. Note the module does depend on
+/// `server::layout` for [`FocusDirection`] (used by the view resize/move
+/// intents) — that direction is acyclic because `server::layout` itself only
+/// depends on `serde`.
 pub type PaneId = u64;
+
+/// Unique identifier for a shared server-side View. Plain `u64` alias, matching
+/// [`PaneId`]'s style.
+pub type ViewId = u64;
+
+/// Unique, per-view stable identifier for a View cell. Plain `u64` alias.
+pub type CellId = u64;
+
+/// Identifies which connection (from the *client's* perspective) a shared-view
+/// cell's pane lives on. Mirrors the client's `ConnId`, but defined here so the
+/// wire protocol carries no dependency on client internals. The server stores
+/// and echoes it verbatim; it does not resolve remote descriptors itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnDescriptor {
+    /// The local server the client is directly attached to.
+    Local,
+    /// A named remote from the client's `[remotes]` config.
+    Remote(String),
+}
 
 // ---------------------------------------------------------------------------
 // Version handshake
@@ -12,7 +36,7 @@ pub type PaneId = u64;
 
 /// The wire protocol version. Bump when a breaking change is made to the
 /// framed message shapes exchanged between client and server.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -146,6 +170,45 @@ pub enum ClientMessage {
         up: bool,
         lines: u16,
     },
+
+    // -- Shared View intents ------------------------------------------------
+    // Client → server requests to mutate the server-owned shared-view registry.
+    // Every mutation is followed by a `ViewList` broadcast to all clients, so
+    // views are consistent across every connected terminal. `ViewCreate` also
+    // gets a direct `ViewCreated { id }` ack to the requester.
+    /// Create a new (empty, Grid-default) shared view named `name`.
+    ViewCreate { name: String },
+    /// Delete the view `id` (no-op if it doesn't exist).
+    ViewDelete { id: ViewId },
+    /// Rename view `id` to `name`.
+    ViewRename { id: ViewId, name: String },
+    /// Append cells aliasing the given `(connection, pane)` pairs to view `id`.
+    ViewAddCells {
+        id: ViewId,
+        cells: Vec<(ConnDescriptor, PaneId)>,
+    },
+    /// Remove the cell `cell_id` from view `id`.
+    ViewRemoveCell { id: ViewId, cell_id: CellId },
+    /// Focus the cell `cell_id` within view `id`.
+    ViewSetFocus { id: ViewId, cell_id: CellId },
+    /// Cycle view `id` to the next automatic layout (dropping any custom tree).
+    ViewCycleLayout { id: ViewId },
+    /// Toggle focus-cell zoom for view `id`.
+    ViewToggleZoom { id: ViewId },
+    /// Resize the cell `cell_id` in view `id` by `amount` percent toward `dir`.
+    ViewResizeCell {
+        id: ViewId,
+        cell_id: CellId,
+        dir: FocusDirection,
+        amount: u16,
+    },
+    /// Move the cell `cell_id` in view `id` toward `dir` (swap with the spatial
+    /// neighbor, else relocate to that edge).
+    ViewMoveCell {
+        id: ViewId,
+        cell_id: CellId,
+        dir: FocusDirection,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +334,62 @@ pub enum ServerMessage {
         #[serde(default)]
         session_visible: bool,
     },
+    /// Direct acknowledgement to the client that issued a `ViewCreate`, carrying
+    /// the id the new view was assigned. Sent alongside the `ViewList` broadcast
+    /// so the creator can immediately refer to the view it just made.
+    ViewCreated { id: ViewId },
+    /// The full current state of every shared view. Broadcast to ALL connected
+    /// clients after any view mutation, and pushed once to a client when it
+    /// connects, so every terminal stays in sync with the shared registry.
+    ViewList {
+        #[serde(default)]
+        views: Vec<ViewInfo>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Shared view snapshot (server -> client)
+// ---------------------------------------------------------------------------
+
+/// One cell of a shared view: a reference to a real pane on a specific
+/// connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CellInfo {
+    /// Stable, per-view identity for this cell.
+    pub id: CellId,
+    /// Which connection (from the client's perspective) hosts the pane.
+    pub conn: ConnDescriptor,
+    /// The aliased pane's id on that connection.
+    pub pane_id: PaneId,
+}
+
+/// A snapshot of one shared view's state, as carried in [`ServerMessage::ViewList`].
+///
+/// Fields marked `#[serde(default)]` may grow in later protocol revisions
+/// without breaking older peers.
+///
+/// Not `PartialEq`: the embedded [`LayoutMode`]/[`LayoutNode`] are not `PartialEq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewInfo {
+    pub id: ViewId,
+    pub name: String,
+    #[serde(default)]
+    pub cells: Vec<CellInfo>,
+    /// The view's automatic layout mode. The full [`LayoutMode`] travels so a
+    /// (Phase 2) client can composite the cells without an extra round trip.
+    #[serde(default)]
+    pub layout: crate::server::layout::LayoutMode,
+    /// The persistent manual arrangement, once the user has resized/moved a
+    /// cell. `None` means the automatic `layout` is in effect; `Some` means the
+    /// view reports its layout name as `custom`.
+    #[serde(default)]
+    pub custom_tree: Option<crate::server::layout::LayoutNode>,
+    /// Index of the focused cell within `cells`.
+    #[serde(default)]
+    pub focused: usize,
+    /// Whether the focused cell is zoomed to fill the view.
+    #[serde(default)]
+    pub zoomed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,6 +1130,91 @@ mod tests {
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: Welcome = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn round_trip_view_intents() {
+        use crate::server::layout::FocusDirection;
+        let cases = vec![
+            ClientMessage::ViewCreate { name: "V1".into() },
+            ClientMessage::ViewDelete { id: 7 },
+            ClientMessage::ViewRename {
+                id: 7,
+                name: "V2".into(),
+            },
+            ClientMessage::ViewAddCells {
+                id: 7,
+                cells: vec![
+                    (ConnDescriptor::Local, 3),
+                    (ConnDescriptor::Remote("box".into()), 9),
+                ],
+            },
+            ClientMessage::ViewRemoveCell { id: 7, cell_id: 2 },
+            ClientMessage::ViewSetFocus { id: 7, cell_id: 2 },
+            ClientMessage::ViewCycleLayout { id: 7 },
+            ClientMessage::ViewToggleZoom { id: 7 },
+            ClientMessage::ViewResizeCell {
+                id: 7,
+                cell_id: 2,
+                dir: FocusDirection::Right,
+                amount: 5,
+            },
+            ClientMessage::ViewMoveCell {
+                id: 7,
+                cell_id: 2,
+                dir: FocusDirection::Down,
+            },
+        ];
+        for msg in cases {
+            let encoded = encode_message(&msg).unwrap();
+            let len = decode_message_length(encoded[..4].try_into().unwrap());
+            let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+            // Compare via debug string (ClientMessage isn't PartialEq).
+            assert_eq!(format!("{decoded:?}"), format!("{msg:?}"));
+        }
+    }
+
+    #[test]
+    fn round_trip_view_list() {
+        let msg = ServerMessage::ViewList {
+            views: vec![ViewInfo {
+                id: 1,
+                name: "V1".into(),
+                cells: vec![CellInfo {
+                    id: 4,
+                    conn: ConnDescriptor::Local,
+                    pane_id: 12,
+                }],
+                layout: crate::server::layout::LayoutMode::Grid(crate::server::layout::GridLayout),
+                custom_tree: None,
+                focused: 0,
+                zoomed: false,
+            }],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ServerMessage::ViewList { views } => {
+                assert_eq!(views.len(), 1);
+                assert_eq!(views[0].name, "V1");
+                assert_eq!(views[0].cells.len(), 1);
+                assert_eq!(views[0].cells[0].id, 4);
+                assert_eq!(views[0].cells[0].pane_id, 12);
+                assert_eq!(views[0].cells[0].conn, ConnDescriptor::Local);
+                assert_eq!(views[0].layout.name(), "grid");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_view_created() {
+        let msg = ServerMessage::ViewCreated { id: 42 };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        assert!(matches!(decoded, ServerMessage::ViewCreated { id: 42 }));
     }
 
     #[test]

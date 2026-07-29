@@ -367,7 +367,11 @@ pub enum Direction {
 }
 
 /// Direction for focus navigation (4-directional).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Derives `Serialize`/`Deserialize` so it can travel on the wire as the shared
+/// direction argument for the view resize/move intents in [`crate::protocol`]
+/// (reusing this enum rather than defining a parallel one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FocusDirection {
     Left,
     Right,

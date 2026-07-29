@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
-use crate::protocol::{ClientMessage, Hello, ServerMessage, Welcome, PROTOCOL_VERSION};
+use crate::protocol::{ClientMessage, Hello, ServerMessage, ViewInfo, Welcome, PROTOCOL_VERSION};
 use crate::server::daemon::{read_message, socket_path, write_message};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,13 @@ pub struct RemuxClient {
     /// handshake. Used to detect version skew against this binary's own
     /// [`crate::protocol::build_version`].
     server_version: String,
+    /// The most recent shared-view registry snapshot seen while
+    /// [`recv_skip_views`](Self::recv_skip_views) skipped `ViewList` broadcasts
+    /// during the synchronous startup handshake. The server pushes an initial
+    /// `ViewList` on connect, which would otherwise be discarded before the
+    /// steady-state loop's reader task exists — so it is *captured* here and
+    /// replayed into the loop's view cache via [`take_captured_views`](Self::take_captured_views).
+    captured_views: Option<Vec<ViewInfo>>,
 }
 
 impl RemuxClient {
@@ -95,6 +102,7 @@ impl RemuxClient {
             writer,
             _child: None,
             server_version,
+            captured_views: None,
         })
     }
 
@@ -158,6 +166,7 @@ impl RemuxClient {
             writer,
             _child: Some(child),
             server_version,
+            captured_views: None,
         })
     }
 
@@ -178,6 +187,49 @@ impl RemuxClient {
     /// Returns `Ok(None)` if the server closed the connection.
     pub async fn recv(&mut self) -> Result<Option<ServerMessage>> {
         read_message::<ServerMessage>(&mut self.reader).await
+    }
+
+    /// Receive the next message, transparently skipping the shared-view
+    /// broadcasts (`ViewList` / `ViewCreated`).
+    ///
+    /// The server pushes an initial `ViewList` to every client as soon as it
+    /// connects (and re-broadcasts on every view mutation). That message can
+    /// therefore arrive in the middle of the client's *synchronous* startup
+    /// request/response handshake (ListSessions → SessionList, etc.), which runs
+    /// before the async reader task is spawned. Those sites expect a specific
+    /// reply, so they use this to ignore the unsolicited view broadcast rather
+    /// than mis-consume it during the handshake.
+    ///
+    /// Phase 2: the initial `ViewList` is not discarded but *captured* into
+    /// `captured_views` (last one wins). The steady-state loop replays it into
+    /// its view cache via [`take_captured_views`](Self::take_captured_views), so a
+    /// client that connects after another terminal created a shared view still
+    /// sees it — its switcher lists it — without waiting for the next mutation.
+    pub async fn recv_skip_views(&mut self) -> Result<Option<ServerMessage>> {
+        loop {
+            match self.recv().await? {
+                Some(ServerMessage::ViewList { views }) => {
+                    log::debug!(
+                        "terminal: capturing startup ViewList ({} view(s))",
+                        views.len()
+                    );
+                    self.captured_views = Some(views);
+                    continue;
+                }
+                Some(ServerMessage::ViewCreated { .. }) => {
+                    log::debug!("terminal: skipping ViewCreated during startup handshake");
+                    continue;
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Take the shared-view registry snapshot captured during the startup
+    /// handshake (see [`recv_skip_views`](Self::recv_skip_views)), leaving `None`
+    /// behind. The steady-state loop calls this once to seed its view cache.
+    pub fn take_captured_views(&mut self) -> Option<Vec<ViewInfo>> {
+        self.captured_views.take()
     }
 
     /// Decompose the client into its owned reader, writer, and (for SSH

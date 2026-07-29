@@ -104,15 +104,24 @@ pub struct ConnectionManager {
     /// local `ConnId::Local` connection has no [`RemoteEntry`], so its reported
     /// version is tracked here for version-skew detection.
     local_server_version: Option<String>,
+    /// The shared-view registry snapshot captured from the local client during
+    /// its startup handshake (see
+    /// [`RemuxClient::take_captured_views`](crate::client::terminal::RemuxClient::take_captured_views)).
+    /// The steady-state loop takes it once at startup to seed its view cache, so
+    /// a terminal that connects after a shared view already exists lists it
+    /// immediately. `None` once taken (or when nothing was captured).
+    initial_view_infos: Option<Vec<crate::protocol::ViewInfo>>,
 }
 
 impl ConnectionManager {
     /// Build a manager around a connected local client, seeding the remotes map
     /// (all `NotConnected`) from config.
-    pub fn new(local: RemuxClient, remotes: &HashMap<String, RemoteConfig>) -> Self {
+    pub fn new(mut local: RemuxClient, remotes: &HashMap<String, RemoteConfig>) -> Self {
         let mut mgr = Self::empty(remotes, ConnId::Local);
-        // Capture the reported version before `into_split` consumes the client.
+        // Capture the reported version + the startup ViewList snapshot before
+        // `into_split` consumes the client.
         mgr.local_server_version = Some(local.server_version().to_string());
+        mgr.initial_view_infos = local.take_captured_views();
         let (reader, writer, _child) = local.into_split();
         mgr.writers.insert(ConnId::Local, writer);
         mgr.spawn_reader(ConnId::Local, reader);
@@ -172,7 +181,15 @@ impl ConnectionManager {
             tx,
             rx,
             local_server_version: None,
+            initial_view_infos: None,
         }
+    }
+
+    /// Take the startup shared-view registry snapshot captured from the local
+    /// client's handshake, leaving `None` behind. Called once by the steady-state
+    /// loop to seed its view cache.
+    pub fn take_initial_view_infos(&mut self) -> Option<Vec<crate::protocol::ViewInfo>> {
+        self.initial_view_infos.take()
     }
 
     /// Spawn a reader task that pumps decoded messages from `reader` into the

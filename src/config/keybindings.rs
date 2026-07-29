@@ -234,6 +234,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('x', leaf("remove cell", "ViewRemovePane")),
                 (' ', leaf("layout next", "ViewLayoutNext")),
                 ('q', leaf("close view", "ViewClose")),
+                ('d', leaf("delete view", "ViewDelete")),
             ],
         ),
     );

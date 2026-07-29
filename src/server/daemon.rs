@@ -511,6 +511,21 @@ impl RemuxServer {
             }
         });
 
+        // Initial view sync: a freshly connected client immediately learns the
+        // current shared views, so a brand-new terminal is in sync with the
+        // shared registry before it does anything. Sent unconditionally (an
+        // empty registry sends an empty `ViewList`, which is still correct
+        // "nothing here" information a client can rely on).
+        {
+            let st = self.state.lock().await;
+            let msg = build_view_list_message(&st);
+            drop(st);
+            let cls = self.clients.lock().await;
+            if let Some(conn) = cls.get(&client_id) {
+                let _ = conn.tx.send(msg);
+            }
+        }
+
         // Spawn reader task.
         let state = Arc::clone(&self.state);
         let panes = Arc::clone(&self.panes);
@@ -991,6 +1006,103 @@ async fn handle_client_message(
                     let _ = conn.tx.send(msg);
                 }
             }
+            Ok(())
+        }
+
+        // -- Shared View intents --------------------------------------------
+        // Each mutates the server-owned registry (behind the `state` lock) then
+        // broadcasts the full `ViewList` to every connected client via the one
+        // helper. `ViewCreate` additionally acks the creator directly.
+        ClientMessage::ViewCreate { name } => {
+            let id = {
+                let mut st = state.lock().await;
+                st.view_create(name)
+            };
+            {
+                let cls = clients.lock().await;
+                if let Some(conn) = cls.get(&client_id) {
+                    let _ = conn.tx.send(ServerMessage::ViewCreated { id });
+                }
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewDelete { id } => {
+            {
+                let mut st = state.lock().await;
+                st.view_delete(id);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewRename { id, name } => {
+            {
+                let mut st = state.lock().await;
+                st.view_rename(id, name);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewAddCells { id, cells } => {
+            {
+                let mut st = state.lock().await;
+                st.view_add_cells(id, cells);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewRemoveCell { id, cell_id } => {
+            {
+                let mut st = state.lock().await;
+                st.view_remove_cell(id, cell_id);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewSetFocus { id, cell_id } => {
+            {
+                let mut st = state.lock().await;
+                st.view_set_focus(id, cell_id);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewCycleLayout { id } => {
+            {
+                let mut st = state.lock().await;
+                st.view_cycle_layout(id);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewToggleZoom { id } => {
+            {
+                let mut st = state.lock().await;
+                st.view_toggle_zoom(id);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewResizeCell {
+            id,
+            cell_id,
+            dir,
+            amount,
+        } => {
+            {
+                let mut st = state.lock().await;
+                st.view_resize_cell(id, cell_id, dir, amount);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
+        ClientMessage::ViewMoveCell { id, cell_id, dir } => {
+            let area = view_reference_area(clients).await;
+            {
+                let mut st = state.lock().await;
+                st.view_move_cell(id, cell_id, dir, area);
+            }
+            broadcast_view_list(state, clients).await;
             Ok(())
         }
     }
@@ -4082,6 +4194,74 @@ async fn build_pane_content(
         tab_name,
         session_visible,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Shared view helpers
+// ---------------------------------------------------------------------------
+
+/// Build the `ViewList` message that mirrors the current shared-view registry.
+/// Pure over a locked `ServerState`; the full [`LayoutMode`]/`custom_tree`
+/// travel so a client can composite without an extra round trip.
+fn build_view_list_message(st: &ServerState) -> ServerMessage {
+    let views = st
+        .views
+        .iter()
+        .map(|v| ViewInfo {
+            id: v.id,
+            name: v.name.clone(),
+            cells: v
+                .cells
+                .iter()
+                .map(|c| CellInfo {
+                    id: c.id,
+                    conn: c.conn.clone(),
+                    pane_id: c.pane_id,
+                })
+                .collect(),
+            layout: v.layout.clone(),
+            custom_tree: v.custom_tree.clone(),
+            focused: v.focused,
+            zoomed: v.zoomed,
+        })
+        .collect();
+    ServerMessage::ViewList { views }
+}
+
+/// Broadcast the full current `ViewList` to EVERY connected client, so the
+/// shared registry stays consistent across all terminals. Called after every
+/// view mutation. Locks `state` to snapshot the message, then `clients` to fan
+/// out — never nested, matching the codebase lock ordering.
+async fn broadcast_view_list(
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    let msg = {
+        let st = state.lock().await;
+        build_view_list_message(&st)
+    };
+    let cls = clients.lock().await;
+    for conn in cls.values() {
+        let _ = conn.tx.send(msg.clone());
+    }
+}
+
+/// A reference area for view geometry (the `find_neighbor` search in
+/// `ViewMoveCell`): the componentwise min terminal size across all connected
+/// clients (fallback 80x24), minus one row for the view's status bar — matching
+/// the client's `cells_area` convention. See the Phase-2 TODO on
+/// [`ServerState::view_move_cell`]: a shared view ultimately needs its own
+/// canonical area rather than one derived from the live client population.
+async fn view_reference_area(clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>) -> Rect {
+    let cls = clients.lock().await;
+    let cols = cls.values().map(|c| c.cols).min().unwrap_or(80);
+    let rows = cls.values().map(|c| c.rows).min().unwrap_or(24);
+    Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows.saturating_sub(1),
+    }
 }
 
 /// Refresh a target session after a structural mutation performed on behalf of
