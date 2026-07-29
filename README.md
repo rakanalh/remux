@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/rakanalh/remux/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/rakanalh/remux/actions/workflows/ci.yml)
 
-A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, a tree-view session manager, and first-class SSH remote sessions.
+A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, a tree-view session manager, first-class SSH remote sessions, and **Views** — a single screen composed of live panes borrowed from any session on any machine.
 
 Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Config changes hot-reload live — no restart needed.
 
@@ -29,7 +29,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`).
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
-- **Four layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), and **Custom** (your exact manual splits, no auto-redistribution). Cycle with `Alt-Space` / `Ctrl-a Space`.
+- **Five layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid).
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
 
@@ -61,6 +61,14 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Remote attach over SSH** — declare servers in `[remotes.<name>]` (or connect ad-hoc with `RemoteConnect user@host`). Each remote is a top-level node in the session manager tree.
 - **Unified lazy tree** — expanding a remote node lazily connects over SSH (spawning `remux relay` on the remote) and lists that server's sessions, merged into the same tree as local sessions.
 - **Foreground handoff** — attaching to a remote session hands the render loop over to the remote transport, so remote sessions feel just like local ones. Structural edits (create/delete/rename/move) stay local-only; remotes support expand and switch-to-session/tab/pane.
+
+### Views (cross-machine multi-pane)
+
+- **Views** — a virtual tab whose cells are live, read/write **aliases** to existing panes that may live on different machines, sessions, and tabs. Watch and drive several long-running things (builds, logs, agents) from one screen without moving them.
+- **Compose from existing panes** — in the session manager, mark panes with `Space` across any servers/sessions/tabs, then `va` to alias them into a view. `Ctrl-a w a` adds the currently focused pane.
+- **Shared across terminals** — views live on the server, so every terminal on the machine sees the same views in the switcher. Add a pane in one terminal and any terminal displaying that view repaints live; focus, layout, and zoom are mirrored too. (Views are in-memory: they clear when the server restarts.)
+- **Real layouts** — views use the same layout engine as normal tabs (Grid by default; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
+- **Re-entry via the switcher** — the quick switcher (`Alt-s`) lists views alongside sessions; selecting one enters it.
 
 ### Mouse
 
@@ -111,6 +119,10 @@ One master pane occupies 50% of the screen; secondary panes divide the remaining
 Full-screen single pane — only the active pane is visible. Cycle through panes with stack next/prev.
 
 ![Monocle layout](docs/screenshots/layout-monocle.png)
+
+### Grid
+
+Equal-size cells in a `ceil(sqrt(n))`-column grid, filled row-major. Every pane gets the same amount of space, which makes it the default for Views (and it works for normal tabs too).
 
 ### Custom
 
@@ -177,9 +189,10 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `t` | Open the **Tab** group |
 | `x` | Open the **Session** group |
 | `s` | Open the **Search** group |
+| `w` | Open the **View** group |
 | `v` | Enter Visual mode |
 | `g` | Toggle border style (Zellij ⇄ Tmux) *(→ Normal)* |
-| `Space` | Cycle layout (BSP → Master → Monocle) *(→ Normal)* |
+| `Space` | Cycle layout (BSP → Master → Monocle → Grid) *(→ Normal)* |
 | `f` | Zoom the focused pane *(→ Normal)* |
 | `}` | Next tab *(→ Normal)* |
 | `{` | Previous tab *(→ Normal)* |
@@ -239,6 +252,20 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `s` | Enter search mode |
 | `e` | Open scrollback in `$EDITOR` |
 
+#### View (`w`)
+
+Views are virtual tabs whose cells alias existing panes (see [Views](#views-cross-machine-multi-pane)). The group lives on `w` because `v` is taken by Visual mode.
+
+| Key | Action |
+|-----|--------|
+| `n` | New view (prompts for a name) |
+| `a` | Add the focused pane to a view (opens the view picker) |
+| `r` | Rename the current view |
+| `x` | Remove the focused cell from the current view |
+| `Space` | Cycle the view's layout |
+| `q` | Leave the view (it stays available to every terminal) |
+| `d` | Delete the view (for everyone) |
+
 ### Alt shortcuts (default, instant in Normal mode)
 
 | Shortcut | Action |
@@ -295,6 +322,8 @@ Opened with `Ctrl-a x m` (or `Alt-s` for the quick switcher).
 | `c` | New folder |
 | `d` | Delete session |
 | `m` | Move session |
+| `Space` | Mark/unmark the highlighted pane (multi-select, across servers) |
+| `v a` | Add the marked panes (or the highlighted one) to a view |
 | `Esc` | Close |
 
 ## Commands
@@ -346,8 +375,15 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `SessionMoveToFolder` | — | Open a folder picker to move the current session. |
 | `SessionSwitchLast` | — | Toggle back to the previously-attached session. |
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
-| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle). |
+| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid). |
 | `SetMaster` | — | Make the focused pane the master pane (Master layout). |
+| `ViewNew` | `[name]` | Create a view and enter it (prompts when no name is given). |
+| `ViewAddPane` | — | Add the focused pane to a view (opens the view picker). |
+| `ViewRename` | `<name>` | Rename the current view. |
+| `ViewRemovePane` | — | Remove (eject) the focused cell from the current view. |
+| `ViewLayoutNext` | — | Cycle the current view's layout. |
+| `ViewClose` | — | Leave the current view; it stays available to every terminal. |
+| `ViewDelete` | — | Delete the current view for everyone. |
 | `EnterNormal` | — | Return to Normal mode (keys pass to the app). |
 | `EnterCommandMode` | — | Enter Command mode (navigate the leader tree). |
 | `EnterVisualMode` | — | Enter Visual/copy mode. |
