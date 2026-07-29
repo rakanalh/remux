@@ -63,9 +63,13 @@ pub struct PaneSnapshot {
 /// plus the most recent snapshot received for it (`None` until the first
 /// `PaneContent` arrives).
 ///
-/// A cell has four observable states, distinguished without a separate enum:
-/// - **waiting**: `snapshot == None && !disconnected` — subscribed but no
-///   `PaneContent` has arrived yet (shows `waiting for <title>…`).
+/// A cell has five observable states, distinguished without a separate enum:
+/// - **waiting**: `snapshot == None && !disconnected && unavailable.is_none()` —
+///   subscribed but no `PaneContent` has arrived yet (shows `waiting for <title>…`).
+/// - **unavailable**: `unavailable == Some(reason)` — this terminal cannot
+///   currently reach the cell's source server (a remote it has not connected, or
+///   one whose dial failed), so no snapshot can ever arrive; shows `reason`
+///   instead of an eternal `waiting…`.
 /// - **active-in-session**: latest snapshot's `session_visible == true` — the
 ///   source pane is shown full-size in its real session, so the cell shows an
 ///   `● Active in <title>` placeholder instead of the streamed content and sends
@@ -94,6 +98,14 @@ pub struct ViewCell {
     /// connection closed). A disconnected cell renders a `disconnected` label
     /// and silently drops keystrokes instead of crashing the client.
     pub disconnected: bool,
+    /// Why this terminal cannot reach the cell's source server right now, as a
+    /// short label to render in place of the content (`connecting to <name>…`,
+    /// `not connected: <name>`). Set by the subscribe pass when the cell's
+    /// connection has no open transport — a shared view can name a remote this
+    /// particular terminal never connected — and cleared as soon as a
+    /// subscription goes out or a `PaneContent` arrives. Without it such a cell
+    /// would sit on `waiting…` forever, since no snapshot can ever come.
+    pub unavailable: Option<String>,
     /// `session / tab` title for the cell's source pane, learned from
     /// `PaneContent`. `None` until the first snapshot; kept live so a rename on
     /// the source updates the border label. Remote cells are host-prefixed by
@@ -186,8 +198,8 @@ impl ClientView {
     ///
     /// Membership / `layout` / `custom_tree` / `focused` / `zoomed` are taken
     /// verbatim from the server (the shared arrangement). Per-terminal render
-    /// state — each cell's last [`PaneSnapshot`], learned title, and disconnected
-    /// flag — is carried over from `prev` (this view's previous cache entry, if
+    /// state — each cell's last [`PaneSnapshot`], learned title, and
+    /// disconnected / unavailable flags — is carried over from `prev` (this view's previous cache entry, if
     /// any) so a resync never drops already-streamed content nor flashes
     /// `waiting…`. Render state is matched first by the stable [`ViewCell::id`],
     /// then by `(conn, pane_id)` so a freshly-added cell aliasing an
@@ -211,6 +223,7 @@ impl ClientView {
                     pane_id: ci.pane_id,
                     snapshot: carried.and_then(|c| c.snapshot.clone()),
                     disconnected: carried.map(|c| c.disconnected).unwrap_or(false),
+                    unavailable: carried.and_then(|c| c.unavailable.clone()),
                     title: carried.and_then(|c| c.title.clone()),
                 }
             })
@@ -660,7 +673,7 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
             put(buf, y, last_x, border_cell('│', focused));
         }
         // Label the top border with the cell's title (session / tab, learned
-        // from PaneContent), or `waiting…` until the first snapshot arrives.
+        // from PaneContent), or its identity until the first snapshot arrives.
         let label = format!(" {} ", cell_title(cell));
         let max = rw.saturating_sub(2);
         for (i, ch) in label.chars().take(max).enumerate() {
@@ -676,6 +689,15 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
     // (now stale) snapshot -- its source is gone.
     if cell.disconnected {
         draw_centered(buf, ix, iy, iw, ih, "disconnected");
+        return;
+    }
+
+    // A cell this terminal cannot reach names the reason (`connecting to x…`,
+    // `not connected: x`). No snapshot can arrive while that holds, so saying so
+    // is strictly better than an eternal `waiting…`; any content still shown
+    // would be stale, since even the subscription never went out.
+    if let Some(reason) = &cell.unavailable {
+        draw_centered(buf, ix, iy, iw, ih, reason);
         return;
     }
 
@@ -715,9 +737,19 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
 }
 
 /// The cell's border/label title: its `session / tab` (host-prefixed for
-/// remotes) once known, else `waiting…` before the first snapshot.
+/// remotes) once known, else the cell's identity — `<host>: pane <id>` for a
+/// remote source, `pane <id>` for a local one.
+///
+/// The fallback must read sensibly BOTH standalone (the top-border label) and
+/// nested inside a sentence (`waiting for {}…`, `● Active in {}`), which is why
+/// it is not itself a status word: a "waiting…" fallback composed into the
+/// no-snapshot placeholder produced the nonsense `waiting for waiting……`.
+/// Never empty — the Monocle strip's tab widths derive from these titles.
 fn cell_title(cell: &ViewCell) -> String {
-    cell.title.clone().unwrap_or_else(|| "waiting…".to_string())
+    cell.title.clone().unwrap_or_else(|| match &cell.conn {
+        ConnId::Remote(host) => format!("{host}: pane {}", cell.pane_id),
+        ConnId::Local => format!("pane {}", cell.pane_id),
+    })
 }
 
 /// Fixed per-tab width for the Monocle strip: the longest title plus one padding
@@ -1040,6 +1072,7 @@ mod tests {
             pane_id,
             snapshot,
             disconnected: false,
+            unavailable: None,
             title: None,
         }
     }
@@ -1758,6 +1791,79 @@ mod tests {
         // A cell with no snapshot yet shows a `waiting…` placeholder.
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("waiting"));
+    }
+
+    /// The no-snapshot placeholder nests `cell_title` inside `waiting for {}…`,
+    /// so the titleless fallback must be an IDENTITY, never a status word --
+    /// a `waiting…` fallback rendered the nonsense `waiting for waiting……`.
+    #[test]
+    fn composite_titleless_cell_never_doubles_the_placeholder() {
+        let mut cell = cell_with(7, None);
+        cell.conn = ConnId::Remote("mini".into());
+        let view = view_of(vec![cell], gridv(), 0);
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
+        assert!(!joined.contains("waiting for waiting"));
+        // Both call sites read sensibly: the border label names the cell, and the
+        // placeholder names what is being waited for.
+        assert!(joined.contains("mini: pane 7"));
+        assert!(joined.contains("waiting for mini: pane 7"));
+    }
+
+    /// A cell whose source server this terminal cannot reach can never receive a
+    /// snapshot, so it must say so instead of waiting forever.
+    #[test]
+    fn composite_unavailable_cell_shows_reason_not_waiting() {
+        let mut cell = cell_with(3, None);
+        cell.conn = ConnId::Remote("mini".into());
+        cell.unavailable = Some("not connected: mini".to_string());
+        let view = view_of(vec![cell], gridv(), 0);
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
+        assert!(joined.contains("not connected: mini"));
+        assert!(!joined.contains("waiting"));
+    }
+
+    /// `disconnected` (the source dropped) outranks `unavailable` (we never got
+    /// there), so a dropped cell keeps its established label.
+    #[test]
+    fn composite_disconnected_outranks_unavailable() {
+        let mut cell = cell_with(4, None);
+        cell.disconnected = true;
+        cell.unavailable = Some("not connected: mini".to_string());
+        let view = view_of(vec![cell], gridv(), 0);
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
+        assert!(joined.contains("disconnected"));
+        assert!(!joined.contains("not connected"));
+    }
+
+    /// A `ViewList` resync must carry `unavailable` forward, or the cell would
+    /// snap back to `waiting…` on every broadcast.
+    #[test]
+    fn from_info_carries_unavailable_forward() {
+        let mut prev_cell = cell_with(5, None);
+        prev_cell.conn = ConnId::Remote("mini".into());
+        prev_cell.unavailable = Some("not connected: mini".to_string());
+        let prev = view_of(vec![prev_cell], gridv(), 0);
+        let info = ViewInfo {
+            id: prev.id,
+            name: prev.name.clone(),
+            cells: vec![crate::protocol::CellInfo {
+                id: 5,
+                conn: ConnDescriptor::Remote("mini".into()),
+                pane_id: 5,
+            }],
+            layout: gridv(),
+            custom_tree: None,
+            focused: 0,
+            zoomed: false,
+        };
+        let rebuilt = ClientView::from_info(&info, Some(&prev));
+        assert_eq!(
+            rebuilt.cells[0].unavailable.as_deref(),
+            Some("not connected: mini")
+        );
     }
 
     #[test]

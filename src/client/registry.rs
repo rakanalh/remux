@@ -59,6 +59,12 @@ pub enum Incoming {
     Message(ConnId, ServerMessage),
     /// The given connection's reader hit EOF or an error.
     Closed(ConnId),
+    /// A background dial started by [`ConnectionManager::begin_connect_remote`]
+    /// finished: the named remote either handed back a connected client or an
+    /// error message. Delivered through the same channel as everything else so
+    /// the SSH dial never blocks the client's event loop; the loop hands it to
+    /// [`ConnectionManager::finish_remote_dial`].
+    RemoteDialed(String, Result<Box<RemuxClient>, String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -329,18 +335,7 @@ impl ConnectionManager {
 
         match result {
             Ok(Ok(client)) => {
-                let id = ConnId::Remote(name.to_string());
-                // Capture the reported version before `into_split` consumes it.
-                let server_version = client.server_version().to_string();
-                let (reader, writer, child) = client.into_split();
-                self.writers.insert(id.clone(), writer);
-                if let Some(entry) = self.remotes.get_mut(name) {
-                    entry._child = child;
-                    entry.state = RemoteState::Connected;
-                    entry.server_version = Some(server_version);
-                }
-                self.spawn_reader(id, reader);
-                log::info!("registry: remote '{name}' connected");
+                self.install_remote(name, client);
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -354,6 +349,100 @@ impl ConnectionManager {
                 log::warn!("registry: remote '{name}' timed out");
                 self.fail_remote(name, msg.clone());
                 anyhow::bail!("connecting to remote '{name}': {msg}")
+            }
+        }
+    }
+
+    /// Adopt a freshly dialed remote client as the transport for `name`: store
+    /// its writer, keep the ssh child alive, record the reported version, mark
+    /// the entry `Connected` and spawn its reader task. Shared by the blocking
+    /// [`connect_remote`](Self::connect_remote) and the background
+    /// [`finish_remote_dial`](Self::finish_remote_dial).
+    fn install_remote(&mut self, name: &str, client: RemuxClient) {
+        let id = ConnId::Remote(name.to_string());
+        // Capture the reported version before `into_split` consumes it.
+        let server_version = client.server_version().to_string();
+        let (reader, writer, child) = client.into_split();
+        self.writers.insert(id.clone(), writer);
+        if let Some(entry) = self.remotes.get_mut(name) {
+            entry._child = child;
+            entry.state = RemoteState::Connected;
+            entry.server_version = Some(server_version);
+        }
+        self.spawn_reader(id, reader);
+        log::info!("registry: remote '{name}' connected");
+    }
+
+    /// Start connecting to a named remote **in the background**, reporting the
+    /// outcome as an [`Incoming::RemoteDialed`] on the shared channel.
+    ///
+    /// Unlike [`connect_remote`](Self::connect_remote) this never awaits the SSH
+    /// dial, so a caller on the client's event loop (a View subscribing a cell
+    /// that names a remote this terminal has not connected) stays responsive
+    /// while the connection is established. The entry is marked `Connecting`
+    /// immediately; the caller must feed the resulting `RemoteDialed` to
+    /// [`finish_remote_dial`](Self::finish_remote_dial).
+    ///
+    /// No-op (returning `false`) unless the remote is known and idle
+    /// (`NotConnected`), so repeated calls — the View subscribe pass runs on
+    /// every layout/focus change — never pile up dials, and a `Failed` remote is
+    /// not retried behind the user's back.
+    pub fn begin_connect_remote(&mut self, name: &str) -> bool {
+        let config = match self.remotes.get(name) {
+            Some(entry) if entry.state == RemoteState::NotConnected => entry.config.clone(),
+            _ => return false,
+        };
+        self.set_state(name, RemoteState::Connecting);
+        log::info!(
+            "registry: background-connecting to remote '{name}' ({})",
+            config.ssh
+        );
+        let tx = self.tx.clone();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let connect = RemuxClient::connect_ssh(
+                &config.ssh,
+                config.port,
+                config.identity.as_deref(),
+                &config.extra_args,
+                &config.remux_path,
+            );
+            let result =
+                match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
+                    Ok(Ok(client)) => Ok(Box::new(client)),
+                    Ok(Err(e)) => Err(format!("{e:#}")),
+                    Err(_) => Err("connection timed out".to_string()),
+                };
+            let _ = tx.send(Incoming::RemoteDialed(name, result));
+        });
+        true
+    }
+
+    /// Apply the outcome of a [`begin_connect_remote`](Self::begin_connect_remote)
+    /// dial: adopt the connection on success, mark the remote `Failed` on error.
+    /// Returns whether the remote is now connected.
+    ///
+    /// A dial that lands after the remote was connected by some other path (the
+    /// session manager's blocking connect) is dropped, so a duplicate transport
+    /// and a second reader task can never be installed for one remote.
+    pub fn finish_remote_dial(
+        &mut self,
+        name: &str,
+        result: Result<Box<RemuxClient>, String>,
+    ) -> bool {
+        if self.remote_state(name) == RemoteState::Connected {
+            log::debug!("registry: dropping late dial for already-connected '{name}'");
+            return true;
+        }
+        match result {
+            Ok(client) => {
+                self.install_remote(name, *client);
+                true
+            }
+            Err(msg) => {
+                log::warn!("registry: background connect to remote '{name}' failed: {msg}");
+                self.fail_remote(name, msg);
+                false
             }
         }
     }

@@ -794,9 +794,17 @@ fn paint_view(
 /// other cell subscribes with `size_demand = false` -- it watches read-only,
 /// clipped, and imposes no size constraint, so merely watching never reflows
 /// the shared pane.
+///
+/// Views are SHARED, so a cell can name a remote *this* terminal has never
+/// connected (another terminal composed it) -- there is then no transport to
+/// subscribe over. Such a cell is lazily dialed in the BACKGROUND
+/// ([`ConnectionManager::begin_connect_remote`], never awaited here so the TUI
+/// stays responsive) and meanwhile labelled with the honest reason via
+/// [`ViewCell::unavailable`]; the `Incoming::RemoteDialed` arm re-subscribes once
+/// the dial lands. Without this the cell sat on `waiting…` forever.
 async fn subscribe_view_cells(
     mgr: &mut ConnectionManager,
-    view: &crate::client::view::ClientView,
+    view: &mut crate::client::view::ClientView,
 ) -> Result<()> {
     let (c, r) = crossterm::terminal::size()?;
     let area = crate::server::layout::Rect {
@@ -807,7 +815,8 @@ async fn subscribe_view_cells(
     };
     let inner = crate::client::view::cells_area(area);
     let rects = crate::client::view::cell_rects(view, area);
-    for (i, cell) in view.cells.iter().enumerate() {
+    let focused = view.focused;
+    for (i, cell) in view.cells.iter_mut().enumerate() {
         // Visible cells subscribe at their rect's interior. Cells hidden by the
         // current layout (e.g. Monocle's unfocused cells) still get a
         // subscription -- at the full cell area with NO size demand -- so a
@@ -818,6 +827,19 @@ async fn subscribe_view_cells(
             let cols = rect.width.saturating_sub(2);
             let rows = rect.height.saturating_sub(2);
             if cols > 0 && rows > 0 {
+                // No transport for this cell's server: start/observe a lazy dial
+                // and label the cell honestly instead of subscribing into the
+                // void. Returning early keeps `unavailable` set for exactly as
+                // long as the cell really is unreachable.
+                if let Some(reason) = reach_conn(mgr, &cell.conn) {
+                    log::info!(
+                        "view: cell pane {} on {:?} unreachable: {reason}",
+                        cell.pane_id,
+                        cell.conn
+                    );
+                    cell.unavailable = Some(reason);
+                    continue;
+                }
                 // Best-effort: a torn-down connection must not abort the whole
                 // subscribe pass (nor exit the client). Log and move on -- the
                 // cell simply never receives snapshots and, on the next
@@ -835,7 +857,7 @@ async fn subscribe_view_cells(
                             // shows the "Active in session" placeholder, so it must
                             // impose no constraint (matches the server, which
                             // ignores the demand for a session-visible pane anyway).
-                            size_demand: i == view.focused && !cell.is_session_visible(),
+                            size_demand: i == focused && !cell.is_session_visible(),
                         },
                     )
                     .await
@@ -845,11 +867,41 @@ async fn subscribe_view_cells(
                         cell.conn,
                         cell.pane_id
                     );
+                } else {
+                    // The subscription is on its way: whatever made the cell
+                    // unreachable is over.
+                    cell.unavailable = None;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Whether `conn` can be subscribed over right now, and if not, the short label
+/// a view cell on it should show ([`ViewCell::unavailable`]).
+///
+/// `None` means "reachable, go ahead". Otherwise a remote this terminal has not
+/// connected is dialed in the BACKGROUND (never awaited: an SSH dial takes
+/// seconds and this runs on the event loop) and reported as `connecting to x…`;
+/// a remote whose dial already failed, or one absent from this terminal's
+/// config, reports `not connected: x`. The local connection is always reachable
+/// -- losing it exits the client.
+fn reach_conn(mgr: &mut ConnectionManager, conn: &ConnId) -> Option<String> {
+    let name = match conn {
+        ConnId::Local => return None,
+        ConnId::Remote(name) => name,
+    };
+    match mgr.remote_state(name) {
+        RemoteState::Connected => None,
+        // Idle and configured: kick off the dial. `begin_connect_remote` is a
+        // no-op for an unknown remote, which is exactly the `not connected` case.
+        RemoteState::NotConnected if mgr.begin_connect_remote(name) => {
+            Some(format!("connecting to {name}…"))
+        }
+        RemoteState::Connecting => Some(format!("connecting to {name}…")),
+        _ => Some(format!("not connected: {name}")),
+    }
 }
 
 /// Unsubscribe every cell of `view` from its source pane (view leave / cell
@@ -904,7 +956,7 @@ fn descriptor_of_conn(conn: &ConnId) -> ConnDescriptor {
 #[allow(clippy::too_many_arguments)]
 async fn enter_view(
     mgr: &mut ConnectionManager,
-    views: &[crate::client::view::ClientView],
+    views: &mut [crate::client::view::ClientView],
     active_view: &mut Option<usize>,
     active_view_id: &mut Option<ViewId>,
     target_idx: usize,
@@ -938,7 +990,7 @@ async fn enter_view(
     }
     let (c, r) = crossterm::terminal::size()?;
     renderer.resize(c, r);
-    subscribe_view_cells(mgr, &views[target_idx]).await?;
+    subscribe_view_cells(mgr, &mut views[target_idx]).await?;
     paint_view(
         renderer,
         &views[target_idx],
@@ -2732,7 +2784,7 @@ async fn run_client_loop(
                                 if index < views.len() {
                                     enter_view(
                                         mgr,
-                                        &views,
+                                        &mut views,
                                         &mut active_view,
                                         &mut active_view_id,
                                         index,
@@ -3275,6 +3327,30 @@ async fn run_client_loop(
                 };
                 let (src, msg) = match incoming {
                     Incoming::Message(src, m) => (src, Some(m)),
+                    // A lazy dial started for a view cell on a remote this
+                    // terminal had not connected (see `subscribe_view_cells`)
+                    // finished. Adopt or fail it, then re-subscribe the displayed
+                    // view so the cell starts streaming (or shows the honest
+                    // `not connected` label the failed state now yields).
+                    Incoming::RemoteDialed(name, result) => {
+                        let connected = mgr.finish_remote_dial(&name, result);
+                        log::debug!("srv: RemoteDialed '{name}' connected={connected}");
+                        if let Some(av) = active_view {
+                            subscribe_view_cells(mgr, &mut views[av]).await?;
+                            paint_view(
+                                &mut renderer,
+                                &views[av],
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &compositor_theme,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                            )?;
+                        }
+                        continue;
+                    }
                     Incoming::Closed(src) => {
                         log::debug!("srv: connection closed src={:?}", src);
                         // Mark every view cell (across ALL views) that aliases a
@@ -3936,6 +4012,7 @@ async fn run_client_loop(
                                     // snapshot means the source is live again.
                                     cell.snapshot = Some(snap.clone());
                                     cell.disconnected = false;
+                                    cell.unavailable = None;
                                     if title.is_some() {
                                         cell.title = title.clone();
                                     }
@@ -3953,7 +4030,7 @@ async fn run_client_loop(
                                 // Re-subscribe the whole active view so the flipped
                                 // cell's size_demand is recomputed (see
                                 // `subscribe_view_cells`).
-                                subscribe_view_cells(mgr, &views[av]).await?;
+                                subscribe_view_cells(mgr, &mut views[av]).await?;
                             }
                         }
                         if active_touched {
@@ -4037,7 +4114,7 @@ async fn run_client_loop(
                                             pending_enter_view = None;
                                             enter_view(
                                                 mgr,
-                                                &views,
+                                                &mut views,
                                                 &mut active_view,
                                                 &mut active_view_id,
                                                 idx,
@@ -4115,7 +4192,7 @@ async fn run_client_loop(
                                                 .await;
                                         }
                                     }
-                                    subscribe_view_cells(mgr, &views[av]).await?;
+                                    subscribe_view_cells(mgr, &mut views[av]).await?;
                                     paint_view(
                                         &mut renderer,
                                         &views[av],
