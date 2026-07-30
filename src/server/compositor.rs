@@ -1067,6 +1067,131 @@ fn blit_screen(buffer: &mut [Vec<RenderCell>], screen: &Screen, rect: Rect, scro
     }
 }
 
+// ---------------------------------------------------------------------------
+// Popup terminal overlay
+// ---------------------------------------------------------------------------
+
+/// Draw the session's popup terminal on top of an already-composited buffer,
+/// returning the popup's interior (content) rect.
+///
+/// Deliberately a **post-pass over the finished frame** rather than a layout
+/// participant: the popup floats above whatever the normal pass produced -- a
+/// plain layout, or a zoomed pane's single-pane substitution -- without changing
+/// any pane's rect. It steals no space; it only paints over.
+///
+/// The whole rect is cleared first so nothing from the layout underneath bleeds
+/// through when the popup's PTY is momentarily smaller than its interior.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_popup(
+    buffer: &mut [Vec<RenderCell>],
+    rect: Rect,
+    pane_id: PaneId,
+    screen: &Screen,
+    title: &str,
+    mode: &str,
+    scroll_offset: usize,
+    selection: Option<&MouseSelection>,
+    theme: &CompositorTheme,
+) -> Rect {
+    if rect.width == 0 || rect.height == 0 {
+        return rect;
+    }
+
+    // The popup owns input whenever it is visible, so it always wears the
+    // active-frame color.
+    let border_fg = theme.frame_active_fg.clone();
+    let blank = RenderCell::default();
+
+    // Clear the popup's footprint so the layout underneath cannot show through.
+    for row in rect.y..rect.y.saturating_add(rect.height) {
+        for col in rect.x..rect.x.saturating_add(rect.width) {
+            set_cell(buffer, row as usize, col as usize, blank.clone());
+        }
+    }
+
+    // Too small for a frame: paint content edge-to-edge (mirrors
+    // `draw_zellij_panes`' small-rect fallback).
+    if rect.width < 3 || rect.height < 3 {
+        blit_screen(buffer, screen, rect, scroll_offset);
+        return rect;
+    }
+
+    let interior = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width - 2,
+        height: rect.height - 2,
+    };
+    blit_screen(buffer, screen, interior, scroll_offset);
+
+    let x = rect.x as usize;
+    let y = rect.y as usize;
+    let w = rect.width as usize;
+    let h = rect.height as usize;
+
+    let border_cell = |c: char| RenderCell {
+        c,
+        fg: border_fg.clone(),
+        bg: CellColor::Default,
+        bold: false,
+        italic: false,
+        underline: false,
+        hyperlink: None,
+        width: 1,
+        combining: Vec::new(),
+    };
+
+    // Rounded corners, matching a ZellijStyle pane frame.
+    set_cell(buffer, y, x, border_cell('\u{256D}')); // ╭
+    set_cell(buffer, y, x + w - 1, border_cell('\u{256E}')); // ╮
+    set_cell(buffer, y + h - 1, x, border_cell('\u{2570}')); // ╰
+    set_cell(buffer, y + h - 1, x + w - 1, border_cell('\u{256F}')); // ╯
+
+    // Title in the top border, styled exactly like a single-pane top border.
+    let stack_info = Some((vec![title.to_string()], vec![pane_id], 0usize));
+    let top_content = build_top_border_content(
+        &stack_info,
+        pane_id,
+        &border_fg,
+        mode,
+        w.saturating_sub(2),
+        theme,
+    );
+    let top_end = x + w - 1;
+    let mut col = x + 1;
+    for cell in &top_content {
+        if col >= top_end {
+            break;
+        }
+        set_cell(buffer, y, col, cell.clone());
+        col += 1;
+    }
+    while col < top_end {
+        set_cell(buffer, y, col, border_cell('\u{2500}')); // ─
+        col += 1;
+    }
+
+    // Bottom border.
+    for col in (x + 1)..(x + w - 1) {
+        set_cell(buffer, y + h - 1, col, border_cell('\u{2500}')); // ─
+    }
+    // Side edges.
+    for row in (y + 1)..(y + h - 1) {
+        set_cell(buffer, row, x, border_cell('\u{2502}')); // │
+        set_cell(buffer, row, x + w - 1, border_cell('\u{2502}')); // │
+    }
+
+    // A drag-selection inside the popup highlights against the popup's own rect
+    // (the layout pass can't: the popup pane is in no layout tree).
+    if let Some(sel) = selection {
+        if sel.pane_id == pane_id {
+            apply_selection_highlight(buffer, sel, &rect, &BorderStyle::ZellijStyle);
+        }
+    }
+
+    interior
+}
+
 /// A single pane's rendered screen plus the cursor/DECCKM state a View cell
 /// needs to render the cursor and encode input. Returned by
 /// [`render_pane_snapshot`].

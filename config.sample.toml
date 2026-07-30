@@ -63,6 +63,14 @@
 # bar row) (default: "anchored").
 # which_key_position = "anchored"
 
+# Popup terminal size, as a percentage of the session's content area. One popup
+# per session, toggled with Alt-p or `Ctrl-a p o`; it floats centered on top of
+# the layout and takes no space from it. Clamped to 20..=100, and resizable at
+# runtime with the pane-resize keys (`Ctrl-a p R h/j/k/l`) while it is open --
+# that adjustment sticks for the session. (default: 80 / 80).
+# popup_width_pct = 80
+# popup_height_pct = 80
+
 # -----------------------------------------------------------------------------
 # APPEARANCE - THEME
 # -----------------------------------------------------------------------------

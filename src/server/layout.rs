@@ -419,6 +419,64 @@ pub struct Rect {
     pub height: u16,
 }
 
+// ---------------------------------------------------------------------------
+// Popup terminal geometry
+// ---------------------------------------------------------------------------
+
+/// Lower bound for a popup's width/height percentage.
+pub const POPUP_MIN_PCT: u8 = 20;
+
+/// Upper bound for a popup's width/height percentage.
+pub const POPUP_MAX_PCT: u8 = 100;
+
+/// Minimum interior (content) width of a popup, in cells.
+pub const POPUP_MIN_INTERIOR_COLS: u16 = 10;
+
+/// Minimum interior (content) height of a popup, in cells.
+pub const POPUP_MIN_INTERIOR_ROWS: u16 = 3;
+
+/// Clamp a `(width_pct, height_pct)` popup size into the supported range.
+///
+/// Applied both when a percentage arrives from config and on every runtime
+/// resize, so a session's stored size can never drift outside the bounds.
+pub fn clamp_popup_size(size: (u8, u8)) -> (u8, u8) {
+    (
+        size.0.clamp(POPUP_MIN_PCT, POPUP_MAX_PCT),
+        size.1.clamp(POPUP_MIN_PCT, POPUP_MAX_PCT),
+    )
+}
+
+/// The rectangle a session's popup terminal occupies, centered inside `area`.
+///
+/// `size` is `(width_pct, height_pct)`; it is clamped by [`clamp_popup_size`]
+/// first. The result is then clamped so the popup always has a usable interior
+/// (`POPUP_MIN_INTERIOR_COLS` x `POPUP_MIN_INTERIOR_ROWS` plus a 1-cell frame on
+/// each side) and can never overflow `area` -- on a terminal too small for even
+/// the minimum, the popup simply fills `area`.
+///
+/// Centering biases up/left on an odd remainder (integer division), matching how
+/// the rest of the compositor rounds.
+pub fn popup_rect(area: Rect, size: (u8, u8)) -> Rect {
+    let (width_pct, height_pct) = clamp_popup_size(size);
+
+    // Border-inclusive minimums: the interior plus a 1-cell frame per side.
+    let min_width = POPUP_MIN_INTERIOR_COLS + 2;
+    let min_height = POPUP_MIN_INTERIOR_ROWS + 2;
+
+    // u32 intermediates: 65535 * 100 overflows u16.
+    let width = ((area.width as u32 * width_pct as u32) / 100) as u16;
+    let width = width.max(min_width).min(area.width);
+    let height = ((area.height as u32 * height_pct as u32) / 100) as u16;
+    let height = height.max(min_height).min(area.height);
+
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 /// Minimum pane dimension in either axis.
 const MIN_PANE_SIZE: u16 = 2;
 
@@ -2851,5 +2909,120 @@ mod tests {
             },
             _ => panic!("expected Split"),
         }
+    }
+}
+
+#[cfg(test)]
+mod popup_geometry_tests {
+    use super::*;
+
+    fn area(width: u16, height: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn popup_rect_default_80_pct_is_centered() {
+        // 100x30 area, 80% -> 80x24, centered: x=(100-80)/2=10, y=(30-24)/2=3.
+        let r = popup_rect(area(100, 30), (80, 80));
+        assert_eq!(
+            r,
+            Rect {
+                x: 10,
+                y: 3,
+                width: 80,
+                height: 24
+            }
+        );
+    }
+
+    #[test]
+    fn popup_rect_honors_area_origin_offset() {
+        let r = popup_rect(
+            Rect {
+                x: 5,
+                y: 7,
+                width: 100,
+                height: 30,
+            },
+            (80, 80),
+        );
+        assert_eq!(r.x, 5 + 10);
+        assert_eq!(r.y, 7 + 3);
+        assert_eq!((r.width, r.height), (80, 24));
+    }
+
+    #[test]
+    fn popup_rect_odd_remainder_biases_up_and_left() {
+        // 101x31 area, 80% -> 80x24; remainders 21 and 7 are odd -> 10 / 3.
+        let r = popup_rect(area(101, 31), (80, 80));
+        assert_eq!((r.x, r.width), (10, 80));
+        assert_eq!((r.y, r.height), (3, 24));
+        // Centered means the trailing gap is at most one cell larger.
+        assert!((101 - r.width - r.x) - r.x <= 1);
+        assert!((31 - r.height - r.y) - r.y <= 1);
+    }
+
+    #[test]
+    fn popup_rect_100_pct_fills_the_area_exactly() {
+        let r = popup_rect(area(100, 30), (100, 100));
+        assert_eq!(r, area(100, 30));
+    }
+
+    #[test]
+    fn popup_rect_clamps_percentages_out_of_range() {
+        // 0% and 5% clamp up to POPUP_MIN_PCT (20); 200% clamps down to 100.
+        assert_eq!(clamp_popup_size((0, 5)), (POPUP_MIN_PCT, POPUP_MIN_PCT));
+        assert_eq!(clamp_popup_size((200, 101)), (POPUP_MAX_PCT, POPUP_MAX_PCT));
+        let lo = popup_rect(area(100, 30), (0, 0));
+        assert_eq!((lo.width, lo.height), (20, 6));
+        let hi = popup_rect(area(100, 30), (255, 255));
+        assert_eq!((hi.width, hi.height), (100, 30));
+    }
+
+    #[test]
+    fn popup_rect_enforces_minimum_interior() {
+        // 20% of 40 cols = 8 and 20% of 20 rows = 4: both below the
+        // interior+frame minimums, so both are widened to 12 x 5.
+        let r = popup_rect(area(40, 20), (20, 20));
+        assert_eq!(r.width, POPUP_MIN_INTERIOR_COLS + 2);
+        assert_eq!(r.height, POPUP_MIN_INTERIOR_ROWS + 2);
+        // The interior is still usable after removing the 1-cell frame.
+        assert!(r.width - 2 >= POPUP_MIN_INTERIOR_COLS);
+        assert!(r.height - 2 >= POPUP_MIN_INTERIOR_ROWS);
+    }
+
+    #[test]
+    fn popup_rect_never_overflows_a_tiny_area() {
+        // Smaller than the minimum popup: fill the area rather than overflow.
+        for (w, h) in [(1u16, 1u16), (4, 2), (11, 4), (12, 5), (0, 0)] {
+            let a = area(w, h);
+            let r = popup_rect(a, (80, 80));
+            assert!(r.width <= a.width, "width {} > area {}", r.width, a.width);
+            assert!(
+                r.height <= a.height,
+                "height {} > area {}",
+                r.height,
+                a.height
+            );
+            assert!(r.x + r.width <= a.x + a.width);
+            assert!(r.y + r.height <= a.y + a.height);
+        }
+        assert_eq!(popup_rect(area(4, 2), (80, 80)), area(4, 2));
+    }
+
+    #[test]
+    fn popup_rect_is_monotonic_in_percentage() {
+        let mut prev = 0;
+        for pct in [20u8, 30, 50, 80, 100] {
+            let r = popup_rect(area(200, 60), (pct, pct));
+            assert!(r.width >= prev, "width shrank at {pct}%");
+            prev = r.width;
+        }
+        assert_eq!(popup_rect(area(200, 60), (50, 50)).width, 100);
     }
 }

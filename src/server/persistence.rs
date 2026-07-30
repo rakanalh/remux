@@ -141,6 +141,7 @@ mod tests {
                 None,
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
+                (80, 80),
             )
             .unwrap();
 
@@ -165,6 +166,7 @@ mod tests {
                 Some("work"),
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
+                (80, 80),
             )
             .unwrap();
         state.create_tab("s1", "tab2", Default::default()).unwrap();
@@ -191,6 +193,7 @@ mod tests {
                 None,
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
+                (80, 80),
             )
             .unwrap();
 

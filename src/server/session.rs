@@ -170,6 +170,60 @@ pub struct Session {
     /// Present only while a client is actively typing a new name.
     #[serde(skip)]
     pub rename_state: Option<(PaneId, String)>,
+    /// The session's popup-terminal pane, spawned lazily on the first
+    /// `PopupToggle` and kept for the session's lifetime.
+    ///
+    /// A real PTY pane in the daemon's pane map, but deliberately **NOT** a
+    /// member of any tab's `pane_order` or layout tree -- it floats above the
+    /// layout instead of taking space in it. Runtime-only: PTYs don't survive a
+    /// server restart (a restored session re-spawns its shells), so persisting
+    /// this would resurrect an empty box.
+    #[serde(skip)]
+    pub popup_pane: Option<PaneId>,
+    /// Whether the popup is currently drawn on top of the layout. Session-scoped
+    /// (shared by every attached client, like `Tab::zoomed_pane`) and
+    /// runtime-only for the same reason as `popup_pane`.
+    #[serde(skip)]
+    pub popup_visible: bool,
+    /// The popup's `(width_pct, height_pct)` of the session's content area.
+    /// Seeded from `config.appearance.popup_{width,height}_pct` and adjusted at
+    /// runtime by the resize commands; the adjustment sticks for the session.
+    #[serde(skip, default = "default_popup_size")]
+    pub popup_size: (u8, u8),
+}
+
+impl Session {
+    /// The pane a client's input (keys, mouse, scroll) should reach.
+    ///
+    /// **The popup input chokepoint.** While the popup is visible it owns input,
+    /// but `Tab::focused_pane` is deliberately left untouched so hiding the popup
+    /// returns input to exactly the pane that had it before.
+    pub fn input_target(&self) -> Option<PaneId> {
+        if self.popup_visible {
+            if let Some(popup) = self.popup_pane {
+                return Some(popup);
+            }
+        }
+        self.tabs.get(self.active_tab).map(|t| t.focused_pane)
+    }
+
+    /// Clear the popup, returning its pane id so the caller can kill the PTY.
+    pub fn take_popup(&mut self) -> Option<PaneId> {
+        self.popup_visible = false;
+        self.popup_pane.take()
+    }
+
+    /// Apply a runtime popup resize by adding `(dw, dh)` percentage points,
+    /// clamped to the supported range. Returns the new size.
+    pub fn resize_popup(&mut self, dw: i16, dh: i16) -> (u8, u8) {
+        let adjust =
+            |cur: u8, delta: i16| -> u8 { (cur as i16 + delta).clamp(0, u8::MAX as i16) as u8 };
+        self.popup_size = layout::clamp_popup_size((
+            adjust(self.popup_size.0, dw),
+            adjust(self.popup_size.1, dh),
+        ));
+        self.popup_size
+    }
 }
 
 /// Per-tab activity state for background activity monitoring (tmux-like
@@ -241,6 +295,70 @@ pub fn should_promote_to_silent(
 
 fn default_border_style() -> BorderStyle {
     BorderStyle::ZellijStyle
+}
+
+/// **The hard popup invariant, as a reusable assertion.**
+///
+/// The popup pane is a real PTY that must never be spliced into the layout: if
+/// it ever landed in a `pane_order`, a layout tree, or a `zoomed_pane`, then
+/// `PaneMove*`/`SetMaster`/an automatic rebuild/a stack splice could capture it
+/// and it would start taking space in (or replace) the layout.
+///
+/// Checks, for **every** tab of `sess`:
+/// 1. `popup_pane` is not in `tab.pane_order`;
+/// 2. `popup_pane` is not in the tab's layout tree;
+/// 3. `tab.zoomed_pane` is not the popup;
+/// 4. the layout tree's pane set == `pane_order`'s set, with no duplicates
+///    (the structural health check: catches orphans and dupes whether or not a
+///    popup is involved).
+#[cfg(test)]
+pub(crate) fn assert_popup_invariant(sess: &Session, context: &str) {
+    for (i, tab) in sess.tabs.iter().enumerate() {
+        let tree_panes = layout::all_pane_ids(&tab.layout);
+        let tree_set: HashSet<PaneId> = tree_panes.iter().copied().collect();
+        let order_set: HashSet<PaneId> = tab.pane_order.iter().copied().collect();
+
+        if let Some(popup) = sess.popup_pane {
+            assert!(
+                !tab.pane_order.contains(&popup),
+                "[{context}] popup pane {popup} leaked into tab {i} pane_order {:?}",
+                tab.pane_order
+            );
+            assert!(
+                !tree_set.contains(&popup),
+                "[{context}] popup pane {popup} leaked into tab {i} layout tree {tree_panes:?}"
+            );
+            assert_ne!(
+                tab.zoomed_pane,
+                Some(popup),
+                "[{context}] popup pane {popup} became tab {i}'s zoomed_pane"
+            );
+        }
+
+        assert_eq!(
+            tree_panes.len(),
+            tree_set.len(),
+            "[{context}] tab {i} layout tree has duplicate panes: {tree_panes:?}"
+        );
+        assert_eq!(
+            tab.pane_order.len(),
+            order_set.len(),
+            "[{context}] tab {i} pane_order has duplicates: {:?}",
+            tab.pane_order
+        );
+        assert_eq!(
+            tree_set, order_set,
+            "[{context}] tab {i} layout tree {tree_panes:?} and pane_order {:?} disagree",
+            tab.pane_order
+        );
+    }
+}
+
+/// Fallback popup size for a session deserialized from disk (the field is
+/// `#[serde(skip)]`, so restored sessions never carry one). Mirrors the
+/// `AppearanceConfig` default.
+fn default_popup_size() -> (u8, u8) {
+    (80, 80)
 }
 
 impl ServerState {
@@ -532,6 +650,7 @@ impl ServerState {
         folder: Option<&str>,
         border_style: BorderStyle,
         layout_mode: LayoutMode,
+        popup_size: (u8, u8),
     ) -> Result<PaneId> {
         log::debug!(
             "session: create_session name={:?}, folder={:?}",
@@ -589,6 +708,9 @@ impl ServerState {
             active_tab: 0,
             border_style,
             rename_state: None,
+            popup_pane: None,
+            popup_visible: false,
+            popup_size: layout::clamp_popup_size(popup_size),
         };
 
         self.sessions.insert(name.to_string(), session);
@@ -643,11 +765,13 @@ impl ServerState {
             }
         }
 
-        // Collect all pane IDs across all tabs.
+        // Collect all pane IDs across all tabs, plus the popup pane: it lives
+        // outside every layout tree, so it would otherwise leak its PTY.
         let mut pane_ids = Vec::new();
         for tab in &session.tabs {
             pane_ids.extend(layout::all_pane_ids(&tab.layout));
         }
+        pane_ids.extend(session.popup_pane);
 
         Ok(pane_ids)
     }
@@ -844,13 +968,16 @@ impl ServerState {
         }
 
         let tab = sess.tabs.remove(tab_idx);
-        let pane_ids = layout::all_pane_ids(&tab.layout);
+        let mut pane_ids = layout::all_pane_ids(&tab.layout);
 
         if sess.tabs.is_empty() {
             // Last tab -- delete the session.
             // We need to remove the session from its folder too.
             let session_name = session.to_string();
             let folder_id = sess.folder.clone();
+            // The popup lives outside every layout tree, so the session going
+            // away is the only thing that reclaims its PTY.
+            pane_ids.extend(sess.take_popup());
 
             self.sessions.remove(&session_name);
 
@@ -1332,6 +1459,7 @@ mod tests {
                 None,
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         dormant
@@ -1340,6 +1468,7 @@ mod tests {
                 None,
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
 
@@ -1363,7 +1492,13 @@ mod tests {
     fn state_with_tabs(n: usize) -> (ServerState, Vec<TabId>) {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         for i in 1..n {
             state
@@ -1439,6 +1574,7 @@ mod tests {
                 None,
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         assert_eq!(pane_id, 1);
@@ -1459,6 +1595,7 @@ mod tests {
                 Some("work"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
 
@@ -1479,6 +1616,7 @@ mod tests {
                 None,
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         let result = state.create_session(
@@ -1486,6 +1624,7 @@ mod tests {
             None,
             BorderStyle::ZellijStyle,
             LayoutMode::default(),
+            (80, 80),
         );
         assert!(result.is_err());
     }
@@ -1499,6 +1638,7 @@ mod tests {
                 Some("folder"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         state.rename_session("old", "new").unwrap();
@@ -1515,10 +1655,22 @@ mod tests {
     fn test_rename_session_duplicate() {
         let mut state = ServerState::new();
         state
-            .create_session("a", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "a",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
-            .create_session("b", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "b",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
 
         let result = state.rename_session("a", "b");
@@ -1529,7 +1681,13 @@ mod tests {
     fn test_rename_session_same_name() {
         let mut state = ServerState::new();
         state
-            .create_session("a", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "a",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state.rename_session("a", "a").unwrap();
     }
@@ -1543,6 +1701,7 @@ mod tests {
                 Some("folder"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         let pane_ids = state.delete_session("test").unwrap();
@@ -1564,7 +1723,13 @@ mod tests {
     fn test_list_sessions() {
         let mut state = ServerState::new();
         state
-            .create_session("b", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "b",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_session(
@@ -1572,6 +1737,7 @@ mod tests {
                 Some("f"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
 
@@ -1607,6 +1773,7 @@ mod tests {
                 Some("old"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         state.rename_folder("old", "new").unwrap();
@@ -1635,6 +1802,7 @@ mod tests {
                 Some("work"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         assert!(state.delete_folder("work").is_err());
@@ -1656,7 +1824,13 @@ mod tests {
     fn test_create_tab() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         let pane_id = state
             .create_tab("s", "new-tab", LayoutMode::default())
@@ -1673,7 +1847,13 @@ mod tests {
     fn test_close_tab() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_tab("s", "tab2", LayoutMode::default())
@@ -1697,6 +1877,7 @@ mod tests {
                 Some("f"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
 
@@ -1714,7 +1895,13 @@ mod tests {
     fn test_rename_tab() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state.rename_tab("s", 0, "renamed").unwrap();
 
@@ -1726,7 +1913,13 @@ mod tests {
     fn test_goto_tab() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_tab("s", "tab2", LayoutMode::default())
@@ -1741,7 +1934,13 @@ mod tests {
     fn test_record_activity_background_tab_only() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         // pane 1 is in tab 0 (initially active). Create tab 1 (now active) with
         // pane 2. So tab 0 is now a background tab holding pane 1.
@@ -1768,7 +1967,13 @@ mod tests {
     fn test_record_activity_bell_wins_and_no_downgrade() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_tab("s", "tab2", LayoutMode::default())
@@ -1794,7 +1999,13 @@ mod tests {
     fn test_goto_tab_clears_activity() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_tab("s", "tab2", LayoutMode::default())
@@ -1860,7 +2071,13 @@ mod tests {
     fn test_promote_silent_tabs_transitions_activity() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_tab("s", "tab2", LayoutMode::default())
@@ -1892,7 +2109,13 @@ mod tests {
     fn test_goto_tab_out_of_range() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         assert!(state.goto_tab("s", 5).is_err());
     }
@@ -1901,7 +2124,13 @@ mod tests {
     fn test_move_session_to_folder() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state.move_session("s", Some("new-folder")).unwrap();
 
@@ -1921,6 +2150,7 @@ mod tests {
                 Some("old"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         state.move_session("s", Some("new")).unwrap();
@@ -1941,6 +2171,7 @@ mod tests {
                 Some("folder"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         state.move_session("s", None).unwrap();
@@ -1961,13 +2192,20 @@ mod tests {
                 Some("work"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         state
             .create_tab("s1", "tab2", LayoutMode::default())
             .unwrap();
         state
-            .create_session("s2", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s2",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
 
         let json = serde_json::to_string(&state).expect("serialize");
@@ -1998,6 +2236,7 @@ mod tests {
                 Some("work"),
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
         state
@@ -2006,6 +2245,7 @@ mod tests {
                 None,
                 BorderStyle::ZellijStyle,
                 LayoutMode::default(),
+                (80, 80),
             )
             .unwrap();
 
@@ -2031,7 +2271,13 @@ mod tests {
     fn test_build_session_tree_with_tabs_and_panes() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
         state
             .create_tab("s", "tab2", LayoutMode::default())
@@ -2053,7 +2299,13 @@ mod tests {
     fn test_build_session_tree_custom_pane_name_wins() {
         let mut state = ServerState::new();
         state
-            .create_session("s", None, BorderStyle::ZellijStyle, LayoutMode::default())
+            .create_session(
+                "s",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::default(),
+                (80, 80),
+            )
             .unwrap();
 
         // Identify the first pane and give it a user-set custom name (as PaneRename does).
@@ -2088,5 +2340,410 @@ mod tests {
         assert_eq!(unfiled.len(), 1);
         // The custom name must win over the auto-detected process name.
         assert_eq!(unfiled[0].tabs[0].panes[0].name, "XYZZY");
+    }
+}
+
+/// Tests for the **hard popup invariant**: the popup pane is a real PTY that
+/// must never be spliced into a tab's `pane_order`, its layout tree, or its
+/// `zoomed_pane` -- otherwise `PaneMove*`, `SetMaster`, an automatic rebuild or a
+/// stack splice could capture it and it would start taking space in the layout.
+///
+/// Every case runs `assert_popup_invariant` after the mutation, and each
+/// structural mutation is exercised BOTH with the popup visible and with it
+/// hidden-but-existing (the pane exists either way, so both states can leak).
+#[cfg(test)]
+mod popup_invariant_tests {
+    use super::*;
+    use crate::server::layout::{
+        BspLayout, CustomLayout, Direction, GridLayout, MasterLayout, MonocleLayout,
+    };
+
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    };
+
+    /// A session with `pane_count` real panes in one tab, plus a popup pane whose
+    /// id is allocated from the same counter (so an id-confusion bug would show
+    /// up as a real collision rather than being masked by a magic id).
+    fn state_with_popup(pane_count: usize, visible: bool) -> (ServerState, String, PaneId) {
+        let mut st = ServerState::new();
+        let first = st
+            .create_session(
+                "main",
+                None,
+                BorderStyle::ZellijStyle,
+                LayoutMode::Custom(CustomLayout),
+                (80, 80),
+            )
+            .expect("create_session");
+        // Grow the tab to `pane_count` panes via real splits.
+        let mut ids = vec![first];
+        for _ in 1..pane_count {
+            let new_id = st.next_pane_id();
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            let focused = tab.focused_pane;
+            tab.layout.split_vertical(focused, new_id);
+            tab.pane_order.push(new_id);
+            tab.focused_pane = new_id;
+            ids.push(new_id);
+        }
+        // Allocate the popup id AFTER the real panes, as the daemon does.
+        let popup = st.next_pane_id();
+        let sess = st.sessions.get_mut("main").expect("session");
+        sess.popup_pane = Some(popup);
+        sess.popup_visible = visible;
+        assert_popup_invariant(sess, "fixture");
+        (st, "main".to_string(), popup)
+    }
+
+    fn sess_of<'a>(st: &'a ServerState, name: &str) -> &'a Session {
+        st.sessions.get(name).expect("session")
+    }
+
+    /// Run `f` against a fresh popup session in BOTH popup states, asserting the
+    /// invariant afterwards each time.
+    fn both_states(label: &str, pane_count: usize, mut f: impl FnMut(&mut ServerState, PaneId)) {
+        for visible in [true, false] {
+            let (mut st, name, popup) = state_with_popup(pane_count, visible);
+            f(&mut st, popup);
+            let ctx = format!("{label} (popup_visible={visible})");
+            // The session may have been removed by the mutation (e.g. close_tab
+            // on the last tab); only assert while it still exists.
+            if let Some(sess) = st.sessions.get(&name) {
+                assert_popup_invariant(sess, &ctx);
+                assert_eq!(
+                    sess.popup_pane,
+                    Some(popup),
+                    "[{ctx}] popup identity changed"
+                );
+            }
+        }
+    }
+
+    // -- The structural command matrix --------------------------------------
+
+    #[test]
+    fn pane_move_all_directions_never_capture_the_popup() {
+        for dir in [
+            FocusDirection::Left,
+            FocusDirection::Right,
+            FocusDirection::Up,
+            FocusDirection::Down,
+        ] {
+            both_states(&format!("PaneMove {dir:?}"), 3, |st, _popup| {
+                let sess = st.sessions.get_mut("main").expect("session");
+                let tab = sess.tabs.get_mut(0).expect("tab");
+                // Mirrors the daemon's PaneMove* arm: swap with the neighbor, else
+                // relocate to the edge.
+                if let Some(neighbor) =
+                    find_neighbor(&tab.layout, AREA, tab.focused_pane, dir.clone(), 0)
+                {
+                    swap_panes(&mut tab.layout, tab.focused_pane, neighbor);
+                } else if let Some(new_tree) =
+                    relocate_pane_to_edge(&tab.layout, tab.focused_pane, dir.clone())
+                {
+                    tab.layout = new_tree;
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn pane_focus_all_directions_never_capture_the_popup() {
+        for dir in [
+            FocusDirection::Left,
+            FocusDirection::Right,
+            FocusDirection::Up,
+            FocusDirection::Down,
+        ] {
+            both_states(&format!("PaneFocus {dir:?}"), 3, |st, popup| {
+                let sess = st.sessions.get_mut("main").expect("session");
+                let tab = sess.tabs.get_mut(0).expect("tab");
+                if let Some(target) = layout::focus_in_direction(
+                    &mut tab.layout,
+                    AREA,
+                    tab.focused_pane,
+                    dir.clone(),
+                    0,
+                ) {
+                    tab.focused_pane = target;
+                }
+                // Directional focus can never land on the popup: it is not in the
+                // tree, so no neighbor search can reach it.
+                assert_ne!(tab.focused_pane, popup);
+            });
+        }
+    }
+
+    #[test]
+    fn layout_next_in_every_mode_never_captures_the_popup() {
+        for mode in [
+            LayoutMode::Bsp(BspLayout),
+            LayoutMode::Master(MasterLayout::default()),
+            LayoutMode::Monocle(MonocleLayout),
+            LayoutMode::Grid(GridLayout),
+            LayoutMode::Custom(CustomLayout),
+        ] {
+            let label = format!("LayoutNext -> {}", mode.name());
+            both_states(&label, 4, |st, _popup| {
+                let sess = st.sessions.get_mut("main").expect("session");
+                let tab = sess.tabs.get_mut(0).expect("tab");
+                tab.layout_mode = mode.clone();
+                if tab.layout_mode.is_automatic() {
+                    // The rebuild reads `pane_order` -- the exact route by which a
+                    // leaked popup id would become a real layout leaf.
+                    tab.layout = tab
+                        .layout_mode
+                        .build_tree(&tab.pane_order, tab.focused_pane);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn set_master_never_promotes_the_popup() {
+        both_states("SetMaster", 3, |st, popup| {
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            tab.layout_mode = LayoutMode::Master(MasterLayout::default());
+            if let LayoutMode::Master(ref mut ml) = tab.layout_mode {
+                ml.master_pane = Some(tab.focused_pane);
+                tab.layout = tab
+                    .layout_mode
+                    .build_tree(&tab.pane_order, tab.focused_pane);
+            }
+            assert!(!layout::all_pane_ids(&tab.layout).contains(&popup));
+        });
+    }
+
+    #[test]
+    fn pane_toggle_zoom_never_zooms_the_popup() {
+        both_states("PaneToggleZoom", 2, |st, popup| {
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            tab.zoomed_pane = Some(tab.focused_pane);
+            assert_ne!(tab.zoomed_pane, Some(popup));
+        });
+    }
+
+    #[test]
+    fn splits_and_stack_ops_never_capture_the_popup() {
+        both_states("PaneSplitVertical", 2, |st, _popup| {
+            let new_id = st.next_pane_id();
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            let focused = tab.focused_pane;
+            tab.layout.split_vertical(focused, new_id);
+            tab.pane_order.push(new_id);
+            tab.focused_pane = new_id;
+        });
+        both_states("PaneSplitHorizontal", 2, |st, _popup| {
+            let new_id = st.next_pane_id();
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            let focused = tab.focused_pane;
+            tab.layout.split_horizontal(focused, new_id);
+            tab.pane_order.push(new_id);
+            tab.focused_pane = new_id;
+        });
+        both_states("PaneStackAdd", 2, |st, _popup| {
+            let new_id = st.next_pane_id();
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            let focused = tab.focused_pane;
+            tab.layout.add_to_stack(focused, new_id);
+            tab.pane_order.push(new_id);
+            tab.focused_pane = new_id;
+        });
+        both_states("PaneStackNext/Prev", 3, |st, popup| {
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            if let Some(next) = tab.layout.stack_next(tab.focused_pane) {
+                tab.focused_pane = next;
+            }
+            if let Some(prev) = tab.layout.stack_prev(tab.focused_pane) {
+                tab.focused_pane = prev;
+            }
+            assert_ne!(tab.focused_pane, popup);
+        });
+    }
+
+    #[test]
+    fn resize_never_captures_the_popup() {
+        both_states("ResizeLeft", 3, |st, _popup| {
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            tab.layout
+                .resize(tab.focused_pane, Direction::Vertical, -0.05);
+            tab.layout
+                .resize(tab.focused_pane, Direction::Horizontal, 0.05);
+        });
+    }
+
+    #[test]
+    fn pane_close_never_captures_the_popup() {
+        both_states("PaneClose", 3, |st, _popup| {
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            let victim = tab.focused_pane;
+            if let Some(nf) = tab.layout.close_pane(victim) {
+                tab.pane_order.retain(|&id| id != victim);
+                tab.focused_pane = nf;
+            }
+        });
+    }
+
+    #[test]
+    fn tab_new_and_tab_close_never_capture_the_popup() {
+        both_states("TabNew", 2, |st, _popup| {
+            st.create_tab("main", "Tab 2", LayoutMode::Bsp(BspLayout))
+                .expect("create_tab");
+        });
+        both_states("TabClose (not last)", 2, |st, _popup| {
+            st.create_tab("main", "Tab 2", LayoutMode::Bsp(BspLayout))
+                .expect("create_tab");
+            let (_panes, deleted) = st.close_tab("main", 1).expect("close_tab");
+            assert!(!deleted);
+        });
+    }
+
+    // -- Teardown reclaims the popup PTY ------------------------------------
+
+    #[test]
+    fn close_tab_on_last_tab_returns_the_popup_pane() {
+        for visible in [true, false] {
+            let (mut st, _, popup) = state_with_popup(2, visible);
+            let (panes, deleted) = st.close_tab("main", 0).expect("close_tab");
+            assert!(deleted, "closing the only tab deletes the session");
+            assert!(
+                panes.contains(&popup),
+                "popup pane {popup} must be reclaimed with the session, got {panes:?}"
+            );
+            assert!(!st.sessions.contains_key("main"));
+        }
+    }
+
+    #[test]
+    fn delete_session_returns_the_popup_pane() {
+        let (mut st, _, popup) = state_with_popup(2, true);
+        let panes = st.delete_session("main").expect("delete_session");
+        assert!(
+            panes.contains(&popup),
+            "popup pane {popup} must be reclaimed, got {panes:?}"
+        );
+    }
+
+    // -- The converse: normal panes and the popup don't contaminate ---------
+
+    #[test]
+    fn a_regular_pane_never_becomes_the_popup() {
+        let (mut st, _, popup) = state_with_popup(3, true);
+        let real: Vec<PaneId> = {
+            let sess = sess_of(&st, "main");
+            sess.tabs[0].pane_order.clone()
+        };
+        // Every structural op above already ran; re-verify the popup id is
+        // disjoint from the real pane set and unchanged by more mutation.
+        for id in &real {
+            assert_ne!(*id, popup, "real pane {id} collided with the popup id");
+        }
+        st.create_tab("main", "Tab 2", LayoutMode::Bsp(BspLayout))
+            .expect("create_tab");
+        let sess = sess_of(&st, "main");
+        assert_eq!(sess.popup_pane, Some(popup));
+        for tab in &sess.tabs {
+            assert!(!tab.pane_order.contains(&popup));
+        }
+        assert_popup_invariant(sess, "regular pane never becomes the popup");
+    }
+
+    #[test]
+    fn closing_normal_panes_does_not_disturb_the_popup() {
+        let (mut st, _, popup) = state_with_popup(3, true);
+        let order = sess_of(&st, "main").tabs[0].pane_order.clone();
+        // Close every real pane but the last one.
+        for victim in order.iter().take(order.len() - 1) {
+            let sess = st.sessions.get_mut("main").expect("session");
+            let tab = sess.tabs.get_mut(0).expect("tab");
+            if let Some(nf) = tab.layout.close_pane(*victim) {
+                tab.pane_order.retain(|id| id != victim);
+                tab.focused_pane = nf;
+            }
+            assert_eq!(sess.popup_pane, Some(popup), "popup lost on pane close");
+            assert!(sess.popup_visible, "popup visibility lost on pane close");
+            assert_popup_invariant(sess, "closing normal panes");
+        }
+    }
+
+    // -- Popup state behavior -----------------------------------------------
+
+    #[test]
+    fn input_target_is_the_popup_only_while_visible() {
+        let (mut st, _, popup) = state_with_popup(2, true);
+        let focused = sess_of(&st, "main").tabs[0].focused_pane;
+        assert_eq!(sess_of(&st, "main").input_target(), Some(popup));
+
+        // Hiding returns input to EXACTLY the pane that had it -- the whole point
+        // of not touching `tab.focused_pane`.
+        st.sessions.get_mut("main").expect("session").popup_visible = false;
+        assert_eq!(sess_of(&st, "main").input_target(), Some(focused));
+
+        // Visible but with no pane yet (never toggled) falls back too.
+        let sess = st.sessions.get_mut("main").expect("session");
+        sess.popup_visible = true;
+        sess.popup_pane = None;
+        assert_eq!(sess_of(&st, "main").input_target(), Some(focused));
+    }
+
+    #[test]
+    fn take_popup_clears_both_fields() {
+        let (mut st, _, popup) = state_with_popup(2, true);
+        let sess = st.sessions.get_mut("main").expect("session");
+        assert_eq!(sess.take_popup(), Some(popup));
+        assert_eq!(sess.popup_pane, None);
+        assert!(!sess.popup_visible);
+        assert_eq!(sess.take_popup(), None, "second take is a no-op");
+    }
+
+    #[test]
+    fn resize_popup_clamps_and_sticks() {
+        let (mut st, _, _) = state_with_popup(2, true);
+        let sess = st.sessions.get_mut("main").expect("session");
+        assert_eq!(sess.popup_size, (80, 80));
+        assert_eq!(sess.resize_popup(5, 0), (85, 80));
+        assert_eq!(sess.resize_popup(0, 5), (85, 85));
+        assert_eq!(sess.popup_size, (85, 85), "the adjustment sticks");
+        // Clamp at both ends, including a shrink that would underflow u8.
+        for _ in 0..10 {
+            sess.resize_popup(20, 20);
+        }
+        assert_eq!(sess.popup_size, (100, 100));
+        for _ in 0..20 {
+            sess.resize_popup(-20, -20);
+        }
+        assert_eq!(sess.popup_size, (20, 20));
+    }
+
+    #[test]
+    fn popup_state_is_never_persisted() {
+        let (st, _, _) = state_with_popup(2, true);
+        let json = serde_json::to_string(&st).expect("serialize");
+        assert!(
+            !json.contains("popup"),
+            "popup state must not be persisted (PTYs don't survive a restart): {json}"
+        );
+        let back: ServerState = serde_json::from_str(&json).expect("deserialize");
+        let sess = back.sessions.get("main").expect("session");
+        assert_eq!(sess.popup_pane, None);
+        assert!(!sess.popup_visible);
+        assert_eq!(
+            sess.popup_size,
+            (80, 80),
+            "restored sessions get the default size"
+        );
     }
 }

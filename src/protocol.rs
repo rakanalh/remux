@@ -36,7 +36,7 @@ pub enum ConnDescriptor {
 
 /// The wire protocol version. Bump when a breaking change is made to the
 /// framed message shapes exchanged between client and server.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -562,6 +562,11 @@ pub enum RemuxCommand {
     PaneMoveDown,
     PaneRename(String),
     PaneToggleZoom,
+    /// Show/hide the session's popup terminal -- a floating, centered pane drawn
+    /// on top of the layout. One popup per session, shared by every attached
+    /// client; the pane is spawned lazily on the first toggle and its shell keeps
+    /// running while hidden.
+    PopupToggle,
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -721,6 +726,7 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
         ("PaneMoveDown", None),
         ("PaneRename", Some("<name>")),
         ("PaneToggleZoom", None),
+        ("PopupToggle", None),
         ("ResizeLeft", Some("<amount>")),
         ("ResizeRight", Some("<amount>")),
         ("ResizeUp", Some("<amount>")),

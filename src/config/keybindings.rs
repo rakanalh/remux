@@ -129,6 +129,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     leaf_chain("move right", &["PaneMoveRight", "EnterNormal"]),
                 ),
                 ('z', leaf_chain("zoom", &["PaneToggleZoom", "EnterNormal"])),
+                ('o', leaf_chain("popup", &["PopupToggle", "EnterNormal"])),
                 ('m', leaf_chain("set master", &["SetMaster", "EnterNormal"])),
                 ('r', leaf("rename", "PaneRename")),
                 (
@@ -737,6 +738,7 @@ impl Default for ShortcutBindings {
         bindings.insert(alt_key('s'), cmd("SessionQuickSwitch"));
         bindings.insert(alt_key('o'), cmd("SessionSwitchLast"));
         bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
+        bindings.insert(alt_key('p'), cmd("PopupToggle"));
         bindings.insert(alt_key(' '), cmd("LayoutNext"));
         bindings.insert(alt_key('m'), cmd("SetMaster"));
 
@@ -898,6 +900,7 @@ pub fn parse_command(input: &str) -> Option<RemuxCommand> {
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
+        "PopupToggle" => Some(RemuxCommand::PopupToggle),
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterNormal" => Some(RemuxCommand::EnterNormal),
         "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),

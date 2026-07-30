@@ -118,6 +118,13 @@ pub struct AppearanceConfig {
     pub theme: theme::ThemeConfig,
     /// Placement style for the which-key hint popup.
     pub which_key_position: WhichKeyPosition,
+    /// Width of the popup terminal as a percentage of the session's content
+    /// area. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT` (20..=100) when a
+    /// session is created, and adjustable at runtime with the resize commands.
+    pub popup_width_pct: u8,
+    /// Height of the popup terminal as a percentage of the session's content
+    /// area. Clamped like `popup_width_pct`.
+    pub popup_height_pct: u8,
 }
 
 impl Default for AppearanceConfig {
@@ -128,6 +135,8 @@ impl Default for AppearanceConfig {
             default_layout: DefaultLayout::default(),
             theme: theme::ThemeConfig::default(),
             which_key_position: WhichKeyPosition::default(),
+            popup_width_pct: 80,
+            popup_height_pct: 80,
         }
     }
 }
@@ -568,6 +577,8 @@ mod tests {
             default_layout: _,
             theme: _,
             which_key_position: _,
+            popup_width_pct: _,
+            popup_height_pct: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
     }
