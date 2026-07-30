@@ -701,6 +701,18 @@ fn relay_overlays(
     Ok(())
 }
 
+/// Flip a border style, exactly as the server's `ToggleStyle` handler flips a
+/// session's. Used to advance the client-local view border style
+/// (`view_border_style` in [`run_client_loop`]) whenever `ToggleStyle` runs --
+/// in a view or in a normal tab -- so `Ctrl-a g` reads as a single toggle and a
+/// view opens in the style the user last chose.
+fn toggled_border_style(style: &crate::config::BorderStyle) -> crate::config::BorderStyle {
+    match style {
+        crate::config::BorderStyle::ZellijStyle => crate::config::BorderStyle::TmuxStyle,
+        crate::config::BorderStyle::TmuxStyle => crate::config::BorderStyle::ZellijStyle,
+    }
+}
+
 /// Composite the given active View into a full-screen frame and paint it,
 /// re-laying any active overlay on top. Used by every code path that changes
 /// what a live view shows (a fresh `PaneContent` snapshot, focus movement,
@@ -710,6 +722,10 @@ fn relay_overlays(
 /// when unavailable). The bottom row is reserved for a client-side status bar
 /// (view name, focused cell title, input mode, layout name); cells are laid out
 /// above it so they never overwrite it.
+///
+/// `border_style` is the client-local view border style (see
+/// `view_border_style` in [`run_client_loop`]): the cells are framed with it
+/// exactly as a normal tab's panes are framed with the session's style.
 #[allow(clippy::too_many_arguments)]
 fn paint_view(
     renderer: &mut Renderer,
@@ -718,6 +734,7 @@ fn paint_view(
     whichkey: &WhichKeyPopup,
     theme: &crate::config::theme::Theme,
     compositor_theme: &crate::config::theme::CompositorTheme,
+    border_style: &crate::config::BorderStyle,
     which_key_position: &crate::config::WhichKeyPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
@@ -739,7 +756,8 @@ fn paint_view(
         Mode::Search => "SEARCH",
         Mode::SessionManager => "SESSION_MANAGER",
     };
-    let mut composed = crate::client::view::composite(view, area, compositor_theme, mode);
+    let mut composed =
+        crate::client::view::composite(view, area, compositor_theme, mode, border_style);
     let cell_title = view
         .cells
         .get(view.focused)
@@ -763,10 +781,11 @@ fn paint_view(
     // Show the terminal cursor at the focused cell's source cursor position (if
     // visible and in view); unfocused cells and hidden/clipped cursors leave it
     // off. This lets a mirrored interactive app (vim, claude) show a live cursor.
-    let (cur_x, cur_y, cur_vis) = match crate::client::view::focused_cursor(view, area) {
-        Some((x, y)) => (x, y, true),
-        None => (0, 0, false),
-    };
+    let (cur_x, cur_y, cur_vis) =
+        match crate::client::view::focused_cursor(view, area, border_style) {
+            Some((x, y)) => (x, y, true),
+            None => (0, 0, false),
+        };
     renderer.render_full(&composed, cur_x, cur_y, cur_vis, 0)?;
     relay_overlays(
         renderer,
@@ -805,6 +824,7 @@ fn paint_view(
 async fn subscribe_view_cells(
     mgr: &mut ConnectionManager,
     view: &mut crate::client::view::ClientView,
+    border_style: &crate::config::BorderStyle,
 ) -> Result<()> {
     let (c, r) = crossterm::terminal::size()?;
     let area = crate::server::layout::Rect {
@@ -824,8 +844,12 @@ async fn subscribe_view_cells(
         // staying pinned to the old cell size forever.
         {
             let rect = rects.get(i).copied().flatten().unwrap_or(inner);
-            let cols = rect.width.saturating_sub(2);
-            let rows = rect.height.saturating_sub(2);
+            // The demanded size is the cell's CONTENT region, which depends on
+            // the border style (zellij loses a row/column to each border edge,
+            // tmux is edge-to-edge). Sharing `cell_content_size` with the
+            // compositor keeps the reflowed pane exactly the size that is drawn,
+            // instead of leaving two blank columns in tmux style.
+            let (cols, rows) = crate::client::view::cell_content_size(rect, border_style);
             if cols > 0 && rows > 0 {
                 // No transport for this cell's server: start/observe a lazy dial
                 // and label the cell honestly instead of subscribing into the
@@ -966,6 +990,7 @@ async fn enter_view(
     whichkey: &WhichKeyPopup,
     theme: &crate::config::theme::Theme,
     compositor_theme: &crate::config::theme::CompositorTheme,
+    border_style: &crate::config::BorderStyle,
     which_key_position: &crate::config::WhichKeyPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
@@ -990,7 +1015,7 @@ async fn enter_view(
     }
     let (c, r) = crossterm::terminal::size()?;
     renderer.resize(c, r);
-    subscribe_view_cells(mgr, &mut views[target_idx]).await?;
+    subscribe_view_cells(mgr, &mut views[target_idx], border_style).await?;
     paint_view(
         renderer,
         &views[target_idx],
@@ -998,6 +1023,7 @@ async fn enter_view(
         whichkey,
         theme,
         compositor_theme,
+        border_style,
         which_key_position,
         viewport_top,
         focused_pane_rect,
@@ -1029,6 +1055,8 @@ async fn enter_view(
 /// - `PaneToggleZoom` -> `ViewToggleZoom`.
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
+/// - `ToggleStyle` -> repaint the view's cells in the (already flipped, see
+///   `view_border_style`) border style. Client-local; nothing is forwarded.
 /// - `SessionDetach` -> NOT consumed (returns `false`) so the caller's detach
 ///   path runs and the client exits.
 /// - `SendKey(bytes)` -> route the raw bytes to the focused cell's pane by
@@ -1045,6 +1073,7 @@ async fn handle_view_command(
     whichkey: &mut WhichKeyPopup,
     theme: &crate::config::theme::Theme,
     compositor_theme: &crate::config::theme::CompositorTheme,
+    border_style: &crate::config::BorderStyle,
     which_key_position: &crate::config::WhichKeyPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
@@ -1073,6 +1102,7 @@ async fn handle_view_command(
                 whichkey,
                 theme,
                 compositor_theme,
+                border_style,
                 which_key_position,
                 viewport_top,
                 focused_pane_rect,
@@ -1191,6 +1221,27 @@ async fn handle_view_command(
                 )
                 .await?;
             }
+            repaint!();
+            Ok(true)
+        }
+        RemuxCommand::ToggleStyle => {
+            // Border style is a display preference, not a structural change, so
+            // it is NOT a no-op in a view: the caller has already flipped the
+            // client-local `view_border_style` (so `border_style` here is the NEW
+            // one and `repaint!` shows it) and the cells are simply redrawn in it.
+            //
+            // Deliberately NOT forwarded to the server. `Session::border_style`
+            // is PER-SESSION state, and a view's cells alias panes across several
+            // sessions and machines that each own their own style -- so there is
+            // no single "the session" whose style a view could mirror. (A forward
+            // would also be dead anyway: entering a view detaches the foreground
+            // session, and the server drops any command from a client with no
+            // attached session.) The view's frame is client-local, exactly as a
+            // view's geometry already is.
+            hide_whichkey!();
+            // The interior a cell paints changed size (a border was gained or
+            // lost on every edge), so re-demand the new content size.
+            subscribe_view_cells(mgr, &mut views[av], border_style).await?;
             repaint!();
             Ok(true)
         }
@@ -1319,6 +1370,20 @@ async fn run_client_loop(
     // the client-side view status bar with the same colors as the normal bar.
     let mut compositor_theme = config.compositor_theme();
     let mut which_key_position = config.appearance.which_key_position.clone();
+    // Border style used to frame a VIEW's cells. This is client-local, and has
+    // to be: `Session::border_style` is PER-SESSION server state, while a view's
+    // cells alias panes across several sessions and machines at once, so there
+    // is no single session style a view could inherit or mirror. (A view's
+    // *geometry* is already per-terminal for the same reason, and staying
+    // client-local needs no `PROTOCOL_VERSION` bump.)
+    //
+    // Seeded from `appearance.border_style` -- the same value each session is
+    // seeded with, so a view opens in the style the user configured -- and
+    // flipped by `ToggleStyle` wherever it executes, in a view or in a normal
+    // tab. That last part is why `Ctrl-a g` reads as one toggle: whichever
+    // surface the user pressed it on, the next view they open shows the style
+    // they last chose.
+    let mut view_border_style = config.appearance.border_style.clone();
 
     // Spawn the config-file watcher for live hot-reload. This is best-effort:
     // if it fails to start we log and continue without hot-reload rather than
@@ -1519,6 +1584,7 @@ async fn run_client_loop(
                                                 &whichkey,
                                                 &theme,
                                                 &compositor_theme,
+                                                &view_border_style,
                                                 &which_key_position,
                                                 viewport_top,
                                                 focused_pane_rect.as_ref(),
@@ -1537,6 +1603,16 @@ async fn run_client_loop(
                             }
                             InputAction::Execute(cmd) => {
                                 log::debug!("input: Execute cmd={:?}", cmd);
+                                // Border style is a display preference honored by
+                                // BOTH renderers: flip the client-local view style
+                                // here -- before the view interception, so the
+                                // repaint below already uses it -- whether a view
+                                // or a normal tab is on screen. Doing it in one
+                                // place per action arm is what stops the two from
+                                // drifting apart.
+                                if matches!(cmd, RemuxCommand::ToggleStyle) {
+                                    view_border_style = toggled_border_style(&view_border_style);
+                                }
                                 // Clear command palette overlay if it was just
                                 // closed. Done BEFORE the view interception so a
                                 // command run from `:` while in a view (which the
@@ -1564,6 +1640,7 @@ async fn run_client_loop(
                                         &mut whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -1626,6 +1703,14 @@ async fn run_client_loop(
                                     if matches!(cmd, RemuxCommand::SessionDetach) {
                                         return Ok(());
                                     }
+                                    // See the `Execute` arm: keep the client-local
+                                    // view border style in step with the server's.
+                                    // `Prefix g` arrives here (a chain of
+                                    // `ToggleStyle` + `EnterNormal`).
+                                    if matches!(cmd, RemuxCommand::ToggleStyle) {
+                                        view_border_style =
+                                            toggled_border_style(&view_border_style);
+                                    }
                                     // While a view is active, intercept structural
                                     // commands client-side (focus / layout / eject
                                     // / no-op); nothing structural is forwarded to
@@ -1642,6 +1727,7 @@ async fn run_client_loop(
                                             &mut whichkey,
                                             &theme,
                                             &compositor_theme,
+                                            &view_border_style,
                                             &which_key_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
@@ -1837,6 +1923,11 @@ async fn run_client_loop(
                                 // masked foreground server (resizing the wrong
                                 // panes) instead of the view's cells.
                                 let (c, r) = crossterm::terminal::size()?;
+                                // See the `Execute` arm: keep the client-local view
+                                // border style in step with the server's.
+                                if matches!(command, RemuxCommand::ToggleStyle) {
+                                    view_border_style = toggled_border_style(&view_border_style);
+                                }
                                 let mut consumed = false;
                                 if let Some(av) = active_view {
                                     consumed = handle_view_command(
@@ -1849,6 +1940,7 @@ async fn run_client_loop(
                                         &mut whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2632,6 +2724,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2656,6 +2749,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2794,6 +2888,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2851,6 +2946,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -2877,6 +2973,7 @@ async fn run_client_loop(
                                             &whichkey,
                                             &theme,
                                             &compositor_theme,
+                                            &view_border_style,
                                             &which_key_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
@@ -2931,6 +3028,7 @@ async fn run_client_loop(
                                                     &whichkey,
                                                     &theme,
                                                     &compositor_theme,
+                                                    &view_border_style,
                                                     &which_key_position,
                                                     viewport_top,
                                                     focused_pane_rect.as_ref(),
@@ -2973,6 +3071,7 @@ async fn run_client_loop(
                                         &mut whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -3002,6 +3101,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -3075,6 +3175,7 @@ async fn run_client_loop(
                                     area,
                                     mouse.column,
                                     mouse.row,
+                                    &view_border_style,
                                 ) {
                                     // Clicking a cell focuses it for EVERY terminal:
                                     // intent the shared focus change; the resync
@@ -3113,6 +3214,7 @@ async fn run_client_loop(
                                     area,
                                     mouse.column,
                                     mouse.row,
+                                    &view_border_style,
                                 )
                                 .unwrap_or(views[av].focused);
                                 if let Some(cell) = views[av].cells.get(target) {
@@ -3147,6 +3249,7 @@ async fn run_client_loop(
                                     area,
                                     mouse.column,
                                     mouse.row,
+                                    &view_border_style,
                                 )
                                 .unwrap_or(views[av].focused);
                                 if let (Some(Some(rect)), Some(cell)) =
@@ -3293,6 +3396,7 @@ async fn run_client_loop(
                                 &whichkey,
                                 &theme,
                                 &compositor_theme,
+                                &view_border_style,
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
@@ -3336,7 +3440,7 @@ async fn run_client_loop(
                         let connected = mgr.finish_remote_dial(&name, result);
                         log::debug!("srv: RemoteDialed '{name}' connected={connected}");
                         if let Some(av) = active_view {
-                            subscribe_view_cells(mgr, &mut views[av]).await?;
+                            subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
                             paint_view(
                                 &mut renderer,
                                 &views[av],
@@ -3344,6 +3448,7 @@ async fn run_client_loop(
                                 &whichkey,
                                 &theme,
                                 &compositor_theme,
+                                &view_border_style,
                                 &which_key_position,
                                 viewport_top,
                                 focused_pane_rect.as_ref(),
@@ -3378,6 +3483,7 @@ async fn run_client_loop(
                                     &whichkey,
                                     &theme,
                                     &compositor_theme,
+                                    &view_border_style,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -3817,6 +3923,7 @@ async fn run_client_loop(
                                     &whichkey,
                                     &theme,
                                     &compositor_theme,
+                                    &view_border_style,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -4030,7 +4137,7 @@ async fn run_client_loop(
                                 // Re-subscribe the whole active view so the flipped
                                 // cell's size_demand is recomputed (see
                                 // `subscribe_view_cells`).
-                                subscribe_view_cells(mgr, &mut views[av]).await?;
+                                subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
                             }
                         }
                         if active_touched {
@@ -4042,6 +4149,7 @@ async fn run_client_loop(
                                     &whichkey,
                                     &theme,
                                     &compositor_theme,
+                                    &view_border_style,
                                     &which_key_position,
                                     viewport_top,
                                     focused_pane_rect.as_ref(),
@@ -4124,6 +4232,7 @@ async fn run_client_loop(
                                                 &whichkey,
                                                 &theme,
                                                 &compositor_theme,
+                                                &view_border_style,
                                                 &which_key_position,
                                                 viewport_top,
                                                 focused_pane_rect.as_ref(),
@@ -4192,7 +4301,7 @@ async fn run_client_loop(
                                                 .await;
                                         }
                                     }
-                                    subscribe_view_cells(mgr, &mut views[av]).await?;
+                                    subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
                                     paint_view(
                                         &mut renderer,
                                         &views[av],
@@ -4200,6 +4309,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
@@ -4222,6 +4332,7 @@ async fn run_client_loop(
                                         &whichkey,
                                         &theme,
                                         &compositor_theme,
+                                        &view_border_style,
                                         &which_key_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),

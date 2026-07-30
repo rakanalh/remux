@@ -334,6 +334,96 @@ fn normalize_selection(start: (u16, u16), end: (u16, u16)) -> ((u16, u16), (u16,
 // Zellij-style rendering (full box borders with rounded corners)
 // ---------------------------------------------------------------------------
 
+/// Whether a rect is big enough to carry a zellij-style box border plus at
+/// least one interior row/column.
+///
+/// Public so the client-side View compositor decides border-vs-no-border with
+/// the SAME threshold a normal tab's panes use (below it, content is blitted
+/// edge-to-edge over the whole rect).
+pub fn fits_zellij_border(width: u16, height: u16) -> bool {
+    width >= 3 && height >= 3
+}
+
+/// Draw one pane's zellij-style box border: rounded corners, `border_fg`-colored
+/// edges, and the top-border label / stacked-tab content from
+/// [`build_top_border_content`].
+///
+/// `rect` is in BUFFER coordinates and is expected to satisfy
+/// [`fits_zellij_border`]; smaller rects still draw safely (every write is
+/// bounds-checked) but leave no interior.
+///
+/// Factored out of [`draw_zellij_panes`] so the client-side View compositor
+/// draws a cell's border with byte-for-byte the same glyphs, colors and title
+/// treatment as a normal tab's pane border (see `crate::client::view`); keeping
+/// one implementation is what makes them stay identical as the code evolves.
+/// Hit-testing (stacked-tab regions) stays in [`draw_zellij_panes`] -- it is not
+/// drawing, and a view cell's single-title stack has no tabs to hit.
+pub fn draw_zellij_border(
+    buffer: &mut [Vec<RenderCell>],
+    rect: Rect,
+    border_fg: &CellColor,
+    stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
+    pane_id: PaneId,
+    mode: &str,
+    theme: &CompositorTheme,
+) {
+    let x = rect.x as usize;
+    let y = rect.y as usize;
+    let w = rect.width as usize;
+    let h = rect.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let border_cell = |c: char| RenderCell {
+        c,
+        fg: border_fg.clone(),
+        bg: CellColor::Default,
+        bold: false,
+        italic: false,
+        underline: false,
+        hyperlink: None,
+        width: 1,
+        combining: Vec::new(),
+    };
+
+    // Corners.
+    set_cell(buffer, y, x, border_cell('\u{256D}')); // ╭
+    set_cell(buffer, y, x + w - 1, border_cell('\u{256E}')); // ╮
+    set_cell(buffer, y + h - 1, x, border_cell('\u{2570}')); // ╰
+    set_cell(buffer, y + h - 1, x + w - 1, border_cell('\u{256F}')); // ╯
+
+    // Top border: the pane name / tab labels, then ─ fill to the right corner.
+    let available_width = w.saturating_sub(2); // inside the two corner chars
+    let top_content =
+        build_top_border_content(stack_info, pane_id, border_fg, mode, available_width, theme);
+    let top_start = x + 1;
+    let top_end = x + w - 1;
+    let mut col = top_start;
+    for cell in &top_content {
+        if col >= top_end {
+            break;
+        }
+        set_cell(buffer, y, col, cell.clone());
+        col += 1;
+    }
+    while col < top_end {
+        set_cell(buffer, y, col, border_cell('\u{2500}')); // ─
+        col += 1;
+    }
+
+    // Bottom border (fill between corners).
+    for col in top_start..top_end {
+        set_cell(buffer, y + h - 1, col, border_cell('\u{2500}')); // ─
+    }
+
+    // Left and right edges (between corners).
+    for row in (y + 1)..(y + h - 1) {
+        set_cell(buffer, row, x, border_cell('\u{2502}')); // │
+        set_cell(buffer, row, x + w - 1, border_cell('\u{2502}')); // │
+    }
+}
+
 /// Draw panes with full box-drawing borders using rounded corners.
 ///
 /// Every pane gets a border (including single-pane layouts). The active pane
@@ -371,7 +461,7 @@ fn draw_zellij_panes(
         let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
 
         // If rect is too small for borders, blit content to full rect.
-        if rect.width < 3 || rect.height < 3 {
+        if !fits_zellij_border(rect.width, rect.height) {
             blit_screen(buffer, screen, rect, offset);
             continue;
         }
@@ -397,53 +487,15 @@ fn draw_zellij_panes(
         );
         blit_screen(buffer, screen, inner, offset);
 
-        // Draw the full box border with rounded corners.
+        // Draw the full box border with rounded corners (shared with the
+        // client-side View compositor, so both stay identical).
+        let stack_info = layout::find_stack_names(layout, pane_id);
+        draw_zellij_border(buffer, rect, &border_fg, &stack_info, pane_id, mode, theme);
+
         let x = rect.x as usize;
         let y = rect.y as usize;
         let w = rect.width as usize;
-        let h = rect.height as usize;
-
-        let border_cell = |c: char| RenderCell {
-            c,
-            fg: border_fg.clone(),
-            bg: CellColor::Default,
-            bold: false,
-            italic: false,
-            underline: false,
-            hyperlink: None,
-            width: 1,
-            combining: Vec::new(),
-        };
-
-        // Top-left corner.
-        set_cell(buffer, y, x, border_cell('\u{256D}')); // ╭
-
-        // Top-right corner.
-        if x + w > 0 {
-            set_cell(buffer, y, x + w - 1, border_cell('\u{256E}')); // ╮
-        }
-
-        // Bottom-left corner.
-        if y + h > 0 {
-            set_cell(buffer, y + h - 1, x, border_cell('\u{2570}')); // ╰
-        }
-
-        // Bottom-right corner.
-        if x + w > 0 && y + h > 0 {
-            set_cell(buffer, y + h - 1, x + w - 1, border_cell('\u{256F}')); // ╯
-        }
-
-        // Build the top border content (with pane name / tab labels).
-        let stack_info = layout::find_stack_names(layout, pane_id);
         let available_width = w.saturating_sub(2); // inside the two corner chars
-        let top_content = build_top_border_content(
-            &stack_info,
-            pane_id,
-            &border_fg,
-            mode,
-            available_width,
-            theme,
-        );
 
         // Track stack label regions for hit testing (multi-pane stacks).
         if let Some((names, pane_ids, _active_idx)) = &stack_info {
@@ -479,41 +531,6 @@ fn draw_zellij_panes(
                     label_x = label_end;
                 }
             }
-        }
-
-        // Write the top border: fill between corners.
-        let top_start = x + 1;
-        let top_end = x + w - 1;
-        let mut col = top_start;
-
-        // Write tab content cells.
-        for cell in &top_content {
-            if col >= top_end {
-                break;
-            }
-            set_cell(buffer, y, col, cell.clone());
-            col += 1;
-        }
-
-        // Fill remaining top border with ─.
-        while col < top_end {
-            set_cell(buffer, y, col, border_cell('\u{2500}')); // ─
-            col += 1;
-        }
-
-        // Bottom border (fill between corners).
-        for col in (x + 1)..(x + w - 1) {
-            set_cell(buffer, y + h - 1, col, border_cell('\u{2500}')); // ─
-        }
-
-        // Left edge (between corners).
-        for row in (y + 1)..(y + h - 1) {
-            set_cell(buffer, row, x, border_cell('\u{2502}')); // │
-        }
-
-        // Right edge (between corners).
-        for row in (y + 1)..(y + h - 1) {
-            set_cell(buffer, row, x + w - 1, border_cell('\u{2502}')); // │
         }
     }
 }
@@ -777,7 +794,12 @@ fn draw_tmux_panes(
 }
 
 /// Draw a 1-row tab bar at the top of a pane rect for multi-pane stacks.
-fn draw_tmux_tab_bar(
+///
+/// Public so the client-side View compositor renders its Monocle title strip
+/// with the same tmux-style treatment a normal stacked pane's tab bar gets
+/// (status-bar background fill, `separator_fg` `" | "` separators, mode-colored
+/// active tab) instead of the zellij top-border treatment.
+pub fn draw_tmux_tab_bar(
     buffer: &mut [Vec<RenderCell>],
     rect: Rect,
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
@@ -964,7 +986,11 @@ fn draw_tmux_tab_bar(
 }
 
 /// Draw simple divider lines between adjacent panes (tmux style).
-fn draw_tmux_dividers(
+///
+/// Public so the client-side View compositor separates its (borderless) tmux
+/// -style cells with exactly the same dividers a normal tab's panes get. Rects
+/// are in BUFFER coordinates.
+pub fn draw_tmux_dividers(
     buffer: &mut [Vec<RenderCell>],
     pane_rects: &[(PaneId, Rect)],
     theme: &CompositorTheme,

@@ -28,8 +28,12 @@
 
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
+use crate::config::BorderStyle;
 use crate::protocol::{CellColor, ConnDescriptor, PaneId, RenderCell, ViewId, ViewInfo};
-use crate::server::compositor::build_top_border_content;
+use crate::server::compositor::{
+    build_top_border_content, draw_tmux_dividers, draw_tmux_tab_bar, draw_zellij_border,
+    fits_zellij_border, HitRegions,
+};
 use crate::server::layout::{
     compute_layout, focus_in_direction, FocusDirection, LayoutMode, LayoutNode, Rect,
 };
@@ -449,12 +453,55 @@ pub fn cell_rects(view: &ClientView, area: Rect) -> Vec<Option<Rect>> {
 // Compositing
 // ---------------------------------------------------------------------------
 
-/// SGR indexed color for the focused cell's border (bright green). Chosen over
-/// threading a `Theme` through so the compositor stays trivially testable; the
-/// focused cell must be visually unmistakable, which this + bold achieves.
-const FOCUSED_BORDER: CellColor = CellColor::Indexed(10);
-/// Indexed color for an unfocused cell's border (bright black / grey).
-const UNFOCUSED_BORDER: CellColor = CellColor::Indexed(8);
+/// The border color for a view cell, resolved from the SAME theme roles a
+/// normal tab's panes use: `frame_active_fg` for the focused cell,
+/// `frame_fg` for every other one. Threading the theme through is what makes a
+/// view's borders indistinguishable from a normal tab's (the previous hardcoded
+/// `Indexed(10)`/`Indexed(8)` pair did not match any theme).
+fn cell_border_fg(theme: &CompositorTheme, focused: bool) -> CellColor {
+    if focused {
+        theme.frame_active_fg.clone()
+    } else {
+        theme.frame_fg.clone()
+    }
+}
+
+/// The interior (content) region of a cell whose outer rect is `rw` x `rh` at
+/// buffer-local `(rx, ry)`, for the given border style. Returns
+/// `(ix, iy, iw, ih)`.
+///
+/// Mirrors the server exactly: `ZellijStyle` insets by one on every side when
+/// the rect satisfies [`fits_zellij_border`] (below that the content fills the
+/// rect, as `draw_zellij_panes` does); `TmuxStyle` is always edge-to-edge.
+/// [`draw_cell`], [`focused_cursor`] and [`cell_content_size`] all go through
+/// this, so cursor placement and subscription sizing can never disagree with
+/// what was painted.
+fn cell_interior(
+    rx: usize,
+    ry: usize,
+    rw: usize,
+    rh: usize,
+    style: &BorderStyle,
+) -> (usize, usize, usize, usize) {
+    // `rw`/`rh` always originate from a `Rect`'s u16 fields, so the narrowing
+    // back to u16 for the shared threshold check is lossless.
+    let bordered =
+        matches!(style, BorderStyle::ZellijStyle) && fits_zellij_border(rw as u16, rh as u16);
+    if bordered {
+        (rx + 1, ry + 1, rw - 2, rh - 2)
+    } else {
+        (rx, ry, rw, rh)
+    }
+}
+
+/// The content size (cols, rows) a cell of outer size `rect` can show in the
+/// given border style — the size its `SubscribePane` must request so the source
+/// pane reflows to exactly the region that gets painted. Zellij style loses one
+/// row/column to each border edge; tmux style loses nothing.
+pub fn cell_content_size(rect: Rect, style: &BorderStyle) -> (u16, u16) {
+    let (_, _, iw, ih) = cell_interior(0, 0, rect.width as usize, rect.height as usize, style);
+    (iw as u16, ih as u16)
+}
 
 /// Composite a view into an `area.height` x `area.width` buffer of
 /// [`RenderCell`]s, ready to hand to
@@ -462,11 +509,13 @@ const UNFOCUSED_BORDER: CellColor = CellColor::Indexed(8);
 ///
 /// Cells are placed within [`cells_area`] (the terminal minus the reserved
 /// status row); the status row itself is drawn separately by
-/// [`draw_status_bar`]. Each cell gets a box border (the focused cell's border
-/// is drawn bold in a distinct color) and its snapshot is blitted
-/// bottom-anchored into the box's interior, clipped to the interior's
-/// width/height. Cells with no snapshot yet show a centered placeholder label.
-/// In `Monocle` only the focused cell is drawn.
+/// [`draw_status_bar`]. Each cell is framed exactly as a normal tab's pane is in
+/// `style` — a rounded, theme-colored box border in `ZellijStyle` (drawn by the
+/// server's own [`draw_zellij_border`]), or edge-to-edge content with
+/// [`draw_tmux_dividers`] between adjacent cells in `TmuxStyle` — and its
+/// snapshot is blitted bottom-anchored into the interior, clipped to the
+/// interior's width/height. Cells with no snapshot yet show a centered
+/// placeholder label. In `Monocle` only the focused cell is drawn.
 ///
 /// `area` is expected to have its origin at the buffer origin in normal use
 /// (the full terminal, `x = y = 0`); rect coordinates are translated back to
@@ -476,6 +525,7 @@ pub fn composite(
     area: Rect,
     theme: &CompositorTheme,
     mode: &str,
+    style: &BorderStyle,
 ) -> Vec<Vec<RenderCell>> {
     let w = area.width as usize;
     let h = area.height as usize;
@@ -504,7 +554,41 @@ pub fn composite(
     let rects = cell_rects(view, area);
     for (i, cell) in view.cells.iter().enumerate() {
         if let Some(Some(rect)) = rects.get(i) {
-            draw_cell(&mut buf, area, *rect, cell, i == view.focused);
+            draw_cell(
+                &mut buf,
+                area,
+                *rect,
+                cell,
+                i == view.focused,
+                theme,
+                mode,
+                style,
+            );
+        }
+    }
+    // Tmux style draws no per-cell border, so adjacent cells are separated by the
+    // same 1-column/1-row dividers the server puts between tmux panes. Fed the
+    // buffer-local rects (the shared helper writes in buffer coordinates).
+    if matches!(style, BorderStyle::TmuxStyle) {
+        let local: Vec<(PaneId, Rect)> = view
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                rects.get(i).copied().flatten().map(|r| {
+                    (
+                        c.id,
+                        Rect {
+                            x: r.x.saturating_sub(area.x),
+                            y: r.y.saturating_sub(area.y),
+                            ..r
+                        },
+                    )
+                })
+            })
+            .collect();
+        if local.len() > 1 {
+            draw_tmux_dividers(&mut buf, &local, theme);
         }
     }
     // Monocle shows only the focused cell, so draw a top strip listing EVERY
@@ -512,7 +596,7 @@ pub fn composite(
     // the panes the user can page to. Drawn LAST so it always wins the reserved
     // row even if the cell geometry above ever regressed.
     if let Some(strip) = monocle_strip_rect(view, area) {
-        draw_monocle_strip(&mut buf, area, strip, view, theme, mode);
+        draw_monocle_strip(&mut buf, area, strip, view, theme, mode, style);
     }
     buf
 }
@@ -523,7 +607,13 @@ pub fn composite(
 /// focused cell has a rect below the strip, but a click landing on a title in
 /// the top strip resolves to THAT cell, so clicking a strip entry pages to it;
 /// any other in-bounds click resolves to the focused cell.
-pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
+pub fn cell_at(
+    view: &ClientView,
+    area: Rect,
+    x: u16,
+    y: u16,
+    style: &BorderStyle,
+) -> Option<usize> {
     if view.cells.is_empty() {
         return None;
     }
@@ -534,7 +624,7 @@ pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
         if y == strip.y && x >= strip.x && x < strip.x + strip.width {
             let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
             let rel = (x - strip.x) as usize;
-            if let Some((idx, _, _)) = strip_segments(&titles, strip.width as usize)
+            if let Some((idx, _, _)) = strip_segments(&titles, strip.width as usize, style)
                 .into_iter()
                 .find(|(_, s, e)| rel >= *s && rel < *e)
             {
@@ -558,7 +648,7 @@ pub fn cell_at(view: &ClientView, area: Rect, x: u16, y: u16) -> Option<usize> {
 /// disconnected cells, no snapshot, a hidden source cursor, or a cursor
 /// scrolled/clipped out of view. Mirrors [`draw_cell`]'s geometry exactly so
 /// the cursor lands on the character it addresses.
-pub fn focused_cursor(view: &ClientView, area: Rect) -> Option<(u16, u16)> {
+pub fn focused_cursor(view: &ClientView, area: Rect, style: &BorderStyle) -> Option<(u16, u16)> {
     let n = view.cells.len();
     if n == 0 {
         return None;
@@ -587,12 +677,7 @@ pub fn focused_cursor(view: &ClientView, area: Rect) -> Option<(u16, u16)> {
     if rw == 0 || rh == 0 {
         return None;
     }
-    let draw_border = rw >= 2 && rh >= 2;
-    let (ix, iy, iw, ih) = if draw_border {
-        (rx + 1, ry + 1, rw - 2, rh - 2)
-    } else {
-        (rx, ry, rw, rh)
-    };
+    let (ix, iy, iw, ih) = cell_interior(rx, ry, rw, rh, style);
     if iw == 0 || ih == 0 {
         return None;
     }
@@ -618,23 +703,31 @@ fn put(buf: &mut [Vec<RenderCell>], y: usize, x: usize, cell: RenderCell) {
     }
 }
 
-/// Make a border cell with the given glyph and focus styling.
-fn border_cell(ch: char, focused: bool) -> RenderCell {
-    RenderCell {
-        c: ch,
-        fg: if focused {
-            FOCUSED_BORDER
-        } else {
-            UNFOCUSED_BORDER
-        },
-        bold: focused,
-        ..RenderCell::default()
-    }
-}
-
 /// Draw one cell (border + snapshot) into `buf`. `rect` is in `area`-absolute
 /// coordinates; it is translated to buffer-local space using `area`'s origin.
-fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCell, focused: bool) {
+///
+/// The frame is drawn by the SERVER's own border code so a view cell is
+/// indistinguishable from a normal tab's pane:
+/// - `ZellijStyle`: [`draw_zellij_border`] paints the rounded corners, the
+///   `frame_active_fg`/`frame_fg` edges and the ` title ` top-border label — the
+///   cell's title is handed over as a single-entry "stack", which is exactly the
+///   shape a named single pane presents, so `build_top_border_content` renders it
+///   identically.
+/// - `TmuxStyle`: no border at all (as the server gives tmux panes none); the
+///   content runs edge-to-edge and [`composite`] draws the dividers between
+///   adjacent cells afterwards. The focus cue is the cursor, exactly as in a
+///   normal tmux-style tab.
+#[allow(clippy::too_many_arguments)]
+fn draw_cell(
+    buf: &mut [Vec<RenderCell>],
+    area: Rect,
+    rect: Rect,
+    cell: &ViewCell,
+    focused: bool,
+    theme: &CompositorTheme,
+    mode: &str,
+    style: &BorderStyle,
+) {
     let ox = area.x as usize;
     let oy = area.y as usize;
     let rx = (rect.x as usize).saturating_sub(ox);
@@ -645,40 +738,29 @@ fn draw_cell(buf: &mut [Vec<RenderCell>], area: Rect, rect: Rect, cell: &ViewCel
         return;
     }
 
-    // A border is only drawn when there is room for it plus at least one
-    // interior cell in each axis; otherwise the snapshot fills the whole rect.
-    let draw_border = rw >= 2 && rh >= 2;
-    let (ix, iy, iw, ih) = if draw_border {
-        (rx + 1, ry + 1, rw - 2, rh - 2)
-    } else {
-        (rx, ry, rw, rh)
-    };
+    let (ix, iy, iw, ih) = cell_interior(rx, ry, rw, rh, style);
 
-    if draw_border {
-        let last_x = rx + rw - 1;
-        let last_y = ry + rh - 1;
-        // Corners.
-        put(buf, ry, rx, border_cell('┌', focused));
-        put(buf, ry, last_x, border_cell('┐', focused));
-        put(buf, last_y, rx, border_cell('└', focused));
-        put(buf, last_y, last_x, border_cell('┘', focused));
-        // Horizontal edges.
-        for x in (rx + 1)..last_x {
-            put(buf, ry, x, border_cell('─', focused));
-            put(buf, last_y, x, border_cell('─', focused));
-        }
-        // Vertical edges.
-        for y in (ry + 1)..last_y {
-            put(buf, y, rx, border_cell('│', focused));
-            put(buf, y, last_x, border_cell('│', focused));
-        }
-        // Label the top border with the cell's title (session / tab, learned
-        // from PaneContent), or its identity until the first snapshot arrives.
-        let label = format!(" {} ", cell_title(cell));
-        let max = rw.saturating_sub(2);
-        for (i, ch) in label.chars().take(max).enumerate() {
-            put(buf, ry, rx + 1 + i, border_cell(ch, focused));
-        }
+    // A border was inset iff the interior is smaller than the rect.
+    if iw < rw && ih < rh {
+        // The title travels as a one-entry stack: `build_top_border_content`'s
+        // single-pane branch then renders ` title `, byte-for-byte what a named
+        // pane's top border shows. `cell_title` is never empty, so the label is
+        // always present.
+        let stack_info = Some((vec![cell_title(cell)], vec![cell.id], 0));
+        draw_zellij_border(
+            buf,
+            Rect {
+                x: rx as u16,
+                y: ry as u16,
+                width: rw as u16,
+                height: rh as u16,
+            },
+            &cell_border_fg(theme, focused),
+            &stack_info,
+            cell.id,
+            mode,
+            theme,
+        );
     }
 
     if iw == 0 || ih == 0 {
@@ -767,23 +849,34 @@ fn strip_tab_width(titles: &[String], width: usize) -> usize {
 }
 
 /// Lay out the Monocle title strip's tab entries within `width` columns,
-/// mirroring the regular stacked-pane strip: a leading space, then equal-width
-/// tabs (`strip_tab_width`) separated by a 3-column `" | "` separator.
+/// mirroring the regular stacked-pane strip for `style`: equal-width tabs
+/// (`strip_tab_width`) separated by a 3-column `" | "` separator, preceded by a
+/// leading space in `ZellijStyle` only.
 /// Returns `(cell_index, start, end)` column offsets (relative to the strip's
 /// left edge, `end` exclusive) for every entry at least partially visible;
 /// entries past the right edge are dropped and the last visible one is clipped.
 /// Used by [`cell_at`] for hit-testing; its boundaries match the columns
+/// [`draw_monocle_strip`] paints — via
 /// [`build_top_border_content`](crate::server::compositor::build_top_border_content)
-/// paints in [`draw_monocle_strip`] (same leading space, same `" | "` 3-column
-/// separator, same `strip_tab_width`), so a click always lands on the tab drawn
-/// there.
-fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)> {
+/// (zellij: one leading space) or
+/// [`draw_tmux_tab_bar`](crate::server::compositor::draw_tmux_tab_bar) (tmux:
+/// flush left) — so a click always lands on the tab drawn there.
+fn strip_segments(
+    titles: &[String],
+    width: usize,
+    style: &BorderStyle,
+) -> Vec<(usize, usize, usize)> {
     let mut segs = Vec::new();
     let tab_width = strip_tab_width(titles, width);
     if tab_width == 0 {
         return segs;
     }
-    let mut x = 1usize; // leading space before the first tab
+    // Zellij's top-border strip starts with a padding space; the tmux tab bar
+    // starts flush at the left edge.
+    let mut x = match style {
+        BorderStyle::ZellijStyle => 1usize,
+        BorderStyle::TmuxStyle => 0usize,
+    };
     for i in 0..titles.len() {
         if i > 0 {
             // 3-column " | " separator between tabs.
@@ -802,16 +895,19 @@ fn strip_segments(titles: &[String], width: usize) -> Vec<(usize, usize, usize)>
 
 /// Draw the Monocle title strip on `strip` (the reserved top row of the cell
 /// area): a tab-like list of EVERY cell's title, rendered by the SAME server
-/// function a normal stacked pane's top border uses
-/// ([`build_top_border_content`](crate::server::compositor::build_top_border_content)),
-/// so the strip is pixel-identical to a normal Monocle tab's — fixed tab width,
-/// the active tab filled with `theme.mode_colors(mode)`, inactive tabs on
-/// `CellColor::Indexed(237)`, `" | "` separators.
+/// function a normal stacked pane uses in the current `style`, so the strip is
+/// pixel-identical to a normal Monocle tab's —
+/// [`build_top_border_content`](crate::server::compositor::build_top_border_content)
+/// for `ZellijStyle` (top-border tabs: fixed tab width, the active tab filled
+/// with `theme.mode_colors(mode)`, inactive tabs on `CellColor::Indexed(237)`,
+/// `" | "` separators) and
+/// [`draw_tmux_tab_bar`](crate::server::compositor::draw_tmux_tab_bar) for
+/// `TmuxStyle` (status-bar-colored bar, `separator_fg` separators).
 ///
 /// The cells' [`ViewCell::id`]s serve as the pseudo-pane ids and the focused
-/// cell index as the active index. `border_fg` is the focused-frame color
-/// (`frame_active_fg`): the whole strip belongs to the focused view, exactly as
-/// a focused pane's border does.
+/// cell index as the active index. In zellij style the strip is drawn in the
+/// focused-frame color (`frame_active_fg`): the whole strip belongs to the
+/// focused view, exactly as a focused pane's border does.
 fn draw_monocle_strip(
     buf: &mut [Vec<RenderCell>],
     area: Rect,
@@ -819,6 +915,7 @@ fn draw_monocle_strip(
     view: &ClientView,
     theme: &CompositorTheme,
     mode: &str,
+    style: &BorderStyle,
 ) {
     let by = (strip.y as usize).saturating_sub(area.y as usize);
     let bx = (strip.x as usize).saturating_sub(area.x as usize);
@@ -834,6 +931,26 @@ fn draw_monocle_strip(
     let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
     let pseudo_ids: Vec<PaneId> = view.cells.iter().map(|c| c.id).collect();
     let stack_info = Some((titles, pseudo_ids, view.focused));
+    if matches!(style, BorderStyle::TmuxStyle) {
+        // The tmux tab bar writes straight into the buffer at `strip`'s (already
+        // buffer-local) position and needs no hit regions here: `cell_at`
+        // hit-tests the strip itself via `strip_segments`.
+        let mut regions = HitRegions::default();
+        draw_tmux_tab_bar(
+            buf,
+            Rect {
+                x: bx as u16,
+                y: by as u16,
+                width: strip.width,
+                height: 1,
+            },
+            &stack_info,
+            mode,
+            &mut regions,
+            theme,
+        );
+        return;
+    }
     let border_fg = theme.frame_active_fg.clone();
     let cells = build_top_border_content(
         &stack_info,
@@ -1037,6 +1154,17 @@ mod tests {
         CompositorTheme::default()
     }
 
+    /// The default border style (rounded zellij boxes), used by every test that
+    /// isn't specifically about the tmux-style rendering.
+    fn zj() -> BorderStyle {
+        BorderStyle::ZellijStyle
+    }
+
+    /// The alternative (tmux) border style: no per-cell box, minimal dividers.
+    fn tmx() -> BorderStyle {
+        BorderStyle::TmuxStyle
+    }
+
     fn gridv() -> LayoutMode {
         LayoutMode::Grid(GridLayout)
     }
@@ -1233,7 +1361,7 @@ mod tests {
         v2.cells[0].snapshot = Some(snap_filled(40, 10, 'A'));
         v2.cells[1].snapshot = Some(snap_filled(40, 10, 'B'));
         v2.zoomed = true;
-        let buf = composite(&v2, a, &tt(), "NORMAL");
+        let buf = composite(&v2, a, &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|r| r.iter().map(|c| c.c)).collect();
         assert!(joined.contains('A') && !joined.contains('B'));
     }
@@ -1267,7 +1395,7 @@ mod tests {
         cells[0].title = Some("aa".into());
         cells[1].title = Some("bb".into());
         let view = view_of(cells, monoclev(), 0);
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let row0: String = buf[0].iter().map(|c| c.c).collect();
         // The shared strip function separates tabs with an ASCII " | " (space
         // pipe space), NOT a box-drawing vertical bar.
@@ -1288,7 +1416,7 @@ mod tests {
         cells[0].title = Some("aa".into());
         cells[1].title = Some("bb".into());
         let view = view_of(cells, monoclev(), 0); // cell 0 focused/active
-        let buf = composite(&view, area(80, 24), &theme, "NORMAL");
+        let buf = composite(&view, area(80, 24), &theme, "NORMAL", &zj());
         let row0 = &buf[0];
         let (mode_fg, mode_bg) = theme.mode_colors("NORMAL");
         let apos = row0.iter().position(|c| c.c == 'a').unwrap();
@@ -1310,7 +1438,7 @@ mod tests {
         cells[0].title = Some("aa".into());
         cells[1].title = Some("bb".into());
         let view = view_of(cells, monoclev(), 0); // cell 0 focused/active
-        let buf = composite(&view, area(80, 24), &theme, "NORMAL");
+        let buf = composite(&view, area(80, 24), &theme, "NORMAL", &zj());
         let row0 = &buf[0];
         let bpos = row0.iter().position(|c| c.c == 'b').unwrap();
         assert_eq!(row0[bpos].bg, CellColor::Indexed(237));
@@ -1331,11 +1459,11 @@ mod tests {
         cells[2].title = Some("gamma".into());
         let view = view_of(cells, monoclev(), 1); // middle cell focused
         let a = area(80, 24);
-        let buf = composite(&view, a, &theme, "NORMAL");
+        let buf = composite(&view, a, &theme, "NORMAL", &zj());
         let strip = monocle_strip_rect(&view, a).unwrap();
         let width = strip.width as usize;
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let segs = strip_segments(&titles, width);
+        let segs = strip_segments(&titles, width, &zj());
         assert_eq!(segs.len(), 3, "three visible tabs");
         let (_, mode_bg) = theme.mode_colors("NORMAL");
         for (idx, start, end) in segs {
@@ -1481,7 +1609,7 @@ mod tests {
         };
         let theme = tt();
         let a = area(80, 24);
-        let buf = composite(&view, a, &theme, "NORMAL");
+        let buf = composite(&view, a, &theme, "NORMAL", &zj());
         // Row 0 is the strip: it lists ALL three titles.
         let row0: String = buf[0].iter().map(|c| c.c).collect();
         assert!(
@@ -1532,7 +1660,7 @@ mod tests {
             zoomed: false,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a, &tt(), "NORMAL");
+        let buf = composite(&view, a, &tt(), "NORMAL", &zj());
         let row0: String = buf[0].iter().map(|c| c.c).collect();
         assert!(row0.contains("alpha / Tab 1"));
         assert!(row0.contains("beta / Tab 1"));
@@ -1563,7 +1691,7 @@ mod tests {
             zoomed: false,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a, &tt(), "NORMAL");
+        let buf = composite(&view, a, &tt(), "NORMAL", &zj());
         // Row 0 is the strip; the focused snapshot char 'A' appears only below.
         assert!(
             !buf[0].iter().any(|c| c.c == 'A'),
@@ -1593,12 +1721,12 @@ mod tests {
         // draw it, then hit-test its middle column.
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
         let strip = monocle_strip_rect(&view, a).unwrap();
-        let segs = strip_segments(&titles, strip.width as usize);
+        let segs = strip_segments(&titles, strip.width as usize, &zj());
         let (_, s, e) = segs.iter().copied().find(|(i, _, _)| *i == 1).unwrap();
         let mid = strip.x + ((s + e) / 2) as u16;
-        assert_eq!(cell_at(&view, a, mid, strip.y), Some(1));
+        assert_eq!(cell_at(&view, a, mid, strip.y, &zj()), Some(1));
         // A click below the strip resolves to the focused cell (0).
-        assert_eq!(cell_at(&view, a, 5, 5), Some(0));
+        assert_eq!(cell_at(&view, a, 5, 5, &zj()), Some(0));
     }
 
     #[test]
@@ -1619,7 +1747,7 @@ mod tests {
             zoomed: false,
         };
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 2), (10, 3), (0, 0)] {
-            let buf = composite(&view, area(w, h), &tt(), "NORMAL");
+            let buf = composite(&view, area(w, h), &tt(), "NORMAL", &zj());
             assert_eq!(buf.len(), h as usize);
             assert!(buf.iter().all(|row| row.len() == w as usize));
         }
@@ -1656,7 +1784,7 @@ mod tests {
             zoomed: false,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a, &tt(), "NORMAL");
+        let buf = composite(&view, a, &tt(), "NORMAL", &zj());
         let rects = cell_rects(&view, a);
 
         // Interior center of cell 0 must be 'A', cell 1 must be 'B'.
@@ -1682,20 +1810,28 @@ mod tests {
             zoomed: false,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a, &tt(), "NORMAL");
+        let theme = tt();
+        let buf = composite(&view, a, &theme, "NORMAL", &zj());
         let rects = cell_rects(&view, a);
 
-        // Focused cell (index 1) top-left corner is bold + focused color.
+        // The focused/unfocused distinction is the SAME one the server makes
+        // between panes -- `frame_active_fg` vs `frame_fg`, no bold -- because a
+        // view cell's border is drawn by the server's own `draw_zellij_border`.
+        // (It used to be a hardcoded `Indexed(10)`/`Indexed(8)` + bold pair that
+        // matched no theme and never matched a normal tab.)
         let f = rects[1].unwrap();
         let fc = &buf[f.y as usize][f.x as usize];
-        assert_eq!(fc.fg, FOCUSED_BORDER);
-        assert!(fc.bold);
+        assert_eq!(fc.c, '╭');
+        assert_eq!(fc.fg, theme.frame_active_fg);
+        assert!(!fc.bold);
 
-        // Unfocused cell (index 0) corner is not.
+        // Unfocused cell (index 0) corner is the inactive frame color.
         let u = rects[0].unwrap();
         let uc = &buf[u.y as usize][u.x as usize];
-        assert_eq!(uc.fg, UNFOCUSED_BORDER);
+        assert_eq!(uc.c, '╭');
+        assert_eq!(uc.fg, theme.frame_fg);
         assert!(!uc.bold);
+        assert_ne!(fc.fg, uc.fg);
     }
 
     #[test]
@@ -1742,7 +1878,7 @@ mod tests {
             zoomed: false,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a, &tt(), "NORMAL");
+        let buf = composite(&view, a, &tt(), "NORMAL", &zj());
 
         // The single cell fills the cell area (area minus the status row); its
         // interior bottom row (just above the box border) must be 'L'.
@@ -1771,7 +1907,7 @@ mod tests {
             zoomed: false,
         };
         let a = area(80, 24);
-        let buf = composite(&view, a, &tt(), "NORMAL");
+        let buf = composite(&view, a, &tt(), "NORMAL", &zj());
         // Interior starts at row 1 (under the top border).
         assert_eq!(buf[1][2].c, 'S');
     }
@@ -1787,7 +1923,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         // A cell with no snapshot yet shows a `waiting…` placeholder.
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("waiting"));
@@ -1801,7 +1937,7 @@ mod tests {
         let mut cell = cell_with(7, None);
         cell.conn = ConnId::Remote("mini".into());
         let view = view_of(vec![cell], gridv(), 0);
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(!joined.contains("waiting for waiting"));
         // Both call sites read sensibly: the border label names the cell, and the
@@ -1818,7 +1954,7 @@ mod tests {
         cell.conn = ConnId::Remote("mini".into());
         cell.unavailable = Some("not connected: mini".to_string());
         let view = view_of(vec![cell], gridv(), 0);
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("not connected: mini"));
         assert!(!joined.contains("waiting"));
@@ -1832,7 +1968,7 @@ mod tests {
         cell.disconnected = true;
         cell.unavailable = Some("not connected: mini".to_string());
         let view = view_of(vec![cell], gridv(), 0);
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("disconnected"));
         assert!(!joined.contains("not connected"));
@@ -1879,7 +2015,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains("disconnected"));
         // The stale snapshot content must NOT bleed through.
@@ -1900,7 +2036,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        let buf = composite(&view, area(80, 24), &tt(), "NORMAL");
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
         let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
         assert!(joined.contains('B'));
         assert!(
@@ -1928,13 +2064,13 @@ mod tests {
             let r = r.unwrap();
             let x = r.x + r.width / 2;
             let y = r.y + r.height / 2;
-            assert_eq!(cell_at(&view, a, x, y), Some(i));
+            assert_eq!(cell_at(&view, a, x, y, &zj()), Some(i));
         }
         // A click on the reserved status row hits nothing.
-        assert_eq!(cell_at(&view, a, 10, a.height - 1), None);
+        assert_eq!(cell_at(&view, a, 10, a.height - 1, &zj()), None);
         // Empty view: no hit.
         let empty = ClientView::new("e".into());
-        assert_eq!(cell_at(&empty, a, 10, 10), None);
+        assert_eq!(cell_at(&empty, a, 10, 10, &zj()), None);
     }
 
     #[test]
@@ -1948,7 +2084,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        assert_eq!(cell_at(&view, area(80, 24), 5, 5), Some(1));
+        assert_eq!(cell_at(&view, area(80, 24), 5, 5, &zj()), Some(1));
     }
 
     #[test]
@@ -1971,7 +2107,7 @@ mod tests {
         // the interior so start=0 -> cursor row = iy + 9, col = ix + 3.
         let rects = cell_rects(&view, a);
         let f = rects[0].unwrap();
-        let got = focused_cursor(&view, a).expect("cursor shown");
+        let got = focused_cursor(&view, a, &zj()).expect("cursor shown");
         assert_eq!(got, (f.x + 1 + 3, f.y + 1 + 9));
 
         // A hidden source cursor -> no cursor.
@@ -1986,7 +2122,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        assert_eq!(focused_cursor(&view2, a), None);
+        assert_eq!(focused_cursor(&view2, a, &zj()), None);
 
         // A disconnected focused cell -> no cursor.
         let mut cell = cell_with(1, Some(snap_filled(40, 10, 'A')));
@@ -2003,7 +2139,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        assert_eq!(focused_cursor(&view3, a), None);
+        assert_eq!(focused_cursor(&view3, a, &zj()), None);
     }
 
     #[test]
@@ -2175,7 +2311,7 @@ mod tests {
                 zoomed: false,
             };
             let a = area(80, 24);
-            let buf = composite(&view, a, &tt(), "NORMAL");
+            let buf = composite(&view, a, &tt(), "NORMAL", &zj());
             assert_eq!(buf.len(), a.height as usize, "row count");
             assert!(
                 buf.iter().all(|row| row.len() == a.width as usize),
@@ -2195,7 +2331,7 @@ mod tests {
         // stay within bounds (clamped).
         let view = ClientView::new("empty".into());
         for (w, h) in [(1u16, 1u16), (5, 1), (10, 3), (0, 0)] {
-            let buf = composite(&view, area(w, h), &tt(), "NORMAL");
+            let buf = composite(&view, area(w, h), &tt(), "NORMAL", &zj());
             assert_eq!(buf.len(), h as usize);
             assert!(buf.iter().all(|row| row.len() == w as usize));
         }
@@ -2232,5 +2368,205 @@ mod tests {
         let bar: String = buf[a.height as usize - 1].iter().map(|c| c.c).collect();
         assert!(bar.contains("Empty"));
         assert!(bar.contains("grid"));
+    }
+
+    // -- Border-style parity with a normal tab -------------------------------
+
+    /// Give every stack in `node` the same display names a view gives its
+    /// titleless local cells (`cell_title`'s `pane <id>` fallback), so a server
+    /// pane's top-border label is directly comparable to a view cell's.
+    fn name_stacks(node: &mut LayoutNode) {
+        match node {
+            LayoutNode::Stack { panes, names, .. } => {
+                *names = panes.iter().map(|id| format!("pane {id}")).collect();
+            }
+            LayoutNode::Split { first, second, .. } => {
+                name_stacks(first);
+                name_stacks(second);
+            }
+        }
+    }
+
+    /// Composite the same cell arrangement as a NORMAL TAB via the server
+    /// compositor: same tree, same content area (`cells_area`, i.e. one row
+    /// reserved for the status bar), same focused pane, same theme.
+    fn server_frame(view: &ClientView, a: Rect, style: &BorderStyle) -> Vec<Vec<RenderCell>> {
+        use crate::screen::Screen;
+        use crate::server::compositor::StatusInfo;
+        use crate::server::session::TabActivity;
+        let mut tree = view.auto_tree();
+        name_stacks(&mut tree);
+        let inner = cells_area(a);
+        let screens: Vec<(PaneId, Screen)> = view
+            .cells
+            .iter()
+            .map(|c| (c.id, Screen::new(a.width, inner.height, 100)))
+            .collect();
+        let mut pane_screens: std::collections::HashMap<PaneId, &Screen> =
+            std::collections::HashMap::new();
+        for (id, s) in &screens {
+            pane_screens.insert(*id, s);
+        }
+        let status = StatusInfo {
+            mode: "NORMAL".to_string(),
+            session_name: "s".to_string(),
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
+            layout_mode: "grid".to_string(),
+            search_info: None,
+        };
+        let (buf, _) = crate::server::compositor::composite(
+            &tree,
+            &pane_screens,
+            inner,
+            style,
+            &status,
+            a.width,
+            a.height,
+            0,
+            view.focused_id(),
+            None,
+            &std::collections::HashMap::new(),
+            &tt(),
+        );
+        buf
+    }
+
+    /// The decisive parity check for bug 1: composite the same three-cell Grid
+    /// arrangement BOTH as a view (client compositor) and as a normal tab (server
+    /// compositor), then assert every border cell agrees on glyph, colors and
+    /// bold. It fails the moment either side grows its own box-drawing code.
+    #[test]
+    fn view_cell_frame_matches_server_pane_frame_zellij() {
+        let a = area(80, 24);
+        let view = view_n(3, gridv(), 1);
+        let vbuf = composite(&view, a, &tt(), "NORMAL", &zj());
+        let sbuf = server_frame(&view, a, &BorderStyle::ZellijStyle);
+
+        let mut checked = 0usize;
+        for rect in cell_rects(&view, a).into_iter().flatten() {
+            let (x0, y0) = (rect.x as usize, rect.y as usize);
+            let (x1, y1) = (x0 + rect.width as usize - 1, y0 + rect.height as usize - 1);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    // Perimeter only: the interior holds content, not frame.
+                    if y != y0 && y != y1 && x != x0 && x != x1 {
+                        continue;
+                    }
+                    let v = &vbuf[y][x];
+                    let s = &sbuf[y][x];
+                    assert_eq!(
+                        (v.c, &v.fg, &v.bg, v.bold),
+                        (s.c, &s.fg, &s.bg, s.bold),
+                        "border mismatch at ({x},{y})"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "too few border cells compared: {checked}");
+
+        // And no square corner survives anywhere in the view.
+        let all: String = vbuf.iter().flatten().map(|c| c.c).collect();
+        assert!(all.contains('╭') && all.contains('╮'));
+        assert!(all.contains('╰') && all.contains('╯'));
+        for sq in ['┌', '┐', '└', '┘'] {
+            assert!(!all.contains(sq), "square corner {sq} still drawn");
+        }
+    }
+
+    /// Tmux style: the view draws no box at all and puts the SAME dividers the
+    /// server puts between tmux panes, in the same places and colors.
+    #[test]
+    fn view_cells_match_server_panes_tmux() {
+        let a = area(80, 24);
+        let view = view_n(3, gridv(), 1);
+        let vbuf = composite(&view, a, &tt(), "NORMAL", &tmx());
+        let sbuf = server_frame(&view, a, &BorderStyle::TmuxStyle);
+
+        let mut dividers = 0usize;
+        for (y, srow) in sbuf.iter().enumerate().take(a.height as usize - 1) {
+            for (x, s) in srow.iter().enumerate() {
+                if s.c == '\u{2502}' || s.c == '\u{2500}' {
+                    let v = &vbuf[y][x];
+                    assert_eq!((v.c, &v.fg), (s.c, &s.fg), "divider mismatch at ({x},{y})");
+                    dividers += 1;
+                }
+            }
+        }
+        assert!(dividers > 20, "too few dividers compared: {dividers}");
+
+        // No box border, no rounded corners, no per-cell title in tmux style.
+        let all: String = vbuf.iter().flatten().map(|c| c.c).collect();
+        for ch in ['╭', '╮', '╰', '╯'] {
+            assert!(!all.contains(ch), "tmux style drew a box corner {ch}");
+        }
+    }
+
+    /// Toggling the style must actually change what a view paints (bug 2: the
+    /// view rendered identically in both styles because it ignored the style).
+    #[test]
+    fn toggling_style_changes_what_a_view_paints() {
+        let a = area(80, 24);
+        let view = view_n(2, gridv(), 0);
+        let z: Vec<char> = composite(&view, a, &tt(), "NORMAL", &zj())
+            .iter()
+            .flatten()
+            .map(|c| c.c)
+            .collect();
+        let t: Vec<char> = composite(&view, a, &tt(), "NORMAL", &tmx())
+            .iter()
+            .flatten()
+            .map(|c| c.c)
+            .collect();
+        assert_ne!(z, t);
+    }
+
+    /// The subscription size is the region actually painted, per style.
+    #[test]
+    fn cell_content_size_tracks_the_border_style() {
+        let r = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        assert_eq!(cell_content_size(r, &zj()), (38, 10));
+        assert_eq!(cell_content_size(r, &tmx()), (40, 12));
+        // Below the shared border threshold zellij also goes edge-to-edge.
+        let tiny = Rect {
+            width: 2,
+            height: 2,
+            ..r
+        };
+        assert_eq!(cell_content_size(tiny, &zj()), (2, 2));
+    }
+
+    /// The tmux Monocle strip is the server's tab bar (status-bar background),
+    /// and hit-testing follows it: flush left, with no zellij leading space.
+    #[test]
+    fn monocle_strip_tmux_uses_tab_bar_and_flush_hit_testing() {
+        let a = area(80, 24);
+        let view = view_n(3, monoclev(), 1);
+        let theme = tt();
+        let buf = composite(&view, a, &theme, "NORMAL", &tmx());
+        let strip = monocle_strip_rect(&view, a).expect("strip");
+        let row = &buf[strip.y as usize];
+        let last = strip.width as usize - 1;
+        // The tmux tab bar fills the whole row with the status-bar background;
+        // the zellij top-border strip writes only its tab cells and leaves the
+        // rest of the row on the default background.
+        assert_eq!(row[last].bg, theme.status_bar_bg);
+        let zrow = &composite(&view, a, &theme, "NORMAL", &zj())[strip.y as usize];
+        assert_eq!(zrow[last].bg, CellColor::Default);
+        let text: String = row.iter().map(|c| c.c).collect();
+        assert!(text.contains("pane 1"), "titles missing: {text:?}");
+
+        let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+        let zsegs = strip_segments(&titles, strip.width as usize, &zj());
+        let tsegs = strip_segments(&titles, strip.width as usize, &tmx());
+        assert_eq!(zsegs[0].1, 1, "zellij strip starts after a leading space");
+        assert_eq!(tsegs[0].1, 0, "tmux tab bar starts flush left");
+        // A click on the first tab still resolves to cell 0 in tmux style.
+        assert_eq!(cell_at(&view, a, strip.x, strip.y, &tmx()), Some(0));
     }
 }
