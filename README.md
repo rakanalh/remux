@@ -30,6 +30,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
 - **Five layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid).
+- **Popup terminal** — a scratch terminal that floats centered on top of the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per session — toggle it from any tab and it follows you. Sized as a percentage of the screen (`popup_width_pct` / `popup_height_pct`, default 80×80) and resizable while open with the pane-resize keys. It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
 
@@ -210,6 +211,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `h` / `j` / `k` / `l` | Focus left / down / up / right *(→ Normal)* |
 | `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right *(→ Normal)* |
 | `z` | Toggle zoom *(→ Normal)* |
+| `o` | Toggle the popup terminal *(→ Normal)* |
 | `r` | Rename pane |
 | `a` | Add pane to stack *(→ Normal)* |
 | `]` | Next pane in stack *(→ Normal)* |
@@ -278,6 +280,7 @@ Views are virtual tabs whose cells alias existing panes (see [Views](#views-cros
 | `Alt-s` | Quick session switcher (local + remote) |
 | `Alt-o` | Last session (toggle) |
 | `Alt-z` | Toggle pane zoom |
+| `Alt-p` | Toggle the popup terminal |
 | `Alt-Space` | Cycle layout |
 
 ### Visual mode
@@ -377,6 +380,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
 | `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid). |
 | `SetMaster` | — | Make the focused pane the master pane (Master layout). |
+| `PopupToggle` | — | Show/hide the session's popup terminal (created on first use, kept running while hidden). |
 | `ViewNew` | `[name]` | Create a view and enter it (prompts when no name is given). |
 | `ViewAddPane` | — | Add the focused pane to a view (opens the view picker). |
 | `ViewRename` | `<name>` | Rename the current view. |
@@ -442,6 +446,7 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `border_style` — `"zellij_style"` or `"tmux_style"`.
   - `default_layout` — `"bsp"`, `"master"`, `"monocle"`, or `"custom"`.
   - `which_key_position` — `"anchored"`, `"centered"`, or `"full_width"`.
+  - `popup_width_pct` / `popup_height_pct` — popup terminal size as a percentage of the content area (default 80 / 80, clamped to 20–100).
   - `[appearance.theme]` — per-role colors (named / hex / `{ ansi = N }` / `{ rgb = [r,g,b] }`); defaults are Catppuccin Mocha.
 - **`[modes.command]`**
   - `timeout_ms` — delay before the which-key popup appears (default 500).
