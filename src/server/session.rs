@@ -274,6 +274,90 @@ pub struct Tab {
     pub last_output: Option<Instant>,
 }
 
+impl Tab {
+    /// **The one answer to "which panes does this tab own".**
+    ///
+    /// `pane_order` and the layout tree are two views of the same set (see
+    /// [`Session::check_structural_invariant`]); consumers that picked one side
+    /// at random used to disagree when the two drifted -- a restored session
+    /// could silently get no PTY for a pane, or a View cell no title. Everything
+    /// that just needs the membership goes through here, in insertion order (the
+    /// order automatic layouts rebuild from). The popup pane is deliberately in
+    /// neither side and so is never returned.
+    pub fn panes(&self) -> &[PaneId] {
+        &self.pane_order
+    }
+
+    /// The layout to render and size this tab with: the real tree, or -- while a
+    /// pane is zoomed -- a synthetic single-pane stack holding the **zoomed**
+    /// pane, so it owns the whole area.
+    ///
+    /// The zoom substitution is exactly this and nowhere else: the render path,
+    /// the pane-rect math and the PTY sizing all take their layout from here, so
+    /// they can never disagree about how many panes there are (a disagreement is
+    /// what made a zoomed *stacked* pane's PTY one row shorter than the area
+    /// painted for it under the tmux border style).
+    pub fn effective_layout(&self) -> std::borrow::Cow<'_, LayoutNode> {
+        match self.zoomed_pane {
+            Some(zoomed) => std::borrow::Cow::Owned(LayoutNode::new_stack(zoomed)),
+            None => std::borrow::Cow::Borrowed(&self.layout),
+        }
+    }
+
+    /// Move focus to `pane_id`, carrying an active zoom along with it.
+    ///
+    /// `zoomed_pane` names the pane that is actually painted full-area, so it
+    /// must follow focus: "zoom, then step to the next pane in the stack" keeps
+    /// showing the pane you are typing into. Every focus change *within* a
+    /// zoomed tab goes through here so the id can never go stale behind the
+    /// zoom.
+    pub fn focus_pane(&mut self, pane_id: PaneId) {
+        self.focused_pane = pane_id;
+        if self.zoomed_pane.is_some() {
+            self.zoomed_pane = Some(pane_id);
+        }
+    }
+
+    /// Make `pane_order` agree with the layout tree, keeping the existing order
+    /// for the panes both sides know about.
+    ///
+    /// Only meaningful on deserialized state: `pane_order` is `#[serde(default)]`,
+    /// so a state file written before the field existed restores an empty order
+    /// with a fully populated tree. Repairing on the way in means the live
+    /// invariant holds from the first frame and both consumers of the pane set
+    /// see the same panes.
+    pub fn reconcile_pane_order(&mut self) {
+        let tree: Vec<PaneId> = layout::all_pane_ids(&self.layout);
+        let tree_set: HashSet<PaneId> = tree.iter().copied().collect();
+        let mut seen: HashSet<PaneId> = HashSet::new();
+        let mut repaired: Vec<PaneId> = Vec::new();
+        for &id in &self.pane_order {
+            if tree_set.contains(&id) && seen.insert(id) {
+                repaired.push(id);
+            }
+        }
+        for id in tree {
+            if seen.insert(id) {
+                repaired.push(id);
+            }
+        }
+        if repaired != self.pane_order {
+            log::warn!(
+                "tab {}: repaired pane_order {:?} -> {repaired:?}",
+                self.id,
+                self.pane_order
+            );
+            self.pane_order = repaired;
+        }
+        if let Some(zoomed) = self.zoomed_pane {
+            if !self.pane_order.contains(&zoomed) {
+                log::warn!("tab {}: dropped stale zoomed_pane {zoomed}", self.id);
+                self.zoomed_pane = None;
+            }
+        }
+    }
+}
+
 /// Return true if a tab currently in [`TabActivity::Activity`] should be
 /// promoted to [`TabActivity::Silent`] given the current time `now` and the
 /// silence `threshold`.
@@ -297,12 +381,14 @@ fn default_border_style() -> BorderStyle {
     BorderStyle::ZellijStyle
 }
 
-/// **The hard popup invariant, as a reusable assertion.**
+/// **The hard structural invariant, as a reusable check.**
 ///
 /// The popup pane is a real PTY that must never be spliced into the layout: if
 /// it ever landed in a `pane_order`, a layout tree, or a `zoomed_pane`, then
 /// `PaneMove*`/`SetMaster`/an automatic rebuild/a stack splice could capture it
-/// and it would start taking space in (or replace) the layout.
+/// and it would start taking space in (or replace) the layout. And the two
+/// views of a tab's pane set must not drift, since different consumers read
+/// different sides (see [`Tab::panes`]).
 ///
 /// Checks, for **every** tab of `sess`:
 /// 1. `popup_pane` is not in `tab.pane_order`;
@@ -310,47 +396,83 @@ fn default_border_style() -> BorderStyle {
 /// 3. `tab.zoomed_pane` is not the popup;
 /// 4. the layout tree's pane set == `pane_order`'s set, with no duplicates
 ///    (the structural health check: catches orphans and dupes whether or not a
-///    popup is involved).
-#[cfg(test)]
-pub(crate) fn assert_popup_invariant(sess: &Session, context: &str) {
+///    popup is involved);
+/// 5. `tab.zoomed_pane`, when set, names a pane the tab still owns -- the id is
+///    honoured by the render/sizing paths, so a stale one would paint a dead
+///    pane full-screen.
+///
+/// Returns the first violation as a message rather than panicking, so
+/// production code can `debug_assert` on it (see [`debug_check_invariant`]) and
+/// tests can turn it into a hard assertion.
+pub fn check_structural_invariant(sess: &Session) -> Result<(), String> {
     for (i, tab) in sess.tabs.iter().enumerate() {
         let tree_panes = layout::all_pane_ids(&tab.layout);
         let tree_set: HashSet<PaneId> = tree_panes.iter().copied().collect();
         let order_set: HashSet<PaneId> = tab.pane_order.iter().copied().collect();
 
         if let Some(popup) = sess.popup_pane {
-            assert!(
-                !tab.pane_order.contains(&popup),
-                "[{context}] popup pane {popup} leaked into tab {i} pane_order {:?}",
-                tab.pane_order
-            );
-            assert!(
-                !tree_set.contains(&popup),
-                "[{context}] popup pane {popup} leaked into tab {i} layout tree {tree_panes:?}"
-            );
-            assert_ne!(
-                tab.zoomed_pane,
-                Some(popup),
-                "[{context}] popup pane {popup} became tab {i}'s zoomed_pane"
-            );
+            if tab.pane_order.contains(&popup) {
+                return Err(format!(
+                    "popup pane {popup} leaked into tab {i} pane_order {:?}",
+                    tab.pane_order
+                ));
+            }
+            if tree_set.contains(&popup) {
+                return Err(format!(
+                    "popup pane {popup} leaked into tab {i} layout tree {tree_panes:?}"
+                ));
+            }
+            if tab.zoomed_pane == Some(popup) {
+                return Err(format!("popup pane {popup} became tab {i}'s zoomed_pane"));
+            }
         }
 
-        assert_eq!(
-            tree_panes.len(),
-            tree_set.len(),
-            "[{context}] tab {i} layout tree has duplicate panes: {tree_panes:?}"
-        );
-        assert_eq!(
-            tab.pane_order.len(),
-            order_set.len(),
-            "[{context}] tab {i} pane_order has duplicates: {:?}",
-            tab.pane_order
-        );
-        assert_eq!(
-            tree_set, order_set,
-            "[{context}] tab {i} layout tree {tree_panes:?} and pane_order {:?} disagree",
-            tab.pane_order
-        );
+        if tree_panes.len() != tree_set.len() {
+            return Err(format!(
+                "tab {i} layout tree has duplicate panes: {tree_panes:?}"
+            ));
+        }
+        if tab.pane_order.len() != order_set.len() {
+            return Err(format!(
+                "tab {i} pane_order has duplicates: {:?}",
+                tab.pane_order
+            ));
+        }
+        if tree_set != order_set {
+            return Err(format!(
+                "tab {i} layout tree {tree_panes:?} and pane_order {:?} disagree",
+                tab.pane_order
+            ));
+        }
+        if let Some(zoomed) = tab.zoomed_pane {
+            if !order_set.contains(&zoomed) {
+                return Err(format!(
+                    "tab {i} zoomed_pane {zoomed} is not one of its panes {:?}",
+                    tab.pane_order
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Debug-build guard over [`check_structural_invariant`], called after every
+/// structural mutation of a session (pane create/close, layout rebuilds). A
+/// violation is a programming error in the mutation that just ran, so it panics
+/// in debug/test builds and costs nothing in release.
+pub fn debug_check_invariant(sess: &Session, context: &str) {
+    if cfg!(debug_assertions) {
+        if let Err(e) = check_structural_invariant(sess) {
+            panic!("[{context}] session '{}': {e}", sess.name);
+        }
+    }
+}
+
+/// [`check_structural_invariant`] as a hard assertion, for tests.
+#[cfg(test)]
+pub(crate) fn assert_popup_invariant(sess: &Session, context: &str) {
+    if let Err(e) = check_structural_invariant(sess) {
+        panic!("[{context}] {e}");
     }
 }
 
@@ -2351,6 +2473,11 @@ mod tests {
 /// Every case runs `assert_popup_invariant` after the mutation, and each
 /// structural mutation is exercised BOTH with the popup visible and with it
 /// hidden-but-existing (the pane exists either way, so both states can leak).
+///
+/// Also home to the wider structural invariant the popup rules are part of
+/// (`check_structural_invariant`, which production code debug-asserts on) and to
+/// the `Tab` helpers it constrains -- `panes`, `effective_layout`, `focus_pane`
+/// and `reconcile_pane_order` -- since they share these fixtures.
 #[cfg(test)]
 mod popup_invariant_tests {
     use super::*;
@@ -2744,6 +2871,179 @@ mod popup_invariant_tests {
             sess.popup_size,
             (80, 80),
             "restored sessions get the default size"
+        );
+    }
+    // -- The structural invariant, in production -----------------------------
+    //
+    // `check_structural_invariant` is compiled into release builds (guarded by
+    // `debug_check_invariant`), so these assert on the production function
+    // rather than on a test-only mirror of it.
+
+    #[test]
+    fn invariant_accepts_a_healthy_session_with_a_popup() {
+        for visible in [true, false] {
+            let (st, name, _popup) = state_with_popup(3, visible);
+            assert!(
+                check_structural_invariant(sess_of(&st, &name)).is_ok(),
+                "the popup pane must never trip the invariant (visible={visible})"
+            );
+        }
+    }
+
+    #[test]
+    fn invariant_catches_a_pane_missing_from_the_tree() {
+        let (mut st, name, _popup) = state_with_popup(2, false);
+        st.sessions.get_mut(&name).expect("session").tabs[0]
+            .pane_order
+            .push(4242);
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("disagree"), "{err}");
+    }
+
+    #[test]
+    fn invariant_catches_a_pane_missing_from_pane_order() {
+        let (mut st, name, _popup) = state_with_popup(2, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let orphan = tab.pane_order.pop().expect("a pane to orphan");
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("disagree"), "orphan {orphan}: {err}");
+    }
+
+    #[test]
+    fn invariant_catches_a_duplicate_in_pane_order() {
+        let (mut st, name, _popup) = state_with_popup(2, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let dup = tab.pane_order[0];
+        tab.pane_order.push(dup);
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("duplicates"), "{err}");
+    }
+
+    #[test]
+    fn invariant_catches_the_popup_leaking_into_the_layout() {
+        let (mut st, name, popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let focused = tab.focused_pane;
+        tab.layout.add_to_stack(focused, popup);
+        tab.pane_order.push(popup);
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("leaked"), "{err}");
+    }
+
+    #[test]
+    fn invariant_catches_a_stale_zoomed_pane() {
+        let (mut st, name, _popup) = state_with_popup(2, false);
+        st.sessions.get_mut(&name).expect("session").tabs[0].zoomed_pane = Some(9999);
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("zoomed_pane"), "{err}");
+    }
+
+    #[test]
+    fn invariant_catches_the_popup_as_zoomed_pane() {
+        let (mut st, name, popup) = state_with_popup(2, true);
+        st.sessions.get_mut(&name).expect("session").tabs[0].zoomed_pane = Some(popup);
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("zoomed_pane"), "{err}");
+    }
+
+    #[test]
+    fn reconcile_pane_order_repairs_a_deserialized_tab() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        // The shape an old snapshot restores as: a full tree, no `pane_order`.
+        let tree = layout::all_pane_ids(&tab.layout);
+        tab.pane_order.clear();
+        tab.zoomed_pane = Some(4242);
+        tab.reconcile_pane_order();
+        assert_eq!(tab.pane_order, tree, "pane_order rebuilt from the tree");
+        assert_eq!(tab.zoomed_pane, None, "the stale zoom id is dropped");
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn reconcile_pane_order_drops_orphans_and_keeps_order() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let tree = layout::all_pane_ids(&tab.layout);
+        let kept: Vec<PaneId> = tab.pane_order.iter().rev().copied().collect();
+        tab.pane_order = kept.clone();
+        tab.pane_order.push(4242); // not in the tree
+        tab.reconcile_pane_order();
+        assert_eq!(tab.pane_order, kept, "existing order is preserved");
+        assert!(!tab.pane_order.contains(&4242), "orphans are dropped");
+        assert_eq!(
+            tab.pane_order.len(),
+            tree.len(),
+            "every tree pane is present"
+        );
+    }
+
+    // -- Zoom: `zoomed_pane` is an id, and it is honoured --------------------
+
+    #[test]
+    fn effective_layout_is_the_real_tree_when_not_zoomed() {
+        let (st, name, _popup) = state_with_popup(3, false);
+        let tab = &sess_of(&st, &name).tabs[0];
+        let effective = tab.effective_layout();
+        assert_eq!(
+            layout::all_pane_ids(&effective),
+            layout::all_pane_ids(&tab.layout)
+        );
+    }
+
+    #[test]
+    fn effective_layout_honours_the_recorded_zoom_id_not_the_focus() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let panes = layout::all_pane_ids(&tab.layout);
+        let (zoomed, other) = (panes[0], panes[2]);
+        tab.zoomed_pane = Some(zoomed);
+        // A focus change that did NOT go through `focus_pane` must not silently
+        // redirect the zoom to a different pane.
+        tab.focused_pane = other;
+        assert_eq!(
+            layout::all_pane_ids(&tab.effective_layout()),
+            vec![zoomed],
+            "the zoom shows the pane it names"
+        );
+    }
+
+    #[test]
+    fn focus_pane_carries_an_active_zoom_and_is_inert_without_one() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let panes = layout::all_pane_ids(&tab.layout);
+        let (first, last) = (panes[0], panes[2]);
+
+        tab.focus_pane(last);
+        assert_eq!(tab.focused_pane, last);
+        assert_eq!(tab.zoomed_pane, None, "no zoom is created out of thin air");
+
+        tab.zoomed_pane = Some(last);
+        tab.focus_pane(first);
+        assert_eq!(tab.focused_pane, first);
+        assert_eq!(
+            tab.zoomed_pane,
+            Some(first),
+            "the zoom follows focus, so the id never goes stale"
+        );
+        assert_eq!(layout::all_pane_ids(&tab.effective_layout()), vec![first]);
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn panes_accessor_agrees_with_the_layout_tree() {
+        let (st, name, _popup) = state_with_popup(3, true);
+        let tab = &sess_of(&st, &name).tabs[0];
+        let mut from_tree = layout::all_pane_ids(&tab.layout);
+        let mut from_accessor = tab.panes().to_vec();
+        from_tree.sort_unstable();
+        from_accessor.sort_unstable();
+        assert_eq!(from_accessor, from_tree);
+        assert!(
+            !tab.panes()
+                .contains(&sess_of(&st, &name).popup_pane.expect("popup")),
+            "the popup is in neither side"
         );
     }
 }

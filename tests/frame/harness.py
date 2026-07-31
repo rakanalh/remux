@@ -15,10 +15,16 @@ class Server:
         self.sock = f"{rundir}/run/remux.sock"
         self.proc = None
 
-    def start(self):
+    def start(self, config=None):
+        """Start the throwaway server. `config`, when given, is written to the
+        isolated `$XDG_CONFIG_HOME/remux/config.toml` before launch."""
         shutil.rmtree(self.rundir, ignore_errors=True)
         for s in ("run", "state", "data", "config"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
+        if config is not None:
+            os.makedirs(f"{self.rundir}/config/remux", exist_ok=True)
+            with open(f"{self.rundir}/config/remux/config.toml", "w") as f:
+                f.write(config)
         self.env = {
             **os.environ,
             "XDG_RUNTIME_DIR": f"{self.rundir}/run",

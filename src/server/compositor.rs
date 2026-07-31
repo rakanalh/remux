@@ -344,6 +344,56 @@ pub fn fits_zellij_border(width: u16, height: u16) -> bool {
     width >= 3 && height >= 3
 }
 
+/// Whether `pane_id` renders as a *multi-pane stack* in `layout` -- i.e. it gets
+/// a tab strip (zellij: labels in the top border; tmux: a 1-row tab bar) rather
+/// than a plain pane.
+///
+/// Always ask this about the layout actually being drawn: under zoom that is the
+/// tab's *effective* layout (a synthetic single-pane stack), not the real tree.
+pub fn is_multi_stack(layout: &LayoutNode, pane_id: PaneId) -> bool {
+    layout::find_stack_names(layout, pane_id)
+        .map(|(_, panes, _)| panes.len() > 1)
+        .unwrap_or(false)
+}
+
+/// **The one definition of a pane's content (blit) rect.** `rect` is the pane's
+/// full allotment; the result is what is left once the border style has taken
+/// its share -- the zellij box (one cell all round) or the tmux stack tab bar
+/// (the top row).
+///
+/// Both the compositor and the PTY-sizing path (`active_tab_content_sizes`) go
+/// through here, so a pane's screen is always exactly as large as the area
+/// painted for it. They used to compute it separately and could disagree by one
+/// row, leaving a dead strip at the bottom of a zoomed stacked pane.
+pub fn pane_content_rect(style: &BorderStyle, rect: Rect, multi_stack: bool) -> Rect {
+    match style {
+        BorderStyle::ZellijStyle => {
+            if fits_zellij_border(rect.width, rect.height) {
+                Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 1,
+                    width: rect.width - 2,
+                    height: rect.height - 2,
+                }
+            } else {
+                rect
+            }
+        }
+        BorderStyle::TmuxStyle => {
+            if multi_stack && rect.height >= 2 {
+                Rect {
+                    x: rect.x,
+                    y: rect.y + 1,
+                    width: rect.width,
+                    height: rect.height - 1,
+                }
+            } else {
+                rect
+            }
+        }
+    }
+}
+
 /// Draw one pane's zellij-style box border: rounded corners, `border_fg`-colored
 /// edges, and the top-border label / stacked-tab content from
 /// [`build_top_border_content`].
@@ -460,19 +510,14 @@ fn draw_zellij_panes(
 
         let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
 
-        // If rect is too small for borders, blit content to full rect.
+        // Blit screen content to the inner area (inside the border); when the
+        // rect is too small to carry a border that IS the whole rect.
+        let inner = pane_content_rect(&BorderStyle::ZellijStyle, rect, false);
         if !fits_zellij_border(rect.width, rect.height) {
-            blit_screen(buffer, screen, rect, offset);
+            blit_screen(buffer, screen, inner, offset);
             continue;
         }
 
-        // Blit screen content to inner area (inside border).
-        let inner = Rect {
-            x: rect.x + 1,
-            y: rect.y + 1,
-            width: rect.width - 2,
-            height: rect.height - 2,
-        };
         log::debug!(
             "draw_zellij_panes: pane_id={}, rect={}x{} at ({},{}), inner={}x{} at ({},{})",
             pane_id,
@@ -765,26 +810,18 @@ fn draw_tmux_panes(
         let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
 
         let stack_info = layout::find_stack_names(layout, pane_id);
-        let is_multi = stack_info
-            .as_ref()
-            .map(|(_, panes, _)| panes.len() > 1)
-            .unwrap_or(false);
+        let content_rect = pane_content_rect(
+            &BorderStyle::TmuxStyle,
+            rect,
+            is_multi_stack(layout, pane_id),
+        );
 
-        if is_multi && rect.height >= 2 {
-            // Draw 1-row tab bar at the top, content below.
+        // A reserved top row (and only that) means a tab bar goes there; a
+        // single-pane stack or a rect too small to spare the row blits full.
+        if content_rect.y > rect.y {
             draw_tmux_tab_bar(buffer, rect, &stack_info, mode, hit_regions, theme);
-
-            let content_rect = Rect {
-                x: rect.x,
-                y: rect.y + 1,
-                width: rect.width,
-                height: rect.height - 1,
-            };
-            blit_screen(buffer, screen, content_rect, offset);
-        } else {
-            // Single-pane stack or too small: full content area.
-            blit_screen(buffer, screen, rect, offset);
         }
+        blit_screen(buffer, screen, content_rect, offset);
     }
 
     // Draw dividers between adjacent panes.

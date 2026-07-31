@@ -22,14 +22,15 @@ use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
 use crate::server::compositor::{
-    composite, hit_test, ClickTarget, HitRegions, MouseSelection, StatusInfo,
+    composite, hit_test, is_multi_stack, pane_content_rect, ClickTarget, HitRegions,
+    MouseSelection, StatusInfo,
 };
 use crate::server::layout::{
     self, BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, Pty};
-use crate::server::session::{Folder, ServerState, Session};
+use crate::server::session::{self, Folder, ServerState, Session};
 
 /// In-memory store of dormant (saved-but-not-live) sessions.
 ///
@@ -1708,105 +1709,18 @@ async fn handle_command(
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::PaneSplitVertical => {
-            let (new_pane_id, focused_pane_id) = {
-                let mut st = state.lock().await;
-                let new_pane_id = st.next_pane_id();
-                let sess = match st.sessions.get_mut(&session_name) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
-                    Some(t) => t,
-                    None => return Ok(()),
-                };
-                // Eject to Custom mode on manual split
-                if tab.layout_mode.is_automatic() {
-                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
-                }
-                let focused = tab.focused_pane;
-                tab.layout.split_vertical(focused, new_pane_id);
-                tab.focused_pane = new_pane_id;
-                tab.zoomed_pane = None;
-                tab.pane_order.push(new_pane_id);
-                log::debug!(
-                    "server: PaneSplitVertical new_pane_id={new_pane_id} from focused={focused}"
-                );
-                (new_pane_id, focused)
+        RemuxCommand::PaneSplitVertical | RemuxCommand::PaneSplitHorizontal => {
+            let placement = if matches!(cmd, RemuxCommand::PaneSplitVertical) {
+                PanePlacement::SplitVertical
+            } else {
+                PanePlacement::SplitHorizontal
             };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                panes_lock
-                    .get(&focused_pane_id)
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            spawn_pane(
-                new_pane_id,
-                cols / 2,
-                rows,
-                None,
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            start_pty_forwarding(
+            create_pane_in_tab(
                 &session_name,
-                state,
-                panes,
-                clients,
-                config,
-                prev_frames,
-                dormant,
-            )
-            .await;
-            resize_session_panes(&session_name, state, panes, clients, config).await?;
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
-        }
-        RemuxCommand::PaneSplitHorizontal => {
-            let (new_pane_id, focused_pane_id) = {
-                let mut st = state.lock().await;
-                let new_pane_id = st.next_pane_id();
-                let sess = match st.sessions.get_mut(&session_name) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
-                    Some(t) => t,
-                    None => return Ok(()),
-                };
-                // Eject to Custom mode on manual split
-                if tab.layout_mode.is_automatic() {
-                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
-                }
-                let focused = tab.focused_pane;
-                tab.layout.split_horizontal(focused, new_pane_id);
-                tab.focused_pane = new_pane_id;
-                tab.zoomed_pane = None;
-                tab.pane_order.push(new_pane_id);
-                log::debug!(
-                    "server: PaneSplitHorizontal new_pane_id={new_pane_id} from focused={focused}"
-                );
-                (new_pane_id, focused)
-            };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                panes_lock
-                    .get(&focused_pane_id)
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            spawn_pane(
-                new_pane_id,
+                None,
+                placement,
                 cols,
-                rows / 2,
-                None,
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            start_pty_forwarding(
-                &session_name,
+                rows,
                 state,
                 panes,
                 clients,
@@ -1814,7 +1728,7 @@ async fn handle_command(
                 prev_frames,
                 dormant,
             )
-            .await;
+            .await?;
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -1882,7 +1796,7 @@ async fn handle_command(
                     direction,
                     0,
                 ) {
-                    tab.focused_pane = target;
+                    tab.focus_pane(target);
                 }
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -1943,44 +1857,12 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackAdd => {
-            let (new_pane_id, focused_pane_id) = {
-                let mut st = state.lock().await;
-                let new_pane_id = st.next_pane_id();
-                let sess = match st.sessions.get_mut(&session_name) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
-                    Some(t) => t,
-                    None => return Ok(()),
-                };
-                let focused = tab.focused_pane;
-                tab.layout.add_to_stack(focused, new_pane_id);
-                tab.focused_pane = new_pane_id;
-                tab.pane_order.push(new_pane_id);
-                log::debug!(
-                    "server: PaneStackAdd new_pane_id={new_pane_id} from focused={focused}"
-                );
-                (new_pane_id, focused)
-            };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                panes_lock
-                    .get(&focused_pane_id)
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            spawn_pane(
-                new_pane_id,
+            create_pane_in_tab(
+                &session_name,
+                None,
+                PanePlacement::Stack,
                 cols,
                 rows,
-                None,
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            start_pty_forwarding(
-                &session_name,
                 state,
                 panes,
                 clients,
@@ -1988,7 +1870,7 @@ async fn handle_command(
                 prev_frames,
                 dormant,
             )
-            .await;
+            .await?;
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -2004,7 +1886,7 @@ async fn handle_command(
                     None => return Ok(()),
                 };
                 if let Some(next) = tab.layout.stack_next(tab.focused_pane) {
-                    tab.focused_pane = next;
+                    tab.focus_pane(next);
                 }
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -2021,7 +1903,7 @@ async fn handle_command(
                     None => return Ok(()),
                 };
                 if let Some(prev) = tab.layout.stack_prev(tab.focused_pane) {
-                    tab.focused_pane = prev;
+                    tab.focus_pane(prev);
                 }
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -2140,50 +2022,12 @@ async fn handle_command(
             }
         }
         RemuxCommand::PaneNew => {
-            let (new_pane_id, focused_pane_id) = {
-                let mut st = state.lock().await;
-                let new_pane_id = st.next_pane_id();
-                let sess = match st.sessions.get_mut(&session_name) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
-                    Some(t) => t,
-                    None => return Ok(()),
-                };
-                let prev_focused = tab.focused_pane;
-                tab.pane_order.push(new_pane_id);
-                if tab.layout_mode.is_automatic() {
-                    // Rebuild tree from layout mode
-                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_pane_id);
-                    tab.focused_pane = new_pane_id;
-                } else {
-                    // Custom mode: split at focused pane (default vertical)
-                    let focused = tab.focused_pane;
-                    tab.layout.split_vertical(focused, new_pane_id);
-                    tab.focused_pane = new_pane_id;
-                }
-                tab.zoomed_pane = None;
-                (new_pane_id, prev_focused)
-            };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                panes_lock
-                    .get(&focused_pane_id)
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            spawn_pane(
-                new_pane_id,
+            create_pane_in_tab(
+                &session_name,
+                None,
+                PanePlacement::Auto,
                 cols,
                 rows,
-                None,
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            start_pty_forwarding(
-                &session_name,
                 state,
                 panes,
                 clients,
@@ -2191,7 +2035,7 @@ async fn handle_command(
                 prev_frames,
                 dormant,
             )
-            .await;
+            .await?;
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -2228,7 +2072,7 @@ async fn handle_command(
                     // active-pane markers so the focused pane stays visible.
                     tab.layout = saved;
                     if let Some(active) = tab.layout.active_pane() {
-                        tab.focused_pane = active;
+                        tab.focus_pane(active);
                     }
                 }
             }
@@ -2246,6 +2090,13 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                // Snapshot the manual arrangement *before* the rebuild below
+                // discards it, exactly as `LayoutNext` does -- otherwise
+                // promoting a master out of a hand-built (e.g. stacked) layout
+                // would lose it with no way back through the cycle.
+                if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
+                    tab.saved_custom_layout = Some(tab.layout.clone());
+                }
                 // Switch to Master layout if not already in it.
                 if !matches!(tab.layout_mode, LayoutMode::Master(_)) {
                     tab.layout_mode = LayoutMode::Master(MasterLayout::default());
@@ -2320,7 +2171,7 @@ async fn handle_command(
                 }
                 if let Some(sess) = st.sessions.get_mut(&session) {
                     if let Some(tab) = sess.tabs.get_mut(sess.active_tab) {
-                        tab.focused_pane = pane_id;
+                        tab.focus_pane(pane_id);
                     }
                 }
             }
@@ -2632,58 +2483,17 @@ async fn handle_command(
             refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
         }
         RemuxCommand::PaneNewInTab { session, tab_index } => {
-            // Mirror PaneNew's split/insert logic, but on tab `tab_index` of the
-            // named target session (PaneNew operates on the requester's focused
-            // tab).
+            // Same placement as `PaneNew`, but on tab `tab_index` of the named
+            // target session (`PaneNew` operates on the requester's focused tab),
+            // sized from that session's own render size and refreshing only the
+            // clients attached to it.
             let (tcols, trows) = session_render_size(&session, clients).await;
-            let (new_pane_id, focused_pane_id) = {
-                let mut st = state.lock().await;
-                let new_pane_id = st.next_pane_id();
-                let sess = match st.sessions.get_mut(&session) {
-                    Some(s) => s,
-                    None => {
-                        log::info!("PaneNewInTab: session '{session}' not found");
-                        return Ok(());
-                    }
-                };
-                let tab = match sess.tabs.get_mut(tab_index) {
-                    Some(t) => t,
-                    None => {
-                        log::info!("PaneNewInTab: tab index {tab_index} out of range");
-                        return Ok(());
-                    }
-                };
-                let prev_focused = tab.focused_pane;
-                tab.pane_order.push(new_pane_id);
-                if tab.layout_mode.is_automatic() {
-                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_pane_id);
-                    tab.focused_pane = new_pane_id;
-                } else {
-                    let focused = tab.focused_pane;
-                    tab.layout.split_vertical(focused, new_pane_id);
-                    tab.focused_pane = new_pane_id;
-                }
-                tab.zoomed_pane = None;
-                (new_pane_id, prev_focused)
-            };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                panes_lock
-                    .get(&focused_pane_id)
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            spawn_pane(
-                new_pane_id,
+            if create_pane_in_tab(
+                &session,
+                Some(tab_index),
+                PanePlacement::Auto,
                 tcols,
                 trows,
-                None,
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            start_pty_forwarding(
-                &session,
                 state,
                 panes,
                 clients,
@@ -2691,7 +2501,11 @@ async fn handle_command(
                 prev_frames,
                 dormant,
             )
-            .await;
+            .await?
+            .is_none()
+            {
+                return Ok(());
+            }
             refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
         }
         RemuxCommand::PaneCloseById { session, pane_id } => {
@@ -2749,12 +2563,19 @@ async fn handle_command(
                     let tab = &mut sess.tabs[tab_idx];
                     let new_focus = tab.layout.close_pane(pane_id);
                     tab.pane_order.retain(|&id| id != pane_id);
+                    // Closing the zoomed pane un-zooms the tab: `zoomed_pane` is
+                    // the pane that gets painted full-area, so keeping a dead id
+                    // there would paint a pane that no longer exists.
+                    if tab.zoomed_pane == Some(pane_id) {
+                        tab.zoomed_pane = None;
+                    }
                     match new_focus {
                         Some(nf) => {
-                            tab.focused_pane = nf;
+                            tab.focus_pane(nf);
                             if tab.layout_mode.is_automatic() {
                                 tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
                             }
+                            session::debug_check_invariant(sess, "PaneCloseById");
                         }
                         None => {
                             // Last pane in this background tab -> remove the tab.
@@ -3654,7 +3475,7 @@ async fn handle_mouse_click(
                 None => return Ok(()),
             };
             if tab.focused_pane != pane_id {
-                tab.focused_pane = pane_id;
+                tab.focus_pane(pane_id);
                 drop(st);
                 broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
                     .await;
@@ -3680,7 +3501,7 @@ async fn handle_mouse_click(
             };
             // Walk layout to find the stack containing pane_id and set it active.
             activate_pane_in_stack(&mut tab.layout, pane_id);
-            tab.focused_pane = pane_id;
+            tab.focus_pane(pane_id);
             drop(st);
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -4370,6 +4191,165 @@ fn extract_selection_text(
 // Pane management helpers
 // ---------------------------------------------------------------------------
 
+/// Where a newly created pane goes in its tab's layout tree.
+///
+/// The three manual placements splice the tree by hand and therefore **eject the
+/// tab to `Custom`** (see [`create_pane_in_tab`]); `Auto` is the layout-driven
+/// one that lets an automatic mode rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanePlacement {
+    /// Manual vertical split of the focused pane (left/right).
+    SplitVertical,
+    /// Manual horizontal split of the focused pane (top/bottom).
+    SplitHorizontal,
+    /// Manual splice into the focused pane's stack node.
+    Stack,
+    /// Layout-driven: rebuild from the automatic mode, or -- already in
+    /// `Custom` -- a vertical split of the focused pane.
+    Auto,
+}
+
+impl PanePlacement {
+    /// Whether this placement edits the tree by hand rather than letting the
+    /// layout mode build it.
+    fn is_manual(self) -> bool {
+        !matches!(self, PanePlacement::Auto)
+    }
+
+    /// The PTY's initial size, given the session's render size. A split hands
+    /// the new pane about half the axis it divides; the others start full size.
+    /// Only the seed size -- `resize_session_panes` corrects it from the real
+    /// layout immediately afterwards.
+    fn spawn_size(self, cols: u16, rows: u16) -> (u16, u16) {
+        match self {
+            PanePlacement::SplitVertical => (cols / 2, rows),
+            PanePlacement::SplitHorizontal => (cols, rows / 2),
+            PanePlacement::Stack | PanePlacement::Auto => (cols, rows),
+        }
+    }
+}
+
+/// **The one pane-creation path.** Insert a new pane into `session_name`'s tab
+/// (`tab_index`, or the active tab when `None`) according to `placement`, spawn
+/// its PTY inheriting the previously focused pane's CWD, and start forwarding
+/// its output.
+///
+/// Every `RemuxCommand` that creates a pane funnels through here, which is what
+/// keeps the two rules below true for all of them:
+///
+/// * **A manual placement ejects the tab to `Custom`.** `PaneSplit*` and
+///   `PaneStackAdd` mutate the tree directly, so leaving the tab in an automatic
+///   mode would let the next rebuild (`PaneNew` / `LayoutNext` / `SetMaster`)
+///   silently discard the arrangement the user just made -- and, because
+///   `saved_custom_layout` is only snapshotted when the mode is *already*
+///   `Custom`, discard it unrecoverably. Stacking used to skip this and lose
+///   stacks exactly that way.
+/// * **A new pane always clears the zoom.** The tab is showing a new
+///   arrangement, so the old full-area pane is no longer what the user asked
+///   for.
+///
+/// Returns the new pane's id, or `None` when the session/tab could not be
+/// resolved. The caller owns the refresh tail (`resize_session_panes` +
+/// `broadcast_full_render`, or `refresh_target_session` for another session's
+/// tab), since which clients to repaint is a caller-side decision.
+#[allow(clippy::too_many_arguments)]
+async fn create_pane_in_tab(
+    session_name: &str,
+    tab_index: Option<usize>,
+    placement: PanePlacement,
+    cols: u16,
+    rows: u16,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<Option<PaneId>> {
+    let (new_pane_id, source_pane_id) = {
+        let mut st = state.lock().await;
+        let new_pane_id = st.next_pane_id();
+        let sess = match st.sessions.get_mut(session_name) {
+            Some(s) => s,
+            None => {
+                log::info!("create_pane_in_tab: session '{session_name}' not found");
+                return Ok(None);
+            }
+        };
+        let index = tab_index.unwrap_or(sess.active_tab);
+        let tab = match sess.tabs.get_mut(index) {
+            Some(t) => t,
+            None => {
+                log::info!("create_pane_in_tab: tab index {index} out of range");
+                return Ok(None);
+            }
+        };
+        let focused = tab.focused_pane;
+        // Eject to Custom before touching the tree, so `is_automatic()` below
+        // sees the post-eject mode.
+        if placement.is_manual() && tab.layout_mode.is_automatic() {
+            tab.layout_mode = LayoutMode::Custom(CustomLayout);
+        }
+        // Push first: an automatic rebuild reads `pane_order`.
+        tab.pane_order.push(new_pane_id);
+        match placement {
+            PanePlacement::SplitVertical => {
+                tab.layout.split_vertical(focused, new_pane_id);
+            }
+            PanePlacement::SplitHorizontal => {
+                tab.layout.split_horizontal(focused, new_pane_id);
+            }
+            PanePlacement::Stack => {
+                tab.layout.add_to_stack(focused, new_pane_id);
+            }
+            PanePlacement::Auto => {
+                if tab.layout_mode.is_automatic() {
+                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_pane_id);
+                } else {
+                    tab.layout.split_vertical(focused, new_pane_id);
+                }
+            }
+        }
+        tab.focused_pane = new_pane_id;
+        tab.zoomed_pane = None;
+        log::debug!(
+            "server: create_pane_in_tab session={session_name} tab={index} \
+             placement={placement:?} new_pane_id={new_pane_id} from focused={focused}"
+        );
+        session::debug_check_invariant(sess, "create_pane_in_tab");
+        (new_pane_id, focused)
+    };
+
+    let source_cwd = {
+        let panes_lock = panes.lock().await;
+        panes_lock
+            .get(&source_pane_id)
+            .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+    };
+    let (spawn_cols, spawn_rows) = placement.spawn_size(cols, rows);
+    spawn_pane(
+        new_pane_id,
+        spawn_cols,
+        spawn_rows,
+        None,
+        source_cwd.as_deref().map(std::path::Path::new),
+        panes,
+        config,
+    )
+    .await?;
+    start_pty_forwarding(
+        session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await;
+    Ok(Some(new_pane_id))
+}
+
 async fn spawn_pane(
     pane_id: PaneId,
     cols: u16,
@@ -4534,36 +4514,21 @@ async fn active_tab_content_sizes(
         width: cols,
         height: content_rows,
     };
-    let pane_rects = if tab.zoomed_pane.is_some() {
-        vec![(tab.focused_pane, area)]
-    } else {
-        layout::compute_layout(&tab.layout, area, 0)
-    };
+    // The SAME layout the render path composites with -- under zoom that is a
+    // synthetic single-pane stack, so a zoomed *stacked* pane is sized as the
+    // single pane it is painted as (asking the real tree here is what left it a
+    // row short of its painted area under the tmux border style).
+    let effective_layout = tab.effective_layout();
+    let pane_rects = layout::compute_layout(&effective_layout, area, 0);
 
     let mut content_rects = Vec::new();
     for &(pane_id, rect) in &pane_rects {
-        let (content_cols, content_rows) = match sess.border_style {
-            BorderStyle::ZellijStyle => {
-                if rect.width >= 3 && rect.height >= 3 {
-                    (rect.width - 2, rect.height - 2)
-                } else {
-                    (rect.width, rect.height)
-                }
-            }
-            BorderStyle::TmuxStyle => {
-                let stack_info = layout::find_stack_names(&tab.layout, pane_id);
-                let is_multi = stack_info
-                    .as_ref()
-                    .map(|(_, panes, _)| panes.len() > 1)
-                    .unwrap_or(false);
-                if is_multi && rect.height >= 2 {
-                    (rect.width, rect.height - 1)
-                } else {
-                    (rect.width, rect.height)
-                }
-            }
-        };
-        content_rects.push((pane_id, content_cols, content_rows));
+        let content = pane_content_rect(
+            &sess.border_style,
+            rect,
+            is_multi_stack(&effective_layout, pane_id),
+        );
+        content_rects.push((pane_id, content.width, content.height));
     }
     content_rects
 }
@@ -4806,7 +4771,7 @@ async fn session_render_size(
 fn pane_labels(st: &ServerState, pane_id: PaneId) -> (String, String) {
     for sess in st.sessions.values() {
         for tab in &sess.tabs {
-            if tab.pane_order.contains(&pane_id) {
+            if tab.panes().contains(&pane_id) {
                 return (sess.name.clone(), tab.name.clone());
             }
         }
@@ -5545,11 +5510,8 @@ async fn build_composite(
 
     let ps = panes.lock().await;
     let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
-    let pane_rects = if tab.zoomed_pane.is_some() {
-        vec![(tab.focused_pane, area)]
-    } else {
-        layout::compute_layout(&tab.layout, area, 0)
-    };
+    let effective_layout = tab.effective_layout();
+    let pane_rects = layout::compute_layout(&effective_layout, area, 0);
     for (pane_id, _rect) in &pane_rects {
         if let Some(pane_data) = ps.get(pane_id) {
             pane_screens.insert(*pane_id, &pane_data.screen);
@@ -5596,16 +5558,8 @@ async fn build_composite(
         HashMap::new()
     };
 
-    let zoomed_layout;
-    let effective_layout = if tab.zoomed_pane.is_some() {
-        zoomed_layout = layout::LayoutNode::new_stack(tab.focused_pane);
-        &zoomed_layout
-    } else {
-        &tab.layout
-    };
-
     let (mut cells, mut hit_regions) = composite(
-        effective_layout,
+        &effective_layout,
         &pane_screens,
         area,
         &sess.border_style,
@@ -5940,13 +5894,20 @@ async fn close_pane(
 
             let new_focus = tab.layout.close_pane(pane_id);
             tab.pane_order.retain(|&id| id != pane_id);
+            // Closing the zoomed pane un-zooms the tab (tmux does the same):
+            // `zoomed_pane` names the pane painted full-area, so a dead id there
+            // would paint a pane that no longer exists.
+            if tab.zoomed_pane == Some(pane_id) {
+                tab.zoomed_pane = None;
+            }
 
             if let Some(nf) = new_focus {
-                tab.focused_pane = nf;
+                tab.focus_pane(nf);
                 // If in automatic mode, rebuild the tree
                 if tab.layout_mode.is_automatic() {
                     tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
                 }
+                session::debug_check_invariant(sess, "close_pane");
                 CloseAction::Broadcast
             } else {
                 // Last pane in the tab was closed. Close the tab.
@@ -6310,11 +6271,11 @@ async fn materialize_session(
     let pane_ids: Vec<PaneId> = {
         let st = state.lock().await;
         match st.sessions.get(session_name) {
-            Some(sess) => sess
-                .tabs
-                .iter()
-                .flat_map(|t| layout::all_pane_ids(&t.layout))
-                .collect(),
+            // `Tab::panes()`, not the layout tree: the two must agree (the
+            // structural invariant), and reading the same side as every other
+            // consumer is what keeps a restored pane from silently getting no
+            // PTY when they ever drift.
+            Some(sess) => sess.tabs.iter().flat_map(|t| t.panes().to_vec()).collect(),
             None => {
                 log::warn!("materialize_session: session '{session_name}' not in live state");
                 return Ok(());
@@ -6463,6 +6424,16 @@ async fn restore_state(
 ) -> Result<()> {
     let mut restored_state = persisted.state;
     restored_state.ensure_id_counters();
+    // `pane_order` is `#[serde(default)]`, so a snapshot written before the
+    // field existed restores empty alongside a full tree. Repair on the way in,
+    // so the structural invariant holds from the first frame and every consumer
+    // of the pane set (PTY materialization, View cell titles) sees the same
+    // panes.
+    for sess in restored_state.sessions.values_mut() {
+        for tab in &mut sess.tabs {
+            tab.reconcile_pane_order();
+        }
+    }
 
     let session_names: Vec<String> = restored_state.sessions.keys().cloned().collect();
 
@@ -6508,13 +6479,19 @@ fn take_dormant_session(
         log::warn!("resurrect: live session '{name}' already exists; ignoring");
         return None;
     }
-    let session = match dormant.state.sessions.remove(name) {
+    let mut session = match dormant.state.sessions.remove(name) {
         Some(s) => s,
         None => {
             log::warn!("resurrect: no dormant session '{name}'");
             return None;
         }
     };
+
+    // Same deserialization repair as `restore_state`: a dormant snapshot comes
+    // off disk and may predate `pane_order`.
+    for tab in &mut session.tabs {
+        tab.reconcile_pane_order();
+    }
 
     // Detach from any dormant folder membership and collect its pane CWDs.
     let folder = session.folder.clone();
