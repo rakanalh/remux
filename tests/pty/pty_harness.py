@@ -6,7 +6,7 @@ auto-spawns it) with its own XDG dirs and a short socket path.
 """
 import os, shutil, time, pexpect, pyte
 
-BIN = os.path.abspath("target/debug/remux")
+BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
 
 

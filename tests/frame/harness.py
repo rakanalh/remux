@@ -5,7 +5,7 @@ server with isolated XDG dirs and a short socket path.
 """
 import json, os, shutil, socket, struct, subprocess, time
 
-BIN = os.path.abspath("target/debug/remux")
+BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PROTOCOL_VERSION = 4
 
 

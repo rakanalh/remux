@@ -169,6 +169,13 @@ pub struct Screen {
     parser: vte::Parser,
     /// Saved primary screen state for alternate screen buffer switching.
     saved_grid: Option<Vec<Row>>,
+    /// The primary screen's scrollback, set aside while the alternate screen is
+    /// up. The alternate screen is historyless (tmux and zellij both model it
+    /// that way): its own redraws never become scrollback, and the primary
+    /// screen's history is not addressable from it -- scrolling a pane running
+    /// a full-screen application used to walk into text that has nothing to do
+    /// with what is on the screen. Handed back untouched on the way out.
+    saved_scrollback: Option<VecDeque<Row>>,
     saved_cursor_x: u16,
     saved_cursor_y: u16,
     saved_attrs: CellAttrs,
@@ -236,6 +243,7 @@ impl Screen {
             scroll_bottom: rows.saturating_sub(1),
             parser: vte::Parser::new(),
             saved_grid: None,
+            saved_scrollback: None,
             saved_cursor_x: 0,
             saved_cursor_y: 0,
             saved_attrs: CellAttrs::default(),
@@ -719,8 +727,12 @@ impl Screen {
         }
 
         // If the scroll region starts at row 0, the evicted line goes to
-        // scrollback.
-        if top == 0 {
+        // scrollback -- unless we are on the alternate screen, which has no
+        // history at all. A full-screen application's redraws are ephemeral by
+        // definition: letting them accumulate grew `max_scroll_offset()`
+        // without bound and gave a wheel/`ScrollDelta`/copy-mode gesture
+        // something to chase that the user never typed.
+        if top == 0 && !self.alt_screen_active {
             let evicted = self.grid[0].clone();
             self.scrollback.push_back(evicted);
             while self.scrollback.len() > self.scrollback_limit {
@@ -1197,6 +1209,12 @@ impl vte::Perform for Screen {
                         // command (which emits \e[3J via the E3 capability)
                         // truly drop remux's scrollback. total_lines() is
                         // computed on demand, so no cached count to invalidate.
+                        //
+                        // On the alternate screen this clears nothing (that
+                        // screen keeps no saved lines) and deliberately leaves
+                        // the primary screen's history -- parked in
+                        // `saved_scrollback` -- alone: a full-screen app's
+                        // redraw must not throw away the user's shell history.
                         self.scrollback.clear();
                     }
                     _ => {}
@@ -1369,6 +1387,8 @@ impl vte::Perform for Screen {
                                 // Save cursor and switch to alternate screen
                                 if !self.alt_screen_active {
                                     self.saved_grid = Some(self.grid.clone());
+                                    self.saved_scrollback =
+                                        Some(std::mem::take(&mut self.scrollback));
                                     self.saved_cursor_x = self.cursor_x;
                                     self.saved_cursor_y = self.cursor_y;
                                     self.saved_attrs = self.current_attrs.clone();
@@ -1386,6 +1406,7 @@ impl vte::Perform for Screen {
                             1047 if !self.alt_screen_active => {
                                 // Switch to alternate screen (no cursor save)
                                 self.saved_grid = Some(self.grid.clone());
+                                self.saved_scrollback = Some(std::mem::take(&mut self.scrollback));
                                 self.saved_scroll_top = self.scroll_top;
                                 self.saved_scroll_bottom = self.scroll_bottom;
                                 self.grid = Self::make_grid(self.cols, self.rows);
@@ -1423,6 +1444,9 @@ impl vte::Perform for Screen {
                                     if let Some(grid) = self.saved_grid.take() {
                                         self.grid = grid;
                                     }
+                                    if let Some(scrollback) = self.saved_scrollback.take() {
+                                        self.scrollback = scrollback;
+                                    }
                                     self.cursor_x = self.saved_cursor_x;
                                     self.cursor_y = self.saved_cursor_y;
                                     self.current_attrs = self.saved_attrs.clone();
@@ -1445,6 +1469,9 @@ impl vte::Perform for Screen {
                                 // Switch back to primary screen
                                 if let Some(grid) = self.saved_grid.take() {
                                     self.grid = grid;
+                                }
+                                if let Some(scrollback) = self.saved_scrollback.take() {
+                                    self.scrollback = scrollback;
                                 }
                                 self.scroll_top = self.saved_scroll_top;
                                 self.scroll_bottom = self.saved_scroll_bottom;
@@ -2645,6 +2672,134 @@ mod tests {
         // Used to panic here.
         s.process_output(b"\x1b[2J");
         s.process_output(b"\x1b[1M");
+    }
+
+    /// Scrollback rows as plain text, for byte-identical round-trip checks.
+    fn scrollback_texts(s: &Screen) -> Vec<String> {
+        s.scrollback
+            .iter()
+            .map(|row| row.cells.iter().map(|c| c.c).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_alt_screen_output_does_not_grow_scrollback() {
+        // A full-screen application's own redraws are ephemeral: they must not
+        // become history the user can scroll into.
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..10 {
+            s.process_output(format!("primary {i}\r\n").as_bytes());
+        }
+        let before = s.scrollback.len();
+        assert!(
+            before > 0,
+            "need primary history for the test to mean anything"
+        );
+
+        s.process_output(b"\x1b[?1049h");
+        for i in 0..50 {
+            s.process_output(format!("alt {i}\r\n").as_bytes());
+        }
+
+        assert!(
+            s.scrollback.is_empty(),
+            "the alternate screen has no scrollback of its own"
+        );
+        assert_eq!(
+            s.max_scroll_offset(),
+            0,
+            "nothing to scroll while a full-screen app is up"
+        );
+        assert_eq!(
+            s.total_lines(),
+            s.grid.len(),
+            "only the alt grid is addressable"
+        );
+
+        s.process_output(b"\x1b[?1049l");
+        assert_eq!(
+            s.scrollback.len(),
+            before,
+            "leaving the alt screen must not have added history"
+        );
+    }
+
+    #[test]
+    fn test_alt_screen_round_trip_preserves_primary_scrollback() {
+        // The primary screen's history is the user's; an app switching to the
+        // alternate screen and back must hand it back byte-identical.
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..30 {
+            s.process_output(format!("history {i}\r\n").as_bytes());
+        }
+        let texts = scrollback_texts(&s);
+        let evicted = s.lines_evicted;
+        let max_off = s.max_scroll_offset();
+        assert!(max_off > 0);
+
+        // No resize here: a width change while on the alt screen legitimately
+        // changes what is addressable afterwards.
+        s.process_output(b"\x1b[?1049h");
+        for i in 0..40 {
+            s.process_output(format!("alt {i}\r\n").as_bytes());
+        }
+        assert_eq!(s.max_scroll_offset(), 0);
+        s.process_output(b"\x1b[?1049l");
+
+        assert_eq!(
+            scrollback_texts(&s),
+            texts,
+            "primary history must survive intact"
+        );
+        assert_eq!(s.lines_evicted, evicted, "nothing may have been evicted");
+        assert_eq!(
+            s.max_scroll_offset(),
+            max_off,
+            "the pane scrolls exactly as far as it did before"
+        );
+    }
+
+    #[test]
+    fn test_alt_screen_1047_round_trip_preserves_primary_scrollback() {
+        // Mode 1047 takes the same path as 1049 without the cursor save.
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..20 {
+            s.process_output(format!("history {i}\r\n").as_bytes());
+        }
+        let texts = scrollback_texts(&s);
+
+        s.process_output(b"\x1b[?1047h");
+        for i in 0..30 {
+            s.process_output(format!("alt {i}\r\n").as_bytes());
+        }
+        assert!(s.scrollback.is_empty());
+        s.process_output(b"\x1b[?1047l");
+
+        assert_eq!(scrollback_texts(&s), texts);
+    }
+
+    #[test]
+    fn test_scrolled_back_pane_entering_alt_screen_stays_addressable() {
+        // Entering the alt screen while a client sits scrolled back leaves that
+        // client's stored offset pointing past the end of what is addressable.
+        // Every render path clamps against `max_scroll_offset()`, so the clamp
+        // must land on the live view and `line_at` must stay in range.
+        let mut s = Screen::new(20, 4, 100);
+        for i in 0..30 {
+            s.process_output(format!("history {i}\r\n").as_bytes());
+        }
+        let stale_offset = s.max_scroll_offset();
+        s.process_output(b"\x1b[?1049h");
+
+        let clamped = stale_offset.min(s.max_scroll_offset());
+        assert_eq!(clamped, 0, "a stale offset clamps to the live alt screen");
+        for row in 0..s.rows {
+            let abs = s.abs_of_row(clamped, row);
+            assert!(
+                s.line_at(s.array_index_of_abs(abs)).is_some(),
+                "row {row} must resolve to a real line"
+            );
+        }
     }
 
     #[test]
