@@ -169,12 +169,14 @@ pub enum ClientMessage {
     /// session/tab this client has in the foreground. Used by View cells that
     /// alias a real pane. `cols`/`rows` are the subscribing cell's desired size.
     ///
-    /// `size_demand` distinguishes the two viewing models:
-    /// - `true` (Model A, or a Model-B *focused* cell): the cell demands the
-    ///   pane reflow to `(cols, rows)` — it is folded into the pane's
-    ///   min-across-viewers effective size.
-    /// - `false` (a Model-B *unfocused*, watch-only cell): the cell renders the
-    ///   pane clipped and imposes NO size constraint, so merely watching never
+    /// `size_demand` distinguishes a cell that SHOWS the pane from one that only
+    /// watches it:
+    /// - `true` (a cell the view's layout draws): the cell demands the pane
+    ///   reflow to `(cols, rows)` — it is folded into the pane's
+    ///   min-across-viewers effective size, so the pane fits the cell.
+    /// - `false` (a watch-only subscription: a cell hidden by the layout, a cell
+    ///   whose pane is session-visible, or a pure observer): the content is
+    ///   streamed but NO size constraint is imposed, so merely watching never
     ///   reflows the source pane.
     ///
     /// `#[serde(default)]` on `size_demand` means an older peer that omits it

@@ -86,6 +86,17 @@ class Tui:
         time.sleep(0.15)
         self.send(keys, t)
 
+    def resize(self, cols, rows, t=1.2):
+        """Resize the real pseudo-terminal (the client gets a genuine SIGWINCH).
+
+        The pyte screen is resized with it, so `rows_text()`/`screen.buffer`
+        keep matching what the client is now painting.
+        """
+        self.cols, self.rows = cols, rows
+        self.child.setwinsize(rows, cols)
+        self.screen.resize(rows, cols)
+        self.pump(t)
+
     def alive(self):
         return self.child.isalive()
 

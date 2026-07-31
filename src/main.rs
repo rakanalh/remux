@@ -808,11 +808,27 @@ fn paint_view(
 /// as the "cells changed" / "focus moved" re-subscribe. Cells whose interior
 /// collapses to zero in either axis are skipped.
 ///
-/// Model B (focus-to-zoom): only the FOCUSED cell carries a real size demand
-/// (`size_demand = true`), so its source pane reflows to fit the cell. Every
-/// other cell subscribes with `size_demand = false` -- it watches read-only,
-/// clipped, and imposes no size constraint, so merely watching never reflows
-/// the shared pane.
+/// A cell sizes its pane to itself: every cell the current layout actually
+/// SHOWS carries a real size demand (`size_demand = true`), so its source pane
+/// reflows to the cell's interior whether or not it is focused. A pane added to
+/// a view therefore fits the space it is given -- the earlier focus-only rule
+/// left every other cell's pane at its home session's allotment, which a
+/// reflowing shell hid but a full-screen app (neovim in a quarter-height pane)
+/// exposed as a tiny render inside a big cell.
+///
+/// Two cells impose NO demand:
+/// - a cell HIDDEN by the current layout (Monocle's unfocused cells, and the
+///   non-zoomed cells while the view is zoomed): it is still subscribed -- at
+///   the full cell area, so a cell that has just been focused releases its old
+///   size clamp instead of staying pinned to it forever -- but a cell nobody
+///   sees must not clamp the pane to a size nothing is drawing;
+/// - a SESSION-VISIBLE cell: its pane is driven full-size by its real session
+///   and the cell paints the "Active in session" placeholder, so it must not
+///   shrink it (the server force-ignores such demands too, see
+///   `recompute_pane_size`).
+///
+/// Several viewers of one pane still fold via min-across-subscribers on the
+/// server, so the pane ends up small enough for every cell showing it.
 ///
 /// Views are SHARED, so a cell can name a remote *this* terminal has never
 /// connected (another terminal composed it) -- there is then no transport to
@@ -835,7 +851,6 @@ async fn subscribe_view_cells(
     };
     let inner = crate::client::view::cells_area(area);
     let rects = crate::client::view::cell_rects(view, area);
-    let focused = view.focused;
     for (i, cell) in view.cells.iter_mut().enumerate() {
         // The source pane is gone (the server reported `PaneExited`). Nothing can
         // ever stream again, so skip it: re-subscribing would only make the
@@ -847,10 +862,13 @@ async fn subscribe_view_cells(
         // Visible cells subscribe at their rect's interior. Cells hidden by the
         // current layout (e.g. Monocle's unfocused cells) still get a
         // subscription -- at the full cell area with NO size demand -- so a
-        // cell that was just focused releases its Model-B size clamp instead of
+        // cell that was just focused releases its old size clamp instead of
         // staying pinned to the old cell size forever.
         {
-            let rect = rects.get(i).copied().flatten().unwrap_or(inner);
+            // `None` here IS "hidden by the current layout": `cell_rects` places
+            // only the cells the layout draws.
+            let placed = rects.get(i).copied().flatten();
+            let rect = placed.unwrap_or(inner);
             // The demanded size is the cell's CONTENT region, which depends on
             // the border style (zellij loses a row/column to each border edge,
             // tmux is edge-to-edge). Sharing `cell_content_size` with the
@@ -882,13 +900,16 @@ async fn subscribe_view_cells(
                             pane_id: cell.pane_id,
                             cols,
                             rows,
-                            // Only the focused cell demands a size (Model B), and
-                            // never when its pane is session-visible: that pane is
-                            // driven full-size by its real session and the cell
-                            // shows the "Active in session" placeholder, so it must
-                            // impose no constraint (matches the server, which
-                            // ignores the demand for a session-visible pane anyway).
-                            size_demand: i == focused && !cell.is_session_visible(),
+                            // Every cell the layout SHOWS sizes its pane to
+                            // itself, focused or not -- that is what makes a pane
+                            // added to a view fit the space it is given. A hidden
+                            // cell (`placed.is_none()`) demands nothing: nothing
+                            // draws it, so it must not clamp the pane. Nor does a
+                            // session-visible cell: that pane is driven full-size
+                            // by its real session and the cell shows the "Active in
+                            // session" placeholder (matches the server, which
+                            // ignores the demand for such a pane anyway).
+                            size_demand: placed.is_some() && !cell.is_session_visible(),
                         },
                     )
                     .await
@@ -3610,7 +3631,12 @@ async fn run_client_loop(
                         mgr.send_foreground(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
                         // A live view owns the screen; recomposite it at the new
                         // size so it doesn't stay blank until the next snapshot.
+                        // Every cell's rect changed with the terminal, so re-demand
+                        // first: the cells' panes must follow the new cell sizes
+                        // (the other geometry changes -- layout/resize/move/zoom --
+                        // arrive as `ViewList` and re-subscribe there).
                         if let Some(av) = active_view {
+                            subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
                             paint_view(
                                 &mut renderer,
                                 &views[av],

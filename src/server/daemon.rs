@@ -203,9 +203,10 @@ struct ClientConnection {
     autoscroll_repeat: Option<(u16, u16, u16, u16)>,
     /// Panes this client has subscribed to via `SubscribePane`, mapped to the
     /// subscribing cell's size demand: `Some((cols, rows))` for a cell that
-    /// demands the pane reflow to it (Model A, or a Model-B focused cell), or
-    /// `None` for a watch-only cell that imposes no size constraint (Model-B
-    /// unfocused). Folded into the pane's min-across-viewers effective size by
+    /// SHOWS the pane and so demands it reflow to fit, or `None` for a
+    /// watch-only subscription that imposes no size constraint (a cell hidden by
+    /// the view's layout, a session-visible pane, or a plain observer).
+    /// Folded into the pane's min-across-viewers effective size by
     /// [`recompute_pane_size`]. Each subscribed pane receives a `PaneContent`
     /// snapshot on subscribe and on every change, regardless of which
     /// session/tab this client has in the foreground.
@@ -981,7 +982,7 @@ async fn handle_client_message(
                 }
                 return Ok(());
             }
-            // Record the subscriber's size demand (Model A/B min-across-viewers
+            // Record the subscriber's size demand (folded by min-across-viewers
             // sizing) and send an immediate snapshot.
             {
                 let mut cls = clients.lock().await;
@@ -4929,8 +4930,9 @@ async fn active_tab_content_sizes(
 }
 
 /// The minimum `(cols, rows)` demanded across every client's *sized*
-/// (`Some`) subscription to `pane_id`. `None` when no client demands a size
-/// (either unsubscribed, or only watch-only cells). Takes the already-held
+/// (`Some`) subscription to `pane_id`, so the pane fits every cell that shows
+/// it. `None` when no client demands a size (either unsubscribed, or only
+/// watch-only subscriptions). Takes the already-held
 /// clients guard to keep lock ordering explicit at the call sites.
 fn subscriber_min_demand_locked(
     cls: &HashMap<u64, ClientConnection>,
@@ -5029,8 +5031,9 @@ async fn pane_home_allotment(
 /// allotment and every sized View-cell demand, then resize the PTY/screen and
 /// re-stream a fresh `PaneContent` to subscribers if it changed. When nothing
 /// constrains the pane (no home, no sized subscriber) it is left untouched --
-/// so merely watching a pane (Model B unfocused, `None` demand) never reflows
-/// it. Called on subscribe/unsubscribe (the home path uses `resize_session_panes`).
+/// so merely watching a pane (a hidden cell or a plain observer, `None` demand)
+/// never reflows it. Called on subscribe/unsubscribe (the home path uses
+/// `resize_session_panes`).
 async fn recompute_pane_size(
     pane_id: PaneId,
     state: &Arc<Mutex<ServerState>>,

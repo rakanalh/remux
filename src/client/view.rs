@@ -20,11 +20,12 @@
 //! [`cells_area`]), so cell rects never overwrite it.
 //!
 //! Sizing note: cells render a pane's snapshot clipped and letterboxed into the
-//! cell rect, bottom-anchored so the latest output is visible. Under Model B
-//! (focus-to-zoom) only the FOCUSED cell demands a size from its source pane
-//! (the pane reflows to fit it, via the server's min-across-viewers sizing);
-//! unfocused cells watch read-only and impose no size demand, so merely watching
-//! never reflows the shared pane.
+//! cell rect, bottom-anchored so the latest output is visible. Every cell the
+//! layout SHOWS demands its interior from its source pane, which reflows to fit
+//! (via the server's min-across-viewers sizing), so a pane added to a view fits
+//! the cell it is given. Cells the layout hides (Monocle's unfocused ones, the
+//! non-zoomed ones under zoom) watch read-only and impose no size demand, so a
+//! cell nobody sees never reflows the shared pane.
 
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
