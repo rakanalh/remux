@@ -837,6 +837,13 @@ async fn subscribe_view_cells(
     let rects = crate::client::view::cell_rects(view, area);
     let focused = view.focused;
     for (i, cell) in view.cells.iter_mut().enumerate() {
+        // The source pane is gone (the server reported `PaneExited`). Nothing can
+        // ever stream again, so skip it: re-subscribing would only make the
+        // server repeat the event, and the cell keeps its honest `pane closed`
+        // label instead of flickering back to `waiting…`.
+        if cell.exited {
+            continue;
+        }
         // Visible cells subscribe at their rect's interior. Cells hidden by the
         // current layout (e.g. Monocle's unfocused cells) still get a
         // subscription -- at the full cell area with NO size demand -- so a
@@ -1276,7 +1283,7 @@ async fn handle_view_command(
             let target = views[av]
                 .cells
                 .get(focused)
-                .filter(|c| !c.disconnected && !c.is_session_visible())
+                .filter(|c| !c.exited && !c.disconnected && !c.is_session_visible())
                 .map(|c| (c.conn.clone(), c.pane_id));
             if let Some((conn, pane_id)) = target {
                 if let Err(e) = mgr
@@ -1570,7 +1577,7 @@ async fn run_client_loop(
                                     let target = views[av]
                                         .cells
                                         .get(focused)
-                                        .filter(|c| !c.disconnected && !c.is_session_visible())
+                                        .filter(|c| !c.exited && !c.disconnected && !c.is_session_visible())
                                         .map(|c| (c.conn.clone(), c.pane_id));
                                     if let Some((conn, pane_id)) = target {
                                         if let Err(e) = mgr
@@ -4183,6 +4190,62 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: src={:?} {:?}", src, event);
+                        // A pane the SERVER reports dead is deliberately NOT
+                        // foreground-scoped: a view cell can alias a pane on any
+                        // connected server, and the whole point of the event is
+                        // that the client cannot otherwise tell a dead pane from a
+                        // quiet one -- a healthy connection to a server whose pane
+                        // died never trips `disconnected`, so the cell sat on
+                        // `waiting…` (or frozen content) forever and swallowed
+                        // every keystroke.
+                        if let crate::protocol::SessionEvent::PaneExited { pane_id, .. } = &event {
+                            let mut active_touched = false;
+                            for (vi, view) in views.iter_mut().enumerate() {
+                                for cell in view.cells.iter_mut() {
+                                    if cell.conn == src && cell.pane_id == *pane_id && !cell.exited {
+                                        cell.exited = true;
+                                        // Drop the last snapshot with it: keeping it
+                                        // would keep painting stale content that
+                                        // looks live.
+                                        cell.snapshot = None;
+                                        if active_view == Some(vi) {
+                                            active_touched = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if active_touched {
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                }
+                            }
+                        }
+                        // A session created elsewhere (another terminal on this
+                        // server, or any connected remote) must appear in an OPEN
+                        // session manager: every tree refresh is event-driven with
+                        // no timer, so without this the tree stayed stale until
+                        // some unrelated action happened to refresh it. Symmetric
+                        // with the `SessionDeleted` refresh below, minus the exit
+                        // bookkeeping -- a creation can never be the last-session
+                        // shutdown, so it must never arm `pending_manager_exit_check`.
+                        if matches!(event, crate::protocol::SessionEvent::SessionCreated(_))
+                            && input.session_manager.is_some()
+                        {
+                            for id in mgr.connected_ids() {
+                                mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                            }
+                        }
                         // Events are foreground-scoped: a background remote's
                         // SessionDeleted must not drive the local loop.
                         if mgr.is_foreground(&src)
@@ -4291,7 +4354,11 @@ async fn run_client_loop(
                         let mut active_visibility_flipped = false;
                         for (vi, view) in views.iter_mut().enumerate() {
                             for cell in view.cells.iter_mut() {
-                                if cell.conn == src && cell.pane_id == pane_id {
+                                // An exited cell is terminal: an in-flight snapshot
+                                // that raced the `PaneExited` event must not
+                                // resurrect it into painting content for a pane
+                                // that no longer exists.
+                                if cell.conn == src && cell.pane_id == pane_id && !cell.exited {
                                     let was_visible = cell.is_session_visible();
                                     // Clone per match: the same pane can be
                                     // aliased by more than one cell/view. A fresh

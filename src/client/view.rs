@@ -67,9 +67,13 @@ pub struct PaneSnapshot {
 /// plus the most recent snapshot received for it (`None` until the first
 /// `PaneContent` arrives).
 ///
-/// A cell has five observable states, distinguished without a separate enum:
-/// - **waiting**: `snapshot == None && !disconnected && unavailable.is_none()` —
+/// A cell has six observable states, distinguished without a separate enum:
+/// - **waiting**: `snapshot == None && !exited && !disconnected && unavailable.is_none()` —
 ///   subscribed but no `PaneContent` has arrived yet (shows `waiting for <title>…`).
+/// - **exited**: `exited == true` — the SERVER reported the source pane gone
+///   ([`SessionEvent::PaneExited`](crate::protocol::SessionEvent::PaneExited));
+///   shows `pane closed`, takes no more input, and is never re-subscribed.
+///   Outranks every other state.
 /// - **unavailable**: `unavailable == Some(reason)` — this terminal cannot
 ///   currently reach the cell's source server (a remote it has not connected, or
 ///   one whose dial failed), so no snapshot can ever arrive; shows `reason`
@@ -98,6 +102,15 @@ pub struct ViewCell {
     pub conn: ConnId,
     pub pane_id: PaneId,
     pub snapshot: Option<PaneSnapshot>,
+    /// Set when the source PANE is gone, as reported by the server
+    /// ([`SessionEvent::PaneExited`](crate::protocol::SessionEvent::PaneExited)):
+    /// its shell exited, or it was closed from somewhere else. Terminal — a
+    /// `PaneId` is never reused, so the cell can only ever show `pane closed`
+    /// from here on, and it is skipped by the subscribe pass. Distinct from
+    /// `disconnected`, which is about the TRANSPORT: a perfectly healthy
+    /// connection to a server whose pane died never trips that flag, which is
+    /// why such a cell used to sit on `waiting…` forever.
+    pub exited: bool,
     /// Set when the cell's source connection is gone (a send failed or the
     /// connection closed). A disconnected cell renders a `disconnected` label
     /// and silently drops keystrokes instead of crashing the client.
@@ -203,7 +216,7 @@ impl ClientView {
     /// Membership / `layout` / `custom_tree` / `focused` / `zoomed` are taken
     /// verbatim from the server (the shared arrangement). Per-terminal render
     /// state — each cell's last [`PaneSnapshot`], learned title, and
-    /// disconnected / unavailable flags — is carried over from `prev` (this view's previous cache entry, if
+    /// exited / disconnected / unavailable flags — is carried over from `prev` (this view's previous cache entry, if
     /// any) so a resync never drops already-streamed content nor flashes
     /// `waiting…`. Render state is matched first by the stable [`ViewCell::id`],
     /// then by `(conn, pane_id)` so a freshly-added cell aliasing an
@@ -226,6 +239,7 @@ impl ClientView {
                     conn,
                     pane_id: ci.pane_id,
                     snapshot: carried.and_then(|c| c.snapshot.clone()),
+                    exited: carried.map(|c| c.exited).unwrap_or(false),
                     disconnected: carried.map(|c| c.disconnected).unwrap_or(false),
                     unavailable: carried.and_then(|c| c.unavailable.clone()),
                     title: carried.and_then(|c| c.title.clone()),
@@ -680,7 +694,7 @@ pub fn cell_content_geometry(
     style: &BorderStyle,
 ) -> Option<CellContentGeometry> {
     let cell = view.cells.get(idx)?;
-    if cell.disconnected || cell.unavailable.is_some() {
+    if cell.exited || cell.disconnected || cell.unavailable.is_some() {
         return None;
     }
     let snap = cell.snapshot.as_ref()?;
@@ -777,7 +791,7 @@ pub fn focused_cursor(view: &ClientView, area: Rect, style: &BorderStyle) -> Opt
         return None;
     }
     let cell = view.cells.get(view.focused)?;
-    if cell.disconnected {
+    if cell.exited || cell.disconnected {
         return None;
     }
     let snap = cell.snapshot.as_ref()?;
@@ -944,6 +958,15 @@ fn draw_cell(
     }
 
     if iw == 0 || ih == 0 {
+        return;
+    }
+
+    // The source PANE is gone: the server said so, which outranks every other
+    // state -- `disconnected`/`unavailable` are guesses about reachability, this
+    // is a reported fact. Any snapshot still held is stale by definition, so it
+    // is never painted (the client also drops it on the event).
+    if cell.exited {
+        draw_centered(buf, ix, iy, iw, ih, "pane closed");
         return;
     }
 
@@ -1376,6 +1399,7 @@ mod tests {
         // ids), so tree keys stay unique.
         ViewCell {
             id: pane_id,
+            exited: false,
             conn: ConnId::Local,
             pane_id,
             snapshot,
@@ -2344,6 +2368,74 @@ mod tests {
             rebuilt.cells[0].unavailable.as_deref(),
             Some("not connected: mini")
         );
+    }
+
+    /// A cell whose source pane the server reported gone says `pane closed`, and
+    /// the last snapshot it happens to hold is NOT painted -- presenting frozen
+    /// content as live is the lie this state exists to prevent.
+    #[test]
+    fn composite_exited_cell_shows_pane_closed_not_stale_content() {
+        let mut cell = cell_with(6, Some(snap_filled(40, 20, 'A')));
+        cell.exited = true;
+        let view = view_of(vec![cell], gridv(), 0);
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
+        let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
+        assert!(joined.contains("pane closed"));
+        assert!(!joined.contains("waiting"));
+        assert!(!joined.contains('A'));
+    }
+
+    /// `exited` is a fact the server reported; `disconnected`/`unavailable` are
+    /// inferences about reachability. The fact wins.
+    #[test]
+    fn composite_exited_outranks_disconnected_and_unavailable() {
+        let mut cell = cell_with(7, None);
+        cell.exited = true;
+        cell.disconnected = true;
+        cell.unavailable = Some("not connected: mini".to_string());
+        let view = view_of(vec![cell], gridv(), 0);
+        let buf = composite(&view, area(80, 24), &tt(), "NORMAL", &zj());
+        let joined: String = buf.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
+        assert!(joined.contains("pane closed"));
+        assert!(!joined.contains("disconnected"));
+        assert!(!joined.contains("not connected"));
+    }
+
+    /// An exited cell has no source grid, so it offers no content geometry and
+    /// shows no cursor even while focused -- a cursor there would invite typing
+    /// into a pane that no longer exists.
+    #[test]
+    fn exited_cell_has_no_content_geometry_or_cursor() {
+        let mut cell = cell_with(8, Some(snap_filled(40, 20, 'A')));
+        cell.exited = true;
+        let view = view_of(vec![cell], gridv(), 0);
+        assert!(cell_content_geometry(&view, area(80, 24), 0, &zj()).is_none());
+        assert!(focused_cursor(&view, area(80, 24), &zj()).is_none());
+    }
+
+    /// A `ViewList` resync must carry `exited` forward. Without it the cell would
+    /// reset on every broadcast, be re-subscribed, and flicker between
+    /// `waiting…` and `pane closed` as the server re-reported the death.
+    #[test]
+    fn from_info_carries_exited_forward() {
+        let mut prev_cell = cell_with(9, None);
+        prev_cell.exited = true;
+        let prev = view_of(vec![prev_cell], gridv(), 0);
+        let info = ViewInfo {
+            id: prev.id,
+            name: prev.name.clone(),
+            cells: vec![crate::protocol::CellInfo {
+                id: 9,
+                conn: ConnDescriptor::Local,
+                pane_id: 9,
+            }],
+            layout: gridv(),
+            custom_tree: None,
+            focused: 0,
+            zoomed: false,
+        };
+        let rebuilt = ClientView::from_info(&info, Some(&prev));
+        assert!(rebuilt.cells[0].exited);
     }
 
     #[test]

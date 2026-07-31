@@ -948,6 +948,22 @@ async fn handle_client_message(
             rows,
             size_demand,
         } => {
+            // Subscribing to a pane that is already gone gets an explicit answer,
+            // never silence: the snapshot builder returns `None` for a missing
+            // pane and the send below is simply skipped, so recording the
+            // subscription would leave the cell on `waiting…` forever with no way
+            // to learn the truth. Report the death instead and record nothing.
+            if !panes.lock().await.contains_key(&pane_id) {
+                log::info!("server: SubscribePane pane_id={pane_id} is gone; reporting PaneExited");
+                let cls = clients.lock().await;
+                if let Some(conn) = cls.get(&client_id) {
+                    let _ = conn.tx.send(ServerMessage::Event(SessionEvent::PaneExited {
+                        pane_id,
+                        exit_code: EXIT_CODE_UNKNOWN,
+                    }));
+                }
+                return Ok(());
+            }
             // Record the subscriber's size demand (Model A/B min-across-viewers
             // sizing) and send an immediate snapshot.
             {
@@ -1003,10 +1019,29 @@ async fn handle_client_message(
             // UX and is not wanted for targeted cell input. The pane's own PTY
             // output will trigger the existing forwarding task, which fans out
             // PaneContent to subscribers, so no explicit broadcast is needed.
-            let ps = panes.lock().await;
-            if let Some(pane_data) = ps.get(&pane_id) {
-                if let Err(e) = pane_data.pty.write_input(&data) {
-                    log::warn!("server: InputToPane pane_id={pane_id} write failed: {e}");
+            let alive = {
+                let ps = panes.lock().await;
+                match ps.get(&pane_id) {
+                    Some(pane_data) => {
+                        if let Err(e) = pane_data.pty.write_input(&data) {
+                            log::warn!("server: InputToPane pane_id={pane_id} write failed: {e}");
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if !alive {
+                // The pane is gone. Answering keeps the keystroke from vanishing
+                // without a trace: the sender learns its cell is dead and stops
+                // typing into the void.
+                log::warn!("server: InputToPane pane_id={pane_id} dropped: pane is gone");
+                let cls = clients.lock().await;
+                if let Some(conn) = cls.get(&client_id) {
+                    let _ = conn.tx.send(ServerMessage::Event(SessionEvent::PaneExited {
+                        pane_id,
+                        exit_code: EXIT_CODE_UNKNOWN,
+                    }));
                 }
             }
             Ok(())
@@ -1626,12 +1661,7 @@ async fn handle_command(
                 let mut st = state.lock().await;
                 st.close_tab(&session_name, tab_idx)?
             };
-            {
-                let mut ps = panes.lock().await;
-                for pid in pane_ids {
-                    ps.remove(&pid);
-                }
-            }
+            reap_panes(&pane_ids, panes, clients).await;
             if deleted {
                 // Last tab closed -> the session was removed. Re-point attached
                 // clients onto another session (or notify them if none remain);
@@ -2210,12 +2240,7 @@ async fn handle_command(
             };
             match close_result {
                 Ok((pane_ids, session_deleted)) => {
-                    {
-                        let mut ps = panes.lock().await;
-                        for pid in pane_ids {
-                            ps.remove(&pid);
-                        }
-                    }
+                    reap_panes(&pane_ids, panes, clients).await;
                     if session_deleted {
                         // Last tab of the target session closed -> it was
                         // removed. Re-point its attached clients onto another
@@ -2282,12 +2307,11 @@ async fn handle_command(
             };
             // Clean up panes and notify clients for each deleted session.
             {
-                let mut ps = panes.lock().await;
-                for (_, pane_ids) in &deleted_sessions {
-                    for pid in pane_ids {
-                        ps.remove(pid);
-                    }
-                }
+                let doomed: Vec<PaneId> = deleted_sessions
+                    .iter()
+                    .flat_map(|(_, pane_ids)| pane_ids.iter().copied())
+                    .collect();
+                reap_panes(&doomed, panes, clients).await;
             }
             {
                 let mut cls = clients.lock().await;
@@ -2589,10 +2613,7 @@ async fn handle_command(
                         }
                     }
                 }
-                {
-                    let mut ps = panes.lock().await;
-                    ps.remove(&pane_id);
-                }
+                reap_panes(&[pane_id], panes, clients).await;
                 refresh_target_session(&session, state, panes, clients, config, prev_frames)
                     .await?;
             }
@@ -2688,8 +2709,13 @@ async fn handle_create_session(
     log::debug!("server: CreateSession name={name:?} folder={folder:?} pane_id={pane_id}");
     spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
 
+    // Announce to EVERY client, not just the creator. A session manager open in
+    // another terminal has no timer -- every tree refresh is event-driven -- so
+    // a creator-only notification left every other terminal's tree stale until
+    // some unrelated action happened to refresh it. Symmetric with
+    // `SessionDeleted`, which already reaches every client it concerns.
     let cls = clients.lock().await;
-    if let Some(client) = cls.get(&client_id) {
+    for client in cls.values() {
         let _ = client
             .tx
             .send(ServerMessage::Event(SessionEvent::SessionCreated(
@@ -2807,12 +2833,7 @@ async fn handle_kill_session(
         "server: KillSession name={name:?} panes_removed={}",
         pane_ids.len()
     );
-    {
-        let mut ps = panes.lock().await;
-        for pid in pane_ids {
-            ps.remove(&pid);
-        }
-    }
+    reap_panes(&pane_ids, panes, clients).await;
     let mut cls = clients.lock().await;
     for client in cls.values_mut() {
         if client.session_name.as_deref() == Some(name) {
@@ -5840,6 +5861,124 @@ async fn handle_session_removed(
     }
 }
 
+/// `exit_code` reported with [`SessionEvent::PaneExited`] when the pane's real
+/// exit status is not observable: it was closed by command while its child was
+/// still running, or it had already been reaped when a client asked about it.
+/// Real codes are `0..=255` (a signalled child reports `128 + signo`), so this
+/// can never collide with one.
+const EXIT_CODE_UNKNOWN: i32 = -1;
+
+/// Tell every client subscribed to one of `exits` that the pane is gone,
+/// dropping the subscription in the same step.
+///
+/// This is the notification half of pane death. Without it a View cell aliasing
+/// the pane cannot tell a dead pane from a quiet one: it sits on `waiting for …`
+/// (or a frozen last snapshot painted as if it were live) forever, and every
+/// keystroke typed into it vanishes. The event goes ONLY to clients that
+/// actually held a subscription -- they are the ones who were being lied to --
+/// and the send is fused with the subscription drop so a subscriber can never be
+/// forgotten before it is told.
+async fn notify_panes_exited(
+    exits: &[(PaneId, i32)],
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    if exits.is_empty() {
+        return;
+    }
+    let mut cls = clients.lock().await;
+    for conn in cls.values_mut() {
+        for &(pane_id, exit_code) in exits {
+            conn.pane_scroll.remove(&pane_id);
+            conn.pane_selection.remove(&pane_id);
+            if conn.subscribed_panes.remove(&pane_id).is_some() {
+                let _ = conn.tx.send(ServerMessage::Event(SessionEvent::PaneExited {
+                    pane_id,
+                    exit_code,
+                }));
+            }
+            // A gesture on a pane that just went away can never make progress;
+            // drop it (and its repeat timer) so the ticker stops replaying it.
+            if conn.pane_drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
+                conn.pane_drag = None;
+                conn.pane_autoscroll_repeat = None;
+            }
+        }
+    }
+}
+
+/// Drop `pane_ids` from the pane table and notify their subscribers.
+///
+/// Every path that destroys a pane (shell exit, `PaneClose`, `PaneCloseById`,
+/// tab close, session/folder delete, the popup) funnels through here, so the
+/// `PaneExited` notification cannot be forgotten by a new close path.
+async fn reap_panes(
+    pane_ids: &[PaneId],
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    if pane_ids.is_empty() {
+        return;
+    }
+    // Read each child's status before dropping its `PaneData` (dropping the
+    // `Pty` SIGHUPs the child). A pane closed by command still has a live child
+    // and reports `EXIT_CODE_UNKNOWN`; nothing consumes the code today, it is
+    // carried for the client's benefit.
+    let exits: Vec<(PaneId, i32)> = {
+        let mut ps = panes.lock().await;
+        pane_ids
+            .iter()
+            .map(|&pane_id| {
+                let code = match ps.remove(&pane_id) {
+                    Some(pd) => pd
+                        .pty
+                        .try_wait()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(EXIT_CODE_UNKNOWN),
+                    // Already reaped by another path -- still notify, a client
+                    // may be holding a subscription to it.
+                    None => EXIT_CODE_UNKNOWN,
+                };
+                (pane_id, code)
+            })
+            .collect()
+    };
+    // Taken under `clients` alone (the panes lock above is released) to keep the
+    // locks unnested.
+    notify_panes_exited(&exits, clients).await;
+}
+
+/// Run the NOTIFICATION half of pane death for a pane whose PTY exited but that
+/// [`close_pane`] declined to close.
+///
+/// `close_pane` only knows the session's ACTIVE tab, so a pane living in a
+/// background tab is left in the pane table with a dead PTY. Views exist to
+/// watch exactly such panes, so their subscribers must still be told -- a cell
+/// must not sit on a frozen snapshot just because its pane's tab wasn't in the
+/// foreground. Layout state is deliberately untouched here (the pane staying in
+/// its tab's `pane_order` is a separate, pre-existing bug); this only stops the
+/// lying. A no-op when `close_pane` did reap the pane.
+async fn notify_if_close_declined(
+    pane_id: PaneId,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    let declined = {
+        let ps = panes.lock().await;
+        ps.contains_key(&pane_id)
+    };
+    if declined {
+        log::info!(
+            "server: pane_id={pane_id} PTY exited but close_pane declined it; notifying subscribers"
+        );
+        // Deliberately NOT `try_wait`: the `Pty` stays in the table here (that is
+        // what "declined" means), and reaping the child would leave `Pty::drop`
+        // to SIGHUP -- and `get_pane_cwd` to read /proc for -- a pid the OS may
+        // have recycled by then. Nothing consumes the code.
+        notify_panes_exited(&[(pane_id, EXIT_CODE_UNKNOWN)], clients).await;
+    }
+}
+
 async fn close_pane(
     pane_id: PaneId,
     session_name: &str,
@@ -5928,40 +6067,13 @@ async fn close_pane(
             }
         }
     };
-    {
-        let mut ps = panes.lock().await;
-        ps.remove(&pane_id);
-        for extra in &also_reap {
-            ps.remove(extra);
-        }
-    }
-    // Drop any lingering subscriptions to the now-closed pane so a subscription
-    // to a dead pane can't linger. Taken under `clients` alone (the panes lock
-    // above is already released) to keep the locks unnested.
-    {
-        let mut cls = clients.lock().await;
-        for conn in cls.values_mut() {
-            conn.subscribed_panes.remove(&pane_id);
-            conn.pane_scroll.remove(&pane_id);
-            conn.pane_selection.remove(&pane_id);
-            for extra in &also_reap {
-                conn.subscribed_panes.remove(extra);
-                conn.pane_scroll.remove(extra);
-                conn.pane_selection.remove(extra);
-            }
-            // A gesture on a pane that just went away can never make progress;
-            // drop it (and its repeat timer) so the ticker stops replaying it.
-            let dead = conn
-                .pane_drag
-                .as_ref()
-                .map(|d| d.pane_id == pane_id || also_reap.contains(&d.pane_id))
-                .unwrap_or(false);
-            if dead {
-                conn.pane_drag = None;
-                conn.pane_autoscroll_repeat = None;
-            }
-        }
-    }
+    // Drop the pane(s) and TELL their subscribers. A subscription to a dead pane
+    // must not linger, and a subscriber dropped without a word is exactly the
+    // silent failure that left a View cell on `waiting…` forever.
+    let mut reaped = Vec::with_capacity(1 + also_reap.len());
+    reaped.push(pane_id);
+    reaped.extend(also_reap);
+    reap_panes(&reaped, panes, clients).await;
     match action {
         CloseAction::Broadcast => {
             let _ = resize_session_panes(session_name, state, panes, clients, config).await;
@@ -6135,6 +6247,7 @@ async fn start_pty_forwarding(
                             &prev_frames,
                         )
                         .await;
+                        notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
                         break;
                     }
@@ -6395,6 +6508,7 @@ async fn materialize_session(
                             &prev_frames,
                         )
                         .await;
+                        notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
                         break;
                     }
