@@ -96,7 +96,8 @@
 # mode_search_fg = "#1e1e2e"
 # mode_search_bg = "#f9e2af"
 
-# Pane frame:
+# Pane frame. `frame_bg` is UNSET by default, which leaves the border cells on
+# the terminal's own background; set it to paint the frame on a solid color.
 # frame_fg = "#585b70"
 # frame_bg = "#1e1e2e"
 # frame_active_fg = "#89b4fa"
@@ -105,23 +106,49 @@
 # status_bar_fg = "#a6adc8"
 # status_bar_bg = "#181825"
 
-# Tab bar:
+# Tab bar. `tab_inactive_bg` is the raised block behind an inactive tab in a
+# PANE's tab strip (the zellij top-border tabs and the tmux tab bar). Inactive
+# tabs in the status bar's session tab list deliberately sit flat on
+# `status_bar_bg` instead.
 # tab_active_fg = "#1e1e2e"
 # tab_active_bg = "#89b4fa"
 # tab_inactive_fg = "#9399b2"
+# tab_inactive_bg = { ansi = 237 }
+
+# Background-activity markers on inactive status-bar tabs: `!` for a bell,
+# `●` for output, `✓` for a tab that has gone quiet.
+# tab_bell_fg = "bright_red"
+# tab_activity_fg = "bright_yellow"
+# tab_silent_fg = "bright_green"
+
+# Right-hand end of the status bar: the layout indicator (bsp/master/monocle/
+# grid/custom) and the (n/m) search-match counter. Both are shared with a View's
+# status bar, so theming them themes both.
+# layout_indicator_fg = "black"
+# layout_indicator_bg = { ansi = 245 }
+# search_count_fg = "black"
+# search_count_bg = "bright_yellow"
+
+# Mode chip for a mode with no role of its own:
+# mode_unknown_fg = "bright_white"
+# mode_unknown_bg = { ansi = 238 }
 
 # Which-key popup:
 # whichkey_fg = "#cdd6f4"
 # whichkey_bg = "#181825"
 # whichkey_key_fg = "#a6e3a1"
 
-# Separators and labels:
+# Separators and labels. `pane_label_*` style the pane name / stacked-tab title
+# drawn on a pane's top border. Both are UNSET by default: the label then takes
+# the border's own color (so it keeps tracking focus) on the frame's background.
 # separator_fg = "#6c7086"
 # pane_label_fg = "#cdd6f4"
 # pane_label_bg = "#1e1e2e"
 # session_name_fg = "#94e2d5"
 
-# Search highlight colors (all matches vs. the current match):
+# Search highlight colors (all matches vs. the current match). Search
+# highlighting is applied CLIENT-side, so unlike the roles above these four are
+# not part of the server's compositor theme.
 # search_match_fg = "#1e1e2e"
 # search_match_bg = "#585b70"
 # search_current_fg = "#1e1e2e"

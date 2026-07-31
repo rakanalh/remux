@@ -22,8 +22,8 @@ use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
 use crate::server::compositor::{
-    composite, hit_test, is_multi_stack, pane_content_rect, ClickTarget, HitRegions,
-    MouseSelection, StatusInfo,
+    composite, fits_zellij_border, hit_test, is_multi_stack, pane_content_rect, ClickTarget,
+    HitRegions, MouseSelection, StatusInfo,
 };
 use crate::server::layout::{
     self, BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
@@ -3330,7 +3330,7 @@ async fn handle_mouse_scroll(
     if mouse_tracking {
         // Same border-inset logic as handle_mouse_drag, but 1-based coords.
         let border_offset: u16 = match config.appearance.border_style {
-            BorderStyle::ZellijStyle if pane_rect.width >= 3 && pane_rect.height >= 3 => 1,
+            BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
             _ => 0,
         };
         let col = x
@@ -3655,7 +3655,7 @@ async fn handle_mouse_drag(
 
     // Compute border offset based on style.
     let border_offset: u16 = match config.appearance.border_style {
-        BorderStyle::ZellijStyle if pane_rect.width >= 3 && pane_rect.height >= 3 => 1,
+        BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
         _ => 0,
     };
     let content_width = pane_rect.width.saturating_sub(border_offset * 2);
@@ -4482,8 +4482,10 @@ async fn resize_session_panes(
                 height: rows.saturating_sub(1),
             };
             let rect = layout::popup_rect(area, popup_size);
-            // Interior = rect minus the 1-cell frame, matching `draw_popup`.
-            let (inner_cols, inner_rows) = if rect.width >= 3 && rect.height >= 3 {
+            // Interior = rect minus the 1-cell frame, matching `draw_popup`
+            // (the SAME threshold, so the PTY is never sized to a region that
+            // was not painted).
+            let (inner_cols, inner_rows) = if fits_zellij_border(rect.width, rect.height) {
                 (rect.width - 2, rect.height - 2)
             } else {
                 (rect.width, rect.height)
@@ -5656,7 +5658,7 @@ async fn build_composite(
         .map(|(_, rect)| {
             let (x_off, y_off, x_off_end, y_off_end) = match &sess.border_style {
                 BorderStyle::ZellijStyle => {
-                    if rect.width >= 3 && rect.height >= 3 {
+                    if fits_zellij_border(rect.width, rect.height) {
                         (1u16, 1u16, 1u16, 1u16) // 1-cell border on each side
                     } else {
                         (0, 0, 0, 0)

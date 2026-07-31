@@ -100,52 +100,61 @@ impl ThemeColor {
     }
 }
 
+/// **The one table of color names.** Each row is `(name, ANSI index, crossterm
+/// color)`; both [`named_to_crossterm`] and [`named_to_cell_color`] read it, so
+/// a name added here reaches both conversions. They used to enumerate the same
+/// sixteen names in two independent `match`es, where adding a name to one
+/// silently fell through to the fallback in the other.
+///
+/// The crossterm value is carried explicitly instead of being derived from the
+/// index because crossterm's named variants (`Color::Black`) and its indexed one
+/// (`Color::AnsiValue(0)`) emit different SGR sequences, and the named form is
+/// what the client has always emitted.
+///
+/// `"reset"`/`"default"` are deliberately absent: they mean "no color", which
+/// each conversion expresses in its own type via the fallback below.
+const NAMED_COLORS: &[(&str, u8, Color)] = &[
+    ("black", 0, Color::Black),
+    ("red", 1, Color::DarkRed),
+    ("green", 2, Color::DarkGreen),
+    ("yellow", 3, Color::DarkYellow),
+    ("blue", 4, Color::DarkBlue),
+    ("magenta", 5, Color::DarkMagenta),
+    ("cyan", 6, Color::DarkCyan),
+    ("white", 7, Color::Grey),
+    ("dark_grey", 8, Color::DarkGrey),
+    ("dark_gray", 8, Color::DarkGrey),
+    ("light_red", 9, Color::Red),
+    ("bright_red", 9, Color::Red),
+    ("light_green", 10, Color::Green),
+    ("bright_green", 10, Color::Green),
+    ("light_yellow", 11, Color::Yellow),
+    ("bright_yellow", 11, Color::Yellow),
+    ("light_blue", 12, Color::Blue),
+    ("bright_blue", 12, Color::Blue),
+    ("light_magenta", 13, Color::Magenta),
+    ("bright_magenta", 13, Color::Magenta),
+    ("light_cyan", 14, Color::Cyan),
+    ("bright_cyan", 14, Color::Cyan),
+    ("light_grey", 15, Color::White),
+    ("light_gray", 15, Color::White),
+    ("bright_white", 15, Color::White),
+];
+
+/// Look a color name up in [`NAMED_COLORS`], case-insensitively.
+fn named_lookup(name: &str) -> Option<&'static (&'static str, u8, Color)> {
+    let lower = name.to_lowercase();
+    NAMED_COLORS.iter().find(|(n, _, _)| *n == lower)
+}
+
 /// Map a named color string to a `crossterm::style::Color`.
 fn named_to_crossterm(name: &str) -> Color {
-    match name.to_lowercase().as_str() {
-        "black" => Color::Black,
-        "red" => Color::DarkRed,
-        "green" => Color::DarkGreen,
-        "yellow" => Color::DarkYellow,
-        "blue" => Color::DarkBlue,
-        "magenta" => Color::DarkMagenta,
-        "cyan" => Color::DarkCyan,
-        "white" => Color::Grey,
-        "dark_grey" | "dark_gray" => Color::DarkGrey,
-        "light_red" | "bright_red" => Color::Red,
-        "light_green" | "bright_green" => Color::Green,
-        "light_yellow" | "bright_yellow" => Color::Yellow,
-        "light_blue" | "bright_blue" => Color::Blue,
-        "light_magenta" | "bright_magenta" => Color::Magenta,
-        "light_cyan" | "bright_cyan" => Color::Cyan,
-        "light_grey" | "light_gray" | "bright_white" => Color::White,
-        "reset" | "default" => Color::Reset,
-        _ => Color::Reset,
-    }
+    named_lookup(name).map_or(Color::Reset, |(_, _, c)| *c)
 }
 
 /// Map a named color string to a `CellColor`.
 fn named_to_cell_color(name: &str) -> CellColor {
-    match name.to_lowercase().as_str() {
-        "black" => CellColor::Indexed(0),
-        "red" => CellColor::Indexed(1),
-        "green" => CellColor::Indexed(2),
-        "yellow" => CellColor::Indexed(3),
-        "blue" => CellColor::Indexed(4),
-        "magenta" => CellColor::Indexed(5),
-        "cyan" => CellColor::Indexed(6),
-        "white" => CellColor::Indexed(7),
-        "dark_grey" | "dark_gray" => CellColor::Indexed(8),
-        "light_red" | "bright_red" => CellColor::Indexed(9),
-        "light_green" | "bright_green" => CellColor::Indexed(10),
-        "light_yellow" | "bright_yellow" => CellColor::Indexed(11),
-        "light_blue" | "bright_blue" => CellColor::Indexed(12),
-        "light_magenta" | "bright_magenta" => CellColor::Indexed(13),
-        "light_cyan" | "bright_cyan" => CellColor::Indexed(14),
-        "light_grey" | "light_gray" | "bright_white" => CellColor::Indexed(15),
-        "reset" | "default" => CellColor::Default,
-        _ => CellColor::Default,
-    }
+    named_lookup(name).map_or(CellColor::Default, |(_, i, _)| CellColor::Indexed(*i))
 }
 
 // ---------------------------------------------------------------------------
@@ -164,26 +173,69 @@ pub struct ThemeConfig {
     pub mode_visual_fg: ThemeColor,
     pub mode_visual_bg: ThemeColor,
     pub frame_fg: ThemeColor,
-    pub frame_bg: ThemeColor,
+    /// Background of a pane's border cells. `None` (the default) leaves them on
+    /// the terminal's default background, which is how borders have always been
+    /// drawn — so the shipped defaults render exactly as before. Set it to paint
+    /// the frame on a solid color.
+    pub frame_bg: Option<ThemeColor>,
     pub frame_active_fg: ThemeColor,
     pub status_bar_fg: ThemeColor,
     pub status_bar_bg: ThemeColor,
     pub tab_active_fg: ThemeColor,
     pub tab_active_bg: ThemeColor,
     pub tab_inactive_fg: ThemeColor,
+    /// Background of an inactive tab block in a **pane's tab strip** (the zellij
+    /// top-border tabs and the tmux 1-row tab bar). Named replacement for the
+    /// `Indexed(237)` literal those two renderers each carried.
+    ///
+    /// The status bar's inactive SESSION tabs are a different concept and keep
+    /// inheriting `status_bar_bg`: they sit flat on the bar rather than reading
+    /// as a raised block.
+    pub tab_inactive_bg: ThemeColor,
     pub whichkey_fg: ThemeColor,
     pub whichkey_bg: ThemeColor,
     pub whichkey_key_fg: ThemeColor,
     pub separator_fg: ThemeColor,
-    pub pane_label_fg: ThemeColor,
-    pub pane_label_bg: ThemeColor,
+    /// Foreground of the pane label / stacked-tab title drawn on a pane's top
+    /// border. `None` (the default) draws it in the border's own color, which
+    /// tracks focus (`frame_active_fg` vs `frame_fg`) — the historical behavior,
+    /// and something no single static color can reproduce.
+    pub pane_label_fg: Option<ThemeColor>,
+    /// Background of the pane label on a pane's top border. `None` (the default)
+    /// leaves it on the terminal's default background, as before.
+    pub pane_label_bg: Option<ThemeColor>,
     pub session_name_fg: ThemeColor,
 
     // Search mode indicator
     pub mode_search_fg: ThemeColor,
     pub mode_search_bg: ThemeColor,
 
-    // Search highlight colors
+    // Status bar right-hand segments
+    /// The `(n/m)` search-match counter on the status bar. Distinct from
+    /// `mode_search_fg`/`_bg` (the `[SEARCH]` mode chip), which use the
+    /// Catppuccin palette while the counter has always used ANSI bright yellow.
+    pub search_count_fg: ThemeColor,
+    pub search_count_bg: ThemeColor,
+    /// The layout-mode indicator (`bsp`/`master`/`monocle`/`grid`/`custom`) at
+    /// the far right of the status bar.
+    pub layout_indicator_fg: ThemeColor,
+    pub layout_indicator_bg: ThemeColor,
+
+    // Background-activity markers on inactive status-bar tabs
+    pub tab_bell_fg: ThemeColor,
+    pub tab_activity_fg: ThemeColor,
+    pub tab_silent_fg: ThemeColor,
+
+    /// Mode chip colors for a mode name with no role of its own — the fallback
+    /// arm of [`CompositorTheme::mode_colors`].
+    pub mode_unknown_fg: ThemeColor,
+    pub mode_unknown_bg: ThemeColor,
+
+    // Search highlight colors. These four are deliberately absent from
+    // `CompositorTheme`: search highlighting is applied CLIENT-side (see
+    // `client::renderer`), over an already-composited frame, so the server never
+    // needs them. Every other role above is server-side chrome and therefore
+    // lives in both structs.
     pub search_match_fg: ThemeColor,
     pub search_match_bg: ThemeColor,
     pub search_current_fg: ThemeColor,
@@ -201,9 +253,10 @@ impl Default for ThemeConfig {
             mode_visual_fg: ThemeColor::Rgb(30, 30, 46), // base
             mode_visual_bg: ThemeColor::Rgb(203, 166, 247), // mauve
 
-            // Pane frame
+            // Pane frame. `frame_bg` is None so borders keep sitting on the
+            // terminal's default background, exactly as they always have.
             frame_fg: ThemeColor::Rgb(88, 91, 112), // surface2
-            frame_bg: ThemeColor::Rgb(30, 30, 46),  // base
+            frame_bg: None,
             frame_active_fg: ThemeColor::Rgb(137, 180, 250), // blue
 
             // Status bar
@@ -214,21 +267,39 @@ impl Default for ThemeConfig {
             tab_active_fg: ThemeColor::Rgb(30, 30, 46), // base
             tab_active_bg: ThemeColor::Rgb(137, 180, 250), // blue
             tab_inactive_fg: ThemeColor::Rgb(147, 153, 178), // overlay2
+            tab_inactive_bg: ThemeColor::Indexed(237),  // the historical literal
 
             // Which-key popup
             whichkey_fg: ThemeColor::Rgb(205, 214, 244), // text
             whichkey_bg: ThemeColor::Rgb(24, 24, 37),    // mantle
             whichkey_key_fg: ThemeColor::Rgb(166, 227, 161), // green
 
-            // Separators and labels
+            // Separators and labels. The pane label defaults to None/None: it
+            // inherits the border color (which tracks focus) on the default
+            // background, as it did before these roles were consumed.
             separator_fg: ThemeColor::Rgb(108, 112, 134), // overlay0
-            pane_label_fg: ThemeColor::Rgb(205, 214, 244), // text
-            pane_label_bg: ThemeColor::Rgb(30, 30, 46),   // base
+            pane_label_fg: None,
+            pane_label_bg: None,
             session_name_fg: ThemeColor::Rgb(148, 226, 213), // teal
 
             // Search mode indicator
             mode_search_fg: ThemeColor::Rgb(30, 30, 46), // base
             mode_search_bg: ThemeColor::Rgb(249, 226, 175), // yellow
+
+            // Status bar right-hand segments (the historical literals)
+            search_count_fg: ThemeColor::Indexed(0),  // black
+            search_count_bg: ThemeColor::Indexed(11), // bright yellow
+            layout_indicator_fg: ThemeColor::Indexed(0), // black
+            layout_indicator_bg: ThemeColor::Indexed(245), // grey
+
+            // Activity markers (the historical literals)
+            tab_bell_fg: ThemeColor::Indexed(9), // bright red: urgent
+            tab_activity_fg: ThemeColor::Indexed(11), // bright yellow
+            tab_silent_fg: ThemeColor::Indexed(10), // bright green
+
+            // Unknown-mode chip (the historical literals)
+            mode_unknown_fg: ThemeColor::Indexed(15),
+            mode_unknown_bg: ThemeColor::Indexed(238),
 
             // Search highlight colors
             search_match_fg: ThemeColor::Rgb(30, 30, 46), // base
@@ -257,9 +328,10 @@ pub struct Theme {
     pub mode_visual_fg: Color,
     pub mode_visual_bg: Color,
 
-    // Pane frame colors
+    // Pane frame colors. `frame_bg` is optional in the same sense as
+    // `ThemeConfig::frame_bg`: `None` means "leave the terminal's background".
     pub frame_fg: Color,
-    pub frame_bg: Color,
+    pub frame_bg: Option<Color>,
     pub frame_active_fg: Color,
 
     // Status bar
@@ -276,10 +348,11 @@ pub struct Theme {
     pub whichkey_bg: Color,
     pub whichkey_key_fg: Color,
 
-    // Additional fields
+    // Additional fields. The pane-label pair is optional in the same sense as
+    // `ThemeConfig`'s: `None` means "inherit the border color / background".
     pub separator_fg: Color,
-    pub pane_label_fg: Color,
-    pub pane_label_bg: Color,
+    pub pane_label_fg: Option<Color>,
+    pub pane_label_bg: Option<Color>,
     pub session_name_fg: Color,
 
     // Search mode indicator
@@ -304,7 +377,7 @@ impl Theme {
             mode_visual_fg: config.mode_visual_fg.to_crossterm_color(),
             mode_visual_bg: config.mode_visual_bg.to_crossterm_color(),
             frame_fg: config.frame_fg.to_crossterm_color(),
-            frame_bg: config.frame_bg.to_crossterm_color(),
+            frame_bg: config.frame_bg.as_ref().map(ThemeColor::to_crossterm_color),
             frame_active_fg: config.frame_active_fg.to_crossterm_color(),
             status_bar_fg: config.status_bar_fg.to_crossterm_color(),
             status_bar_bg: config.status_bar_bg.to_crossterm_color(),
@@ -315,8 +388,14 @@ impl Theme {
             whichkey_bg: config.whichkey_bg.to_crossterm_color(),
             whichkey_key_fg: config.whichkey_key_fg.to_crossterm_color(),
             separator_fg: config.separator_fg.to_crossterm_color(),
-            pane_label_fg: config.pane_label_fg.to_crossterm_color(),
-            pane_label_bg: config.pane_label_bg.to_crossterm_color(),
+            pane_label_fg: config
+                .pane_label_fg
+                .as_ref()
+                .map(ThemeColor::to_crossterm_color),
+            pane_label_bg: config
+                .pane_label_bg
+                .as_ref()
+                .map(ThemeColor::to_crossterm_color),
             session_name_fg: config.session_name_fg.to_crossterm_color(),
             mode_search_fg: config.mode_search_fg.to_crossterm_color(),
             mode_search_bg: config.mode_search_bg.to_crossterm_color(),
@@ -349,22 +428,35 @@ pub struct CompositorTheme {
     pub mode_visual_fg: CellColor,
     pub mode_visual_bg: CellColor,
     pub frame_fg: CellColor,
-    pub frame_bg: CellColor,
+    /// `None` = leave the terminal's background (see [`ThemeConfig::frame_bg`]).
+    pub frame_bg: Option<CellColor>,
     pub frame_active_fg: CellColor,
     pub status_bar_fg: CellColor,
     pub status_bar_bg: CellColor,
     pub tab_active_fg: CellColor,
     pub tab_active_bg: CellColor,
     pub tab_inactive_fg: CellColor,
+    pub tab_inactive_bg: CellColor,
     pub whichkey_fg: CellColor,
     pub whichkey_bg: CellColor,
     pub whichkey_key_fg: CellColor,
     pub mode_search_fg: CellColor,
     pub mode_search_bg: CellColor,
     pub separator_fg: CellColor,
-    pub pane_label_fg: CellColor,
-    pub pane_label_bg: CellColor,
+    /// `None` = inherit the border color (see [`ThemeConfig::pane_label_fg`]).
+    pub pane_label_fg: Option<CellColor>,
+    /// `None` = leave the terminal's background.
+    pub pane_label_bg: Option<CellColor>,
     pub session_name_fg: CellColor,
+    pub search_count_fg: CellColor,
+    pub search_count_bg: CellColor,
+    pub layout_indicator_fg: CellColor,
+    pub layout_indicator_bg: CellColor,
+    pub tab_bell_fg: CellColor,
+    pub tab_activity_fg: CellColor,
+    pub tab_silent_fg: CellColor,
+    pub mode_unknown_fg: CellColor,
+    pub mode_unknown_bg: CellColor,
 }
 
 impl CompositorTheme {
@@ -378,22 +470,32 @@ impl CompositorTheme {
             mode_visual_fg: config.mode_visual_fg.to_cell_color(),
             mode_visual_bg: config.mode_visual_bg.to_cell_color(),
             frame_fg: config.frame_fg.to_cell_color(),
-            frame_bg: config.frame_bg.to_cell_color(),
+            frame_bg: config.frame_bg.as_ref().map(ThemeColor::to_cell_color),
             frame_active_fg: config.frame_active_fg.to_cell_color(),
             status_bar_fg: config.status_bar_fg.to_cell_color(),
             status_bar_bg: config.status_bar_bg.to_cell_color(),
             tab_active_fg: config.tab_active_fg.to_cell_color(),
             tab_active_bg: config.tab_active_bg.to_cell_color(),
             tab_inactive_fg: config.tab_inactive_fg.to_cell_color(),
+            tab_inactive_bg: config.tab_inactive_bg.to_cell_color(),
             whichkey_fg: config.whichkey_fg.to_cell_color(),
             whichkey_bg: config.whichkey_bg.to_cell_color(),
             whichkey_key_fg: config.whichkey_key_fg.to_cell_color(),
             mode_search_fg: config.mode_search_fg.to_cell_color(),
             mode_search_bg: config.mode_search_bg.to_cell_color(),
             separator_fg: config.separator_fg.to_cell_color(),
-            pane_label_fg: config.pane_label_fg.to_cell_color(),
-            pane_label_bg: config.pane_label_bg.to_cell_color(),
+            pane_label_fg: config.pane_label_fg.as_ref().map(ThemeColor::to_cell_color),
+            pane_label_bg: config.pane_label_bg.as_ref().map(ThemeColor::to_cell_color),
             session_name_fg: config.session_name_fg.to_cell_color(),
+            search_count_fg: config.search_count_fg.to_cell_color(),
+            search_count_bg: config.search_count_bg.to_cell_color(),
+            layout_indicator_fg: config.layout_indicator_fg.to_cell_color(),
+            layout_indicator_bg: config.layout_indicator_bg.to_cell_color(),
+            tab_bell_fg: config.tab_bell_fg.to_cell_color(),
+            tab_activity_fg: config.tab_activity_fg.to_cell_color(),
+            tab_silent_fg: config.tab_silent_fg.to_cell_color(),
+            mode_unknown_fg: config.mode_unknown_fg.to_cell_color(),
+            mode_unknown_bg: config.mode_unknown_bg.to_cell_color(),
         }
     }
 
@@ -404,8 +506,31 @@ impl CompositorTheme {
             "COMMAND" => (self.mode_command_fg.clone(), self.mode_command_bg.clone()),
             "VISUAL" => (self.mode_visual_fg.clone(), self.mode_visual_bg.clone()),
             "SEARCH" => (self.mode_search_fg.clone(), self.mode_search_bg.clone()),
-            _ => (CellColor::Indexed(15), CellColor::Indexed(238)),
+            _ => (self.mode_unknown_fg.clone(), self.mode_unknown_bg.clone()),
         }
+    }
+
+    /// The background a **border cell** should carry: `frame_bg` when the user
+    /// set one, otherwise the terminal's default. The one accessor every border
+    /// renderer goes through, so the client's View cells pick the role up for
+    /// free through the shared drawing code.
+    pub fn border_bg(&self) -> CellColor {
+        self.frame_bg.clone().unwrap_or(CellColor::Default)
+    }
+
+    /// The `(fg, bg)` a **pane label** on a top border should carry, given the
+    /// color that border is being drawn in. `pane_label_fg` defaults to the
+    /// border color so the label keeps tracking focus; `pane_label_bg` defaults
+    /// to the border background.
+    pub fn label_colors(&self, border_fg: &CellColor) -> (CellColor, CellColor) {
+        (
+            self.pane_label_fg
+                .clone()
+                .unwrap_or_else(|| border_fg.clone()),
+            self.pane_label_bg
+                .clone()
+                .unwrap_or_else(|| self.border_bg()),
+        )
     }
 }
 
@@ -471,10 +596,24 @@ mod tests {
         assert_eq!(ct.mode_visual_fg, CellColor::Rgb(30, 30, 46)); // base
         assert_eq!(ct.mode_visual_bg, CellColor::Rgb(203, 166, 247)); // mauve
 
-        // Frame colors
+        // Frame colors. `frame_bg` is None by design: border cells have always
+        // been drawn on the terminal's default background, and the role is
+        // opt-in so wiring it up changed nobody's default appearance. It used to
+        // default to `Rgb(30, 30, 46)` -- a value no renderer ever read.
         assert_eq!(ct.frame_fg, CellColor::Rgb(88, 91, 112)); // surface2
-        assert_eq!(ct.frame_bg, CellColor::Rgb(30, 30, 46)); // base
+        assert_eq!(ct.frame_bg, None);
+        assert_eq!(ct.border_bg(), CellColor::Default);
         assert_eq!(ct.frame_active_fg, CellColor::Rgb(137, 180, 250)); // blue
+
+        // The pane label defaults to the border's own color/background, so it
+        // keeps tracking focus the way it always has.
+        assert_eq!(ct.pane_label_fg, None);
+        assert_eq!(ct.pane_label_bg, None);
+        let border = CellColor::Rgb(1, 2, 3);
+        assert_eq!(
+            ct.label_colors(&border),
+            (border.clone(), CellColor::Default)
+        );
 
         // Status bar
         assert_eq!(ct.status_bar_fg, CellColor::Rgb(166, 173, 200)); // subtext0
@@ -484,6 +623,19 @@ mod tests {
         assert_eq!(ct.tab_active_fg, CellColor::Rgb(30, 30, 46)); // base
         assert_eq!(ct.tab_active_bg, CellColor::Rgb(137, 180, 250)); // blue
         assert_eq!(ct.tab_inactive_fg, CellColor::Rgb(147, 153, 178)); // overlay2
+        assert_eq!(ct.tab_inactive_bg, CellColor::Indexed(237));
+
+        // Status-bar right-hand segments and activity markers: the named roles
+        // must default to the literals the renderers used to hardcode.
+        assert_eq!(ct.search_count_fg, CellColor::Indexed(0));
+        assert_eq!(ct.search_count_bg, CellColor::Indexed(11));
+        assert_eq!(ct.layout_indicator_fg, CellColor::Indexed(0));
+        assert_eq!(ct.layout_indicator_bg, CellColor::Indexed(245));
+        assert_eq!(ct.tab_bell_fg, CellColor::Indexed(9));
+        assert_eq!(ct.tab_activity_fg, CellColor::Indexed(11));
+        assert_eq!(ct.tab_silent_fg, CellColor::Indexed(10));
+        assert_eq!(ct.mode_unknown_fg, CellColor::Indexed(15));
+        assert_eq!(ct.mode_unknown_bg, CellColor::Indexed(238));
 
         // Separators and session name
         assert_eq!(ct.separator_fg, CellColor::Rgb(108, 112, 134)); // overlay0
@@ -565,6 +717,78 @@ mod tests {
         let (fg, bg) = ct.mode_colors("SEARCH");
         assert_eq!(fg, CellColor::Rgb(30, 30, 46));
         assert_eq!(bg, CellColor::Rgb(249, 226, 175));
+    }
+
+    #[test]
+    fn optional_roles_round_trip_when_set() {
+        // The three roles that used to be declared, documented and read by
+        // NOBODY. Setting them must reach `CompositorTheme`'s accessors.
+        let toml_str = r##"
+            frame_bg = "#102030"
+            pane_label_fg = "#405060"
+            pane_label_bg = "#708090"
+        "##;
+        let config: ThemeConfig = toml::from_str(toml_str).unwrap();
+        let ct = CompositorTheme::from_config(&config);
+        assert_eq!(ct.border_bg(), CellColor::Rgb(0x10, 0x20, 0x30));
+        assert_eq!(
+            ct.label_colors(&CellColor::Indexed(7)),
+            (
+                CellColor::Rgb(0x40, 0x50, 0x60),
+                CellColor::Rgb(0x70, 0x80, 0x90)
+            )
+        );
+        // The crossterm-side mirror resolves them too.
+        let t = Theme::from_config(&config);
+        assert_eq!(
+            t.frame_bg,
+            Some(Color::Rgb {
+                r: 0x10,
+                g: 0x20,
+                b: 0x30
+            })
+        );
+        assert_eq!(
+            t.pane_label_fg,
+            Some(Color::Rgb {
+                r: 0x40,
+                g: 0x50,
+                b: 0x60
+            })
+        );
+    }
+
+    #[test]
+    fn label_bg_falls_back_to_frame_bg() {
+        // `pane_label_bg` unset but `frame_bg` set: the label sits on the frame's
+        // background rather than punching a default-colored hole in it.
+        let config: ThemeConfig = toml::from_str(r##"frame_bg = "#010203""##).unwrap();
+        let ct = CompositorTheme::from_config(&config);
+        let (fg, bg) = ct.label_colors(&CellColor::Indexed(4));
+        assert_eq!(fg, CellColor::Indexed(4)); // still the border color
+        assert_eq!(bg, CellColor::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn named_colors_table_is_consistent_across_both_conversions() {
+        // The regression this guards: two independent 16-arm tables, where a name
+        // added to one silently fell through to the fallback in the other.
+        for (name, idx, color) in NAMED_COLORS {
+            let tc = ThemeColor::Named(name.to_string());
+            assert_eq!(tc.to_cell_color(), CellColor::Indexed(*idx), "{name}");
+            assert_eq!(tc.to_crossterm_color(), *color, "{name}");
+            // Case-insensitive in both directions.
+            let upper = ThemeColor::Named(name.to_uppercase());
+            assert_eq!(upper.to_cell_color(), CellColor::Indexed(*idx), "{name}");
+            assert_eq!(upper.to_crossterm_color(), *color, "{name}");
+        }
+        // "reset"/"default" are not in the table; each conversion expresses
+        // "no color" in its own type.
+        for name in ["reset", "default", "nonsense"] {
+            let tc = ThemeColor::Named(name.to_string());
+            assert_eq!(tc.to_cell_color(), CellColor::Default);
+            assert_eq!(tc.to_crossterm_color(), Color::Reset);
+        }
     }
 
     #[test]

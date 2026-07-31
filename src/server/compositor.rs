@@ -270,10 +270,11 @@ fn apply_selection_highlight(
     pane_rect: &Rect,
     border_style: &BorderStyle,
 ) {
-    // Compute the content offset inside the pane rect (skip borders).
+    // Compute the content offset inside the pane rect (skip borders), using the
+    // SAME threshold the renderer used to decide whether to draw one.
     let (x_off, y_off) = match border_style {
         BorderStyle::ZellijStyle => {
-            if pane_rect.width >= 3 && pane_rect.height >= 3 {
+            if fits_zellij_border(pane_rect.width, pane_rect.height) {
                 (1u16, 1u16)
             } else {
                 (0, 0)
@@ -425,10 +426,11 @@ pub fn draw_zellij_border(
         return;
     }
 
+    let border_bg = theme.border_bg();
     let border_cell = |c: char| RenderCell {
         c,
         fg: border_fg.clone(),
-        bg: CellColor::Default,
+        bg: border_bg.clone(),
         bold: false,
         italic: false,
         underline: false,
@@ -542,52 +544,142 @@ fn draw_zellij_panes(
         let w = rect.width as usize;
         let available_width = w.saturating_sub(2); // inside the two corner chars
 
-        // Track stack label regions for hit testing (multi-pane stacks).
+        // Track stack label regions for hit testing (multi-pane stacks). The
+        // strip's own content starts one column inside the left corner, so the
+        // layout's strip-relative offsets are translated by `x + 1`.
         if let Some((names, pane_ids, _active_idx)) = &stack_info {
             if pane_ids.len() > 1 {
-                // Compute positions of each tab label in the top border.
-                // Layout: corner + space + [tab0] + " | " + [tab1] + ... + space + corner
-                let max_name_len = names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| {
-                        if n.is_empty() {
-                            format!("{}", pane_ids[i]).len()
-                        } else {
-                            n.chars().count()
-                        }
-                    })
-                    .max()
-                    .unwrap_or(0);
-                let tab_width = (max_name_len + 2).min(available_width);
-                // Start after corner (x) + 1 (space)
-                let mut label_x = (x + 1 + 1) as u16; // corner + leading space
-                for (i, pid) in pane_ids.iter().enumerate() {
-                    if i > 0 {
-                        label_x += 3; // " | " separator
-                    }
-                    let label_end = label_x + tab_width as u16;
+                let display_names = display_tab_names(names, pane_ids);
+                let strip_x = (x + 1) as u16;
+                for entry in
+                    tab_strip_layout(&display_names, available_width, &BorderStyle::ZellijStyle)
+                {
                     hit_regions.stack_regions.push(StackRegion {
-                        x_start: label_x,
-                        x_end: label_end,
+                        x_start: strip_x + entry.start as u16,
+                        x_end: strip_x + entry.end as u16,
                         y: y as u16,
-                        pane_id: *pid,
+                        pane_id: pane_ids[entry.index],
                     });
-                    label_x = label_end;
                 }
             }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tab strip geometry (shared by every renderer AND every hit-tester)
+// ---------------------------------------------------------------------------
+
+/// The separator drawn between adjacent tabs in a pane tab strip.
+const TAB_SEPARATOR: &str = " | ";
+
+/// One tab's placement in a tab strip: the tab's index and the columns
+/// `[start, end)` it occupies, relative to the strip's own left edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabStripEntry {
+    pub index: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The display name of each tab in a strip: the pane's name, or its id when the
+/// name is empty. **Always measure and lay out tab strips over these**, never
+/// over the raw names -- the id fallback is what a strip actually renders.
+pub fn display_tab_names(names: &[String], pane_ids: &[PaneId]) -> Vec<String> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if name.is_empty() {
+                pane_ids
+                    .get(i)
+                    .map(|id| format!("{id}"))
+                    .unwrap_or_default()
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
+}
+
+/// The fixed per-tab width of a strip: the longest display name plus one padding
+/// column on each side, capped to the strip width. `0` when there are no tabs.
+///
+/// Measured in CHARS. One hit-tester used to measure the id fallback in BYTES,
+/// which agreed with the renderer only because ids are numeric.
+pub fn tab_strip_width(display_names: &[String], width: usize) -> usize {
+    if display_names.is_empty() {
+        return 0;
+    }
+    let max_name = display_names
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    (max_name + 2).min(width)
+}
+
+/// **The one tab-strip geometry.** Where each tab lands in a strip `width`
+/// columns wide, relative to the strip's left edge.
+///
+/// Four sites used to recompute `(max_name_len + 2).min(width)` and the run of
+/// separators independently -- [`build_top_border_content`], the stacked-tab
+/// hit-test in [`draw_zellij_panes`], [`draw_tmux_tab_bar`], and the client's
+/// Monocle-strip hit-test -- so a change to the formula silently desynced a
+/// renderer from its own hit-tester. All four now go through here.
+///
+/// The leading offset is style-dependent, and the single-tab case is the
+/// off-by-one that used to make a 1-cell Monocle view's hit-test boundaries
+/// wrong: zellij's top border pads a MULTI-tab strip with one leading space, but
+/// draws a lone title as a bare ` name ` chip flush at the strip's start; the
+/// tmux tab bar is always flush.
+///
+/// Entries past the right edge are dropped; the last visible one is clipped.
+pub fn tab_strip_layout(
+    display_names: &[String],
+    width: usize,
+    style: &BorderStyle,
+) -> Vec<TabStripEntry> {
+    let mut out = Vec::new();
+    let tab_width = tab_strip_width(display_names, width);
+    if tab_width == 0 {
+        return out;
+    }
+    let mut x = match style {
+        BorderStyle::ZellijStyle if display_names.len() > 1 => 1,
+        _ => 0,
+    };
+    for index in 0..display_names.len() {
+        if index > 0 {
+            x += TAB_SEPARATOR.chars().count();
+        }
+        if x >= width {
+            break;
+        }
+        let end = (x + tab_width).min(width);
+        out.push(TabStripEntry {
+            index,
+            start: x,
+            end,
+        });
+        x = end;
+    }
+    out
+}
+
 /// Build the render cells for the top border content (pane name or tab labels).
 ///
-/// For single-pane stacks: ` name ` (space-padded name).
-/// For multi-pane stacks: equal-width tabs with mode-based coloring.
+/// For single-pane stacks: ` name ` (space-padded name), in the theme's
+/// `pane_label_fg`/`pane_label_bg` roles -- which default to the border's own
+/// color, so an unconfigured label keeps tracking focus as it always has. A pane
+/// with no name gets no label at all.
+/// For multi-pane stacks: equal-width tabs (placed by [`tab_strip_layout`]) with
+/// mode-based coloring for the active one and `tab_inactive_fg`/`tab_inactive_bg`
+/// for the rest.
 ///
 /// Public so the client-side view compositor can render a Monocle cell strip
 /// with byte-for-byte the same tab styling as a normal stacked pane's top
-/// border (fixed tab width, mode-colored active block, `Indexed(237)` inactive).
+/// border.
 pub fn build_top_border_content(
     stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
     pane_id: PaneId,
@@ -604,174 +696,92 @@ pub fn build_top_border_content(
     };
 
     let is_multi = pane_ids.len() > 1;
+    let border_bg = theme.border_bg();
+    let styled = |c: char, fg: &CellColor, bg: &CellColor, bold: bool| RenderCell {
+        c,
+        fg: fg.clone(),
+        bg: bg.clone(),
+        bold,
+        italic: false,
+        underline: false,
+        hyperlink: None,
+        width: 1,
+        combining: Vec::new(),
+    };
 
     if !is_multi {
-        // Single pane: show name if non-empty.
+        // Single pane: show the name if non-empty, as a ` name ` chip flush at
+        // the strip's start (which is what `tab_strip_layout` reports for a lone
+        // title, so the hit-test agrees).
         let name = names.first().map(|s| s.as_str()).unwrap_or("");
-        if !name.is_empty() {
-            // Leading space.
-            cells.push(RenderCell {
-                c: ' ',
-                fg: border_fg.clone(),
-                bg: CellColor::Default,
-                bold: false,
-                italic: false,
-                underline: false,
-                hyperlink: None,
-                width: 1,
-                combining: Vec::new(),
-            });
-            for ch in name.chars() {
-                cells.push(RenderCell {
-                    c: ch,
-                    fg: border_fg.clone(),
-                    bg: CellColor::Default,
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                    hyperlink: None,
-                    width: 1,
-                    combining: Vec::new(),
-                });
-            }
-            cells.push(RenderCell {
-                c: ' ',
-                fg: border_fg.clone(),
-                bg: CellColor::Default,
-                bold: false,
-                italic: false,
-                underline: false,
-                hyperlink: None,
-                width: 1,
-                combining: Vec::new(),
-            });
+        if name.is_empty() {
+            return cells;
         }
-    } else {
-        let _ = pane_id;
-        // Build display names and find the longest one.
-        let display_names: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                if name.is_empty() {
-                    format!("{}", pane_ids[i])
-                } else {
-                    name.clone()
-                }
-            })
-            .collect();
-        let max_name_len = display_names
-            .iter()
-            .map(|n| n.chars().count())
-            .max()
-            .unwrap_or(0);
-        // Fixed tab width: longest name + 2 (1 space padding each side), capped to fit.
-        let tab_width = (max_name_len + 2).min(max_width);
+        let (label_fg, label_bg) = theme.label_colors(border_fg);
+        let single = [name.to_string()];
+        let entry = match tab_strip_layout(&single, max_width, &BorderStyle::ZellijStyle).first() {
+            Some(e) => *e,
+            None => return cells,
+        };
+        for ch in format!(" {name} ").chars().take(entry.end - entry.start) {
+            cells.push(styled(ch, &label_fg, &label_bg, false));
+        }
+        return cells;
+    }
 
-        let (active_fg, active_bg) = theme.mode_colors(mode);
+    let _ = pane_id;
+    let display_names = display_tab_names(names, pane_ids);
+    let layout = tab_strip_layout(&display_names, max_width, &BorderStyle::ZellijStyle);
+    let (active_fg, active_bg) = theme.mode_colors(mode);
 
-        // Leading space before first tab.
-        cells.push(RenderCell {
-            c: ' ',
-            fg: border_fg.clone(),
-            bg: CellColor::Default,
-            bold: false,
-            italic: false,
-            underline: false,
-            hyperlink: None,
-            width: 1,
-            combining: Vec::new(),
-        });
-
-        for (i, display_name) in display_names.iter().enumerate() {
-            if i > 0 {
-                // Separator: " | "
-                for sep_ch in [' ', '|', ' '] {
-                    cells.push(RenderCell {
-                        c: sep_ch,
-                        fg: theme.frame_fg.clone(),
-                        bg: CellColor::Default,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        hyperlink: None,
-                        width: 1,
-                        combining: Vec::new(),
-                    });
-                }
+    for entry in &layout {
+        // Fill the gap the layout left in front of this tab: the strip's single
+        // leading pad space before the first tab, the `" | "` separator between
+        // tabs. Deriving the gap from the layout's own offsets is what keeps the
+        // painted columns and the hit-tested columns identical by construction.
+        let gap = entry.start.saturating_sub(cells.len());
+        if entry.index == 0 {
+            for _ in 0..gap {
+                cells.push(styled(' ', border_fg, &border_bg, false));
             }
-
-            let is_this_active = i == active_idx;
-            let (tab_fg, tab_bg, tab_bold) = if is_this_active {
-                (active_fg.clone(), active_bg.clone(), true)
-            } else {
-                (
-                    theme.tab_inactive_fg.clone(),
-                    CellColor::Indexed(237),
-                    false,
-                )
-            };
-
-            // Center the name within tab_width.
-            let name_len = display_name.chars().count();
-            let content_len = name_len.min(tab_width);
-            let pad_total = tab_width.saturating_sub(content_len);
-            let pad_left = pad_total / 2;
-            let pad_right = pad_total - pad_left;
-
-            for _ in 0..pad_left {
-                cells.push(RenderCell {
-                    c: ' ',
-                    fg: tab_fg.clone(),
-                    bg: tab_bg.clone(),
-                    bold: tab_bold,
-                    italic: false,
-                    underline: false,
-                    hyperlink: None,
-                    width: 1,
-                    combining: Vec::new(),
-                });
-            }
-            for ch in display_name.chars().take(tab_width) {
-                cells.push(RenderCell {
-                    c: ch,
-                    fg: tab_fg.clone(),
-                    bg: tab_bg.clone(),
-                    bold: tab_bold,
-                    italic: false,
-                    underline: false,
-                    hyperlink: None,
-                    width: 1,
-                    combining: Vec::new(),
-                });
-            }
-            for _ in 0..pad_right {
-                cells.push(RenderCell {
-                    c: ' ',
-                    fg: tab_fg.clone(),
-                    bg: tab_bg.clone(),
-                    bold: tab_bold,
-                    italic: false,
-                    underline: false,
-                    hyperlink: None,
-                    width: 1,
-                    combining: Vec::new(),
-                });
+        } else {
+            for ch in TAB_SEPARATOR.chars().take(gap) {
+                cells.push(styled(ch, &theme.frame_fg, &border_bg, false));
             }
         }
 
-        // Trailing space.
-        cells.push(RenderCell {
-            c: ' ',
-            fg: border_fg.clone(),
-            bg: CellColor::Default,
-            bold: false,
-            italic: false,
-            underline: false,
-            hyperlink: None,
-            width: 1,
-            combining: Vec::new(),
-        });
+        let (tab_fg, tab_bg, tab_bold) = if entry.index == active_idx {
+            (active_fg.clone(), active_bg.clone(), true)
+        } else {
+            (
+                theme.tab_inactive_fg.clone(),
+                theme.tab_inactive_bg.clone(),
+                false,
+            )
+        };
+
+        // Center the name within the tab's own width.
+        let tab_width = entry.end - entry.start;
+        let display_name = &display_names[entry.index];
+        let content_len = display_name.chars().count().min(tab_width);
+        let pad_total = tab_width - content_len;
+        let pad_left = pad_total / 2;
+        let pad_right = pad_total - pad_left;
+
+        for _ in 0..pad_left {
+            cells.push(styled(' ', &tab_fg, &tab_bg, tab_bold));
+        }
+        for ch in display_name.chars().take(content_len) {
+            cells.push(styled(ch, &tab_fg, &tab_bg, tab_bold));
+        }
+        for _ in 0..pad_right {
+            cells.push(styled(' ', &tab_fg, &tab_bg, tab_bold));
+        }
+    }
+
+    // Trailing space after the last tab.
+    if !layout.is_empty() {
+        cells.push(styled(' ', border_fg, &border_bg, false));
     }
 
     cells
@@ -874,150 +884,77 @@ pub fn draw_tmux_tab_bar(
         None => return,
     };
 
-    // Build display names and find the longest one.
-    let display_names: Vec<String> = names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            if name.is_empty() {
-                format!("{}", pane_ids[i])
-            } else {
-                name.clone()
-            }
-        })
-        .collect();
-    let max_name_len = display_names
-        .iter()
-        .map(|n| n.chars().count())
-        .max()
-        .unwrap_or(0);
-    // Fixed tab width: longest name + 2 (1 space padding each side), capped to fit.
-    let tab_width = (max_name_len + 2).min(total_width);
-
+    let display_names = display_tab_names(names, pane_ids);
+    let layout = tab_strip_layout(&display_names, total_width, &BorderStyle::TmuxStyle);
     let (active_fg, active_bg) = theme.mode_colors(mode);
-    let mut col = x_start;
+    let styled = |c: char, fg: &CellColor, bg: &CellColor, bold: bool| RenderCell {
+        c,
+        fg: fg.clone(),
+        bg: bg.clone(),
+        bold,
+        italic: false,
+        underline: false,
+        hyperlink: None,
+        width: 1,
+        combining: Vec::new(),
+    };
 
-    for (i, display_name) in display_names.iter().enumerate() {
-        if col >= x_end {
-            break;
-        }
-
-        if i > 0 {
-            // Separator: " | "
-            for sep_ch in [' ', '|', ' '] {
-                if col < x_end {
+    let mut prev_end: Option<usize> = None;
+    for entry in &layout {
+        // The layout leaves a gap between one tab and the next; that gap is the
+        // `" | "` separator. Its extent is read back OUT of the layout rather
+        // than assumed, so the drawn columns and the hit regions below stay
+        // identical by construction even if the separator ever changes width.
+        let mut col = x_start + entry.start;
+        if let Some(pe) = prev_end {
+            let gap = entry.start.saturating_sub(pe);
+            for (i, ch) in TAB_SEPARATOR.chars().take(gap).enumerate() {
+                let sep_col = x_start + pe + i;
+                if sep_col < x_end {
                     set_cell(
                         buffer,
                         y,
-                        col,
-                        RenderCell {
-                            c: sep_ch,
-                            fg: theme.separator_fg.clone(),
-                            bg: theme.status_bar_bg.clone(),
-                            bold: false,
-                            italic: false,
-                            underline: false,
-                            hyperlink: None,
-                            width: 1,
-                            combining: Vec::new(),
-                        },
+                        sep_col,
+                        styled(ch, &theme.separator_fg, &theme.status_bar_bg, false),
                     );
-                    col += 1;
                 }
             }
         }
+        prev_end = Some(entry.end);
 
-        // Track the stack label region for hit testing.
-        let label_start = col as u16;
-        let label_end = (col + tab_width).min(x_end) as u16;
         hit_regions.stack_regions.push(StackRegion {
-            x_start: label_start,
-            x_end: label_end,
+            x_start: (x_start + entry.start) as u16,
+            x_end: (x_start + entry.end).min(x_end) as u16,
             y: y as u16,
-            pane_id: pane_ids[i],
+            pane_id: pane_ids[entry.index],
         });
 
-        let is_active = i == active_idx;
-        let (fg, bg, bold) = if is_active {
+        let (fg, bg, bold) = if entry.index == active_idx {
             (active_fg.clone(), active_bg.clone(), true)
         } else {
             (
                 theme.tab_inactive_fg.clone(),
-                CellColor::Indexed(237),
+                theme.tab_inactive_bg.clone(),
                 false,
             )
         };
 
-        // Center the name within tab_width.
-        let name_len = display_name.chars().count();
-        let content_len = name_len.min(tab_width);
-        let pad_total = tab_width.saturating_sub(content_len);
+        // Center the name within the tab's own width.
+        let tab_width = entry.end - entry.start;
+        let display_name = &display_names[entry.index];
+        let content_len = display_name.chars().count().min(tab_width);
+        let pad_total = tab_width - content_len;
         let pad_left = pad_total / 2;
-        let pad_right = pad_total - pad_left;
 
-        for _ in 0..pad_left {
-            if col < x_end {
-                set_cell(
-                    buffer,
-                    y,
-                    col,
-                    RenderCell {
-                        c: ' ',
-                        fg: fg.clone(),
-                        bg: bg.clone(),
-                        bold,
-                        italic: false,
-                        underline: false,
-                        hyperlink: None,
-                        width: 1,
-                        combining: Vec::new(),
-                    },
-                );
-                col += 1;
-            }
-        }
-        for ch in display_name.chars().take(tab_width) {
+        let block = std::iter::repeat_n(' ', pad_left)
+            .chain(display_name.chars().take(content_len))
+            .chain(std::iter::repeat_n(' ', pad_total - pad_left));
+        for ch in block {
             if col >= x_end {
                 break;
             }
-            set_cell(
-                buffer,
-                y,
-                col,
-                RenderCell {
-                    c: ch,
-                    fg: fg.clone(),
-                    bg: bg.clone(),
-                    bold,
-                    italic: false,
-                    underline: false,
-                    hyperlink: None,
-                    width: 1,
-                    combining: Vec::new(),
-                },
-            );
+            set_cell(buffer, y, col, styled(ch, &fg, &bg, bold));
             col += 1;
-        }
-        for _ in 0..pad_right {
-            if col < x_end {
-                set_cell(
-                    buffer,
-                    y,
-                    col,
-                    RenderCell {
-                        c: ' ',
-                        fg: fg.clone(),
-                        bg: bg.clone(),
-                        bold,
-                        italic: false,
-                        underline: false,
-                        hyperlink: None,
-                        width: 1,
-                        combining: Vec::new(),
-                    },
-                );
-                col += 1;
-            }
         }
     }
 }
@@ -1032,10 +969,11 @@ pub fn draw_tmux_dividers(
     pane_rects: &[(PaneId, Rect)],
     theme: &CompositorTheme,
 ) {
+    // A divider IS the frame in tmux style, so it wears the frame's background.
     let divider_cell = |c: char| RenderCell {
         c,
         fg: theme.frame_fg.clone(),
-        bg: CellColor::Default,
+        bg: theme.border_bg(),
         bold: false,
         italic: false,
         underline: false,
@@ -1173,8 +1111,8 @@ pub fn draw_popup(
     }
 
     // Too small for a frame: paint content edge-to-edge (mirrors
-    // `draw_zellij_panes`' small-rect fallback).
-    if rect.width < 3 || rect.height < 3 {
+    // `draw_zellij_panes`' small-rect fallback, via the SAME threshold).
+    if !fits_zellij_border(rect.width, rect.height) {
         blit_screen(buffer, screen, rect, scroll_offset);
         return rect;
     }
@@ -1195,7 +1133,7 @@ pub fn draw_popup(
     let border_cell = |c: char| RenderCell {
         c,
         fg: border_fg.clone(),
-        bg: CellColor::Default,
+        bg: theme.border_bg(),
         bold: false,
         italic: false,
         underline: false,
@@ -1365,6 +1303,92 @@ fn set_cell(buffer: &mut [Vec<RenderCell>], row: usize, col: usize, cell: Render
 // Status bar
 // ---------------------------------------------------------------------------
 
+/// A styled run of text on the status bar's right-hand side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSegment {
+    pub text: String,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub bold: bool,
+}
+
+/// **The one definition of the status bar's right-hand content**: the search
+/// counter (when searching) followed by the layout-mode indicator.
+///
+/// The client's View status bar used to build its own right side and styled the
+/// layout indicator teal-bold-on-mantle, while this bar draws it black-on-grey
+/// and not bold -- so entering a View visibly changed the indicator. Both sides
+/// now call this, exactly as both call [`draw_zellij_border`] for their frames.
+pub fn status_right_segments(
+    search_info: Option<(usize, usize)>,
+    layout_mode: &str,
+    theme: &CompositorTheme,
+) -> Vec<StatusSegment> {
+    let mut segments = Vec::new();
+    if let Some((current, total)) = search_info {
+        segments.push(StatusSegment {
+            text: format!(" ({}/{}) ", current + 1, total),
+            fg: theme.search_count_fg.clone(),
+            bg: theme.search_count_bg.clone(),
+            bold: false,
+        });
+    }
+    if !layout_mode.is_empty() {
+        segments.push(StatusSegment {
+            text: format!(" {layout_mode} "),
+            fg: theme.layout_indicator_fg.clone(),
+            bg: theme.layout_indicator_bg.clone(),
+            bold: false,
+        });
+    }
+    segments
+}
+
+/// Paint `segments` right-aligned on a status-bar row `cols` wide, given that
+/// the left-hand content already occupies columns `0..left_end`.
+///
+/// When the two would overlap, the right side is dropped rather than shifted:
+/// a truncated session/tab list is far more confusing than a missing layout
+/// hint, and this is the behavior the server bar has always had. The View bar
+/// used to append the indicator after the left content instead; sharing this
+/// function is what settles the disagreement.
+///
+/// Widths are counted in CHARS.
+pub fn draw_right_segments(
+    row: &mut [RenderCell],
+    cols: usize,
+    left_end: usize,
+    segments: &[StatusSegment],
+) {
+    let total: usize = segments.iter().map(|s| s.text.chars().count()).sum();
+    if total == 0 {
+        return;
+    }
+    let start = cols.saturating_sub(total);
+    if start <= left_end {
+        return;
+    }
+    let mut x = start;
+    for seg in segments {
+        for ch in seg.text.chars() {
+            if x < cols && x < row.len() {
+                row[x] = RenderCell {
+                    c: ch,
+                    fg: seg.fg.clone(),
+                    bg: seg.bg.clone(),
+                    bold: seg.bold,
+                    italic: false,
+                    underline: false,
+                    hyperlink: None,
+                    width: 1,
+                    combining: Vec::new(),
+                };
+            }
+            x += 1;
+        }
+    }
+}
+
 /// Draw the status bar on the last row of the buffer.
 fn draw_status_bar(
     buffer: &mut [Vec<RenderCell>],
@@ -1487,9 +1511,9 @@ fn draw_status_bar(
             None
         } else {
             match activity {
-                TabActivity::Bell => Some(('!', CellColor::Indexed(9))), // bright red: urgent
-                TabActivity::Activity => Some(('\u{25CF}', CellColor::Indexed(11))), // ●, bright yellow
-                TabActivity::Silent => Some(('\u{2713}', CellColor::Indexed(10))), // ✓, bright green
+                TabActivity::Bell => Some(('!', theme.tab_bell_fg.clone())), // urgent
+                TabActivity::Activity => Some(('\u{25CF}', theme.tab_activity_fg.clone())), // ●
+                TabActivity::Silent => Some(('\u{2713}', theme.tab_silent_fg.clone())), // ✓
                 TabActivity::None => None,
             }
         };
@@ -1545,52 +1569,10 @@ fn draw_status_bar(
         });
     }
 
-    // Build right-side content: search info + layout mode.
-    let mut right_parts: Vec<String> = Vec::new();
-
-    if let Some((current, total)) = info.search_info {
-        right_parts.push(format!(" ({}/{}) ", current + 1, total));
-    }
-
-    if !info.layout_mode.is_empty() {
-        right_parts.push(format!(" {} ", info.layout_mode));
-    }
-
-    if !right_parts.is_empty() {
-        let right_str: String = right_parts.concat();
-        let right_len = right_str.len();
-        let right_x = cols.saturating_sub(right_len);
-        // Only draw if it doesn't overlap with the left-side content.
-        if right_x > x {
-            // For search info portion, use yellow colors; for layout, use grey.
-            let search_info_len = if info.search_info.is_some() {
-                right_parts[0].len()
-            } else {
-                0
-            };
-
-            for (rx, (i, ch)) in (right_x..).zip(right_str.chars().enumerate()) {
-                if rx < cols && rx < buffer[bar_row].len() {
-                    let (fg, bg) = if i < search_info_len {
-                        (CellColor::Indexed(0), CellColor::Indexed(11)) // Black on bright yellow
-                    } else {
-                        (CellColor::Indexed(0), CellColor::Indexed(245)) // Black on grey
-                    };
-                    buffer[bar_row][rx] = RenderCell {
-                        c: ch,
-                        fg,
-                        bg,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        hyperlink: None,
-                        width: 1,
-                        combining: Vec::new(),
-                    };
-                }
-            }
-        }
-    }
+    // Right-side content (search counter + layout indicator), built and painted
+    // by the shared helpers the View status bar also uses.
+    let segments = status_right_segments(info.search_info, &info.layout_mode, theme);
+    draw_right_segments(&mut buffer[bar_row], cols, x, &segments);
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,8 +1970,393 @@ mod tests {
             &CompositorTheme::default(),
         );
 
-        // First row should be the tab bar (inactive tab uses 237 background).
-        assert_eq!(result[0][0].bg, CellColor::Indexed(237));
+        // First row should be the tab bar; its inactive tab wears the named
+        // `tab_inactive_bg` role (which defaults to the historical Indexed 237).
+        assert_eq!(result[0][0].bg, CompositorTheme::default().tab_inactive_bg);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tab strip geometry: ONE helper drives both renderers and both hit-testers
+    // -----------------------------------------------------------------------
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tab_strip_layout_places_multi_tabs_with_separators() {
+        // Longest name "gamma" (5) + 2 = 7-wide tabs, a leading pad space in
+        // zellij style, `" | "` (3) between tabs.
+        let n = names(&["alpha", "bb", "gamma"]);
+        let zj = tab_strip_layout(&n, 80, &BorderStyle::ZellijStyle);
+        assert_eq!(
+            zj,
+            vec![
+                TabStripEntry {
+                    index: 0,
+                    start: 1,
+                    end: 8
+                },
+                TabStripEntry {
+                    index: 1,
+                    start: 11,
+                    end: 18
+                },
+                TabStripEntry {
+                    index: 2,
+                    start: 21,
+                    end: 28
+                },
+            ]
+        );
+        // The tmux tab bar is flush left; everything else is identical.
+        let tm = tab_strip_layout(&n, 80, &BorderStyle::TmuxStyle);
+        assert_eq!(
+            tm,
+            vec![
+                TabStripEntry {
+                    index: 0,
+                    start: 0,
+                    end: 7
+                },
+                TabStripEntry {
+                    index: 1,
+                    start: 10,
+                    end: 17
+                },
+                TabStripEntry {
+                    index: 2,
+                    start: 20,
+                    end: 27
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_strip_layout_single_title_is_flush_not_offset() {
+        // The off-by-one that made a 1-cell Monocle view's hit-test wrong: the
+        // zellij top border draws a LONE title as a bare ` name ` chip flush at
+        // the strip's start, not offset by the multi-tab leading pad space.
+        let n = names(&["solo"]);
+        let zj = tab_strip_layout(&n, 80, &BorderStyle::ZellijStyle);
+        assert_eq!(
+            zj,
+            vec![TabStripEntry {
+                index: 0,
+                start: 0,
+                end: 6
+            }]
+        );
+
+        // And the layout agrees with what `build_top_border_content` paints:
+        // the chip occupies exactly columns 0..6 of the strip.
+        let theme = CompositorTheme::default();
+        let stack = Some((names(&["solo"]), vec![1 as PaneId], 0usize));
+        let cells = build_top_border_content(&stack, 1, &theme.frame_fg, "NORMAL", 80, &theme);
+        let text: String = cells.iter().map(|c| c.c).collect();
+        assert_eq!(text, " solo ");
+        assert_eq!(cells.len(), zj[0].end - zj[0].start);
+    }
+
+    #[test]
+    fn tab_strip_layout_measures_chars_not_bytes() {
+        // The zellij hit-test used to measure the id fallback in BYTES while the
+        // renderer measured in chars; they agreed only because ids are numeric.
+        // A multi-byte title makes the two answers differ by 4 columns.
+        let n = names(&["日本語", "ab"]);
+        assert_eq!(tab_strip_width(&n, 80), 5); // 3 chars + 2, NOT 9 bytes + 2
+        let layout = tab_strip_layout(&n, 80, &BorderStyle::ZellijStyle);
+        assert_eq!(
+            layout,
+            vec![
+                TabStripEntry {
+                    index: 0,
+                    start: 1,
+                    end: 6
+                },
+                TabStripEntry {
+                    index: 1,
+                    start: 9,
+                    end: 14
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_strip_layout_drops_tabs_past_the_right_edge() {
+        let n = names(&["alpha", "bb", "gamma"]);
+        // Room for the first tab and a clipped second; the third is dropped.
+        let layout = tab_strip_layout(&n, 14, &BorderStyle::ZellijStyle);
+        assert_eq!(
+            layout,
+            vec![
+                TabStripEntry {
+                    index: 0,
+                    start: 1,
+                    end: 8
+                },
+                TabStripEntry {
+                    index: 1,
+                    start: 11,
+                    end: 14
+                },
+            ]
+        );
+        assert!(tab_strip_layout(&names(&[]), 80, &BorderStyle::ZellijStyle).is_empty());
+    }
+
+    #[test]
+    fn clipped_tab_is_painted_exactly_where_the_layout_says() {
+        // A strip too narrow for its tabs: the last visible tab is clipped, and
+        // its painted block must fill exactly the clipped range the layout
+        // reports (padding is centered within the CLIPPED width, so paint and
+        // hit-test agree; the old code centered within the full tab width and
+        // let the caller truncate from the right, which desynced the two).
+        let theme = CompositorTheme::default();
+        let stack = Some((names(&["alpha", "bb"]), vec![1 as PaneId, 2], 0usize));
+        let layout = tab_strip_layout(&names(&["alpha", "bb"]), 14, &BorderStyle::ZellijStyle);
+        assert_eq!(
+            layout[1],
+            TabStripEntry {
+                index: 1,
+                start: 11,
+                end: 14
+            }
+        );
+        let cells = build_top_border_content(&stack, 1, &theme.frame_fg, "NORMAL", 14, &theme);
+        // The clipped tab occupies columns 11..14 of the strip content.
+        for (i, cell) in cells.iter().enumerate().take(14).skip(11) {
+            assert_eq!(cell.bg, theme.tab_inactive_bg, "strip col {i}");
+        }
+        // ...and the separator immediately before it is not part of the block.
+        assert_ne!(cells[10].bg, theme.tab_inactive_bg);
+    }
+
+    #[test]
+    fn tmux_tab_bar_separator_is_placed_from_the_layout() {
+        // Regression guard for the separator's column arithmetic: it is derived
+        // from the previous tab's end, not from a hardcoded back-offset (which
+        // would underflow at `x_start == 0` if a tab ever started before it).
+        let theme = CompositorTheme::default();
+        let display = names(&["a", "b"]);
+        let stack = Some((display.clone(), vec![1 as PaneId, 2], 0usize));
+        let mut buffer = vec![vec![RenderCell::default(); 20]; 2];
+        let mut regions = HitRegions::default();
+        draw_tmux_tab_bar(
+            &mut buffer,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 2,
+            },
+            &stack,
+            "NORMAL",
+            &mut regions,
+            &theme,
+        );
+        let layout = tab_strip_layout(&display, 20, &BorderStyle::TmuxStyle);
+        // 3-wide tabs flush left: 0..3, separator 3..6, second tab 6..9.
+        assert_eq!(layout[0].end, 3);
+        assert_eq!(layout[1].start, 6);
+        let sep: String = (layout[0].end..layout[1].start)
+            .map(|x| buffer[0][x].c)
+            .collect();
+        assert_eq!(sep, TAB_SEPARATOR);
+        assert_eq!(buffer[0][layout[0].end].fg, theme.separator_fg);
+
+        // A strip so narrow the second tab is dropped must still not panic.
+        let mut narrow = vec![vec![RenderCell::default(); 4]; 2];
+        let mut r2 = HitRegions::default();
+        draw_tmux_tab_bar(
+            &mut narrow,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            },
+            &stack,
+            "NORMAL",
+            &mut r2,
+            &theme,
+        );
+        assert_eq!(r2.stack_regions.len(), 1, "only the first tab fits");
+    }
+
+    #[test]
+    fn empty_pane_names_fall_back_to_ids_everywhere() {
+        // `display_tab_names` is what every strip measures and renders over.
+        let d = display_tab_names(&names(&["", "named"]), &[7, 8]);
+        assert_eq!(d, names(&["7", "named"]));
+    }
+
+    #[test]
+    fn zellij_hit_regions_match_the_painted_tab_columns() {
+        // The regression the shared helper exists to prevent: a renderer and its
+        // own hit-tester disagreeing about where a tab starts. Composite a real
+        // 2-pane stack and check every recorded stack region against the columns
+        // that actually carry a tab-block background.
+        let mut layout = LayoutNode::new_stack(1);
+        assert!(layout.add_to_stack(1, 2), "stacked pane 2 onto pane 1");
+        layout::set_pane_name(&mut layout, 1, "alpha");
+        layout::set_pane_name(&mut layout, 2, "bb");
+        let s1 = Screen::new(30, 8, 100);
+        let s2 = Screen::new(30, 8, 100);
+        let mut pane_screens = HashMap::new();
+        pane_screens.insert(1 as PaneId, &s1);
+        pane_screens.insert(2 as PaneId, &s2);
+        let theme = CompositorTheme::default();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut regions = HitRegions::default();
+        let mut buffer = vec![vec![RenderCell::default(); 40]; 10];
+        draw_zellij_panes(
+            &mut buffer,
+            &[(1, area)],
+            &pane_screens,
+            &layout,
+            1,
+            "NORMAL",
+            &mut regions,
+            &HashMap::new(),
+            &theme,
+        );
+        assert_eq!(regions.stack_regions.len(), 2, "one region per stacked tab");
+        let (_, mode_bg) = theme.mode_colors("NORMAL");
+        // Which tab is ACTIVE is the stack's own business, not the focused
+        // pane's -- ask the same source the renderer did.
+        let (_, stack_ids, active_idx) = layout::find_stack_names(&layout, 1).expect("stack info");
+        let active_pane = stack_ids[active_idx];
+        for region in &regions.stack_regions {
+            let expect_bg = if region.pane_id == active_pane {
+                mode_bg.clone()
+            } else {
+                theme.tab_inactive_bg.clone()
+            };
+            for x in region.x_start..region.x_end {
+                assert_eq!(
+                    buffer[0][x as usize].bg, expect_bg,
+                    "pane {} col {x} is not part of its painted tab block",
+                    region.pane_id
+                );
+            }
+            // The column just left of the region is NOT part of the block, so
+            // the region's left edge is the tab's true left edge.
+            assert_ne!(
+                buffer[0][(region.x_start - 1) as usize].bg,
+                expect_bg,
+                "region for pane {} starts one column too late",
+                region.pane_id
+            );
+        }
+    }
+
+    #[test]
+    fn tmux_tab_bar_hit_regions_match_the_painted_columns() {
+        let theme = CompositorTheme::default();
+        let stack = Some((names(&["alpha", "bb"]), vec![1 as PaneId, 2], 0usize));
+        let mut buffer = vec![vec![RenderCell::default(); 40]; 3];
+        let mut regions = HitRegions::default();
+        draw_tmux_tab_bar(
+            &mut buffer,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 3,
+            },
+            &stack,
+            "NORMAL",
+            &mut regions,
+            &theme,
+        );
+        assert_eq!(regions.stack_regions.len(), 2);
+        let (_, mode_bg) = theme.mode_colors("NORMAL");
+        // Flush left, so the first tab starts at column 0.
+        assert_eq!(regions.stack_regions[0].x_start, 0);
+        for region in &regions.stack_regions {
+            // `stack` above declares index 0 (pane 1) active.
+            let expect_bg = if region.pane_id == 1 {
+                mode_bg.clone()
+            } else {
+                theme.tab_inactive_bg.clone()
+            };
+            for x in region.x_start..region.x_end {
+                assert_eq!(buffer[0][x as usize].bg, expect_bg, "col {x}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Status bar right-hand segments (shared with the client's View bar)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn status_right_segments_are_themed_not_hardcoded() {
+        let theme = CompositorTheme::default();
+        let segs = status_right_segments(Some((2, 9)), "bsp", &theme);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, " (3/9) ");
+        assert_eq!(segs[0].fg, theme.search_count_fg);
+        assert_eq!(segs[0].bg, theme.search_count_bg);
+        assert!(!segs[0].bold);
+        assert_eq!(segs[1].text, " bsp ");
+        assert_eq!(segs[1].fg, theme.layout_indicator_fg);
+        assert_eq!(segs[1].bg, theme.layout_indicator_bg);
+        assert!(!segs[1].bold, "the layout indicator is NOT bold");
+
+        // No search, no layout name -> nothing to draw.
+        assert!(status_right_segments(None, "", &theme).is_empty());
+        assert_eq!(status_right_segments(None, "grid", &theme).len(), 1);
+    }
+
+    #[test]
+    fn draw_right_segments_is_right_aligned_and_drops_on_overlap() {
+        let theme = CompositorTheme::default();
+        let segs = status_right_segments(None, "grid", &theme); // " grid " = 6
+        let mut row = vec![RenderCell::default(); 20];
+        draw_right_segments(&mut row, 20, 0, &segs);
+        let text: String = row.iter().map(|c| c.c).collect();
+        assert_eq!(text, format!("{}{}", " ".repeat(14), " grid "));
+        assert_eq!(row[19].fg, theme.layout_indicator_fg);
+        assert_eq!(row[19].bg, theme.layout_indicator_bg);
+
+        // The left content reaches column 15: the segment would overlap it, so
+        // it is dropped rather than shifted (the server bar's long-standing
+        // rule, which the View bar now shares -- it used to append instead).
+        let mut row2 = vec![RenderCell::default(); 20];
+        draw_right_segments(&mut row2, 20, 15, &segs);
+        assert!(
+            row2.iter().all(|c| c.bg != theme.layout_indicator_bg),
+            "should have drawn nothing"
+        );
+    }
+
+    #[test]
+    fn draw_right_segments_counts_chars_not_bytes() {
+        // The server bar used to size the right side with `String::len()`
+        // (bytes) while indexing it by char, so a multi-byte layout name would
+        // have mis-aligned it.
+        let theme = CompositorTheme::default();
+        let segs = status_right_segments(None, "日本", &theme); // 4 chars, 8 bytes
+        let mut row = vec![RenderCell::default(); 20];
+        draw_right_segments(&mut row, 20, 0, &segs);
+        let text: String = row.iter().map(|c| c.c).collect();
+        assert!(
+            text.ends_with(" 日本 "),
+            "not right-aligned by chars: {text:?}"
+        );
+        // 4 chars -> starts at column 16. Sized in BYTES it would have started
+        // at column 12.
+        assert_eq!(row[17].c, '日');
+        assert_ne!(row[13].bg, theme.layout_indicator_bg);
     }
 
     #[test]
@@ -2633,12 +3000,14 @@ mod tests {
             "active tab should be bold: {bar:?}"
         );
 
-        // The Activity marker cell must carry the attention color (bright yellow)
-        // rather than the plain inactive-tab foreground.
+        // The Activity marker cell must carry the attention color from the
+        // named `tab_activity_fg` role (default: bright yellow) rather than the
+        // plain inactive-tab foreground.
         let marker_col = buffer[23]
             .iter()
             .position(|c| c.c == '\u{25CF}')
             .expect("activity marker present");
-        assert_eq!(buffer[23][marker_col].fg, CellColor::Indexed(11));
+        assert_eq!(buffer[23][marker_col].fg, theme.tab_activity_fg);
+        assert_ne!(buffer[23][marker_col].fg, theme.tab_inactive_fg);
     }
 }

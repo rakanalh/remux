@@ -11,16 +11,24 @@ PREFIX = b"\x01"  # Ctrl-a
 
 
 class Tui:
-    def __init__(self, rundir, cols=120, rows=40):
+    def __init__(self, rundir, cols=120, rows=40, config=None):
         self.rundir = rundir
         self.cols = cols
         self.rows = rows
         self.child = None
+        # Optional `config.toml` body. Written into the isolated
+        # XDG_CONFIG_HOME, which the client AND the server it auto-spawns both
+        # read -- so one file themes both sides of a parity comparison.
+        self.config = config
 
     def start(self):
         shutil.rmtree(self.rundir, ignore_errors=True)
         for s in ("run", "state", "data", "config"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
+        if self.config is not None:
+            os.makedirs(f"{self.rundir}/config/remux", exist_ok=True)
+            with open(f"{self.rundir}/config/remux/config.toml", "w") as f:
+                f.write(self.config)
         env = {
             **os.environ,
             "XDG_RUNTIME_DIR": f"{self.rundir}/run",

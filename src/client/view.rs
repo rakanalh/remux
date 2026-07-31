@@ -31,8 +31,8 @@ use crate::config::theme::CompositorTheme;
 use crate::config::BorderStyle;
 use crate::protocol::{CellColor, ConnDescriptor, PaneId, RenderCell, ViewId, ViewInfo};
 use crate::server::compositor::{
-    build_top_border_content, draw_tmux_dividers, draw_tmux_tab_bar, draw_zellij_border,
-    fits_zellij_border, HitRegions,
+    build_top_border_content, draw_right_segments, draw_tmux_dividers, draw_tmux_tab_bar,
+    draw_zellij_border, fits_zellij_border, status_right_segments, tab_strip_layout, HitRegions,
 };
 use crate::server::layout::{
     compute_layout, focus_in_direction, FocusDirection, LayoutMode, LayoutNode, Rect,
@@ -638,11 +638,11 @@ pub fn cell_at(
         if y == strip.y && x >= strip.x && x < strip.x + strip.width {
             let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
             let rel = (x - strip.x) as usize;
-            if let Some((idx, _, _)) = strip_segments(&titles, strip.width as usize, style)
+            if let Some(entry) = tab_strip_layout(&titles, strip.width as usize, style)
                 .into_iter()
-                .find(|(_, s, e)| rel >= *s && rel < *e)
+                .find(|e| rel >= e.start && rel < e.end)
             {
-                return Some(idx);
+                return Some(entry.index);
             }
         }
     }
@@ -1037,64 +1037,11 @@ fn cell_title(cell: &ViewCell) -> String {
     })
 }
 
-/// Fixed per-tab width for the Monocle strip: the longest title plus one padding
-/// column on each side (as the regular strip does: `max_name_len + 2`), capped
-/// to the strip width. `0` when there are no titles.
-///
-/// This mirrors the `tab_width` computed inside
-/// [`build_top_border_content`](crate::server::compositor::build_top_border_content):
-/// `draw_monocle_strip` renders via that shared function while [`cell_at`]
-/// hit-tests via [`strip_segments`], so both must derive tab boundaries from the
-/// identical formula over the identical titles (`cell_title`, never empty).
-fn strip_tab_width(titles: &[String], width: usize) -> usize {
-    let max_name = titles.iter().map(|t| t.chars().count()).max().unwrap_or(0);
-    (max_name + 2).min(width)
-}
-
-/// Lay out the Monocle title strip's tab entries within `width` columns,
-/// mirroring the regular stacked-pane strip for `style`: equal-width tabs
-/// (`strip_tab_width`) separated by a 3-column `" | "` separator, preceded by a
-/// leading space in `ZellijStyle` only.
-/// Returns `(cell_index, start, end)` column offsets (relative to the strip's
-/// left edge, `end` exclusive) for every entry at least partially visible;
-/// entries past the right edge are dropped and the last visible one is clipped.
-/// Used by [`cell_at`] for hit-testing; its boundaries match the columns
-/// [`draw_monocle_strip`] paints — via
-/// [`build_top_border_content`](crate::server::compositor::build_top_border_content)
-/// (zellij: one leading space) or
-/// [`draw_tmux_tab_bar`](crate::server::compositor::draw_tmux_tab_bar) (tmux:
-/// flush left) — so a click always lands on the tab drawn there.
-fn strip_segments(
-    titles: &[String],
-    width: usize,
-    style: &BorderStyle,
-) -> Vec<(usize, usize, usize)> {
-    let mut segs = Vec::new();
-    let tab_width = strip_tab_width(titles, width);
-    if tab_width == 0 {
-        return segs;
-    }
-    // Zellij's top-border strip starts with a padding space; the tmux tab bar
-    // starts flush at the left edge.
-    let mut x = match style {
-        BorderStyle::ZellijStyle => 1usize,
-        BorderStyle::TmuxStyle => 0usize,
-    };
-    for i in 0..titles.len() {
-        if i > 0 {
-            // 3-column " | " separator between tabs.
-            x += 3;
-        }
-        if x >= width {
-            break;
-        }
-        let start = x;
-        let end = (x + tab_width).min(width);
-        segs.push((i, start, end));
-        x = end;
-    }
-    segs
-}
+// (The Monocle strip's tab geometry lives in
+// `compositor::tab_strip_layout` — the SAME function that places the tabs
+// `draw_monocle_strip` paints, so a click can never land off the tab drawn
+// there. This module used to carry its own copy of the formula, which did not
+// model the single-title case and so was off by one for a 1-cell view.)
 
 /// Draw the Monocle title strip on `strip` (the reserved top row of the cell
 /// area): a tab-like list of EVERY cell's title, rendered by the SAME server
@@ -1102,7 +1049,7 @@ fn strip_segments(
 /// pixel-identical to a normal Monocle tab's —
 /// [`build_top_border_content`](crate::server::compositor::build_top_border_content)
 /// for `ZellijStyle` (top-border tabs: fixed tab width, the active tab filled
-/// with `theme.mode_colors(mode)`, inactive tabs on `CellColor::Indexed(237)`,
+/// with `theme.mode_colors(mode)`, inactive tabs on `tab_inactive_bg`,
 /// `" | "` separators) and
 /// [`draw_tmux_tab_bar`](crate::server::compositor::draw_tmux_tab_bar) for
 /// `TmuxStyle` (status-bar-colored bar, `separator_fg` separators).
@@ -1126,7 +1073,7 @@ fn draw_monocle_strip(
     if width == 0 {
         return;
     }
-    // Same titles vector `cell_at`/`strip_segments` hit-test against, so the
+    // Same titles vector `cell_at`/`tab_strip_layout` hit-test against, so the
     // rendered tab boundaries and the click boundaries derive from identical
     // inputs. `cell_title` is never empty, so the pseudo-id fallback inside
     // `build_top_border_content` never fires and both `max_name_len`
@@ -1137,7 +1084,7 @@ fn draw_monocle_strip(
     if matches!(style, BorderStyle::TmuxStyle) {
         // The tmux tab bar writes straight into the buffer at `strip`'s (already
         // buffer-local) position and needs no hit regions here: `cell_at`
-        // hit-tests the strip itself via `strip_segments`.
+        // hit-tests the strip itself via `tab_strip_layout`.
         let mut regions = HitRegions::default();
         draw_tmux_tab_bar(
             buf,
@@ -1311,24 +1258,13 @@ pub fn draw_status_bar(
         );
     }
 
-    // Right side: the layout name, right-aligned when there is room; otherwise
-    // just appended after the left content.
-    let layout_seg = format!(" {layout_name} ");
-    let lw = layout_seg.chars().count();
-    let start = if cols > lw && cols - lw > x {
-        cols - lw
-    } else {
-        x
-    };
-    put_str(
-        row,
-        start,
-        cols,
-        &layout_seg,
-        &theme.session_name_fg,
-        &theme.status_bar_bg,
-        true,
-    );
+    // Right side: built and painted by the SERVER's own status-bar helpers, so
+    // the layout indicator is styled exactly as a normal tab's -- including the
+    // "drop it rather than overlap the left content" rule. It used to be drawn
+    // here in `session_name_fg` + bold, which visibly changed the indicator the
+    // moment you entered a view.
+    let segments = status_right_segments(None, layout_name, theme);
+    draw_right_segments(row, cols, x, &segments);
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1274,7 @@ pub fn draw_status_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::compositor::TabStripEntry;
     use crate::server::layout::{
         all_pane_ids, find_neighbor, relocate_pane_to_edge, Direction, GridLayout, MonocleLayout,
     };
@@ -1799,8 +1736,9 @@ mod tests {
 
     #[test]
     fn monocle_strip_inactive_tab_has_background_block() {
-        // Mirrors the regular strip's inactive-tab grey background (Indexed 237)
-        // and inactive-tab fg (`theme.tab_inactive_fg`).
+        // Mirrors the regular strip's inactive-tab block: the `tab_inactive_bg`
+        // / `tab_inactive_fg` roles (which default to the historical
+        // `Indexed(237)` / overlay2).
         let theme = tt();
         let mut cells: Vec<ViewCell> = (0..2).map(|id| cell_with(id, None)).collect();
         cells[0].title = Some("aa".into());
@@ -1809,17 +1747,17 @@ mod tests {
         let buf = composite(&view, area(80, 24), &theme, "NORMAL", &zj());
         let row0 = &buf[0];
         let bpos = row0.iter().position(|c| c.c == 'b').unwrap();
-        assert_eq!(row0[bpos].bg, CellColor::Indexed(237));
+        assert_eq!(row0[bpos].bg, theme.tab_inactive_bg);
         assert_eq!(row0[bpos].fg, theme.tab_inactive_fg);
         assert!(!row0[bpos].bold, "inactive tab is not bold");
     }
 
     #[test]
-    fn monocle_strip_render_matches_strip_segments() {
-        // Hit-testing (`cell_at` via `strip_segments`) must agree with what
+    fn monocle_strip_render_matches_tab_strip_layout() {
+        // Hit-testing (`cell_at` via `tab_strip_layout`) must agree with what
         // `build_top_border_content` actually paints. Assert each tab's rendered
         // start column (first cell whose bg is a tab block, i.e. NOT the strip's
-        // default-bg leading space / separator) equals `strip_segments`' start.
+        // default-bg leading space / separator) equals the layout's start.
         let theme = tt();
         let mut cells: Vec<ViewCell> = (0..3).map(|id| cell_with(id, None)).collect();
         cells[0].title = Some("alpha".into());
@@ -1831,17 +1769,22 @@ mod tests {
         let strip = monocle_strip_rect(&view, a).unwrap();
         let width = strip.width as usize;
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let segs = strip_segments(&titles, width, &zj());
+        let segs = tab_strip_layout(&titles, width, &zj());
         assert_eq!(segs.len(), 3, "three visible tabs");
         let (_, mode_bg) = theme.mode_colors("NORMAL");
-        for (idx, start, end) in segs {
+        for TabStripEntry {
+            index: idx,
+            start,
+            end,
+        } in segs
+        {
             // Every column of the tab carries a tab background block (mode color
             // for the focused tab, Indexed(237) otherwise) rather than the
             // default-bg spaces used for the leading space and " | " separators.
             let expect_bg = if idx == view.focused {
                 mode_bg.clone()
             } else {
-                CellColor::Indexed(237)
+                theme.tab_inactive_bg.clone()
             };
             for (col, cell) in buf[0].iter().enumerate().take(end).skip(start) {
                 assert_eq!(
@@ -2004,7 +1947,7 @@ mod tests {
         assert_eq!(buf[0][bpos].bg, mode_bg);
         assert!(buf[0][bpos].bold);
         assert_eq!(buf[0][apos].fg, theme.tab_inactive_fg);
-        assert_eq!(buf[0][apos].bg, CellColor::Indexed(237));
+        assert_eq!(buf[0][apos].bg, theme.tab_inactive_bg);
         assert!(!buf[0][apos].bold);
     }
 
@@ -2089,12 +2032,74 @@ mod tests {
         // draw it, then hit-test its middle column.
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
         let strip = monocle_strip_rect(&view, a).unwrap();
-        let segs = strip_segments(&titles, strip.width as usize, &zj());
-        let (_, s, e) = segs.iter().copied().find(|(i, _, _)| *i == 1).unwrap();
-        let mid = strip.x + ((s + e) / 2) as u16;
+        let segs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        let beta = segs.iter().find(|e| e.index == 1).unwrap();
+        let mid = strip.x + ((beta.start + beta.end) / 2) as u16;
         assert_eq!(cell_at(&view, a, mid, strip.y, &zj()), Some(1));
         // A click below the strip resolves to the focused cell (0).
         assert_eq!(cell_at(&view, a, 5, 5, &zj()), Some(0));
+    }
+
+    #[test]
+    fn monocle_strip_click_hits_a_lone_cell_from_its_first_column() {
+        // THE off-by-one this refactor fixes. A 1-cell Monocle view's strip is
+        // drawn by `build_top_border_content`'s single-title branch as a bare
+        // ` title ` chip flush at column 0 -- but the client's own copy of the
+        // tab-width formula applied the MULTI-tab leading pad unconditionally and
+        // reported the chip at 1..len+3. So a click on the chip's first column
+        // missed the only cell there was, and the last column resolved to
+        // nothing. Both sides now read `tab_strip_layout`.
+        let mut cells: Vec<ViewCell> = (0..1).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("solo / Tab 1".into());
+        let view = view_of(cells, monoclev(), 0);
+        let a = area(80, 24);
+        let strip = monocle_strip_rect(&view, a).unwrap();
+        let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+        let segs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        assert_eq!(segs[0].start, 0, "a lone chip is flush at the strip start");
+
+        // Every column of the painted chip resolves to cell 0 -- including the
+        // FIRST, which is what used to miss.
+        for rel in segs[0].start..segs[0].end {
+            assert_eq!(
+                cell_at(&view, a, strip.x + rel as u16, strip.y, &zj()),
+                Some(0),
+                "strip column {rel} did not hit the only cell"
+            );
+        }
+
+        // And the chip really is painted where the layout says it is.
+        let buf = composite(&view, a, &tt(), "NORMAL", &zj());
+        let text: String = (segs[0].start..segs[0].end)
+            .map(|x| buf[strip.y as usize][strip.x as usize + x].c)
+            .collect();
+        assert_eq!(text, " solo / Tab 1 ");
+    }
+
+    #[test]
+    fn monocle_strip_hit_testing_is_char_based_for_wide_titles() {
+        // A cell title can be multi-byte (`<host>: pane N` for a remote source),
+        // and the strip is laid out in COLUMNS. Measuring in bytes would place
+        // every tab after the first far to the right of where it is painted.
+        let mut cells: Vec<ViewCell> = (0..2).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("日本語".into());
+        cells[1].title = Some("ab".into());
+        let view = view_of(cells, monoclev(), 0);
+        let a = area(80, 24);
+        let strip = monocle_strip_rect(&view, a).unwrap();
+        let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+        let segs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        // 3 CHARS + 2 padding = 5-wide tabs, not 9 bytes + 2.
+        assert_eq!(segs[0].end - segs[0].start, 5);
+        for entry in &segs {
+            let mid = strip.x + ((entry.start + entry.end) / 2) as u16;
+            assert_eq!(
+                cell_at(&view, a, mid, strip.y, &zj()),
+                Some(entry.index),
+                "tab {} mid column resolved elsewhere",
+                entry.index
+            );
+        }
     }
 
     #[test]
@@ -2998,10 +3003,13 @@ mod tests {
         assert!(text.contains("pane 1"), "titles missing: {text:?}");
 
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let zsegs = strip_segments(&titles, strip.width as usize, &zj());
-        let tsegs = strip_segments(&titles, strip.width as usize, &tmx());
-        assert_eq!(zsegs[0].1, 1, "zellij strip starts after a leading space");
-        assert_eq!(tsegs[0].1, 0, "tmux tab bar starts flush left");
+        let zsegs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        let tsegs = tab_strip_layout(&titles, strip.width as usize, &tmx());
+        assert_eq!(
+            zsegs[0].start, 1,
+            "zellij strip starts after a leading space"
+        );
+        assert_eq!(tsegs[0].start, 0, "tmux tab bar starts flush left");
         // A click on the first tab still resolves to cell 0 in tmux style.
         assert_eq!(cell_at(&view, a, strip.x, strip.y, &tmx()), Some(0));
     }
