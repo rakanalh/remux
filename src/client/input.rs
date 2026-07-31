@@ -5,10 +5,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::client::command_palette::CommandPaletteState;
 use crate::client::registry::ConnId;
 use crate::config::keybindings::{
-    parse_command, InterceptAction, KeyNode, KeybindingTree, SessionManagerBindings,
+    resolve_action, InterceptAction, KeyNode, KeybindingTree, SessionManagerBindings,
     ShortcutBindings,
 };
-use crate::protocol::RemuxCommand;
+use crate::protocol::{Action, ClientAction, RemuxCommand};
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -1512,12 +1512,6 @@ impl InputHandler {
             return InputAction::SessionManagerOpen;
         }
 
-        if actions.len() == 1 && actions[0] == "SessionQuickSwitch" {
-            self.mode = Mode::Command;
-            self.session_switch = Some(SessionSwitchOverlay::new());
-            return InputAction::SessionSwitchOpen;
-        }
-
         // "Last session" toggle is client-side: never forward to the server.
         if actions.len() == 1 && actions[0] == "SessionSwitchLast" {
             return InputAction::SessionSwitchLast;
@@ -1525,8 +1519,12 @@ impl InputHandler {
 
         let mut commands: Vec<RemuxCommand> = Vec::new();
         for action_str in actions {
-            match parse_command(action_str) {
-                Some(cmd) => commands.push(cmd),
+            match resolve_action(action_str) {
+                // A client-only shortcut (e.g. Alt-s -> SessionQuickSwitch)
+                // opens its overlay and ends the chain, exactly as it would
+                // from a keybinding leaf or the palette.
+                Some(Action::Client(client)) => return self.begin_client_action(client),
+                Some(Action::Server(cmd)) => commands.push(cmd),
                 None => log::error!("Failed to parse shortcut action: {}", action_str),
             }
         }
@@ -1657,6 +1655,72 @@ impl InputHandler {
     // Action chain execution
     // -----------------------------------------------------------------------
 
+    /// Perform a client-only action: the single place that turns a
+    /// [`ClientAction`] into the overlay/mode state it needs plus the
+    /// `InputAction` the main loop acts on.
+    ///
+    /// Every path that can name an action -- a keybinding leaf, an Alt
+    /// shortcut, the command palette -- funnels through here, so the nine
+    /// client actions behave identically however they are reached.
+    fn begin_client_action(&mut self, action: ClientAction) -> InputAction {
+        match action {
+            ClientAction::CommandPaletteOpen => {
+                self.mode = Mode::CommandPalette;
+                self.command_palette = Some(CommandPaletteState::new());
+                InputAction::CommandPaletteOpen
+            }
+            ClientAction::SessionQuickSwitch => {
+                self.mode = Mode::Command;
+                self.session_switch = Some(SessionSwitchOverlay::new());
+                InputAction::SessionSwitchOpen
+            }
+            ClientAction::ViewNew => {
+                // Prompt for a name via the rename overlay; the confirm maps to
+                // InputAction::NewView(name), handled in the main loop.
+                self.mode = Mode::Normal;
+                self.rename_overlay = Some(RenameOverlay {
+                    buffer: String::new(),
+                    cursor: 0,
+                    target: RenameTarget::NewView,
+                });
+                InputAction::ActivateRenameOverlay
+            }
+            ClientAction::ViewAddPane => {
+                self.mode = Mode::Normal;
+                InputAction::ViewAddPaneOpen
+            }
+            ClientAction::ViewRename => {
+                // Prompt for a new name via the rename overlay (empty buffer;
+                // reuses the NewView/CreateFolder text sub-mode). Confirm maps to
+                // InputAction::ViewRename(name), applied to the active view in the
+                // main loop.
+                self.mode = Mode::Normal;
+                self.rename_overlay = Some(RenameOverlay {
+                    buffer: String::new(),
+                    cursor: 0,
+                    target: RenameTarget::ViewRename,
+                });
+                InputAction::ActivateRenameOverlay
+            }
+            ClientAction::ViewRemovePane => {
+                self.mode = Mode::Normal;
+                InputAction::ViewRemovePane
+            }
+            ClientAction::ViewLayoutNext => {
+                self.mode = Mode::Normal;
+                InputAction::ViewLayoutNext
+            }
+            ClientAction::ViewClose => {
+                self.mode = Mode::Normal;
+                InputAction::ViewClose
+            }
+            ClientAction::ViewDelete => {
+                self.mode = Mode::Normal;
+                InputAction::ViewDelete
+            }
+        }
+    }
+
     /// Execute an action chain. Parses each action string, handles mode
     /// transitions, and returns the appropriate InputAction.
     fn execute_action_chain(&mut self, actions: &[String]) -> InputAction {
@@ -1668,68 +1732,12 @@ impl InputHandler {
         let mut final_action: Option<InputAction> = None;
 
         for action_str in actions {
-            // Handle client-only actions that are not RemuxCommand variants.
-            if action_str == "CommandPaletteOpen" {
-                self.mode = Mode::CommandPalette;
-                self.command_palette = Some(CommandPaletteState::new());
-                return InputAction::CommandPaletteOpen;
-            }
-
-            if action_str == "SessionQuickSwitch" {
-                self.mode = Mode::Command;
-                self.session_switch = Some(SessionSwitchOverlay::new());
-                return InputAction::SessionSwitchOpen;
-            }
-
-            // View commands are client-only: they never map to a RemuxCommand
-            // and are never forwarded to the server (mirrors SessionQuickSwitch).
-            if action_str == "ViewNew" {
-                // Prompt for a name via the rename overlay; the confirm maps to
-                // InputAction::NewView(name), handled in the main loop.
-                self.mode = Mode::Normal;
-                self.rename_overlay = Some(RenameOverlay {
-                    buffer: String::new(),
-                    cursor: 0,
-                    target: RenameTarget::NewView,
-                });
-                return InputAction::ActivateRenameOverlay;
-            }
-            if action_str == "ViewAddPane" {
-                self.mode = Mode::Normal;
-                return InputAction::ViewAddPaneOpen;
-            }
-            if action_str == "ViewRename" {
-                // Prompt for a new name via the rename overlay (empty buffer;
-                // reuses the NewView/CreateFolder text sub-mode). Confirm maps to
-                // InputAction::ViewRename(name), applied to the active view in the
-                // main loop.
-                self.mode = Mode::Normal;
-                self.rename_overlay = Some(RenameOverlay {
-                    buffer: String::new(),
-                    cursor: 0,
-                    target: RenameTarget::ViewRename,
-                });
-                return InputAction::ActivateRenameOverlay;
-            }
-            if action_str == "ViewRemovePane" {
-                self.mode = Mode::Normal;
-                return InputAction::ViewRemovePane;
-            }
-            if action_str == "ViewLayoutNext" {
-                self.mode = Mode::Normal;
-                return InputAction::ViewLayoutNext;
-            }
-            if action_str == "ViewClose" {
-                self.mode = Mode::Normal;
-                return InputAction::ViewClose;
-            }
-            if action_str == "ViewDelete" {
-                self.mode = Mode::Normal;
-                return InputAction::ViewDelete;
-            }
-
-            match parse_command(action_str) {
-                Some(cmd) => {
+            match resolve_action(action_str) {
+                // Client-only actions never map to a RemuxCommand and are
+                // never forwarded to the server; they open an overlay or edit
+                // client-side view state, and end the chain there.
+                Some(Action::Client(client)) => return self.begin_client_action(client),
+                Some(Action::Server(cmd)) => {
                     match &cmd {
                         RemuxCommand::EnterNormal => {
                             self.mode = Mode::Normal;
@@ -2785,34 +2793,19 @@ impl InputHandler {
             KeyCode::Enter => {
                 let input = palette.current_input();
                 self.command_palette = None;
+                // Close the palette and leave the chord state clean, then run
+                // the picked action through the SAME path a keybinding takes.
+                // That is what makes the client-only actions (ViewNew,
+                // SessionQuickSwitch, ...) work from the palette, and keeps
+                // the overlay-opening commands behaving identically either
+                // way. `execute_action_chain` overrides the mode itself when
+                // the action calls for it.
                 self.mode = Mode::Normal;
-                if let Some(cmd) = parse_command(&input) {
-                    // Check for mode-transition commands.
-                    match &cmd {
-                        RemuxCommand::EnterNormal => {
-                            self.mode = Mode::Normal;
-                        }
-                        RemuxCommand::EnterCommandMode => {
-                            self.mode = Mode::Command;
-                        }
-                        RemuxCommand::EnterVisualMode => {
-                            self.mode = Mode::Visual;
-                            self.visual_state = Some(VisualState::with_cols(24, 1000, 80));
-                        }
-                        RemuxCommand::RemoteConnect(dest) => {
-                            // Client-side command: open the session manager and
-                            // request the connect via a dedicated action rather
-                            // than forwarding the command to the server.
-                            self.mode = Mode::SessionManager;
-                            self.session_manager = Some(self.new_session_manager(None));
-                            return InputAction::RemoteConnect(dest.clone());
-                        }
-                        _ => {}
-                    }
-                    InputAction::Execute(cmd)
-                } else {
-                    InputAction::CommandPaletteClose
+                self.keybinding_state.reset();
+                if resolve_action(&input).is_none() {
+                    return InputAction::CommandPaletteClose;
                 }
+                self.execute_action_chain(&[input])
             }
             KeyCode::Tab => {
                 palette.tab_complete(false);
@@ -4950,5 +4943,84 @@ mod tests {
 
         let action = handler.handle_session_switch_key(enter_key());
         assert!(matches!(action, InputAction::ViewActivate { index: 0 }));
+    }
+
+    // -- Client actions from every path ----------------------------------------
+
+    /// A client-only action reached through an Alt shortcut opens its overlay,
+    /// exactly as the same action does from a keybinding leaf. This used to be
+    /// a bare `actions[0] == "SessionQuickSwitch"` literal alongside eight
+    /// others that only the which-key tree could reach.
+    #[test]
+    fn shortcut_client_action_opens_its_overlay() {
+        let mut handler = InputHandler::with_defaults();
+        // Alt-s is the shipped SessionQuickSwitch shortcut.
+        let action = handler.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert_eq!(action, InputAction::SessionSwitchOpen);
+        assert!(handler.session_switch.is_some());
+    }
+
+    /// A client action ENDS the chain it appears in -- the same rule the
+    /// which-key path has always followed. Pinned because a shortcut chain
+    /// used to only recognise a client action as its single element.
+    #[test]
+    fn client_action_ends_the_chain_it_appears_in() {
+        let toml_str = r#"
+            "Alt-x" = "PaneNew; ViewLayoutNext; PaneClose"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let mut shortcuts = ShortcutBindings::default();
+        shortcuts.merge(&ShortcutBindings::from_toml(&value).unwrap());
+
+        let mut handler = InputHandler::with_defaults();
+        handler.reload_keybindings(
+            KeybindingTree::default(),
+            handler.leader_key,
+            shortcuts,
+            SessionManagerBindings::default(),
+        );
+        let action = handler.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        // The client action wins and nothing after it runs -- and neither does
+        // the PaneNew before it, which is why chaining past one is a mistake.
+        assert_eq!(action, InputAction::ViewLayoutNext);
+    }
+
+    /// Confirming a palette entry runs the SAME action chain a keybinding
+    /// does, so the client-only actions work from the palette too.
+    #[test]
+    fn palette_enter_performs_a_client_action() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::CommandPalette;
+        handler.command_palette = Some(CommandPaletteState::new());
+        for c in "ViewNew".chars() {
+            handler.handle_key(char_key(c));
+        }
+        let action = handler.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::ActivateRenameOverlay);
+        assert!(handler.command_palette.is_none());
+        assert!(matches!(
+            handler.rename_overlay,
+            Some(RenameOverlay {
+                target: RenameTarget::NewView,
+                ..
+            })
+        ));
+    }
+
+    /// The palette can also reach the mode transitions it lists -- picking
+    /// `EnterSearchMode` (which was missing from the listing entirely) enters
+    /// Search mode rather than shipping a no-op command to the server.
+    #[test]
+    fn palette_enter_performs_enter_search_mode() {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::CommandPalette;
+        handler.command_palette = Some(CommandPaletteState::new());
+        for c in "EnterSearchMode".chars() {
+            handler.handle_key(char_key(c));
+        }
+        let action = handler.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::ModeChanged(Mode::Search));
+        assert_eq!(handler.mode, Mode::Search);
+        assert!(handler.command_palette.is_none());
     }
 }

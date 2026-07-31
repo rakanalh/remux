@@ -248,6 +248,8 @@
 # "Alt-s" = "SessionQuickSwitch"
 # "Alt-o" = "SessionSwitchLast"
 # "Alt-z" = "PaneToggleZoom"
+# "Alt-p" = "PopupToggle"
+# "Alt-m" = "SetMaster"
 # "Alt-Space" = "LayoutNext"
 
 # --- Command-mode leader tree (defaults) ---
@@ -323,6 +325,19 @@
 # _label = "Search"
 # s = "EnterSearchMode"
 # e = "BufferEditInEditor"
+
+# --- View (w) ---
+# Views are client-side virtual tabs whose cells alias real panes on any
+# machine. `v` is taken by Visual mode, so the group lives on `w`.
+# [keybindings.command.w]
+# _label = "View"
+# n = "ViewNew"
+# a = "ViewAddPane"
+# r = "ViewRename"
+# x = "ViewRemovePane"
+# " " = "ViewLayoutNext"
+# q = "ViewClose"
+# d = "ViewDelete"
 
 # --- Direct bindings (root level) ---
 # These are top-level keys pressed right after the leader, not inside a group.
@@ -424,6 +439,16 @@
 #   PaneStackPrev                   — Focus previous pane in stack
 #   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
 #   PaneRename <name>               — Rename the focused pane
+#   PopupToggle                     — Toggle the floating popup terminal
+#
+# View commands (client-side; a view's cells alias real panes on any machine):
+#   ViewNew                         — Create a new view (prompts for a name)
+#   ViewAddPane                     — Add a pane to the active view
+#   ViewRename                      — Rename the active view
+#   ViewRemovePane                  — Drop the focused cell from the active view
+#   ViewLayoutNext                  — Cycle the active view's layout
+#   ViewClose                       — Leave the active view (it keeps existing)
+#   ViewDelete                      — Delete the active view for everyone
 #
 # Session commands:
 #   SessionNew <name> [folder]      — Create a new session

@@ -383,9 +383,26 @@ impl Config {
     /// Validate cross-references between config sections.
     /// Logs errors for invalid references. Returns true if valid.
     pub fn validate(&self) -> bool {
+        let mut valid = true;
+        for problem in self.binding_problems() {
+            log::error!("{problem}");
+            valid = false;
+        }
+
+        // Not `&&`: both checks must run so both get logged.
         let tree = self.keybinding_tree();
         let shortcuts = self.shortcut_bindings();
-        shortcuts.validate_group_refs(&tree)
+        let groups_valid = shortcuts.validate_group_refs(&tree);
+        valid && groups_valid
+    }
+
+    /// Every keybinding whose action string does not resolve, as a
+    /// human-readable message naming the binding and the offending name.
+    ///
+    /// Split out from [`Config::validate`] so tests can assert on the messages
+    /// directly rather than scraping the log.
+    pub fn binding_problems(&self) -> Vec<String> {
+        keybindings::unresolved_actions(&self.keybinding_tree(), &self.shortcut_bindings())
     }
 
     /// Parse the leader key from the config.
@@ -643,5 +660,102 @@ mod tests {
         let leader = config.leader_key();
         assert_eq!(leader.code, crossterm::event::KeyCode::Char('b'));
         assert_eq!(leader.modifiers, crossterm::event::KeyModifiers::CONTROL);
+    }
+
+    // -- Binding validation at config load ------------------------------------
+
+    /// The shipped defaults are clean: loading a config with no keybinding
+    /// overrides reports nothing and validates.
+    #[test]
+    fn valid_config_loads_silently() {
+        let config = Config::default();
+        assert!(config.binding_problems().is_empty());
+        assert!(config.validate());
+
+        // A config that overrides bindings with REAL action names is equally
+        // silent -- including the client-only ones.
+        let toml_str = r#"
+            [keybindings.command]
+            "Alt-y" = "PaneFocusRight"
+
+            [keybindings.command.w]
+            n = "ViewNew"
+            g = "TabNew; EnterNormal"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(
+            config.binding_problems().is_empty(),
+            "{:#?}",
+            config.binding_problems()
+        );
+        assert!(config.validate());
+    }
+
+    /// A typo'd binding is reported at config load, naming the binding and the
+    /// bad action -- instead of silently doing nothing when the key is pressed.
+    #[test]
+    fn typo_in_binding_is_reported_at_load() {
+        let toml_str = r#"
+            [keybindings.command]
+            "Alt-y" = "PaneFocusRigth"
+
+            [keybindings.command.w]
+            n = "ViewNwe"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        let problems = config.binding_problems();
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("binding 'w n'") && p.contains("unknown action 'ViewNwe'")),
+            "{problems:#?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("shortcut 'Alt-y'")
+                    && p.contains("unknown action 'PaneFocusRigth'")),
+            "{problems:#?}"
+        );
+        // `validate` logs each problem and reports the config as invalid.
+        assert!(!config.validate());
+    }
+
+    /// `config.sample.toml` is the user-facing list of what can be bound, so
+    /// it is one more thing that can drift away from the registry. Every
+    /// bindable action must be documented there.
+    ///
+    /// A substring check, so a name contained in a longer documented name
+    /// (`ViewClose` inside a hypothetical `ViewCloseAll`) would pass without
+    /// its own entry. Good enough to catch a whole action going undocumented,
+    /// which is the drift that actually happens.
+    #[test]
+    fn sample_config_documents_every_action() {
+        let sample = include_str!("../../config.sample.toml");
+        let undocumented: Vec<&str> = crate::protocol::action_specs()
+            .iter()
+            .map(|spec| spec.name)
+            .filter(|name| !sample.contains(name))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "config.sample.toml does not document: {undocumented:?}"
+        );
+    }
+
+    /// Bad action names and bad group references are reported together: one
+    /// does not mask the other.
+    #[test]
+    fn validate_reports_bad_actions_and_bad_group_refs_together() {
+        let toml_str = r#"
+            [keybindings.command]
+            "Alt-y" = "PaneFocusRigth"
+            "Alt-u" = "@Z"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.binding_problems().len(), 1);
+        assert!(!config.validate());
     }
 }

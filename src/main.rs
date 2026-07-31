@@ -1558,6 +1558,18 @@ async fn run_client_loop(
                             renderer.clear_overlay(c, r)?;
                             renderer.flush()?;
                         }
+                        // If the palette was dismissed by this key, tear its
+                        // overlay down here -- once, for EVERY action arm.
+                        // Confirming a palette entry runs the same action chain
+                        // a keybinding does, so Enter can now land on any arm
+                        // (a rename prompt, the pane picker, the switcher);
+                        // clearing per-arm would leave the palette painted over
+                        // whichever arm was forgotten.
+                        if was_in_palette && input.command_palette.is_none() {
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_command_palette_overlay(c, r)?;
+                            renderer.flush()?;
+                        }
                         match action {
                             InputAction::SendToPty(data) => {
                                 log::debug!("input: SendToPty {} bytes", data.len());
@@ -1627,15 +1639,11 @@ async fn run_client_loop(
                                 if matches!(cmd, RemuxCommand::ToggleStyle) {
                                     view_border_style = toggled_border_style(&view_border_style);
                                 }
-                                // Clear command palette overlay if it was just
-                                // closed. Done BEFORE the view interception so a
-                                // command run from `:` while in a view (which the
-                                // interception consumes) still tears the palette
-                                // down instead of leaving it on screen.
-                                if was_in_palette && input.command_palette.is_none() {
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_command_palette_overlay(c, r)?;
-                                }
+                                // (The palette overlay was already torn down
+                                // above, before this arm and so before the view
+                                // interception -- a command run from `:` while
+                                // in a view is consumed by the interception and
+                                // would otherwise leave the palette painted.)
                                 // While a view is active, structural pane/tab
                                 // commands are intercepted client-side (focus
                                 // move, layout cycle, eject cell, or no-op) and
@@ -2419,12 +2427,8 @@ async fn run_client_loop(
                                     whichkey.hide();
                                     renderer.clear_overlay(cols, rows)?;
                                 }
-                                // This command usually arrives from the palette;
-                                // clear its overlay so it doesn't render underneath.
-                                if was_in_palette && input.command_palette.is_none() {
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    renderer.clear_command_palette_overlay(c, r)?;
-                                }
+                                // (This command usually arrives from the palette;
+                                // its overlay was torn down above.)
                                 // Resolve the connection name. If the arg is not a
                                 // configured remote, register an ad-hoc (session-only)
                                 // entry using the arg as the SSH destination.

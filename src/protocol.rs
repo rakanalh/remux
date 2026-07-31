@@ -671,8 +671,9 @@ pub enum RemuxCommand {
     // sessions/folders/tabs/panes it is not currently attached to. Like the
     // other explicit-target commands above (SessionSwitchTab, TabCloseByIndex)
     // they are internal protocol commands issued by the session-manager UI and
-    // are deliberately NOT listed in `command_names()` / `parse_command` (a
-    // keybinding string cannot supply their structural arguments).
+    // are deliberately absent from the action registry (`action_specs()`), so
+    // no binding string can name them -- a binding cannot supply their
+    // structural arguments.
     /// Rename session `old` to `new`. Fail-silently if `old` is missing or
     /// `new` already exists.
     SessionRenameByName {
@@ -720,64 +721,214 @@ pub enum RemuxCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Command name enumeration
+// Action registry
 // ---------------------------------------------------------------------------
 
-/// Return the list of all recognised command names (PascalCase strings that
-/// [`crate::config::keybindings::parse_command`] accepts). Commands that
-/// take parameters include a hint suffix after a space.
+/// A client-only action: something a binding (or the command palette) can ask
+/// for that has no [`RemuxCommand`] equivalent because it never leaves the
+/// client -- it opens an overlay or edits client-side view state.
+///
+/// The client maps each of these to an `InputAction`; see
+/// `crate::client::input::InputHandler::begin_client_action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAction {
+    /// Open the command palette overlay.
+    CommandPaletteOpen,
+    /// Open the quick session switcher overlay.
+    SessionQuickSwitch,
+    /// Prompt for a name and create a new (client-side) view.
+    ViewNew,
+    /// Open the pane picker to add a cell to the active view.
+    ViewAddPane,
+    /// Prompt for a new name for the active view.
+    ViewRename,
+    /// Drop the focused cell from the active view.
+    ViewRemovePane,
+    /// Cycle the active view's layout mode.
+    ViewLayoutNext,
+    /// Leave the active view (it keeps existing).
+    ViewClose,
+    /// Delete the active view for everyone.
+    ViewDelete,
+}
+
+/// What an action string resolves to: either a command the server executes or
+/// a client-only action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// A command to send to the server (some are intercepted client-side
+    /// first; see the client's action chain).
+    Server(RemuxCommand),
+    /// An action the client performs itself.
+    Client(ClientAction),
+}
+
+/// One entry in the action registry: everything the rest of the program needs
+/// to know about a bindable action string.
+///
+/// This table is the SINGLE source of truth. [`command_names`] is derived from
+/// it, [`crate::config::keybindings::resolve_action`] refuses any name that is
+/// not in it, and [`crate::config::keybindings::humanize_command`] takes its
+/// label overrides from it -- so the palette listing, the parser, the which-key
+/// labels and config validation cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+pub struct ActionSpec {
+    /// The PascalCase name a binding string starts with.
+    pub name: &'static str,
+    /// Argument hint shown in the palette, e.g. `<name>`.
+    pub hint: Option<&'static str>,
+    /// A representative argument string, so tests can round-trip every
+    /// arg-taking entry through the resolver.
+    pub sample_args: Option<&'static str>,
+    /// `Some` for client-only actions; `None` for server commands.
+    pub client: Option<ClientAction>,
+    /// Whether the command palette offers this action.
+    pub palette: bool,
+    /// Which-key label override; `None` falls back to a PascalCase split.
+    pub label: Option<&'static str>,
+}
+
+impl ActionSpec {
+    /// A server command taking no arguments.
+    fn server(name: &'static str) -> Self {
+        Self {
+            name,
+            hint: None,
+            sample_args: None,
+            client: None,
+            palette: true,
+            label: None,
+        }
+    }
+
+    /// A client-only action (never takes arguments).
+    fn client(name: &'static str, action: ClientAction) -> Self {
+        Self {
+            client: Some(action),
+            ..Self::server(name)
+        }
+    }
+
+    /// Declare the argument hint shown in the palette and a sample argument
+    /// string that makes the action resolvable.
+    fn arg(mut self, hint: &'static str, sample_args: &'static str) -> Self {
+        self.hint = Some(hint);
+        self.sample_args = Some(sample_args);
+        self
+    }
+
+    /// Hide the action from the command palette.
+    fn hidden(mut self) -> Self {
+        self.palette = false;
+        self
+    }
+
+    /// Override the which-key label.
+    fn label(mut self, label: &'static str) -> Self {
+        self.label = Some(label);
+        self
+    }
+}
+
+/// The action registry: every action string a keybinding or the command
+/// palette may name.
+///
+/// Deliberate exclusions: the explicit-target structural commands
+/// (`SessionRenameByName`, `PaneCloseById`, ...) are internal protocol
+/// commands issued by the session-manager UI -- a keybinding string cannot
+/// supply their structural arguments, so they are not bindable at all.
+pub fn action_specs() -> &'static [ActionSpec] {
+    static SPECS: std::sync::OnceLock<Vec<ActionSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        vec![
+            ActionSpec::server("TabNew"),
+            ActionSpec::server("TabClose"),
+            ActionSpec::server("TabRename").arg("<name>", "work"),
+            ActionSpec::server("TabGoto").arg("<index>", "0"),
+            ActionSpec::server("TabNext"),
+            ActionSpec::server("TabPrev"),
+            ActionSpec::server("TabMove").arg("<index>", "1"),
+            ActionSpec::server("PaneNew"),
+            ActionSpec::server("PaneClose"),
+            ActionSpec::server("PaneSplitVertical"),
+            ActionSpec::server("PaneSplitHorizontal"),
+            ActionSpec::server("PaneFocusLeft"),
+            ActionSpec::server("PaneFocusRight"),
+            ActionSpec::server("PaneFocusUp"),
+            ActionSpec::server("PaneFocusDown"),
+            ActionSpec::server("PaneStackAdd"),
+            ActionSpec::server("PaneStackNext"),
+            ActionSpec::server("PaneStackPrev"),
+            ActionSpec::server("PaneMoveLeft"),
+            ActionSpec::server("PaneMoveRight"),
+            ActionSpec::server("PaneMoveUp"),
+            ActionSpec::server("PaneMoveDown"),
+            ActionSpec::server("PaneRename").arg("<name>", "shell"),
+            ActionSpec::server("PaneToggleZoom"),
+            ActionSpec::server("PopupToggle"),
+            ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
+            ActionSpec::server("ResizeRight").arg("<amount>", "5"),
+            ActionSpec::server("ResizeUp").arg("<amount>", "5"),
+            ActionSpec::server("ResizeDown").arg("<amount>", "5"),
+            ActionSpec::server("SessionNew").arg("<name> [folder]", "dev"),
+            ActionSpec::server("SessionDetach"),
+            ActionSpec::server("SessionRename").arg("<name>", "dev"),
+            ActionSpec::server("SessionList"),
+            ActionSpec::server("SessionSave"),
+            ActionSpec::server("FolderNew").arg("<name>", "projects"),
+            ActionSpec::server("FolderDelete").arg("<name>", "projects"),
+            ActionSpec::server("FolderList"),
+            ActionSpec::server("FolderMoveSession").arg("<session> [folder]", "dev projects"),
+            ActionSpec::server("BufferEditInEditor"),
+            ActionSpec::server("OpenSessionManager"),
+            ActionSpec::server("RemoteConnect").arg("<user@host|alias>", "pi"),
+            ActionSpec::server("SessionMoveToFolder"),
+            ActionSpec::server("SessionSwitchLast").label("last session"),
+            ActionSpec::server("ToggleStyle"),
+            ActionSpec::server("LayoutNext").label("next layout"),
+            ActionSpec::server("SetMaster").label("set master"),
+            ActionSpec::server("EnterNormal"),
+            ActionSpec::server("EnterCommandMode"),
+            ActionSpec::server("EnterVisualMode"),
+            ActionSpec::server("EnterSearchMode"),
+            // Send raw key bytes to the focused pane. Hidden from the palette:
+            // its argument is a key notation, which is a binding-file concept
+            // (`SendKey Ctrl-a`), not something to pick from a list.
+            ActionSpec::server("SendKey")
+                .arg("<key>", "Ctrl-a")
+                .hidden(),
+            // -- Client-only actions ----------------------------------------
+            ActionSpec::client("CommandPaletteOpen", ClientAction::CommandPaletteOpen)
+                .label("command palette"),
+            ActionSpec::client("SessionQuickSwitch", ClientAction::SessionQuickSwitch)
+                .label("switch session"),
+            ActionSpec::client("ViewNew", ClientAction::ViewNew).label("new view"),
+            ActionSpec::client("ViewAddPane", ClientAction::ViewAddPane).label("add pane"),
+            ActionSpec::client("ViewRename", ClientAction::ViewRename).label("rename view"),
+            ActionSpec::client("ViewRemovePane", ClientAction::ViewRemovePane).label("remove cell"),
+            ActionSpec::client("ViewLayoutNext", ClientAction::ViewLayoutNext).label("layout next"),
+            ActionSpec::client("ViewClose", ClientAction::ViewClose).label("close view"),
+            ActionSpec::client("ViewDelete", ClientAction::ViewDelete).label("delete view"),
+        ]
+    })
+}
+
+/// Look up an action name in the registry.
+pub fn action_spec(name: &str) -> Option<&'static ActionSpec> {
+    action_specs().iter().find(|spec| spec.name == name)
+}
+
+/// Return the command names the palette lists (PascalCase strings that
+/// [`crate::config::keybindings::resolve_action`] accepts). Commands that take
+/// parameters include a hint suffix after a space.
+///
+/// Derived from [`action_specs`] -- do not maintain a second list here.
 pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
-    vec![
-        ("TabNew", None),
-        ("TabClose", None),
-        ("TabRename", Some("<name>")),
-        ("TabGoto", Some("<index>")),
-        ("TabNext", None),
-        ("TabPrev", None),
-        ("TabMove", Some("<index>")),
-        ("PaneNew", None),
-        ("PaneClose", None),
-        ("PaneSplitVertical", None),
-        ("PaneSplitHorizontal", None),
-        ("PaneFocusLeft", None),
-        ("PaneFocusRight", None),
-        ("PaneFocusUp", None),
-        ("PaneFocusDown", None),
-        ("PaneStackAdd", None),
-        ("PaneStackNext", None),
-        ("PaneStackPrev", None),
-        ("PaneMoveLeft", None),
-        ("PaneMoveRight", None),
-        ("PaneMoveUp", None),
-        ("PaneMoveDown", None),
-        ("PaneRename", Some("<name>")),
-        ("PaneToggleZoom", None),
-        ("PopupToggle", None),
-        ("ResizeLeft", Some("<amount>")),
-        ("ResizeRight", Some("<amount>")),
-        ("ResizeUp", Some("<amount>")),
-        ("ResizeDown", Some("<amount>")),
-        ("SessionNew", Some("<name> [folder]")),
-        ("SessionDetach", None),
-        ("SessionRename", Some("<name>")),
-        ("SessionList", None),
-        ("SessionSave", None),
-        ("FolderNew", Some("<name>")),
-        ("FolderDelete", Some("<name>")),
-        ("FolderList", None),
-        ("FolderMoveSession", Some("<session> [folder]")),
-        ("BufferEditInEditor", None),
-        ("OpenSessionManager", None),
-        ("RemoteConnect", Some("<user@host|alias>")),
-        ("SessionMoveToFolder", None),
-        ("SessionSwitchLast", None),
-        ("ToggleStyle", None),
-        ("LayoutNext", None),
-        ("SetMaster", None),
-        ("EnterNormal", None),
-        ("EnterCommandMode", None),
-        ("EnterVisualMode", None),
-    ]
+    action_specs()
+        .iter()
+        .filter(|spec| spec.palette)
+        .map(|spec| (spec.name, spec.hint))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,5 +1455,133 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    // -- Action registry -------------------------------------------------------
+
+    /// Classify every `RemuxCommand` variant: either it is bindable (and the
+    /// registry name it is reached by) or it is a deliberate exclusion.
+    ///
+    /// The match has NO wildcard arm on purpose. Adding a `RemuxCommand`
+    /// variant fails to compile here until someone decides which it is -- the
+    /// compile-time half of the anti-drift guarantee (the runtime half lives in
+    /// `config::keybindings::tests::every_registry_entry_resolves`).
+    fn registry_name(cmd: &RemuxCommand) -> Option<&'static str> {
+        match cmd {
+            RemuxCommand::TabNew => Some("TabNew"),
+            RemuxCommand::TabClose => Some("TabClose"),
+            RemuxCommand::TabRename(_) => Some("TabRename"),
+            RemuxCommand::TabGoto(_) => Some("TabGoto"),
+            RemuxCommand::TabNext => Some("TabNext"),
+            RemuxCommand::TabPrev => Some("TabPrev"),
+            RemuxCommand::TabMove(_) => Some("TabMove"),
+            RemuxCommand::PaneNew => Some("PaneNew"),
+            RemuxCommand::PaneClose => Some("PaneClose"),
+            RemuxCommand::PaneSplitVertical => Some("PaneSplitVertical"),
+            RemuxCommand::PaneSplitHorizontal => Some("PaneSplitHorizontal"),
+            RemuxCommand::PaneFocusLeft => Some("PaneFocusLeft"),
+            RemuxCommand::PaneFocusRight => Some("PaneFocusRight"),
+            RemuxCommand::PaneFocusUp => Some("PaneFocusUp"),
+            RemuxCommand::PaneFocusDown => Some("PaneFocusDown"),
+            RemuxCommand::PaneStackAdd => Some("PaneStackAdd"),
+            RemuxCommand::PaneStackNext => Some("PaneStackNext"),
+            RemuxCommand::PaneStackPrev => Some("PaneStackPrev"),
+            RemuxCommand::PaneMoveLeft => Some("PaneMoveLeft"),
+            RemuxCommand::PaneMoveRight => Some("PaneMoveRight"),
+            RemuxCommand::PaneMoveUp => Some("PaneMoveUp"),
+            RemuxCommand::PaneMoveDown => Some("PaneMoveDown"),
+            RemuxCommand::PaneRename(_) => Some("PaneRename"),
+            RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
+            RemuxCommand::PopupToggle => Some("PopupToggle"),
+            RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
+            RemuxCommand::ResizeRight(_) => Some("ResizeRight"),
+            RemuxCommand::ResizeUp(_) => Some("ResizeUp"),
+            RemuxCommand::ResizeDown(_) => Some("ResizeDown"),
+            RemuxCommand::SessionNew { .. } => Some("SessionNew"),
+            RemuxCommand::SessionDetach => Some("SessionDetach"),
+            RemuxCommand::SessionRename(_) => Some("SessionRename"),
+            RemuxCommand::SessionList => Some("SessionList"),
+            RemuxCommand::SessionSave => Some("SessionSave"),
+            RemuxCommand::SessionSwitchLast => Some("SessionSwitchLast"),
+            RemuxCommand::SessionMoveToFolder => Some("SessionMoveToFolder"),
+            RemuxCommand::FolderNew(_) => Some("FolderNew"),
+            RemuxCommand::FolderDelete(_) => Some("FolderDelete"),
+            RemuxCommand::FolderList => Some("FolderList"),
+            RemuxCommand::FolderMoveSession { .. } => Some("FolderMoveSession"),
+            RemuxCommand::BufferEditInEditor => Some("BufferEditInEditor"),
+            RemuxCommand::OpenSessionManager => Some("OpenSessionManager"),
+            RemuxCommand::RemoteConnect(_) => Some("RemoteConnect"),
+            RemuxCommand::ToggleStyle => Some("ToggleStyle"),
+            RemuxCommand::LayoutNext => Some("LayoutNext"),
+            RemuxCommand::SetMaster => Some("SetMaster"),
+            RemuxCommand::EnterNormal => Some("EnterNormal"),
+            RemuxCommand::EnterCommandMode => Some("EnterCommandMode"),
+            RemuxCommand::EnterVisualMode => Some("EnterVisualMode"),
+            RemuxCommand::EnterSearchMode => Some("EnterSearchMode"),
+            RemuxCommand::SendKey(_) => Some("SendKey"),
+
+            // Deliberate exclusions: explicit-target commands the session
+            // manager issues internally. A binding string cannot supply their
+            // structural arguments, so they are not bindable.
+            RemuxCommand::SessionSwitchTab { .. }
+            | RemuxCommand::SessionSwitchPane { .. }
+            | RemuxCommand::TabCloseByIndex { .. }
+            | RemuxCommand::SessionRenameByName { .. }
+            | RemuxCommand::FolderRename { .. }
+            | RemuxCommand::TabNewInSession { .. }
+            | RemuxCommand::TabRenameByIndex { .. }
+            | RemuxCommand::PaneNewInTab { .. }
+            | RemuxCommand::PaneCloseById { .. }
+            | RemuxCommand::PaneRenameById { .. }
+            | RemuxCommand::TabMoveByIndex { .. } => None,
+        }
+    }
+
+    /// Every server entry in the registry builds the command that classifies
+    /// back to that same entry -- the registry and the enum agree on names.
+    #[test]
+    fn registry_server_entries_match_their_command_variant() {
+        for spec in action_specs().iter().filter(|s| s.client.is_none()) {
+            let input = match spec.sample_args {
+                Some(args) => format!("{} {}", spec.name, args),
+                None => spec.name.to_string(),
+            };
+            let cmd = match crate::config::keybindings::resolve_action(&input) {
+                Some(Action::Server(cmd)) => cmd,
+                other => panic!("registry entry '{}' resolved to {other:?}", spec.name),
+            };
+            assert_eq!(
+                registry_name(&cmd),
+                Some(spec.name),
+                "registry entry '{}' builds a command classified elsewhere",
+                spec.name
+            );
+        }
+    }
+
+    /// Nothing bindable is missing from the registry: a variant classified as
+    /// bindable must be listed.
+    #[test]
+    fn classified_names_are_registry_names() {
+        for cmd in [
+            RemuxCommand::EnterSearchMode,
+            RemuxCommand::PopupToggle,
+            RemuxCommand::SendKey(vec![1]),
+            RemuxCommand::SessionSwitchLast,
+        ] {
+            let name = registry_name(&cmd).expect("classified as bindable");
+            assert!(
+                action_spec(name).is_some(),
+                "'{name}' is classified as bindable but missing from the registry"
+            );
+        }
+        // ... and an excluded variant stays out of it.
+        assert_eq!(
+            registry_name(&RemuxCommand::PaneCloseById {
+                session: "s".into(),
+                pane_id: 1
+            }),
+            None
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
-use crate::protocol::RemuxCommand;
+use crate::protocol::{action_spec, Action, RemuxCommand};
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -321,11 +321,36 @@ impl KeybindingTree {
         Some(result)
     }
 
+    /// Collect every leaf in the tree as `(key path, action chain)`, depth
+    /// first. Used by config validation to name the binding that carries a
+    /// bad action string.
+    pub fn leaves(&self) -> Vec<(Vec<char>, Vec<String>)> {
+        let mut out = Vec::new();
+        collect_leaves(&self.root, &mut Vec::new(), &mut out);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Merge another tree on top of this one. Keys in `overrides` replace keys
     /// in `self`. Groups are merged recursively; leaves are replaced outright.
     /// A leaf with an empty action string removes that key from the base.
     pub fn merge(&mut self, overrides: &KeybindingTree) {
         merge_maps(&mut self.root, &overrides.root);
+    }
+}
+
+fn collect_leaves(
+    nodes: &HashMap<char, KeyNode>,
+    path: &mut Vec<char>,
+    out: &mut Vec<(Vec<char>, Vec<String>)>,
+) {
+    for (&key, node) in nodes {
+        path.push(key);
+        match node {
+            KeyNode::Group { children, .. } => collect_leaves(children, path, out),
+            KeyNode::Leaf { action, .. } => out.push((path.clone(), action.clone())),
+        }
+        path.pop();
     }
 }
 
@@ -662,13 +687,10 @@ pub fn humanize_command(command: &str) -> String {
         }
     }
 
-    // Friendlier phrasings for a few verbose command names.
-    match name {
-        "SessionQuickSwitch" => return "switch session".to_string(),
-        "SessionSwitchLast" => return "last session".to_string(),
-        "LayoutNext" => return "next layout".to_string(),
-        "SetMaster" => return "set master".to_string(),
-        _ => {}
+    // Friendlier phrasings come from the action registry, so there is no
+    // separate list of labels to keep in step.
+    if let Some(label) = action_spec(name).and_then(|spec| spec.label) {
+        return label.to_string();
     }
 
     // `Tab*` / `Session*` read better with the noun trailing ("next tab"),
@@ -858,16 +880,108 @@ fn tokenize_command(input: &str) -> Vec<String> {
     tokens
 }
 
+/// Resolve an action string (e.g. `"TabNew"`, `"ResizeLeft 5"`, `"ViewNew"`)
+/// into the [`Action`] it names.
+///
+/// Every action string in the program -- keybinding leaves, Alt shortcuts and
+/// what the user picks in the command palette -- goes through here. The first
+/// step is a lookup in [`action_specs`]: a name that is not in the registry
+/// resolves to `None`, so the registry (and therefore the palette listing) can
+/// never fall out of step with what is actually bindable.
+///
+/// Returns `None` if the name is unknown or its arguments are unusable.
+pub fn resolve_action(input: &str) -> Option<Action> {
+    let tokens = tokenize_command(input);
+    let name = tokens.first()?;
+    let spec = action_spec(name)?;
+    match spec.client {
+        Some(action) => Some(Action::Client(action)),
+        None => build_command(spec.name, &tokens[1..]).map(Action::Server),
+    }
+}
+
 /// Parse a PascalCase command string (e.g. `"TabNew"`, `"ResizeLeft 5"`) into
 /// a [`RemuxCommand`].
 ///
-/// Returns `None` if the command string is not recognised.
+/// Returns `None` if the command string is not recognised, or if it names a
+/// client-only action (use [`resolve_action`] to handle those too).
 pub fn parse_command(input: &str) -> Option<RemuxCommand> {
-    let tokens = tokenize_command(input);
-    let name = tokens.first()?;
-    let args = &tokens[1..];
+    match resolve_action(input)? {
+        Action::Server(cmd) => Some(cmd),
+        Action::Client(_) => None,
+    }
+}
 
-    match name.as_str() {
+/// Describe what is wrong with a single action string, or `None` if it is
+/// fine. An empty string is the "unbind this key" sentinel, not an error.
+fn action_problem(action: &str) -> Option<String> {
+    let tokens = tokenize_command(action);
+    let name = tokens.first()?;
+    match action_spec(name) {
+        None => Some(format!("unknown action '{name}'")),
+        Some(_) if resolve_action(action).is_none() => {
+            Some(format!("action '{name}' is missing a required argument"))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Report every bound action string that does not resolve, naming the binding
+/// that carries it.
+///
+/// This is what turns a typo in `[keybindings.command]` from a key that
+/// silently does nothing into an error at config-load time. Returns one
+/// message per bad action; an empty vector means every binding resolves.
+///
+/// `tree` is the EFFECTIVE (merged) tree, so a leaf that came from the
+/// deprecated `[keybindings.normal]` alias is reported under
+/// `[keybindings.command]` -- which is where the deprecation warning tells the
+/// user to move it anyway.
+pub fn unresolved_actions(tree: &KeybindingTree, shortcuts: &ShortcutBindings) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    for (path, actions) in tree.leaves() {
+        let key_path: Vec<String> = path.iter().map(|c| c.to_string()).collect();
+        let key_path = key_path.join(" ");
+        for action in &actions {
+            if let Some(problem) = action_problem(action) {
+                problems.push(format!(
+                    "invalid keybinding '{key_path}' in [keybindings.command]: {problem}"
+                ));
+            }
+        }
+    }
+
+    let mut shortcut_problems: Vec<String> = Vec::new();
+    for (key, action) in &shortcuts.bindings {
+        let actions = match action {
+            InterceptAction::Command(cmds) => cmds,
+            // Group prefixes are checked by `validate_group_refs`.
+            InterceptAction::GroupPrefix(_) => continue,
+        };
+        for action in actions {
+            if let Some(problem) = action_problem(action) {
+                shortcut_problems.push(format!(
+                    "invalid shortcut '{}' in [keybindings.command]: {problem}",
+                    format_key_notation(key)
+                ));
+            }
+        }
+    }
+    // `bindings` is a HashMap, so sort for a stable report order.
+    shortcut_problems.sort();
+    problems.extend(shortcut_problems);
+
+    problems
+}
+
+/// Build the [`RemuxCommand`] for a registry name that is not client-only.
+///
+/// Only ever called with a `name` that [`action_specs`] lists, so the trailing
+/// `None` arm is unreachable in practice -- the round-trip test asserts every
+/// server entry in the registry is handled here.
+fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
+    match name {
         // -- No-arg commands --------------------------------------------------
         "TabNew" => Some(RemuxCommand::TabNew),
         "TabClose" => Some(RemuxCommand::TabClose),
@@ -1362,6 +1476,7 @@ impl Default for SessionManagerBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{action_specs, command_names, ClientAction};
 
     // -- parse_command tests --------------------------------------------------
 
@@ -2515,5 +2630,243 @@ mod tests {
         let b = SessionManagerBindings::from_toml(&value);
         assert!(!b.is_prefix('z'));
         assert_eq!(b.single('z'), Some(SessionManagerBinding::SessionNew));
+    }
+
+    // -- Action registry: the anti-drift tests ---------------------------------
+
+    /// Every entry in the registry resolves, and resolves to the KIND the
+    /// registry declares. This is the check that stops `action_specs()` (which
+    /// the command palette lists) from drifting away from what the resolver
+    /// actually accepts: adding a name to one without teaching the other
+    /// fails here.
+    #[test]
+    fn every_registry_entry_resolves() {
+        for spec in action_specs() {
+            let input = match spec.sample_args {
+                Some(args) => format!("{} {}", spec.name, args),
+                None => spec.name.to_string(),
+            };
+            match (resolve_action(&input), spec.client) {
+                (Some(Action::Client(got)), Some(want)) => assert_eq!(
+                    got, want,
+                    "registry entry '{}' resolved to the wrong client action",
+                    spec.name
+                ),
+                (Some(Action::Server(_)), None) => {}
+                (got, _) => panic!(
+                    "registry entry '{}' resolved to {:?}, which does not match \
+                     its declared kind (client={:?})",
+                    spec.name, got, spec.client
+                ),
+            }
+        }
+    }
+
+    /// An entry that advertises an argument hint must carry a sample argument,
+    /// otherwise `every_registry_entry_resolves` would silently skip it.
+    #[test]
+    fn registry_entries_with_hints_carry_samples() {
+        for spec in action_specs() {
+            assert_eq!(
+                spec.hint.is_some(),
+                spec.sample_args.is_some(),
+                "registry entry '{}' must declare a hint and a sample together",
+                spec.name
+            );
+        }
+    }
+
+    /// The resolver accepts NOTHING that is not in the registry -- it looks the
+    /// name up there first. Structural commands the session manager issues
+    /// internally, and typos, are both rejected.
+    #[test]
+    fn resolver_rejects_names_outside_the_registry() {
+        for name in [
+            "NonexistentCommand",
+            "PaneFocusRigth",
+            "SessionRenameByName",
+            "PaneCloseById",
+            "TabMoveByIndex",
+        ] {
+            assert_eq!(resolve_action(name), None, "'{name}' must not resolve");
+            assert_eq!(parse_command(name), None, "'{name}' must not parse");
+        }
+    }
+
+    /// The palette listing is the registry, filtered -- not a second list.
+    #[test]
+    fn command_names_is_the_registry_filtered() {
+        let expected: Vec<(&str, Option<&str>)> = action_specs()
+            .iter()
+            .filter(|s| s.palette)
+            .map(|s| (s.name, s.hint))
+            .collect();
+        assert_eq!(command_names(), expected);
+        // ... and everything it lists resolves.
+        for (name, hint) in command_names() {
+            let input = match hint {
+                Some(_) => {
+                    let sample = action_spec(name).and_then(|s| s.sample_args).unwrap();
+                    format!("{name} {sample}")
+                }
+                None => name.to_string(),
+            };
+            assert!(
+                resolve_action(&input).is_some(),
+                "palette lists '{name}' but it does not resolve"
+            );
+        }
+    }
+
+    /// `EnterSearchMode` was parseable but missing from the palette listing.
+    #[test]
+    fn enter_search_mode_is_bindable_and_listed() {
+        assert_eq!(
+            parse_command("EnterSearchMode"),
+            Some(RemuxCommand::EnterSearchMode)
+        );
+        assert!(command_names().iter().any(|(n, _)| *n == "EnterSearchMode"));
+    }
+
+    /// The nine client-only actions are reachable from the palette, and the
+    /// resolver reports them as client actions rather than commands.
+    #[test]
+    fn client_actions_are_listed_and_client_kinded() {
+        for (name, want) in [
+            ("CommandPaletteOpen", ClientAction::CommandPaletteOpen),
+            ("SessionQuickSwitch", ClientAction::SessionQuickSwitch),
+            ("ViewNew", ClientAction::ViewNew),
+            ("ViewAddPane", ClientAction::ViewAddPane),
+            ("ViewRename", ClientAction::ViewRename),
+            ("ViewRemovePane", ClientAction::ViewRemovePane),
+            ("ViewLayoutNext", ClientAction::ViewLayoutNext),
+            ("ViewClose", ClientAction::ViewClose),
+            ("ViewDelete", ClientAction::ViewDelete),
+        ] {
+            assert_eq!(resolve_action(name), Some(Action::Client(want)));
+            // A client action is not a server command.
+            assert_eq!(parse_command(name), None);
+            assert!(
+                command_names().iter().any(|(n, _)| *n == name),
+                "client action '{name}' is missing from the palette listing"
+            );
+        }
+    }
+
+    /// `SendKey` is the one registry entry deliberately kept out of the
+    /// palette: its argument is a key notation, not something to pick.
+    #[test]
+    fn send_key_is_bindable_but_hidden_from_the_palette() {
+        assert_eq!(
+            parse_command("SendKey Ctrl-a"),
+            Some(RemuxCommand::SendKey(vec![0x01]))
+        );
+        assert!(!command_names().iter().any(|(n, _)| *n == "SendKey"));
+    }
+
+    // -- Binding validation ----------------------------------------------------
+
+    /// EVERY action string in the shipped keybindings resolves -- the default
+    /// which-key tree and the default Alt shortcuts. A default binding naming
+    /// an action the resolver does not know would be silently inert.
+    #[test]
+    fn every_default_binding_resolves() {
+        let problems = unresolved_actions(&KeybindingTree::default(), &ShortcutBindings::default());
+        assert!(
+            problems.is_empty(),
+            "default bindings do not resolve: {problems:#?}"
+        );
+
+        // Belt and braces: the walk actually visited the tree.
+        let leaves = KeybindingTree::default().leaves();
+        assert!(
+            leaves.len() > 40,
+            "expected the default tree to have leaves"
+        );
+        assert!(leaves
+            .iter()
+            .any(|(path, actions)| path == &['w', 'n'] && actions == &["ViewNew".to_string()]));
+    }
+
+    /// A typo in a binding is reported, naming the key path AND the bad name.
+    #[test]
+    fn unresolved_actions_names_the_binding_and_the_typo() {
+        let mut tree = KeybindingTree::default();
+        let toml_str = r#"
+            [w]
+            n = "ViewNwe"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        tree.merge(&KeybindingTree::from_toml(&value).unwrap());
+
+        let mut shortcuts = ShortcutBindings::default();
+        let shortcut_toml: toml::Value = r#"
+            "Alt-y" = "PaneFocusRigth"
+        "#
+        .parse()
+        .unwrap();
+        shortcuts.merge(&ShortcutBindings::from_toml(&shortcut_toml).unwrap());
+
+        let problems = unresolved_actions(&tree, &shortcuts);
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("binding 'w n'") && p.contains("unknown action 'ViewNwe'")),
+            "{problems:#?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("shortcut 'Alt-y'")
+                    && p.contains("unknown action 'PaneFocusRigth'")),
+            "{problems:#?}"
+        );
+    }
+
+    /// An action chain is validated element by element, and the unbind
+    /// sentinel (an empty action) is not an error.
+    #[test]
+    fn unresolved_actions_checks_chains_and_ignores_unbinds() {
+        let toml_str = r#"
+            q = "TabNew; EnterNorml"
+            h = ""
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let tree = KeybindingTree::from_toml(&value).unwrap();
+        let problems = unresolved_actions(&tree, &ShortcutBindings::default());
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("unknown action 'EnterNorml'"),
+            "{problems:#?}"
+        );
+    }
+
+    /// A known name with a missing required argument is reported differently
+    /// from an unknown name -- the user typed a real command, not a typo.
+    #[test]
+    fn unresolved_actions_flags_missing_arguments() {
+        let toml_str = r#"
+            q = "TabGoto"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let tree = KeybindingTree::from_toml(&value).unwrap();
+        let problems = unresolved_actions(&tree, &ShortcutBindings::default());
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("'TabGoto' is missing a required argument"),
+            "{problems:#?}"
+        );
+    }
+
+    /// Which-key labels come from the registry, so there is no fifth list.
+    #[test]
+    fn humanize_uses_registry_labels() {
+        assert_eq!(humanize_command("SessionQuickSwitch"), "switch session");
+        assert_eq!(humanize_command("ViewRemovePane"), "remove cell");
+        // Names with no label override still fall back to the PascalCase split,
+        // including strings that are not in the registry at all.
+        assert_eq!(humanize_command("PaneFocusLeft"), "focus left");
+        assert_eq!(humanize_command("SomethingUnknown"), "something unknown");
     }
 }
