@@ -1276,6 +1276,47 @@ pub(crate) fn render_pane_snapshot_at(screen: &Screen, scroll_offset: usize) -> 
     }
 }
 
+/// Like [`render_pane_snapshot_at`] but with a drag-selection highlight applied
+/// over the blitted grid.
+///
+/// The selection's coordinates are content-relative to the pane's own grid, so
+/// the highlight is applied against a zero-origin rect in `TmuxStyle` — the
+/// combination that makes [`apply_selection_highlight`] subtract no border
+/// offset. (A View cell's border is drawn by the *client*, around this grid, so
+/// the grid itself is borderless here.) Rows/columns are clamped to the
+/// snapshot's current size first, so a selection made before the pane shrank
+/// highlights what is still there instead of nothing.
+pub(crate) fn render_pane_snapshot_selected(
+    screen: &Screen,
+    scroll_offset: usize,
+    selection: Option<&MouseSelection>,
+) -> PaneRenderSnapshot {
+    let mut snap = render_pane_snapshot_at(screen, scroll_offset);
+    if let Some(sel) = selection {
+        if snap.cols > 0 && snap.rows > 0 {
+            let max_col = snap.cols - 1;
+            let max_row = snap.rows - 1;
+            let clamped = MouseSelection {
+                pane_id: sel.pane_id,
+                start: (sel.start.0.min(max_col), sel.start.1.min(max_row)),
+                end: (sel.end.0.min(max_col), sel.end.1.min(max_row)),
+            };
+            apply_selection_highlight(
+                &mut snap.cells,
+                &clamped,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: snap.cols,
+                    height: snap.rows,
+                },
+                &BorderStyle::TmuxStyle,
+            );
+        }
+    }
+    snap
+}
+
 /// Safely set a cell in the buffer (bounds-checked).
 fn set_cell(buffer: &mut [Vec<RenderCell>], row: usize, col: usize, cell: RenderCell) {
     if row < buffer.len() && col < buffer[row].len() {

@@ -214,6 +214,21 @@ struct ClientConnection {
     /// foreground `scroll_offset` and of other clients viewing the same pane.
     /// `0`/absent = live view. Cleared on `UnsubscribePane` and pane close.
     pane_scroll: std::collections::HashMap<PaneId, usize>,
+    /// Per-(this client, pane) drag-selection over a subscribed pane, in the
+    /// pane's own content coordinates. The View-cell analog of
+    /// `mouse_selection`: a client displaying a view is detached, so the
+    /// session-scoped selection has no pane to attach to. Rendered into the
+    /// per-subscriber `PaneContent` by [`stream_pane_content`].
+    pane_selection: std::collections::HashMap<PaneId, MouseSelection>,
+    /// In-progress pane-scoped drag gesture (a View cell), if any. Separate from
+    /// `drag` so a session drag and a cell drag can never be confused for one
+    /// another; the anchor is likewise kept in eviction-stable absolute
+    /// coordinates so cell edge auto-scroll doesn't drift it.
+    pane_drag: Option<DragSession>,
+    /// The pane-scoped analog of `autoscroll_repeat`: `(pane_id, start_x,
+    /// start_y, end_x, end_y)` in the pane's content coordinates, replayed by
+    /// the ticker task while a cell drag rests on a scrollable content edge.
+    pane_autoscroll_repeat: Option<(PaneId, u16, u16, u16, u16)>,
 }
 
 /// The Remux server.
@@ -494,6 +509,9 @@ impl RemuxServer {
                     autoscroll_repeat: None,
                     subscribed_panes: std::collections::HashMap::new(),
                     pane_scroll: std::collections::HashMap::new(),
+                    pane_selection: std::collections::HashMap::new(),
+                    pane_drag: None,
+                    pane_autoscroll_repeat: None,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -611,10 +629,10 @@ impl RemuxServer {
                 ticker.tick().await;
                 // Read (and drop the lock before calling into handle_mouse_drag,
                 // which locks `clients` itself). Break when the client is gone.
-                let armed = {
+                let (armed, pane_armed) = {
                     let cls = ts_clients.lock().await;
                     match cls.get(&client_id) {
-                        Some(c) => c.autoscroll_repeat,
+                        Some(c) => (c.autoscroll_repeat, c.pane_autoscroll_repeat),
                         None => break,
                     }
                 };
@@ -635,6 +653,30 @@ impl RemuxServer {
                     .await
                     {
                         log::error!("autoscroll drag error: {e}");
+                    }
+                }
+                // The same replay for a View cell's gesture: a drag resting on a
+                // cell's content edge scrolls that cell's source pane. The two
+                // are mutually exclusive in practice (a client is either
+                // attached to a session or displaying a view), but each is armed
+                // and disarmed by its own handler, so both are simply checked.
+                if let Some((pane_id, sx, sy, ex, ey)) = pane_armed {
+                    if let Err(e) = handle_pane_mouse_drag(
+                        client_id,
+                        pane_id,
+                        sx,
+                        sy,
+                        ex,
+                        ey,
+                        false,
+                        &ts_state,
+                        &ts_panes,
+                        &ts_clients,
+                        &ts_config,
+                    )
+                    .await
+                    {
+                        log::error!("pane autoscroll drag error: {e}");
                     }
                 }
             }
@@ -674,9 +716,10 @@ async fn handle_client_message(
             end_x,
             end_y,
             is_final,
+            pane_id,
         } => {
             log::debug!(
-                "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final})"
+                "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final}, pane_id={pane_id:?})"
             );
         }
         other => {
@@ -782,31 +825,48 @@ async fn handle_client_message(
         ClientMessage::ModeChanged { mode } => {
             handle_mode_changed(client_id, &mode, state, panes, clients, config, prev_frames).await
         }
-        ClientMessage::MouseClick { x, y } => {
-            handle_mouse_click(client_id, x, y, state, panes, clients, config, prev_frames).await
-        }
+        // `pane_id: Some(..)` routes the gesture by pane identity in that
+        // pane's own content coordinates (a View cell); `None` keeps the
+        // original screen-coordinate, foreground-session path.
+        ClientMessage::MouseClick { x, y, pane_id } => match pane_id {
+            Some(pid) => handle_pane_mouse_click(client_id, pid, state, panes, clients).await,
+            None => {
+                handle_mouse_click(client_id, x, y, state, panes, clients, config, prev_frames)
+                    .await
+            }
+        },
         ClientMessage::MouseDrag {
             start_x,
             start_y,
             end_x,
             end_y,
             is_final,
-        } => {
-            handle_mouse_drag(
-                client_id,
-                start_x,
-                start_y,
-                end_x,
-                end_y,
-                is_final,
-                state,
-                panes,
-                clients,
-                config,
-                prev_frames,
-            )
-            .await
-        }
+            pane_id,
+        } => match pane_id {
+            Some(pid) => {
+                handle_pane_mouse_drag(
+                    client_id, pid, start_x, start_y, end_x, end_y, is_final, state, panes,
+                    clients, config,
+                )
+                .await
+            }
+            None => {
+                handle_mouse_drag(
+                    client_id,
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                    is_final,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                )
+                .await
+            }
+        },
         ClientMessage::ScrollDelta { delta } => {
             handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
         }
@@ -888,10 +948,7 @@ async fn handle_client_message(
             size_demand,
         } => {
             // Record the subscriber's size demand (Model A/B min-across-viewers
-            // sizing), fold it into the pane's effective size, and send an
-            // immediate snapshot. `build_pane_content` acquires panes/state/clients
-            // independently so we never nest locks.
-            let snapshot = build_pane_content(pane_id, state, panes, clients).await;
+            // sizing) and send an immediate snapshot.
             {
                 let mut cls = clients.lock().await;
                 if let Some(conn) = cls.get_mut(&client_id) {
@@ -900,15 +957,21 @@ async fn handle_client_message(
                     } else {
                         None
                     };
-                    conn.subscribed_panes.insert(pane_id, demand);
-                    // A fresh (re)subscribe snaps the cell back to the live view;
-                    // the immediate snapshot below is rendered at offset 0.
-                    conn.pane_scroll.remove(&pane_id);
-                    if let Some(msg) = snapshot {
-                        let _ = conn.tx.send(msg);
+                    // A FRESH subscribe starts at the live view with nothing
+                    // selected. A RE-subscribe of a pane this client already
+                    // watches does not: the client re-subscribes its cells
+                    // whenever the view's focus or geometry changes (the size
+                    // demand follows focus), and resetting there would throw away
+                    // a scroll position or a drag anchor mid-gesture just because
+                    // the user clicked a cell.
+                    if conn.subscribed_panes.insert(pane_id, demand).is_none() {
+                        conn.pane_scroll.remove(&pane_id);
+                        conn.pane_selection.remove(&pane_id);
                     }
                 }
             }
+            // Snapshot at whatever offset/selection this client now holds.
+            stream_pane_content(pane_id, state, panes, clients).await;
             // The new/updated demand may shrink (or release) the pane's effective
             // size; recompute and re-stream if it changed.
             recompute_pane_size(pane_id, state, panes, clients, config).await;
@@ -920,6 +983,11 @@ async fn handle_client_message(
                 if let Some(conn) = cls.get_mut(&client_id) {
                     conn.subscribed_panes.remove(&pane_id);
                     conn.pane_scroll.remove(&pane_id);
+                    conn.pane_selection.remove(&pane_id);
+                    if conn.pane_drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
+                        conn.pane_drag = None;
+                        conn.pane_autoscroll_repeat = None;
+                    }
                 }
             }
             // Dropping a viewer may let the pane grow back; recompute.
@@ -975,37 +1043,16 @@ async fn handle_client_message(
                     _ => return Ok(()),
                 }
             };
-            // Render at the new offset and stream to this client only.
-            let snap = {
-                let ps = panes.lock().await;
-                ps.get(&pane_id).map(|pd| {
-                    crate::server::compositor::render_pane_snapshot_at(&pd.screen, new_off)
-                })
-            };
-            if let Some(snap) = snap {
-                let (session_name, tab_name) = {
-                    let st = state.lock().await;
-                    pane_labels(&st, pane_id)
-                };
-                let session_visible = pane_session_visible(pane_id, state, clients).await;
-                let msg = ServerMessage::PaneContent {
-                    pane_id,
-                    cols: snap.cols,
-                    rows: snap.rows,
-                    cells: snap.cells,
-                    cursor_x: snap.cursor_x,
-                    cursor_y: snap.cursor_y,
-                    cursor_visible: snap.cursor_visible,
-                    application_cursor_keys: snap.application_cursor_keys,
-                    session_name,
-                    tab_name,
-                    session_visible,
-                };
-                let cls = clients.lock().await;
-                if let Some(conn) = cls.get(&client_id) {
-                    let _ = conn.tx.send(msg);
-                }
-            }
+            // A live selection has to follow the scroll: extend it while a drag
+            // is in flight, drop it otherwise (see
+            // `rescope_pane_selection_on_scroll`).
+            rescope_pane_selection_on_scroll(client_id, pane_id, up, new_off, panes, clients).await;
+            // Repaint through the shared per-subscriber path so the snapshot is
+            // rendered at THIS client's new offset WITH its selection applied --
+            // a bespoke render here would silently drop the highlight. Other
+            // subscribers re-render at their own unchanged state, so they simply
+            // receive the frame they already had.
+            stream_pane_content(pane_id, state, panes, clients).await;
             Ok(())
         }
 
@@ -3269,6 +3316,86 @@ async fn extend_selection_on_scroll(
     }
 }
 
+/// Keep a View cell's selection honest across a `ScrollPane` (wheel) step.
+///
+/// The pane-scoped counterpart of [`extend_selection_on_scroll`], with the extra
+/// case that path does not have to handle:
+///
+/// * **A drag is in flight** -- the wheel EXTENDS the selection to the newly
+///   revealed edge, exactly as a session drag does, so the highlight keeps
+///   matching what a release would yank. The anchor is absolute, so it stays
+///   pinned to its logical line.
+/// * **No drag, but a selection is still up** (only possible with
+///   `mouse_auto_yank = false`, which leaves the highlight for keyboard
+///   adjustment) -- the selection is CLEARED. `MouseSelection` is
+///   viewport-relative, so scrolling the content out from under it would leave
+///   the grey block sitting on whatever text happened to land in those rows.
+async fn rescope_pane_selection_on_scroll(
+    client_id: u64,
+    pane_id: PaneId,
+    up: bool,
+    new_offset: usize,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    let anchor = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id).and_then(|c| c.pane_drag.as_ref()) {
+            Some(d) if d.pane_id == pane_id => Some((d.anchor_col, d.anchor_abs)),
+            _ => None,
+        }
+    };
+    let (anchor_col, anchor_abs) = match anchor {
+        Some(a) => a,
+        None => {
+            // No gesture to extend: a leftover highlight cannot survive the
+            // scroll, so drop it rather than let it point at the wrong text.
+            let mut cls = clients.lock().await;
+            if let Some(client) = cls.get_mut(&client_id) {
+                client.pane_selection.remove(&pane_id);
+            }
+            return;
+        }
+    };
+    let projected = {
+        let ps = panes.lock().await;
+        ps.get(&pane_id).map(|pd| {
+            let screen = &pd.screen;
+            let (rows, cols) = (screen.rows, screen.cols);
+            // The moving end pins to the revealed edge: the top row scrolling
+            // back into history, the bottom row scrolling forward.
+            let end_row = if up { 0 } else { rows.saturating_sub(1) };
+            let end_col = if up { 0 } else { cols.saturating_sub(1) };
+            let end_abs = screen.abs_of_row(new_offset, end_row);
+            let anchor_row = screen
+                .row_of_abs(new_offset, anchor_abs)
+                .clamp(0, rows.saturating_sub(1) as i64) as u16;
+            (end_row, end_col, end_abs, anchor_row)
+        })
+    };
+    let (end_row, end_col, end_abs, anchor_row) = match projected {
+        Some(v) => v,
+        None => return,
+    };
+    let mut cls = clients.lock().await;
+    if let Some(client) = cls.get_mut(&client_id) {
+        if let Some(d) = client.pane_drag.as_mut() {
+            if d.pane_id == pane_id {
+                d.end_abs = end_abs;
+                d.end_col = end_col;
+            }
+        }
+        client.pane_selection.insert(
+            pane_id,
+            MouseSelection {
+                pane_id,
+                start: (anchor_col, anchor_row),
+                end: (end_col, end_row),
+            },
+        );
+    }
+}
+
 /// Route a mouse wheel event. If the pane under the cursor has mouse tracking
 /// enabled, forward a wheel report to its application. Otherwise, if it is on
 /// the alternate screen, emit the alternate-scroll arrow-key fallback. For a
@@ -3926,6 +4053,269 @@ async fn handle_mouse_drag(
     Ok(())
 }
 
+/// Disarm the pane-scoped drag-autoscroll repeat timer for a client. The
+/// [`disarm_autoscroll`] analog for a View cell's gesture.
+async fn disarm_pane_autoscroll(
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    client_id: u64,
+) {
+    let mut cls = clients.lock().await;
+    if let Some(c) = cls.get_mut(&client_id) {
+        c.pane_autoscroll_repeat = None;
+    }
+}
+
+/// A left-click inside a View cell: clear that cell's selection and end any
+/// gesture on it, so the drag that follows starts from a fresh anchor.
+///
+/// Sent on the press, and also on a release that never moved -- which is a click,
+/// not a selection. That second case is not just tidiness: it is what disarms the
+/// repeat timer for a gesture that wandered onto a content edge and came back, so
+/// the cell stops auto-scrolling once the button is up. The disarm therefore
+/// happens unconditionally; only the (comparatively costly) repaint is skipped
+/// when there was no selection to clear.
+///
+/// The pane-scoped counterpart of [`handle_mouse_click`]. There is no hit
+/// testing to do -- the client already resolved which cell was clicked against
+/// its own cell rects -- and no focus to move: cell focus is shared view state
+/// driven by `ViewSetFocus`, not by this message.
+async fn handle_pane_mouse_click(
+    client_id: u64,
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Result<()> {
+    let had_selection = {
+        let mut cls = clients.lock().await;
+        match cls.get_mut(&client_id) {
+            // Only a subscribed client may drive a pane it watches (same guard
+            // as `ScrollPane`).
+            Some(conn) if conn.subscribed_panes.contains_key(&pane_id) => {
+                let had = conn.pane_selection.remove(&pane_id).is_some();
+                if conn.pane_drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
+                    conn.pane_drag = None;
+                }
+                conn.pane_autoscroll_repeat = None;
+                had
+            }
+            _ => return Ok(()),
+        }
+    };
+    // Only repaint when something actually changed: a plain click-to-focus in a
+    // view is the common case and should cost no extra frame.
+    if had_selection {
+        stream_pane_content(pane_id, state, panes, clients).await;
+    }
+    Ok(())
+}
+
+/// A left-drag inside a View cell: select text in that cell's source pane.
+///
+/// The pane-scoped counterpart of [`handle_mouse_drag`], and deliberately built
+/// from the same pieces -- [`Screen::abs_of_row`]/[`Screen::row_of_abs`] for an
+/// eviction-stable anchor, [`extract_selection_text`] for the yank, and
+/// `mouse_auto_yank` for the release semantics -- so a cell selects, scrolls and
+/// copies exactly like a normal pane does. The differences are all consequences
+/// of the client being *detached* while a view is up:
+///
+/// * coordinates arrive already content-relative (the client owns the cell
+///   geometry; the server has no layout rect for a cell), so there is no
+///   composite/hit-test step;
+/// * the scroll offset auto-scroll moves is the per-(client, pane) `pane_scroll`
+///   that the wheel already drives, not the foreground `scroll_offset`;
+/// * the repaint is a per-subscriber `PaneContent`, not a session frame.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pane_mouse_drag(
+    client_id: u64,
+    pane_id: PaneId,
+    start_x: u16,
+    start_y: u16,
+    end_x: u16,
+    end_y: u16,
+    is_final: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) -> Result<()> {
+    // Current per-(client, pane) offset and the state of any gesture already
+    // running on this pane. A drag on a pane this client does not subscribe to
+    // is ignored, mirroring `ScrollPane`.
+    let (scroll_offset, gesture) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) if c.subscribed_panes.contains_key(&pane_id) => (
+                c.pane_scroll.get(&pane_id).copied().unwrap_or(0),
+                c.pane_drag
+                    .as_ref()
+                    .filter(|d| d.pane_id == pane_id)
+                    .map(|d| (d.anchor_col, d.anchor_abs)),
+            ),
+            _ => {
+                disarm_pane_autoscroll(clients, client_id).await;
+                return Ok(());
+            }
+        }
+    };
+    let new_gesture = gesture.is_none();
+
+    // Everything that needs the pane's screen, in one lock scope: the content
+    // size to clamp against, the anchor/end in absolute coordinates, and the
+    // scroll bound that gates the repeat timer.
+    let computed = 'compute: {
+        let ps = panes.lock().await;
+        let screen = match ps.get(&pane_id) {
+            Some(pd) => &pd.screen,
+            None => break 'compute None,
+        };
+        let content_width = screen.cols;
+        let content_height = screen.rows;
+        if content_width == 0 || content_height == 0 {
+            break 'compute None;
+        }
+        let max_scroll = screen.max_scroll_offset();
+        // The stored offset can outlive the scrollback it addressed; clamp it
+        // before deriving anything from it (`stream_pane_content` clamps the
+        // same way when rendering).
+        let base_offset = scroll_offset.min(max_scroll);
+
+        let local_start_x = start_x.min(content_width - 1);
+        let local_start_y = start_y.min(content_height - 1);
+        let end_col = end_x.min(content_width - 1);
+        let end_row = end_y.min(content_height - 1);
+
+        // Edge auto-scroll: resting on the top/bottom content row pulls history
+        // in. A final drag (release) never scrolls -- the yanked range must match
+        // the highlight the user saw when letting go.
+        let at_top = end_row == 0;
+        let at_bottom = end_row == content_height - 1;
+        let new_offset = if is_final {
+            base_offset
+        } else if at_top {
+            (base_offset + 1).min(max_scroll)
+        } else if at_bottom {
+            base_offset.saturating_sub(1)
+        } else {
+            base_offset
+        };
+
+        // Anchor in eviction-stable absolute coordinates, captured in the
+        // PRE-scroll view for a fresh gesture and reused thereafter, so
+        // auto-scrolling under the pointer never drags the anchor along.
+        let (anchor_col, anchor_abs) = match gesture {
+            Some(g) => g,
+            None => (local_start_x, screen.abs_of_row(base_offset, local_start_y)),
+        };
+        let end_abs = screen.abs_of_row(new_offset, end_row);
+        let anchor_row_i64 = screen.row_of_abs(new_offset, anchor_abs);
+        // Project the anchor back into the post-scroll viewport for the
+        // (viewport-relative) highlight: an anchor scrolled off the top clamps
+        // to row 0, one below the fold to the last content row.
+        let anchor_row = anchor_row_i64.clamp(0, content_height as i64 - 1) as u16;
+        Some((
+            new_offset, max_scroll, anchor_col, anchor_abs, anchor_row, end_col, end_row, end_abs,
+            at_top, at_bottom,
+        ))
+    };
+    let (
+        new_offset,
+        max_scroll,
+        anchor_col,
+        anchor_abs,
+        anchor_row,
+        end_col,
+        end_row,
+        end_abs,
+        at_top,
+        at_bottom,
+    ) = match computed {
+        Some(v) => v,
+        None => {
+            disarm_pane_autoscroll(clients, client_id).await;
+            return Ok(());
+        }
+    };
+
+    // Commit the gesture, the new offset and the derived highlight.
+    {
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            if new_gesture {
+                client.pane_drag = Some(DragSession {
+                    pane_id,
+                    anchor_col,
+                    anchor_abs,
+                    end_abs,
+                    end_col,
+                });
+            } else if let Some(d) = client.pane_drag.as_mut() {
+                d.end_abs = end_abs;
+                d.end_col = end_col;
+            }
+            if new_offset == 0 {
+                client.pane_scroll.remove(&pane_id);
+            } else {
+                client.pane_scroll.insert(pane_id, new_offset);
+            }
+            client.pane_selection.insert(
+                pane_id,
+                MouseSelection {
+                    pane_id,
+                    start: (anchor_col, anchor_row),
+                    end: (end_col, end_row),
+                },
+            );
+            // Keep the repeat timer firing only while resting on an edge that
+            // still has somewhere to go, so it stops at the scrollback top /
+            // live bottom instead of spinning.
+            client.pane_autoscroll_repeat = if !is_final
+                && ((at_top && new_offset < max_scroll) || (at_bottom && new_offset > 0))
+            {
+                Some((pane_id, start_x, start_y, end_x, end_y))
+            } else {
+                None
+            };
+        }
+    }
+
+    if is_final {
+        if config.general.mouse_auto_yank {
+            // Extract over the ABSOLUTE range so a selection dragged through
+            // scrollback yanks what it covered, not what is on screen now.
+            let selected_text = {
+                let ps = panes.lock().await;
+                match ps.get(&pane_id) {
+                    Some(pd) => {
+                        extract_selection_text(&pd.screen, anchor_col, anchor_abs, end_col, end_abs)
+                    }
+                    None => String::new(),
+                }
+            };
+            let mut cls = clients.lock().await;
+            if let Some(client) = cls.get_mut(&client_id) {
+                if !selected_text.is_empty() {
+                    let _ = client.tx.send(ServerMessage::CopyToClipboard {
+                        data: selected_text,
+                    });
+                }
+                client.pane_selection.remove(&pane_id);
+            }
+        }
+        // With mouse_auto_yank off the highlight stays up for keyboard
+        // adjustment, exactly as in a normal pane. Either way the gesture ends.
+        let mut cls = clients.lock().await;
+        if let Some(client) = cls.get_mut(&client_id) {
+            client.pane_drag = None;
+        }
+    }
+
+    // Repaint: every subscriber renders at its own offset/selection, so this
+    // shows the highlight (and any auto-scroll) to this client alone.
+    stream_pane_content(pane_id, state, panes, clients).await;
+    Ok(())
+}
+
 /// Extract text from a pane's screen buffer between two selection endpoints
 /// given in absolute, eviction-stable line coordinates (see
 /// [`Screen::abs_of_row`]). Working in absolute space means the yank is correct
@@ -4348,14 +4738,7 @@ async fn recompute_pane_size(
         // subscriber right away, so a cell that reflowed a pane -- or whose pane
         // just flipped visibility -- updates without waiting for the next PTY
         // output.
-        if let Some(msg) = build_pane_content(pane_id, state, panes, clients).await {
-            let cls = clients.lock().await;
-            for conn in cls.values() {
-                if conn.subscribed_panes.contains_key(&pane_id) {
-                    let _ = conn.tx.send(msg.clone());
-                }
-            }
-        }
+        stream_pane_content(pane_id, state, panes, clients).await;
     }
 }
 
@@ -4431,39 +4814,117 @@ fn pane_labels(st: &ServerState, pane_id: PaneId) -> (String, String) {
     (String::new(), String::new())
 }
 
-/// Build a `PaneContent` message for `pane_id`: render its screen snapshot
-/// (cells + cursor + DECCKM) and resolve its session/tab title. Returns `None`
-/// when the pane no longer exists. Acquires the panes and state locks
+/// What makes one subscriber's `PaneContent` differ from another's: the
+/// scrollback offset it is rendered at, plus its selection flattened to
+/// `(start_col, start_row, end_col, end_row)`. Used to memoize the renders in
+/// [`stream_pane_content`] so identical viewing states cost one snapshot.
+type RenderKey = (usize, Option<(u16, u16, u16, u16)>);
+
+/// Render and send a fresh `PaneContent` for `pane_id` to every client
+/// subscribed to it, **rendered per subscriber**.
+///
+/// Each subscriber sees the pane through its own per-(client, pane) scrollback
+/// offset and its own cell drag-selection, so a single shared snapshot is wrong:
+/// broadcasting one render at offset 0 is what made a scrolled-back View cell
+/// snap to the live tail on the next byte of PTY output. Renders are memoized on
+/// `(offset, selection)`, so the common case (all subscribers live, nothing
+/// selected) still costs exactly one snapshot.
+///
+/// A no-op when nothing subscribes -- the snapshot is skipped entirely rather
+/// than built and dropped. Acquires the clients, state and panes locks
 /// independently (never nested), honoring the codebase's lock ordering.
-async fn build_pane_content(
+async fn stream_pane_content(
     pane_id: PaneId,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
-) -> Option<ServerMessage> {
-    let snap = {
-        let ps = panes.lock().await;
-        ps.get(&pane_id)
-            .map(|pd| crate::server::compositor::render_pane_snapshot(&pd.screen))
-    }?;
+) {
+    // Every subscriber with the viewing state that makes its snapshot differ:
+    // its own scrollback offset and its own cell selection. Both are
+    // per-(client, pane), so one shared snapshot cannot serve them all -- that
+    // was the bug where any PTY output yanked a scrolled-back cell to the live
+    // tail, because the fanout rendered once at offset 0 and cloned it.
+    let subs: Vec<(u64, usize, Option<MouseSelection>)> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| c.subscribed_panes.contains_key(&pane_id))
+            .map(|(id, c)| {
+                (
+                    *id,
+                    c.pane_scroll.get(&pane_id).copied().unwrap_or(0),
+                    c.pane_selection.get(&pane_id).cloned(),
+                )
+            })
+            .collect()
+    };
+    if subs.is_empty() {
+        return;
+    }
     let (session_name, tab_name) = {
         let st = state.lock().await;
         pane_labels(&st, pane_id)
     };
     let session_visible = pane_session_visible(pane_id, state, clients).await;
-    Some(ServerMessage::PaneContent {
-        pane_id,
-        cols: snap.cols,
-        rows: snap.rows,
-        cells: snap.cells,
-        cursor_x: snap.cursor_x,
-        cursor_y: snap.cursor_y,
-        cursor_visible: snap.cursor_visible,
-        application_cursor_keys: snap.application_cursor_keys,
-        session_name,
-        tab_name,
-        session_visible,
-    })
+
+    // Render, then send: the messages are owned, so the panes lock is released
+    // before the clients lock is taken again (never nested).
+    let outgoing: Vec<(u64, ServerMessage)> = {
+        let ps = panes.lock().await;
+        let screen = match ps.get(&pane_id) {
+            Some(pd) => &pd.screen,
+            // Pane gone between the subscriber scan and here: nothing to send.
+            None => return,
+        };
+        // A stored offset can outlive the scrollback it pointed into (eviction,
+        // or a reflow-shrinking resize), so clamp at render time instead of
+        // trying to keep every client's map correct on every mutation.
+        let max_off = screen.max_scroll_offset();
+        // One render per DISTINCT (offset, selection). The steady state is every
+        // subscriber live and unselected, which collapses back to exactly one.
+        let mut cache: Vec<(RenderKey, ServerMessage)> = Vec::new();
+        let mut out = Vec::with_capacity(subs.len());
+        for (cid, off, sel) in subs {
+            let off = off.min(max_off);
+            let key = (
+                off,
+                sel.as_ref()
+                    .map(|s| (s.start.0, s.start.1, s.end.0, s.end.1)),
+            );
+            let msg = match cache.iter().find(|(k, _)| *k == key) {
+                Some((_, m)) => m.clone(),
+                None => {
+                    let snap = crate::server::compositor::render_pane_snapshot_selected(
+                        screen,
+                        off,
+                        sel.as_ref(),
+                    );
+                    let m = ServerMessage::PaneContent {
+                        pane_id,
+                        cols: snap.cols,
+                        rows: snap.rows,
+                        cells: snap.cells,
+                        cursor_x: snap.cursor_x,
+                        cursor_y: snap.cursor_y,
+                        cursor_visible: snap.cursor_visible,
+                        application_cursor_keys: snap.application_cursor_keys,
+                        session_name: session_name.clone(),
+                        tab_name: tab_name.clone(),
+                        session_visible,
+                    };
+                    cache.push((key, m.clone()));
+                    m
+                }
+            };
+            out.push((cid, msg));
+        }
+        out
+    };
+    let cls = clients.lock().await;
+    for (cid, msg) in outgoing {
+        if let Some(conn) = cls.get(&cid) {
+            let _ = conn.tx.send(msg);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5521,9 +5982,22 @@ async fn close_pane(
         for conn in cls.values_mut() {
             conn.subscribed_panes.remove(&pane_id);
             conn.pane_scroll.remove(&pane_id);
+            conn.pane_selection.remove(&pane_id);
             for extra in &also_reap {
                 conn.subscribed_panes.remove(extra);
                 conn.pane_scroll.remove(extra);
+                conn.pane_selection.remove(extra);
+            }
+            // A gesture on a pane that just went away can never make progress;
+            // drop it (and its repeat timer) so the ticker stops replaying it.
+            let dead = conn
+                .pane_drag
+                .as_ref()
+                .map(|d| d.pane_id == pane_id || also_reap.contains(&d.pane_id))
+                .unwrap_or(false);
+            if dead {
+                conn.pane_drag = None;
+                conn.pane_autoscroll_repeat = None;
             }
         }
     }
@@ -5669,30 +6143,11 @@ async fn start_pty_forwarding(
                                 }
                             }
                         }
-                        // Only snapshot + stream if at least one client subscribes
-                        // to this pane; rendering a full grid on every PTY batch
-                        // for zero subscribers would be a needless per-keystroke
-                        // cost on every pane. Check the (cheap) subscriber set
-                        // first under the clients lock, drop it, THEN snapshot
-                        // under panes -- keeping the clients->panes order
-                        // broadcast_full_render already uses (never nested).
-                        let has_subscriber = {
-                            let cls = clients.lock().await;
-                            cls.values()
-                                .any(|c| c.subscribed_panes.contains_key(&pane_id))
-                        };
-                        if has_subscriber {
-                            if let Some(msg) =
-                                build_pane_content(pane_id, &state, &panes, &clients).await
-                            {
-                                let cls = clients.lock().await;
-                                for conn in cls.values() {
-                                    if conn.subscribed_panes.contains_key(&pane_id) {
-                                        let _ = conn.tx.send(msg.clone());
-                                    }
-                                }
-                            }
-                        }
+                        // Stream to the pane's View-cell subscribers, each at its
+                        // own scroll offset and selection. Self-limiting: with no
+                        // subscriber it returns before snapshotting, so a pane
+                        // nobody watches costs nothing per PTY batch.
+                        stream_pane_content(pane_id, &state, &panes, &clients).await;
                         broadcast_full_render(
                             &session_name,
                             &state,
@@ -5953,32 +6408,11 @@ async fn materialize_session(
                                 }
                             }
                         }
-                        // Only snapshot + stream if at least one client subscribes
-                        // to this pane; rendering a full grid on every PTY batch
-                        // for zero subscribers would be a needless per-keystroke
-                        // cost on every pane. This resurrect path is a second
-                        // per-pane forwarding loop; subscribers to a materialized
-                        // session must stream here too. Check the (cheap)
-                        // subscriber set first under the clients lock, drop it,
-                        // THEN snapshot under panes -- keeping the clients->panes
-                        // order broadcast_full_render already uses (never nested).
-                        let has_subscriber = {
-                            let cls = clients.lock().await;
-                            cls.values()
-                                .any(|c| c.subscribed_panes.contains_key(&pane_id))
-                        };
-                        if has_subscriber {
-                            if let Some(msg) =
-                                build_pane_content(pane_id, &state, &panes, &clients).await
-                            {
-                                let cls = clients.lock().await;
-                                for conn in cls.values() {
-                                    if conn.subscribed_panes.contains_key(&pane_id) {
-                                        let _ = conn.tx.send(msg.clone());
-                                    }
-                                }
-                            }
-                        }
+                        // Stream to the pane's View-cell subscribers, each at its
+                        // own scroll offset and selection. This resurrect path is a
+                        // second per-pane forwarding loop; subscribers to a
+                        // materialized session must stream here too.
+                        stream_pane_content(pane_id, &state, &panes, &clients).await;
                         broadcast_full_render(
                             &session_name,
                             &state,

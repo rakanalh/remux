@@ -35,6 +35,11 @@ class Tui:
         }
         self.screen = pyte.Screen(self.cols, self.rows)
         self.stream = pyte.ByteStream(self.screen)
+        # Raw copy of everything the client wrote. pyte drops the sequences it
+        # does not model, and OSC 52 (the clipboard write a yank performs) is one
+        # of them -- so a test that wants to assert on the YANKED text has to
+        # read it out of the byte stream itself. See `yanks()`.
+        self.raw = bytearray()
         self.child = pexpect.spawn(
             BIN, [], env=env, dimensions=(self.rows, self.cols), encoding=None,
         )
@@ -47,6 +52,7 @@ class Tui:
             try:
                 data = self.child.read_nonblocking(65536, 0.1)
                 if data:
+                    self.raw.extend(data)
                     self.stream.feed(data)
             except Exception:
                 pass
@@ -93,3 +99,18 @@ class Tui:
 
     def has(self, needle):
         return any(needle in r for r in self.rows_text())
+
+    def yanks(self):
+        """Every clipboard write the client made, decoded, oldest first.
+
+        `copy_to_clipboard` emits OSC 52 (`ESC ] 52 ; c ; <base64> BEL`), so this
+        is what a real terminal would have put on the clipboard.
+        """
+        import base64, re
+        out = []
+        for m in re.finditer(rb"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", bytes(self.raw)):
+            try:
+                out.append(base64.b64decode(m.group(1)).decode("utf-8", "replace"))
+            except Exception:
+                pass
+        return out

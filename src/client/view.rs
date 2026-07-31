@@ -641,6 +641,129 @@ pub fn cell_at(
     })
 }
 
+/// The region of the screen a cell's content actually occupies, and where the
+/// source pane's grid starts within it.
+///
+/// Every mouse/visual mapping into a cell goes through this so it can never
+/// disagree with what [`draw_cell`] painted. `origin` is the top-left of the
+/// painted content; `cols`/`rows` is its extent; `src_row0` is the source
+/// pane grid row shown on the first painted row.
+///
+/// `src_row0` is where the two anchoring regimes differ, and getting it
+/// backwards shifts every selection by the difference: `draw_cell` shows
+/// snapshot rows `start..` with `start = sr.saturating_sub(ih)`, so a snapshot
+/// TALLER than the interior is bottom-anchored (`src_row0 = sr - ih`, the top of
+/// the pane is cut off) while a SHORTER one is top-aligned at row 0 with blank
+/// rows below (`src_row0 = 0`), not floated to the bottom.
+pub struct CellContentGeometry {
+    /// Screen `(x, y)` of the first painted content cell.
+    pub origin: (u16, u16),
+    /// Painted content width in columns.
+    pub cols: u16,
+    /// Painted content height in rows.
+    pub rows: u16,
+    /// Source-pane grid row displayed on the first painted row.
+    pub src_row0: u16,
+}
+
+/// Content geometry of cell `idx`, or `None` when it paints no content (no
+/// rect, a degenerate interior, or an empty snapshot).
+///
+/// Coordinates are in `area`'s own space, matching [`cell_at`] — in normal use
+/// `area` is the full terminal at the origin, so they are screen coordinates.
+/// A cell with no snapshot yet, a disconnected one, or one showing the "Active
+/// in session" placeholder has no source grid to map into and yields `None`.
+pub fn cell_content_geometry(
+    view: &ClientView,
+    area: Rect,
+    idx: usize,
+    style: &BorderStyle,
+) -> Option<CellContentGeometry> {
+    let cell = view.cells.get(idx)?;
+    if cell.disconnected || cell.unavailable.is_some() {
+        return None;
+    }
+    let snap = cell.snapshot.as_ref()?;
+    if snap.session_visible {
+        return None;
+    }
+    let rect = cell_rects(view, area).get(idx).copied().flatten()?;
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let (ix, iy, iw, ih) = cell_interior(
+        rect.x as usize,
+        rect.y as usize,
+        rect.width as usize,
+        rect.height as usize,
+        style,
+    );
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let sr = snap.cells.len();
+    if sr == 0 {
+        return None;
+    }
+    // Exactly `draw_cell`'s `start`: bottom-anchored when the snapshot overflows
+    // the interior, top-aligned (with blank rows below) when it underfills it.
+    let src_row0 = sr.saturating_sub(ih);
+    Some(CellContentGeometry {
+        origin: (ix as u16, iy as u16),
+        cols: iw.min(snap.cols as usize) as u16,
+        rows: ih.min(sr) as u16,
+        src_row0: src_row0 as u16,
+    })
+}
+
+/// Map a screen point into cell `idx`'s source-pane content coordinates,
+/// clamping to the painted content.
+///
+/// Clamping (rather than returning `None` off-cell) is what makes drag-select
+/// work: the pointer routinely leaves the cell mid-drag, and a drag that runs
+/// past the top/bottom content row is exactly the edge the server turns into an
+/// auto-scroll step. The gesture stays bound to the cell it started in.
+pub fn cell_content_pos(
+    view: &ClientView,
+    area: Rect,
+    idx: usize,
+    x: u16,
+    y: u16,
+    style: &BorderStyle,
+) -> Option<(u16, u16)> {
+    let g = cell_content_geometry(view, area, idx, style)?;
+    let col = x.saturating_sub(g.origin.0).min(g.cols.saturating_sub(1));
+    let row_in_view = y.saturating_sub(g.origin.1).min(g.rows.saturating_sub(1));
+    Some((col, g.src_row0 + row_in_view))
+}
+
+/// Hit-test a screen point to the cell whose *content* contains it, returning
+/// `(cell index, content col, content row)`.
+///
+/// Unlike [`cell_at`] this rejects a point on a cell's border or on the Monocle
+/// title strip: those are chrome, not text, so a press there must not start a
+/// selection.
+pub fn cell_content_at(
+    view: &ClientView,
+    area: Rect,
+    x: u16,
+    y: u16,
+    style: &BorderStyle,
+) -> Option<(usize, u16, u16)> {
+    let idx = cell_rects(view, area).iter().position(|r| match r {
+        Some(rect) => {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        }
+        None => false,
+    })?;
+    let g = cell_content_geometry(view, area, idx, style)?;
+    if x < g.origin.0 || x >= g.origin.0 + g.cols || y < g.origin.1 || y >= g.origin.1 + g.rows {
+        return None;
+    }
+    let (col, row) = cell_content_pos(view, area, idx, x, y, style)?;
+    Some((idx, col, row))
+}
+
 /// Buffer position `(x, y)` of the FOCUSED cell's terminal cursor, if it
 /// should be shown. Only the focused cell shows a cursor, and only when its
 /// snapshot's cursor is visible and falls within the (clipped, bottom-anchored)
@@ -692,6 +815,63 @@ pub fn focused_cursor(view: &ClientView, area: Rect, style: &BorderStyle) -> Opt
     let buf_x = ix + cx;
     let buf_y = iy + (cy - start);
     Some((buf_x as u16, buf_y as u16))
+}
+
+/// The screen region Visual mode must be scoped to while a view is displayed,
+/// as `(origin_x, origin_y, cols, rows, cursor_col, cursor_row)` with the cursor
+/// relative to the origin.
+///
+/// Visual mode is a *copy mode over what is painted*: the client extracts the
+/// yank from its own front buffer within `pane_offset`/`visible_*`. In a normal
+/// tab those come from the server's `focused_pane_rect`, but a client showing a
+/// view is detached, so that rect is a stale leftover describing a pane of some
+/// other session's layout -- scoping to it put the cursor in the wrong cell at a
+/// meaningless offset. This is the view's own answer, derived from the same
+/// [`cell_rects`]/[`cell_interior`] geometry that painted the cells.
+///
+/// The rect is the FOCUSED cell's painted content. When that cell has nothing to
+/// select (no snapshot yet, disconnected, or showing the "Active in session"
+/// placeholder) the whole interior is used with the cursor at its top-left: the
+/// selection is empty, but the cursor is still in the cell the user is looking
+/// at, which is the property that was broken. `None` only when the view has no
+/// focused cell rect at all (empty view, degenerate geometry) -- the caller then
+/// leaves Visual mode scoped as before.
+pub fn focused_cell_visual_scope(
+    view: &ClientView,
+    area: Rect,
+    style: &BorderStyle,
+) -> Option<(u16, u16, u16, u16, u16, u16)> {
+    let idx = view.focused;
+    let rect = cell_rects(view, area).get(idx).copied().flatten()?;
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let (ix, iy, iw, ih) = cell_interior(
+        rect.x as usize,
+        rect.y as usize,
+        rect.width as usize,
+        rect.height as usize,
+        style,
+    );
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    match cell_content_geometry(view, area, idx, style) {
+        Some(g) => {
+            // Place the cursor where the cell's own cursor is drawn when it is
+            // visible; otherwise the last content row, mirroring how Visual mode
+            // opens at the bottom of a normal pane.
+            let (cc, cr) = match focused_cursor(view, area, style) {
+                Some((cx, cy)) => (
+                    cx.saturating_sub(g.origin.0).min(g.cols.saturating_sub(1)),
+                    cy.saturating_sub(g.origin.1).min(g.rows.saturating_sub(1)),
+                ),
+                None => (0, g.rows.saturating_sub(1)),
+            };
+            Some((g.origin.0, g.origin.1, g.cols, g.rows, cc, cr))
+        }
+        None => Some((ix as u16, iy as u16, iw as u16, ih as u16, 0, 0)),
+    }
 }
 
 /// Write a single cell into the buffer if the coordinates are in range.
@@ -1226,6 +1406,170 @@ mod tests {
     fn view_n(n: usize, layout: LayoutMode, focused: usize) -> ClientView {
         let cells: Vec<ViewCell> = (1..=n as PaneId).map(|id| cell_with(id, None)).collect();
         view_of(cells, layout, focused)
+    }
+
+    // -- Mouse/visual mapping into a cell's content --------------------------
+
+    /// A snapshot whose row `r` is the digit `r % 10`, so a mapped row is
+    /// identifiable from the character it addresses.
+    fn snap_numbered(cols: u16, rows: u16) -> PaneSnapshot {
+        let cells = (0..rows as usize)
+            .map(|r| {
+                vec![
+                    RenderCell {
+                        c: char::from_digit((r % 10) as u32, 10).unwrap(),
+                        ..RenderCell::default()
+                    };
+                    cols as usize
+                ]
+            })
+            .collect();
+        PaneSnapshot {
+            cols,
+            rows,
+            cells,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            application_cursor_keys: false,
+            session_visible: false,
+        }
+    }
+
+    /// A snapshot TALLER than the interior is bottom-anchored, so the first
+    /// painted row is `sr - ih` -- the top of the pane is cut off. Getting this
+    /// backwards shifts every selection by the overflow.
+    #[test]
+    fn cell_content_geometry_bottom_anchors_a_tall_snapshot() {
+        let a = area(80, 25);
+        let v = view_of(vec![cell_with(1, Some(snap_numbered(40, 100)))], gridv(), 0);
+        let g = cell_content_geometry(&v, a, 0, &zj()).expect("geometry");
+        let (_, _, _, ih) = cell_interior(0, 0, 80, 24, &zj());
+        assert_eq!(g.src_row0 as usize, 100 - ih);
+        assert_eq!(g.rows as usize, ih);
+        // The top painted row maps to the first row actually shown.
+        let (_, row) = cell_content_pos(&v, a, 0, g.origin.0, g.origin.1, &zj()).unwrap();
+        assert_eq!(row, g.src_row0);
+    }
+
+    /// A snapshot SHORTER than the interior is TOP-aligned with blank rows
+    /// below (`draw_cell`'s loop breaks past the snapshot), not floated to the
+    /// bottom -- so the first painted row is source row 0.
+    #[test]
+    fn cell_content_geometry_top_aligns_a_short_snapshot() {
+        let a = area(80, 25);
+        let v = view_of(vec![cell_with(1, Some(snap_numbered(40, 5)))], gridv(), 0);
+        let g = cell_content_geometry(&v, a, 0, &zj()).expect("geometry");
+        assert_eq!(g.src_row0, 0);
+        assert_eq!(g.rows, 5, "only the rows that exist are content");
+        let (_, row) = cell_content_pos(&v, a, 0, g.origin.0, g.origin.1, &zj()).unwrap();
+        assert_eq!(row, 0);
+        // A point below the content clamps to the last existing row, never past.
+        let (_, row) = cell_content_pos(&v, a, 0, g.origin.0, g.origin.1 + 50, &zj()).unwrap();
+        assert_eq!(row, 4);
+    }
+
+    /// A drag routinely leaves the cell; the point must clamp INTO the anchor
+    /// cell rather than escape it, which is what keeps a gesture bound to the
+    /// cell it started in (and what turns a run past the edge into a scroll).
+    #[test]
+    fn cell_content_pos_clamps_a_point_outside_the_cell() {
+        let a = area(80, 25);
+        let v = view_of(vec![cell_with(1, Some(snap_numbered(40, 10)))], gridv(), 0);
+        let g = cell_content_geometry(&v, a, 0, &zj()).unwrap();
+        let (col, row) = cell_content_pos(&v, a, 0, 0, 0, &zj()).unwrap();
+        assert_eq!(
+            (col, row),
+            (0, g.src_row0),
+            "above/left clamps to the origin"
+        );
+        let (col, row) = cell_content_pos(&v, a, 0, 500, 500, &zj()).unwrap();
+        assert_eq!(col, g.cols - 1);
+        assert_eq!(row, g.src_row0 + g.rows - 1);
+    }
+
+    /// Borders are chrome: a press on one must not start a selection.
+    #[test]
+    fn cell_content_at_rejects_the_border_but_accepts_the_interior() {
+        let a = area(80, 25);
+        let v = view_of(vec![cell_with(1, Some(snap_numbered(40, 10)))], gridv(), 0);
+        let rect = cell_rects(&v, a)[0].unwrap();
+        assert_eq!(cell_content_at(&v, a, rect.x, rect.y, &zj()), None);
+        let g = cell_content_geometry(&v, a, 0, &zj()).unwrap();
+        assert_eq!(
+            cell_content_at(&v, a, g.origin.0, g.origin.1, &zj()),
+            Some((0, 0, g.src_row0))
+        );
+    }
+
+    /// A cell with nothing to select (no snapshot, or the "Active in session"
+    /// placeholder) yields no content mapping at all.
+    #[test]
+    fn cell_content_geometry_none_without_selectable_content() {
+        let a = area(80, 25);
+        let v = view_of(vec![cell_with(1, None)], gridv(), 0);
+        assert!(cell_content_geometry(&v, a, 0, &zj()).is_none());
+        let mut snap = snap_numbered(40, 10);
+        snap.session_visible = true;
+        let v = view_of(vec![cell_with(1, Some(snap))], gridv(), 0);
+        assert!(cell_content_geometry(&v, a, 0, &zj()).is_none());
+    }
+
+    /// Bug B: Visual mode must scope to the FOCUSED cell. With four cells in a
+    /// Grid and the focus on a RIGHT-hand one, the scope rect has to sit in that
+    /// cell -- the symptom was a rect belonging to the foreground session, which
+    /// put the cursor in the left-hand cell.
+    #[test]
+    fn focused_cell_visual_scope_follows_the_focused_cell() {
+        let a = area(120, 40);
+        let cells: Vec<ViewCell> = (1..=4)
+            .map(|id| cell_with(id, Some(snap_numbered(60, 20))))
+            .collect();
+        let rects: Vec<Rect> = cell_rects(&view_of(cells.clone(), gridv(), 0), a)
+            .into_iter()
+            .flatten()
+            .collect();
+        // The cell furthest to the right is the user's "focused on the right one".
+        let right = rects
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, r)| r.x)
+            .map(|(i, _)| i)
+            .unwrap();
+        let v = view_of(cells, gridv(), right);
+        let (ox, oy, cols, rows, cc, cr) = focused_cell_visual_scope(&v, a, &zj()).expect("scope");
+        let rect = rects[right];
+        assert!(ox > rect.x - 1 && ox + cols <= rect.x + rect.width);
+        assert!(oy >= rect.y && oy + rows <= rect.y + rect.height);
+        // The cursor is expressed relative to the origin and stays inside.
+        assert!(cc < cols && cr < rows);
+        // ... and it is NOT in any other cell.
+        for (i, other) in rects.iter().enumerate() {
+            if i == right {
+                continue;
+            }
+            let (x, y) = (ox + cc, oy + cr);
+            let inside = x >= other.x
+                && x < other.x + other.width
+                && y >= other.y
+                && y < other.y + other.height;
+            assert!(!inside, "visual cursor landed in cell {i}");
+        }
+    }
+
+    /// A focused cell showing a placeholder still scopes to ITS OWN interior --
+    /// the selection is empty, but the cursor stays in the cell the user is
+    /// looking at, which is the property Bug B broke.
+    #[test]
+    fn focused_cell_visual_scope_falls_back_to_the_interior() {
+        let a = area(80, 25);
+        let v = view_of(vec![cell_with(1, None)], gridv(), 0);
+        let rect = cell_rects(&v, a)[0].unwrap();
+        let (ox, oy, cols, rows, cc, cr) = focused_cell_visual_scope(&v, a, &zj()).expect("scope");
+        assert_eq!((cc, cr), (0, 0));
+        assert!(ox >= rect.x && oy >= rect.y);
+        assert!(ox + cols <= rect.x + rect.width);
+        assert!(oy + rows <= rect.y + rect.height);
     }
 
     // -- Prerequisite refactor: stable ids, custom_tree, layout_name ---------

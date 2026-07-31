@@ -97,9 +97,33 @@ pub enum ClientMessage {
     KillSession { name: String },
     /// Notify the server that the client's input mode changed.
     ModeChanged { mode: String },
-    /// A mouse click at the given screen coordinates.
-    MouseClick { x: u16, y: u16 },
-    /// A mouse drag selection from start to end screen coordinates.
+    /// A mouse click at the given coordinates.
+    ///
+    /// `pane_id` selects the coordinate space and the routing (see
+    /// [`MouseDrag`](ClientMessage::MouseDrag)): `None` = screen coordinates in
+    /// the client's foreground session, `Some(id)` = content coordinates in that
+    /// pane, routed by identity.
+    MouseClick {
+        x: u16,
+        y: u16,
+        #[serde(default)]
+        pane_id: Option<PaneId>,
+    },
+    /// A mouse drag selection from start to end coordinates.
+    ///
+    /// `pane_id` selects the coordinate space and the routing:
+    /// - `None` (the default, and what an older client sends): screen
+    ///   coordinates, resolved against the client's foreground session layout.
+    /// - `Some(id)`: coordinates are **content-relative** to that pane's own
+    ///   rendered grid (0-based, borders already subtracted), and the gesture is
+    ///   routed by pane identity. This is what a View cell uses: a client
+    ///   displaying a view is detached, so it has no foreground session for the
+    ///   screen-coordinate path to resolve against.
+    ///
+    /// `#[serde(default)]` keeps the wire shape compatible in both directions —
+    /// an older server decodes a new client's pane-scoped drag as `None`
+    /// (session-scoped), which, since such a client is detached while in a view,
+    /// no-ops in the handler rather than selecting in the wrong pane.
     MouseDrag {
         start_x: u16,
         start_y: u16,
@@ -107,6 +131,8 @@ pub enum ClientMessage {
         end_y: u16,
         /// `true` when the mouse button was released (final drag event).
         is_final: bool,
+        #[serde(default)]
+        pane_id: Option<PaneId>,
     },
     /// A mouse wheel event at the given full-screen 0-based coordinates.
     /// `up` is true for wheel-up, false for wheel-down. The server decides
@@ -961,15 +987,54 @@ mod tests {
 
     #[test]
     fn round_trip_mouse_click() {
-        let msg = ClientMessage::MouseClick { x: 42, y: 10 };
+        let msg = ClientMessage::MouseClick {
+            x: 42,
+            y: 10,
+            pane_id: None,
+        };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         match decoded {
-            ClientMessage::MouseClick { x, y } => {
+            ClientMessage::MouseClick { x, y, pane_id } => {
                 assert_eq!(x, 42);
                 assert_eq!(y, 10);
+                assert_eq!(pane_id, None);
             }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// A pane-scoped gesture round-trips its target, and a payload written by an
+    /// older peer (no `pane_id` at all) still decodes -- as the session-scoped
+    /// `None`, which is what keeps the change off `PROTOCOL_VERSION`.
+    #[test]
+    fn mouse_pane_id_round_trips_and_defaults() {
+        let msg = ClientMessage::MouseDrag {
+            start_x: 1,
+            start_y: 2,
+            end_x: 3,
+            end_y: 4,
+            is_final: true,
+            pane_id: Some(77),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            ClientMessage::MouseDrag { pane_id, .. } => assert_eq!(pane_id, Some(77)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy = br#"{"MouseClick":{"x":1,"y":2}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::MouseClick { pane_id, .. } => assert_eq!(pane_id, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let legacy =
+            br#"{"MouseDrag":{"start_x":1,"start_y":2,"end_x":3,"end_y":4,"is_final":false}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::MouseDrag { pane_id, .. } => assert_eq!(pane_id, None),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
@@ -982,6 +1047,7 @@ mod tests {
             end_x: 20,
             end_y: 7,
             is_final: false,
+            pane_id: None,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -993,6 +1059,7 @@ mod tests {
                 end_x,
                 end_y,
                 is_final,
+                ..
             } => {
                 assert_eq!(start_x, 5);
                 assert_eq!(start_y, 3);

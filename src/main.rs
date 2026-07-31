@@ -1498,6 +1498,13 @@ async fn run_client_loop(
 
     // Mouse drag state for coalescing drag events (~60fps throttle).
     let mut drag_start: Option<(u16, u16)> = None;
+    // An in-progress drag-selection inside a VIEW cell: the cell's connection,
+    // its source pane, and the press point in that pane's own content
+    // coordinates. Kept separate from `drag_start` (screen coordinates in the
+    // foreground session) because a client displaying a view is detached: the
+    // gesture is routed by pane identity, and it stays bound to the cell it
+    // started in even as the pointer leaves that cell.
+    let mut view_drag: Option<(ConnId, protocol::PaneId, u16, u16)> = None;
     let mut last_drag_send: Instant = Instant::now();
     /// Minimum interval between drag event sends (~16ms = ~60fps).
     const DRAG_THROTTLE: Duration = Duration::from_millis(16);
@@ -1804,7 +1811,48 @@ async fn run_client_loop(
                                 // focused pane's bounds instead of the full
                                 // terminal dimensions.
                                 if mode == Mode::Visual {
-                                    if let Some(ref mut vs) = input.visual_state {
+                                    // A VIEW is scoped to its FOCUSED CELL, from
+                                    // the view's own geometry. `focused_pane_rect`
+                                    // describes the server's foreground session,
+                                    // and entering a view detaches -- so in a view
+                                    // it is a stale rect from a layout that is not
+                                    // on screen, which is what put the cursor in
+                                    // the wrong cell at a nonsensical offset.
+                                    let view_scope = active_view.and_then(|av| {
+                                        let (c, r) = crossterm::terminal::size().ok()?;
+                                        crate::client::view::focused_cell_visual_scope(
+                                            &views[av],
+                                            crate::server::layout::Rect {
+                                                x: 0,
+                                                y: 0,
+                                                width: c,
+                                                height: r,
+                                            },
+                                            &view_border_style,
+                                        )
+                                    });
+                                    if let (Some((ox, oy, vc, vr, cc, cr)), Some(vs)) =
+                                        (view_scope, input.visual_state.as_mut())
+                                    {
+                                        vs.pane_offset_x = ox;
+                                        vs.pane_offset_y = oy;
+                                        vs.visible_cols = vc as usize;
+                                        vs.visible_rows = vr as usize;
+                                        vs.cursor_col = cc as usize;
+                                        vs.cursor_row = cr as usize;
+                                        // Pin the scrollback extent to what the cell
+                                        // paints. The client has no line count for a
+                                        // cell's source pane (`RequestScrollbackInfo`
+                                        // is session-scoped, hence dead while
+                                        // detached), so leaving `total_lines` larger
+                                        // would let `k` scroll the copy view into
+                                        // coordinates the extraction cannot address.
+                                        // Visual mode in a view therefore covers the
+                                        // cell's VISIBLE content; the mouse wheel
+                                        // still pages the cell through its history.
+                                        vs.scroll_offset = 0;
+                                        vs.total_lines = vs.visible_rows;
+                                    } else if let Some(ref mut vs) = input.visual_state {
                                         if let Some(pr) = focused_pane_rect {
                                             vs.visible_rows = pr.height as usize;
                                             vs.visible_cols = pr.width as usize;
@@ -1840,8 +1888,13 @@ async fn run_client_loop(
                                     if let Some(ref vs) = input.visual_state {
                                         last_visual_scroll = vs.scroll_offset;
                                     }
-                                    // Request scrollback info to get accurate total_lines.
-                                    mgr.send_foreground(ClientMessage::RequestScrollbackInfo).await?;
+                                    // Request scrollback info to get accurate
+                                    // total_lines -- session-scoped, so skipped in a
+                                    // view (nothing is attached to answer it, and the
+                                    // reply would un-pin the cell's total_lines).
+                                    if active_view.is_none() {
+                                        mgr.send_foreground(ClientMessage::RequestScrollbackInfo).await?;
+                                    }
                                 }
                                 // When entering Search mode, render the prompt.
                                 if mode == Mode::Search {
@@ -1866,6 +1919,29 @@ async fn run_client_loop(
                                         last_cursor_x,
                                         last_cursor_y,
                                         last_cursor_visible,
+                                    )?;
+                                }
+                                // A view has to repaint itself. In a normal tab
+                                // the `ModeChanged` above makes the server send a
+                                // frame carrying the new mode, and painting that
+                                // frame is what redraws the status bar and lays
+                                // the visual overlay back on top. A client in a
+                                // view is detached, so no such frame ever comes:
+                                // without this, entering Visual left the status
+                                // bar reading [NORMAL] and drew no copy cursor at
+                                // all.
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
                                     )?;
                                 }
                                 renderer.flush()?;
@@ -3157,10 +3233,13 @@ async fn run_client_loop(
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
                         // A live view owns the screen: mouse events target its
-                        // cells, not the (masked) foreground session. A left click
-                        // hit-tests the cell rects and focuses the clicked cell
-                        // (re-subscribing so the size demand follows focus). Other
-                        // mouse events are swallowed (no foreground pane to drive).
+                        // cells, not the (masked) foreground session. Everything
+                        // here is routed by CELL GEOMETRY and PANE IDENTITY --
+                        // never through the session-scoped `MouseClick`/
+                        // `MouseDrag`/`MouseScroll` path below, whose server
+                        // handlers resolve the target from the client's attached
+                        // session. Entering a view detaches, so those would find
+                        // no session and silently do nothing.
                         if let Some(av) = active_view {
                             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                                 let (c, r) = crossterm::terminal::size()?;
@@ -3188,6 +3267,96 @@ async fn run_client_loop(
                                             mgr.send(
                                                 &ConnId::Local,
                                                 ClientMessage::ViewSetFocus { id, cell_id },
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                }
+                                // A press on a cell's CONTENT (not its border or
+                                // the Monocle strip) also anchors a drag-selection
+                                // there. The click itself clears any previous
+                                // selection on that pane, so a plain click
+                                // dismisses a highlight exactly like it does in a
+                                // normal pane.
+                                view_drag = None;
+                                if let Some((idx, cx, cy)) =
+                                    crate::client::view::cell_content_at(
+                                        &views[av],
+                                        area,
+                                        mouse.column,
+                                        mouse.row,
+                                        &view_border_style,
+                                    )
+                                {
+                                    if let Some(cell) = views[av].cells.get(idx) {
+                                        view_drag =
+                                            Some((cell.conn.clone(), cell.pane_id, cx, cy));
+                                        mgr.send(
+                                            &cell.conn,
+                                            ClientMessage::MouseClick {
+                                                x: cx,
+                                                y: cy,
+                                                pane_id: Some(cell.pane_id),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            } else if let MouseEventKind::Up(MouseButton::Left) = mouse.kind {
+                                // Release commits the gesture: the server yanks
+                                // over the absolute selection range and honors
+                                // `mouse_auto_yank`, replying with
+                                // `CopyToClipboard` just as it does for a pane.
+                                if let Some((conn, pane_id, sx, sy)) = view_drag.take() {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    let area = crate::server::layout::Rect {
+                                        x: 0,
+                                        y: 0,
+                                        width: c,
+                                        height: r,
+                                    };
+                                    let idx = views[av]
+                                        .cells
+                                        .iter()
+                                        .position(|cell| cell.pane_id == pane_id);
+                                    if let Some((ex, ey)) = idx.and_then(|i| {
+                                        crate::client::view::cell_content_pos(
+                                            &views[av],
+                                            area,
+                                            i,
+                                            mouse.column,
+                                            mouse.row,
+                                            &view_border_style,
+                                        )
+                                    }) {
+                                        if (ex, ey) != (sx, sy) {
+                                            mgr.send(
+                                                &conn,
+                                                ClientMessage::MouseDrag {
+                                                    start_x: sx,
+                                                    start_y: sy,
+                                                    end_x: ex,
+                                                    end_y: ey,
+                                                    is_final: true,
+                                                    pane_id: Some(pane_id),
+                                                },
+                                            )
+                                            .await?;
+                                        } else {
+                                            // Released where it began: a click,
+                                            // not a selection -- so nothing is
+                                            // yanked. Still tell the server, or a
+                                            // gesture that wandered to a content
+                                            // edge and came back would leave its
+                                            // repeat timer armed and the cell
+                                            // would keep scrolling after release.
+                                            mgr.send(
+                                                &conn,
+                                                ClientMessage::MouseClick {
+                                                    x: ex,
+                                                    y: ey,
+                                                    pane_id: Some(pane_id),
+                                                },
                                             )
                                             .await?;
                                         }
@@ -3230,54 +3399,53 @@ async fn run_client_loop(
                                     .await?;
                                 }
                             } else if let MouseEventKind::Drag(MouseButton::Left) = mouse.kind {
-                                // Views have no server-side selection, but a drag
-                                // that reaches a cell's top/bottom content edge
-                                // autoscrolls that cell's source pane (like the
-                                // wheel in #2) so the user can pull history into
-                                // view while dragging -- the normal-session
-                                // drag-autoscroll analog for a View cell.
-                                let (c, r) = crossterm::terminal::size()?;
-                                let area = crate::server::layout::Rect {
-                                    x: 0,
-                                    y: 0,
-                                    width: c,
-                                    height: r,
-                                };
-                                let rects = crate::client::view::cell_rects(&views[av], area);
-                                let idx = crate::client::view::cell_at(
-                                    &views[av],
-                                    area,
-                                    mouse.column,
-                                    mouse.row,
-                                    &view_border_style,
-                                )
-                                .unwrap_or(views[av].focused);
-                                if let (Some(Some(rect)), Some(cell)) =
-                                    (rects.get(idx), views[av].cells.get(idx))
-                                {
-                                    // Interior content rows (inside the 1-cell
-                                    // border). Only the top/bottom content edges
-                                    // trigger an autoscroll step.
-                                    let top_edge = rect.y.saturating_add(1);
-                                    let bot_edge =
-                                        rect.y.saturating_add(rect.height).saturating_sub(2);
-                                    let up = if mouse.row <= top_edge {
-                                        Some(true)
-                                    } else if mouse.row >= bot_edge {
-                                        Some(false)
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(up) = up {
-                                        mgr.send(
-                                            &cell.conn,
-                                            ClientMessage::ScrollPane {
-                                                pane_id: cell.pane_id,
-                                                up,
-                                                lines: 1,
-                                            },
-                                        )
-                                        .await?;
+                                // Extend the selection anchored by the press. The
+                                // point is mapped into the ANCHOR cell's content
+                                // coordinates and clamped there, so dragging out
+                                // of the cell keeps growing that cell's selection
+                                // instead of jumping to a neighbour -- and landing
+                                // on its top/bottom content row is what the server
+                                // turns into an edge auto-scroll step (which also
+                                // extends the selection, since the anchor is held
+                                // in eviction-stable absolute coordinates).
+                                if let Some((conn, pane_id, sx, sy)) = view_drag.clone() {
+                                    let now = Instant::now();
+                                    if now.duration_since(last_drag_send) >= DRAG_THROTTLE {
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        let area = crate::server::layout::Rect {
+                                            x: 0,
+                                            y: 0,
+                                            width: c,
+                                            height: r,
+                                        };
+                                        let idx = views[av]
+                                            .cells
+                                            .iter()
+                                            .position(|cell| cell.pane_id == pane_id);
+                                        if let Some((ex, ey)) = idx.and_then(|i| {
+                                            crate::client::view::cell_content_pos(
+                                                &views[av],
+                                                area,
+                                                i,
+                                                mouse.column,
+                                                mouse.row,
+                                                &view_border_style,
+                                            )
+                                        }) {
+                                            mgr.send(
+                                                &conn,
+                                                ClientMessage::MouseDrag {
+                                                    start_x: sx,
+                                                    start_y: sy,
+                                                    end_x: ex,
+                                                    end_y: ey,
+                                                    is_final: false,
+                                                    pane_id: Some(pane_id),
+                                                },
+                                            )
+                                            .await?;
+                                            last_drag_send = now;
+                                        }
                                     }
                                 }
                             }
@@ -3292,6 +3460,7 @@ async fn run_client_loop(
                                     .send_foreground(ClientMessage::MouseClick {
                                         x: mouse.column,
                                         y: mouse.row,
+                                        pane_id: None,
                                     })
                                     .await?;
                             }
@@ -3307,6 +3476,7 @@ async fn run_client_loop(
                                                 end_x: mouse.column,
                                                 end_y: mouse.row,
                                                 is_final: false,
+                                                pane_id: None,
                                             })
                                             .await?;
                                         last_drag_send = now;
@@ -3324,6 +3494,7 @@ async fn run_client_loop(
                                                 end_x: mouse.column,
                                                 end_y: mouse.row,
                                                 is_final: true,
+                                                pane_id: None,
                                             })
                                             .await?;
                                     }
@@ -4057,8 +4228,16 @@ async fn run_client_loop(
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);
                         // Update visual state with accurate total line count.
-                        if let Some(ref mut vs) = input.visual_state {
-                            vs.total_lines = total_lines;
+                        // Never while a view is up: this counts the FOREGROUND
+                        // session's scrollback, but there Visual mode is scoped to
+                        // a view cell whose `total_lines` is pinned to the rows it
+                        // paints. A reply still in flight from before the view was
+                        // entered would otherwise un-pin it and let the copy view
+                        // scroll into lines it cannot extract.
+                        if active_view.is_none() {
+                            if let Some(ref mut vs) = input.visual_state {
+                                vs.total_lines = total_lines;
+                            }
                         }
                     }
                     Some(ServerMessage::PaneContent {
