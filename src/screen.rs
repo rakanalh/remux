@@ -199,6 +199,12 @@ pub struct Screen {
     pub application_cursor_keys: bool,
     /// Whether the application has enabled mouse tracking (modes 1000/1002/1003).
     pub mouse_tracking: bool,
+    /// Whether the application asked for MOTION reports too (modes 1002
+    /// button-event and 1003 any-event), as opposed to plain 1000 which reports
+    /// presses and releases only. A drag is forwarded as motion reports only
+    /// when this is set, so a 1000-only application is not fed events it never
+    /// asked for.
+    pub mouse_motion: bool,
     /// Whether the application requested SGR mouse encoding (mode 1006).
     pub mouse_sgr: bool,
     /// Set when a BEL (`0x07`) is received; consumed via [`Screen::take_bell`].
@@ -247,6 +253,7 @@ impl Screen {
             lock_renders: false,
             application_cursor_keys: false,
             mouse_tracking: false,
+            mouse_motion: false,
             mouse_sgr: false,
             bell_pending: false,
             pending_wrap: false,
@@ -1350,7 +1357,12 @@ impl vte::Perform for Screen {
                             25 => self.cursor_visible = true,
                             2026 => self.lock_renders = true,
                             // Mouse tracking: 1000=normal, 1002=button-event, 1003=any-event.
-                            1000 | 1002 | 1003 => self.mouse_tracking = true,
+                            1000 | 1002 | 1003 => {
+                                self.mouse_tracking = true;
+                                if mode != 1000 {
+                                    self.mouse_motion = true;
+                                }
+                            }
                             // 1006 = SGR mouse encoding.
                             1006 => self.mouse_sgr = true,
                             1049 => {
@@ -1399,7 +1411,10 @@ impl vte::Perform for Screen {
                             25 => self.cursor_visible = false,
                             2026 => self.lock_renders = false,
                             // Mouse tracking: 1000=normal, 1002=button-event, 1003=any-event.
-                            1000 | 1002 | 1003 => self.mouse_tracking = false,
+                            1000 | 1002 | 1003 => {
+                                self.mouse_tracking = false;
+                                self.mouse_motion = false;
+                            }
                             // 1006 = SGR mouse encoding.
                             1006 => self.mouse_sgr = false,
                             1049 => {
@@ -1422,6 +1437,7 @@ impl vte::Perform for Screen {
                                     // matching DECRST doesn't leave the wheel forwarding
                                     // escape sequences to the shell instead of scrolling.
                                     self.mouse_tracking = false;
+                                    self.mouse_motion = false;
                                     self.mouse_sgr = false;
                                 }
                             }
@@ -1437,6 +1453,7 @@ impl vte::Perform for Screen {
                                 // (see mode 1049 above) to recover the common
                                 // "app gone, flag stuck" case.
                                 self.mouse_tracking = false;
+                                self.mouse_motion = false;
                                 self.mouse_sgr = false;
                             }
                             _ => {}
@@ -1751,13 +1768,23 @@ mod tests {
         assert!(!s.mouse_tracking);
         assert!(!s.mouse_sgr);
 
-        // Button-event (1002) and any-event (1003) also set mouse_tracking.
+        // Button-event (1002) and any-event (1003) also set mouse_tracking, and
+        // additionally ask for MOTION reports -- which plain 1000 does not, so a
+        // drag over a 1000-only app is not forwarded as motion.
+        s.process_output(b"\x1b[?1000h");
+        assert!(s.mouse_tracking);
+        assert!(!s.mouse_motion);
+        s.process_output(b"\x1b[?1000l");
+
         s.process_output(b"\x1b[?1002h");
         assert!(s.mouse_tracking);
+        assert!(s.mouse_motion);
         s.process_output(b"\x1b[?1002l");
         assert!(!s.mouse_tracking);
+        assert!(!s.mouse_motion);
         s.process_output(b"\x1b[?1003h");
         assert!(s.mouse_tracking);
+        assert!(s.mouse_motion);
     }
 
     #[test]
@@ -1767,10 +1794,11 @@ mod tests {
         // Enter alt screen (1049) and enable mouse tracking (1000) + SGR (1006),
         // simulating a TUI app.
         s.process_output(b"\x1b[?1049h");
-        s.process_output(b"\x1b[?1000h");
+        s.process_output(b"\x1b[?1002h");
         s.process_output(b"\x1b[?1006h");
         assert!(s.alt_screen_active);
         assert!(s.mouse_tracking);
+        assert!(s.mouse_motion);
         assert!(s.mouse_sgr);
 
         // The app exits/crashes and only the alt-screen reset (1049l) arrives,
@@ -1779,6 +1807,7 @@ mod tests {
         s.process_output(b"\x1b[?1049l");
         assert!(!s.alt_screen_active);
         assert!(!s.mouse_tracking);
+        assert!(!s.mouse_motion);
         assert!(!s.mouse_sgr);
     }
 

@@ -3308,6 +3308,7 @@ async fn run_client_loop(
                                                 x: cx,
                                                 y: cy,
                                                 pane_id: Some(cell.pane_id),
+                                                release: false,
                                             },
                                         )
                                         .await?;
@@ -3361,12 +3362,17 @@ async fn run_client_loop(
                                             // edge and came back would leave its
                                             // repeat timer armed and the cell
                                             // would keep scrolling after release.
+                                            // `release` marks it as the button
+                                            // coming UP, which is what a
+                                            // mouse-tracking application needs to
+                                            // see after the press it already got.
                                             mgr.send(
                                                 &conn,
                                                 ClientMessage::MouseClick {
                                                     x: ex,
                                                     y: ey,
                                                     pane_id: Some(pane_id),
+                                                    release: true,
                                                 },
                                             )
                                             .await?;
@@ -3399,12 +3405,30 @@ async fn run_client_loop(
                                 .unwrap_or(views[av].focused);
                                 if let Some(cell) = views[av].cells.get(target) {
                                     let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                                    // The wheel position in the cell's content
+                                    // coordinates: the server needs it to build a
+                                    // mouse report when the pane's application has
+                                    // tracking on. A pointer that is off the cell
+                                    // (the focused-cell fallback above) has no
+                                    // position of its own, so it reports the
+                                    // top-left content cell.
+                                    let (wx, wy) = crate::client::view::cell_content_pos(
+                                        &views[av],
+                                        area,
+                                        target,
+                                        mouse.column,
+                                        mouse.row,
+                                        &view_border_style,
+                                    )
+                                    .unwrap_or((0, 0));
                                     mgr.send(
                                         &cell.conn,
                                         ClientMessage::ScrollPane {
                                             pane_id: cell.pane_id,
                                             up,
                                             lines: 3,
+                                            x: wx,
+                                            y: wy,
                                         },
                                     )
                                     .await?;
@@ -3472,6 +3496,7 @@ async fn run_client_loop(
                                         x: mouse.column,
                                         y: mouse.row,
                                         pane_id: None,
+                                        release: false,
                                     })
                                     .await?;
                             }
@@ -3506,6 +3531,21 @@ async fn run_client_loop(
                                                 end_y: mouse.row,
                                                 is_final: true,
                                                 pane_id: None,
+                                            })
+                                            .await?;
+                                    } else {
+                                        // Released where it began: no drag to
+                                        // finalize, but a mouse-tracking
+                                        // application still needs the button-up
+                                        // that follows the press it already got,
+                                        // or it latches the button down. (Mirrors
+                                        // the view path's release-click.)
+                                        mgr
+                                            .send_foreground(ClientMessage::MouseClick {
+                                                x: mouse.column,
+                                                y: mouse.row,
+                                                pane_id: None,
+                                                release: true,
                                             })
                                             .await?;
                                     }

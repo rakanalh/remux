@@ -829,11 +829,28 @@ async fn handle_client_message(
         // `pane_id: Some(..)` routes the gesture by pane identity in that
         // pane's own content coordinates (a View cell); `None` keeps the
         // original screen-coordinate, foreground-session path.
-        ClientMessage::MouseClick { x, y, pane_id } => match pane_id {
-            Some(pid) => handle_pane_mouse_click(client_id, pid, state, panes, clients).await,
+        ClientMessage::MouseClick {
+            x,
+            y,
+            pane_id,
+            release,
+        } => match pane_id {
+            Some(pid) => {
+                handle_pane_mouse_click(client_id, pid, x, y, release, state, panes, clients).await
+            }
             None => {
-                handle_mouse_click(client_id, x, y, state, panes, clients, config, prev_frames)
-                    .await
+                handle_mouse_click(
+                    client_id,
+                    x,
+                    y,
+                    release,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                )
+                .await
             }
         },
         ClientMessage::MouseDrag {
@@ -1046,18 +1063,63 @@ async fn handle_client_message(
             }
             Ok(())
         }
-        ClientMessage::ScrollPane { pane_id, up, lines } => {
-            // Per-(client, pane) scrollback for a View cell. Clamp to the pane's
-            // max scroll offset, render a snapshot at the new offset, and send it
-            // to THIS client only -- the offset is per-subscriber.
-            let max_off = {
+        ClientMessage::ScrollPane {
+            pane_id,
+            up,
+            lines,
+            x,
+            y,
+        } => {
+            // A View cell's wheel takes the SAME routing decision the session
+            // wheel takes (`handle_mouse_scroll`) -- the whole reason the wheel
+            // did nothing over a cell running a mouse-aware application is that
+            // this path used to skip it and scroll a scrollback the alternate
+            // screen does not have.
+            let copy_mode = client_in_copy_mode(clients, client_id).await;
+            let (max_off, route) = {
                 let ps = panes.lock().await;
                 match ps.get(&pane_id) {
-                    Some(pd) => pd.screen.max_scroll_offset(),
+                    Some(pd) => (
+                        pd.screen.max_scroll_offset(),
+                        mouse_route(&pd.screen, MouseGesture::Wheel, copy_mode),
+                    ),
                     // Pane gone: nothing to scroll.
                     None => return Ok(()),
                 }
             };
+            // Only a subscribed client may drive a pane it watches (the same
+            // guard the scroll path below applies).
+            {
+                let cls = clients.lock().await;
+                match cls.get(&client_id) {
+                    Some(conn) if conn.subscribed_panes.contains_key(&pane_id) => {}
+                    _ => return Ok(()),
+                }
+            }
+            match route {
+                MouseRoute::App { sgr, .. } => {
+                    // Cell coordinates arrive content-relative; a report is
+                    // 1-based.
+                    let bytes = wheel_report(sgr, up, x + 1, y + 1);
+                    log::debug!(
+                        "server: ScrollPane->app client_id={client_id} pane_id={pane_id} sgr={sgr} up={up} col={} row={}",
+                        x + 1,
+                        y + 1
+                    );
+                    return write_to_pane(panes, pane_id, &bytes).await;
+                }
+                MouseRoute::AltArrows { app_cursor } => {
+                    let bytes = alt_scroll_arrows(app_cursor, up, lines.max(1));
+                    log::debug!(
+                        "server: ScrollPane->alt-arrows client_id={client_id} pane_id={pane_id} app_cursor={app_cursor} up={up}"
+                    );
+                    return write_to_pane(panes, pane_id, &bytes).await;
+                }
+                MouseRoute::Remux { .. } => {}
+            }
+            // Per-(client, pane) scrollback for a View cell. Clamp to the pane's
+            // max scroll offset, render a snapshot at the new offset, and send it
+            // to THIS client only -- the offset is per-subscriber.
             let new_off = {
                 let mut cls = clients.lock().await;
                 match cls.get_mut(&client_id) {
@@ -2999,6 +3061,203 @@ fn arrow_report(app_cursor: bool, up: bool) -> Vec<u8> {
     vec![0x1b, mid, final_byte]
 }
 
+/// The three phases of a left-button gesture, as a mouse-tracking application
+/// expects to see them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ButtonPhase {
+    /// Button went down.
+    Press,
+    /// Pointer moved with the button held (only sent to apps that asked for
+    /// motion, i.e. modes 1002/1003).
+    Motion,
+    /// Button came back up.
+    Release,
+}
+
+/// Build a left-button mouse-report byte sequence, the [`wheel_report`] sibling
+/// for press/motion/release. `col`/`row` are pane-relative 1-based coordinates.
+///
+/// SGR (1006) distinguishes press from release by the FINAL BYTE (`M` vs `m`)
+/// and so keeps the button number on both; the legacy X10 encoding has no
+/// lowercase form and reports a release as button 3 ("no button"). Motion adds
+/// the +32 motion bit in both encodings.
+fn button_report(sgr: bool, phase: ButtonPhase, col: u16, row: u16) -> Vec<u8> {
+    // Left button = 0; motion sets bit 5; X10 spells a release as button 3.
+    let btn: u16 = match phase {
+        ButtonPhase::Press => 0,
+        ButtonPhase::Motion => 32,
+        ButtonPhase::Release if sgr => 0,
+        ButtonPhase::Release => 3,
+    };
+    if sgr {
+        let final_byte = if phase == ButtonPhase::Release {
+            'm'
+        } else {
+            'M'
+        };
+        format!("\x1b[<{btn};{col};{row}{final_byte}").into_bytes()
+    } else {
+        let b = (32u32 + btn as u32).min(255) as u8;
+        let c = (32u32 + col as u32).min(255) as u8;
+        let r = (32u32 + row as u32).min(255) as u8;
+        vec![0x1b, b'[', b'M', b, c, r]
+    }
+}
+
+/// Which kind of mouse event is being routed. The two differ only in their
+/// no-tracking fallback on the alternate screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MouseGesture {
+    /// A wheel notch.
+    Wheel,
+    /// A left-button press, drag or release.
+    Button,
+}
+
+/// What remux should do with a mouse event that landed on a pane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MouseRoute {
+    /// Forward an encoded mouse report to the application. `sgr` selects the
+    /// 1006 encoding over legacy X10; `motion` is whether the app asked for
+    /// drag/motion reports (1002/1003) rather than presses only (1000).
+    App { sgr: bool, motion: bool },
+    /// Alternate-scroll fallback: an alt-screen application with no mouse
+    /// tracking gets arrow keys for the wheel, since it has no scrollback of
+    /// its own for remux to scroll.
+    AltArrows { app_cursor: bool },
+    /// Handle the event in remux: scrollback scrolling and text selection.
+    ///
+    /// `scrollback` is false on the alternate screen, where remux's scrollback
+    /// holds the PRIMARY screen's history — text that has nothing to do with
+    /// what the pane is showing. Dragging or wheeling into it would replace a
+    /// full-screen app's display with unrelated history, and (because an
+    /// alt-screen app's own output keeps feeding that scrollback) an edge
+    /// auto-scroll aimed at it can never reach the end. So the caller must
+    /// neither move the offset nor arm the repeat timer when this is false.
+    Remux { scrollback: bool },
+}
+
+/// **The one mouse-routing decision in the server.** Every mouse path —
+/// session-scoped (`MouseScroll`/`MouseClick`/`MouseDrag` with no `pane_id`)
+/// and pane-scoped (`ScrollPane` and the `pane_id` forms, i.e. a View cell) —
+/// asks this and nothing else, so a view and a session treat the same pane
+/// identically.
+///
+/// Precedence matches what a terminal multiplexer is expected to do:
+/// 0. `copy_mode` (remux's Visual mode) is an explicit "the mouse is MINE"
+///    request from the user, so it outranks the application — the same reason
+///    the client already refuses to forward the wheel in Visual mode;
+/// 1. the application asked for mouse events (1000/1002/1003) — it gets them,
+///    and remux does no selection or scrolling of its own;
+/// 2. otherwise, on the alternate screen there is no meaningful remux
+///    scrollback, so a wheel becomes arrow keys and a drag stays put;
+/// 3. otherwise it is a plain shell: remux scrolls and selects as always.
+fn mouse_route(screen: &Screen, gesture: MouseGesture, copy_mode: bool) -> MouseRoute {
+    if copy_mode {
+        // Selection still works over a full-screen app; only the scrolling that
+        // would chase the primary screen's history is withheld.
+        MouseRoute::Remux {
+            scrollback: !screen.alt_screen_active,
+        }
+    } else if screen.mouse_tracking {
+        MouseRoute::App {
+            sgr: screen.mouse_sgr,
+            motion: screen.mouse_motion,
+        }
+    } else if screen.alt_screen_active {
+        match gesture {
+            MouseGesture::Wheel => MouseRoute::AltArrows {
+                app_cursor: screen.application_cursor_keys,
+            },
+            MouseGesture::Button => MouseRoute::Remux { scrollback: false },
+        }
+    } else {
+        MouseRoute::Remux { scrollback: true }
+    }
+}
+
+/// Map a full-screen coordinate into the 1-based, content-relative coordinates
+/// a mouse report carries, applying the same border inset the compositor drew
+/// the pane with. Shared by every session-scoped forwarding site; the
+/// pane-scoped ones receive content coordinates already (the client owns a
+/// View cell's geometry) and only add the 1-based bias.
+fn report_coords(config: &Config, pane_rect: Rect, x: u16, y: u16) -> (u16, u16) {
+    let border_offset: u16 = match config.appearance.border_style {
+        BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
+        _ => 0,
+    };
+    let col = x
+        .saturating_sub(pane_rect.x + border_offset)
+        .saturating_add(1);
+    let row = y
+        .saturating_sub(pane_rect.y + border_offset)
+        .saturating_add(1);
+    (col, row)
+}
+
+/// Write bytes to a pane's PTY, if the pane is still alive.
+async fn write_to_pane(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    pane_id: PaneId,
+    bytes: &[u8],
+) -> Result<()> {
+    let ps = panes.lock().await;
+    if let Some(pane_data) = ps.get(&pane_id) {
+        pane_data.pty.write_input(bytes)?;
+    }
+    Ok(())
+}
+
+/// Read the routing decision for a pane, or `None` if the pane is gone.
+async fn route_of_pane(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    pane_id: PaneId,
+    gesture: MouseGesture,
+    copy_mode: bool,
+) -> Option<MouseRoute> {
+    let ps = panes.lock().await;
+    ps.get(&pane_id)
+        .map(|p| mouse_route(&p.screen, gesture, copy_mode))
+}
+
+/// remux's Visual mode is its copy-mode, and it claims the mouse (see
+/// [`mouse_route`]). The client reports its mode with `ModeChanged` whether it
+/// is attached or displaying a view, so this reads the same for both paths.
+const COPY_MODE: &str = "VISUAL";
+
+/// Whether this client currently has the mouse to itself.
+async fn client_in_copy_mode(
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    client_id: u64,
+) -> bool {
+    let cls = clients.lock().await;
+    cls.get(&client_id).map(|c| c.mode.as_str()) == Some(COPY_MODE)
+}
+
+/// Forward one phase of a left-button gesture to a tracking application.
+///
+/// Motion is dropped for an application that only asked for press/release
+/// (mode 1000). Press and release are always sent: an app that gets a press
+/// without its release latches the button down.
+async fn forward_button(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    pane_id: PaneId,
+    sgr: bool,
+    motion: bool,
+    phase: ButtonPhase,
+    col: u16,
+    row: u16,
+) -> Result<()> {
+    if phase == ButtonPhase::Motion && !motion {
+        return Ok(());
+    }
+    let bytes = button_report(sgr, phase, col, row);
+    log::debug!(
+        "server: mouse->app pane_id={pane_id} phase={phase:?} sgr={sgr} col={col} row={row}"
+    );
+    write_to_pane(panes, pane_id, &bytes).await
+}
+
 /// Apply a scroll delta to the client's server-owned scroll offset, clamp it to
 /// the valid range, and send a render if the offset changed. Shared by the
 /// `ScrollDelta` message (keyboard/visual scrolling) and the plain-shell
@@ -3313,62 +3572,55 @@ async fn handle_mouse_scroll(
         None => return Ok(()),
     };
 
-    // Read the target pane's emulator flags.
-    let (mouse_tracking, mouse_sgr, alt_screen_active, app_cursor_keys) = {
-        let ps = panes.lock().await;
-        match ps.get(&target_pane) {
-            Some(p) => (
-                p.screen.mouse_tracking,
-                p.screen.mouse_sgr,
-                p.screen.alt_screen_active,
-                p.screen.application_cursor_keys,
-            ),
+    // The shared routing decision (see `mouse_route`).
+    let route =
+        match route_of_pane(panes, target_pane, MouseGesture::Wheel, mode == COPY_MODE).await {
+            Some(r) => r,
             None => return Ok(()),
-        }
-    };
-
-    if mouse_tracking {
-        // Same border-inset logic as handle_mouse_drag, but 1-based coords.
-        let border_offset: u16 = match config.appearance.border_style {
-            BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
-            _ => 0,
         };
-        let col = x
-            .saturating_sub(pane_rect.x + border_offset)
-            .saturating_add(1);
-        let row = y
-            .saturating_sub(pane_rect.y + border_offset)
-            .saturating_add(1);
-        let bytes = wheel_report(mouse_sgr, up, col, row);
-        log::debug!(
-            "server: MouseScroll->app client_id={client_id} pane_id={target_pane} sgr={mouse_sgr} up={up} col={col} row={row}"
-        );
-        let ps = panes.lock().await;
-        if let Some(pane_data) = ps.get(&target_pane) {
-            pane_data.pty.write_input(&bytes)?;
+
+    match route {
+        MouseRoute::App { sgr, .. } => {
+            let (col, row) = report_coords(config, pane_rect, x, y);
+            let bytes = wheel_report(sgr, up, col, row);
+            log::debug!(
+                "server: MouseScroll->app client_id={client_id} pane_id={target_pane} sgr={sgr} up={up} col={col} row={row}"
+            );
+            write_to_pane(panes, target_pane, &bytes).await
         }
-        Ok(())
-    } else if alt_screen_active {
-        // Alternate-scroll fallback: three arrow keys per wheel notch.
-        let one = arrow_report(app_cursor_keys, up);
-        let mut bytes = Vec::with_capacity(one.len() * 3);
-        for _ in 0..3 {
-            bytes.extend_from_slice(&one);
+        MouseRoute::AltArrows { app_cursor } => {
+            // Alternate-scroll fallback: three arrow keys per wheel notch.
+            let bytes = alt_scroll_arrows(app_cursor, up, WHEEL_LINES);
+            log::debug!(
+                "server: MouseScroll->alt-arrows client_id={client_id} pane_id={target_pane} app_cursor={app_cursor} up={up}"
+            );
+            write_to_pane(panes, target_pane, &bytes).await
         }
-        log::debug!(
-            "server: MouseScroll->alt-arrows client_id={client_id} pane_id={target_pane} app_cursor={app_cursor_keys} up={up}"
-        );
-        let ps = panes.lock().await;
-        if let Some(pane_data) = ps.get(&target_pane) {
-            pane_data.pty.write_input(&bytes)?;
+        MouseRoute::Remux { .. } => {
+            // Plain shell: preserve remux's own scrollback scroll (delta ±3).
+            let delta = if up {
+                WHEEL_LINES as i32
+            } else {
+                -(WHEEL_LINES as i32)
+            };
+            log::debug!("server: MouseScroll->remux-scroll client_id={client_id} delta={delta}");
+            handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
         }
-        Ok(())
-    } else {
-        // Plain shell: preserve remux's own scrollback scroll (delta ±3).
-        let delta = if up { 3 } else { -3 };
-        log::debug!("server: MouseScroll->remux-scroll client_id={client_id} delta={delta}");
-        handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
     }
+}
+
+/// Lines a single wheel notch moves — the scrollback delta remux applies itself,
+/// and the number of arrow keys the alternate-scroll fallback sends.
+const WHEEL_LINES: u16 = 3;
+
+/// `lines` repetitions of the alternate-scroll arrow key.
+fn alt_scroll_arrows(app_cursor: bool, up: bool, lines: u16) -> Vec<u8> {
+    let one = arrow_report(app_cursor, up);
+    let mut bytes = Vec::with_capacity(one.len() * lines as usize);
+    for _ in 0..lines {
+        bytes.extend_from_slice(&one);
+    }
+    bytes
 }
 
 /// Popup-aware hit test: **the mouse chokepoint.**
@@ -3427,6 +3679,7 @@ async fn handle_mouse_click(
     client_id: u64,
     x: u16,
     y: u16,
+    release: bool,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -3439,12 +3692,16 @@ async fn handle_mouse_click(
             Some(c) => c,
             None => return Ok(()),
         };
-        // Clear any active selection on click. Also end any in-progress drag
+        // Clear any active selection on press. Also end any in-progress drag
         // gesture so the next drag starts a fresh anchor (a click always begins
-        // a new selection in the same or a different pane).
-        client.mouse_selection = None;
-        client.drag = None;
-        // A click ends any in-progress edge auto-scroll.
+        // a new selection in the same or a different pane). A RELEASE never
+        // clears: with `mouse_auto_yank = false` the drag that just ended left a
+        // highlight up on purpose, and wiping it here would undo that.
+        if !release {
+            client.mouse_selection = None;
+            client.drag = None;
+        }
+        // Either half of a click ends any in-progress edge auto-scroll.
         client.autoscroll_repeat = None;
         (
             client.session_name.clone(),
@@ -3476,7 +3733,39 @@ async fn handle_mouse_click(
     .await;
 
     let target = hit_test_with_popup(x, y, &hit_regions, &pane_rects, popup);
-    log::debug!("server: MouseClick client_id={client_id} x={x} y={y} target={target:?}");
+    log::debug!(
+        "server: MouseClick client_id={client_id} x={x} y={y} release={release} target={target:?}"
+    );
+
+    // A pane whose application asked for mouse events gets the press/release
+    // itself (the same policy the wheel and a View cell's click follow). Focus
+    // still moves first, exactly as tmux does: clicking a pane selects it AND
+    // the application sees the click. While the popup is up it owns input, so
+    // only the popup's own pane may be driven -- the same rule the focus arms
+    // below apply, and forwarding to a pane hidden behind the popup would break
+    // it.
+    let popup_pane = popup.map(|(pid, _)| pid);
+    if let ClickTarget::Pane(pane_id) = target {
+        if popup_pane.is_none() || popup_pane == Some(pane_id) {
+            if let (Some(MouseRoute::App { sgr, motion }), Some(rect)) = (
+                route_of_pane(panes, pane_id, MouseGesture::Button, mode == COPY_MODE).await,
+                rect_of_pane(&pane_rects, popup, pane_id),
+            ) {
+                let (col, row) = report_coords(config, rect, x, y);
+                let phase = if release {
+                    ButtonPhase::Release
+                } else {
+                    ButtonPhase::Press
+                };
+                forward_button(panes, pane_id, sgr, motion, phase, col, row).await?;
+            }
+        }
+    }
+    // A release only forwards; it must not re-run the focus/tab side effects a
+    // press already applied.
+    if release {
+        return Ok(());
+    }
 
     match target {
         // While the popup is up it already owns input, and moving the layout's
@@ -3653,6 +3942,33 @@ async fn handle_mouse_drag(
         }
     };
 
+    // The shared routing decision (see `mouse_route`). An application that asked
+    // for mouse events owns the gesture: it gets the motion/release report and
+    // remux selects nothing, so the same drag that would highlight text in a
+    // shell drives the application's own selection instead.
+    let route =
+        match route_of_pane(panes, target_pane, MouseGesture::Button, mode == COPY_MODE).await {
+            Some(r) => r,
+            None => {
+                disarm_autoscroll(clients, client_id).await;
+                return Ok(());
+            }
+        };
+    if let MouseRoute::App { sgr, motion } = route {
+        disarm_autoscroll(clients, client_id).await;
+        let (col, row) = report_coords(config, pane_rect, end_x, end_y);
+        let phase = if is_final {
+            ButtonPhase::Release
+        } else {
+            ButtonPhase::Motion
+        };
+        return forward_button(panes, target_pane, sgr, motion, phase, col, row).await;
+    }
+    // False on the alternate screen: remux's scrollback belongs to the PRIMARY
+    // screen there, so an edge drag must neither scroll into it nor arm the
+    // repeat timer for a scroll that can never finish.
+    let may_scroll = matches!(route, MouseRoute::Remux { scrollback: true });
+
     // Compute border offset based on style.
     let border_offset: u16 = match config.appearance.border_style {
         BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
@@ -3744,7 +4060,7 @@ async fn handle_mouse_drag(
         // scrolls: the selection must end exactly where the user let go, so the
         // yanked range matches the highlight shown at release instead of pulling
         // in one extra edge line.
-        let new_offset = if is_focused && !is_final {
+        let new_offset = if is_focused && !is_final && may_scroll {
             if at_top {
                 (scroll_offset + 1).min(screen_max_scroll_offset)
             } else if at_bottom {
@@ -3819,6 +4135,7 @@ async fn handle_mouse_drag(
             // stops instead of spinning. A final drag never arms.
             client.autoscroll_repeat = if is_focused
                 && !is_final
+                && may_scroll
                 && ((at_top && new_offset < screen_max_scroll_offset)
                     || (at_bottom && new_offset > 0))
             {
@@ -3921,29 +4238,58 @@ async fn disarm_pane_autoscroll(
 /// testing to do -- the client already resolved which cell was clicked against
 /// its own cell rects -- and no focus to move: cell focus is shared view state
 /// driven by `ViewSetFocus`, not by this message.
+#[allow(clippy::too_many_arguments)]
 async fn handle_pane_mouse_click(
     client_id: u64,
     pane_id: PaneId,
+    x: u16,
+    y: u16,
+    release: bool,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 ) -> Result<()> {
-    let had_selection = {
+    let (had_selection, copy_mode) = {
         let mut cls = clients.lock().await;
         match cls.get_mut(&client_id) {
             // Only a subscribed client may drive a pane it watches (same guard
             // as `ScrollPane`).
             Some(conn) if conn.subscribed_panes.contains_key(&pane_id) => {
-                let had = conn.pane_selection.remove(&pane_id).is_some();
-                if conn.pane_drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
+                let copy_mode = conn.mode == COPY_MODE;
+                // A release leaves an intentionally-kept highlight alone; see
+                // the same rule in `handle_mouse_click`.
+                let had = if release {
+                    false
+                } else {
+                    conn.pane_selection.remove(&pane_id).is_some()
+                };
+                if !release && conn.pane_drag.as_ref().map(|d| d.pane_id) == Some(pane_id) {
                     conn.pane_drag = None;
                 }
                 conn.pane_autoscroll_repeat = None;
-                had
+                (had, copy_mode)
             }
             _ => return Ok(()),
         }
     };
+    // Same policy as a session pane: an application that asked for mouse events
+    // gets the press/release. Cell coordinates arrive content-relative, so they
+    // only need the 1-based bias a report carries.
+    if let Some(MouseRoute::App { sgr, motion }) =
+        route_of_pane(panes, pane_id, MouseGesture::Button, copy_mode).await
+    {
+        // A highlight left over from before the application claimed the mouse
+        // still has to be repainted away.
+        if had_selection {
+            stream_pane_content(pane_id, state, panes, clients).await;
+        }
+        let phase = if release {
+            ButtonPhase::Release
+        } else {
+            ButtonPhase::Press
+        };
+        return forward_button(panes, pane_id, sgr, motion, phase, x + 1, y + 1).await;
+    }
     // Only repaint when something actually changed: a plain click-to-focus in a
     // view is the common case and should cost no extra frame.
     if had_selection {
@@ -3984,7 +4330,7 @@ async fn handle_pane_mouse_drag(
     // Current per-(client, pane) offset and the state of any gesture already
     // running on this pane. A drag on a pane this client does not subscribe to
     // is ignored, mirroring `ScrollPane`.
-    let (scroll_offset, gesture) = {
+    let (scroll_offset, gesture, copy_mode) = {
         let cls = clients.lock().await;
         match cls.get(&client_id) {
             Some(c) if c.subscribed_panes.contains_key(&pane_id) => (
@@ -3993,6 +4339,7 @@ async fn handle_pane_mouse_drag(
                     .as_ref()
                     .filter(|d| d.pane_id == pane_id)
                     .map(|d| (d.anchor_col, d.anchor_abs)),
+                c.mode == COPY_MODE,
             ),
             _ => {
                 disarm_pane_autoscroll(clients, client_id).await;
@@ -4001,6 +4348,30 @@ async fn handle_pane_mouse_drag(
         }
     };
     let new_gesture = gesture.is_none();
+
+    // The shared routing decision (see `mouse_route`), identical to the one the
+    // session path makes -- which is the whole point: a cell aliasing a pane
+    // running a mouse-aware application drives it, instead of selecting text
+    // over the top of it.
+    let route = match route_of_pane(panes, pane_id, MouseGesture::Button, copy_mode).await {
+        Some(r) => r,
+        None => {
+            disarm_pane_autoscroll(clients, client_id).await;
+            return Ok(());
+        }
+    };
+    if let MouseRoute::App { sgr, motion } = route {
+        disarm_pane_autoscroll(clients, client_id).await;
+        let phase = if is_final {
+            ButtonPhase::Release
+        } else {
+            ButtonPhase::Motion
+        };
+        return forward_button(panes, pane_id, sgr, motion, phase, end_x + 1, end_y + 1).await;
+    }
+    // No scrolling into the primary screen's history from an alt-screen cell,
+    // and therefore no repeat timer either (see `MouseRoute::Remux`).
+    let may_scroll = matches!(route, MouseRoute::Remux { scrollback: true });
 
     // Everything that needs the pane's screen, in one lock scope: the content
     // size to clamp against, the anchor/end in absolute coordinates, and the
@@ -4032,7 +4403,7 @@ async fn handle_pane_mouse_drag(
         // the highlight the user saw when letting go.
         let at_top = end_row == 0;
         let at_bottom = end_row == content_height - 1;
-        let new_offset = if is_final {
+        let new_offset = if is_final || !may_scroll {
             base_offset
         } else if at_top {
             (base_offset + 1).min(max_scroll)
@@ -4112,6 +4483,7 @@ async fn handle_pane_mouse_drag(
             // still has somewhere to go, so it stops at the scrollback top /
             // live bottom instead of spinning.
             client.pane_autoscroll_repeat = if !is_final
+                && may_scroll
                 && ((at_top && new_offset < max_scroll) || (at_bottom && new_offset > 0))
             {
                 Some((pane_id, start_x, start_y, end_x, end_y))
@@ -6687,10 +7059,12 @@ async fn handle_resurrect_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrow_report, compute_diff, merge_dormant_into, next_layout_mode,
-        saved_custom_is_restorable, take_dormant_session, wheel_report,
+        arrow_report, button_report, compute_diff, merge_dormant_into, mouse_route,
+        next_layout_mode, saved_custom_is_restorable, take_dormant_session, wheel_report,
+        ButtonPhase, MouseGesture, MouseRoute,
     };
     use crate::protocol::RenderCell;
+    use crate::screen::Screen;
     use crate::server::layout::{
         BspLayout, CustomLayout, GridLayout, LayoutMode, LayoutNode, MasterLayout, MonocleLayout,
     };
@@ -6900,6 +7274,131 @@ mod tests {
         assert_eq!(arrow_report(false, false), vec![0x1b, b'[', b'B']);
         assert_eq!(arrow_report(true, true), vec![0x1b, b'O', b'A']);
         assert_eq!(arrow_report(true, false), vec![0x1b, b'O', b'B']);
+    }
+
+    #[test]
+    fn test_button_report_sgr() {
+        // SGR keeps the button number on a release and marks it with a
+        // lowercase final byte; motion sets the +32 motion bit.
+        assert_eq!(
+            button_report(true, ButtonPhase::Press, 10, 5),
+            b"\x1b[<0;10;5M".to_vec()
+        );
+        assert_eq!(
+            button_report(true, ButtonPhase::Motion, 10, 6),
+            b"\x1b[<32;10;6M".to_vec()
+        );
+        assert_eq!(
+            button_report(true, ButtonPhase::Release, 10, 6),
+            b"\x1b[<0;10;6m".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_button_report_legacy() {
+        // X10 has no lowercase form: a release is button 3 ("no button").
+        assert_eq!(
+            button_report(false, ButtonPhase::Press, 5, 10),
+            vec![0x1b, b'[', b'M', 32, 32 + 5, 32 + 10]
+        );
+        assert_eq!(
+            button_report(false, ButtonPhase::Motion, 5, 10),
+            vec![0x1b, b'[', b'M', 32 + 32, 32 + 5, 32 + 10]
+        );
+        assert_eq!(
+            button_report(false, ButtonPhase::Release, 5, 10),
+            vec![0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 10]
+        );
+        // Coordinates saturate into a single byte, as in `wheel_report`.
+        assert_eq!(
+            button_report(false, ButtonPhase::Press, 300, 400),
+            vec![0x1b, b'[', b'M', 32, 255, 255]
+        );
+    }
+
+    /// The one routing decision every mouse path shares. A plain shell scrolls
+    /// and selects in remux; an application that asked for mouse events gets
+    /// them; an alt-screen application that did not gets the arrow fallback for
+    /// the wheel and, crucially, a `scrollback: false` verdict for buttons --
+    /// remux's scrollback there belongs to the primary screen, so an edge drag
+    /// must not chase it (the drag-autoscroll spin).
+    #[test]
+    fn test_mouse_route() {
+        let mut s = Screen::new(80, 24, 100);
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Wheel, false),
+            MouseRoute::Remux { scrollback: true }
+        );
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, false),
+            MouseRoute::Remux { scrollback: true }
+        );
+
+        // Alt screen, no tracking (e.g. `less`): arrows for the wheel, no
+        // scrollback for a drag.
+        s.process_output(b"\x1b[?1049h");
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Wheel, false),
+            MouseRoute::AltArrows { app_cursor: false }
+        );
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, false),
+            MouseRoute::Remux { scrollback: false }
+        );
+        s.process_output(b"\x1b[?1h");
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Wheel, false),
+            MouseRoute::AltArrows { app_cursor: true }
+        );
+
+        // Tracking wins over everything, and carries the encoding + whether the
+        // app asked for motion.
+        s.process_output(b"\x1b[?1000h");
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, false),
+            MouseRoute::App {
+                sgr: false,
+                motion: false
+            }
+        );
+        s.process_output(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Wheel, false),
+            MouseRoute::App {
+                sgr: true,
+                motion: true
+            }
+        );
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, false),
+            MouseRoute::App {
+                sgr: true,
+                motion: true
+            }
+        );
+
+        // Copy mode (Visual) outranks the application: the user asked for the
+        // mouse explicitly. Selection still works, but not the scrolling that
+        // would chase the primary screen's history under a full-screen app.
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, true),
+            MouseRoute::Remux { scrollback: false }
+        );
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Wheel, true),
+            MouseRoute::Remux { scrollback: false }
+        );
+
+        // Leaving the alt screen releases the app's claim on the mouse.
+        s.process_output(b"\x1b[?1049l");
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, false),
+            MouseRoute::Remux { scrollback: true }
+        );
+        assert_eq!(
+            mouse_route(&s, MouseGesture::Button, true),
+            MouseRoute::Remux { scrollback: true }
+        );
     }
 
     // -- Layout cycle (Alt+Space) -------------------------------------------

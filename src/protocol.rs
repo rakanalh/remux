@@ -103,11 +103,20 @@ pub enum ClientMessage {
     /// [`MouseDrag`](ClientMessage::MouseDrag)): `None` = screen coordinates in
     /// the client's foreground session, `Some(id)` = content coordinates in that
     /// pane, routed by identity.
+    ///
+    /// `release` distinguishes the button going DOWN (`false`, the default and
+    /// what an older client always means) from a button-UP that never moved. A
+    /// gesture that moved reports its release through
+    /// [`MouseDrag`](ClientMessage::MouseDrag) with `is_final`; one that did not
+    /// has no drag to finalize, so the release arrives here. A mouse-tracking
+    /// application needs both halves or it latches the button down forever.
     MouseClick {
         x: u16,
         y: u16,
         #[serde(default)]
         pane_id: Option<PaneId>,
+        #[serde(default)]
+        release: bool,
     },
     /// A mouse drag selection from start to end coordinates.
     ///
@@ -191,10 +200,22 @@ pub enum ClientMessage {
     /// scroll offset, clamps it to the pane's scrollback, and streams a fresh
     /// `PaneContent` rendered at that offset back to this client only. `up`
     /// scrolls back into history, `!up` forward toward the live view.
+    /// `x`/`y` are the wheel position in the pane's own **content** coordinates
+    /// (0-based, borders already subtracted), the same space
+    /// [`MouseDrag`](ClientMessage::MouseDrag) uses when `pane_id` is set. They
+    /// matter only when the pane's application has mouse tracking on, in which
+    /// case the wheel is forwarded to it as a mouse report at that position
+    /// instead of scrolling remux's own view. `#[serde(default)]` keeps an older
+    /// client's coordinate-less wheel decodable: it lands on the pane's
+    /// top-left cell, which is the only place a position-less report can go.
     ScrollPane {
         pane_id: PaneId,
         up: bool,
         lines: u16,
+        #[serde(default)]
+        x: u16,
+        #[serde(default)]
+        y: u16,
     },
 
     // -- Shared View intents ------------------------------------------------
@@ -1142,16 +1163,67 @@ mod tests {
             x: 42,
             y: 10,
             pane_id: None,
+            release: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         match decoded {
-            ClientMessage::MouseClick { x, y, pane_id } => {
+            ClientMessage::MouseClick {
+                x,
+                y,
+                pane_id,
+                release,
+            } => {
                 assert_eq!(x, 42);
                 assert_eq!(y, 10);
                 assert_eq!(pane_id, None);
+                assert!(!release);
             }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The button-up half of a click round-trips, and the wheel carries the
+    /// position a mouse report needs. Both are `#[serde(default)]` additions, so
+    /// a payload from an older peer still decodes -- to the press-at-origin
+    /// meaning it always had, which is what keeps them off `PROTOCOL_VERSION`.
+    #[test]
+    fn mouse_release_and_wheel_position_round_trip_and_default() {
+        let msg = ClientMessage::MouseClick {
+            x: 4,
+            y: 5,
+            pane_id: Some(9),
+            release: true,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        match serde_json::from_slice::<ClientMessage>(&encoded[4..4 + len]).unwrap() {
+            ClientMessage::MouseClick { release, .. } => assert!(release),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let legacy = br#"{"MouseClick":{"x":1,"y":2,"pane_id":3}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::MouseClick { release, .. } => assert!(!release),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let msg = ClientMessage::ScrollPane {
+            pane_id: 3,
+            up: true,
+            lines: 3,
+            x: 11,
+            y: 7,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        match serde_json::from_slice::<ClientMessage>(&encoded[4..4 + len]).unwrap() {
+            ClientMessage::ScrollPane { x, y, .. } => assert_eq!((x, y), (11, 7)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let legacy = br#"{"ScrollPane":{"pane_id":3,"up":false,"lines":3}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::ScrollPane { x, y, .. } => assert_eq!((x, y), (0, 0)),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
