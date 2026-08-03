@@ -74,6 +74,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 ### Mouse
 
 - **Text selection** — click-drag to select; on release the selection auto-copies to the clipboard and clears (`mouse_auto_yank`, on by default). Disable it to keep the selection for keyboard adjustment in Visual mode.
+- **Application clipboard (OSC 52)** — when an app in a pane copies (editors, pagers, TUI tools), the text reaches your real system clipboard, including through a remote session. Only the pane you are actually looking at can do it, and clipboard *reads* are never served, so nothing can exfiltrate what you copied. Turn it off with `allow_app_clipboard = false`.
 - **Click to switch** — click tabs and stacked panes to switch to them.
 - **Wheel forwarding** — the mouse wheel is forwarded to applications that request mouse tracking or use the alternate screen (e.g. `less`, `vim`); otherwise it scrolls Remux's own scrollback.
 
@@ -441,6 +442,7 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `save_sessions` — persist session state to disk (default `true`). When `false`, nothing is written and `automatic_restore` is ignored.
   - `automatic_restore` — restore persisted sessions live on startup (default `true`). With `save_sessions = true` and this `false`, saved sessions load as **dormant/resurrectable** entries in the session manager instead.
   - `mouse_auto_yank` — auto-copy mouse selections on release (default `true`).
+  - `allow_app_clipboard` — let applications in a pane copy to your system clipboard with OSC 52 (default `true`). Read by the server owning the pane, so a remote session obeys the remote machine's setting. Clipboard *reads* are never served either way.
 - **`[appearance]`**
   - `status_bar_position` — `"top"` or `"bottom"`.
   - `border_style` — `"zellij_style"` or `"tmux_style"`.

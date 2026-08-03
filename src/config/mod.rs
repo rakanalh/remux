@@ -90,6 +90,13 @@ pub struct GeneralConfig {
     /// release and clears the selection. When false, the selection stays visible
     /// for keyboard adjustment in Visual mode.
     pub mouse_auto_yank: bool,
+    /// When true (default), an application running in a pane may put text on the
+    /// user's system clipboard by emitting `OSC 52` — how editors, pagers and
+    /// TUI tools copy. Set it false to let nothing but the user's own selections
+    /// reach the clipboard. Consulted server-side, so for a remote session it is
+    /// the *remote* server's setting that applies. Clipboard *reads* are never
+    /// served, whatever this is set to.
+    pub allow_app_clipboard: bool,
 }
 
 impl Default for GeneralConfig {
@@ -100,6 +107,7 @@ impl Default for GeneralConfig {
             save_sessions: true,
             automatic_restore: true,
             mouse_auto_yank: true,
+            allow_app_clipboard: true,
         }
     }
 }

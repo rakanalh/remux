@@ -41,6 +41,15 @@
 # keyboard adjustment in Visual mode (default: true).
 # mouse_auto_yank = true
 
+# When true (default), an application running in a pane may put text on your
+# system clipboard by emitting OSC 52 -- how editors, pagers and TUI tools copy.
+# Set it false if you want nothing but your own selections to reach the
+# clipboard. Read by the SERVER that owns the pane, so for a remote session it is
+# the remote machine's config that decides. Clipboard *reads* (an application
+# asking the terminal what you have copied) are never served either way
+# (default: true).
+# allow_app_clipboard = true
+
 # -----------------------------------------------------------------------------
 # APPEARANCE
 # -----------------------------------------------------------------------------

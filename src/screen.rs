@@ -9,6 +9,12 @@ use std::ops::{Deref, DerefMut};
 
 use unicode_width::UnicodeWidthChar;
 
+/// Largest base64 payload accepted from an `OSC 52` clipboard write. Anything
+/// bigger is logged and dropped, so a runaway or hostile program cannot balloon
+/// the server's memory or wedge the render loop by "copying" a huge blob.
+/// 256 KiB of base64 is ~192 KiB of text — far more than any plausible copy.
+const MAX_OSC52_BASE64_LEN: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Cell types
 // ---------------------------------------------------------------------------
@@ -217,6 +223,11 @@ pub struct Screen {
     /// Set when a BEL (`0x07`) is received; consumed via [`Screen::take_bell`].
     /// Used by the server for per-tab bell activity monitoring.
     pub bell_pending: bool,
+    /// Text an application asked the terminal to put on the system clipboard
+    /// with `OSC 52`; consumed via [`Screen::take_clipboard`]. Last write wins —
+    /// a batch of PTY output holding several clipboard writes leaves the last
+    /// one, exactly as a real terminal would.
+    pub clipboard_pending: Option<String>,
     /// Deferred line-wrap (DECAWM "last column") state. When a printable char
     /// fills the last column, the cursor stays parked on that column and this
     /// flag is set; the actual wrap to the next row happens only when the NEXT
@@ -264,6 +275,7 @@ impl Screen {
             mouse_motion: false,
             mouse_sgr: false,
             bell_pending: false,
+            clipboard_pending: None,
             pending_wrap: false,
         }
     }
@@ -272,6 +284,62 @@ impl Screen {
     /// since the last call and clearing it.
     pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.bell_pending)
+    }
+
+    /// Consume any pending `OSC 52` clipboard write, clearing it.
+    ///
+    /// The server drains this after every batch of PTY output and hands the text
+    /// to the clients that should act on it as a `CopyToClipboard`.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard_pending.take()
+    }
+
+    /// Handle `OSC 52` — an application asking the terminal to put text on the
+    /// system clipboard: `OSC 52 ; <targets> ; <base64> ST`.
+    ///
+    /// Only clipboard **writes** are honored. A payload of `?` is a clipboard
+    /// *read* request: the terminal is expected to answer on the PTY with the
+    /// clipboard's current contents. Answering it would let any program — or any
+    /// file run through `cat` — exfiltrate whatever the user last copied, so
+    /// reads are deliberately ignored and never replied to.
+    ///
+    /// `targets` is xterm's selection list. Empty means "the default selection";
+    /// `c` is the clipboard, `p` the primary selection and `s` the configured
+    /// selection. Any of those is accepted — they all mean "the thing the user
+    /// pastes with", and Remux has exactly one clipboard to offer. A request
+    /// aimed only at the numbered cut buffers `0`-`7` has no system-clipboard
+    /// equivalent and is ignored.
+    fn osc52_clipboard(&mut self, params: &[&[u8]]) {
+        let targets = params.get(1).copied().unwrap_or(b"");
+        if !targets.is_empty() && !targets.iter().any(|b| matches!(b, b'c' | b'p' | b's')) {
+            return;
+        }
+        let payload = params.get(2).copied().unwrap_or(b"");
+        if payload == b"?" {
+            // Clipboard READ — see the note above. Never answered.
+            log::debug!("screen: ignoring OSC 52 clipboard read request");
+            return;
+        }
+        if payload.is_empty() {
+            // `OSC 52 ; c ; ST` clears the selection; there is nothing to copy.
+            return;
+        }
+        if payload.len() > MAX_OSC52_BASE64_LEN {
+            log::warn!(
+                "screen: dropping oversized OSC 52 clipboard write ({} bytes of base64)",
+                payload.len()
+            );
+            return;
+        }
+        match base64_decode(payload) {
+            Some(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if !text.is_empty() {
+                    self.clipboard_pending = Some(text);
+                }
+            }
+            None => log::debug!("screen: ignoring OSC 52 write with undecodable base64"),
+        }
     }
 
     /// Resize the screen to new dimensions.
@@ -1578,6 +1646,8 @@ impl vte::Perform for Screen {
             } else {
                 Some(String::from_utf8_lossy(&uri).into_owned())
             };
+        } else if params.first().map(|p| *p == b"52").unwrap_or(false) {
+            self.osc52_clipboard(params);
         }
         // Other OSC sequences (e.g. title setting) are acknowledged but currently
         // ignored. A future version may store the window title.
@@ -1594,6 +1664,62 @@ impl vte::Perform for Screen {
     fn put(&mut self, _byte: u8) {
         // DCS put - not yet implemented.
     }
+}
+
+// ---------------------------------------------------------------------------
+// base64
+// ---------------------------------------------------------------------------
+
+/// Decode standard-alphabet base64, returning `None` for anything malformed.
+///
+/// Hand-rolled (Remux takes no base64 dependency) and deliberately strict: the
+/// only caller feeds it untrusted bytes straight off a PTY, so a bad payload
+/// must be rejected outright rather than guessed at — and must never panic.
+/// Padding is optional, so both `=`-padded and unpadded input decode, but `=`
+/// anywhere other than the tail, any byte outside the alphabet (whitespace
+/// included), a padding run that does not complete a 4-byte group, or a length
+/// that cannot encode a whole byte (`len % 4 == 1`) rejects the whole payload.
+fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    fn sextet(b: u8) -> Option<u32> {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        Some(u32::from(v))
+    }
+
+    let (body, pad) = if let Some(b) = input.strip_suffix(b"==") {
+        (b, 2)
+    } else if let Some(b) = input.strip_suffix(b"=") {
+        (b, 1)
+    } else {
+        (input, 0)
+    };
+    // Padding, when present, must land the payload on a whole 4-byte group, and
+    // may only appear at the tail (`sextet` rejects a `=` inside `body`).
+    if pad > 0 && (body.len() + pad) % 4 != 0 {
+        return None;
+    }
+    if body.len() % 4 == 1 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(body.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in body {
+        acc = (acc << 6) | sextet(b)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,6 +1901,178 @@ mod tests {
         assert!(!s.take_bell());
         // BEL should not disturb normal text output.
         assert_eq!(s.grid[0][0].c, 'h');
+    }
+
+    // -----------------------------------------------------------------------
+    // OSC 52 clipboard + base64
+    // -----------------------------------------------------------------------
+
+    /// Encode with the same alphabet `base64_decode` accepts, so the round-trip
+    /// tests do not depend on a hand-written literal being right.
+    fn b64(input: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_base64_decode_padded_and_unpadded() {
+        // Two `=`, one `=`, and no padding needed.
+        assert_eq!(base64_decode(b"YQ==").unwrap(), b"a");
+        assert_eq!(base64_decode(b"YWI=").unwrap(), b"ab");
+        assert_eq!(base64_decode(b"YWJj").unwrap(), b"abc");
+        // The same payloads with the padding stripped decode identically.
+        assert_eq!(base64_decode(b"YQ").unwrap(), b"a");
+        assert_eq!(base64_decode(b"YWI").unwrap(), b"ab");
+        // Empty in, empty out (the caller treats this as "nothing to copy").
+        assert_eq!(base64_decode(b"").unwrap(), b"");
+    }
+
+    #[test]
+    fn test_base64_decode_rejects_malformed() {
+        // A length of 4n+1 cannot encode a whole byte.
+        assert!(base64_decode(b"YWJjZ").is_none());
+        // Bytes outside the alphabet -- including whitespace, which some encoders
+        // wrap lines with but an OSC payload must never contain.
+        assert!(base64_decode(b"YW*j").is_none());
+        assert!(base64_decode(b"YW Jj").is_none());
+        assert!(base64_decode(b"YWJj\n").is_none());
+        // `=` anywhere but the tail.
+        assert!(base64_decode(b"Y=Jj").is_none());
+        // Padding that does not complete a 4-byte group.
+        assert!(base64_decode(b"YWJ==").is_none());
+        // A clipboard READ request is not base64 and must not decode.
+        assert!(base64_decode(b"?").is_none());
+    }
+
+    #[test]
+    fn test_osc52_write_reaches_clipboard() {
+        let mut s = make_screen();
+        s.process_output(format!("\x1b]52;c;{}\x07", b64(b"REMUX_CLIP_7788")).as_bytes());
+        assert_eq!(s.take_clipboard().as_deref(), Some("REMUX_CLIP_7788"));
+        // Consumed: a second take yields nothing.
+        assert_eq!(s.take_clipboard(), None);
+    }
+
+    #[test]
+    fn test_osc52_accepts_st_terminator_and_selection_targets() {
+        // ST-terminated rather than BEL-terminated.
+        let mut s = make_screen();
+        s.process_output(format!("\x1b]52;c;{}\x1b\\", b64(b"st-form")).as_bytes());
+        assert_eq!(s.take_clipboard().as_deref(), Some("st-form"));
+
+        // Primary selection, the combined list, and an empty (default) target all
+        // mean "the thing the user pastes with".
+        for targets in ["p", "s", "cp", ""] {
+            let mut s = make_screen();
+            s.process_output(format!("\x1b]52;{targets};{}\x07", b64(b"sel")).as_bytes());
+            assert_eq!(
+                s.take_clipboard().as_deref(),
+                Some("sel"),
+                "targets {targets:?} should be honored"
+            );
+        }
+
+        // A request aimed only at the numbered cut buffers has no clipboard
+        // meaning here and is ignored.
+        let mut s = make_screen();
+        s.process_output(format!("\x1b]52;0;{}\x07", b64(b"cutbuf")).as_bytes());
+        assert_eq!(s.take_clipboard(), None);
+    }
+
+    #[test]
+    fn test_osc52_read_request_is_ignored() {
+        // `?` asks the terminal to hand the clipboard BACK to the application.
+        // Serving it would let any program exfiltrate what the user copied, so it
+        // must set no clipboard and, critically, queue no PTY response.
+        let mut s = make_screen();
+        s.process_output(b"\x1b]52;c;?\x07");
+        assert_eq!(s.take_clipboard(), None);
+        assert!(s.take_responses().is_empty());
+    }
+
+    #[test]
+    fn test_osc52_invalid_and_oversized_payloads_are_dropped() {
+        // Garbage base64: ignored, no panic.
+        let mut s = make_screen();
+        s.process_output(b"\x1b]52;c;!!!not base64!!!\x07");
+        assert_eq!(s.take_clipboard(), None);
+
+        // An empty payload clears the selection; there is nothing to copy.
+        let mut s = make_screen();
+        s.process_output(b"\x1b]52;c;\x07");
+        assert_eq!(s.take_clipboard(), None);
+
+        // Over the cap: dropped rather than decoded.
+        let mut s = make_screen();
+        let huge = "A".repeat(MAX_OSC52_BASE64_LEN + 4);
+        s.process_output(format!("\x1b]52;c;{huge}\x07").as_bytes());
+        assert_eq!(s.take_clipboard(), None);
+    }
+
+    #[test]
+    fn test_osc52_multi_kilobyte_payload_round_trips() {
+        // The reported case is a TUI app copying a real block of text, not a
+        // 15-byte marker: 8 KiB has to survive the OSC parser's buffering intact
+        // or the clipboard silently gets a truncated fragment.
+        let mut s = make_screen();
+        let text: String = (0..512)
+            .map(|i| format!("line {i:04} of copied text\n"))
+            .collect();
+        assert!(
+            text.len() > 8 * 1024,
+            "payload must exceed the parser's buffer"
+        );
+        s.process_output(format!("\x1b]52;c;{}\x07", b64(text.as_bytes())).as_bytes());
+        assert_eq!(s.take_clipboard().as_deref(), Some(text.as_str()));
+    }
+
+    #[test]
+    fn test_osc52_last_write_wins_within_one_batch() {
+        // A batch of PTY output holding several clipboard writes leaves the last,
+        // as a real terminal would -- not a queue that thrashes the clipboard.
+        let mut s = make_screen();
+        s.process_output(
+            format!(
+                "\x1b]52;c;{}\x07\x1b]52;c;{}\x07",
+                b64(b"first"),
+                b64(b"second")
+            )
+            .as_bytes(),
+        );
+        assert_eq!(s.take_clipboard().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn test_osc52_does_not_disturb_osc8_hyperlinks() {
+        // The two OSC handlers compose: a clipboard write between a link's open
+        // and close must not clear or capture the active hyperlink.
+        let mut s = make_screen();
+        s.process_output(b"\x1b]8;;https://example.com/a;b\x1b\\");
+        s.process_output(format!("\x1b]52;c;{}\x07", b64(b"clip")).as_bytes());
+        s.process_output(b"X");
+        assert_eq!(s.take_clipboard().as_deref(), Some("clip"));
+        assert_eq!(
+            s.grid[0][0].hyperlink.as_deref(),
+            Some("https://example.com/a;b")
+        );
+        s.process_output(b"\x1b]8;;\x1b\\");
+        assert_eq!(s.current_hyperlink, None);
     }
 
     #[test]

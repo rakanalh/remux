@@ -5177,6 +5177,53 @@ fn pane_labels(st: &ServerState, pane_id: PaneId) -> (String, String) {
     (String::new(), String::new())
 }
 
+/// Deliver an application's `OSC 52` clipboard write (drained from the pane's
+/// screen with [`Screen::take_clipboard`]) to the clients that should act on it,
+/// as the same `CopyToClipboard` a Remux yank sends.
+///
+/// **Routing rule: the pane must be one the user is looking at.** A client gets
+/// the write when the pane is the one its own keystrokes would reach — the
+/// `input_target` of the session it is attached to — or when it is *showing* the
+/// pane in a View cell (a `Some(size)` subscription; `None` is watch-only). A
+/// pane in a background tab, in a session nobody has in the foreground, or in a
+/// View cell hidden by the layout is skipped: a program left running out of
+/// sight must not be able to quietly take over the clipboard. Using
+/// `input_target` rather than the raw focused pane also means a pane shadowed by
+/// a visible popup does not count as focused, matching where input goes.
+///
+/// Each matching client is sent exactly one message even if both rules apply.
+async fn deliver_app_clipboard(
+    pane_id: PaneId,
+    data: String,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    // Sessions in which this pane is the current input target. Taken before the
+    // clients lock: state-then-clients, never nested the other way.
+    let focused_in: Vec<String> = {
+        let st = state.lock().await;
+        st.sessions
+            .iter()
+            .filter(|(_, sess)| sess.input_target() == Some(pane_id))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    let cls = clients.lock().await;
+    for client in cls.values() {
+        let attached_and_focused = client
+            .session_name
+            .as_ref()
+            .is_some_and(|name| focused_in.iter().any(|f| f == name));
+        let showing_in_view = matches!(client.subscribed_panes.get(&pane_id), Some(Some(_)));
+        if attached_and_focused || showing_in_view {
+            let _ = client
+                .tx
+                .send(ServerMessage::CopyToClipboard { data: data.clone() });
+        }
+    }
+}
+
 /// What makes one subscriber's `PaneContent` differ from another's: the
 /// scrollback offset it is rendered at, plus its selection flattened to
 /// `(start_col, start_row, end_col, end_row)`. Used to memoize the renders in
@@ -6556,7 +6603,7 @@ async fn start_pty_forwarding(
                             }
                         }
 
-                        let (responses, bell) = {
+                        let (responses, bell, clipboard) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 for chunk in &chunks {
@@ -6571,9 +6618,13 @@ async fn start_pty_forwarding(
                                     pane_data.screen.scroll_bottom
                                 );
                                 let bell = pane_data.screen.take_bell();
-                                (pane_data.screen.take_responses(), bell)
+                                // Always drained, even when the config gate is
+                                // off, so a disallowed write cannot sit pending
+                                // and land the moment it is switched back on.
+                                let clipboard = pane_data.screen.take_clipboard();
+                                (pane_data.screen.take_responses(), bell, clipboard)
                             } else {
-                                (Vec::new(), false)
+                                (Vec::new(), false, None)
                             }
                         };
                         // Record background-tab activity (no-op if this pane's
@@ -6591,6 +6642,12 @@ async fn start_pty_forwarding(
                                 for resp in &responses {
                                     let _ = pane_data.pty.write_input(resp);
                                 }
+                            }
+                        }
+                        // An application asked for the system clipboard via OSC 52.
+                        if let Some(text) = clipboard {
+                            if config.general.allow_app_clipboard {
+                                deliver_app_clipboard(pane_id, text, &state, &clients).await;
                             }
                         }
                         // Stream to the pane's View-cell subscribers, each at its
@@ -6837,14 +6894,15 @@ async fn materialize_session(
 
                 match recv_result {
                     Some(Ok(data)) => {
-                        let (responses, bell) = {
+                        let (responses, bell, clipboard) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 pane_data.screen.process_output(&data);
                                 let bell = pane_data.screen.take_bell();
-                                (pane_data.screen.take_responses(), bell)
+                                let clipboard = pane_data.screen.take_clipboard();
+                                (pane_data.screen.take_responses(), bell, clipboard)
                             } else {
-                                (Vec::new(), false)
+                                (Vec::new(), false, None)
                             }
                         };
                         {
@@ -6857,6 +6915,12 @@ async fn materialize_session(
                                 for resp in &responses {
                                     let _ = pane_data.pty.write_input(resp);
                                 }
+                            }
+                        }
+                        // An application asked for the system clipboard via OSC 52.
+                        if let Some(text) = clipboard {
+                            if config.general.allow_app_clipboard {
+                                deliver_app_clipboard(pane_id, text, &state, &clients).await;
                             }
                         }
                         // Stream to the pane's View-cell subscribers, each at its

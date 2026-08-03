@@ -6,7 +6,13 @@ edition = "2021"
 [dependencies]
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
-vte = "0.13"
+# `default-features = false` turns OFF vte's `no_std` feature (which is ON by
+# default). With it on, the parser's OSC buffer is a fixed `ArrayVec<u8, 1024>`
+# and any OSC payload past 1 KiB is silently truncated — which would hand a
+# mangled fragment to `OSC 52` clipboard writes and to long OSC 8 URIs. Off, the
+# buffer is a `Vec` that holds the whole sequence. Removes the arrayvec dep and
+# adds none.
+vte = { version = "0.13", default-features = false }
 nix = { version = "0.29", features = ["term", "signal", "process", "fs"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
