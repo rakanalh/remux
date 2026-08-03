@@ -304,6 +304,30 @@ impl Tab {
         }
     }
 
+    /// Flip the tab's zoom, returning whether the zoom state actually changed.
+    ///
+    /// **Disengaging always works; only engaging can be refused.** `Monocle`
+    /// already paints one pane full-area, so *taking* a zoom there is
+    /// redundant -- but *releasing* one is not, and refusing it is a trap:
+    /// `zoomed_pane` outranks the mode in [`Tab::effective_layout`], so a tab
+    /// zoomed in another mode and then cycled into `Monocle` would stay stuck
+    /// on that one pane with no way back, for every attached client (the zoom
+    /// is session state, not client state) and across a save/restore (both
+    /// fields persist). That is exactly how a session became permanently
+    /// "zoomed in and unable to zoom out" on one machine and looked the same
+    /// way from another.
+    pub fn toggle_zoom(&mut self) -> bool {
+        if self.zoomed_pane.is_some() {
+            self.zoomed_pane = None;
+            true
+        } else if matches!(self.layout_mode, LayoutMode::Monocle(_)) {
+            false
+        } else {
+            self.zoomed_pane = Some(self.focused_pane);
+            true
+        }
+    }
+
     /// Move focus to `pane_id`, carrying an active zoom along with it.
     ///
     /// `zoomed_pane` names the pane that is actually painted full-area, so it
@@ -3006,6 +3030,51 @@ mod popup_invariant_tests {
             vec![zoomed],
             "the zoom shows the pane it names"
         );
+    }
+
+    #[test]
+    fn toggle_zoom_takes_and_releases_a_zoom_outside_monocle() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let focused = tab.focused_pane;
+
+        assert!(tab.toggle_zoom(), "taking a zoom changes the state");
+        assert_eq!(tab.zoomed_pane, Some(focused));
+        assert!(tab.toggle_zoom(), "releasing it changes the state too");
+        assert_eq!(tab.zoomed_pane, None);
+    }
+
+    #[test]
+    fn toggle_zoom_refuses_to_take_a_zoom_in_monocle() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.layout_mode = LayoutMode::Monocle(MonocleLayout);
+
+        assert!(!tab.toggle_zoom(), "Monocle is already fullscreen");
+        assert_eq!(tab.zoomed_pane, None, "no redundant zoom is taken");
+    }
+
+    #[test]
+    fn toggle_zoom_always_releases_a_zoom_even_in_monocle() {
+        // The wedge: a tab zoomed in another mode, then cycled into Monocle.
+        // `effective_layout` obeys `zoomed_pane` over the mode, so refusing the
+        // release would strand every attached client on the one pane -- and both
+        // fields persist, so a save/restore would carry the trap forward.
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let zoomed = tab.focused_pane;
+        tab.toggle_zoom();
+        tab.layout_mode = LayoutMode::Monocle(MonocleLayout);
+        assert_eq!(layout::all_pane_ids(&tab.effective_layout()), vec![zoomed]);
+
+        assert!(tab.toggle_zoom(), "the release is never refused");
+        assert_eq!(tab.zoomed_pane, None);
+        assert_eq!(
+            layout::all_pane_ids(&tab.effective_layout()).len(),
+            3,
+            "the whole tab is reachable again"
+        );
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
     }
 
     #[test]

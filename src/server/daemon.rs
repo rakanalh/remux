@@ -2149,6 +2149,13 @@ async fn handle_command(
                 if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
                     tab.saved_custom_layout = Some(tab.layout.clone());
                 }
+                // Cycling the layout releases the zoom, for the same reason a
+                // new pane does: the tab is showing a different arrangement, and
+                // a zoom would hide all of it. Cleared *first*, so the
+                // `focus_pane` below can't carry a stale zoom into the restored
+                // tree -- and so the cycle can never park a live zoom in Monocle,
+                // the one mode that refuses to take one.
+                tab.zoomed_pane = None;
                 // Grid (the last automatic before wrap) returns to Custom only
                 // when the saved tree is still restorable (its pane set matches
                 // the live panes); otherwise the cycle stays automatic.
@@ -2190,6 +2197,9 @@ async fn handle_command(
                 if matches!(tab.layout_mode, LayoutMode::Custom(_)) {
                     tab.saved_custom_layout = Some(tab.layout.clone());
                 }
+                // Promoting a master rebuilds the arrangement, so it releases
+                // the zoom too (see `LayoutNext`).
+                tab.zoomed_pane = None;
                 // Switch to Master layout if not already in it.
                 if !matches!(tab.layout_mode, LayoutMode::Master(_)) {
                     tab.layout_mode = LayoutMode::Master(MasterLayout::default());
@@ -2437,20 +2447,20 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
-                // No-op in Monocle mode (already fullscreen).
-                if matches!(tab.layout_mode, LayoutMode::Monocle(_)) {
-                    return Ok(());
-                }
-                if tab.zoomed_pane.is_some() {
-                    tab.zoomed_pane = None;
-                } else {
-                    tab.zoomed_pane = Some(tab.focused_pane);
-                }
+                // `Tab::toggle_zoom` owns the rule that only *engaging* a zoom
+                // can be refused (Monocle is already fullscreen); releasing one
+                // always works, so the zoom can never become unreachable.
+                let changed = tab.toggle_zoom();
                 log::debug!(
-                    "server: PaneToggleZoom pane={} zoomed={}",
+                    "server: PaneToggleZoom pane={} zoomed={} changed={changed}",
                     tab.focused_pane,
                     tab.zoomed_pane.is_some()
                 );
+                // Nothing moved (a redundant zoom request in Monocle): skip the
+                // resize + repaint entirely, as this arm always has.
+                if !changed {
+                    return Ok(());
+                }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
