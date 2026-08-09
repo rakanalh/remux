@@ -1446,7 +1446,14 @@ async fn run_client_loop(
     // stable coordinate for drawing search-match highlights even when
     // `scroll_offset` is transiently repurposed by in-view visual moves.
     let mut viewport_top: usize = 0;
-    // Whether the client is currently scrolled back (server owns the actual offset).
+    // Whether the client is currently scrolled back (server owns the actual
+    // offset). Read from the render frames' `scroll_offset`, NEVER from
+    // `viewport_top`: the latter is an absolute line index, so at maximum scroll
+    // (the first line of history on the top row) it is exactly 0 -- identical to
+    // the live tail. Deriving this flag from it made the client believe it was
+    // unscrolled at precisely the maximum, and every path that returns to the
+    // live tail (typing, Escape to Normal, leaving Visual, cancelling Search) is
+    // gated on this flag, so none of them fired and the session looked dead.
     let mut is_scrolled: bool = false;
     // Baseline for computing VisualScroll deltas, in VisualState's own units
     // (lines-from-bottom). Re-synced to `vs.scroll_offset` at every point the
@@ -2227,7 +2234,13 @@ async fn run_client_loop(
                                         let target_vt = match_line.saturating_sub(pane_h / 2);
                                         let delta = scroll_offset as i32 - target_vt as i32;
                                         scroll_offset = target_vt;
-                                        is_scrolled = scroll_offset > 0;
+                                        // Entered only when the match is OUTSIDE the
+                                        // visible window, so we are scrolling away
+                                        // from the tail. Not `target_vt > 0`: a match
+                                        // near the top of history centers at
+                                        // viewport_top 0, which is maximum scroll, not
+                                        // the live tail (see `is_scrolled`'s comment).
+                                        is_scrolled = true;
                                         if delta != 0 {
                                             mgr.send_foreground(ClientMessage::ScrollDelta { delta })
                                                 .await?;
@@ -2409,6 +2422,11 @@ async fn run_client_loop(
                                             let target_vt = match_line.saturating_sub(pane_height / 2);
                                             let delta = scroll_offset as i32 - target_vt as i32;
                                             scroll_offset = target_vt;
+                                            // Same as the visual match-nav arm: the
+                                            // match was off-screen, so this leaves the
+                                            // live tail even when it centers at
+                                            // viewport_top 0.
+                                            is_scrolled = true;
                                             if delta != 0 {
                                                 mgr.send_foreground(ClientMessage::ScrollDelta { delta }).await?;
                                             }
@@ -3818,16 +3836,16 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
-                        log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} scroll_offset={}",
-                            cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so);
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so, scroll_offset: srv_so }) => {
+                        log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
+                            cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
                         scroll_offset = so;
                         // Server render is authoritative for the viewport top;
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
-                        is_scrolled = so > 0;
+                        is_scrolled = srv_so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
@@ -3850,15 +3868,15 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
-                        log::debug!("srv: RenderDiff changes={} cursor=({},{}) scroll_offset={}", changes.len(), cursor_x, cursor_y, so);
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so, scroll_offset: srv_so }) => {
+                        log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
                         scroll_offset = so;
                         // Server render is authoritative for the viewport top;
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
-                        is_scrolled = so > 0;
+                        is_scrolled = srv_so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
@@ -3879,15 +3897,15 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so }) => {
-                        log::debug!("srv: ScrollRender delta={} pane=({},{} {}x{}) scroll_offset={}", delta, pane_x, pane_y, pane_width, pane_height, so);
+                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so, scroll_offset: srv_so }) => {
+                        log::debug!("srv: ScrollRender delta={} pane=({},{} {}x{}) viewport_top={} scroll_offset={}", delta, pane_x, pane_y, pane_width, pane_height, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
                         scroll_offset = so;
                         // Server render is authoritative for the viewport top;
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
-                        is_scrolled = so > 0;
+                        is_scrolled = srv_so > 0;
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;

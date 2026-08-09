@@ -282,6 +282,17 @@ pub enum ServerMessage {
         /// Index in the combined scrollback+grid buffer of the first displayed line.
         #[serde(default)]
         viewport_top: usize,
+        /// How far the viewport is scrolled back from the live tail, in lines;
+        /// 0 means the client is watching the live tail.
+        ///
+        /// **Not derivable from `viewport_top`.** That field is an absolute line
+        /// index, so at maximum scroll (`scroll_offset == max_scroll_offset()`,
+        /// i.e. the first line of history is the top visible row) it is exactly
+        /// `0` -- byte-identical to what the live tail reports. A client that
+        /// inferred "am I scrolled?" from it was blind at precisely the maximum,
+        /// and so never asked to return to the tail.
+        #[serde(default)]
+        scroll_offset: usize,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -298,6 +309,17 @@ pub enum ServerMessage {
         /// Index in the combined scrollback+grid buffer of the first displayed line.
         #[serde(default)]
         viewport_top: usize,
+        /// How far the viewport is scrolled back from the live tail, in lines;
+        /// 0 means the client is watching the live tail.
+        ///
+        /// **Not derivable from `viewport_top`.** That field is an absolute line
+        /// index, so at maximum scroll (`scroll_offset == max_scroll_offset()`,
+        /// i.e. the first line of history is the top visible row) it is exactly
+        /// `0` -- byte-identical to what the live tail reports. A client that
+        /// inferred "am I scrolled?" from it was blind at precisely the maximum,
+        /// and so never asked to return to the tail.
+        #[serde(default)]
+        scroll_offset: usize,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -321,6 +343,17 @@ pub enum ServerMessage {
         /// Index in the combined scrollback+grid buffer of the first displayed line.
         #[serde(default)]
         viewport_top: usize,
+        /// How far the viewport is scrolled back from the live tail, in lines;
+        /// 0 means the client is watching the live tail.
+        ///
+        /// **Not derivable from `viewport_top`.** That field is an absolute line
+        /// index, so at maximum scroll (`scroll_offset == max_scroll_offset()`,
+        /// i.e. the first line of history is the top visible row) it is exactly
+        /// `0` -- byte-identical to what the live tail reports. A client that
+        /// inferred "am I scrolled?" from it was blind at precisely the maximum,
+        /// and so never asked to return to the tail.
+        #[serde(default)]
+        scroll_offset: usize,
     },
     /// Response to a `ListSessions` request.
     SessionList { sessions: Vec<SessionListEntry> },

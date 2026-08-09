@@ -752,7 +752,13 @@ async fn handle_client_message(
             Ok(())
         }
         ClientMessage::Input { data } => {
-            handle_input(client_id, &data, state, panes, clients).await
+            handle_input(client_id, &data, state, panes, clients).await?;
+            // Typing leaves scrollback, as it does in tmux and zellij. The
+            // server owns `scroll_offset`, so the server ends it -- see
+            // `snap_client_to_live_tail` for why the client cannot be trusted to
+            // ask.
+            snap_client_to_live_tail(client_id, state, panes, clients, config, prev_frames).await;
+            Ok(())
         }
         ClientMessage::Resize { cols, rows } => {
             handle_resize(
@@ -1388,6 +1394,89 @@ async fn handle_input(
         }
     }
     Ok(())
+}
+
+/// Return this client's viewport to the live tail, repainting only if it moved.
+///
+/// **Why the server does this and not the client.** `scroll_offset` is
+/// server-owned state, and the render messages' `viewport_top` is an absolute
+/// line index -- which is exactly `0` at maximum scroll, the same value the live
+/// tail reports. A client that inferred "am I scrolled?" from `viewport_top`
+/// was therefore blind at precisely the maximum, so it never sent the
+/// `ScrollReset` that every one of its unstick paths (typing, Escape back to
+/// Normal, leaving Visual, cancelling Search) is gated on. The session then
+/// looked completely dead: the application kept answering keystrokes and the
+/// server kept rendering, but always at the pinned offset, so the output landed
+/// below the viewport and the screen never changed. Ending the scroll here means
+/// it ends whatever the client believes.
+///
+/// The render messages now carry a real `scroll_offset` beside `viewport_top`,
+/// so a current client does see the maximum for what it is and sends the
+/// `ScrollReset` itself -- arriving *before* the `Input` for the same keystroke,
+/// which makes this a no-op on that path. It stays because the field is
+/// `#[serde(default)]`: a client older than it still reads 0 and is still blind,
+/// and this is what unsticks that client's session anyway.
+///
+/// A no-op for a client already at the tail, which is the overwhelmingly common
+/// case -- so this costs one lock and no repaint per keystroke.
+///
+/// Scoped tightly, so it can only ever undo a scroll the same keystroke made
+/// pointless:
+///
+/// * Only the client that typed. Another client scrolled back through the same
+///   session keeps its offset -- `scroll_offset` is per-client and this touches
+///   exactly one entry.
+/// * Only the attached-session viewport. A View cell's scrollback is the
+///   per-(client, pane) `pane_scroll`, which this never reads, so cell input
+///   (`InputToPane`, a different arm entirely) cannot move a scrolled cell.
+/// * Never in an explicit scrollback mode. Visual (remux's copy mode) and Search
+///   are sessions in history that the user drives with keys, and yanking them to
+///   the bottom mid-selection would destroy the selection. Belt and braces
+///   today: `handle_visual_key`/`handle_search_key` return no `SendToPty`, so
+///   neither mode can reach this arm -- but the invariant is what makes the rule
+///   safe, so it is enforced rather than assumed.
+async fn snap_client_to_live_tail(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let session_name = {
+        let mut cls = clients.lock().await;
+        match cls.get_mut(&client_id) {
+            Some(client)
+                if client.scroll_offset != 0
+                    && client.mode != COPY_MODE
+                    && client.mode != SEARCH_MODE =>
+            {
+                log::debug!(
+                    "server: input returns client_id={client_id} to the live tail from offset={}",
+                    client.scroll_offset
+                );
+                client.scroll_offset = 0;
+                client.prev_scroll_offset = 0;
+                // The client's diff baseline is a scrolled frame, so the repaint
+                // below must be a full one.
+                client.needs_full_render = true;
+                client.session_name.clone()
+            }
+            _ => return,
+        }
+    };
+    if let Some(session_name) = session_name {
+        send_full_render_to_client(
+            client_id,
+            &session_name,
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+        )
+        .await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3236,6 +3325,10 @@ async fn route_of_pane(
 /// is attached or displaying a view, so this reads the same for both paths.
 const COPY_MODE: &str = "VISUAL";
 
+/// The scrollback search prompt. Like [`COPY_MODE`] it is an explicit trip into
+/// history, so [`snap_client_to_live_tail`] leaves it alone.
+const SEARCH_MODE: &str = "SEARCH";
+
 /// Whether this client currently has the mouse to itself.
 async fn client_in_copy_mode(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -3320,10 +3413,39 @@ async fn handle_scroll_delta(
     } else {
         0
     };
+    // Everything `max_scrollable` is made of, so a report of "it stops scrolling
+    // too early" can be diagnosed from one log line instead of a round trip.
+    // `max_scrollable` is exactly `scrollback.len()` (grid.len() == rows), so a
+    // small value is always a small scrollback, never a clamp: `alt` tells you
+    // the history is parked and deliberately unreachable, a `region` other than
+    // 0..rows-1 tells you the application suppressed accumulation (only a scroll
+    // region starting at row 0 feeds scrollback), and `evicted` tells you the
+    // limit was hit.
+    let detail = if let Some(fp) = focused_pane_id {
+        let ps = panes.lock().await;
+        ps.get(&fp)
+            .map(|p| {
+                let s = &p.screen;
+                format!(
+                    " pane_id={fp} alt={} sb={} evicted={} grid={} rows={} cols={} region={}..{}",
+                    s.alt_screen_active,
+                    s.scrollback.len(),
+                    s.lines_evicted,
+                    s.grid.len(),
+                    s.rows,
+                    s.cols,
+                    s.scroll_top,
+                    s.scroll_bottom,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let clamped = new_offset.min(max_offset);
     let changed = clamped != old_offset;
     log::debug!(
-        "server: ScrollDelta client_id={client_id} delta={delta} new_offset={clamped} max_scrollable={max_offset}"
+        "server: ScrollDelta client_id={client_id} delta={delta} new_offset={clamped} max_scrollable={max_offset}{detail}"
     );
     {
         let mut cls = clients.lock().await;
@@ -5654,6 +5776,7 @@ async fn send_full_render_to_client(
                 focused_pane_rect: Some(fpr),
                 application_cursor_keys,
                 viewport_top,
+                scroll_offset,
             });
         } else {
             let _ = client.tx.send(ServerMessage::FullRender {
@@ -5665,6 +5788,7 @@ async fn send_full_render_to_client(
                 focused_pane_rect,
                 application_cursor_keys,
                 viewport_top,
+                scroll_offset,
             });
         }
     }
@@ -5810,6 +5934,9 @@ async fn broadcast_full_render(
                         focused_pane_rect,
                         application_cursor_keys,
                         viewport_top,
+                        // Only live-tail clients are targeted here (see the
+                        // `scroll_offset == 0` filter above).
+                        scroll_offset: 0,
                     }
                 } else {
                     log::debug!(
@@ -5826,6 +5953,7 @@ async fn broadcast_full_render(
                         focused_pane_rect,
                         application_cursor_keys,
                         viewport_top,
+                        scroll_offset: 0,
                     }
                 }
             }
@@ -5842,6 +5970,7 @@ async fn broadcast_full_render(
                     focused_pane_rect,
                     application_cursor_keys,
                     viewport_top,
+                    scroll_offset: 0,
                 }
             }
         };
