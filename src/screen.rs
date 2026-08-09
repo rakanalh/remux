@@ -349,13 +349,24 @@ impl Screen {
     /// and re-split at the new width, so text that was hard-wrapped narrow fills
     /// the pane again when it is widened -- and re-wraps when it is narrowed.
     ///
-    /// Two cases deliberately skip reflow:
-    /// * the **alternate screen** -- full-screen apps repaint from scratch on
-    ///   `SIGWINCH`, and rewrapping their private buffer underneath them only
-    ///   races that redraw and produces garbage. tmux, zellij, Alacritty, kitty
-    ///   and WezTerm all skip it too.
-    /// * a **pure vertical resize** -- nothing can rewrap when the width is
-    ///   unchanged, so the cheap block copy is both correct and faster.
+    /// Only the **alternate screen** skips reflow: full-screen apps repaint from
+    /// scratch on `SIGWINCH`, and rewrapping their private buffer underneath
+    /// them only races that redraw and produces garbage. tmux, zellij,
+    /// Alacritty, kitty and WezTerm all skip it too.
+    ///
+    /// A *pure vertical* resize on the primary screen used to skip it as well,
+    /// on the reasoning that nothing can rewrap when the width is unchanged.
+    /// Nothing rewraps -- but the row count still changes, and that is not a
+    /// block copy. [`Screen::resize_clamp`] keeps the **top** `rows` of the grid,
+    /// so shrinking the height *deleted the bottom rows outright*: the cursor,
+    /// the prompt and the newest output, dropped rather than scrolled into
+    /// scrollback. Zooming a full-width pane changes only the height, so a
+    /// `Prefix+f` in and back out silently ate every line that no longer fit and
+    /// left `max_scroll_offset()` frozen -- history that could never be scrolled
+    /// to because it was never recorded. Reflow already re-derives the split
+    /// correctly in both directions (the last `rows` lines are the grid, the
+    /// rest is scrollback), so the primary screen always takes it; with the
+    /// width unchanged the rejoin/re-split is an identity on the wrapping.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         log::debug!(
             "screen: resize old={}x{}, new={}x{}",
@@ -367,7 +378,7 @@ impl Screen {
 
         self.resize_saved_screen(cols, rows);
 
-        if self.alt_screen_active || cols == self.cols {
+        if self.alt_screen_active {
             self.resize_clamp(cols, rows);
         } else {
             self.reflow(cols, rows);
@@ -431,6 +442,7 @@ impl Screen {
         let last_row = rows.saturating_sub(1);
 
         if let Some(saved) = self.saved_grid.take() {
+            let saved = self.spill_saved_rows(saved, rows);
             self.saved_grid = Some(Self::clamp_grid(&saved, self.cols, cols, rows));
         }
 
@@ -444,6 +456,41 @@ impl Screen {
         self.saved_scroll_top = self.saved_scroll_top.min(self.saved_scroll_bottom);
         self.saved_cursor_x = self.saved_cursor_x.min(cols.saturating_sub(1));
         self.saved_cursor_y = self.saved_cursor_y.min(last_row);
+    }
+
+    /// Scroll the rows a shrinking primary snapshot can no longer hold off its
+    /// **top** and into the parked primary scrollback, returning what remains.
+    ///
+    /// [`Screen::clamp_grid`] keeps the top `rows`, so clamping the snapshot on
+    /// its own deleted the *bottom* of the primary screen -- the cursor, the
+    /// prompt and the newest output -- and deleted it silently, without even the
+    /// consolation of it landing in scrollback. That is the same defect
+    /// [`Screen::resize`] no longer has on the live screen, one indirection
+    /// further out: it fires when a pane is resized (a zoom, a split, a client
+    /// attaching at a smaller size) *while a full-screen application is up*, and
+    /// only shows itself much later, when the application exits and hands back a
+    /// primary screen with its last few dozen lines missing.
+    fn spill_saved_rows(&mut self, mut saved: Vec<Row>, rows: u16) -> Vec<Row> {
+        let overflow = saved.len().saturating_sub(rows as usize);
+        if overflow == 0 {
+            return saved;
+        }
+        let limit = self.scrollback_limit;
+        // The two snapshots are taken and released together, so a parked grid
+        // always has a parked scrollback to spill into -- asserted directly by
+        // `the_scrollback_park_is_held_exactly_while_the_alt_screen_is_up`. The
+        // `else` is unreachable defensive cover: without somewhere to put them,
+        // dropping the rows is the only option, as before.
+        if let Some(scrollback) = self.saved_scrollback.as_mut() {
+            scrollback.extend(saved.drain(..overflow));
+            while scrollback.len() > limit {
+                scrollback.pop_front();
+                self.lines_evicted += 1;
+            }
+        } else {
+            saved.drain(..overflow);
+        }
+        saved
     }
 
     /// Feed raw terminal output bytes through the VTE parser, updating the
@@ -3098,6 +3145,265 @@ mod tests {
                 "row {row} must resolve to a real line"
             );
         }
+    }
+
+    /// Every addressable line, oldest first, as trimmed text.
+    fn all_lines(s: &Screen) -> Vec<String> {
+        (0..s.total_lines())
+            .filter_map(|i| s.line_at(i))
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vertical_resize_scrolls_off_the_top_instead_of_deleting_the_bottom() {
+        // Zooming a pane that already spans the full width changes only the
+        // height, which used to take the clamp path. `clamp_grid` keeps the TOP
+        // `rows`, so unzooming deleted every line that no longer fit -- cursor,
+        // prompt and newest output first -- and deleted it outright: the lines
+        // never reached scrollback, so nothing could ever scroll back to them.
+        let mut s = Screen::new(80, 24, 2000);
+        for i in 0..39 {
+            s.process_output(format!("early {i}\r\n").as_bytes());
+        }
+        s.resize(80, 45); // zoom (height only)
+        for i in 0..30 {
+            s.process_output(format!("zoomed {i}\r\n").as_bytes());
+        }
+        let total_before = s.total_lines();
+        s.resize(80, 24); // unzoom (height only)
+
+        assert_eq!(
+            s.total_lines(),
+            total_before,
+            "a height change may move lines between grid and scrollback, never drop them"
+        );
+        let lines = all_lines(&s);
+        for i in 0..30 {
+            let want = format!("zoomed {i}");
+            assert!(
+                lines.contains(&want),
+                "{want:?} was deleted by the unzoom; kept {lines:?}"
+            );
+        }
+        assert!(lines.contains(&"early 0".to_string()), "history intact too");
+        // The newest line is still ON the screen, not scrolled past it.
+        assert!(
+            all_lines(&s)[s.scrollback.len()..].contains(&"zoomed 29".to_string()),
+            "the bottom of the screen must survive the shrink"
+        );
+    }
+
+    #[test]
+    fn zoom_cycles_keep_growing_the_scrollback() {
+        // The user-visible shape of the bug: `max_scroll_offset()` frozen while
+        // real output streams past, so the wheel and Visual mode both stop at
+        // the same stale line no matter how much has since been printed.
+        let mut s = Screen::new(80, 24, 5000);
+        for i in 0..39 {
+            s.process_output(format!("early {i}\r\n").as_bytes());
+        }
+        for cycle in 0..3 {
+            let before = s.max_scroll_offset();
+            s.resize(80, 45);
+            for i in 0..30 {
+                s.process_output(format!("cycle {cycle} line {i}\r\n").as_bytes());
+            }
+            s.resize(80, 24);
+            // 30 lines printed at the same height means 30 more reachable lines.
+            // The clamp path let the zoom absorb most of them, so the wheel kept
+            // stopping at very nearly the line it stopped at last time.
+            assert_eq!(
+                s.max_scroll_offset(),
+                before + 30,
+                "cycle {cycle}: 30 lines of output must add 30 scrollable lines"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_while_alt_active_keeps_the_primary_screens_bottom_rows() {
+        // A pane resized while a full-screen application is up (zoom, split, a
+        // client attaching smaller) shrinks the parked primary snapshot too.
+        // Clamping it kept the top rows, so the application's exit handed back a
+        // primary screen missing its last few dozen lines -- including the shell
+        // prompt the user was looking at before they started the app.
+        let mut s = Screen::new(80, 40, 2000);
+        for i in 0..100 {
+            s.process_output(format!("primary {i}\r\n").as_bytes());
+        }
+        let total_before = s.total_lines();
+
+        s.process_output(b"\x1b[?1049h");
+        s.resize(80, 10); // unzoom while the app is up
+        s.process_output(b"\x1b[?1049l");
+
+        assert_eq!(
+            s.total_lines(),
+            total_before,
+            "the round trip must not consume primary lines"
+        );
+        let lines = all_lines(&s);
+        for i in 0..100 {
+            let want = format!("primary {i}");
+            assert!(
+                lines.contains(&want),
+                "{want:?} lost to the alt-active resize"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_screen_round_trip_survives_a_resize() {
+        // The round trip plus a resize in the middle -- the combination the
+        // plain round-trip test above deliberately leaves out.
+        for (cols, rows) in [(200u16, 50u16), (40, 12), (80, 50), (200, 24)] {
+            let mut s = Screen::new(80, 24, 2000);
+            for i in 0..200 {
+                s.process_output(format!("history {i:03}\r\n").as_bytes());
+            }
+            assert!(s.max_scroll_offset() > 0);
+
+            s.process_output(b"\x1b[?1049h");
+            assert_eq!(s.max_scroll_offset(), 0, "the alt screen is historyless");
+            for i in 0..80 {
+                s.process_output(format!("alt {i}\r\n").as_bytes());
+            }
+            s.resize(cols, rows);
+            s.process_output(b"\x1b[?1049l");
+
+            // The row count decides how the same content is split between grid
+            // and scrollback, so `max_scroll_offset()` legitimately moves. What
+            // may not move is the content: every line still addressable.
+            let lines = all_lines(&s);
+            for i in 0..200 {
+                let want = format!("history {i:03}");
+                assert!(
+                    lines.contains(&want),
+                    "{want:?} lost to a {cols}x{rows} resize while alt-active"
+                );
+            }
+            assert!(
+                !lines.iter().any(|l| l.starts_with("alt ")),
+                "the alt screen's own output must never enter the primary history"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_history_survives_a_width_change_while_alt_active() {
+        // Lines long enough to wrap, so the rejoin/re-split actually has work to
+        // do when the pane comes back to its original width.
+        let mut s = Screen::new(80, 24, 4000);
+        for i in 0..200 {
+            s.process_output(format!("line{i:03} {}\r\n", "x".repeat(150)).as_bytes());
+        }
+        let max_before = s.max_scroll_offset();
+
+        s.process_output(b"\x1b[?1049h");
+        s.resize(200, 50);
+        s.process_output(b"\x1b[?1049l");
+        s.resize(80, 24);
+
+        assert_eq!(
+            s.max_scroll_offset(),
+            max_before,
+            "a width round trip must land back on the same rewrap"
+        );
+        assert!(all_lines(&s)[0].starts_with("line000 "));
+    }
+
+    #[test]
+    fn an_app_killed_on_the_alt_screen_does_not_take_the_history_with_it() {
+        // No `1049l` ever arrives. The primary history is parked, not lost: the
+        // alt screen's own output must not reach it, and the next clean leave --
+        // a later application exiting normally -- must hand it back whole.
+        let mut s = Screen::new(80, 24, 2000);
+        for i in 0..200 {
+            s.process_output(format!("history {i:03}\r\n").as_bytes());
+        }
+        let max_before = s.max_scroll_offset();
+
+        s.process_output(b"\x1b[?1049h");
+        for i in 0..500 {
+            s.process_output(format!("output after the app died {i}\r\n").as_bytes());
+        }
+        assert_eq!(
+            s.max_scroll_offset(),
+            0,
+            "still believed to be on the alt screen, so still historyless"
+        );
+
+        // A later application starts (a no-op enter) and exits cleanly.
+        s.process_output(b"\x1b[?1049h");
+        s.process_output(b"\x1b[?1049l");
+        assert_eq!(
+            s.max_scroll_offset(),
+            max_before,
+            "the parked history comes back whole, never a truncated or empty one"
+        );
+        let lines = all_lines(&s);
+        assert!(lines.contains(&"history 000".to_string()));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("output after the app died")),
+            "alt-screen output must not have leaked into the primary history"
+        );
+    }
+
+    #[test]
+    fn the_scrollback_park_is_held_exactly_while_the_alt_screen_is_up() {
+        // The park and `alt_screen_active` must agree after ANY sequence of
+        // enters and leaves, balanced or not: a park held while the primary
+        // screen is live would freeze history, and a released one while the alt
+        // screen is up would let an application's redraws into it.
+        let mut s = Screen::new(80, 24, 2000);
+        for i in 0..100 {
+            s.process_output(format!("history {i:03}\r\n").as_bytes());
+        }
+        for seq in [
+            &b"\x1b[?1049h"[..],
+            &b"\x1b[?1049h"[..],
+            &b"\x1b[?1047h"[..],
+            &b"\x1b[?1047l"[..],
+            &b"\x1b[?1049l"[..],
+            &b"\x1b[?1047h"[..],
+            &b"\x1b[?1049l"[..],
+            &b"\x1b[?1047l"[..],
+        ] {
+            s.process_output(seq);
+            assert_eq!(
+                s.saved_scrollback.is_some(),
+                s.alt_screen_active,
+                "park and alt flag disagree after {:?}",
+                String::from_utf8_lossy(seq)
+            );
+            // The two snapshots are held and released together. `spill_saved_rows`
+            // branches on `saved_grid` but spills into `saved_scrollback`, so a
+            // grid parked without a scrollback to spill into would silently drop
+            // the rows it displaces -- the very defect this file is about.
+            assert_eq!(
+                s.saved_grid.is_some(),
+                s.saved_scrollback.is_some(),
+                "the grid and scrollback snapshots disagree after {:?}",
+                String::from_utf8_lossy(seq)
+            );
+            assert_eq!(
+                s.total_lines(),
+                s.scrollback.len() + s.grid.len(),
+                "total_lines must stay consistent after {:?}",
+                String::from_utf8_lossy(seq)
+            );
+        }
+        assert!(all_lines(&s).contains(&"history 000".to_string()));
     }
 
     #[test]
