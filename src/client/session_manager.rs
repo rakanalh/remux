@@ -305,6 +305,12 @@ pub struct SessionManagerState {
     /// The sub-modes are only ever entered by a binding or a hardcoded key, and
     /// neither can fire while focus is on the search bar.
     pub search_focused: bool,
+    /// Direct hits from the most recent [`SessionManagerState::rebuild_rows`]
+    /// (see [`Filter::hits`]); empty when no query is active. Refreshed on every
+    /// rebuild and read only by [`SessionManagerState::on_query_changed`] to
+    /// place the selection -- it is derived state, never user-visible, and must
+    /// not leak into `expanded`.
+    filter_hits: HashSet<String>,
 }
 
 /// A per-rebuild view of what the current query allows to render.
@@ -322,6 +328,12 @@ struct Filter {
     /// beneath them are reachable. Only ever the *ancestors* of a match -- a
     /// matching node's own subtree stays governed by `expanded`.
     force_expand: HashSet<String>,
+    /// Keys of the nodes whose OWN name matched the query -- the *direct hits*,
+    /// as opposed to the rows that only render because an ancestor or a
+    /// descendant matched. This is what the selection must land on: the first
+    /// visible row is typically an ancestor (a server, then a folder), and
+    /// activating an ancestor is not what the user typed.
+    hits: HashSet<String>,
 }
 
 /// Whether `filter` permits the node with `key` to render. No filter (an empty
@@ -504,6 +516,7 @@ impl SessionManagerState {
             // The overlay opens with the search bar focused so the user can
             // just start typing; Tab/Down/Enter hands focus to the tree.
             search_focused: true,
+            filter_hits: HashSet::new(),
         }
     }
 
@@ -536,22 +549,32 @@ impl SessionManagerState {
     /// meaningless against a new result set, so it is re-placed against the
     /// rows the filter just produced.
     ///
-    /// Row 0 is always a `Server` row -- servers render regardless of the query
-    /// -- so parking the selection there would put Enter on "toggle the server's
-    /// expansion" rather than on what the user typed. With a query active the
-    /// selection therefore lands on the first non-server row, falling back to
-    /// the top when the query matched nothing. An empty query means no filtering
-    /// at all, so it keeps the plain "back to the top" behaviour.
+    /// The filtered tree shows a match's whole ancestor chain, so the topmost
+    /// rows are ancestors: always a `Server` row (servers render regardless of
+    /// the query), then usually the enclosing folder. Activating an ancestor
+    /// only toggles its expansion -- not what the user typed. The selection
+    /// therefore lands on the first *direct hit* (a row whose own name matched,
+    /// per [`Filter::hits`]).
+    ///
+    /// Two fallbacks, for rows that are visible without being hits: the first
+    /// non-server row, then the top. An empty query means no filtering at all,
+    /// so it keeps the plain "back to the top" behaviour.
     fn on_query_changed(&mut self) {
         self.rebuild_rows();
-        self.selected = if self.query.is_empty() {
+        let next = if self.query.is_empty() {
             0
         } else {
             self.rows
                 .iter()
-                .position(|r| !matches!(r.node_type, NodeType::Server { .. }))
+                .position(|r| self.filter_hits.contains(&self.row_key(r)))
+                .or_else(|| {
+                    self.rows
+                        .iter()
+                        .position(|r| !matches!(r.node_type, NodeType::Server { .. }))
+                })
                 .unwrap_or(0)
         };
+        self.selected = next;
     }
 
     /// Move focus to the search bar. Any half-typed chord prefix is dropped so
@@ -734,6 +757,9 @@ impl SessionManagerState {
                             child_hit = true;
                         }
                     }
+                    if folder_hit {
+                        f.hits.insert(fkey.clone());
+                    }
                     if folder_hit || child_hit {
                         f.visible.insert(fkey.clone());
                         f.force_expand.insert(skey.clone());
@@ -750,7 +776,9 @@ impl SessionManagerState {
                 let mut any_dormant = false;
                 for name in &self.dormant {
                     if hit(name) {
-                        f.visible.insert(dormant_key(id, name));
+                        let dkey = dormant_key(id, name);
+                        f.visible.insert(dkey.clone());
+                        f.hits.insert(dkey);
                         any_dormant = true;
                     }
                 }
@@ -789,8 +817,15 @@ impl SessionManagerState {
                 pane_hit |= this_pane_hit;
                 // A pane renders when it matches or when anything above it did.
                 if this_pane_hit || tab_hit || session_hit || ancestor_hit {
-                    f.visible.insert(pane_key(server, &session.name, pane.id));
+                    let pkey = pane_key(server, &session.name, pane.id);
+                    if this_pane_hit {
+                        f.hits.insert(pkey.clone());
+                    }
+                    f.visible.insert(pkey);
                 }
+            }
+            if tab_hit {
+                f.hits.insert(tkey.clone());
             }
             if tab_hit || pane_hit || session_hit || ancestor_hit {
                 f.visible.insert(tkey.clone());
@@ -806,6 +841,9 @@ impl SessionManagerState {
             }
         }
 
+        if session_hit {
+            f.hits.insert(skey.clone());
+        }
         if session_hit || child_hit || ancestor_hit {
             f.visible.insert(skey.clone());
         }
@@ -920,6 +958,10 @@ impl SessionManagerState {
         }
 
         self.rows = rows;
+        // Unconditionally refreshed: `rebuild_rows` also runs for expand /
+        // collapse / tree updates, and leaving a previous query's hits behind
+        // would let a stale set outlive the query that produced it.
+        self.filter_hits = filter.map(|f| f.hits.clone()).unwrap_or_default();
         // Clamp selection.
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
@@ -1074,6 +1116,26 @@ impl SessionManagerState {
             NodeType::SavedGroup { server } => saved_key(server),
             // Panes and dormant sessions don't expand.
             NodeType::Pane { .. } | NodeType::DormantSession { .. } => String::new(),
+        }
+    }
+
+    /// The filter key of a row, for hit-testing against [`Filter::hits`].
+    ///
+    /// Distinct from [`SessionManagerState::node_key`], which deliberately
+    /// returns an empty string for panes and dormant sessions because they have
+    /// no expansion state. Search matching has no such exemption -- either can
+    /// be the thing the user typed -- so those two get their real filter keys
+    /// here and everything else defers to `node_key`.
+    fn row_key(&self, row: &TreeRow) -> String {
+        match &row.node_type {
+            NodeType::Pane {
+                server,
+                session,
+                pane_id,
+                ..
+            } => pane_key(server, session, *pane_id),
+            NodeType::DormantSession { server, name } => dormant_key(server, name),
+            other => self.node_key(other),
         }
     }
 
@@ -3362,6 +3424,9 @@ mod tests {
                 "dormant:saved-one".to_string(),
             ],
         );
+        // The "Saved (resurrect)" header is an ancestor, not the match: the
+        // selection belongs on the dormant session itself.
+        assert_eq!(row_labels(&state)[state.selected], "dormant:saved-one");
     }
 
     #[test]
@@ -3399,9 +3464,58 @@ mod tests {
         state.selected = 3;
         type_query(&mut state, "a");
         // The stale index is gone, and the selection is NOT parked on the server
-        // row at 0 -- here it is the folder holding the topmost match.
+        // row at 0 -- nor on `folder:clients`, which only renders because a
+        // session beneath it matched. `alpha` is the topmost direct hit.
         assert_ne!(state.selected, 3);
-        assert_eq!(row_labels(&state)[state.selected], "folder:clients");
+        assert_eq!(row_labels(&state)[state.selected], "session:alpha");
+    }
+
+    #[test]
+    fn search_selection_lands_on_a_foldered_session_not_its_folder() {
+        let mut state = search_state(Vec::new());
+        // `alpha` lives inside the `clients` folder, so the filtered tree is
+        // server > folder > session: the first non-server row is the FOLDER, and
+        // Enter there would merely toggle it open.
+        type_query(&mut state, "alpha");
+        let labels = row_labels(&state);
+        assert_eq!(labels[1], "folder:clients", "the ancestor folder must show");
+        assert_eq!(
+            labels[state.selected], "session:alpha",
+            "the selection landed on an ancestor instead of the direct hit"
+        );
+        assert!(matches!(
+            state.handle_enter(),
+            SessionManagerAction::SwitchSession { server: ConnId::Local, session }
+                if session == "alpha"
+        ));
+    }
+
+    #[test]
+    fn search_selection_lands_on_a_tab_not_its_ancestors() {
+        let mut state = search_state(Vec::new());
+        // Two ancestor rows sit above this match, and neither is what was typed.
+        type_query(&mut state, "editor");
+        let labels = row_labels(&state);
+        assert_eq!(
+            labels,
+            vec![
+                "server:local".to_string(),
+                "folder:clients".to_string(),
+                "session:alpha".to_string(),
+                "tab:editor".to_string(),
+            ],
+            "the ancestors must still be visible above the match"
+        );
+        assert_eq!(labels[state.selected], "tab:editor");
+    }
+
+    #[test]
+    fn search_selection_lands_on_a_matching_folder() {
+        let mut state = search_state(Vec::new());
+        // A folder is a legitimate direct hit: nothing beneath `personal`
+        // matches, so the folder row itself is what the user searched for.
+        type_query(&mut state, "personal");
+        assert_eq!(row_labels(&state)[state.selected], "folder:personal");
     }
 
     #[test]

@@ -4857,14 +4857,15 @@ mod tests {
         for c in "alpha".chars() {
             let _ = handler.handle_session_manager_key(char_key(c));
         }
+        // Down only hands focus to the tree; the query already placed the
+        // selection on `alpha` itself (the direct hit), not on its folder.
         let _ = handler.handle_session_manager_key(make_key(KeyCode::Down, KeyModifiers::NONE));
-        // server row -> folder -> session
-        let _ = handler.handle_session_manager_key(char_key('j'));
-        let _ = handler.handle_session_manager_key(char_key('j'));
         let _ = handler.handle_session_manager_key(char_key('d'));
         let sm = handler.session_manager.as_ref().unwrap();
+        // Named exactly: `contains("alpha")` also passes for "tab 0 in 'alpha'",
+        // which is what the old two-`j` navigation was actually landing on.
         assert!(
-            matches!(&sm.sub_mode, SubMode::ConfirmDelete(d) if d.contains("alpha")),
+            matches!(&sm.sub_mode, SubMode::ConfirmDelete(d) if d == "session 'alpha'"),
             "expected the delete confirm for the filtered session, got {:?}",
             sm.sub_mode
         );

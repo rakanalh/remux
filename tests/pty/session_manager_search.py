@@ -25,7 +25,10 @@ Asserted here:
      back.
   7. A query matching a SESSION puts the selection ON that session, not on the
      always-visible `local` server row -- Tab then Enter switches to it.
-  8. The client is still alive and the log has no panic.
+  8. A query matching a session INSIDE A FOLDER selects the session, not the
+     folder that is only visible as its ancestor -- Enter switches rather than
+     toggling the folder open.
+  9. The client is still alive and the log has no panic.
 
 Run from the repo root:  python3 tests/pty/session_manager_search.py
 """
@@ -241,7 +244,46 @@ def main():
         if len(fails) == before:
             print(f"7. OK: a query matching {OTHER!r} selects it; Enter switches to it")
 
-        # --- 8. still alive, no panic ----------------------------------------
+        # --- 8. a match inside a FOLDER selects the session, not the folder ---
+        # The residual of check 7's bug, one level down: "first non-server row"
+        # is the FOLDER whenever the match is foldered (ancestors always render),
+        # and Enter on a folder just toggles it open. SESSION lives inside
+        # FOLDER, so this is the case that must select the session itself.
+        before = len(fails)
+        t.prefix(b"xm", 1.2)
+        t.pump(0.8)
+        if not t.has("Session Manager"):
+            fail("the manager did not reopen for the foldered-match check",
+                 "8: manager did not reopen")
+        else:
+            t.send(b"\x15", 0.8)       # a reopened manager starts empty; be sure
+            status_before = t.rows_text()[-1]
+            if SESSION in status_before:
+                fail(f"precondition: already attached to {SESSION!r} "
+                     f"(status {status_before.rstrip()!r})", "8: bad precondition")
+            t.send(SESSION.encode(), 1.2)
+            if not t.has(FOLDER):
+                fail(f"the match's folder {FOLDER!r} is not shown -- the fixture "
+                     "is not exercising the foldered case", "8: folder missing")
+            t.send(b"\t", 0.8)         # hand focus to the tree
+            t.send(b"\r", 1.5)         # activate whatever the selection is on
+            if t.has("Session Manager"):
+                fail("Enter did not activate the match -- the manager is still "
+                     f"open, so the selection was sitting on the {FOLDER!r} "
+                     "folder row and Enter just toggled its expansion",
+                     "8: manager still open")
+            status_after = t.rows_text()[-1]
+            if SESSION not in status_after:
+                fail(f"the client did not switch to the matched session {SESSION!r} "
+                     f"(status bar {status_after.rstrip()!r})", "8: no switch")
+            if not t.alive():
+                fail("the client died activating the foldered search match",
+                     "8: client dead")
+        if len(fails) == before:
+            print(f"8. OK: a query matching foldered {SESSION!r} selects the "
+                  f"session, not {FOLDER!r}; Enter switches to it")
+
+        # --- 9. still alive, no panic ----------------------------------------
         if not t.alive():
             fails.append("the client is not alive at the end")
         logs = (t.log("client") + t.log("server")).lower()
