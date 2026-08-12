@@ -20,6 +20,8 @@ t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
 
 # Open session manager (Ctrl-a x m).
 t.prefix(b"xm", 0.7)
+# The manager opens with its search bar focused; Tab hands focus to the tree.
+t.send(b"\t", 0.3)
 t.dump("session manager")
 
 # Expand current session/tab if needed with 'l', then mark panes.

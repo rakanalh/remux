@@ -63,6 +63,8 @@ def make_two_panes(t):
 
 def compose_view(t):
     t.prefix(b"xm", 0.8)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)
     t.send("j", 0.2); t.send(" ", 0.3)
     t.send("j", 0.2); t.send(" ", 0.3)

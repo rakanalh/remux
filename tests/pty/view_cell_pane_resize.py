@@ -107,6 +107,8 @@ def two_stacked_panes(t):
 def compose_view(t):
     """Mark both panes in the session manager and alias them into a new view."""
     t.prefix(b"xm", 0.8)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)   # expand Tab 1
     t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 1 (top)
     t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 2 (bottom)

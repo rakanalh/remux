@@ -253,8 +253,8 @@ def grep_client_log(needle):
 
 def sm_open(c):
     c.prefix(b"xm", 1.0)
-
-
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    c.send(b"\t", 0.3)
 def sm_goto_row(c, needle, max_steps=25):
     """Move the overlay cursor down (`j`) until the highlighted row matches
     `needle`. Works for the session manager and the switcher alike."""

@@ -40,6 +40,8 @@ def main():
 
     # Build a 1-cell view over this pane.
     t.prefix(b"xm", 0.7)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1
     t.send("j", 0.2); t.send(" ", 0.3)                    # mark the pane
     t.send("v", 0.2); t.send("a", 0.5)                    # AddToView

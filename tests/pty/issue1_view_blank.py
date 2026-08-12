@@ -20,6 +20,8 @@ def make_view(t):
     # content; this harness asserts live content, so the panes must be backgrounded.
     t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
     t.prefix(b"xm", 0.7)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1
     t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 1
     t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 2

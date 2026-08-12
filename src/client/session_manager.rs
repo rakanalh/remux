@@ -288,6 +288,46 @@ pub struct SessionManagerState {
     /// not stable across tree refreshes). Insertion order is preserved so the
     /// resulting view cell order is deterministic; inserts dedupe.
     marked: Vec<(ConnId, u64)>,
+    /// The search bar's text. Filters the tree to matching nodes plus their
+    /// ancestor chain (see [`SessionManagerState::compute_filter`]). Empty means
+    /// "no filtering" -- the tree renders exactly as it did before the search
+    /// bar existed.
+    ///
+    /// Deliberately a plain field rather than a [`SubMode`] variant: `sub_mode`
+    /// holds a single value, and the query must survive while a
+    /// delete/create/move/rename sub-mode is active (otherwise deleting a
+    /// filtered session would wipe the query out from under the user).
+    pub query: String,
+    /// Whether keystrokes are typed into the search bar rather than routed to
+    /// the tree.
+    ///
+    /// Invariant: `search_focused == true` implies `sub_mode == SubMode::Navigate`.
+    /// The sub-modes are only ever entered by a binding or a hardcoded key, and
+    /// neither can fire while focus is on the search bar.
+    pub search_focused: bool,
+}
+
+/// A per-rebuild view of what the current query allows to render.
+///
+/// Computed fresh on every [`SessionManagerState::rebuild_rows`] and thrown
+/// away afterwards. `force_expand` deliberately does NOT touch
+/// `SessionManagerState::expanded`: auto-expanding a match path must not
+/// permanently rewrite the user's expansion state, or clearing the query would
+/// leave the tree splayed open.
+#[derive(Debug, Default)]
+struct Filter {
+    /// Keys of the nodes the query permits to render.
+    visible: HashSet<String>,
+    /// Keys of the nodes that must be treated as expanded so matches nested
+    /// beneath them are reachable. Only ever the *ancestors* of a match -- a
+    /// matching node's own subtree stays governed by `expanded`.
+    force_expand: HashSet<String>,
+}
+
+/// Whether `filter` permits the node with `key` to render. No filter (an empty
+/// query) permits everything.
+fn filter_allows(filter: Option<&Filter>, key: &str) -> bool {
+    filter.is_none_or(|f| f.visible.contains(key))
 }
 
 /// Pad or truncate a string to exactly `target_width` display columns,
@@ -421,6 +461,18 @@ fn saved_key(server: &ConnId) -> String {
     format!("saved:{}", server.key())
 }
 
+/// Filter key for a pane node. Panes never expand, so this key only ever
+/// appears in [`Filter::visible`].
+fn pane_key(server: &ConnId, session: &str, pane_id: u64) -> String {
+    format!("pane:{}:{}:{}", server.key(), session, pane_id)
+}
+
+/// Filter key for a dormant (saved) session row. Dormant sessions never expand,
+/// so this key only ever appears in [`Filter::visible`].
+fn dormant_key(server: &ConnId, name: &str) -> String {
+    format!("dormant:{}:{}", server.key(), name)
+}
+
 impl SessionManagerState {
     /// Create a new session manager state (initially just a local server node,
     /// expanded so local sessions show immediately as before).
@@ -448,7 +500,55 @@ impl SessionManagerState {
             bindings: SessionManagerBindings::default(),
             pending_chord: None,
             marked: Vec::new(),
+            query: String::new(),
+            // The overlay opens with the search bar focused so the user can
+            // just start typing; Tab/Down/Enter hands focus to the tree.
+            search_focused: true,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------------
+
+    /// Append a char to the search query and refilter.
+    pub fn push_query_char(&mut self, c: char) {
+        self.query.push(c);
+        self.on_query_changed();
+    }
+
+    /// Remove the last char of the search query and refilter.
+    pub fn pop_query_char(&mut self) {
+        self.query.pop();
+        self.on_query_changed();
+    }
+
+    /// Clear the search query and refilter (Ctrl-U).
+    pub fn clear_query(&mut self) {
+        if self.query.is_empty() {
+            return;
+        }
+        self.query.clear();
+        self.on_query_changed();
+    }
+
+    /// Re-filter after the query changed. The previous selection index is
+    /// meaningless against a new result set, so it resets to the top.
+    fn on_query_changed(&mut self) {
+        self.selected = 0;
+        self.rebuild_rows();
+    }
+
+    /// Move focus to the search bar. Any half-typed chord prefix is dropped so
+    /// it cannot lurk and complete after the user comes back to the tree.
+    pub fn focus_search(&mut self) {
+        self.search_focused = true;
+        self.pending_chord = None;
+    }
+
+    /// Move focus to the tree (Tab / Down / Enter from the search bar).
+    pub fn focus_tree(&mut self) {
+        self.search_focused = false;
     }
 
     /// Toggle the mark on the selected row when it is a pane. Marks are keyed by
@@ -578,13 +678,143 @@ impl SessionManagerState {
         self.rebuild_rows();
     }
 
+    /// Compute the visibility / auto-expansion sets implied by the current
+    /// query, or `None` when the query is empty (no filtering at all).
+    ///
+    /// A node is visible when it matches, when any descendant matches, or when
+    /// any ancestor matches -- so a hit on a tab name drags its session and
+    /// folder into view, and a hit on a session name keeps that session's tabs
+    /// and panes browsable. Matching is a case-insensitive substring test
+    /// against the *entity* name, not the decorated `display_name` (which
+    /// carries client-count suffixes, the dormant `💤` prefix and the focused
+    /// pane's `*`).
+    ///
+    /// Server rows are always visible: the roster is tiny, and hiding an
+    /// offline remote would remove the only affordance to connect it.
+    fn compute_filter(&self) -> Option<Filter> {
+        if self.query.is_empty() {
+            return None;
+        }
+        let needle = self.query.to_lowercase();
+        let hit = |name: &str| name.to_lowercase().contains(&needle);
+
+        let mut f = Filter::default();
+        for (id, _, _, _) in &self.roster {
+            let skey = server_key(id);
+            f.visible.insert(skey.clone());
+
+            if let Some((folders, unfiled)) = self.trees.get(id) {
+                // Unfiled sessions hang directly off the server node.
+                for session in unfiled {
+                    if self.filter_session(&mut f, id, session, false, &hit) {
+                        f.force_expand.insert(skey.clone());
+                    }
+                }
+                for folder in folders {
+                    let fkey = folder_key(id, &folder.name);
+                    let folder_hit = hit(&folder.name);
+                    let mut child_hit = false;
+                    for session in &folder.sessions {
+                        if self.filter_session(&mut f, id, session, folder_hit, &hit) {
+                            child_hit = true;
+                        }
+                    }
+                    if folder_hit || child_hit {
+                        f.visible.insert(fkey.clone());
+                        f.force_expand.insert(skey.clone());
+                    }
+                    if child_hit {
+                        f.force_expand.insert(fkey);
+                    }
+                }
+            }
+
+            // The "Saved (resurrect)" group is Local-only; it shows when any
+            // dormant session name matches.
+            if *id == ConnId::Local {
+                let mut any_dormant = false;
+                for name in &self.dormant {
+                    if hit(name) {
+                        f.visible.insert(dormant_key(id, name));
+                        any_dormant = true;
+                    }
+                }
+                if any_dormant {
+                    f.visible.insert(saved_key(id));
+                    f.force_expand.insert(saved_key(id));
+                    f.force_expand.insert(skey);
+                }
+            }
+        }
+        Some(f)
+    }
+
+    /// Filter one session subtree into `f`. `ancestor_hit` is true when an
+    /// enclosing folder already matched (which makes the whole subtree visible).
+    /// Returns whether this session or anything beneath it matched -- the caller
+    /// uses that to decide whether to force-expand the session's parent.
+    fn filter_session(
+        &self,
+        f: &mut Filter,
+        server: &ConnId,
+        session: &SessionTreeEntry,
+        ancestor_hit: bool,
+        hit: &impl Fn(&str) -> bool,
+    ) -> bool {
+        let skey = session_key(server, &session.name);
+        let session_hit = hit(&session.name);
+        let mut child_hit = false;
+
+        for (tab_idx, tab) in session.tabs.iter().enumerate() {
+            let tkey = tab_key(server, &session.name, tab_idx);
+            let tab_hit = hit(&tab.name);
+            let mut pane_hit = false;
+            for pane in &tab.panes {
+                let this_pane_hit = hit(&pane.name);
+                pane_hit |= this_pane_hit;
+                // A pane renders when it matches or when anything above it did.
+                if this_pane_hit || tab_hit || session_hit || ancestor_hit {
+                    f.visible.insert(pane_key(server, &session.name, pane.id));
+                }
+            }
+            if tab_hit || pane_hit || session_hit || ancestor_hit {
+                f.visible.insert(tkey.clone());
+            }
+            if pane_hit {
+                // Only a match *below* the tab forces it open; a tab that
+                // merely matched keeps its own panes under `expanded`.
+                f.force_expand.insert(tkey);
+                child_hit = true;
+            }
+            if tab_hit {
+                child_hit = true;
+            }
+        }
+
+        if session_hit || child_hit || ancestor_hit {
+            f.visible.insert(skey.clone());
+        }
+        if child_hit {
+            f.force_expand.insert(skey);
+        }
+        session_hit || child_hit
+    }
+
+    /// Whether `key` renders as expanded: either the user expanded it, or the
+    /// active filter is holding it open so a match beneath it is reachable.
+    fn is_expanded(&self, key: &str, filter: Option<&Filter>) -> bool {
+        self.expanded.contains(key) || filter.is_some_and(|f| f.force_expand.contains(key))
+    }
+
     /// Rebuild the flat row list from the roster + per-server tree data.
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
+        let filter = self.compute_filter();
+        let filter = filter.as_ref();
 
         for (id, label, state, mismatch) in &self.roster {
             let skey = server_key(id);
-            let server_expanded = self.expanded.contains(&skey);
+            let server_expanded = self.is_expanded(&skey, filter);
             let connected = matches!(state, RemoteState::Connected);
             let mut suffix = match state {
                 RemoteState::Connected => String::new(),
@@ -613,7 +843,10 @@ impl SessionManagerState {
                 if let Some((folders, unfiled)) = self.trees.get(id) {
                     for folder in folders {
                         let fkey = folder_key(id, &folder.name);
-                        let folder_expanded = self.expanded.contains(&fkey);
+                        if !filter_allows(filter, &fkey) {
+                            continue;
+                        }
+                        let folder_expanded = self.is_expanded(&fkey, filter);
                         rows.push(TreeRow {
                             indent: 1,
                             node_type: NodeType::Folder {
@@ -627,21 +860,22 @@ impl SessionManagerState {
 
                         if folder_expanded {
                             for session in &folder.sessions {
-                                self.add_session_rows(&mut rows, id, session, 2);
+                                self.add_session_rows(&mut rows, id, session, 2, filter);
                             }
                         }
                     }
 
                     for session in unfiled {
-                        self.add_session_rows(&mut rows, id, session, 1);
+                        self.add_session_rows(&mut rows, id, session, 1, filter);
                     }
                 }
 
                 // Render the "Saved (resurrect)" group at the bottom of the
                 // Local server's children. Dormant sessions are Local-only.
-                if *id == ConnId::Local && !self.dormant.is_empty() {
-                    let gkey = saved_key(id);
-                    let group_expanded = self.expanded.contains(&gkey);
+                let gkey = saved_key(id);
+                if *id == ConnId::Local && !self.dormant.is_empty() && filter_allows(filter, &gkey)
+                {
+                    let group_expanded = self.is_expanded(&gkey, filter);
                     rows.push(TreeRow {
                         indent: 1,
                         node_type: NodeType::SavedGroup { server: id.clone() },
@@ -651,6 +885,9 @@ impl SessionManagerState {
                     });
                     if group_expanded {
                         for name in &self.dormant {
+                            if !filter_allows(filter, &dormant_key(id, name)) {
+                                continue;
+                            }
                             rows.push(TreeRow {
                                 indent: 2,
                                 node_type: NodeType::DormantSession {
@@ -680,9 +917,13 @@ impl SessionManagerState {
         server: &ConnId,
         session: &SessionTreeEntry,
         indent: usize,
+        filter: Option<&Filter>,
     ) {
         let skey = session_key(server, &session.name);
-        let session_expanded = self.expanded.contains(&skey);
+        if !filter_allows(filter, &skey) {
+            return;
+        }
+        let session_expanded = self.is_expanded(&skey, filter);
         let client_suffix = if session.client_count > 0 {
             format!(" ({})", session.client_count)
         } else {
@@ -704,7 +945,10 @@ impl SessionManagerState {
         if session_expanded {
             for (tab_idx, tab) in session.tabs.iter().enumerate() {
                 let tkey = tab_key(server, &session.name, tab_idx);
-                let tab_expanded = self.expanded.contains(&tkey);
+                if !filter_allows(filter, &tkey) {
+                    continue;
+                }
+                let tab_expanded = self.is_expanded(&tkey, filter);
                 rows.push(TreeRow {
                     indent: indent + 1,
                     node_type: NodeType::Tab {
@@ -719,6 +963,9 @@ impl SessionManagerState {
 
                 if tab_expanded {
                     for pane in &tab.panes {
+                        if !filter_allows(filter, &pane_key(server, &session.name, pane.id)) {
+                            continue;
+                        }
                         let focus_marker = if pane.is_focused { "*" } else { "" };
                         rows.push(TreeRow {
                             indent: indent + 2,
@@ -1447,16 +1694,62 @@ impl SessionManagerState {
             bg,
         });
 
+        // Search row, directly under the top border. Focused, it carries a
+        // block cursor and the accent color so there is no doubt where the
+        // keystrokes are going.
+        let search_y = start_y + 1;
+        let search_text = if self.search_focused {
+            format!(" / {}\u{2588}", self.query)
+        } else if self.query.is_empty() {
+            " / (search)".to_string()
+        } else {
+            format!(" / {}", self.query)
+        };
+        let search_fg = if self.search_focused { current_fg } else { fg };
+        commands.push(DrawCommand {
+            x: start_x,
+            y: search_y,
+            text: "\u{2502}".to_string(),
+            fg: border_fg,
+            bg,
+        });
+        commands.push(DrawCommand {
+            x: start_x + 1,
+            y: search_y,
+            text: pad_to_display_width(&search_text, inner_width),
+            fg: search_fg,
+            bg,
+        });
+        commands.push(DrawCommand {
+            x: start_x + 1 + inner_width as u16,
+            y: search_y,
+            text: "\u{2502}".to_string(),
+            fg: border_fg,
+            bg,
+        });
+        // Separator between the search row and the tree.
+        commands.push(DrawCommand {
+            x: start_x,
+            y: search_y + 1,
+            text: format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width)),
+            fg: border_fg,
+            bg,
+        });
+
         // Help footer: the dynamic chord list (or, when a chord prefix is
         // pending, a mini which-key of that prefix's chords), packed into up to
-        // 3 lines that fit the popup width.
+        // 3 lines that fit the popup width. On a very short popup the footer is
+        // capped so the fixed chrome (5 rows: two borders, the search row and
+        // the two separators) still fits.
+        let footer_budget = (popup_height as usize).saturating_sub(5).clamp(1, 3);
         let footer_cells = self.footer_cells();
-        let footer_lines = pack_footer_lines(&footer_cells, inner_width, 3);
+        let footer_lines = pack_footer_lines(&footer_cells, inner_width, footer_budget);
         let footer_n = footer_lines.len().max(1);
 
         // Content area (rows): popup height minus the top border (1), the
-        // separator line (1), the footer lines, and the bottom border (1).
-        let content_height = (popup_height as usize).saturating_sub(3 + footer_n);
+        // search row (1), its separator (1), the prompt/separator line (1), the
+        // footer lines, and the bottom border (1).
+        let content_height = (popup_height as usize).saturating_sub(5 + footer_n);
         let scroll_offset = if self.selected >= content_height {
             self.selected - content_height + 1
         } else {
@@ -1465,7 +1758,8 @@ impl SessionManagerState {
 
         for row_idx in 0..content_height {
             let tree_idx = scroll_offset + row_idx;
-            let y = start_y + 1 + row_idx as u16;
+            // +3: top border, search row, search separator.
+            let y = start_y + 3 + row_idx as u16;
 
             if let Some(row) = self.rows.get(tree_idx) {
                 let is_selected = tree_idx == self.selected;
@@ -1603,7 +1897,7 @@ impl SessionManagerState {
         };
 
         // Separator line.
-        let sep_y = start_y + 1 + content_height as u16;
+        let sep_y = start_y + 3 + content_height as u16;
         if !prompt_line.is_empty() {
             let prompt_content = pad_to_display_width(&prompt_line, inner_width);
             commands.push(DrawCommand {
@@ -2860,6 +3154,310 @@ mod tests {
             .unwrap();
         let action = state.apply_binding(SessionManagerBinding::AddToView);
         assert!(matches!(action, SessionManagerAction::None));
+    }
+
+    // -----------------------------------------------------------------------
+    // Search / filtering
+    // -----------------------------------------------------------------------
+
+    /// A tree with distinct folder / session / tab / pane names at every level,
+    /// so a query can be aimed at exactly one depth.
+    fn search_tree() -> (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>) {
+        let pane = |id: u64, name: &str| PaneTreeEntry {
+            id,
+            name: name.to_string(),
+            is_focused: false,
+        };
+        let folders = vec![
+            FolderTreeEntry {
+                name: "clients".to_string(),
+                sessions: vec![SessionTreeEntry {
+                    name: "alpha".to_string(),
+                    tabs: vec![
+                        TabTreeEntry {
+                            id: 1,
+                            name: "editor".to_string(),
+                            panes: vec![pane(10, "vim"), pane(11, "logtail")],
+                        },
+                        TabTreeEntry {
+                            id: 2,
+                            name: "shell".to_string(),
+                            panes: vec![pane(12, "bash")],
+                        },
+                    ],
+                    client_count: 0,
+                    is_current: false,
+                }],
+            },
+            FolderTreeEntry {
+                name: "personal".to_string(),
+                sessions: vec![SessionTreeEntry {
+                    name: "beta".to_string(),
+                    tabs: vec![TabTreeEntry {
+                        id: 3,
+                        name: "notes".to_string(),
+                        panes: vec![pane(13, "nvim")],
+                    }],
+                    client_count: 0,
+                    is_current: false,
+                }],
+            },
+        ];
+        let unfiled = vec![SessionTreeEntry {
+            name: "gamma".to_string(),
+            tabs: vec![TabTreeEntry {
+                id: 4,
+                name: "build".to_string(),
+                panes: vec![pane(14, "cargo")],
+            }],
+            client_count: 0,
+            is_current: false,
+        }];
+        (folders, unfiled)
+    }
+
+    fn search_state(dormant: Vec<String>) -> SessionManagerState {
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = search_tree();
+        state.update_tree(ConnId::Local, folders, unfiled, dormant);
+        state
+    }
+
+    /// Compact `kind:name` label per visible row, for exact assertions.
+    fn row_labels(state: &SessionManagerState) -> Vec<String> {
+        state
+            .rows
+            .iter()
+            .map(|r| match &r.node_type {
+                NodeType::Server { id, .. } => format!("server:{}", id.key()),
+                NodeType::Folder { name, .. } => format!("folder:{name}"),
+                NodeType::Session { name, .. } => format!("session:{name}"),
+                NodeType::Tab { .. } => format!("tab:{}", r.display_name),
+                NodeType::Pane { .. } => {
+                    format!("pane:{}", r.display_name.trim_end_matches('*'))
+                }
+                NodeType::SavedGroup { .. } => "saved".to_string(),
+                NodeType::DormantSession { name, .. } => format!("dormant:{name}"),
+            })
+            .collect()
+    }
+
+    /// Type `q` into the search bar one char at a time (the same path the key
+    /// handler drives).
+    fn type_query(state: &mut SessionManagerState, q: &str) {
+        for c in q.chars() {
+            state.push_query_char(c);
+        }
+    }
+
+    /// Index of the first row whose label matches.
+    fn label_row(state: &SessionManagerState, label: &str) -> usize {
+        row_labels(state).iter().position(|l| l == label).unwrap()
+    }
+
+    #[test]
+    fn search_empty_query_changes_nothing() {
+        let mut state = search_state(Vec::new());
+        let before = row_labels(&state);
+        // Type then delete: back to an empty query, and the tree is identical.
+        type_query(&mut state, "al");
+        assert_ne!(row_labels(&state), before);
+        state.pop_query_char();
+        state.pop_query_char();
+        assert!(state.query.is_empty());
+        assert_eq!(row_labels(&state), before);
+    }
+
+    #[test]
+    fn search_tab_name_drags_session_and_folder_into_view() {
+        let mut state = search_state(Vec::new());
+        type_query(&mut state, "editor");
+        let labels = row_labels(&state);
+        // The match's full ancestor chain is shown...
+        assert_eq!(
+            labels,
+            vec![
+                "server:local".to_string(),
+                "folder:clients".to_string(),
+                "session:alpha".to_string(),
+                "tab:editor".to_string(),
+            ],
+            "tab match must show its session and folder and nothing else"
+        );
+        // ...and the matching tab is not force-opened, so its panes stay under
+        // the user's own expansion state (the tab was never expanded).
+        assert!(!labels.iter().any(|l| l.starts_with("pane:")));
+    }
+
+    #[test]
+    fn search_pane_name_shows_the_whole_chain() {
+        let mut state = search_state(Vec::new());
+        type_query(&mut state, "logtail");
+        assert_eq!(
+            row_labels(&state),
+            vec![
+                "server:local".to_string(),
+                "folder:clients".to_string(),
+                "session:alpha".to_string(),
+                "tab:editor".to_string(),
+                "pane:logtail".to_string(),
+            ],
+            "pane match must force its tab open and show the chain above it"
+        );
+    }
+
+    #[test]
+    fn search_session_name_keeps_its_subtree_browsable() {
+        let mut state = search_state(Vec::new());
+        type_query(&mut state, "ALPHA"); // case-insensitive
+        let labels = row_labels(&state);
+        assert!(labels.contains(&"session:alpha".to_string()));
+        assert!(labels.contains(&"folder:clients".to_string()));
+        // A matching session is visible with its tabs (the session is expanded),
+        // but the sibling folder and the unfiled session are filtered out.
+        assert!(labels.contains(&"tab:editor".to_string()));
+        assert!(!labels.contains(&"folder:personal".to_string()));
+        assert!(!labels.contains(&"session:gamma".to_string()));
+    }
+
+    #[test]
+    fn search_no_match_leaves_only_server_rows() {
+        let mut state = search_state(Vec::new());
+        type_query(&mut state, "zzzznope");
+        assert_eq!(row_labels(&state), vec!["server:local".to_string()]);
+        // Nothing panics with a stale selection against the shrunken list.
+        state.select_next();
+        state.select_prev();
+        assert!(matches!(state.handle_enter(), SessionManagerAction::None));
+        assert!(matches!(
+            state.handle_delete_key(),
+            SessionManagerAction::None
+        ));
+    }
+
+    #[test]
+    fn search_matches_dormant_sessions() {
+        let mut state = search_state(vec!["saved-one".to_string(), "other".to_string()]);
+        type_query(&mut state, "saved");
+        assert_eq!(
+            row_labels(&state),
+            vec![
+                "server:local".to_string(),
+                "saved".to_string(),
+                "dormant:saved-one".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn search_does_not_permanently_expand_the_tree() {
+        let mut state = search_state(Vec::new());
+        // Collapse a folder FIRST, so "restored" is a state the auto-expansion
+        // in `update_tree` did not already produce.
+        state.selected = label_row(&state, "folder:personal");
+        state.collapse_selected();
+        let rows_before = row_labels(&state);
+        let expanded_before = state.expanded.clone();
+        assert!(!rows_before.contains(&"session:beta".to_string()));
+
+        // A query that only matches inside the collapsed folder must reveal it.
+        type_query(&mut state, "notes");
+        assert_eq!(
+            row_labels(&state),
+            vec![
+                "server:local".to_string(),
+                "folder:personal".to_string(),
+                "session:beta".to_string(),
+                "tab:notes".to_string(),
+            ],
+        );
+
+        // Clearing the query restores the user's expansion state exactly.
+        state.clear_query();
+        assert_eq!(state.expanded, expanded_before, "expanded set was mutated");
+        assert_eq!(row_labels(&state), rows_before);
+    }
+
+    #[test]
+    fn search_query_change_resets_the_selection() {
+        let mut state = search_state(Vec::new());
+        state.selected = 3;
+        type_query(&mut state, "a");
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn search_bar_renders_focused_then_unfocused() {
+        let theme = Theme::default();
+        let mut state = search_state(Vec::new());
+
+        // The search row is the popup's own content command on the row directly
+        // under the top border; pull it out rather than asserting against every
+        // draw command concatenated together.
+        let search_row = |state: &SessionManagerState| -> DrawCommand {
+            let (cols, rows) = (100u16, 30u16);
+            let popup_width = (cols / 2).max(40).min(cols);
+            let popup_height = (rows / 2).max(12).min(rows);
+            let start_x = (cols.saturating_sub(popup_width)) / 2;
+            let start_y = (rows.saturating_sub(popup_height)) / 2;
+            state
+                .render(cols, rows, &theme)
+                .into_iter()
+                .find(|c| c.y == start_y + 1 && c.x == start_x + 1)
+                .expect("search row content command")
+        };
+
+        // Opens focused: the block cursor, painted in the accent color.
+        assert!(state.search_focused);
+        let row = search_row(&state);
+        assert_eq!(row.text.trim(), "/ \u{2588}");
+        assert_eq!(row.fg, theme.whichkey_key_fg);
+
+        // Unfocused with an empty query: the placeholder, no cursor, normal fg.
+        state.focus_tree();
+        let row = search_row(&state);
+        assert_eq!(row.text.trim(), "/ (search)");
+        assert_eq!(row.fg, theme.whichkey_fg);
+
+        // Unfocused with a query: the query, still no cursor.
+        type_query(&mut state, "alpha");
+        let row = search_row(&state);
+        assert_eq!(row.text.trim(), "/ alpha");
+        assert_eq!(row.fg, theme.whichkey_fg);
+
+        // Refocused: cursor back, accent color back.
+        state.focus_search();
+        let row = search_row(&state);
+        assert_eq!(row.text.trim(), "/ alpha\u{2588}");
+        assert_eq!(row.fg, theme.whichkey_key_fg);
+    }
+
+    #[test]
+    fn search_focus_drops_a_pending_chord() {
+        let mut state = search_state(Vec::new());
+        state.focus_tree();
+        assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
+        state.focus_search();
+        assert_eq!(state.pending_chord(), None);
+    }
+
+    #[test]
+    fn render_rows_do_not_overflow_a_tiny_popup() {
+        // The popup floor (`popup_height < 6` returns early) must still lay out
+        // inside its own box now that the search row and its separator exist.
+        let theme = Theme::default();
+        let state = search_state(Vec::new());
+        for rows in 6u16..14 {
+            let cmds = state.render(40, rows, &theme);
+            let popup_height = (rows / 2).max(12).min(rows);
+            let start_y = (rows.saturating_sub(popup_height)) / 2;
+            let max_y = cmds.iter().map(|c| c.y).max().unwrap_or(0);
+            assert!(
+                max_y < start_y + popup_height,
+                "rows={rows}: drew at y={max_y}, popup ends at {}",
+                start_y + popup_height
+            );
+        }
     }
 
     #[test]

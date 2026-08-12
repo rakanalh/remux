@@ -4,3 +4,6 @@
 bug*.png
 openspec/
 docs/superpowers/
+# Byte-code the python test harnesses leave behind (tests/pty, tests/frame).
+__pycache__/
+*.py[co]
