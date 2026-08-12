@@ -2118,6 +2118,43 @@ impl InputHandler {
             }
         };
 
+        // The search bar owns every keystroke while it is focused -- before the
+        // sub-modes and before the chord engine, so `q`/`j`/`d`/... are plain
+        // text and nothing is a command. (The invariant that focus can only be
+        // on the search bar in `SubMode::Navigate` makes the ordering safe.)
+        if sm.search_focused {
+            return match key.code {
+                // Esc closes the overlay outright, exactly as it does from the
+                // tree -- it does not merely clear the query.
+                KeyCode::Esc => {
+                    self.session_manager = None;
+                    self.mode = Mode::Normal;
+                    InputAction::SessionManagerClose
+                }
+                // Hand focus to the tree without also moving the selection or
+                // activating a row on this same keystroke.
+                KeyCode::Tab | KeyCode::Down | KeyCode::Enter => {
+                    sm.focus_tree();
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Backspace => {
+                    sm.pop_query_char();
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    sm.clear_query();
+                    InputAction::SessionManagerUpdate
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    sm.push_query_char(c);
+                    InputAction::SessionManagerUpdate
+                }
+                _ => InputAction::None,
+            };
+        }
+
         // Handle sub-modes first.
         match &sm.sub_mode {
             SubMode::ConfirmDelete(_) => {
@@ -2205,6 +2242,13 @@ impl InputHandler {
                 };
             }
             SubMode::Navigate => {} // Fall through to chord/navigation keys.
+        }
+
+        // `/` moves focus to the search bar. Intercepted ahead of the chord
+        // engine so a user-configured `/` chord cannot swallow it.
+        if key.code == KeyCode::Char('/') && key.modifiers.is_empty() {
+            sm.focus_search();
+            return InputAction::SessionManagerUpdate;
         }
 
         // Chord engine (Navigate mode): configured chords are checked before
@@ -4609,6 +4653,9 @@ mod tests {
             )
             .unwrap();
         sm.selected = idx;
+        // The overlay opens with the search bar focused; this test drives the
+        // tree, so hand focus over first (as Tab/Down/Enter would).
+        sm.focus_tree();
         handler.session_manager = Some(sm);
 
         // 'n' starts create-session; type a name; Enter -> folder select; Enter
@@ -4690,6 +4737,7 @@ mod tests {
             )
             .unwrap();
         sm.selected = tidx;
+        sm.focus_tree();
         handler.session_manager = Some(sm);
 
         // Chord t,r -> rename sub-mode; type "x"; Enter confirms and emits the
@@ -4714,6 +4762,148 @@ mod tests {
         }
     }
 
+    /// Build a session-manager handler over a one-folder/one-session/one-tab
+    /// local tree, for the search-bar routing tests.
+    fn search_handler() -> InputHandler {
+        use crate::client::registry::RemoteState;
+        use crate::client::session_manager::SessionManagerState;
+        use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::SessionManager;
+        let mut sm = SessionManagerState::new(None);
+        sm.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            None,
+        )]);
+        sm.update_tree(
+            ConnId::Local,
+            vec![FolderTreeEntry {
+                name: "work".to_string(),
+                sessions: vec![SessionTreeEntry {
+                    name: "alpha".to_string(),
+                    tabs: vec![TabTreeEntry {
+                        id: 1,
+                        name: "editor".to_string(),
+                        panes: vec![PaneTreeEntry {
+                            id: 10,
+                            name: "zsh".to_string(),
+                            is_focused: true,
+                        }],
+                    }],
+                    client_count: 0,
+                    is_current: false,
+                }],
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        handler.session_manager = Some(sm);
+        handler
+    }
+
+    #[test]
+    fn session_manager_search_bar_swallows_command_keys() {
+        let mut handler = search_handler();
+        // The overlay opens focused on the search bar, so `q` is text -- not the
+        // close key -- and `d` does not open the delete prompt.
+        for c in "qd".chars() {
+            let a = handler.handle_session_manager_key(char_key(c));
+            assert!(matches!(a, InputAction::SessionManagerUpdate));
+        }
+        let sm = handler.session_manager.as_ref().unwrap();
+        assert_eq!(sm.query, "qd");
+        assert!(matches!(
+            sm.sub_mode,
+            crate::client::session_manager::SubMode::Navigate
+        ));
+
+        // Ctrl-U clears; Backspace pops.
+        let _ = handler.handle_session_manager_key(ctrl_key('u'));
+        assert_eq!(handler.session_manager.as_ref().unwrap().query, "");
+        let _ = handler.handle_session_manager_key(char_key('a'));
+        let _ = handler.handle_session_manager_key(char_key('b'));
+        let _ =
+            handler.handle_session_manager_key(make_key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(handler.session_manager.as_ref().unwrap().query, "a");
+    }
+
+    #[test]
+    fn session_manager_tab_hands_focus_to_the_tree() {
+        let mut handler = search_handler();
+        let _ = handler.handle_session_manager_key(make_key(KeyCode::Tab, KeyModifiers::NONE));
+        let sm = handler.session_manager.as_ref().unwrap();
+        assert!(!sm.search_focused);
+        // Focus moved without also moving the selection.
+        assert_eq!(sm.selected, 0);
+
+        // `j` now navigates instead of typing.
+        let _ = handler.handle_session_manager_key(char_key('j'));
+        let sm = handler.session_manager.as_ref().unwrap();
+        assert_eq!(sm.selected, 1);
+        assert!(sm.query.is_empty());
+    }
+
+    #[test]
+    fn session_manager_query_survives_the_delete_sub_mode() {
+        use crate::client::session_manager::SubMode;
+
+        let mut handler = search_handler();
+        // Filter to the session, then take tree focus and delete it: the query
+        // must still be there while the confirm prompt is up (this is what
+        // modelling search as a SubMode would have broken).
+        for c in "alpha".chars() {
+            let _ = handler.handle_session_manager_key(char_key(c));
+        }
+        // Down only hands focus to the tree; the query already placed the
+        // selection on `alpha` itself (the direct hit), not on its folder.
+        let _ = handler.handle_session_manager_key(make_key(KeyCode::Down, KeyModifiers::NONE));
+        let _ = handler.handle_session_manager_key(char_key('d'));
+        let sm = handler.session_manager.as_ref().unwrap();
+        // Named exactly: `contains("alpha")` also passes for "tab 0 in 'alpha'",
+        // which is what the old two-`j` navigation was actually landing on.
+        assert!(
+            matches!(&sm.sub_mode, SubMode::ConfirmDelete(d) if d == "session 'alpha'"),
+            "expected the delete confirm for the filtered session, got {:?}",
+            sm.sub_mode
+        );
+        assert_eq!(sm.query, "alpha", "the query must survive the sub-mode");
+    }
+
+    #[test]
+    fn session_manager_slash_refocuses_the_search_bar() {
+        let mut handler = search_handler();
+        let _ = handler.handle_session_manager_key(make_key(KeyCode::Tab, KeyModifiers::NONE));
+        // Half-type a chord, then `/`: focus moves and the prefix is dropped so
+        // it cannot complete later.
+        let _ = handler.handle_session_manager_key(char_key('t'));
+        assert_eq!(
+            handler.session_manager.as_ref().unwrap().pending_chord(),
+            Some('t')
+        );
+        let a = handler.handle_session_manager_key(char_key('/'));
+        assert!(matches!(a, InputAction::SessionManagerUpdate));
+        let sm = handler.session_manager.as_ref().unwrap();
+        assert!(sm.search_focused);
+        assert_eq!(sm.pending_chord(), None);
+        assert!(
+            sm.query.is_empty(),
+            "`/` must not type itself into the query"
+        );
+    }
+
+    #[test]
+    fn session_manager_esc_from_the_search_bar_closes() {
+        let mut handler = search_handler();
+        let _ = handler.handle_session_manager_key(char_key('a'));
+        let a = handler.handle_session_manager_key(esc_key());
+        assert!(matches!(a, InputAction::SessionManagerClose));
+        assert!(handler.session_manager.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
     #[test]
     fn session_manager_chord_prefix_then_esc_cancels() {
         use crate::client::registry::RemoteState;
@@ -4728,6 +4918,7 @@ mod tests {
             RemoteState::Connected,
             None,
         )]);
+        sm.focus_tree();
         handler.session_manager = Some(sm);
 
         // 't' starts a pending chord; Esc cancels it WITHOUT closing the overlay.

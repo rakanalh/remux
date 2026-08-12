@@ -43,6 +43,8 @@ def main():
     t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
     # 1-cell view over this pane.
     t.prefix(b"xm", 0.7)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)
     t.send("j", 0.2); t.send(" ", 0.3)
     t.send("v", 0.2); t.send("a", 0.5)

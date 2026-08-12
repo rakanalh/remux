@@ -78,6 +78,8 @@ def build_view(t):
     # put a cursor on or yank.
     t.send(b"\x1bt", 0.8)
     t.prefix(b"xm", 1.0)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)   # expand Tab 1
     for _ in range(4):                                      # mark all 4 panes
         t.send("j", 0.2); t.send(" ", 0.3)

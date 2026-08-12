@@ -75,6 +75,8 @@ def build_view(t):
     # of content, and every assertion below would pass for the wrong reason.
     t.send(b"\x1bt", 0.8)
     t.prefix(b"xm", 0.9)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     for k in (b"j", b"j", b"l"):
         t.send(k, 0.3)
     t.send(b"j", 0.2); t.send(b" ", 0.3)

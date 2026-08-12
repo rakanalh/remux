@@ -35,6 +35,8 @@ def make_self_view(t):
     t.send(f"printf '{MARK_B}\\n'\r", 0.5)
     # Compose a 2-cell view over both (do NOT background them).
     t.prefix(b"xm", 0.7)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1
     t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 1
     t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 2

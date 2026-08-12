@@ -11,7 +11,8 @@ t.send("printf 'BBBB_marker_two\\n'\r", 0.5)
 # "Active in session" placeholder).
 t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
 t.prefix(b"xm", 0.7)
-
+# The manager opens with its search bar focused; Tab hands focus to the tree.
+t.send(b"\t", 0.3)
 # Navigate to Tab 1 row and expand it. Selected starts on 'local' (row 0).
 # j down to 'main', j to 'Tab 1', then 'l' to expand.
 t.send("j", 0.2)   # -> main

@@ -82,6 +82,8 @@ def main():
     t.send(f"printf '{B}\\n'\r", 0.5)
     t.send(b"\x1bt", 0.7)             # Alt+t: background panes 1 & 2
     t.prefix(b"xm", 0.8)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    t.send(b"\t", 0.3)
     t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.3)
     t.send("j", 0.2); t.send(" ", 0.3)   # mark pane 1
     t.send("j", 0.2); t.send(" ", 0.3)   # mark pane 2

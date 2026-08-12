@@ -124,6 +124,8 @@ def sm_compose_mark_first(a):
     """Open the session manager, expand the session's Tab 1, mark ONLY the
     first pane, and create+enter a new view over it."""
     a.prefix(b"xm", 0.8)
+    # The manager opens with its search bar focused; Tab hands focus to the tree.
+    a.send(b"\t", 0.3)
     if VERBOSE:
         a.dump("SM opened")
     # Expand down to the panes. Mirrors issue1_view_blank: j to session, j to
@@ -196,6 +198,8 @@ def main():
 
             # (c) A adds a SECOND pane to the view; B repaints WITHOUT input.
             a.prefix(b"xm", 0.8)
+            # The manager opens with its search bar focused; Tab hands focus to the tree.
+            a.send(b"\t", 0.3)
             a.send("j", 0.2); a.send("j", 0.2); a.send("l", 0.3)
             a.send("j", 0.2); a.send("j", 0.2)   # move to the SECOND pane
             if VERBOSE:
