@@ -533,10 +533,25 @@ impl SessionManagerState {
     }
 
     /// Re-filter after the query changed. The previous selection index is
-    /// meaningless against a new result set, so it resets to the top.
+    /// meaningless against a new result set, so it is re-placed against the
+    /// rows the filter just produced.
+    ///
+    /// Row 0 is always a `Server` row -- servers render regardless of the query
+    /// -- so parking the selection there would put Enter on "toggle the server's
+    /// expansion" rather than on what the user typed. With a query active the
+    /// selection therefore lands on the first non-server row, falling back to
+    /// the top when the query matched nothing. An empty query means no filtering
+    /// at all, so it keeps the plain "back to the top" behaviour.
     fn on_query_changed(&mut self) {
-        self.selected = 0;
         self.rebuild_rows();
+        self.selected = if self.query.is_empty() {
+            0
+        } else {
+            self.rows
+                .iter()
+                .position(|r| !matches!(r.node_type, NodeType::Server { .. }))
+                .unwrap_or(0)
+        };
     }
 
     /// Move focus to the search bar. Any half-typed chord prefix is dropped so
@@ -3379,10 +3394,46 @@ mod tests {
     }
 
     #[test]
-    fn search_query_change_resets_the_selection() {
+    fn search_query_change_replaces_a_stale_selection() {
         let mut state = search_state(Vec::new());
         state.selected = 3;
         type_query(&mut state, "a");
+        // The stale index is gone, and the selection is NOT parked on the server
+        // row at 0 -- here it is the folder holding the topmost match.
+        assert_ne!(state.selected, 3);
+        assert_eq!(row_labels(&state)[state.selected], "folder:clients");
+    }
+
+    #[test]
+    fn search_selection_lands_on_the_match_not_the_server_row() {
+        let mut state = search_state(Vec::new());
+        // `gamma` is an unfiled session, so the filtered tree is the server row
+        // followed by the session the user actually searched for.
+        type_query(&mut state, "gamma");
+        assert!(
+            !matches!(
+                state.rows[state.selected].node_type,
+                NodeType::Server { .. }
+            ),
+            "the selection sat on a server row after a query"
+        );
+        assert_eq!(row_labels(&state)[state.selected], "session:gamma");
+        // ...so Enter activates the match instead of toggling the server open.
+        assert!(matches!(
+            state.handle_enter(),
+            SessionManagerAction::SwitchSession { server: ConnId::Local, session }
+                if session == "gamma"
+        ));
+
+        // A query that matches nothing leaves only server rows: the selection
+        // falls back to the top rather than pointing past the end.
+        state.clear_query();
+        type_query(&mut state, "zzzznope");
+        assert_eq!(row_labels(&state), vec!["server:local".to_string()]);
+        assert_eq!(state.selected, 0);
+
+        // Clearing the query restores the plain "top of the tree" selection.
+        state.clear_query();
         assert_eq!(state.selected, 0);
     }
 

@@ -23,7 +23,9 @@ Asserted here:
   5. `/` refocuses the search bar, and `q` typed there does NOT close the popup.
   6. A query matching nothing does not crash, and clearing it brings the tree
      back.
-  7. The client is still alive and the log has no panic.
+  7. A query matching a SESSION puts the selection ON that session, not on the
+     always-visible `local` server row -- Tab then Enter switches to it.
+  8. The client is still alive and the log has no panic.
 
 Run from the repo root:  python3 tests/pty/session_manager_search.py
 """
@@ -209,7 +211,37 @@ def main():
         if len(fails) == before:
             print("6. OK: a no-match query is harmless and Ctrl-U restores the tree")
 
-        # --- 7. still alive, no panic ----------------------------------------
+        # --- 7. the selection lands on the match, so Enter activates it -------
+        # The regression: `on_query_changed` reset `selected` to 0, and row 0 is
+        # ALWAYS the `local` server row (server rows ignore the query). Enter
+        # there merely toggled the server's expansion, so the first thing a user
+        # tries after searching did nothing. OTHER is an unfiled session, so the
+        # filtered tree is `local` + that session; Enter must switch to it.
+        before = len(fails)
+        status_before = t.rows_text()[-1]
+        if OTHER in status_before:
+            fail(f"precondition: already attached to {OTHER!r} "
+                 f"(status {status_before.rstrip()!r})", "7: bad precondition")
+        t.send(b"omega", 1.0)          # focus is on the search bar with an empty query
+        t.send(b"\t", 0.8)             # hand focus to the tree
+        t.send(b"\r", 1.5)             # activate whatever the selection is on
+        if t.has("Session Manager"):
+            fail("Enter did not activate the match -- the manager is still open, "
+                 "so the selection was sitting on the `local` server row and "
+                 "Enter just toggled its expansion", "7: manager still open")
+        status_after = t.rows_text()[-1]
+        if OTHER not in status_after:
+            fail(f"the client did not switch to the matched session {OTHER!r} "
+                 f"(status bar {status_after.rstrip()!r})", "7: no switch")
+        if status_after == status_before:
+            fail("the status bar is unchanged -- nothing was activated",
+                 "7: status unchanged")
+        if not t.alive():
+            fail("the client died activating the search match", "7: client dead")
+        if len(fails) == before:
+            print(f"7. OK: a query matching {OTHER!r} selects it; Enter switches to it")
+
+        # --- 8. still alive, no panic ----------------------------------------
         if not t.alive():
             fails.append("the client is not alive at the end")
         logs = (t.log("client") + t.log("server")).lower()
