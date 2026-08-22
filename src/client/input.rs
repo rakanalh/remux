@@ -2889,6 +2889,17 @@ impl InputHandler {
 fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // xterm's modifier parameter -- the encoding readline, vim, tmux and every
+    // other terminal app already reads for modified cursor/nav/function keys.
+    // 1 means "unmodified", and the sequences below then drop the `1;<n>` part
+    // entirely: an app that only knows the bare forms must keep seeing exactly
+    // the bare forms. Note this folds ALT into the parameter for those keys
+    // instead of prefixing an ESC, matching xterm/tmux; the ESC-prefix
+    // convention below is still right for Char/Enter/Tab/Backspace.
+    let mod_param = 1
+        + u8::from(key.modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(alt)
+        + 4 * u8::from(ctrl);
 
     match key.code {
         KeyCode::Char(c) if ctrl => {
@@ -2913,80 +2924,71 @@ fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<V
             }
         }
         KeyCode::Enter => Some(wrap_alt(alt, b'\r')),
+        // Shift+Tab is CSI Z. Terminals report it either as its own key code or,
+        // under the CSI-u/kitty protocol, as Tab carrying SHIFT -- so both have
+        // to be matched ahead of the plain-Tab arm, which would otherwise
+        // flatten the shift away into a bare HT.
+        KeyCode::BackTab => Some(escape_seq(alt, b"[Z")),
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(escape_seq(alt, b"[Z")),
         KeyCode::Tab => Some(wrap_alt(alt, b'\t')),
         KeyCode::Backspace => Some(wrap_alt(alt, 0x7f)),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(escape_seq(
-            alt,
-            if application_cursor_keys {
-                b"OA" as &[u8]
-            } else {
-                b"[A"
-            },
-        )),
-        KeyCode::Down => Some(escape_seq(
-            alt,
-            if application_cursor_keys {
-                b"OB"
-            } else {
-                b"[B"
-            },
-        )),
-        KeyCode::Right => Some(escape_seq(
-            alt,
-            if application_cursor_keys {
-                b"OC"
-            } else {
-                b"[C"
-            },
-        )),
-        KeyCode::Left => Some(escape_seq(
-            alt,
-            if application_cursor_keys {
-                b"OD"
-            } else {
-                b"[D"
-            },
-        )),
-        KeyCode::Home => Some(escape_seq(
-            alt,
-            if application_cursor_keys {
-                b"OH"
-            } else {
-                b"[H"
-            },
-        )),
-        KeyCode::End => Some(escape_seq(
-            alt,
-            if application_cursor_keys {
-                b"OF"
-            } else {
-                b"[F"
-            },
-        )),
-        KeyCode::PageUp => Some(escape_seq(alt, b"[5~")),
-        KeyCode::PageDown => Some(escape_seq(alt, b"[6~")),
-        KeyCode::Insert => Some(escape_seq(alt, b"[2~")),
-        KeyCode::Delete => Some(escape_seq(alt, b"[3~")),
-        KeyCode::F(n) => {
-            let seq = match n {
-                1 => b"OP".as_slice(),
-                2 => b"OQ",
-                3 => b"OR",
-                4 => b"OS",
-                5 => b"[15~",
-                6 => b"[17~",
-                7 => b"[18~",
-                8 => b"[19~",
-                9 => b"[20~",
-                10 => b"[21~",
-                11 => b"[23~",
-                12 => b"[24~",
-                _ => return Option::None,
-            };
-            Some(escape_seq(alt, seq))
-        }
+        KeyCode::Up => Some(csi_final_key(mod_param, b'A', application_cursor_keys)),
+        KeyCode::Down => Some(csi_final_key(mod_param, b'B', application_cursor_keys)),
+        KeyCode::Right => Some(csi_final_key(mod_param, b'C', application_cursor_keys)),
+        KeyCode::Left => Some(csi_final_key(mod_param, b'D', application_cursor_keys)),
+        KeyCode::Home => Some(csi_final_key(mod_param, b'H', application_cursor_keys)),
+        KeyCode::End => Some(csi_final_key(mod_param, b'F', application_cursor_keys)),
+        KeyCode::Insert => Some(tilde_key(mod_param, 2)),
+        KeyCode::Delete => Some(tilde_key(mod_param, 3)),
+        KeyCode::PageUp => Some(tilde_key(mod_param, 5)),
+        KeyCode::PageDown => Some(tilde_key(mod_param, 6)),
+        // F1-F4 are SS3 keys and F5+ are tilde keys. That split is an xterm
+        // quirk rather than a pattern, but terminfo and every app that reads it
+        // expect exactly this, so the two halves encode differently.
+        KeyCode::F(n) => match n {
+            1 => Some(csi_final_key(mod_param, b'P', true)),
+            2 => Some(csi_final_key(mod_param, b'Q', true)),
+            3 => Some(csi_final_key(mod_param, b'R', true)),
+            4 => Some(csi_final_key(mod_param, b'S', true)),
+            5 => Some(tilde_key(mod_param, 15)),
+            6 => Some(tilde_key(mod_param, 17)),
+            7 => Some(tilde_key(mod_param, 18)),
+            8 => Some(tilde_key(mod_param, 19)),
+            9 => Some(tilde_key(mod_param, 20)),
+            10 => Some(tilde_key(mod_param, 21)),
+            11 => Some(tilde_key(mod_param, 23)),
+            12 => Some(tilde_key(mod_param, 24)),
+            _ => Option::None,
+        },
         _ => Option::None,
+    }
+}
+
+/// Encode a key whose bare form is `ESC [ <final>` -- or the SS3 form
+/// `ESC O <final>` when `ss3` is set -- carrying xterm's modifier parameter.
+///
+/// A modified key always takes the CSI form: xterm never emits SS3 for one, so
+/// an app that has turned on application cursor keys still expects
+/// `ESC [ 1 ; 5 C` for Ctrl+Right, not an SS3 variant it has no entry for.
+fn csi_final_key(mod_param: u8, final_byte: u8, ss3: bool) -> Vec<u8> {
+    if mod_param > 1 {
+        let mut seq = format!("\x1b[1;{mod_param}").into_bytes();
+        seq.push(final_byte);
+        seq
+    } else if ss3 {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        vec![0x1b, b'[', final_byte]
+    }
+}
+
+/// Encode a "tilde" key (`ESC [ <n> ~`) carrying xterm's modifier parameter.
+fn tilde_key(mod_param: u8, n: u8) -> Vec<u8> {
+    if mod_param > 1 {
+        format!("\x1b[{n};{mod_param}~").into_bytes()
+    } else {
+        format!("\x1b[{n}~").into_bytes()
     }
 }
 
@@ -3898,6 +3900,164 @@ mod tests {
         };
         let bytes = key_event_to_bytes(&key, false).unwrap();
         assert_eq!(bytes, "\u{00e9}".as_bytes());
+    }
+
+    /// Build a key event for the encoder tests.
+    fn kb(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn key_to_bytes_shift_tab() {
+        // Terminals report Shift+Tab either as BackTab or -- under CSI-u -- as
+        // Tab carrying SHIFT. Both have to come out as CSI Z, and plain Tab
+        // must stay a bare HT.
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::BackTab, KeyModifiers::SHIFT), false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Tab, KeyModifiers::SHIFT), false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Tab, KeyModifiers::NONE), false),
+            Some(b"\t".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_modified_cursor_keys() {
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Right, KeyModifiers::CONTROL), false),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Down, KeyModifiers::SHIFT), false),
+            Some(b"\x1b[1;2B".to_vec())
+        );
+        // Alt folds into the modifier parameter rather than prefixing an ESC.
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Up, KeyModifiers::ALT), false),
+            Some(b"\x1b[1;3A".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_cursor_keys_application_mode() {
+        // A modified cursor key never uses SS3, even in application-cursor mode.
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Up, KeyModifiers::CONTROL), true),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::Up, KeyModifiers::NONE), true),
+            Some(b"\x1bOA".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_modified_tilde_keys() {
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::PageUp, KeyModifiers::CONTROL), false),
+            Some(b"\x1b[5;5~".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::PageUp, KeyModifiers::NONE), false),
+            Some(b"\x1b[5~".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_modified_function_keys() {
+        // F1-F4 keep SS3 unmodified and switch to the CSI form when modified;
+        // F5+ are tilde keys either way.
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::F(3), KeyModifiers::SHIFT), false),
+            Some(b"\x1b[1;2R".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::F(3), KeyModifiers::NONE), false),
+            Some(b"\x1bOR".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::F(5), KeyModifiers::SHIFT), false),
+            Some(b"\x1b[15;2~".to_vec())
+        );
+        // Above F12 there is no sequence to send, modified or not.
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::F(13), KeyModifiers::NONE), false),
+            Option::None
+        );
+        assert_eq!(
+            key_event_to_bytes(&kb(KeyCode::F(13), KeyModifiers::CONTROL), false),
+            Option::None
+        );
+    }
+
+    #[test]
+    fn bound_keys_win_over_the_pty_encoder() {
+        // Regression guard for the constraint that the modifier-encoding change
+        // must not break any existing keybinding. `handle_normal_key` consults
+        // the shortcut bindings and the leader key BEFORE `key_event_to_bytes`,
+        // so the encoder is a fallthrough for UNBOUND keys only -- binding a key
+        // whose encoding changed must still run the command, never send bytes.
+        let mut handler = InputHandler::with_defaults();
+        let value: toml::Value = concat!(
+            "\"Ctrl-Right\" = \"PaneSplitVertical\"\n",
+            "\"Alt-Up\" = \"PaneFocusUp\"\n",
+            "\"Shift-Tab\" = \"TabPrev\"\n",
+        )
+        .parse()
+        .unwrap();
+        let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+        handler.reload_keybindings(
+            KeybindingTree::default(),
+            ctrl_key('a'),
+            shortcuts,
+            SessionManagerBindings::default(),
+        );
+
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Right, KeyModifiers::CONTROL)),
+            InputAction::Execute(RemuxCommand::PaneSplitVertical)
+        );
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Up, KeyModifiers::ALT)),
+            InputAction::Execute(RemuxCommand::PaneFocusUp)
+        );
+        // Shift-Tab is BackTab+SHIFT once parsed, which is the arm the fix added.
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            InputAction::Execute(RemuxCommand::TabPrev)
+        );
+        // Pre-existing asymmetry, pinned so it stays visible: a terminal using
+        // the CSI-u form reports Shift+Tab as Tab+SHIFT, and `NormalizedKeyEvent`
+        // does not fold that into BackTab -- so the binding above does not match
+        // it and the key falls through to the encoder. That was true before the
+        // encoder change too (it fell through as a bare HT); closing it means
+        // normalizing in `src/config/keybindings.rs`, so update this assert if
+        // that ever happens.
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Tab, KeyModifiers::SHIFT)),
+            InputAction::SendToPty(b"\x1b[Z".to_vec())
+        );
+        // The leader still wins too, and an unbound sibling still reaches the
+        // encoder -- so the precedence above is real, not a dead lookup.
+        assert!(matches!(
+            handler.handle_key(ctrl_key('a')),
+            InputAction::ShowWhichKey { .. }
+        ));
+        handler.mode = Mode::Normal;
+        assert_eq!(
+            handler.handle_key(make_key(KeyCode::Left, KeyModifiers::CONTROL)),
+            InputAction::SendToPty(b"\x1b[1;5D".to_vec())
+        );
     }
 
     // -- Normal mode passes all non-leader keys -------------------------
