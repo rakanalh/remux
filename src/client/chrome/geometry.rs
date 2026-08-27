@@ -8,7 +8,8 @@ use crate::config::StatusBarPosition;
 use crate::server::layout::Rect;
 
 /// Which terminal edge a sidebar is docked to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SidebarEdge {
     Left,
     Right,
@@ -132,6 +133,7 @@ pub fn panel_rects(
     // side by side rather than overlapping.
     let mut left_x = 0u16;
     let mut right_x = term_cols;
+    let mut bottom_y = term_rows;
 
     for (i, s) in sidebars.iter().enumerate() {
         let size = sizes[i];
@@ -158,12 +160,15 @@ pub fn panel_rects(
                     height: term_rows,
                 }
             }
-            SidebarEdge::Bottom => Rect {
-                x: content.x,
-                y: term_rows - size,
-                width: content.width,
-                height: size,
-            },
+            SidebarEdge::Bottom => {
+                bottom_y -= size;
+                Rect {
+                    x: content.x,
+                    y: bottom_y,
+                    width: content.width,
+                    height: size,
+                }
+            }
         };
         let vertical = !matches!(s.edge, SidebarEdge::Bottom);
         for (pi, rect) in split_panels(bar, &s.panels, vertical) {
@@ -587,5 +592,85 @@ mod tests {
                 height: 33
             }
         );
+    }
+
+    #[test]
+    fn two_bottom_sidebars_stack_instead_of_overlapping() {
+        let sbs = [
+            sb(SidebarEdge::Bottom, 6, &[1]),
+            sb(SidebarEdge::Bottom, 4, &[1]),
+        ];
+        let rects = panel_rects(&sbs, 100, 40);
+        let first = rects.iter().find(|(s, _, _)| *s == 0).unwrap().2;
+        let second = rects.iter().find(|(s, _, _)| *s == 1).unwrap().2;
+        // First declared sits closest to the bottom edge; the second stacks above it.
+        assert_eq!(
+            first,
+            Rect {
+                x: 0,
+                y: 34,
+                width: 100,
+                height: 6
+            }
+        );
+        assert_eq!(
+            second,
+            Rect {
+                x: 0,
+                y: 30,
+                width: 100,
+                height: 4
+            }
+        );
+        assert!(
+            second.y + second.height <= first.y,
+            "bottom sidebars overlap: {second:?} vs {first:?}"
+        );
+    }
+
+    #[test]
+    fn two_left_sidebars_stack_side_by_side() {
+        let sbs = [
+            sb(SidebarEdge::Left, 20, &[1]),
+            sb(SidebarEdge::Left, 10, &[1]),
+        ];
+        let rects = panel_rects(&sbs, 100, 30);
+        assert_eq!(
+            rects[0].2,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 30
+            }
+        );
+        assert_eq!(
+            rects[1].2,
+            Rect {
+                x: 20,
+                y: 0,
+                width: 10,
+                height: 30
+            }
+        );
+        assert_eq!(content_rect(&sbs, 100, 30).x, 30);
+    }
+
+    #[test]
+    fn same_axis_budget_goes_to_the_first_declared_sidebar() {
+        // Documented, deliberate rule: when two same-axis sidebars compete for a
+        // budget that cannot satisfy both, the earlier entry wins and the later
+        // one is force-hidden rather than both being shrunk.
+        let sbs = [
+            sb(SidebarEdge::Left, 60, &[1]),
+            sb(SidebarEdge::Right, 60, &[1]),
+        ];
+        let sizes = effective_sizes(&sbs, 100, 30);
+        assert_eq!(sizes[0], 60);
+        assert_eq!(
+            sizes[1], 20,
+            "second same-axis sidebar takes only the leftover budget"
+        );
+        assert_eq!(content_rect(&sbs, 100, 30).width, MIN_CONTENT_COLS);
     }
 }

@@ -1,4 +1,5 @@
 pub mod keybindings;
+pub mod sidebar;
 pub mod theme;
 pub mod watcher;
 
@@ -19,6 +20,9 @@ pub struct Config {
     /// Named remote servers reachable over SSH, keyed by a short label used in
     /// the session manager tree. Configured via `[remotes.<name>]` tables.
     pub remotes: std::collections::HashMap<String, RemoteConfig>,
+    /// Sidebar definitions, in declaration order. Empty means no chrome.
+    #[serde(default)]
+    pub sidebar: Vec<sidebar::SidebarConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +297,7 @@ impl Default for Config {
             modes: ModesConfig::default(),
             keybindings: KeybindingsConfig::default(),
             remotes: std::collections::HashMap::new(),
+            sidebar: Vec::new(),
         }
     }
 }
