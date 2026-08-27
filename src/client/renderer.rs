@@ -10,12 +10,12 @@ use crossterm::cursor::MoveTo;
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
-use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue, terminal};
 
 use crate::client::input::{SelectionMode, VisualState};
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
+use crate::server::layout::Rect;
 
 // ---------------------------------------------------------------------------
 // Renderer
@@ -23,11 +23,42 @@ use crate::protocol::{CellChange, CellColor, RenderCell};
 
 /// The client-side renderer that maintains a front buffer and uses crossterm
 /// to draw changes to the actual terminal.
+///
+/// # Coordinate contract
+///
+/// The terminal is split into a *content rect* -- where server frames are
+/// drawn -- and the sidebar panels around it. Two coordinate spaces meet here,
+/// and which one a method takes is part of its contract:
+///
+/// - **Server-frame methods** -- [`Renderer::render_full`],
+///   [`Renderer::render_diff`], [`Renderer::render_scroll`] and
+///   [`Renderer::restore_cursor`] -- take **content-relative** coordinates and
+///   apply the content origin internally.
+/// - **[`Renderer::paint_panel`]** takes **absolute screen** coordinates. Panel
+///   rects come from `chrome::geometry::panel_rects`, which already computes
+///   absolutes, so no origin is applied.
+///
+/// The front buffer is always the FULL terminal in absolute coordinates,
+/// panels included. Nothing a server frame draws may write, clear, or move a
+/// cell outside the content rect.
 pub struct Renderer {
-    /// The front buffer: what is currently displayed on screen.
+    /// The front buffer: what is currently displayed on screen. Always the
+    /// FULL terminal, including sidebar columns -- only the write position of
+    /// server content is offset. This is what keeps diff rendering coherent.
     front: Vec<Vec<RenderCell>>,
     cols: u16,
     rows: u16,
+    /// Top-left of the content rect. Server frames arrive in content-relative
+    /// coordinates and are written here.
+    origin_x: u16,
+    origin_y: u16,
+    /// Size of the content rect. Every clear a server frame performs is bounded
+    /// by it: a frame smaller than the content rect must still blank the stale
+    /// remainder *inside* the rect, but must never reach past it into a panel.
+    /// Defaults to the full terminal, which reproduces the pre-sidebar
+    /// behaviour exactly when no sidebars are configured.
+    content_cols: u16,
+    content_rows: u16,
 }
 
 impl Renderer {
@@ -37,7 +68,49 @@ impl Renderer {
             front: vec![vec![RenderCell::default(); cols as usize]; rows as usize],
             cols,
             rows,
+            origin_x: 0,
+            origin_y: 0,
+            content_cols: cols,
+            content_rows: rows,
         }
+    }
+
+    /// Set the top-left of the content rect. Server frames are written here.
+    pub fn set_origin(&mut self, x: u16, y: u16) {
+        self.origin_x = x;
+        self.origin_y = y;
+    }
+
+    /// The current content origin.
+    pub fn origin(&self) -> (u16, u16) {
+        (self.origin_x, self.origin_y)
+    }
+
+    /// Set the size of the content rect, in cells.
+    ///
+    /// This bounds every clear a server frame performs. A [`Renderer::resize`]
+    /// resets it to the full terminal, so the caller must set it again after
+    /// one -- otherwise a frame smaller than the content rect would blank
+    /// across a panel.
+    pub fn set_content_size(&mut self, cols: u16, rows: u16) {
+        self.content_cols = cols;
+        self.content_rows = rows;
+    }
+
+    /// The current content rect size.
+    pub fn content_size(&self) -> (u16, u16) {
+        (self.content_cols, self.content_rows)
+    }
+
+    /// Translate a content-relative cursor position to an absolute screen
+    /// position, clamped to the terminal.
+    fn cursor_screen_pos(&self, x: u16, y: u16) -> (u16, u16) {
+        (
+            x.saturating_add(self.origin_x)
+                .min(self.cols.saturating_sub(1)),
+            y.saturating_add(self.origin_y)
+                .min(self.rows.saturating_sub(1)),
+        )
     }
 
     /// Apply a full render (replace everything).
@@ -59,6 +132,16 @@ impl Renderer {
             cursor_y,
             cursor_visible
         );
+
+        let ox = self.origin_x as usize;
+        let oy = self.origin_y as usize;
+        // Absolute right/bottom edges of the content rect, clipped to the
+        // terminal. Every clear below is bounded by these: a frame smaller than
+        // the content rect must still blank the stale remainder inside the
+        // rect, but a panel lives beyond it and must never be touched.
+        let content_right = (ox + self.content_cols as usize).min(self.cols as usize);
+        let content_bottom = (oy + self.content_rows as usize).min(self.rows as usize);
+
         let mut stdout = io::stdout().lock();
 
         // Bracket the whole frame in synchronized output (DEC 2026) so the
@@ -69,10 +152,19 @@ impl Renderer {
         queue!(stdout, cursor::Hide)?;
 
         for (y, row) in cells.iter().enumerate() {
-            if y as u16 >= self.rows {
+            let sy = y + oy;
+            if sy >= self.rows as usize {
                 break;
             }
-            queue!(stdout, MoveTo(0, y as u16))?;
+
+            // Full SGR reset (SGR 0) so the terminal's real state matches the
+            // per-row assumption that fg/bg are Default and bold/italic/underline
+            // are off. `ResetColor` only clears colors, leaving stale
+            // bold/italic/underline from a previous row visible on leading cells.
+            // Emitted before the MoveTo so the assumption holds at the content
+            // origin's column, not just at column 0.
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+            queue!(stdout, MoveTo(self.origin_x, sy as u16))?;
 
             let mut last_fg = CellColor::Default;
             let mut last_bg = CellColor::Default;
@@ -81,14 +173,9 @@ impl Renderer {
             let mut last_underline = false;
             let mut last_hyperlink: Option<String> = None;
 
-            // Full SGR reset (SGR 0) so the terminal's real state matches the
-            // per-row assumption that fg/bg are Default and bold/italic/underline
-            // are off. `ResetColor` only clears colors, leaving stale
-            // bold/italic/underline from a previous row visible on leading cells.
-            queue!(stdout, SetAttribute(Attribute::Reset))?;
-
             for (x, cell) in row.iter().enumerate() {
-                if x as u16 >= self.cols {
+                let sx = x + ox;
+                if sx >= self.cols as usize {
                     break;
                 }
 
@@ -159,34 +246,48 @@ impl Renderer {
             }
             queue!(stdout, ResetColor)?;
 
-            // The composite frame may be narrower than this client's terminal
-            // (frame is sized to the MIN across attached clients). A larger
-            // client would otherwise leave stale content to the right of the
-            // frame. The cursor is already positioned after the last painted
-            // cell; ResetColor above ensures the cleared area uses the default
-            // background, then clear to end of line.
-            if (row.len() as u16) < self.cols {
-                queue!(stdout, Clear(ClearType::UntilNewLine))?;
+            // A row may be shorter than the content area (the frame is sized to
+            // the MIN across attached clients, so a larger client would leave
+            // stale content to the right of it). Blank the remainder of the
+            // CONTENT rect only -- never to the terminal edge, because a right
+            // sidebar lives out there and `Clear(ClearType::UntilNewLine)` would
+            // erase it on every frame. The cursor is already positioned after
+            // the last painted cell and ResetColor above put the default
+            // background back, so spaces are equivalent to the clear.
+            let painted = (ox + row.len()).min(self.cols as usize);
+            if painted < content_right {
+                for sx in painted..content_right {
+                    self.front[sy][sx] = RenderCell::default();
+                }
+                queue!(stdout, Print(" ".repeat(content_right - painted)))?;
             }
         }
 
-        // Clear any terminal rows below the frame. When the composite frame has
-        // fewer rows than this client's terminal, stale content (e.g. a doubled
-        // status bar) would otherwise persist at the true bottom of the screen.
-        if cells.len() < self.rows as usize {
-            queue!(
-                stdout,
-                ResetColor,
-                MoveTo(0, cells.len() as u16),
-                Clear(ClearType::FromCursorDown),
-            )?;
+        // Blank any content rows below the frame. When the composite frame has
+        // fewer rows than the content area, stale content (e.g. a doubled status
+        // bar) would otherwise persist below it. Bounded to the content rect on
+        // every side: `Clear(ClearType::FromCursorDown)` would wipe a bottom
+        // sidebar entirely, and even a per-row clear-to-EOL would eat a right
+        // sidebar's cells on these rows.
+        let first_blank = (oy + cells.len()).min(self.rows as usize);
+        if first_blank < content_bottom && ox < content_right {
+            queue!(stdout, ResetColor)?;
+            for sy in first_blank..content_bottom {
+                queue!(stdout, MoveTo(self.origin_x, sy as u16))?;
+                queue!(stdout, Print(" ".repeat(content_right - ox)))?;
+                for sx in ox..content_right {
+                    self.front[sy][sx] = RenderCell::default();
+                }
+            }
         }
 
-        // Update cursor.
+        // Update cursor. The reported position is content-relative, so it has
+        // to be offset -- otherwise the hardware cursor lands in a left sidebar.
         if cursor_visible {
+            let (sx, sy) = self.cursor_screen_pos(cursor_x, cursor_y);
             queue!(
                 stdout,
-                MoveTo(cursor_x, cursor_y),
+                MoveTo(sx, sy),
                 cursor_style_command(cursor_style),
                 cursor::Show,
             )?;
@@ -194,8 +295,22 @@ impl Renderer {
             queue!(stdout, cursor::Hide)?;
         }
 
-        // Update front buffer.
-        self.front = cells.to_vec();
+        // Blit into the front buffer at the origin. NEVER `self.front = cells.to_vec()`
+        // -- the front buffer is the FULL terminal, including sidebar columns, and
+        // replacing it would both resize it and destroy every panel cell.
+        for (y, row) in cells.iter().enumerate() {
+            let sy = y + oy;
+            if sy >= self.rows as usize {
+                break;
+            }
+            for (x, cell) in row.iter().enumerate() {
+                let sx = x + ox;
+                if sx >= self.cols as usize {
+                    break;
+                }
+                self.front[sy][sx] = cell.clone();
+            }
+        }
 
         // End synchronized output.
         queue!(stdout, Print("\x1b[?2026l"))?;
@@ -227,7 +342,11 @@ impl Renderer {
         queue!(stdout, cursor::Hide)?;
 
         for change in changes {
-            if change.x >= self.cols || change.y >= self.rows {
+            // Change coordinates are content-relative; translate them to the
+            // screen and drop anything that falls outside the terminal.
+            let sx = change.x as usize + self.origin_x as usize;
+            let sy = change.y as usize + self.origin_y as usize;
+            if sx >= self.cols as usize || sy >= self.rows as usize {
                 continue;
             }
 
@@ -238,7 +357,7 @@ impl Renderer {
             if change.cell.width != 0 {
                 queue!(
                     stdout,
-                    MoveTo(change.x, change.y),
+                    MoveTo(sx as u16, sy as u16),
                     SetForegroundColor(cell_color_to_crossterm(&change.cell.fg)),
                     SetBackgroundColor(cell_color_to_crossterm(&change.cell.bg)),
                 )?;
@@ -284,18 +403,18 @@ impl Renderer {
             }
 
             // Update front buffer (always, even for skipped continuation cells).
-            let y = change.y as usize;
-            let x = change.x as usize;
-            if y < self.front.len() && x < self.front[y].len() {
-                self.front[y][x] = change.cell.clone();
+            if sy < self.front.len() && sx < self.front[sy].len() {
+                self.front[sy][sx] = change.cell.clone();
             }
         }
 
-        // Update cursor.
+        // Update cursor. The reported position is content-relative, so it has
+        // to be offset -- otherwise the hardware cursor lands in a left sidebar.
         if cursor_visible {
+            let (sx, sy) = self.cursor_screen_pos(cursor_x, cursor_y);
             queue!(
                 stdout,
-                MoveTo(cursor_x, cursor_y),
+                MoveTo(sx, sy),
                 cursor_style_command(cursor_style),
                 cursor::Show,
             )?;
@@ -336,8 +455,10 @@ impl Renderer {
         let mut stdout = io::stdout().lock();
         queue!(stdout, cursor::Hide)?;
 
-        let px = pane_x as usize;
-        let py = pane_y as usize;
+        // `pane_x`/`pane_y` arrive content-relative; the front buffer is the
+        // full terminal, so translate them to screen coordinates once here.
+        let px = pane_x as usize + self.origin_x as usize;
+        let py = pane_y as usize + self.origin_y as usize;
         let pw = pane_width as usize;
         let ph = pane_height as usize;
         let abs_delta = delta.unsigned_abs() as usize;
@@ -409,11 +530,17 @@ impl Renderer {
         // know the content shifted.
         for row in 0..ph {
             let screen_y = py + row;
-            if screen_y >= self.front.len() || screen_y as u16 >= self.rows {
+            if screen_y >= self.front.len() || screen_y >= self.rows as usize {
                 break;
             }
 
-            queue!(stdout, MoveTo(pane_x, screen_y as u16))?;
+            queue!(
+                stdout,
+                MoveTo(
+                    px.min(self.cols.saturating_sub(1) as usize) as u16,
+                    screen_y as u16
+                )
+            )?;
 
             let mut last_fg = CellColor::Default;
             let mut last_bg = CellColor::Default;
@@ -503,11 +630,14 @@ impl Renderer {
             queue!(stdout, ResetColor)?;
         }
 
-        // 3. Update cursor
+        // 3. Update cursor. The reported position is content-relative, so it
+        // has to be offset -- otherwise the hardware cursor lands in a left
+        // sidebar.
         if cursor_visible {
+            let (sx, sy) = self.cursor_screen_pos(cursor_x, cursor_y);
             queue!(
                 stdout,
-                MoveTo(cursor_x, cursor_y),
+                MoveTo(sx, sy),
                 cursor_style_command(cursor_style),
                 cursor::Show,
             )?;
@@ -519,6 +649,93 @@ impl Renderer {
         queue!(stdout, Print("\x1b[?2026l"))?;
 
         Ok(())
+    }
+
+    /// Write a panel's grid into the front buffer at `rect` and emit it.
+    ///
+    /// Panels are NOT overlays: they go into the front buffer so a later
+    /// `render_full` or `repaint_all` reproduces them instead of erasing them.
+    /// Extra rows/columns in `cells` are ignored; a `cells` smaller than `rect`
+    /// simply leaves the remainder untouched.
+    pub fn paint_panel(&mut self, rect: Rect, cells: &[Vec<RenderCell>]) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        queue!(stdout, Print("\x1b[?2026h"))?;
+        queue!(stdout, cursor::Hide)?;
+
+        for (ry, row) in cells.iter().enumerate() {
+            let sy = rect.y as usize + ry;
+            if ry >= rect.height as usize || sy >= self.rows as usize {
+                break;
+            }
+            // Same reset discipline as render_full: without it the previous
+            // row's attributes bleed into this panel's leading cells.
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+            queue!(stdout, MoveTo(rect.x, sy as u16))?;
+
+            let mut last_fg = CellColor::Default;
+            let mut last_bg = CellColor::Default;
+            for (rx, cell) in row.iter().enumerate() {
+                let sx = rect.x as usize + rx;
+                if rx >= rect.width as usize || sx >= self.cols as usize {
+                    break;
+                }
+                if cell.width == 0 {
+                    self.front[sy][sx] = cell.clone();
+                    continue;
+                }
+                if cell.fg != last_fg {
+                    queue!(
+                        stdout,
+                        SetForegroundColor(cell_color_to_crossterm(&cell.fg))
+                    )?;
+                    last_fg = cell.fg.clone();
+                }
+                if cell.bg != last_bg {
+                    queue!(
+                        stdout,
+                        SetBackgroundColor(cell_color_to_crossterm(&cell.bg))
+                    )?;
+                    last_bg = cell.bg.clone();
+                }
+                queue!(stdout, Print(cell.c))?;
+                self.front[sy][sx] = cell.clone();
+            }
+            // Reset at end of row so the panel's background cannot bleed into
+            // the first content column.
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+        }
+
+        queue!(stdout, Print("\x1b[?2026l"))?;
+        Ok(())
+    }
+
+    /// Repaint the ENTIRE front buffer from (0, 0), ignoring the content
+    /// origin.
+    ///
+    /// `render_full` writes at the origin, so it can no longer be used to
+    /// restore the whole screen. Overlay teardown must call this instead, or
+    /// the sidebars are erased.
+    pub fn repaint_all(&mut self) -> Result<()> {
+        let saved = (
+            self.origin_x,
+            self.origin_y,
+            self.content_cols,
+            self.content_rows,
+        );
+        // The frame here IS the whole terminal, so the content rect must be the
+        // whole terminal too -- otherwise the clears would treat the panel
+        // columns as stale remainder and blank them.
+        self.origin_x = 0;
+        self.origin_y = 0;
+        self.content_cols = self.cols;
+        self.content_rows = self.rows;
+        let cells = self.front.clone();
+        let res = self.render_full(&cells, 0, 0, false, 0);
+        self.origin_x = saved.0;
+        self.origin_y = saved.1;
+        self.content_cols = saved.2;
+        self.content_rows = saved.3;
+        res
     }
 
     /// Flush all queued render commands to the terminal.
@@ -533,6 +750,10 @@ impl Renderer {
         log::debug!("renderer: resize cols={} rows={}", cols, rows);
         self.cols = cols;
         self.rows = rows;
+        // The content rect falls back to the whole terminal until the caller
+        // recomputes it for the new size; the origin is left alone.
+        self.content_cols = cols;
+        self.content_rows = rows;
         self.front = vec![vec![RenderCell::default(); cols as usize]; rows as usize];
         // Clear the terminal to avoid stale content from old layout.
         let mut stdout = io::stdout().lock();
@@ -1124,15 +1345,14 @@ impl Renderer {
         &self.front
     }
 
-    /// Clear the overlay by re-rendering the front buffer rows that might
-    /// have been affected (bottom portion of screen).
+    /// Clear the overlay by re-rendering the whole front buffer.
+    ///
+    /// Delegates to `repaint_all`: `render_full` writes at the content origin,
+    /// so using it here would re-blit the full-terminal buffer offset by the
+    /// origin and erase the sidebars.
     pub fn clear_overlay(&mut self, cols: u16, rows: u16) -> Result<()> {
-        // Re-render the current front buffer to clear any overlay.
-        let cells = self.front.clone();
-        // Determine cursor position from existing state (place at 0,0 hidden).
-        self.render_full(&cells, 0, 0, false, 0)?;
         let _ = (cols, rows); // suppress unused warnings
-        Ok(())
+        self.repaint_all()
     }
 
     /// Restore the hardware cursor to a known terminal position and visibility.
@@ -1145,7 +1365,10 @@ impl Renderer {
     pub fn restore_cursor(&mut self, x: u16, y: u16, visible: bool) -> Result<()> {
         let mut stdout = io::stdout().lock();
         if visible {
-            queue!(stdout, MoveTo(x, y), cursor::Show)?;
+            // `x`/`y` are the last server-reported position, i.e.
+            // content-relative: offset them or the cursor lands in a sidebar.
+            let (sx, sy) = self.cursor_screen_pos(x, y);
+            queue!(stdout, MoveTo(sx, sy), cursor::Show)?;
         } else {
             queue!(stdout, cursor::Hide)?;
         }
@@ -1348,5 +1571,294 @@ mod tests {
         vs.cursor_col = 2;
         let text = renderer.extract_text(&vs);
         assert_eq!(text, "BBB\nCCC");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use crate::protocol::CellColor;
+    use crate::server::layout::Rect;
+
+    fn cell(c: char) -> RenderCell {
+        RenderCell {
+            c,
+            fg: CellColor::Default,
+            bg: CellColor::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+            width: 1,
+            combining: Vec::new(),
+            hyperlink: None,
+        }
+    }
+
+    fn grid(text: &str, rows: usize) -> Vec<Vec<RenderCell>> {
+        (0..rows)
+            .map(|_| text.chars().map(cell).collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[test]
+    fn origin_defaults_to_zero() {
+        let r = Renderer::new(80, 24);
+        assert_eq!(r.origin(), (0, 0));
+    }
+
+    #[test]
+    fn render_full_writes_the_front_buffer_at_the_origin() {
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 1);
+        r.render_full(&grid("abc", 2), 0, 0, false, 0).unwrap();
+        let front = r.front_buffer();
+        // Columns 0..5 of row 1 are untouched; the content starts at column 5.
+        assert_eq!(front[1][4].c, ' ');
+        assert_eq!(front[1][5].c, 'a');
+        assert_eq!(front[1][6].c, 'b');
+        assert_eq!(front[1][7].c, 'c');
+        // Row 0 is above the content origin and stays blank.
+        assert!(front[0].iter().all(|c| c.c == ' '));
+    }
+
+    #[test]
+    fn render_full_clips_content_that_would_overflow_the_terminal() {
+        let mut r = Renderer::new(10, 3);
+        r.set_origin(8, 2);
+        // 5 wide x 3 tall at origin (8,2) in a 10x3 terminal: only 2 columns
+        // and 1 row fit. Must clip, not panic.
+        r.render_full(&grid("vwxyz", 3), 0, 0, false, 0).unwrap();
+        let front = r.front_buffer();
+        assert_eq!(front[2][8].c, 'v');
+        assert_eq!(front[2][9].c, 'w');
+    }
+
+    #[test]
+    fn render_diff_applies_the_origin_to_change_coordinates() {
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 1);
+        r.render_full(&grid("abc", 2), 0, 0, false, 0).unwrap();
+        let changes = vec![CellChange {
+            y: 0,
+            x: 1,
+            cell: cell('Z'),
+        }];
+        r.render_diff(&changes, 0, 0, false, 0).unwrap();
+        // Server-relative (1,0) is screen (6,1).
+        assert_eq!(r.front_buffer()[1][6].c, 'Z');
+    }
+
+    #[test]
+    fn render_diff_drops_changes_that_fall_outside_the_terminal() {
+        let mut r = Renderer::new(10, 3);
+        r.set_origin(8, 2);
+        let changes = vec![CellChange {
+            y: 5,
+            x: 5,
+            cell: cell('Q'),
+        }];
+        // Must not panic and must not write anywhere.
+        r.render_diff(&changes, 0, 0, false, 0).unwrap();
+        assert!(r
+            .front_buffer()
+            .iter()
+            .all(|row| row.iter().all(|c| c.c != 'Q')));
+    }
+
+    #[test]
+    fn paint_panel_writes_into_the_front_buffer_so_it_survives_a_repaint() {
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 0);
+        let panel = grid("SIDE", 4);
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &panel,
+        )
+        .unwrap();
+        assert_eq!(r.front_buffer()[0][0].c, 'S');
+        assert_eq!(r.front_buffer()[3][3].c, 'E');
+    }
+
+    #[test]
+    fn a_content_render_does_not_erase_a_painted_panel() {
+        // The bug this whole design exists to avoid: overlay-style painting
+        // would be wiped by the next full render.
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 0);
+        let panel = grid("SIDE", 4);
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &panel,
+        )
+        .unwrap();
+        r.render_full(&grid("xyz", 4), 0, 0, false, 0).unwrap();
+        assert_eq!(
+            r.front_buffer()[0][0].c,
+            'S',
+            "panel was erased by render_full"
+        );
+        assert_eq!(r.front_buffer()[0][5].c, 'x');
+    }
+
+    #[test]
+    fn paint_panel_clips_a_rect_that_runs_past_the_terminal() {
+        let mut r = Renderer::new(6, 2);
+        let panel = grid("abcdefgh", 4);
+        r.paint_panel(
+            Rect {
+                x: 4,
+                y: 1,
+                width: 8,
+                height: 4,
+            },
+            &panel,
+        )
+        .unwrap();
+        assert_eq!(r.front_buffer()[1][4].c, 'a');
+        assert_eq!(r.front_buffer()[1][5].c, 'b');
+    }
+
+    #[test]
+    fn paint_panel_ignores_a_grid_smaller_than_its_rect() {
+        let mut r = Renderer::new(20, 4);
+        // A misbehaving plugin returning too few rows must not panic.
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &grid("ab", 1),
+        )
+        .unwrap();
+        assert_eq!(r.front_buffer()[0][0].c, 'a');
+    }
+
+    #[test]
+    fn repaint_all_preserves_both_panel_and_content_cells() {
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 0);
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &grid("SIDE", 4),
+        )
+        .unwrap();
+        r.render_full(&grid("xyz", 4), 0, 0, false, 0).unwrap();
+        r.repaint_all().unwrap();
+        assert_eq!(r.front_buffer()[0][0].c, 'S');
+        assert_eq!(r.front_buffer()[0][5].c, 'x');
+    }
+
+    #[test]
+    fn render_full_does_not_shrink_the_front_buffer() {
+        // Guards hazard (a): `self.front = cells.to_vec()` would resize the
+        // front buffer to the content frame and destroy the sidebar columns.
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 0);
+        r.render_full(&grid("xyz", 4), 0, 0, false, 0).unwrap();
+        assert_eq!(r.front_buffer().len(), 4, "front buffer lost rows");
+        assert_eq!(r.front_buffer()[0].len(), 20, "front buffer lost columns");
+    }
+
+    #[test]
+    fn a_narrow_frame_does_not_clear_a_right_sidebar() {
+        // Guards hazard (b): the end-of-row clear must stop at the content
+        // rect's right edge, not the terminal's.
+        let mut r = Renderer::new(20, 2);
+        // Content is columns 0..14; a right sidebar occupies 14..20.
+        r.paint_panel(
+            Rect {
+                x: 14,
+                y: 0,
+                width: 6,
+                height: 2,
+            },
+            &grid("RIGHT!", 2),
+        )
+        .unwrap();
+        r.set_origin(0, 0);
+        r.set_content_size(14, 2);
+        // A frame narrower than the content rect: 3 columns of a 14-wide area.
+        r.render_full(&grid("abc", 2), 0, 0, false, 0).unwrap();
+        assert_eq!(r.front_buffer()[0][14].c, 'R', "right sidebar was cleared");
+        assert_eq!(r.front_buffer()[0][19].c, '!', "right sidebar was cleared");
+    }
+
+    #[test]
+    fn a_short_frame_does_not_clear_a_bottom_sidebar() {
+        // Guards hazard (c): the below-frame clear must stop at the content
+        // rect's bottom edge, not the terminal's.
+        let mut r = Renderer::new(10, 6);
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 4,
+                width: 10,
+                height: 2,
+            },
+            &grid("BOTTOMBOTT", 2),
+        )
+        .unwrap();
+        r.set_origin(0, 0);
+        r.set_content_size(10, 4);
+        // Frame is 2 rows in a 4-row content area, terminal is 6 rows.
+        r.render_full(&grid("abcdefghij", 2), 0, 0, false, 0)
+            .unwrap();
+        assert_eq!(r.front_buffer()[4][0].c, 'B', "bottom sidebar was cleared");
+        assert_eq!(r.front_buffer()[5][9].c, 'T', "bottom sidebar was cleared");
+    }
+
+    #[test]
+    fn a_smaller_frame_still_clears_stale_content_at_the_default_content_size() {
+        // The today-behaviour gate. With no sidebars configured -- default
+        // content size, origin (0, 0) -- a frame narrower AND shorter than the
+        // terminal must still blank the stale region beyond it. That is what
+        // `Clear(UntilNewLine)` / `Clear(FromCursorDown)` did for the
+        // min-across-clients case (the composite frame is sized to the MIN
+        // across attached clients, so a larger client sees a smaller frame),
+        // and bounding the clears must not regress it.
+        let mut r = Renderer::new(10, 4);
+        r.render_full(&grid("SSSSSSSSSS", 4), 0, 0, false, 0)
+            .unwrap();
+        r.render_full(&grid("abc", 2), 0, 0, false, 0).unwrap();
+        let front = r.front_buffer();
+        assert_eq!(front[0][0].c, 'a');
+        assert_eq!(
+            front[0][5].c, ' ',
+            "stale content to the right of the frame was not cleared"
+        );
+        assert_eq!(
+            front[3][9].c, ' ',
+            "stale content below the frame was not cleared"
+        );
+    }
+
+    #[test]
+    fn resize_resets_the_front_buffer_but_keeps_the_origin() {
+        let mut r = Renderer::new(20, 4);
+        r.set_origin(5, 1);
+        r.resize(30, 10);
+        assert_eq!(r.origin(), (5, 1));
+        // The content rect falls back to the whole terminal; the caller must
+        // recompute it for the new size.
+        assert_eq!(r.content_size(), (30, 10));
+        assert_eq!(r.front_buffer().len(), 10);
+        assert_eq!(r.front_buffer()[0].len(), 30);
     }
 }
