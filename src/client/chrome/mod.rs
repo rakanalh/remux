@@ -313,10 +313,15 @@ impl Chrome {
 ///
 /// `focused_pane_rect` is the pane's interior, so an edge pane's reported rect
 /// is short of the pane area by the border width. Both border styles inset by
-/// at most one cell per side (zellij-style: 1 all round when the pane is big
-/// enough; tmux-style: 1 row at the top when the pane has a stack tab bar), and
-/// a pane that is genuinely NOT at an edge is a whole neighbouring pane away --
-/// far more than one cell -- so a one-cell tolerance cannot confuse the two.
+/// at most one cell per side: zellij-style is 1 all round when the pane is big
+/// enough, tmux-style is 1 row at the top when the pane has a stack tab bar and
+/// 0 columns either side.
+///
+/// 1 is exactly right and 2 would be a bug, not merely a looser bound.
+/// `layout::MIN_PANE_SIZE` is 2, so a 2-column pane is legal; under tmux-style
+/// (`x_off == 0`) its RIGHT neighbour's interior then begins at `rect.x == 2`,
+/// and a tolerance of 2 would call that non-edge pane "at the left edge" and
+/// steal its `PaneFocusLeft`. Widening this constant needs that case rechecked.
 const BORDER_INSET: u16 = 1;
 
 /// Intercept a directional focus command. Returns `true` when the command was
@@ -338,6 +343,18 @@ pub fn intercept_focus(
 ) -> bool {
     use FocusDirection::*;
 
+    // The key path resolves focus through `focused_panel`, but a command can
+    // reach here without passing through it -- a SIGWINCH landing between the
+    // prefix and the chord key force-hides the sidebar while `chrome.focus`
+    // still names it. Release it here too, or `Prefix p h` would be swallowed
+    // with no sidebar on screen.
+    if matches!(chrome.focus, ChromeFocus::Sidebar { .. })
+        && chrome.focused_panel(term_cols, term_rows).is_none()
+    {
+        log::debug!("sidebar: focus was stranded by a resize; releasing it to the content");
+        chrome.leave_sidebar();
+    }
+
     match chrome.focus {
         ChromeFocus::Sidebar { sidebar, panel } => {
             let edge = chrome.sidebars[sidebar].edge;
@@ -356,15 +373,25 @@ pub fn intercept_focus(
                 SidebarEdge::Bottom => matches!(dir, Left | Right),
             };
             if along_stack {
-                let n = chrome.sidebars[sidebar].panels.len();
-                let next = if matches!(dir, Down | Right) {
-                    if panel + 1 < n {
-                        panel + 1
-                    } else {
-                        panel
+                // Walk `panel_rects`, not `panels`: `split_panels` DROPS a panel
+                // whose share falls below its `min_size`, so the laid-out indices
+                // can be non-contiguous and `panel + 1` may name a panel that is
+                // never painted. `focus_edge` and `cycle_focus` both walk the
+                // rects; this matches them.
+                let rects = chrome.panel_rects(term_cols, term_rows);
+                let mine: Vec<usize> = rects
+                    .iter()
+                    .filter(|(s, _, _)| *s == sidebar)
+                    .map(|(_, p, _)| *p)
+                    .collect();
+                let next = match mine.iter().position(|p| *p == panel) {
+                    Some(i) if matches!(dir, Down | Right) => {
+                        mine.get(i + 1).copied().unwrap_or(panel)
                     }
-                } else {
-                    panel.saturating_sub(1)
+                    Some(i) => i.checked_sub(1).map(|j| mine[j]).unwrap_or(panel),
+                    // Focus is on a panel that is not laid out. The release above
+                    // makes this unreachable; stay put rather than guess.
+                    None => panel,
                 };
                 chrome.focus = ChromeFocus::Sidebar {
                     sidebar,
@@ -739,6 +766,108 @@ mod focus_tests {
             ChromeFocus::Sidebar {
                 sidebar: 0,
                 panel: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_focus_stranded_by_a_resize_is_released_rather_than_swallowing_the_command() {
+        // Review minor 2: the key path releases stranded focus via
+        // `focused_panel`, but a command can reach `intercept_focus` without
+        // passing through it -- a SIGWINCH between the prefix and the chord key.
+        // At 18 columns the sidebar is force-hidden, so `Prefix p h` must be
+        // FORWARDED (there is no sidebar on screen to enter), not swallowed.
+        let mut c = chrome_with(SidebarEdge::Left, 30);
+        c.focus = ChromeFocus::Sidebar {
+            sidebar: 0,
+            panel: 0,
+        };
+        let pane = PaneRect {
+            x: 1,
+            y: 1,
+            width: 16,
+            height: 27,
+        };
+        assert!(!intercept_focus(
+            &mut c,
+            FocusDirection::Left,
+            Some(&pane),
+            18,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(c.focus, ChromeFocus::Content);
+    }
+
+    #[test]
+    fn the_stack_walk_skips_a_panel_that_was_dropped_for_being_too_small() {
+        // Review minor 3: `split_panels` drops a panel below its `min_size`, so
+        // the laid-out indices are non-contiguous. Walking `panels.len()` would
+        // move focus onto index 1 -- a panel that is never painted.
+        //
+        // The placeholder's min is (8, 2). Over 5 rows with weights 10/1/10,
+        // the middle panel's share is 0 rows, so it is dropped and only panels
+        // 0 and 2 are laid out.
+        let mut c = Chrome::from_config(&[SidebarConfig {
+            edge: SidebarEdge::Left,
+            size: 30,
+            visible: true,
+            panel: vec![
+                PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: 10,
+                },
+                PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: 1,
+                },
+                PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: 10,
+                },
+            ],
+        }]);
+        let laid_out: Vec<usize> = c
+            .panel_rects(100, 5)
+            .into_iter()
+            .map(|(_, p, _)| p)
+            .collect();
+        assert_eq!(laid_out, vec![0, 2], "the fixture no longer drops panel 1");
+
+        c.focus = ChromeFocus::Sidebar {
+            sidebar: 0,
+            panel: 0,
+        };
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Down,
+            None,
+            100,
+            5,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(
+            c.focus,
+            ChromeFocus::Sidebar {
+                sidebar: 0,
+                panel: 2
+            },
+            "the walk landed on the dropped panel instead of skipping it"
+        );
+        // ... and back up again, skipping it in the other direction too.
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Up,
+            None,
+            100,
+            5,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(
+            c.focus,
+            ChromeFocus::Sidebar {
+                sidebar: 0,
+                panel: 0
             }
         );
     }

@@ -4261,6 +4261,20 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Paste(text))) => {
+                        // Bracketed paste is a SEPARATE crossterm event, so it never
+                        // passes the key routing above: without this guard a focused
+                        // sidebar would have Ctrl-Shift-V typed into the shell behind
+                        // it, which is the one path by which input reaches the server
+                        // while a panel owns the keyboard. Dropped rather than routed
+                        // -- a plugin paste hook belongs to the plugin tasks.
+                        let (tc, tr) = renderer.size();
+                        if chrome.focused_panel(tc, tr).is_some() {
+                            log::debug!(
+                                "sidebar: dropping a {}-byte paste -- a panel has focus",
+                                text.len()
+                            );
+                            continue;
+                        }
                         // Wrap pasted text in bracketed paste sequences.
                         let mut data = Vec::new();
                         data.extend_from_slice(b"\x1b[200~");

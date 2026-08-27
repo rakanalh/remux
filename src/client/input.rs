@@ -1573,12 +1573,21 @@ impl InputHandler {
             || self.view_picker.is_some()
     }
 
-    /// Whether this key is the configured prefix (leader).
+    /// Whether this key is a way into command mode: the configured leader, or a
+    /// shortcut bound to a group prefix (`"Alt-p" = "@p"`).
     ///
-    /// A focused sidebar owns the keyboard, but never the prefix: swallowing it
-    /// would make command mode unreachable from inside a panel.
+    /// A focused sidebar owns the keyboard, but never these: swallowing one
+    /// would make command mode unreachable from inside a panel. A group prefix
+    /// is a second entrance to the same place, so it earns the same exemption.
     pub fn is_prefix_key(&self, key: &KeyEvent) -> bool {
-        self.is_leader_key(key)
+        if self.is_leader_key(key) {
+            return true;
+        }
+        self.mode == Mode::Normal
+            && matches!(
+                self.shortcut_bindings.lookup(key),
+                Some(InterceptAction::GroupPrefix(_))
+            )
     }
 
     /// Whether this key resolves to one of the sidebar `ClientAction`s.
@@ -1614,6 +1623,12 @@ impl InputHandler {
     /// Directional keys are the one command a focused sidebar does not take:
     /// they are how the user gets back out, and `intercept_focus` decides what
     /// they mean. Non-mutating, so it can be asked before `handle_key`.
+    ///
+    /// EVERY action in the chain must be a `PaneFocus*`, not just one of them:
+    /// the exemption passes the whole key through to `ExecuteChain`, so a mixed
+    /// chain like `"PaneFocusLeft; PaneKill"` would forward `PaneKill` to the
+    /// server while a panel has the keyboard. A mixed chain goes to the plugin
+    /// instead, like any other key.
     pub fn resolves_to_pane_focus(&self, key: &KeyEvent) -> bool {
         if self.mode != Mode::Normal {
             return false;
@@ -1621,17 +1636,18 @@ impl InputHandler {
         let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
             return false;
         };
-        actions.iter().any(|a| {
-            matches!(
-                resolve_action(a),
-                Some(Action::Server(
-                    RemuxCommand::PaneFocusLeft
-                        | RemuxCommand::PaneFocusRight
-                        | RemuxCommand::PaneFocusUp
-                        | RemuxCommand::PaneFocusDown
-                ))
-            )
-        })
+        !actions.is_empty()
+            && actions.iter().all(|a| {
+                matches!(
+                    resolve_action(a),
+                    Some(Action::Server(
+                        RemuxCommand::PaneFocusLeft
+                            | RemuxCommand::PaneFocusRight
+                            | RemuxCommand::PaneFocusUp
+                            | RemuxCommand::PaneFocusDown
+                    ))
+                )
+            })
     }
 
     // -----------------------------------------------------------------------

@@ -93,6 +93,19 @@ size = {SIDEBAR_W}
 visible = true
 {PANEL}"""
 
+# A MIXED chain (a directional command plus a destructive one) and a group-prefix
+# shortcut, for the two exemption edge cases the review found.
+CFG_EXEMPTIONS = f"""
+[keybindings.command]
+"Alt-5" = "PaneFocusLeft; SetMaster"
+"Alt-6" = "@p"
+
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+{PANEL}"""
+
 # The regression baseline: a valid config with no `[[sidebar]]` at all, so
 # `panel_rects` is empty and every sidebar code path is unreachable.
 # The toggle/focus/cycle actions bound to keys, so the `InputAction::Sidebar`
@@ -681,6 +694,125 @@ def test_focusing_a_sidebar_that_cannot_fit_is_refused_and_logged():
     print("PASS test_focusing_a_sidebar_that_cannot_fit_is_refused_and_logged")
 
 
+def bracketed_paste(text: str) -> bytes:
+    """What a terminal sends for a paste once bracketed paste is enabled."""
+    return b"\x1b[200~" + text.encode() + b"\x1b[201~"
+
+
+def test_a_paste_does_not_leak_past_a_focused_sidebar():
+    """Bracketed paste is a SEPARATE crossterm event from a key press.
+
+    It never passes the key routing, so without an explicit guard Ctrl-Shift-V
+    with a panel focused types straight into the shell behind the sidebar --
+    the one path by which input reaches the server while a panel owns the
+    keyboard. Both directions are asserted: dropped while focused, delivered
+    once focus returns, so the guard cannot pass by breaking paste outright.
+    """
+    env = make_env(CFG_LEFT)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen), "the sidebar never took focus"
+
+    child.send(bracketed_paste("PASTELEAK"))
+    pump(1.5)
+    assert not any("PASTELEAK" in r for r in screen.display), (
+        "a paste reached the shell while a panel had focus:\n"
+        + "\n".join(screen.display)
+    )
+    assert child.isalive(), "the client died handling a paste with a panel focused"
+
+    # Leaving the sidebar restores paste -- the guard drops it, it does not
+    # break bracketed paste.
+    child.send(ALT_L)
+    pump(1.0)
+    assert not focused_rows(screen), "Alt+l did not leave the sidebar"
+    child.send(bracketed_paste("PASTEOK"))
+    pump(1.5)
+    assert any("PASTEOK" in r[SIDEBAR_W:] for r in screen.display), (
+        "paste stayed broken after focus returned to the content:\n"
+        + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_paste_does_not_leak_past_a_focused_sidebar")
+
+
+def test_a_mixed_chain_does_not_earn_the_directional_exemption():
+    """`Alt-5 = "PaneFocusLeft; SetMaster"` must NOT pass through a focused panel.
+
+    The exemption passes the WHOLE key to `ExecuteChain`, so letting a chain
+    through because it merely *contains* a `PaneFocus*` would forward its other
+    commands to the server while a panel has the keyboard. A mixed chain goes to
+    the plugin like any other key.
+    """
+    env = make_env(CFG_EXEMPTIONS)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen), "the sidebar never took focus"
+
+    child.send(b"\x1b5")
+    pump(1.5)
+
+    log = server_log()
+    assert "SetMaster" not in log, (
+        "a mixed chain leaked its non-directional command to the server:\n"
+        + "\n".join(ln for ln in log.splitlines() if "msg=Command" in ln)
+    )
+    assert not pane_focus_cmds(log), (
+        f"the chain's directional command leaked too: {pane_focus_cmds(log)}"
+    )
+    # The key went to the PLUGIN, which is why nothing reached the server. The
+    # placeholder only reacts visibly to j/k, so the discriminator is the client
+    # log: the sidebar routing `continue`s before `handle_key`, so a key the
+    # exemption wrongly passed through would be logged there.
+    assert "handle_key code=Char('5')" not in client_log(), (
+        "the mixed chain passed through to the input handler instead of the "
+        "plugin; it only did not reach the server by luck:\n"
+        + "\n".join(ln for ln in client_log().splitlines() if "Char('5')" in ln)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_mixed_chain_does_not_earn_the_directional_exemption")
+
+
+def test_a_group_prefix_shortcut_still_opens_command_mode():
+    """`Alt-6 = "@p"` is a second entrance to command mode, not a plugin key.
+
+    `is_prefix_key` matching only the leader would let the plugin eat it, so a
+    user who reaches the Pane group by shortcut rather than by `Ctrl-a p` could
+    not do so from inside a sidebar.
+    """
+    env = make_env(CFG_EXEMPTIONS)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen), "the sidebar never took focus"
+
+    child.send(b"\x1b6")
+    pump(1.5)
+    assert any("focus left" in r for r in screen.display), (
+        "a group-prefix shortcut did not open command mode from a focused "
+        "panel:\n" + "\n".join(screen.display)
+    )
+    child.send(b"\x1b")
+    pump(1.0)
+    assert child.isalive(), "the client died leaving the group"
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_group_prefix_shortcut_still_opens_command_mode")
+
+
 if __name__ == "__main__":
     if not os.path.exists(BIN):
         sys.exit(f"build first: {BIN} missing")
@@ -695,5 +827,8 @@ if __name__ == "__main__":
     test_a_command_chain_intercepts_per_command()
     test_the_sidebar_actions_toggle_focus_and_cycle()
     test_focusing_a_sidebar_that_cannot_fit_is_refused_and_logged()
+    test_a_paste_does_not_leak_past_a_focused_sidebar()
+    test_a_mixed_chain_does_not_earn_the_directional_exemption()
+    test_a_group_prefix_shortcut_still_opens_command_mode()
     test_with_no_sidebar_every_directional_key_is_unchanged()
     print("ALL PASS")
