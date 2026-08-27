@@ -5,6 +5,7 @@ pub mod input;
 pub mod registry;
 pub mod renderer;
 pub mod session_manager;
+pub mod sidebar;
 pub mod terminal;
 pub mod view;
 pub mod whichkey;
