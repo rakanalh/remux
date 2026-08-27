@@ -40,12 +40,10 @@ use crate::server::layout::Rect;
 ///
 /// The front buffer is always the FULL terminal in absolute coordinates,
 /// panels included. Nothing a server frame draws may write, clear, or move a
-/// cell outside the content rect: [`Renderer::render_full`],
-/// [`Renderer::render_diff`] and [`Renderer::restore_cursor`] clip to it
-/// unconditionally, so an in-flight frame built for a previous, larger
-/// geometry is truncated rather than allowed to paint over a panel.
-/// [`Renderer::render_scroll`] is bounded by the pane rect it is handed, which
-/// the server derives from the content-rect-sized frame.
+/// cell outside the content rect. Every server-frame method clips to it
+/// unconditionally, so an in-flight frame -- or a stale pane rect -- built for
+/// a previous, larger geometry is truncated rather than allowed to paint over
+/// a panel.
 pub struct Renderer {
     /// The front buffer: what is currently displayed on screen. Always the
     /// FULL terminal, including sidebar columns -- only the write position of
@@ -490,6 +488,13 @@ impl Renderer {
         let pw = pane_width as usize;
         let ph = pane_height as usize;
         let abs_delta = delta.unsigned_abs() as usize;
+        // Bound every write and emission below to the content rect: a stale
+        // pane rect from a pre-resize scroll event must not shift or repaint
+        // panel cells. `ph` and `abs_delta` are deliberately NOT clamped --
+        // `ph` is load-bearing arithmetic for the `delta < 0` insertion point
+        // `py + ph - abs_delta + i` and for the `abs_delta >= ph` guard, so
+        // clamping it would move where new rows land.
+        let (content_right, content_bottom) = self.content_edges();
 
         if abs_delta == 0 || abs_delta >= ph {
             // Nothing to shift or entire pane replaced — caller should use render_full
@@ -507,10 +512,10 @@ impl Renderer {
             for row in (abs_delta..ph).rev() {
                 let src_y = py + row - abs_delta;
                 let dst_y = py + row;
-                if dst_y < self.front.len() && src_y < self.front.len() {
+                if dst_y < content_bottom && src_y < content_bottom {
                     for col in 0..pw {
                         let src_x = px + col;
-                        if src_x < self.front[src_y].len() && src_x < self.front[dst_y].len() {
+                        if src_x < content_right {
                             self.front[dst_y][src_x] = self.front[src_y][src_x].clone();
                         }
                     }
@@ -521,10 +526,10 @@ impl Renderer {
             for row in 0..ph.saturating_sub(abs_delta) {
                 let src_y = py + row + abs_delta;
                 let dst_y = py + row;
-                if dst_y < self.front.len() && src_y < self.front.len() {
+                if dst_y < content_bottom && src_y < content_bottom {
                     for col in 0..pw {
                         let src_x = px + col;
-                        if src_x < self.front[src_y].len() && src_x < self.front[dst_y].len() {
+                        if src_x < content_right {
                             self.front[dst_y][src_x] = self.front[src_y][src_x].clone();
                         }
                     }
@@ -540,7 +545,7 @@ impl Renderer {
                 py + ph - abs_delta + i // New rows at bottom of pane
             };
 
-            if screen_y >= self.front.len() {
+            if screen_y >= content_bottom {
                 continue;
             }
 
@@ -553,7 +558,7 @@ impl Renderer {
                     break;
                 }
                 let screen_x = px + col;
-                if screen_x < self.front[screen_y].len() {
+                if screen_x < content_right {
                     self.front[screen_y][screen_x] = cell.clone();
                 }
             }
@@ -565,14 +570,14 @@ impl Renderer {
         // know the content shifted.
         for row in 0..ph {
             let screen_y = py + row;
-            if screen_y >= self.front.len() || screen_y >= self.rows as usize {
+            if screen_y >= content_bottom {
                 break;
             }
 
             queue!(
                 stdout,
                 MoveTo(
-                    px.min(self.cols.saturating_sub(1) as usize) as u16,
+                    px.min(content_right.saturating_sub(1)) as u16,
                     screen_y as u16
                 )
             )?;
@@ -591,7 +596,7 @@ impl Renderer {
 
             for col in 0..pw {
                 let screen_x = px + col;
-                if screen_x >= self.cols as usize {
+                if screen_x >= content_right {
                     break;
                 }
                 let cell = if screen_x < self.front[screen_y].len() {
@@ -1998,6 +2003,53 @@ mod origin_tests {
         // The content rect itself is fully painted.
         assert_eq!(front[0][4].c, 'X');
         assert_eq!(front[3][15].c, 'X');
+    }
+
+    #[test]
+    fn a_scroll_whose_pane_runs_past_the_content_rect_leaves_panels_intact() {
+        // A stale pane rect from a pre-resize scroll event must be clipped to
+        // the content rect. Every write and emission is bounded, while `ph`,
+        // `abs_delta` and the delta arithmetic -- the `abs_delta >= ph`
+        // early-return and the `delta < 0` insertion point -- are untouched.
+        let mut r = Renderer::new(10, 6);
+        // Right panel on columns 6..10, bottom panel on rows 4..6.
+        r.paint_panel(
+            Rect {
+                x: 6,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &grid("RGHT", 4),
+        )
+        .unwrap();
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 4,
+                width: 10,
+                height: 2,
+            },
+            &grid("BBBBBBBBBB", 2),
+        )
+        .unwrap();
+        // Content rect is columns 0..6, rows 0..4.
+        r.set_origin(0, 0);
+        r.set_content_size(6, 4);
+        // Seed the content area so the shift has something to move.
+        r.render_full(&grid("CCCCCC", 4), 0, 0, false, 0).unwrap();
+        // A stale pane rect: 10x6, the whole pre-resize terminal.
+        let new_row = grid("NNNNNNNNNN", 1);
+        r.render_scroll(0, 0, 10, 6, 1, &new_row, 0, 0, false, 0)
+            .unwrap();
+        let front = r.front_buffer();
+        assert_eq!(front[0][6].c, 'R', "scroll wrote into the right panel");
+        assert_eq!(front[0][9].c, 'T', "scroll wrote into the right panel");
+        assert_eq!(front[4][0].c, 'B', "scroll shifted into the bottom panel");
+        assert_eq!(front[5][9].c, 'B', "scroll shifted into the bottom panel");
+        // The content rect still scrolled: the new row landed at its top.
+        assert_eq!(front[0][0].c, 'N');
+        assert_eq!(front[0][5].c, 'N');
     }
 
     #[test]
