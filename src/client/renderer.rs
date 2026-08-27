@@ -902,8 +902,13 @@ impl Renderer {
 
         queue!(stdout, cursor::Hide)?;
 
-        let pane_ox = visual_state.pane_offset_x;
-        let pane_oy = visual_state.pane_offset_y;
+        // The pane offset arrives CONTENT-relative (the server composited the
+        // frame into the content rect), while `self.front` and every `MoveTo`
+        // below are ABSOLUTE. Offsetting here fixes the whole function at once:
+        // the front-buffer repaint, the selection highlight, and the block
+        // cursor all derive from these two values.
+        let pane_ox = visual_state.pane_offset_x.saturating_add(self.origin_x);
+        let pane_oy = visual_state.pane_offset_y.saturating_add(self.origin_y);
         let pane_w = visual_state.visible_cols;
         let pane_h = visual_state.visible_rows;
 
@@ -1126,8 +1131,10 @@ impl Renderer {
         let ((start_row, start_col), (end_row, end_col)) = selection;
         let is_line_mode = visual_state.selection_mode == SelectionMode::Line;
 
-        let pane_ox = visual_state.pane_offset_x as usize;
-        let pane_oy = visual_state.pane_offset_y as usize;
+        // Content-relative in, absolute out: `self.front` is the full terminal,
+        // so without the origin a copy would lift text out of a sidebar panel.
+        let pane_ox = visual_state.pane_offset_x.saturating_add(self.origin_x) as usize;
+        let pane_oy = visual_state.pane_offset_y.saturating_add(self.origin_y) as usize;
         let pane_h = visual_state.visible_rows;
         let pane_w = visual_state.visible_cols;
 
@@ -1383,6 +1390,12 @@ impl Renderer {
         if pane_h == 0 {
             return Ok(());
         }
+        // `pr` is the server's pane rect, i.e. content-relative; every screen
+        // coordinate derived from it below must be absolute. `viewport_top` is
+        // deliberately NOT offset -- it is a scrollback LINE index compared
+        // against match line numbers, not a screen coordinate.
+        let pane_x = pr.x.saturating_add(self.origin_x) as usize;
+        let pane_y = pr.y.saturating_add(self.origin_y) as usize;
 
         // The visible line range in scrollback coordinates.
         let visible_start = viewport_top;
@@ -1396,8 +1409,8 @@ impl Renderer {
                 continue;
             }
 
-            let screen_y = pr.y as usize + (line - visible_start);
-            let screen_x_start = pr.x as usize + col;
+            let screen_y = pane_y + (line - visible_start);
+            let screen_x_start = pane_x + col;
 
             // Choose colors: bright for current match, subtle for others.
             let (hl_fg, hl_bg) = if idx == current_match {
@@ -1412,7 +1425,7 @@ impl Renderer {
                     break;
                 }
                 // Also clamp to pane content area.
-                if screen_x >= (pr.x + pr.width) as usize || screen_y >= (pr.y + pr.height) as usize
+                if screen_x >= pane_x + pr.width as usize || screen_y >= pane_y + pr.height as usize
                 {
                     break;
                 }

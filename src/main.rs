@@ -556,7 +556,8 @@ async fn client_event_loop(
 
 /// Hand the foreground over to `target`: connect it if it is a not-yet-connected
 /// remote, detach the current foreground so it stops streaming, make `target`
-/// the foreground, and resize it to the current terminal.
+/// the foreground, and resize it to the current CONTENT rect (the terminal
+/// minus the visible sidebars), never to the raw terminal size.
 ///
 /// No-op (and crucially no `Detach`) when `target` is already the foreground, so
 /// same-server switches behave exactly as before. The detach-before-attach step
@@ -565,8 +566,7 @@ async fn client_event_loop(
 async fn switch_to_server(
     mgr: &mut ConnectionManager,
     target: &ConnId,
-    cols: u16,
-    rows: u16,
+    content: crate::server::layout::Rect,
 ) -> Result<()> {
     if mgr.is_foreground(target) {
         return Ok(());
@@ -580,8 +580,14 @@ async fn switch_to_server(
     }
     let _ = mgr.send_foreground(ClientMessage::Detach).await;
     mgr.set_foreground(target.clone());
-    mgr.send(target, ClientMessage::Resize { cols, rows })
-        .await?;
+    mgr.send(
+        target,
+        ClientMessage::Resize {
+            cols: content.width,
+            rows: content.height,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -603,6 +609,49 @@ fn record_switch(
     }
     *previous = current.take();
     *current = Some(new_attached);
+}
+
+/// The rect the server composites into: the terminal minus the visible
+/// sidebars.
+///
+/// EVERY "content" `terminal::size()` call site goes through this. See section
+/// 7 of the design doc for the content-vs-chrome classification -- the modal
+/// overlays (rename, palette, search prompt, switcher, pickers, session
+/// manager, which-key) deliberately keep using the raw terminal size, because
+/// they centre on the whole terminal.
+///
+/// A live View is the one exception on the content side: `paint_view` builds a
+/// FULL-terminal buffer and blits it with `render_full`, so while a view is
+/// displayed the content rect must be the whole terminal or the view would be
+/// clipped to the content columns. Task 8 teaches `paint_view` about the
+/// content rect; until then this keeps view rendering byte-identical.
+fn content_rect_now(
+    chrome: &crate::client::chrome::Chrome,
+    active_view: Option<usize>,
+) -> Result<crate::server::layout::Rect> {
+    let (c, r) = crossterm::terminal::size()?;
+    if active_view.is_some() {
+        return Ok(crate::server::layout::Rect {
+            x: 0,
+            y: 0,
+            width: c,
+            height: r,
+        });
+    }
+    Ok(chrome.content_rect(c, r))
+}
+
+/// Point the renderer at `content`.
+///
+/// The origin and the content size are ONE piece of state and must always be
+/// set together. `Renderer::resize` resets the content size to the full
+/// terminal but deliberately leaves the origin alone, so setting only one
+/// leaves a stale origin paired with a full-terminal content rect -- in which
+/// the end-of-row clear runs to the terminal's right edge and blanks a right
+/// sidebar.
+fn sync_content_rect(renderer: &mut Renderer, content: &crate::server::layout::Rect) {
+    renderer.set_origin(content.x, content.y);
+    renderer.set_content_size(content.width, content.height);
 }
 
 /// Re-render whichever transient overlay is currently active on top of the
@@ -1043,6 +1092,13 @@ async fn enter_view(
     }
     let (c, r) = crossterm::terminal::size()?;
     renderer.resize(c, r);
+    // A View composites the FULL terminal itself and blits it with
+    // `render_full`, so the renderer's content rect must be the whole terminal
+    // while one is displayed -- otherwise the view would be clipped to the
+    // content columns and the sidebars would show through stale. `resize`
+    // already reset the content size; the origin has to be reset with it.
+    renderer.set_origin(0, 0);
+    renderer.set_content_size(c, r);
     subscribe_view_cells(mgr, &mut views[target_idx], border_style).await?;
     paint_view(
         renderer,
@@ -1432,6 +1488,11 @@ async fn run_client_loop(
     // `CompositorTheme` (CellColor) mirror of the client `Theme`, used to draw
     // the client-side view status bar with the same colors as the normal bar.
     let mut compositor_theme = config.compositor_theme();
+    // Client-side sidebars. The server never learns they exist: the client
+    // hands it a reduced content rect and paints the panels around the frames
+    // it gets back. Built once here -- plugins carry state, so a config
+    // hot-reload deliberately leaves the existing chrome in place.
+    let chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
     let mut which_key_position = config.appearance.which_key_position.clone();
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
@@ -1579,10 +1640,22 @@ async fn run_client_loop(
     /// Minimum interval between drag event sends (~16ms = ~60fps).
     const DRAG_THROTTLE: Duration = Duration::from_millis(16);
 
-    // Tell server our terminal size
-    log::debug!("run_client_loop: sending initial resize {}x{}", cols, rows);
-    mgr.send_foreground(ClientMessage::Resize { cols, rows })
-        .await?;
+    // Tell the server the size of the area it composites: the terminal minus
+    // any visible sidebars, not the terminal itself.
+    let content = content_rect_now(&chrome, active_view)?;
+    sync_content_rect(&mut renderer, &content);
+    log::debug!(
+        "run_client_loop: sending initial resize {}x{} at ({},{})",
+        content.width,
+        content.height,
+        content.x,
+        content.y
+    );
+    mgr.send_foreground(ClientMessage::Resize {
+        cols: content.width,
+        rows: content.height,
+    })
+    .await?;
 
     loop {
         tokio::select! {
@@ -2592,7 +2665,12 @@ async fn run_client_loop(
                                         // A live view masks the switched-to session:
                                         // tear it down before handing off the screen.
                                         leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        switch_to_server(mgr, &server, c, r).await?;
+                                        // Leaving the view hands the screen back to the content rect:
+                                        // re-point the renderer at it before the target server is told
+                                        // what size to composite.
+                                        let content = content_rect_now(&chrome, active_view)?;
+                                        sync_content_rect(&mut renderer, &content);
+                                        switch_to_server(mgr, &server, content).await?;
                                         mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                         mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                         if server == ConnId::Local {
@@ -2609,7 +2687,12 @@ async fn run_client_loop(
                                         // A live view masks the switched-to session:
                                         // tear it down before handing off the screen.
                                         leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        switch_to_server(mgr, &server, c, r).await?;
+                                        // Leaving the view hands the screen back to the content rect:
+                                        // re-point the renderer at it before the target server is told
+                                        // what size to composite.
+                                        let content = content_rect_now(&chrome, active_view)?;
+                                        sync_content_rect(&mut renderer, &content);
+                                        switch_to_server(mgr, &server, content).await?;
                                         // The server's handle_command ignores commands from a
                                         // client with no attached session, so a remote tab switch
                                         // must attach first (harmless re-attach for local).
@@ -2633,7 +2716,12 @@ async fn run_client_loop(
                                         // A live view masks the switched-to session:
                                         // tear it down before handing off the screen.
                                         leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        switch_to_server(mgr, &server, c, r).await?;
+                                        // Leaving the view hands the screen back to the content rect:
+                                        // re-point the renderer at it before the target server is told
+                                        // what size to composite.
+                                        let content = content_rect_now(&chrome, active_view)?;
+                                        sync_content_rect(&mut renderer, &content);
+                                        switch_to_server(mgr, &server, content).await?;
                                         // The server's handle_command ignores commands from a
                                         // client with no attached session, so a remote pane switch
                                         // must attach first (harmless re-attach for local).
@@ -2915,7 +3003,12 @@ async fn run_client_loop(
                                 // A live view masks the switched-to session: tear it
                                 // down first so the switch actually shows.
                                 leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                switch_to_server(mgr, &server, c, r).await?;
+                                // Leaving the view hands the screen back to the content rect:
+                                // re-point the renderer at it before the target server is told
+                                // what size to composite.
+                                let content = content_rect_now(&chrome, active_view)?;
+                                sync_content_rect(&mut renderer, &content);
+                                switch_to_server(mgr, &server, content).await?;
                                 mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                 mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 if server == ConnId::Local {
@@ -2942,7 +3035,12 @@ async fn run_client_loop(
                                     // A live view masks the switched-to session: tear
                                     // it down before handing off the screen.
                                     leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                    switch_to_server(mgr, &server, c, r).await?;
+                                    // Leaving the view hands the screen back to the content rect:
+                                    // re-point the renderer at it before the target server is told
+                                    // what size to composite.
+                                    let content = content_rect_now(&chrome, active_view)?;
+                                    sync_content_rect(&mut renderer, &content);
+                                    switch_to_server(mgr, &server, content).await?;
                                     mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                     mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                     if server == ConnId::Local {
@@ -3262,6 +3360,10 @@ async fn run_client_loop(
                                     active_view_id = None;
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.resize(c, r);
+                                    // Back to the content rect: the view no longer
+                                    // owns the terminal, so the sidebars do again.
+                                    let content = chrome.content_rect(c, r);
+                                    sync_content_rect(&mut renderer, &content);
                                     // Entering the view detached the foreground session
                                     // (bug4 fix); re-attach it now so the server resumes
                                     // rendering it. `handle_resize` is a no-op for an
@@ -3272,7 +3374,9 @@ async fn run_client_loop(
                                             session_name: session,
                                         }).await?;
                                     }
-                                    mgr.send_foreground(ClientMessage::Resize { cols: c, rows: r }).await?;
+                                    mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
+                                    chrome.paint(&mut renderer, c, r, &compositor_theme)?;
+                                    renderer.flush()?;
                                 }
                             }
                             InputAction::ViewDelete => {
@@ -3659,7 +3763,24 @@ async fn run_client_loop(
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
                         log::debug!("resize: {}x{}", new_cols, new_rows);
                         renderer.resize(new_cols, new_rows);
-                        mgr.send_foreground(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
+                        // `resize` reallocated the front buffer and reset the
+                        // content size to the whole terminal, but deliberately
+                        // left the origin alone: re-point BOTH at the new
+                        // content rect before anything paints.
+                        let content = if active_view.is_some() {
+                            crate::server::layout::Rect { x: 0, y: 0, width: new_cols, height: new_rows }
+                        } else {
+                            chrome.content_rect(new_cols, new_rows)
+                        };
+                        sync_content_rect(&mut renderer, &content);
+                        mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
+                        // The panels have to be re-laid for the new terminal;
+                        // the server frame that answers the Resize repaints only
+                        // the content columns.
+                        if active_view.is_none() {
+                            chrome.paint(&mut renderer, new_cols, new_rows, &compositor_theme)?;
+                            renderer.flush()?;
+                        }
                         // A live view owns the screen; recomposite it at the new
                         // size so it doesn't stay blank until the next snapshot.
                         // Every cell's rect changed with the terminal, so re-demand
@@ -3808,8 +3929,8 @@ async fn run_client_loop(
                                         return Ok(());
                                     }
                                     mgr.set_foreground(ConnId::Local);
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    mgr.send(&ConnId::Local, ClientMessage::Resize { cols: c, rows: r }).await?;
+                                    let content = content_rect_now(&chrome, active_view)?;
+                                    mgr.send(&ConnId::Local, ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
                                     if let Some(session) = last_local_session.clone() {
                                         // Reattach; the server responds with a fresh FullRender.
                                         mgr.send(&ConnId::Local, ClientMessage::Attach { session_name: session.clone() }).await?;
@@ -3890,6 +4011,13 @@ async fn run_client_loop(
                         // closes) but skip painting the server's frame.
                         if active_view.is_none() {
                             renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            // Panels write INTO the front buffer, so this
+                            // is idempotent and cheap next to a frame. It is
+                            // needed because a server frame repaints only the
+                            // content columns, while a `resize` reallocates
+                            // the whole buffer.
+                            let (tc, tr) = crossterm::terminal::size()?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -3919,6 +4047,13 @@ async fn run_client_loop(
                         // See the FullRender arm: a View suppresses the paint.
                         if active_view.is_none() {
                             renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            // Panels write INTO the front buffer, so this
+                            // is idempotent and cheap next to a frame. It is
+                            // needed because a server frame repaints only the
+                            // content columns, while a `resize` reallocates
+                            // the whole buffer.
+                            let (tc, tr) = crossterm::terminal::size()?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -3948,6 +4083,13 @@ async fn run_client_loop(
                         // See the FullRender arm: a View suppresses the paint.
                         if active_view.is_none() {
                             renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            // Panels write INTO the front buffer, so this
+                            // is idempotent and cheap next to a frame. It is
+                            // needed because a server frame repaints only the
+                            // content columns, while a `resize` reallocates
+                            // the whole buffer.
+                            let (tc, tr) = crossterm::terminal::size()?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -3987,7 +4129,8 @@ async fn run_client_loop(
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.clear_overlay(c, r)?;
                             renderer.flush()?;
-                            switch_to_server(mgr, &ConnId::Local, c, r).await?;
+                            let content = content_rect_now(&chrome, active_view)?;
+                            switch_to_server(mgr, &ConnId::Local, content).await?;
                             mgr.send(&ConnId::Local, ClientMessage::Attach {
                                 session_name: target.clone(),
                             }).await?;
@@ -4023,7 +4166,19 @@ async fn run_client_loop(
                             // Re-send resize in case terminal changed
                             let (cols, rows) = crossterm::terminal::size()?;
                             renderer.resize(cols, rows);
-                            mgr.send_foreground(ClientMessage::Resize { cols, rows }).await?;
+                            // See the resize arm: origin and content size move
+                            // together, and `resize` only moves one of them.
+                            let content = if active_view.is_some() {
+                                crate::server::layout::Rect { x: 0, y: 0, width: cols, height: rows }
+                            } else {
+                                chrome.content_rect(cols, rows)
+                            };
+                            sync_content_rect(&mut renderer, &content);
+                            mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
+                            if active_view.is_none() {
+                                chrome.paint(&mut renderer, cols, rows, &compositor_theme)?;
+                                renderer.flush()?;
+                            }
                         } else if let Some(ref mut ss) = input.search_state {
                             if let Some(ref query) = ss.confirmed_query {
                                 let pane_height = focused_pane_rect
@@ -4636,6 +4791,10 @@ async fn run_client_loop(
                                     active_view_id = None;
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.resize(c, r);
+                                    // The view no longer owns the terminal: hand
+                                    // the edges back to the sidebars.
+                                    let content = chrome.content_rect(c, r);
+                                    sync_content_rect(&mut renderer, &content);
                                     if let Some((_, session)) = current_attached.clone() {
                                         mgr.send_foreground(ClientMessage::Attach {
                                             session_name: session,
@@ -4643,10 +4802,12 @@ async fn run_client_loop(
                                         .await?;
                                     }
                                     mgr.send_foreground(ClientMessage::Resize {
-                                        cols: c,
-                                        rows: r,
+                                        cols: content.width,
+                                        rows: content.height,
                                     })
                                     .await?;
+                                    chrome.paint(&mut renderer, c, r, &compositor_theme)?;
+                                    renderer.flush()?;
                                 } else if let Some(av) = active_view {
                                     // Diff the pane set: unsubscribe panes fully gone,
                                     // (re)subscribe the current set (adds the new ones,
