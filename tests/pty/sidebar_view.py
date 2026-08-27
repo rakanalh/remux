@@ -12,10 +12,13 @@ The four things that had to move together, and the assertion that pins each:
                          or right of the seam; the panel still renders left of
                          it)
   subscribe_view_cells -> `test_view_cells_are_sized_to_the_content_rect`
-                         (`stty size` INSIDE a cell reports the cell's real
-                         interior -- borders can land in the right place while
-                         the pane behind them is reflowed for the wrong width,
-                         which the geometry assertion above cannot see)
+                         (reads the CONTENT of a cell, not its frame: `stty
+                         size` INSIDE the cell reports the interior the server
+                         reflowed the pane to, and a line one column too long
+                         must WRAP inside the cell rather than have its tail
+                         cropped away. Borders can land in exactly the right
+                         columns while the pane behind them is sized wrong,
+                         which the geometry assertion above cannot see.)
   the mouse hit tests -> `test_clicking_a_view_cell_uses_content_coordinates`
                          (a screen column that resolves to a DIFFERENT cell
                          untranslated)
@@ -53,6 +56,14 @@ NO_SIDEBAR_STTY = "37 58"
 
 MARK_A = "AAAA_view_marker"
 MARK_B = "BBBB_view_marker"
+
+# 43 filler columns then a tail: in a correctly-sized cell the line is exactly
+# one column too long and the tail wraps onto the next row. A cell whose PANE
+# still thinks it is 58 columns wide does not wrap at all, and the blit crops
+# the row at the cell's 43 painted columns -- so the tail is simply GONE. That
+# missing tail is the user-visible symptom, and it is what this asserts.
+WRAP_FILL = "W" * 43
+WRAP_TAIL = "WRAPTAIL"
 
 BOX = set("╭╮╰╯│─┌┐└┘├┤┬┴┼")
 
@@ -287,6 +298,36 @@ def test_view_cells_are_sized_to_the_content_rect():
         fails.append(f"cell pane size {got!r}, expected {CELL_STTY!r}")
     else:
         print(f"  cell reports `stty size` = {got!r}")
+
+    # The same fact read off the PAINTED CELL rather than out of the pane: the
+    # size the server reports and the text a user actually sees are two
+    # different failure surfaces, and only this one covers the blit.
+    t.send(f"printf '{WRAP_FILL}{WRAP_TAIL}\\n'\r", 1.8)
+    tail_rows = [i for i, r in enumerate(t.rows_text()) if WRAP_TAIL in r]
+    # The command echo carries the tail too; the WRAPPED OUTPUT row is the one
+    # that starts with the tail at the cell's left content edge.
+    # ...i.e. nothing but the panel, padding and the cell's own border sits to
+    # its left. The echoed command also carries the tail, but never at the edge.
+    wrapped = [
+        i
+        for i in tail_rows
+        if not t.rows_text()[i][: t.rows_text()[i].index(WRAP_TAIL)]
+        .strip("".join(BOX) + " ")
+    ]
+    if not wrapped:
+        t.dump("no wrapped tail")
+        fails.append(
+            f"{WRAP_TAIL!r} never wrapped onto its own row inside the cell: the "
+            f"pane did not wrap at the cell's width and the blit cropped the "
+            f"tail away (tail seen on rows {tail_rows})"
+        )
+    else:
+        row = t.rows_text()[wrapped[0]]
+        at = row.index(WRAP_TAIL)
+        if at < SIDEBAR_W:
+            fails.append(f"the wrapped tail painted at column {at}, in the sidebar")
+        else:
+            print(f"  wrapped tail painted at column {at}")
 
     return finish(t, name, fails)
 
