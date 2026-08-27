@@ -6,7 +6,9 @@ crossing from section 7.
 
 Run: python3 tests/pty/sidebar_layout.py
 """
+import base64
 import os
+import re
 import shutil
 import sys
 import time
@@ -75,20 +77,41 @@ def make_env(config: str) -> dict:
     return env
 
 
-def spawn(env):
-    screen = pyte.Screen(COLS, ROWS)
+def spawn(env, cols=COLS, rows=ROWS):
+    """Start the client under a PTY. Returns (child, screen, pump, raw).
+
+    `raw` accumulates every byte the client emitted, so tests can decode the
+    OSC 52 clipboard writes a real terminal would have acted on.
+    """
+    screen = pyte.Screen(cols, rows)
     stream = pyte.ByteStream(screen)
-    child = pexpect.spawn(BIN, [], env=env, dimensions=(ROWS, COLS), encoding=None)
+    child = pexpect.spawn(BIN, [], env=env, dimensions=(rows, cols), encoding=None)
+    raw = bytearray()
 
     def pump(t=0.6):
         end = time.time() + t
         while time.time() < end:
             try:
-                stream.feed(child.read_nonblocking(65536, 0.1))
+                chunk = child.read_nonblocking(65536, 0.1)
             except Exception:
-                pass
+                continue
+            raw.extend(chunk)
+            stream.feed(chunk)
 
-    return child, screen, pump
+    return child, screen, pump, raw
+
+
+def yanks(raw):
+    """Every clipboard write the client made, decoded, oldest first."""
+    out = []
+    for m in re.finditer(
+        rb"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", bytes(raw)
+    ):
+        try:
+            out.append(base64.b64decode(m.group(1)).decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return out
 
 
 def teardown(child, env):
@@ -121,7 +144,7 @@ def check_no_panic():
 
 def test_no_sidebar_is_unchanged():
     env = make_env("")
-    child, screen, pump = spawn(env)
+    child, screen, pump, raw = spawn(env)
     pump(1.5)
     child.send(b"echo NOSIDEBAR\r")
     pump(1.5)
@@ -141,7 +164,7 @@ def test_no_sidebar_is_unchanged():
 
 def test_left_sidebar_offsets_content():
     env = make_env(SIDEBAR_CFG_LEFT)
-    child, screen, pump = spawn(env)
+    child, screen, pump, raw = spawn(env)
     pump(1.5)
 
     rows = screen.display
@@ -161,14 +184,47 @@ def test_left_sidebar_offsets_content():
         # Assertion 3: content lands at or right of the content origin.
         assert col >= SIDEBAR_W, f"content bled into the sidebar at col {col}"
 
-    # Assertion 2: no bleed at the seam -- the panel's block fill must stop
-    # before the first content column.
-    y = hit[0]
-    assert screen.buffer[y][SIDEBAR_W].data != "█", "panel block bled past the seam"
-
     teardown(child, env)
     check_no_panic()
     print("PASS test_left_sidebar_offsets_content")
+
+
+def test_seam_has_no_background_bleed():
+    """Assertion 2: the panel fills its rect and not one column more.
+
+    Run with a distinct `frame_bg` so the panel's background is visible to
+    pyte. The panel must own every column left of the seam, the pane's left
+    border must sit exactly ON the seam, and the pane's interior must keep the
+    terminal's own background -- if the panel's fill or its trailing SGR state
+    ran past its rect, the interior would come back painted.
+
+    (This replaces a `data != "█"` assertion carried in from the task
+    brief, which could never fire: the placeholder fills with spaces, so no
+    block glyph is ever emitted.)
+    """
+    env = make_env(SIDEBAR_CFG_LEFT_THEMED)
+    child, screen, pump, raw = spawn(env)
+    pump(1.5)
+    child.send(b"echo SEAMMARKER\r")
+    pump(1.5)
+    rows = screen.display
+    hit = [i for i, r in enumerate(rows) if "SEAMMARKER" in r]
+    assert hit, "marker never appeared"
+    y = hit[0]
+
+    assert (
+        str(screen.buffer[y][SIDEBAR_W - 1].bg) == FRAME_BG
+    ), f"the panel does not own its last column: {screen.buffer[y][SIDEBAR_W - 1]!r}"
+    assert (
+        rows[y][SIDEBAR_W] == "│"
+    ), f"the pane border is not on the seam: {rows[y][SIDEBAR_W]!r}"
+    assert (
+        str(screen.buffer[y][SIDEBAR_W + 1].bg) == "default"
+    ), f"panel background bled into the pane interior: {screen.buffer[y][SIDEBAR_W + 1]!r}"
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_seam_has_no_background_bleed")
 
 
 def test_all_three_edges_corner_ownership():
@@ -179,7 +235,7 @@ def test_all_three_edges_corner_ownership():
     columns and its panel starts at the content origin, not at column 0.
     """
     env = make_env(SIDEBAR_CFG_THREE)
-    child, screen, pump = spawn(env)
+    child, screen, pump, raw = spawn(env)
     pump(1.5)
     rows = screen.display
 
@@ -214,6 +270,17 @@ def test_all_three_edges_corner_ownership():
     print("PASS test_all_three_edges_corner_ownership")
 
 
+# A distinct frame background makes the panel's fill visible to pyte, so the
+# seam test can prove the panel painted its rect and not one column more.
+FRAME_BG = "5f00af"
+SIDEBAR_CFG_LEFT_THEMED = (
+    SIDEBAR_CFG_LEFT
+    + f"""
+[appearance.theme]
+frame_bg = "#{FRAME_BG}"
+"""
+)
+
 SIDEBAR_CFG_RIGHT = """
 [[sidebar]]
 edge = "right"
@@ -225,16 +292,19 @@ size = 20
 
 
 def test_resize_keeps_the_right_sidebar():
-    """A terminal resize must re-point the origin AND the content size.
+    """A right sidebar survives a terminal resize; content stops short of it.
 
-    `Renderer::resize` resets the content size to the whole terminal but
-    deliberately leaves the origin alone. If the resize path sets only one of
-    them, the end-of-row clear in the next `render_full` runs to the terminal's
-    right edge and blanks a right sidebar -- so this asserts the panel survives
-    a resize and the content still stops short of it.
+    NOTE on what this does and does NOT pin. It does **not** discriminate the
+    `set_origin`-without-`set_content_size` bug: with only the origin set, the
+    next `render_full`'s end-of-row clear does reach the terminal's right edge
+    and blank the panel, but `chrome.paint` repaints it in the same flush, so
+    the screen ends up identical -- verified by injecting that bug, after which
+    this test still passed. What it genuinely pins is the user-visible
+    invariant: after a resize the panel is still there and the server's content
+    is laid out for the reduced width.
     """
     env = make_env(SIDEBAR_CFG_RIGHT)
-    child, screen, pump = spawn(env)
+    child, screen, pump, raw = spawn(env)
     pump(1.5)
     rows = screen.display
     assert any(
@@ -273,7 +343,7 @@ def test_overlay_teardown_restores_the_sidebar():
     whole terminal rather than on the content rect.
     """
     env = make_env(SIDEBAR_CFG_LEFT)
-    child, screen, pump = spawn(env)
+    child, screen, pump, raw = spawn(env)
     pump(1.5)
     # Prefix (Ctrl-a) then `x m` opens the session manager.
     child.send(b"\x01")
@@ -293,6 +363,140 @@ def test_overlay_teardown_restores_the_sidebar():
     teardown(child, env)
     check_no_panic()
     print("PASS test_overlay_teardown_restores_the_sidebar")
+
+
+def test_cursor_stays_visible_with_a_sidebar():
+    """The hardware cursor must survive `chrome.paint`.
+
+    `paint_panel` hides the cursor while it draws. The frame arms run
+    `render_*` -> `chrome.paint` -> `relay_overlays` -> one `flush`, so the
+    panel's Hide and the frame's Show land in the SAME flush: unless the panel
+    painter re-issues the cursor, a configured sidebar leaves the shell with no
+    cursor, permanently. This asserts the cursor is shown and parked at the
+    shell prompt inside the content rect.
+    """
+    env = make_env(SIDEBAR_CFG_LEFT)
+    child, screen, pump, raw = spawn(env)
+    pump(1.5)
+    child.send(b"echo CURSORHERE\r")
+    pump(1.8)
+    assert (
+        screen.cursor.hidden is False
+    ), "the sidebar left the hardware cursor hidden"
+    assert (
+        screen.cursor.x >= SIDEBAR_W
+    ), f"the cursor is parked inside the sidebar at column {screen.cursor.x}"
+    assert (
+        "CURSORHERE" in "".join(screen.display)
+    ), "the shell never echoed; the cursor position proves nothing"
+    # `PS1` is pinned to "> " by make_env, so the cursor must sit immediately
+    # after a prompt -- not merely somewhere right of the seam.
+    row = screen.display[screen.cursor.y]
+    assert (
+        row[screen.cursor.x - 2 : screen.cursor.x] == "> "
+    ), f"the cursor is not parked at the shell prompt: {row!r} x={screen.cursor.x}"
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_cursor_stays_visible_with_a_sidebar")
+
+
+def test_search_highlights_land_on_the_match():
+    """`render_search_highlight` takes a CONTENT-relative pane rect.
+
+    It indexes the absolute front buffer and issues absolute `MoveTo`s, so
+    without the origin every highlight lands `origin.x` columns too far left --
+    inside the sidebar. Assert every highlighted cell is right of the seam and
+    carries a character of the needle, i.e. the highlight is ON the match.
+    """
+    needle = "NEEDLEXYZ"
+    env = make_env(SIDEBAR_CFG_LEFT)
+    child, screen, pump, raw = spawn(env)
+    pump(1.5)
+    child.send(f"echo {needle}\r".encode())
+    pump(1.5)
+    # Prefix (Ctrl-a) then `s s` enters search; type the needle and confirm.
+    child.send(b"\x01ss")
+    pump(0.8)
+    child.send(needle.encode())
+    pump(0.8)
+    child.send(b"\r")
+    pump(1.5)
+
+    # Two rows carry a background of their own and are not search highlights:
+    # the status bar (last row) and the search prompt, which is chrome and
+    # deliberately spans the whole terminal.
+    skip = {ROWS - 1} | {
+        y for y in range(ROWS) if screen.display[y].lstrip().startswith("/" + needle)
+    }
+    highlighted = [
+        (x, y)
+        for y in range(ROWS)
+        for x in range(COLS)
+        if y not in skip and str(screen.buffer[y][x].bg) != "default"
+    ]
+    assert highlighted, "search produced no highlights"
+    bad = [(x, y) for (x, y) in highlighted if x < SIDEBAR_W]
+    assert not bad, f"search highlighted sidebar columns: {bad[:8]}"
+    off = [
+        (x, y, screen.buffer[y][x].data)
+        for (x, y) in highlighted
+        if screen.buffer[y][x].data not in set(needle)
+    ]
+    assert not off, f"highlight is not sitting on the match: {off[:8]}"
+
+    child.send(b"\x1b")
+    pump(0.4)
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_search_highlights_land_on_the_match")
+
+
+def test_yank_copies_content_not_the_sidebar():
+    """`extract_text` reads the ABSOLUTE front buffer at pane coordinates.
+
+    The pane offset arrives content-relative, so without the origin a yank
+    lifts whatever sits in the sidebar's columns straight into the user's
+    clipboard. Type a token WITHOUT pressing Enter so it is on the cursor's own
+    line, select that line in visual mode, and assert the OSC 52 write carries
+    the shell line -- not the panel's text or a run of blanks.
+    """
+    token = "YANKTOKEN"
+    env = make_env(SIDEBAR_CFG_LEFT)
+    child, screen, pump, raw = spawn(env)
+    pump(1.5)
+    child.send(f"echo {token}".encode())
+    pump(1.2)
+    child.send(b"\x01v")  # visual (copy) mode
+    pump(0.8)
+    for _ in range(25):  # `h` clamps at column 0 of the pane
+        child.send(b"h")
+        time.sleep(0.06)
+    pump(0.6)
+    child.send(b"v")  # start a character selection
+    pump(0.5)
+    for _ in range(len("> echo ") + len(token)):
+        child.send(b"l")
+        time.sleep(0.08)
+    pump(0.6)
+    child.send(b"y")
+    pump(1.2)
+
+    got = yanks(raw)
+    assert got, "y produced no OSC 52 clipboard write"
+    yanked = got[-1]
+    assert token in yanked, (
+        f"the yank did not copy the shell line: {yanked!r} "
+        "(a sidebar-relative read would copy the panel or blanks)"
+    )
+    assert "Placeholder" not in yanked and "idle" not in yanked, (
+        f"the yank copied the sidebar panel: {yanked!r}"
+    )
+
+    child.send(b"\x1b")
+    pump(0.4)
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_yank_copies_content_not_the_sidebar")
 
 
 def snapshot(screen):
@@ -325,7 +529,7 @@ def test_visual_selection_highlights_correct_columns():
     `make_env` so the cursor sits within the sidebar's columns if unoffset.
     """
     env = make_env(SIDEBAR_CFG_LEFT)
-    child, screen, pump = spawn(env)
+    child, screen, pump, raw = spawn(env)
     pump(1.5)
     child.send(b"echo VISUALTARGET\r")
     pump(1.2)
@@ -356,8 +560,12 @@ if __name__ == "__main__":
         sys.exit(f"build first: {BIN} missing")
     test_no_sidebar_is_unchanged()
     test_left_sidebar_offsets_content()
+    test_seam_has_no_background_bleed()
     test_all_three_edges_corner_ownership()
     test_resize_keeps_the_right_sidebar()
     test_overlay_teardown_restores_the_sidebar()
     test_visual_selection_highlights_correct_columns()
+    test_cursor_stays_visible_with_a_sidebar()
+    test_search_highlights_land_on_the_match()
+    test_yank_copies_content_not_the_sidebar()
     print("ALL PASS")

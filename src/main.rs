@@ -1999,10 +1999,15 @@ async fn run_client_loop(
                                                 vs.cursor_col = vs.visible_cols.saturating_sub(1);
                                             }
                                         } else {
-                                            // Fallback: use full terminal dims.
-                                            let (tc, tr) = crossterm::terminal::size()?;
-                                            vs.visible_rows = tr as usize;
-                                            vs.visible_cols = tc as usize;
+                                            // Fallback: the server reported no
+                                            // focused pane, so scope the visual
+                                            // state to the CONTENT rect. Using
+                                            // the raw terminal here would let
+                                            // the selection-highlight loop walk
+                                            // into a sidebar's columns.
+                                            let content = content_rect_now(&chrome, active_view)?;
+                                            vs.visible_rows = content.height as usize;
+                                            vs.visible_cols = content.width as usize;
                                             vs.cursor_row = vs.visible_rows.saturating_sub(1);
                                         }
                                         // total_lines is at least visible_rows
@@ -4015,8 +4020,11 @@ async fn run_client_loop(
                             // is idempotent and cheap next to a frame. It is
                             // needed because a server frame repaints only the
                             // content columns, while a `resize` reallocates
-                            // the whole buffer.
-                            let (tc, tr) = crossterm::terminal::size()?;
+                            // the whole buffer. Laid out against the size the
+                            // front buffer was allocated for -- a fresh
+                            // `terminal::size()` disagrees with it between a
+                            // SIGWINCH and the `Resize` event.
+                            let (tc, tr) = renderer.size();
                             chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
                             relay_overlays(
                                 &mut renderer,
@@ -4051,8 +4059,11 @@ async fn run_client_loop(
                             // is idempotent and cheap next to a frame. It is
                             // needed because a server frame repaints only the
                             // content columns, while a `resize` reallocates
-                            // the whole buffer.
-                            let (tc, tr) = crossterm::terminal::size()?;
+                            // the whole buffer. Laid out against the size the
+                            // front buffer was allocated for -- a fresh
+                            // `terminal::size()` disagrees with it between a
+                            // SIGWINCH and the `Resize` event.
+                            let (tc, tr) = renderer.size();
                             chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
                             relay_overlays(
                                 &mut renderer,
@@ -4087,8 +4098,11 @@ async fn run_client_loop(
                             // is idempotent and cheap next to a frame. It is
                             // needed because a server frame repaints only the
                             // content columns, while a `resize` reallocates
-                            // the whole buffer.
-                            let (tc, tr) = crossterm::terminal::size()?;
+                            // the whole buffer. Laid out against the size the
+                            // front buffer was allocated for -- a fresh
+                            // `terminal::size()` disagrees with it between a
+                            // SIGWINCH and the `Resize` event.
+                            let (tc, tr) = renderer.size();
                             chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
                             relay_overlays(
                                 &mut renderer,

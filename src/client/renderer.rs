@@ -62,6 +62,14 @@ pub struct Renderer {
     /// behaviour exactly when no sidebars are configured.
     content_cols: u16,
     content_rows: u16,
+    /// The last cursor state a SERVER FRAME reported, content-relative:
+    /// `(x, y, visible, style)`.
+    ///
+    /// Remembered so painting a panel can be cursor-neutral: `paint_panel`
+    /// hides the cursor while it draws and re-issues this afterwards. Without
+    /// it the panel's `Hide` and the frame's `Show` land in the same flush and
+    /// the cursor stays hidden for as long as a sidebar is visible.
+    last_cursor: (u16, u16, bool, u8),
 }
 
 impl Renderer {
@@ -75,6 +83,7 @@ impl Renderer {
             origin_y: 0,
             content_cols: cols,
             content_rows: rows,
+            last_cursor: (0, 0, false, 0),
         }
     }
 
@@ -105,6 +114,16 @@ impl Renderer {
         (self.content_cols, self.content_rows)
     }
 
+    /// The terminal size the front buffer is allocated for.
+    ///
+    /// Panels must be laid out against THIS, not against a fresh
+    /// `terminal::size()`: between a SIGWINCH and the `Resize` event the two
+    /// disagree, and a panel laid out for the new width would be clipped
+    /// against the old buffer.
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
     /// The absolute right/bottom edges of the content rect, clipped to the
     /// terminal. Every server-frame write, clear and cursor move is bounded by
     /// these; a panel lives beyond them.
@@ -130,6 +149,42 @@ impl Renderer {
             y.saturating_add(self.origin_y)
                 .min(bottom.saturating_sub(1) as u16),
         )
+    }
+
+    /// Remember the cursor state a server frame reported and queue it.
+    ///
+    /// Every server-frame method ends here, so [`Renderer::paint_panel`] can
+    /// put the cursor back exactly as the last frame left it.
+    fn queue_cursor<W: Write>(
+        &mut self,
+        out: &mut W,
+        cursor_x: u16,
+        cursor_y: u16,
+        cursor_visible: bool,
+        cursor_style: u8,
+    ) -> Result<()> {
+        self.last_cursor = (cursor_x, cursor_y, cursor_visible, cursor_style);
+        self.queue_remembered_cursor(out)
+    }
+
+    /// Queue the remembered cursor state without changing it.
+    ///
+    /// The remembered position is content-relative, so it is offset here --
+    /// otherwise the hardware cursor lands in a left sidebar.
+    fn queue_remembered_cursor<W: Write>(&self, out: &mut W) -> Result<()> {
+        let (x, y, visible, style) = self.last_cursor;
+        if visible {
+            let (sx, sy) = self.cursor_screen_pos(x, y);
+            queue!(
+                out,
+                MoveTo(sx, sy),
+                cursor_style_command(style),
+                cursor::Show,
+            )?;
+        } else {
+            queue!(out, cursor::Hide)?;
+        }
+        Ok(())
     }
 
     /// Apply a full render (replace everything).
@@ -303,17 +358,13 @@ impl Renderer {
 
         // Update cursor. The reported position is content-relative, so it has
         // to be offset -- otherwise the hardware cursor lands in a left sidebar.
-        if cursor_visible {
-            let (sx, sy) = self.cursor_screen_pos(cursor_x, cursor_y);
-            queue!(
-                stdout,
-                MoveTo(sx, sy),
-                cursor_style_command(cursor_style),
-                cursor::Show,
-            )?;
-        } else {
-            queue!(stdout, cursor::Hide)?;
-        }
+        self.queue_cursor(
+            &mut stdout,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+        )?;
 
         // Blit into the front buffer at the origin. NEVER `self.front = cells.to_vec()`
         // -- the front buffer is the FULL terminal, including sidebar columns, and
@@ -436,17 +487,13 @@ impl Renderer {
 
         // Update cursor. The reported position is content-relative, so it has
         // to be offset -- otherwise the hardware cursor lands in a left sidebar.
-        if cursor_visible {
-            let (sx, sy) = self.cursor_screen_pos(cursor_x, cursor_y);
-            queue!(
-                stdout,
-                MoveTo(sx, sy),
-                cursor_style_command(cursor_style),
-                cursor::Show,
-            )?;
-        } else {
-            queue!(stdout, cursor::Hide)?;
-        }
+        self.queue_cursor(
+            &mut stdout,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+        )?;
 
         // End synchronized output.
         queue!(stdout, Print("\x1b[?2026l"))?;
@@ -673,17 +720,13 @@ impl Renderer {
         // 3. Update cursor. The reported position is content-relative, so it
         // has to be offset -- otherwise the hardware cursor lands in a left
         // sidebar.
-        if cursor_visible {
-            let (sx, sy) = self.cursor_screen_pos(cursor_x, cursor_y);
-            queue!(
-                stdout,
-                MoveTo(sx, sy),
-                cursor_style_command(cursor_style),
-                cursor::Show,
-            )?;
-        } else {
-            queue!(stdout, cursor::Hide)?;
-        }
+        self.queue_cursor(
+            &mut stdout,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+        )?;
 
         // End synchronized output.
         queue!(stdout, Print("\x1b[?2026l"))?;
@@ -803,6 +846,12 @@ impl Renderer {
             queue!(out, SetAttribute(Attribute::Reset))?;
         }
 
+        // Painting a panel must be cursor-neutral. The `Hide` above and the
+        // server frame's `Show` are queued into the SAME flush, so leaving the
+        // cursor hidden here would hide it permanently for as long as a sidebar
+        // is visible -- the headline symptom being a shell with no cursor.
+        self.queue_remembered_cursor(out)?;
+
         queue!(out, Print("\x1b[?2026l"))?;
         Ok(())
     }
@@ -820,6 +869,11 @@ impl Renderer {
             self.content_cols,
             self.content_rows,
         );
+        // `render_full(.., false, ..)` below would otherwise record "hidden" as
+        // the server's last reported cursor, and a later `paint_panel` would
+        // faithfully restore that. Overlay teardown already re-shows the cursor
+        // via `restore_cursor`; this keeps the memory pointing at the truth.
+        let saved_cursor = self.last_cursor;
         // The frame here IS the whole terminal, so the content rect must be the
         // whole terminal too -- otherwise the clears would treat the panel
         // columns as stale remainder and blank them.
@@ -833,6 +887,7 @@ impl Renderer {
         self.origin_y = saved.1;
         self.content_cols = saved.2;
         self.content_rows = saved.3;
+        self.last_cursor = saved_cursor;
         res
     }
 
@@ -1474,6 +1529,11 @@ impl Renderer {
     /// AFTER `clear_overlay` to put the cursor back where the last server frame
     /// reported it. Queues the operation; the caller must `flush()`.
     pub fn restore_cursor(&mut self, x: u16, y: u16, visible: bool) -> Result<()> {
+        // The caller is asserting where the cursor now is, so record it: a
+        // `paint_panel` after this must restore THIS state, not the one the
+        // last server frame reported. The style is left as remembered -- this
+        // entry point never carried one.
+        self.last_cursor = (x, y, visible, self.last_cursor.3);
         let mut stdout = io::stdout().lock();
         if visible {
             // `x`/`y` are the last server-reported position, i.e.
