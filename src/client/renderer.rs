@@ -40,7 +40,12 @@ use crate::server::layout::Rect;
 ///
 /// The front buffer is always the FULL terminal in absolute coordinates,
 /// panels included. Nothing a server frame draws may write, clear, or move a
-/// cell outside the content rect.
+/// cell outside the content rect: [`Renderer::render_full`],
+/// [`Renderer::render_diff`] and [`Renderer::restore_cursor`] clip to it
+/// unconditionally, so an in-flight frame built for a previous, larger
+/// geometry is truncated rather than allowed to paint over a panel.
+/// [`Renderer::render_scroll`] is bounded by the pane rect it is handed, which
+/// the server derives from the content-rect-sized frame.
 pub struct Renderer {
     /// The front buffer: what is currently displayed on screen. Always the
     /// FULL terminal, including sidebar columns -- only the write position of
@@ -102,14 +107,30 @@ impl Renderer {
         (self.content_cols, self.content_rows)
     }
 
+    /// The absolute right/bottom edges of the content rect, clipped to the
+    /// terminal. Every server-frame write, clear and cursor move is bounded by
+    /// these; a panel lives beyond them.
+    fn content_edges(&self) -> (usize, usize) {
+        (
+            (self.origin_x as usize + self.content_cols as usize).min(self.cols as usize),
+            (self.origin_y as usize + self.content_rows as usize).min(self.rows as usize),
+        )
+    }
+
     /// Translate a content-relative cursor position to an absolute screen
-    /// position, clamped to the terminal.
+    /// position, clamped to the content rect.
+    ///
+    /// Clamping to the terminal instead would park the hardware cursor inside a
+    /// panel. The content rect is never zero-sized in practice
+    /// (`chrome::geometry` guarantees it), so the `saturating_sub` floors here
+    /// only matter for a degenerate rect that has no content to draw anyway.
     fn cursor_screen_pos(&self, x: u16, y: u16) -> (u16, u16) {
+        let (right, bottom) = self.content_edges();
         (
             x.saturating_add(self.origin_x)
-                .min(self.cols.saturating_sub(1)),
+                .min(right.saturating_sub(1) as u16),
             y.saturating_add(self.origin_y)
-                .min(self.rows.saturating_sub(1)),
+                .min(bottom.saturating_sub(1) as u16),
         )
     }
 
@@ -135,12 +156,13 @@ impl Renderer {
 
         let ox = self.origin_x as usize;
         let oy = self.origin_y as usize;
-        // Absolute right/bottom edges of the content rect, clipped to the
-        // terminal. Every clear below is bounded by these: a frame smaller than
-        // the content rect must still blank the stale remainder inside the
-        // rect, but a panel lives beyond it and must never be touched.
-        let content_right = (ox + self.content_cols as usize).min(self.cols as usize);
-        let content_bottom = (oy + self.content_rows as usize).min(self.rows as usize);
+        // Absolute right/bottom edges of the content rect. EVERY write below is
+        // bounded by these, not by the terminal: a frame smaller than the
+        // content rect must still blank the stale remainder inside the rect,
+        // and a frame LARGER than it (an in-flight frame built for a previous,
+        // bigger geometry, e.g. after a resize) must be clipped rather than
+        // allowed to paint over a panel and persist that into the front buffer.
+        let (content_right, content_bottom) = self.content_edges();
 
         let mut stdout = io::stdout().lock();
 
@@ -153,7 +175,7 @@ impl Renderer {
 
         for (y, row) in cells.iter().enumerate() {
             let sy = y + oy;
-            if sy >= self.rows as usize {
+            if sy >= content_bottom {
                 break;
             }
 
@@ -175,7 +197,7 @@ impl Renderer {
 
             for (x, cell) in row.iter().enumerate() {
                 let sx = x + ox;
-                if sx >= self.cols as usize {
+                if sx >= content_right {
                     break;
                 }
 
@@ -254,7 +276,7 @@ impl Renderer {
             // erase it on every frame. The cursor is already positioned after
             // the last painted cell and ResetColor above put the default
             // background back, so spaces are equivalent to the clear.
-            let painted = (ox + row.len()).min(self.cols as usize);
+            let painted = (ox + row.len()).min(content_right);
             if painted < content_right {
                 for sx in painted..content_right {
                     self.front[sy][sx] = RenderCell::default();
@@ -300,12 +322,12 @@ impl Renderer {
         // replacing it would both resize it and destroy every panel cell.
         for (y, row) in cells.iter().enumerate() {
             let sy = y + oy;
-            if sy >= self.rows as usize {
+            if sy >= content_bottom {
                 break;
             }
             for (x, cell) in row.iter().enumerate() {
                 let sx = x + ox;
-                if sx >= self.cols as usize {
+                if sx >= content_right {
                     break;
                 }
                 self.front[sy][sx] = cell.clone();
@@ -341,12 +363,18 @@ impl Renderer {
 
         queue!(stdout, cursor::Hide)?;
 
+        // Same bound as render_full's paint loop and blit: a diff built for a
+        // previous, larger geometry must be clipped to the content rect rather
+        // than the terminal, or it writes over panel cells and persists that
+        // into the front buffer.
+        let (content_right, content_bottom) = self.content_edges();
+
         for change in changes {
             // Change coordinates are content-relative; translate them to the
-            // screen and drop anything that falls outside the terminal.
+            // screen and drop anything that falls outside the content rect.
             let sx = change.x as usize + self.origin_x as usize;
             let sy = change.y as usize + self.origin_y as usize;
-            if sx >= self.cols as usize || sy >= self.rows as usize {
+            if sx >= content_right || sy >= content_bottom {
                 continue;
             }
 
@@ -517,6 +545,13 @@ impl Renderer {
             }
 
             for (col, cell) in row_cells.iter().enumerate() {
+                // Bound to the pane width, matching step 3's re-render. A server
+                // row longer than the pane would otherwise write front cells
+                // past the pane that step 3 never repaints -- and at a non-zero
+                // origin those cells can belong to a right sidebar.
+                if col >= pw {
+                    break;
+                }
                 let screen_x = px + col;
                 if screen_x < self.front[screen_y].len() {
                     self.front[screen_y][screen_x] = cell.clone();
@@ -659,8 +694,24 @@ impl Renderer {
     /// simply leaves the remainder untouched.
     pub fn paint_panel(&mut self, rect: Rect, cells: &[Vec<RenderCell>]) -> Result<()> {
         let mut stdout = io::stdout().lock();
-        queue!(stdout, Print("\x1b[?2026h"))?;
-        queue!(stdout, cursor::Hide)?;
+        self.paint_panel_into(&mut stdout, rect, cells)
+    }
+
+    /// The body of [`Renderer::paint_panel`], parameterised over the sink.
+    ///
+    /// Splitting it out lets a test capture the emitted bytes and prove that
+    /// what is *emitted* matches what is *stored* in the front buffer. That
+    /// equality is the whole point: `render_full` honours every attribute it
+    /// finds in the front buffer, so any attribute stored but not emitted would
+    /// make the panel change appearance the first time `repaint_all` runs.
+    fn paint_panel_into<W: Write>(
+        &mut self,
+        out: &mut W,
+        rect: Rect,
+        cells: &[Vec<RenderCell>],
+    ) -> Result<()> {
+        queue!(out, Print("\x1b[?2026h"))?;
+        queue!(out, cursor::Hide)?;
 
         for (ry, row) in cells.iter().enumerate() {
             let sy = rect.y as usize + ry;
@@ -669,11 +720,16 @@ impl Renderer {
             }
             // Same reset discipline as render_full: without it the previous
             // row's attributes bleed into this panel's leading cells.
-            queue!(stdout, SetAttribute(Attribute::Reset))?;
-            queue!(stdout, MoveTo(rect.x, sy as u16))?;
+            queue!(out, SetAttribute(Attribute::Reset))?;
+            queue!(out, MoveTo(rect.x, sy as u16))?;
 
             let mut last_fg = CellColor::Default;
             let mut last_bg = CellColor::Default;
+            let mut last_bold = false;
+            let mut last_italic = false;
+            let mut last_underline = false;
+            let mut last_hyperlink: Option<String> = None;
+
             for (rx, cell) in row.iter().enumerate() {
                 let sx = rect.x as usize + rx;
                 if rx >= rect.width as usize || sx >= self.cols as usize {
@@ -684,28 +740,65 @@ impl Renderer {
                     continue;
                 }
                 if cell.fg != last_fg {
-                    queue!(
-                        stdout,
-                        SetForegroundColor(cell_color_to_crossterm(&cell.fg))
-                    )?;
+                    queue!(out, SetForegroundColor(cell_color_to_crossterm(&cell.fg)))?;
                     last_fg = cell.fg.clone();
                 }
                 if cell.bg != last_bg {
-                    queue!(
-                        stdout,
-                        SetBackgroundColor(cell_color_to_crossterm(&cell.bg))
-                    )?;
+                    queue!(out, SetBackgroundColor(cell_color_to_crossterm(&cell.bg)))?;
                     last_bg = cell.bg.clone();
                 }
-                queue!(stdout, Print(cell.c))?;
+                // The attribute set is emitted exactly as render_full would
+                // emit it, because render_full is what replays this row out of
+                // the front buffer on the next repaint.
+                if cell.bold != last_bold {
+                    if cell.bold {
+                        queue!(out, SetAttribute(Attribute::Bold))?;
+                    } else {
+                        queue!(out, SetAttribute(Attribute::NormalIntensity))?;
+                    }
+                    last_bold = cell.bold;
+                }
+                if cell.italic != last_italic {
+                    if cell.italic {
+                        queue!(out, SetAttribute(Attribute::Italic))?;
+                    } else {
+                        queue!(out, SetAttribute(Attribute::NoItalic))?;
+                    }
+                    last_italic = cell.italic;
+                }
+                if cell.underline != last_underline {
+                    if cell.underline {
+                        queue!(out, SetAttribute(Attribute::Underlined))?;
+                    } else {
+                        queue!(out, SetAttribute(Attribute::NoUnderline))?;
+                    }
+                    last_underline = cell.underline;
+                }
+                if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
+                    match &cell.hyperlink {
+                        Some(uri) => queue!(out, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        None => queue!(out, Print("\x1b]8;;\x1b\\"))?,
+                    }
+                    last_hyperlink = cell.hyperlink.clone();
+                }
+                queue!(out, Print(cell.c))?;
+                // Combining marks are zero-width; they compose onto the base
+                // glyph just printed.
+                for m in &cell.combining {
+                    queue!(out, Print(*m))?;
+                }
                 self.front[sy][sx] = cell.clone();
             }
-            // Reset at end of row so the panel's background cannot bleed into
-            // the first content column.
-            queue!(stdout, SetAttribute(Attribute::Reset))?;
+            // Close any open hyperlink so links never span rows, then reset at
+            // end of row so the panel's styling cannot bleed into the first
+            // content column.
+            if last_hyperlink.is_some() {
+                queue!(out, Print("\x1b]8;;\x1b\\"))?;
+            }
+            queue!(out, SetAttribute(Attribute::Reset))?;
         }
 
-        queue!(stdout, Print("\x1b[?2026l"))?;
+        queue!(out, Print("\x1b[?2026l"))?;
         Ok(())
     }
 
@@ -1825,6 +1918,166 @@ mod origin_tests {
     }
 
     #[test]
+    fn render_diff_drops_changes_that_fall_outside_the_content_rect() {
+        // Same class as the oversized-frame case, on the diff path: a change
+        // built for a previous, larger geometry must not write into a panel.
+        let mut r = Renderer::new(20, 4);
+        r.paint_panel(
+            Rect {
+                x: 12,
+                y: 0,
+                width: 8,
+                height: 4,
+            },
+            &grid("PANELPAN", 4),
+        )
+        .unwrap();
+        r.set_origin(0, 0);
+        r.set_content_size(12, 4);
+        let changes = vec![CellChange {
+            y: 0,
+            x: 15,
+            cell: cell('Q'),
+        }];
+        r.render_diff(&changes, 0, 0, false, 0).unwrap();
+        assert_eq!(r.front_buffer()[0][15].c, 'E', "diff wrote into the panel");
+    }
+
+    #[test]
+    fn an_oversized_frame_is_clipped_to_the_content_rect_not_the_terminal() {
+        // Guards Important 1. A frame LARGER than the content rect is
+        // reachable: a resize race can deliver an in-flight server frame built
+        // for the previous, bigger geometry. Bounding the paint loop and the
+        // blit by the terminal would let it paint straight over the panels and
+        // persist that corruption into the front buffer, where `repaint_all`
+        // would reproduce it faithfully.
+        let mut r = Renderer::new(20, 6);
+        // Left panel on columns 0..4, right panel on 16..20, bottom on rows 4..6.
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &grid("LEFT", 4),
+        )
+        .unwrap();
+        r.paint_panel(
+            Rect {
+                x: 16,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &grid("RGHT", 4),
+        )
+        .unwrap();
+        r.paint_panel(
+            Rect {
+                x: 0,
+                y: 4,
+                width: 20,
+                height: 2,
+            },
+            &grid(&"B".repeat(20), 2),
+        )
+        .unwrap();
+        // Content rect is columns 4..16, rows 0..4.
+        r.set_origin(4, 0);
+        r.set_content_size(12, 4);
+        // A frame from the pre-resize geometry: 20x6 into a 12x4 content rect.
+        r.render_full(&grid(&"X".repeat(20), 6), 0, 0, false, 0)
+            .unwrap();
+        let front = r.front_buffer();
+        assert_eq!(front[0][0].c, 'L', "left panel was painted over");
+        assert_eq!(front[0][16].c, 'R', "right panel was painted over");
+        assert_eq!(front[0][19].c, 'T', "right panel was painted over");
+        assert_eq!(front[4][0].c, 'B', "bottom panel was painted over");
+        assert_eq!(front[5][19].c, 'B', "bottom panel was painted over");
+        // The content rect itself is fully painted.
+        assert_eq!(front[0][4].c, 'X');
+        assert_eq!(front[3][15].c, 'X');
+    }
+
+    #[test]
+    fn render_scroll_does_not_write_new_row_cells_past_the_pane() {
+        // Guards Minor 3. Step 2 wrote the full length of each new row while
+        // step 3's re-render stops at the pane width, so a server row longer
+        // than the pane left front cells past it that were never repainted --
+        // and at a non-zero origin those cells belong to a right sidebar.
+        let mut r = Renderer::new(10, 4);
+        r.paint_panel(
+            Rect {
+                x: 4,
+                y: 0,
+                width: 6,
+                height: 4,
+            },
+            &grid("PANEL!", 4),
+        )
+        .unwrap();
+        r.set_content_size(4, 4);
+        // The pane is 4 columns wide; the new row is 10 cells long.
+        let new_row = grid("NNNNNNNNNN", 1);
+        r.render_scroll(0, 0, 4, 4, 1, &new_row, 0, 0, false, 0)
+            .unwrap();
+        let front = r.front_buffer();
+        assert_eq!(front[0][0].c, 'N');
+        assert_eq!(front[0][3].c, 'N');
+        assert_eq!(front[0][4].c, 'P', "wrote past the pane into the panel");
+        assert_eq!(front[0][9].c, '!', "wrote past the pane into the panel");
+    }
+
+    #[test]
+    fn paint_panel_emits_every_attribute_it_stores() {
+        // Guards Important 2. `render_full` honours bold/italic/underline/
+        // hyperlink out of the front buffer, so an attribute that `paint_panel`
+        // stores but never emits makes the panel silently change appearance the
+        // first time an overlay teardown calls `repaint_all`. Capture the bytes
+        // and prove emitted == stored.
+        let mut r = Renderer::new(10, 1);
+        let styled = RenderCell {
+            c: 'P',
+            bold: true,
+            underline: true,
+            hyperlink: Some("https://example.invalid".to_string()),
+            ..RenderCell::default()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        r.paint_panel_into(
+            &mut out,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            &[vec![styled.clone()]],
+        )
+        .unwrap();
+
+        let emitted = String::from_utf8(out).unwrap();
+        assert!(
+            emitted.contains("\x1b[1m"),
+            "bold was stored but not emitted"
+        );
+        assert!(
+            emitted.contains("\x1b[4m"),
+            "underline was stored but not emitted"
+        );
+        assert!(
+            emitted.contains("https://example.invalid"),
+            "hyperlink was stored but not emitted"
+        );
+
+        // ...and the stored cell carries exactly those attributes, so the
+        // repaint reproduces the paint rather than restyling it.
+        let stored = &r.front_buffer()[0][0];
+        assert_eq!(stored, &styled);
+    }
+
+    #[test]
     fn a_smaller_frame_still_clears_stale_content_at_the_default_content_size() {
         // The today-behaviour gate. With no sidebars configured -- default
         // content size, origin (0, 0) -- a frame narrower AND shorter than the
@@ -1850,7 +2103,7 @@ mod origin_tests {
     }
 
     #[test]
-    fn resize_resets_the_front_buffer_but_keeps_the_origin() {
+    fn resize_resets_the_front_buffer_and_content_rect_but_keeps_the_origin() {
         let mut r = Renderer::new(20, 4);
         r.set_origin(5, 1);
         r.resize(30, 10);
