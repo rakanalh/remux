@@ -165,6 +165,25 @@ def sgr_release(col, row):
     return f"\x1b[<0;{col};{row}m".encode()
 
 
+def sgr_wheel_up(col, row):
+    return f"\x1b[<64;{col};{row}M".encode()
+
+
+def sgr_wheel_down(col, row):
+    return f"\x1b[<65;{col};{row}M".encode()
+
+
+def panel_focus_marker(screen):
+    """"focused" / "idle" as the placeholder currently renders it, or None."""
+    for row in screen.display:
+        cell = row[:SIDEBAR_W]
+        if "focused" in cell:
+            return "focused"
+        if "idle" in cell:
+            return "idle"
+    return None
+
+
 def test_click_in_sidebar_is_swallowed():
     """Row 4: a press inside a panel reaches the plugin and NOT the server."""
     env = make_env(SIDEBAR_CFG_LEFT)
@@ -242,6 +261,10 @@ def test_drag_from_content_over_the_sidebar_stays_with_the_content():
     child.send(sgr_release(5, 5))
     pump(1.2)
 
+    # NOTE: this line is NOT what proves the drag never reached the plugin.
+    # `PlaceholderPlugin::on_mouse` only mutates on `Down(Left)`, so a leaked
+    # drag would render identically and this comparison would still hold. The
+    # server-log assertions below carry that direction; keep them.
     assert panel_rows(screen) == before, (
         "a drag that began in the content reached the plugin: "
         f"{before} -> {panel_rows(screen)}"
@@ -302,6 +325,99 @@ def test_drag_from_the_sidebar_over_the_content_stays_with_the_panel():
     print("PASS test_drag_from_the_sidebar_over_the_content_stays_with_the_panel")
 
 
+def test_clicking_the_content_returns_focus_to_it():
+    """A panel press is not a one-way door: clicking back returns focus.
+
+    Without the content-route focus restore, the panel keeps rendering as
+    focused AND (once directional navigation lands) keeps the keyboard, so the
+    user is stuck typing into a panel. Both halves are asserted: the rendered
+    marker and where a subsequent keystroke actually lands.
+    """
+    env = make_env(SIDEBAR_CFG_LEFT)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    assert panel_focus_marker(screen) == "idle", (
+        f"the panel did not start unfocused: {panel_focus_marker(screen)}"
+    )
+    child.send(sgr_press(5, 3))
+    child.send(sgr_release(5, 3))
+    pump(1.0)
+    assert panel_focus_marker(screen) == "focused", (
+        "the panel press did not focus the panel; the restore assertion below "
+        "would be vacuous"
+    )
+
+    child.send(sgr_press(SIDEBAR_W + 11, 3))
+    child.send(sgr_release(SIDEBAR_W + 11, 3))
+    pump(1.0)
+    assert panel_focus_marker(screen) == "idle", (
+        "clicking the content left the panel rendering as focused: "
+        f"{panel_focus_marker(screen)}"
+    )
+
+    # And the keyboard came back with it.
+    child.send(b"echo zzqq\r")
+    pump(1.2)
+    assert any("zzqq" in r[SIDEBAR_W:] for r in screen.display), (
+        "a keystroke after clicking the content never reached the shell:\n"
+        + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_clicking_the_content_returns_focus_to_it")
+
+
+def test_wheel_over_a_panel_is_swallowed():
+    """A wheel event over a panel reaches neither scroll path on the server.
+
+    The placeholder ignores the wheel, so there is nothing to see on screen --
+    the server log is the whole assertion, and it is the half that regresses
+    silently.
+    """
+    env = make_env(SIDEBAR_CFG_LEFT)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    assert panel_rows(screen), "the panel never painted; the wheel has no target"
+    before = server_log()
+    base_scroll = before.count("msg=MouseScroll")
+    base_delta = before.count("msg=ScrollDelta")
+
+    for _ in range(3):
+        child.send(sgr_wheel_up(5, 4))
+        pump(0.2)
+    for _ in range(3):
+        child.send(sgr_wheel_down(5, 4))
+        pump(0.2)
+    pump(1.0)
+
+    after = server_log()
+    assert after.count("msg=MouseScroll") == base_scroll, (
+        "a wheel event over a panel leaked to the server as MouseScroll: "
+        f"{base_scroll} -> {after.count('msg=MouseScroll')}"
+    )
+    assert after.count("msg=ScrollDelta") == base_delta, (
+        "a wheel event over a panel leaked to the server as ScrollDelta: "
+        f"{base_delta} -> {after.count('msg=ScrollDelta')}"
+    )
+
+    # The same wheel over the CONTENT does reach the server -- otherwise the
+    # assertions above would pass on a client that ignores the wheel entirely.
+    child.send(sgr_wheel_up(SIDEBAR_W + 11, 4))
+    pump(1.2)
+    reached = server_log()
+    assert (
+        reached.count("msg=MouseScroll") > base_scroll
+        or reached.count("msg=ScrollDelta") > base_delta
+    ), "the control wheel over the content never reached the server either"
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_wheel_over_a_panel_is_swallowed")
+
+
 if __name__ == "__main__":
     if not os.path.exists(BIN):
         sys.exit(f"build first: {BIN} missing")
@@ -309,4 +425,6 @@ if __name__ == "__main__":
     test_click_in_content_is_translated()
     test_drag_from_content_over_the_sidebar_stays_with_the_content()
     test_drag_from_the_sidebar_over_the_content_stays_with_the_panel()
+    test_clicking_the_content_returns_focus_to_it()
+    test_wheel_over_a_panel_is_swallowed()
     print("ALL PASS")

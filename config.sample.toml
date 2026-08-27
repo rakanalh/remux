@@ -459,6 +459,15 @@
 #   ViewClose                       — Leave the active view (it keeps existing)
 #   ViewDelete                      — Delete the active view for everyone
 #
+# Sidebar commands (client-side chrome; sidebars are declared with [[sidebar]]):
+#   SidebarToggleLeft               — Show/hide the left sidebar
+#   SidebarToggleRight              — Show/hide the right sidebar
+#   SidebarToggleBottom             — Show/hide the bottom sidebar
+#   SidebarFocusLeft                — Focus the left sidebar, opening it if hidden
+#   SidebarFocusRight               — Focus the right sidebar, opening it if hidden
+#   SidebarFocusBottom              — Focus the bottom sidebar, opening it if hidden
+#   SidebarCycle                    — Cycle focus through every panel, then the content
+#
 # Session commands:
 #   SessionNew <name> [folder]      — Create a new session
 #   SessionQuickSwitch              — Open the quick session switcher

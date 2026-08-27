@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::client::chrome::SidebarEdge;
 use crate::client::command_palette::CommandPaletteState;
 use crate::client::registry::ConnId;
 use crate::config::keybindings::{
@@ -458,8 +459,24 @@ pub enum InputAction {
     ViewPickerConfirm { view: Option<usize> },
     /// The view picker was cancelled.
     ViewPickerClose,
+    /// A sidebar action the main loop applies to the `Chrome`.
+    Sidebar(SidebarIntent),
     /// No action to take.
     None,
+}
+
+/// What a sidebar `ClientAction` asks the main loop to do.
+///
+/// The chrome lives in the main loop, not in the `InputHandler`, so these are
+/// intents rather than mutations -- the same shape the view actions use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarIntent {
+    /// Show or hide the sidebar on this edge.
+    Toggle(crate::client::chrome::SidebarEdge),
+    /// Focus the sidebar on this edge, opening it if hidden.
+    Focus(crate::client::chrome::SidebarEdge),
+    /// Move focus to the next visible panel, then back to the content area.
+    Cycle,
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,6 +1557,83 @@ impl InputHandler {
         key.code == self.leader_key.code && key.modifiers == self.leader_key.modifiers
     }
 
+    /// Whether any overlay is currently capturing keystrokes.
+    ///
+    /// These sit ON TOP of the mode (a rename prompt or the switcher runs with
+    /// `mode == Normal`), so a mode check alone does not see them. The sidebar
+    /// key routing asks this before claiming a key: an open overlay owns the
+    /// keyboard first.
+    pub fn has_overlay(&self) -> bool {
+        self.rename_overlay.is_some()
+            || self.command_palette.is_some()
+            || self.search_state.is_some()
+            || self.session_manager.is_some()
+            || self.folder_select.is_some()
+            || self.session_switch.is_some()
+            || self.view_picker.is_some()
+    }
+
+    /// Whether this key is the configured prefix (leader).
+    ///
+    /// A focused sidebar owns the keyboard, but never the prefix: swallowing it
+    /// would make command mode unreachable from inside a panel.
+    pub fn is_prefix_key(&self, key: &KeyEvent) -> bool {
+        self.is_leader_key(key)
+    }
+
+    /// Whether this key resolves to one of the sidebar `ClientAction`s.
+    ///
+    /// The same exemption `resolves_to_pane_focus` earns, for the same reason:
+    /// a focused sidebar that swallowed `SidebarCycle` would make the sidebar
+    /// commands unreachable from precisely the place they are most useful.
+    pub fn resolves_to_sidebar_action(&self, key: &KeyEvent) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
+            return false;
+        };
+        actions.iter().any(|a| {
+            matches!(
+                resolve_action(a),
+                Some(Action::Client(
+                    ClientAction::SidebarToggleLeft
+                        | ClientAction::SidebarToggleRight
+                        | ClientAction::SidebarToggleBottom
+                        | ClientAction::SidebarFocusLeft
+                        | ClientAction::SidebarFocusRight
+                        | ClientAction::SidebarFocusBottom
+                        | ClientAction::SidebarCycle
+                ))
+            )
+        })
+    }
+
+    /// Whether this key resolves to a `PaneFocus*` command in the current mode.
+    ///
+    /// Directional keys are the one command a focused sidebar does not take:
+    /// they are how the user gets back out, and `intercept_focus` decides what
+    /// they mean. Non-mutating, so it can be asked before `handle_key`.
+    pub fn resolves_to_pane_focus(&self, key: &KeyEvent) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
+            return false;
+        };
+        actions.iter().any(|a| {
+            matches!(
+                resolve_action(a),
+                Some(Action::Server(
+                    RemuxCommand::PaneFocusLeft
+                        | RemuxCommand::PaneFocusRight
+                        | RemuxCommand::PaneFocusUp
+                        | RemuxCommand::PaneFocusDown
+                ))
+            )
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Command mode
     // -----------------------------------------------------------------------
@@ -1718,6 +1812,25 @@ impl InputHandler {
                 self.mode = Mode::Normal;
                 InputAction::ViewDelete
             }
+            ClientAction::SidebarToggleLeft => {
+                InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Left))
+            }
+            ClientAction::SidebarToggleRight => {
+                InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Right))
+            }
+            ClientAction::SidebarToggleBottom => {
+                InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Bottom))
+            }
+            ClientAction::SidebarFocusLeft => {
+                InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Left))
+            }
+            ClientAction::SidebarFocusRight => {
+                InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Right))
+            }
+            ClientAction::SidebarFocusBottom => {
+                InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Bottom))
+            }
+            ClientAction::SidebarCycle => InputAction::Sidebar(SidebarIntent::Cycle),
         }
     }
 

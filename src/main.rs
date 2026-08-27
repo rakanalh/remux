@@ -18,6 +18,7 @@ use futures::StreamExt;
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
     FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget, SessionSwitchOverlay,
+    SidebarIntent,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
@@ -676,38 +677,143 @@ enum MouseGrab {
     Panel { sidebar: usize, panel: usize },
 }
 
+/// The focus direction a `PaneFocus*` command asks for, if it is one.
+///
+/// The chrome intercepts these before they reach the server; every other
+/// command is `None` and falls straight through.
+fn focus_direction_of(cmd: &RemuxCommand) -> Option<crate::server::layout::FocusDirection> {
+    use crate::server::layout::FocusDirection;
+    match cmd {
+        RemuxCommand::PaneFocusLeft => Some(FocusDirection::Left),
+        RemuxCommand::PaneFocusRight => Some(FocusDirection::Right),
+        RemuxCommand::PaneFocusUp => Some(FocusDirection::Up),
+        RemuxCommand::PaneFocusDown => Some(FocusDirection::Down),
+        _ => None,
+    }
+}
+
+/// Go to a pane anywhere: leave any live view, re-point the renderer at the
+/// content rect, hand the screen to `server`, attach and switch.
+///
+/// Extracted from the session manager's `SwitchPane` arm so the sidebar's
+/// `PluginAction::JumpTo` has exactly ONE implementation of "go to that pane"
+/// to reuse rather than a second, drifting copy. The session-manager teardown
+/// (closing the overlay, clearing it) stays at that call site: it is about the
+/// overlay, not about the jump.
+#[allow(clippy::too_many_arguments)]
+async fn switch_to_pane(
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    chrome: &crate::client::chrome::Chrome,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+    server: ConnId,
+    session: String,
+    tab_index: usize,
+    pane_id: crate::protocol::PaneId,
+) -> Result<()> {
+    // A live view masks the switched-to session: tear it down before handing
+    // off the screen.
+    leave_active_view(mgr, views, active_view, active_view_id).await?;
+    // Leaving the view hands the screen back to the content rect: re-point the
+    // renderer at it before the target server is told what size to composite.
+    let content = content_rect_now(chrome, *active_view)?;
+    sync_content_rect(renderer, &content);
+    switch_to_server(mgr, &server, content).await?;
+    // The server's handle_command ignores commands from a client with no
+    // attached session, so a remote pane switch must attach first (a harmless
+    // re-attach for local).
+    mgr.send(
+        &server,
+        ClientMessage::Attach {
+            session_name: session.clone(),
+        },
+    )
+    .await?;
+    mgr.send(
+        &server,
+        ClientMessage::Command(RemuxCommand::SessionSwitchPane {
+            session: session.clone(),
+            tab_index,
+            pane_id,
+        }),
+    )
+    .await?;
+    mgr.send(
+        &server,
+        ClientMessage::ModeChanged {
+            mode: "NORMAL".to_string(),
+        },
+    )
+    .await?;
+    if server == ConnId::Local {
+        *last_local_session = Some(session.clone());
+    }
+    record_switch(current_attached, previous_attached, server, session);
+    Ok(())
+}
+
 /// Act on what a sidebar plugin asked for after an input event.
 ///
-/// `LeaveTo`/`JumpTo` are wired up in Task 7; until then they are logged so a
-/// plugin returning one is visible in the client log rather than silently
-/// ignored.
+/// Both focus-leaving arms go through `Chrome::leave_sidebar` so the panel the
+/// user was on is remembered: `focus_edge` comes back to it rather than
+/// resetting to the first panel.
+#[allow(clippy::too_many_arguments)]
 async fn handle_plugin_action(
     action: crate::client::sidebar::PluginAction,
     chrome: &mut crate::client::chrome::Chrome,
-    _mgr: &mut ConnectionManager,
+    mgr: &mut ConnectionManager,
     renderer: &mut Renderer,
     theme: &crate::config::theme::CompositorTheme,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
 ) -> Result<()> {
     use crate::client::sidebar::PluginAction;
+    let (c, r) = renderer.size();
     match action {
         PluginAction::None => {}
         PluginAction::Redraw => {
-            let (c, r) = renderer.size();
             chrome.paint(renderer, c, r, theme)?;
             renderer.flush()?;
         }
         PluginAction::LeaveTo(dir) => {
-            log::debug!("sidebar: plugin asked to leave towards {dir:?} (not wired up yet)");
+            log::debug!("sidebar: plugin asked to leave towards {dir:?}");
+            chrome.leave_sidebar();
+            chrome.paint(renderer, c, r, theme)?;
+            renderer.flush()?;
         }
         PluginAction::JumpTo {
-            ref conn,
-            ref session,
+            conn,
+            session,
             tab_index,
             pane_id,
         } => {
-            log::debug!(
-                "sidebar: plugin asked to jump to {conn:?} {session}:{tab_index} pane {pane_id} (not wired up yet)"
-            );
+            log::debug!("sidebar: plugin jump to {conn:?} {session}:{tab_index} pane {pane_id}");
+            chrome.leave_sidebar();
+            switch_to_pane(
+                mgr,
+                renderer,
+                chrome,
+                views,
+                active_view,
+                active_view_id,
+                last_local_session,
+                current_attached,
+                previous_attached,
+                conn,
+                session,
+                tab_index,
+                pane_id,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1708,10 +1814,9 @@ async fn run_client_loop(
     let mut mouse_grab: Option<MouseGrab> = None;
     // An in-progress drag-selection inside a VIEW cell: the cell's connection,
     // its source pane, and the press point in that pane's own content
-    // coordinates. Kept separate from `drag_start` (screen coordinates in the
-    // foreground session) because a client displaying a view is detached: the
-    // gesture is routed by pane identity, and it stays bound to the cell it
-    // started in even as the pointer leaves that cell.
+    // coordinates. Kept separate from `drag_start` because a client displaying
+    // a view is detached: the gesture is routed by pane identity, and it stays
+    // bound to the cell it started in even as the pointer leaves that cell.
     let mut view_drag: Option<(ConnId, protocol::PaneId, u16, u16)> = None;
     let mut last_drag_send: Instant = Instant::now();
     /// Minimum interval between drag event sends (~16ms = ~60fps).
@@ -1742,6 +1847,67 @@ async fn run_client_loop(
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
+                        // A focused sidebar owns the keyboard, except for the
+                        // prefix (which keeps command mode reachable), directional
+                        // focus (handled by `intercept_focus` on the way out), the
+                        // sidebar commands themselves (a swallowed `SidebarCycle`
+                        // would be unreachable from the one place it is most
+                        // useful) and Escape (which returns to the content area).
+                        // This sits BEFORE `handle_key` because it inspects the
+                        // raw key.
+                        //
+                        // The guard is deliberately narrow. An open overlay or a
+                        // half-typed prefix chord owns the keyboard FIRST -- the
+                        // prefix is let through, so without the mode check the
+                        // NEXT key of `Prefix x m` would be eaten by the plugin
+                        // and command mode would be unreachable from a panel. A
+                        // live view composites the whole terminal, so the chrome
+                        // claims nothing while one is up.
+                        //
+                        // Panels are laid out against the front buffer, so the
+                        // sizes come from `Renderer::size` -- see `panel_at` for
+                        // the SIGWINCH window a fresh `terminal::size()` reopens.
+                        if active_view.is_none() && input.mode == Mode::Normal && !input.has_overlay() {
+                            let (tc, tr) = renderer.size();
+                            match chrome.focused_panel(tc, tr) {
+                                Some((sidebar, panel)) => {
+                                    if key.code == crossterm::event::KeyCode::Esc {
+                                        chrome.leave_sidebar();
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                        renderer.flush()?;
+                                        continue;
+                                    }
+                                    let passes_through = input.is_prefix_key(&key)
+                                        || input.resolves_to_pane_focus(&key)
+                                        || input.resolves_to_sidebar_action(&key);
+                                    if !passes_through {
+                                        let plugin_action = chrome.sidebars[sidebar].panels[panel]
+                                            .plugin
+                                            .on_key(key);
+                                        handle_plugin_action(
+                                            plugin_action,
+                                            &mut chrome,
+                                            mgr,
+                                            &mut renderer,
+                                            &compositor_theme,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                }
+                                // Focus is plain indices, so a resize that
+                                // force-hid the sidebar can strand it on a panel
+                                // that is no longer laid out. Release it rather
+                                // than swallowing keys into something invisible.
+                                None => chrome.leave_sidebar(),
+                            }
+                        }
                         let was_renaming = input.rename_overlay.is_some();
                         let was_in_palette = input.command_palette.is_some();
                         // Inside a view, arrow/nav keys must be encoded with the
@@ -1874,6 +2040,26 @@ async fn run_client_loop(
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
                                     return Ok(());
                                 }
+                                // Directional focus: a sidebar on that edge takes
+                                // it instead of the server. `intercept_focus`
+                                // returns false whenever there is nothing to enter,
+                                // so with no sidebar configured this is a no-op and
+                                // the command forwards exactly as before.
+                                if let Some(dir) = focus_direction_of(&cmd) {
+                                    let (tc, tr) = renderer.size();
+                                    if crate::client::chrome::intercept_focus(
+                                        &mut chrome,
+                                        dir,
+                                        focused_pane_rect.as_ref(),
+                                        tc,
+                                        tr,
+                                        &config.appearance.status_bar_position,
+                                    ) {
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                        renderer.flush()?;
+                                        continue;
+                                    }
+                                }
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
                                     mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
@@ -1949,6 +2135,26 @@ async fn run_client_loop(
                                         )
                                         .await?
                                         {
+                                            continue;
+                                        }
+                                    }
+                                    // Directional focus is intercepted here too:
+                                    // the default `Prefix h` is a CHAIN
+                                    // (`PaneFocusLeft; EnterNormal`), not a single
+                                    // `Execute`. `continue` skips only this command,
+                                    // so `EnterNormal` still runs.
+                                    if let Some(dir) = focus_direction_of(&cmd) {
+                                        let (tc, tr) = renderer.size();
+                                        if crate::client::chrome::intercept_focus(
+                                            &mut chrome,
+                                            dir,
+                                            focused_pane_rect.as_ref(),
+                                            tc,
+                                            tr,
+                                            &config.appearance.status_bar_position,
+                                        ) {
+                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                            renderer.flush()?;
                                             continue;
                                         }
                                     }
@@ -2795,29 +3001,23 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        // A live view masks the switched-to session:
-                                        // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        // Leaving the view hands the screen back to the content rect:
-                                        // re-point the renderer at it before the target server is told
-                                        // what size to composite.
-                                        let content = content_rect_now(&chrome, active_view)?;
-                                        sync_content_rect(&mut renderer, &content);
-                                        switch_to_server(mgr, &server, content).await?;
-                                        // The server's handle_command ignores commands from a
-                                        // client with no attached session, so a remote pane switch
-                                        // must attach first (harmless re-attach for local).
-                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchPane {
-                                            session: session.clone(),
+                                        // The jump itself is shared with the sidebar's
+                                        // `PluginAction::JumpTo`; see `switch_to_pane`.
+                                        switch_to_pane(
+                                            mgr,
+                                            &mut renderer,
+                                            &chrome,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                            server,
+                                            session,
                                             tab_index,
                                             pane_id,
-                                        })).await?;
-                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        if server == ConnId::Local {
-                                            last_local_session = Some(session.clone());
-                                        }
-                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
+                                        ).await?;
                                     }
                                     // Structural edits target the server carried by the
                                     // action (the selected node's connection), so the
@@ -3477,6 +3677,50 @@ async fn run_client_loop(
                                         .await?;
                                 }
                             }
+                            InputAction::Sidebar(intent) => {
+                                log::debug!("input: Sidebar {intent:?}");
+                                // A live view composites the WHOLE terminal and is
+                                // not sidebar-aware yet, so its content rect is the
+                                // terminal. Applying a chrome change here would
+                                // hand the server a rect the view does not use;
+                                // ignore the intent while one is up. Logged, because
+                                // a no-op that leaves no trace reads as a dropped
+                                // keypress to whoever debugs it next.
+                                if active_view.is_some() {
+                                    log::debug!(
+                                        "sidebar: ignoring {intent:?} -- a view owns the whole terminal"
+                                    );
+                                }
+                                if active_view.is_none() {
+                                    let (tc, tr) = renderer.size();
+                                    let before = chrome.content_rect(tc, tr);
+                                    match intent {
+                                        SidebarIntent::Toggle(edge) => {
+                                            chrome.toggle_edge(edge);
+                                        }
+                                        SidebarIntent::Focus(edge) => {
+                                            chrome.focus_edge(edge, tc, tr);
+                                        }
+                                        SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
+                                    }
+                                    // Showing or hiding a sidebar moves the content
+                                    // rect, which is the server's whole world: the
+                                    // origin and the `Resize` must travel together
+                                    // (see `sync_content_rect`). Focus/cycle leave
+                                    // the geometry alone, so nothing is sent.
+                                    let content = chrome.content_rect(tc, tr);
+                                    if content != before {
+                                        sync_content_rect(&mut renderer, &content);
+                                        mgr.send_foreground(ClientMessage::Resize {
+                                            cols: content.width,
+                                            rows: content.height,
+                                        })
+                                        .await?;
+                                    }
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                    renderer.flush()?;
+                                }
+                            }
                             InputAction::None => {}
                         }
                     }
@@ -3811,6 +4055,12 @@ async fn run_client_loop(
                                 mgr,
                                 &mut renderer,
                                 &compositor_theme,
+                                &views,
+                                &mut active_view,
+                                &mut active_view_id,
+                                &mut last_local_session,
+                                &mut current_attached,
+                                &mut previous_attached,
                             )
                             .await?;
                             if repaint_for_focus {
@@ -3818,6 +4068,24 @@ async fn run_client_loop(
                                 renderer.flush()?;
                             }
                             continue;
+                        }
+                        // A press in the content area returns focus there.
+                        // Without this, the panel-press focus above is a one-way
+                        // door: keys stay in the panel after clicking the terminal.
+                        // Mirroring `focused_panel` before leaving is what lets a
+                        // later `focus_edge` return to the panel the user was last
+                        // on rather than resetting to the first.
+                        if matches!(mouse.kind, MouseEventKind::Down(_))
+                            && !matches!(chrome.focus, crate::client::chrome::ChromeFocus::Content)
+                        {
+                            if let crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel } =
+                                chrome.focus
+                            {
+                                chrome.sidebars[sidebar].focused_panel = panel;
+                            }
+                            chrome.focus = crate::client::chrome::ChromeFocus::Content;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            renderer.flush()?;
                         }
                         // Content-bound: screen -> content coordinates, clamped
                         // into the rect so a gesture that strayed over a sidebar

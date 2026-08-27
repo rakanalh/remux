@@ -811,6 +811,20 @@ pub enum ClientAction {
     ViewClose,
     /// Delete the active view for everyone.
     ViewDelete,
+    /// Toggle the left sidebar's visibility.
+    SidebarToggleLeft,
+    /// Toggle the right sidebar's visibility.
+    SidebarToggleRight,
+    /// Toggle the bottom sidebar's visibility.
+    SidebarToggleBottom,
+    /// Focus the left sidebar, opening it if hidden.
+    SidebarFocusLeft,
+    /// Focus the right sidebar, opening it if hidden.
+    SidebarFocusRight,
+    /// Focus the bottom sidebar, opening it if hidden.
+    SidebarFocusBottom,
+    /// Cycle focus through every visible panel, then back to the content area.
+    SidebarCycle,
 }
 
 /// What an action string resolves to: either a command the server executes or
@@ -970,6 +984,20 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::client("ViewLayoutNext", ClientAction::ViewLayoutNext).label("layout next"),
             ActionSpec::client("ViewClose", ClientAction::ViewClose).label("close view"),
             ActionSpec::client("ViewDelete", ClientAction::ViewDelete).label("delete view"),
+            ActionSpec::client("SidebarToggleLeft", ClientAction::SidebarToggleLeft)
+                .label("toggle left sidebar"),
+            ActionSpec::client("SidebarToggleRight", ClientAction::SidebarToggleRight)
+                .label("toggle right sidebar"),
+            ActionSpec::client("SidebarToggleBottom", ClientAction::SidebarToggleBottom)
+                .label("toggle bottom sidebar"),
+            ActionSpec::client("SidebarFocusLeft", ClientAction::SidebarFocusLeft)
+                .label("focus left sidebar"),
+            ActionSpec::client("SidebarFocusRight", ClientAction::SidebarFocusRight)
+                .label("focus right sidebar"),
+            ActionSpec::client("SidebarFocusBottom", ClientAction::SidebarFocusBottom)
+                .label("focus bottom sidebar"),
+            ActionSpec::client("SidebarCycle", ClientAction::SidebarCycle)
+                .label("cycle sidebar focus"),
         ]
     })
 }
