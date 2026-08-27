@@ -2203,6 +2203,49 @@ mod origin_tests {
     }
 
     #[test]
+    fn repaint_all_keeps_the_cursor_the_last_frame_reported() {
+        // `repaint_all` replays the front buffer with `show_cursor = false`,
+        // which runs through `queue_cursor` and would otherwise record "hidden"
+        // as the server's last reported cursor. The next `paint_panel`
+        // faithfully restores whatever is remembered, so without the save/
+        // restore in `repaint_all` a panel painted after an overlay teardown
+        // hides the cursor -- and with a sidebar configured a panel is painted
+        // after every frame, so the shell is left with no cursor.
+        //
+        // The PTY harness cannot discriminate this: every overlay teardown in
+        // `main.rs` is followed either by `restore_cursor` (which rewrites the
+        // memory) or by a server frame (ditto) before any panel paints. Pinned
+        // here instead, where the emitted bytes are visible.
+        let mut r = Renderer::new(10, 2);
+        r.render_full(&grid("AAAAAAAAAA", 2), 3, 1, true, 0)
+            .unwrap();
+        r.clear_overlay(10, 2).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        r.paint_panel_into(
+            &mut out,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            &[vec![RenderCell::default()]],
+        )
+        .unwrap();
+
+        let emitted = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            emitted.contains("\x1b[?25h"),
+            "a panel painted after an overlay teardown left the cursor hidden: {emitted:?}"
+        );
+        assert!(
+            emitted.contains("\x1b[2;4H"),
+            "the restored cursor is not where the last frame put it: {emitted:?}"
+        );
+    }
+
+    #[test]
     fn a_smaller_frame_still_clears_stale_content_at_the_default_content_size() {
         // The today-behaviour gate. With no sidebars configured -- default
         // content size, origin (0, 0) -- a frame narrower AND shorter than the

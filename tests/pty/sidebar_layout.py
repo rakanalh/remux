@@ -360,6 +360,18 @@ def test_overlay_teardown_restores_the_sidebar():
     assert any(
         "Placeholder" in r[:SIDEBAR_W] for r in rows
     ), "overlay teardown erased the sidebar:\n" + "\n".join(rows[:4])
+    # `repaint_all` re-renders the whole front buffer with `show_cursor=false`
+    # and must put `last_cursor` back afterwards; without that restore the next
+    # `paint_panel` faithfully re-hides a cursor the overlay teardown had just
+    # shown, and the shell is left with no cursor for the rest of the session.
+    assert screen.cursor.hidden is False, "overlay teardown left the cursor hidden"
+    assert (
+        screen.cursor.x >= SIDEBAR_W
+    ), f"the cursor is parked inside the sidebar at column {screen.cursor.x}"
+    row = screen.display[screen.cursor.y]
+    assert (
+        row[screen.cursor.x - 2 : screen.cursor.x] == "> "
+    ), f"the cursor is not parked at the shell prompt: {row!r} x={screen.cursor.x}"
     teardown(child, env)
     check_no_panic()
     print("PASS test_overlay_teardown_restores_the_sidebar")

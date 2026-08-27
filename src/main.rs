@@ -641,6 +641,78 @@ fn content_rect_now(
     Ok(chrome.content_rect(c, r))
 }
 
+/// Which panel, if any, a screen coordinate falls inside.
+///
+/// `term_cols`/`term_rows` must come from [`Renderer::size`], not from a fresh
+/// `terminal::size()`: panels are laid out against the front buffer, and
+/// between a SIGWINCH and the `Resize` event the two disagree -- a hit test run
+/// against the new size would resolve against rects that are not on screen yet.
+fn panel_at(
+    chrome: &crate::client::chrome::Chrome,
+    term_cols: u16,
+    term_rows: u16,
+    x: u16,
+    y: u16,
+) -> Option<(usize, usize)> {
+    chrome
+        .panel_rects(term_cols, term_rows)
+        .into_iter()
+        .find(|(_, _, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+        .map(|(si, pi, _)| (si, pi))
+}
+
+/// Which region a mouse gesture belongs to.
+///
+/// A press claims a region and every event up to the matching release stays
+/// with it: a drag that began in the content and wandered over a sidebar is
+/// clamped into the content rect rather than stealing the panel, and a drag
+/// that began in a panel keeps feeding that panel after the pointer leaves it.
+/// Without this the two halves of one gesture would land on different
+/// consumers -- the server would see a press with no release, or a panel a
+/// release it never got a press for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseGrab {
+    Content,
+    Panel { sidebar: usize, panel: usize },
+}
+
+/// Act on what a sidebar plugin asked for after an input event.
+///
+/// `LeaveTo`/`JumpTo` are wired up in Task 7; until then they are logged so a
+/// plugin returning one is visible in the client log rather than silently
+/// ignored.
+async fn handle_plugin_action(
+    action: crate::client::sidebar::PluginAction,
+    chrome: &mut crate::client::chrome::Chrome,
+    _mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    theme: &crate::config::theme::CompositorTheme,
+) -> Result<()> {
+    use crate::client::sidebar::PluginAction;
+    match action {
+        PluginAction::None => {}
+        PluginAction::Redraw => {
+            let (c, r) = renderer.size();
+            chrome.paint(renderer, c, r, theme)?;
+            renderer.flush()?;
+        }
+        PluginAction::LeaveTo(dir) => {
+            log::debug!("sidebar: plugin asked to leave towards {dir:?} (not wired up yet)");
+        }
+        PluginAction::JumpTo {
+            ref conn,
+            ref session,
+            tab_index,
+            pane_id,
+        } => {
+            log::debug!(
+                "sidebar: plugin asked to jump to {conn:?} {session}:{tab_index} pane {pane_id} (not wired up yet)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Point the renderer at `content`.
 ///
 /// The origin and the content size are ONE piece of state and must always be
@@ -1492,7 +1564,7 @@ async fn run_client_loop(
     // hands it a reduced content rect and paints the panels around the frames
     // it gets back. Built once here -- plugins carry state, so a config
     // hot-reload deliberately leaves the existing chrome in place.
-    let chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
+    let mut chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
     let mut which_key_position = config.appearance.which_key_position.clone();
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
@@ -1628,7 +1700,12 @@ async fn run_client_loop(
     let mut pending_panes: Vec<(ConnId, crate::protocol::PaneId)> = Vec::new();
 
     // Mouse drag state for coalescing drag events (~60fps throttle).
+    // `drag_start` is in CONTENT coordinates -- everything the foreground
+    // session is told about the mouse is.
     let mut drag_start: Option<(u16, u16)> = None;
+    // Which region the in-flight button gesture was pressed in. `None` between
+    // gestures; see [`MouseGrab`].
+    let mut mouse_grab: Option<MouseGrab> = None;
     // An in-progress drag-selection inside a VIEW cell: the cell's connection,
     // its source pane, and the press point in that pane's own content
     // coordinates. Kept separate from `drag_start` (screen coordinates in the
@@ -3647,15 +3724,122 @@ async fn run_client_loop(
                             }
                             continue;
                         }
+
+                        // Sidebar routing, ahead of every arm below. An event
+                        // that lands in a panel belongs to that panel and NEVER
+                        // reaches the server; everything else is translated out
+                        // of screen coordinates into the content rect the
+                        // server composites for. Both are no-ops with no
+                        // sidebar configured: `panel_rects` is empty and the
+                        // content origin is (0, 0), so the translation is the
+                        // identity.
+                        //
+                        // Panels are laid out against the front buffer, so the
+                        // hit test, the rect lookup and the content rect all
+                        // come from ONE size -- mixing `Renderer::size` with a
+                        // fresh `terminal::size()` within a single event would
+                        // reopen the SIGWINCH-to-`Resize` window the buffer size
+                        // exists to close.
+                        let (tc, tr) = renderer.size();
+                        let at_pointer = match panel_at(&chrome, tc, tr, mouse.column, mouse.row) {
+                            Some((sidebar, panel)) => MouseGrab::Panel { sidebar, panel },
+                            None => MouseGrab::Content,
+                        };
+                        let route = match mouse.kind {
+                            // A press claims the region for the whole gesture.
+                            MouseEventKind::Down(_) => {
+                                mouse_grab = Some(at_pointer);
+                                at_pointer
+                            }
+                            // Motion and release follow the press, wherever the
+                            // pointer has since wandered. A stray one with no
+                            // press behind it falls back to position.
+                            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                                mouse_grab.unwrap_or(at_pointer)
+                            }
+                            // The wheel is not part of a button gesture: it acts
+                            // on whatever is under the pointer.
+                            _ => at_pointer,
+                        };
+                        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                            mouse_grab = None;
+                        }
+                        if let MouseGrab::Panel { sidebar, panel } = route {
+                            let rect = chrome
+                                .panel_rects(tc, tr)
+                                .into_iter()
+                                .find(|(a, b, _)| *a == sidebar && *b == panel)
+                                .map(|(_, _, r)| r);
+                            let Some(rect) = rect else {
+                                // The panel stopped being laid out (a resize
+                                // shrank it away) mid-gesture. Drop the event
+                                // rather than re-routing it at the content,
+                                // which would hand the server the tail of a
+                                // drag it never saw the head of.
+                                mouse_grab = None;
+                                continue;
+                            };
+                            // Clamp into the rect before subtracting: a drag
+                            // anchored here may have left the panel, and the
+                            // plugin takes unsigned panel-local coordinates.
+                            let px = mouse
+                                .column
+                                .clamp(rect.x, rect.x + rect.width.saturating_sub(1))
+                                - rect.x;
+                            let py = mouse
+                                .row
+                                .clamp(rect.y, rect.y + rect.height.saturating_sub(1))
+                                - rect.y;
+                            let focus_before = chrome.focus;
+                            // Only a press moves focus: the wheel and a drag
+                            // that merely crosses a panel must not steal it.
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                chrome.focus =
+                                    crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel };
+                            }
+                            let action = chrome.sidebars[sidebar].panels[panel]
+                                .plugin
+                                .on_mouse(px, py, mouse.kind);
+                            // A focus change repaints even when the plugin asks
+                            // for nothing -- the panel renders its header
+                            // differently focused.
+                            let repaint_for_focus = chrome.focus != focus_before
+                                && !matches!(action, crate::client::sidebar::PluginAction::Redraw);
+                            handle_plugin_action(
+                                action,
+                                &mut chrome,
+                                mgr,
+                                &mut renderer,
+                                &compositor_theme,
+                            )
+                            .await?;
+                            if repaint_for_focus {
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                renderer.flush()?;
+                            }
+                            continue;
+                        }
+                        // Content-bound: screen -> content coordinates, clamped
+                        // into the rect so a gesture that strayed over a sidebar
+                        // stays on the content edge instead of underflowing.
+                        let content = chrome.content_rect(tc, tr);
+                        let cx = mouse
+                            .column
+                            .saturating_sub(content.x)
+                            .min(content.width.saturating_sub(1));
+                        let cy = mouse
+                            .row
+                            .saturating_sub(content.y)
+                            .min(content.height.saturating_sub(1));
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
-                                log::debug!("mouse: click at ({}, {})", mouse.column, mouse.row);
-                                drag_start = Some((mouse.column, mouse.row));
+                                log::debug!("mouse: click at ({}, {})", cx, cy);
+                                drag_start = Some((cx, cy));
                                 // Send click immediately.
                                 mgr
                                     .send_foreground(ClientMessage::MouseClick {
-                                        x: mouse.column,
-                                        y: mouse.row,
+                                        x: cx,
+                                        y: cy,
                                         pane_id: None,
                                         release: false,
                                     })
@@ -3670,8 +3854,8 @@ async fn run_client_loop(
                                             .send_foreground(ClientMessage::MouseDrag {
                                                 start_x: sx,
                                                 start_y: sy,
-                                                end_x: mouse.column,
-                                                end_y: mouse.row,
+                                                end_x: cx,
+                                                end_y: cy,
                                                 is_final: false,
                                                 pane_id: None,
                                             })
@@ -3683,13 +3867,13 @@ async fn run_client_loop(
                             MouseEventKind::Up(MouseButton::Left) => {
                                 // Send final drag on release.
                                 if let Some((sx, sy)) = drag_start.take() {
-                                    if sx != mouse.column || sy != mouse.row {
+                                    if sx != cx || sy != cy {
                                         mgr
                                             .send_foreground(ClientMessage::MouseDrag {
                                                 start_x: sx,
                                                 start_y: sy,
-                                                end_x: mouse.column,
-                                                end_y: mouse.row,
+                                                end_x: cx,
+                                                end_y: cy,
                                                 is_final: true,
                                                 pane_id: None,
                                             })
@@ -3703,8 +3887,8 @@ async fn run_client_loop(
                                         // the view path's release-click.)
                                         mgr
                                             .send_foreground(ClientMessage::MouseClick {
-                                                x: mouse.column,
-                                                y: mouse.row,
+                                                x: cx,
+                                                y: cy,
                                                 pane_id: None,
                                                 release: true,
                                             })
@@ -3730,8 +3914,8 @@ async fn run_client_loop(
                                     // or scroll remux scrollback. It replies with a render
                                     // that re-syncs scroll_offset/is_scrolled.
                                     mgr.send_foreground(ClientMessage::MouseScroll {
-                                        x: mouse.column,
-                                        y: mouse.row,
+                                        x: cx,
+                                        y: cy,
                                         up: true,
                                     })
                                     .await?;
@@ -3755,8 +3939,8 @@ async fn run_client_loop(
                                     // or scroll remux scrollback. It replies with a render
                                     // that re-syncs scroll_offset/is_scrolled.
                                     mgr.send_foreground(ClientMessage::MouseScroll {
-                                        x: mouse.column,
-                                        y: mouse.row,
+                                        x: cx,
+                                        y: cy,
                                         up: false,
                                     })
                                     .await?;
