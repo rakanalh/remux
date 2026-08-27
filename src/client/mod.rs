@@ -1,3 +1,4 @@
+pub mod chrome;
 pub mod command_palette;
 pub mod editor;
 pub mod input;
