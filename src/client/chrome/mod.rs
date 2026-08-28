@@ -175,6 +175,20 @@ impl Chrome {
         }
     }
 
+    /// Whether any configured panel wants the session-tree push.
+    ///
+    /// Deliberately NOT gated on visibility. A panel that is hidden -- by the
+    /// user, or by `effective_sizes` force-hiding a sidebar the terminal is too
+    /// small for -- must still be current the instant it comes back, and a
+    /// visibility-gated subscription would subscribe and unsubscribe on every
+    /// resize that crosses that threshold. The push only fires on structural
+    /// change, so the standing subscription costs nothing between them.
+    pub fn wants_session_tree(&self) -> bool {
+        self.sidebars
+            .iter()
+            .any(|s| s.panels.iter().any(|p| p.plugin.wants_session_tree()))
+    }
+
     /// Index of the first visible sidebar on `edge`, if any. Consumed by the
     /// navigation task (Task 7).
     pub fn sidebar_on(&self, edge: SidebarEdge, term_cols: u16, term_rows: u16) -> Option<usize> {

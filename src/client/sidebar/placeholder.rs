@@ -166,6 +166,52 @@ mod tests {
     }
 
     #[test]
+    fn draw_text_hangs_a_combining_mark_off_its_base_cell() {
+        // Session and folder names are arbitrary user text, so a decomposed
+        // (NFD) accent is reachable. Forcing the mark to width 1 would give it
+        // a spacing cell of its own and shift everything after it.
+        let mut g = blank_grid(6, 1, CellColor::Default);
+        draw_text(
+            &mut g,
+            0,
+            0,
+            "cafe\u{301}!",
+            CellColor::Default,
+            CellColor::Default,
+        );
+        let row: String = g[0].iter().map(|c| c.c).collect();
+        assert_eq!(row, "cafe! ", "the mark took a column of its own: {row:?}");
+        assert_eq!(g[0][3].c, 'e');
+        assert_eq!(g[0][3].combining, vec!['\u{301}']);
+        assert_eq!(g[0][4].c, '!', "the text after the mark shifted");
+    }
+
+    #[test]
+    fn draw_text_drops_a_combining_mark_with_no_base_and_does_not_panic() {
+        let mut g = blank_grid(3, 1, CellColor::Default);
+        draw_text(
+            &mut g,
+            0,
+            0,
+            "\u{301}ab",
+            CellColor::Default,
+            CellColor::Default,
+        );
+        let row: String = g[0].iter().map(|c| c.c).collect();
+        assert_eq!(row, "ab ");
+        assert!(g[0].iter().all(|c| c.combining.is_empty()));
+    }
+
+    #[test]
+    fn draw_text_drops_control_characters() {
+        // A newline in a name must not become a visible cell.
+        let mut g = blank_grid(4, 1, CellColor::Default);
+        draw_text(&mut g, 0, 0, "a\nb", CellColor::Default, CellColor::Default);
+        let row: String = g[0].iter().map(|c| c.c).collect();
+        assert_eq!(row, "ab  ");
+    }
+
+    #[test]
     fn draw_text_reserves_a_continuation_cell_for_wide_glyphs() {
         // RenderCell.width == 0 marks the continuation of a wide lead; the
         // renderer skips those, so a panel must emit them or CJK text shifts.

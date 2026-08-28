@@ -74,6 +74,51 @@ impl NodeType {
     }
 }
 
+/// Where activating a tree row goes.
+///
+/// A node identity, not a resolved pane: the three levels are exactly the three
+/// the server can already be told to go to (`Attach`, `SessionSwitchTab`,
+/// `SessionSwitchPane`), so "that node's current focus" stays the server's
+/// answer rather than a client-side guess at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JumpTarget {
+    Session {
+        conn: ConnId,
+        session: String,
+    },
+    Tab {
+        conn: ConnId,
+        session: String,
+        tab_index: usize,
+    },
+    Pane {
+        conn: ConnId,
+        session: String,
+        tab_index: usize,
+        pane_id: PaneId,
+    },
+}
+
+impl JumpTarget {
+    /// The connection this target lives on.
+    pub fn conn(&self) -> &ConnId {
+        match self {
+            JumpTarget::Session { conn, .. }
+            | JumpTarget::Tab { conn, .. }
+            | JumpTarget::Pane { conn, .. } => conn,
+        }
+    }
+
+    /// The session this target lives in.
+    pub fn session(&self) -> &str {
+        match self {
+            JumpTarget::Session { session, .. }
+            | JumpTarget::Tab { session, .. }
+            | JumpTarget::Pane { session, .. } => session,
+        }
+    }
+}
+
 /// A single row in the flattened session manager tree.
 #[derive(Debug, Clone)]
 pub struct TreeRow {
@@ -198,6 +243,12 @@ pub struct TreeModel {
     roster: Vec<(ConnId, String, RemoteState, Option<String>)>,
     /// Per-server raw tree data: `(folders, unfiled)`.
     trees: HashMap<ConnId, (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>)>,
+    /// Every folder/session key this model has EVER been shown, per server.
+    /// Drives the auto-expand-what-is-new rule in [`TreeModel::update_tree`];
+    /// cumulative on purpose, so a tree that empties and refills does not read
+    /// as a first load. Never shrinks: forgetting a key would re-open a node
+    /// the user collapsed the moment it reappeared.
+    seen_keys: HashMap<ConnId, HashSet<String>>,
     /// Names of the Local server's dormant (saved-but-not-live) sessions,
     /// rendered as a "Saved (resurrect)" group. Dormant sessions are a
     /// Local-server concept for now.
@@ -237,6 +288,7 @@ impl TreeModel {
                 None,
             )],
             trees: HashMap::new(),
+            seen_keys: HashMap::new(),
             dormant: Vec::new(),
             filter_hits: HashSet::new(),
         }
@@ -264,21 +316,47 @@ impl TreeModel {
         self.rows.get(self.selected)
     }
 
-    /// Where activating the selected row should jump to, as
-    /// `(conn, session, tab_index, pane_id)`.
+    /// Which node activating the selected row should go to.
     ///
-    /// Only a pane row resolves: it is the one node kind that names a jump
-    /// target completely. Session and tab rows deliberately return `None` --
-    /// resolving them to some pane would be a new behaviour, not a moved one.
-    pub fn jump_target(&self) -> Option<(ConnId, String, usize, PaneId)> {
+    /// Names the *node*; it does not resolve a session or a tab down to some
+    /// pane. That resolution is the server's -- `Attach` lands on a session's
+    /// current tab and pane, `SessionSwitchTab` on a tab's focused pane -- so a
+    /// client-side second implementation of "which pane is current" would only
+    /// be able to disagree with it.
+    ///
+    /// Server, folder and saved-group rows return `None`: they expand, they do
+    /// not jump. So does a dormant session, which has to be resurrected before
+    /// there is anything to jump to.
+    pub fn jump_target(&self) -> Option<JumpTarget> {
         match &self.selected_row()?.node_type {
+            NodeType::Session { server, name } => Some(JumpTarget::Session {
+                conn: server.clone(),
+                session: name.clone(),
+            }),
+            NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            } => Some(JumpTarget::Tab {
+                conn: server.clone(),
+                session: session.clone(),
+                tab_index: *tab_index,
+            }),
             NodeType::Pane {
                 server,
                 session,
                 tab_index,
                 pane_id,
-            } => Some((server.clone(), session.clone(), *tab_index, *pane_id)),
-            _ => None,
+            } => Some(JumpTarget::Pane {
+                conn: server.clone(),
+                session: session.clone(),
+                tab_index: *tab_index,
+                pane_id: *pane_id,
+            }),
+            NodeType::Server { .. }
+            | NodeType::Folder { .. }
+            | NodeType::SavedGroup { .. }
+            | NodeType::DormantSession { .. } => None,
         }
     }
 
@@ -406,44 +484,34 @@ impl TreeModel {
         if server == ConnId::Local {
             self.dormant = dormant;
         }
-        // Determine whether this is the first data we've seen for this server.
-        let is_first_load = self
-            .trees
-            .get(&server)
-            .map(|(f, u)| f.is_empty() && u.is_empty())
-            .unwrap_or(true);
-
-        // Collect previously known keys so we auto-expand only new entries.
-        let mut known_keys: HashSet<String> = HashSet::new();
-        if let Some((pf, pu)) = self.trees.get(&server) {
-            for f in pf {
-                known_keys.insert(folder_key(&server, &f.name));
-                for s in &f.sessions {
-                    known_keys.insert(session_key(&server, &s.name));
-                }
+        // Auto-expand only entries this model has NEVER seen on this server.
+        //
+        // The memory is cumulative (`seen_keys`) rather than derived from the
+        // previously stored tree: a tree that goes empty and comes back --
+        // a remote whose last session closes, a server that connects with
+        // nothing running -- would otherwise look brand new all over again and
+        // re-open every folder the user had collapsed. The sidebar panel
+        // refreshes on every server push, so that boundary is reachable there
+        // in a way it never really was in an overlay opened on demand.
+        //
+        // The deliberate cost: a session deleted and recreated under the same
+        // name is not treated as new, so it does not auto-expand.
+        let known_keys = self.seen_keys.entry(server.clone()).or_default();
+        let expanded = &mut self.expanded;
+        let mut first_sighting = |key: String| {
+            if known_keys.insert(key.clone()) {
+                expanded.insert(key);
             }
-            for s in pu {
-                known_keys.insert(session_key(&server, &s.name));
-            }
-        }
+        };
 
         for f in &folders {
-            let key = folder_key(&server, &f.name);
-            if is_first_load || !known_keys.contains(&key) {
-                self.expanded.insert(key);
-            }
+            first_sighting(folder_key(&server, &f.name));
             for s in &f.sessions {
-                let key = session_key(&server, &s.name);
-                if is_first_load || !known_keys.contains(&key) {
-                    self.expanded.insert(key);
-                }
+                first_sighting(session_key(&server, &s.name));
             }
         }
         for s in &unfiled {
-            let key = session_key(&server, &s.name);
-            if is_first_load || !known_keys.contains(&key) {
-                self.expanded.insert(key);
-            }
+            first_sighting(session_key(&server, &s.name));
         }
 
         self.trees.insert(server, (folders, unfiled));
@@ -1099,12 +1167,13 @@ mod tests {
     }
 
     #[test]
-    fn jump_target_resolves_a_pane_row_and_nothing_else() {
+    fn jump_target_resolves_session_tab_and_pane_rows() {
         let (mut model, _) = two_conn_fixture();
         expand(&mut model, "editor");
         expand(&mut model, "pi");
         expand(&mut model, "shell");
 
+        // Rows that expand rather than jump.
         model.selected = row_of(&model, "local");
         assert_eq!(
             model.jump_target(),
@@ -1117,20 +1186,35 @@ mod tests {
             None,
             "a folder row is not a jump target"
         );
+
+        // The three levels the server can be told to go to.
         model.selected = row_of(&model, "alpha");
         assert_eq!(
             model.jump_target(),
-            None,
-            "a session row is not a jump target"
+            Some(JumpTarget::Session {
+                conn: ConnId::Local,
+                session: "alpha".to_string()
+            }),
         );
         model.selected = row_of(&model, "editor");
-        assert_eq!(model.jump_target(), None, "a tab row is not a jump target");
-
+        assert_eq!(
+            model.jump_target(),
+            Some(JumpTarget::Tab {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_index: 0
+            }),
+        );
         model.selected = row_of(&model, "top");
         assert_eq!(
             model.jump_target(),
-            Some((ConnId::Local, "alpha".to_string(), 0, 11)),
-            "a pane row resolves to (conn, session, tab_index, pane_id)"
+            Some(JumpTarget::Pane {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_index: 0,
+                pane_id: 11
+            }),
+            "a pane row names the pane, not merely its session"
         );
 
         // ... including a pane on a remote connection.
@@ -1142,7 +1226,88 @@ mod tests {
         model.selected = remote_pane;
         assert_eq!(
             model.jump_target(),
-            Some((remote("pi"), "beta".to_string(), 0, 20))
+            Some(JumpTarget::Pane {
+                conn: remote("pi"),
+                session: "beta".to_string(),
+                tab_index: 0,
+                pane_id: 20
+            })
+        );
+    }
+
+    #[test]
+    fn a_dormant_session_row_is_not_a_jump_target() {
+        // It has to be resurrected before there is anything to jump to, so the
+        // panel must be able to tell it apart from a live session row.
+        let mut model = TreeModel::new();
+        model.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            None,
+        )]);
+        model.update_tree(
+            ConnId::Local,
+            Vec::new(),
+            Vec::new(),
+            vec!["archived".to_string()],
+        );
+        model.selected = model
+            .rows
+            .iter()
+            .position(|r| matches!(r.node_type, NodeType::DormantSession { .. }))
+            .expect("a dormant row");
+        assert_eq!(model.jump_target(), None);
+    }
+
+    #[test]
+    fn a_tree_that_empties_and_refills_does_not_re_expand_a_collapsed_folder() {
+        // The sidebar panel refreshes on EVERY server push, so "this server's
+        // stored tree is empty" is a reachable state mid-session -- a remote
+        // whose last session closes, say. If that read as a first load, every
+        // folder the user collapsed would spring back open.
+        let (mut model, per_conn) = two_conn_fixture();
+        let local = per_conn[0].1.clone();
+
+        model.selected = row_of(&model, "work");
+        model.collapse_selected();
+        assert!(!model.rows.iter().any(|r| r.display_name == "alpha"));
+
+        // The server goes quiet, then comes back with exactly what it had.
+        model.update_tree(ConnId::Local, Vec::new(), Vec::new(), Vec::new());
+        model.update_tree(
+            ConnId::Local,
+            local.folders.clone(),
+            local.unfiled.clone(),
+            Vec::new(),
+        );
+
+        assert!(
+            model.rows.iter().any(|r| r.display_name == "work"),
+            "the folder itself must come back: {:?}",
+            labels(&model)
+        );
+        assert!(
+            !model.rows.iter().any(|r| r.display_name == "alpha"),
+            "the collapsed folder re-opened itself: {:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn a_genuinely_new_session_still_auto_expands() {
+        // The other half of the rule: only NEVER-seen entries auto-expand, and
+        // a brand new session is one.
+        let (mut model, per_conn) = two_conn_fixture();
+        let mut local = per_conn[0].1.clone();
+        local
+            .unfiled
+            .push(session("gamma", vec![tab(9, "gtab", vec![pane(90, "sh")])]));
+        model.update_tree(ConnId::Local, local.folders, local.unfiled, Vec::new());
+        assert!(
+            model.rows.iter().any(|r| r.display_name == "gtab"),
+            "a new session did not auto-expand: {:?}",
+            labels(&model)
         );
     }
 

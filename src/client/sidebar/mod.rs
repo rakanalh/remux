@@ -9,8 +9,9 @@ use crossterm::event::{KeyEvent, MouseEventKind};
 use unicode_width::UnicodeWidthChar;
 
 use crate::client::registry::ConnId;
+use crate::client::tree_model::JumpTarget;
 use crate::config::theme::CompositorTheme;
-use crate::protocol::{CellColor, PaneId, RenderCell};
+use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
 
 pub mod placeholder;
@@ -25,14 +26,13 @@ pub enum PluginAction {
     Redraw,
     /// Move focus out of the sidebar in this direction.
     LeaveTo(FocusDirection),
-    /// Jump to a pane, anywhere. The client routes this through the existing
-    /// session-manager jump path.
-    JumpTo {
-        conn: ConnId,
-        session: String,
-        tab_index: usize,
-        pane_id: PaneId,
-    },
+    /// Go to a session, a tab, or a pane, on any connected server. The client
+    /// routes this through the same jump path the session manager uses.
+    ///
+    /// A node identity rather than a resolved pane: above pane level the target
+    /// is "that node's current focus", and the server is the one that knows
+    /// what that is.
+    JumpTo(JumpTarget),
 }
 
 /// Data pushed to plugins by the client. One variant per plugin family; later
@@ -76,6 +76,15 @@ pub trait SidebarPlugin: Send {
 
     /// Receive pushed data. Called regardless of focus.
     fn on_event(&mut self, ev: &PluginEvent);
+
+    /// Whether this panel needs `PluginEvent::SessionTree`.
+    ///
+    /// The client subscribes to the server's session-tree push only when some
+    /// configured panel says yes -- a client with no such panel must put no
+    /// extra traffic on the wire at all.
+    fn wants_session_tree(&self) -> bool {
+        false
+    }
 }
 
 /// Resolve a config `plugin` name to an instance.
@@ -114,6 +123,13 @@ pub fn blank_grid(cols: u16, rows: u16, bg: CellColor) -> Vec<Vec<RenderCell>> {
 /// Wide glyphs emit a `width: 2` lead followed by a `width: 0` continuation,
 /// matching what the server compositor produces -- the renderer skips
 /// continuation cells, so omitting them would shift every following column.
+///
+/// Zero-width combining marks attach to the cell they modify (`RenderCell`'s
+/// `combining` vec) rather than taking a column of their own: panels render
+/// arbitrary user text -- session, folder, tab and pane names -- and a
+/// decomposed (NFD) accent would otherwise be laid out as a stray spacing cell
+/// that shifts everything after it. A control character (no width at all) is
+/// dropped for the same reason.
 pub fn draw_text(
     grid: &mut [Vec<RenderCell>],
     x: u16,
@@ -127,8 +143,22 @@ pub fn draw_text(
     };
     let width = row.len();
     let mut cx = x as usize;
+    // The column of the last spacing cell written, so a combining mark knows
+    // what it modifies. A mark with nothing before it (`text` opening with one,
+    // or `x` at column 0) has no base and is dropped.
+    let mut last_base: Option<usize> = None;
     for ch in text.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        let w = match UnicodeWidthChar::width(ch) {
+            Some(0) | None if ch.is_control() => continue,
+            Some(0) | None => {
+                // A combining mark: hang it off the base cell.
+                if let Some(base) = last_base {
+                    row[base].combining.push(ch);
+                }
+                continue;
+            }
+            Some(w) => w,
+        };
         if cx + w > width {
             break;
         }
@@ -156,6 +186,7 @@ pub fn draw_text(
                 hyperlink: None,
             };
         }
+        last_base = Some(cx);
         cx += w;
     }
 }

@@ -24,6 +24,7 @@ use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
+use crate::client::tree_model::JumpTarget;
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::{Config, RemoteConfig};
 use crate::protocol::{ClientMessage, ConnDescriptor, RemuxCommand, ServerMessage, ViewId};
@@ -746,16 +747,21 @@ async fn handle_chrome_resize(
     Ok(true)
 }
 
-/// Go to a pane anywhere: leave any live view, re-point the renderer at the
-/// content rect, hand the screen to `server`, attach and switch.
+/// Go to a session, a tab, or a pane, anywhere: leave any live view, re-point
+/// the renderer at the content rect, hand the screen to the target's server,
+/// attach and switch.
 ///
-/// Extracted from the session manager's `SwitchPane` arm so the sidebar's
-/// `PluginAction::JumpTo` has exactly ONE implementation of "go to that pane"
-/// to reuse rather than a second, drifting copy. The session-manager teardown
-/// (closing the overlay, clearing it) stays at that call site: it is about the
-/// overlay, not about the jump.
+/// The ONE implementation of "go to that node". The session manager's three
+/// switch arms and the sidebar's `PluginAction::JumpTo` both route through it,
+/// so the two surfaces cannot drift -- which matters most above pane level,
+/// where "that node's current focus" is resolved by the server (`Attach` lands
+/// on a session's current tab and pane; `SessionSwitchTab` on a tab's focused
+/// pane) and a second client-side answer could only disagree with it.
+///
+/// The session-manager teardown (closing the overlay, clearing it) stays at
+/// those call sites: it is about the overlay, not about the jump.
 #[allow(clippy::too_many_arguments)]
-async fn switch_to_pane(
+async fn switch_to_target(
     mgr: &mut ConnectionManager,
     renderer: &mut Renderer,
     chrome: &mut crate::client::chrome::Chrome,
@@ -766,11 +772,10 @@ async fn switch_to_pane(
     last_local_session: &mut Option<String>,
     current_attached: &mut Option<(ConnId, String)>,
     previous_attached: &mut Option<(ConnId, String)>,
-    server: ConnId,
-    session: String,
-    tab_index: usize,
-    pane_id: crate::protocol::PaneId,
+    target: JumpTarget,
 ) -> Result<()> {
+    let server = target.conn().clone();
+    let session = target.session().to_string();
     // A live view masks the switched-to session: tear it down before handing
     // off the screen.
     leave_active_view(mgr, views, active_view, active_view_id, chrome, mouse_grab).await?;
@@ -780,8 +785,8 @@ async fn switch_to_pane(
     sync_content_rect(renderer, &content);
     switch_to_server(mgr, &server, content).await?;
     // The server's handle_command ignores commands from a client with no
-    // attached session, so a remote pane switch must attach first (a harmless
-    // re-attach for local).
+    // attached session, so a remote switch must attach first (a harmless
+    // re-attach for local). Attaching alone is what a session-level jump is.
     mgr.send(
         &server,
         ClientMessage::Attach {
@@ -789,15 +794,23 @@ async fn switch_to_pane(
         },
     )
     .await?;
-    mgr.send(
-        &server,
-        ClientMessage::Command(RemuxCommand::SessionSwitchPane {
+    let narrow = match &target {
+        JumpTarget::Session { .. } => None,
+        JumpTarget::Tab { tab_index, .. } => Some(RemuxCommand::SessionSwitchTab {
             session: session.clone(),
-            tab_index,
-            pane_id,
+            tab_index: *tab_index,
         }),
-    )
-    .await?;
+        JumpTarget::Pane {
+            tab_index, pane_id, ..
+        } => Some(RemuxCommand::SessionSwitchPane {
+            session: session.clone(),
+            tab_index: *tab_index,
+            pane_id: *pane_id,
+        }),
+    };
+    if let Some(cmd) = narrow {
+        mgr.send(&server, ClientMessage::Command(cmd)).await?;
+    }
     mgr.send(
         &server,
         ClientMessage::ModeChanged {
@@ -846,15 +859,10 @@ async fn handle_plugin_action(
             chrome.paint(renderer, c, r, theme)?;
             renderer.flush()?;
         }
-        PluginAction::JumpTo {
-            conn,
-            session,
-            tab_index,
-            pane_id,
-        } => {
-            log::debug!("sidebar: plugin jump to {conn:?} {session}:{tab_index} pane {pane_id}");
+        PluginAction::JumpTo(target) => {
+            log::debug!("sidebar: plugin jump to {target:?}");
             chrome.leave_sidebar();
-            switch_to_pane(
+            switch_to_target(
                 mgr,
                 renderer,
                 chrome,
@@ -865,10 +873,7 @@ async fn handle_plugin_action(
                 last_local_session,
                 current_attached,
                 previous_attached,
-                conn,
-                session,
-                tab_index,
-                pane_id,
+                target,
             )
             .await?;
         }
@@ -1956,7 +1961,34 @@ async fn run_client_loop(
     })
     .await?;
 
+    // Whether a configured panel needs the server's session-tree push. Panels
+    // come from config and never change at runtime, so this is asked once.
+    let wants_session_tree = chrome.wants_session_tree();
+    // Connections already told to push their tree. Reconciled against
+    // `connected_ids` at the top of every loop pass rather than at each connect
+    // site: remotes are dialled from five different places (startup
+    // auto-connect, the session manager, a lazy view-cell connect, a background
+    // dial completing, a foreground handoff), and a subscription missed at any
+    // one of them is a panel that silently stops updating for that server.
+    let mut tree_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+
     loop {
+        if wants_session_tree {
+            let live = mgr.connected_ids();
+            for id in &live {
+                if tree_subscribed.insert(id.clone()) {
+                    log::debug!("sidebar: subscribing to the session tree on {id:?}");
+                    if let Err(e) = mgr.send(id, ClientMessage::SubscribeSessionTree).await {
+                        log::warn!("sidebar: SubscribeSessionTree to {id:?} failed: {e:#}");
+                        tree_subscribed.remove(id);
+                    }
+                }
+            }
+            // A dropped connection must be forgotten, or reconnecting it would
+            // never re-subscribe (the server forgets the subscription along with
+            // the client that held it).
+            tree_subscribed.retain(|id| live.contains(id));
+        }
         tokio::select! {
             // Keyboard events
             event = event_stream.next() => {
@@ -3161,74 +3193,9 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        // A live view masks the switched-to session:
-                                        // tear it down before handing off the screen.
-                                        leave_active_view(
-                                    mgr,
-                                    &views,
-                                    &mut active_view,
-                                    &mut active_view_id,
-                                    &mut chrome,
-                                    &mut mouse_grab,
-                                ).await?;
-                                        // Leaving the view hands the screen back to the content rect:
-                                        // re-point the renderer at it before the target server is told
-                                        // what size to composite.
-                                        let content = content_rect_now(&chrome)?;
-                                        sync_content_rect(&mut renderer, &content);
-                                        switch_to_server(mgr, &server, content).await?;
-                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        if server == ConnId::Local {
-                                            last_local_session = Some(session.clone());
-                                        }
-                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
-                                    }
-                                    SessionManagerAction::SwitchTab { server, session, tab_index } => {
-                                        input.session_manager = None;
-                                        input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
-                                        renderer.flush()?;
-                                        // A live view masks the switched-to session:
-                                        // tear it down before handing off the screen.
-                                        leave_active_view(
-                                    mgr,
-                                    &views,
-                                    &mut active_view,
-                                    &mut active_view_id,
-                                    &mut chrome,
-                                    &mut mouse_grab,
-                                ).await?;
-                                        // Leaving the view hands the screen back to the content rect:
-                                        // re-point the renderer at it before the target server is told
-                                        // what size to composite.
-                                        let content = content_rect_now(&chrome)?;
-                                        sync_content_rect(&mut renderer, &content);
-                                        switch_to_server(mgr, &server, content).await?;
-                                        // The server's handle_command ignores commands from a
-                                        // client with no attached session, so a remote tab switch
-                                        // must attach first (harmless re-attach for local).
-                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchTab {
-                                            session: session.clone(),
-                                            tab_index,
-                                        })).await?;
-                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        if server == ConnId::Local {
-                                            last_local_session = Some(session.clone());
-                                        }
-                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
-                                    }
-                                    SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
-                                        input.session_manager = None;
-                                        input.mode = Mode::Normal;
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
-                                        renderer.flush()?;
-                                        // The jump itself is shared with the sidebar's
-                                        // `PluginAction::JumpTo`; see `switch_to_pane`.
-                                        switch_to_pane(
+                                        // Same jump path as the sidebar panel; see
+                                        // `switch_to_target`.
+                                        switch_to_target(
                                             mgr,
                                             &mut renderer,
                                             &mut chrome,
@@ -3239,10 +3206,51 @@ async fn run_client_loop(
                                             &mut last_local_session,
                                             &mut current_attached,
                                             &mut previous_attached,
-                                            server,
-                                            session,
-                                            tab_index,
-                                            pane_id,
+                                            JumpTarget::Session { conn: server, session },
+                                        ).await?;
+                                    }
+                                    SessionManagerAction::SwitchTab { server, session, tab_index } => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
+                                        // Same jump path as the sidebar panel; see
+                                        // `switch_to_target`.
+                                        switch_to_target(
+                                            mgr,
+                                            &mut renderer,
+                                            &mut chrome,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut mouse_grab,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                            JumpTarget::Tab { conn: server, session, tab_index },
+                                        ).await?;
+                                    }
+                                    SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        renderer.flush()?;
+                                        // The jump itself is shared with the sidebar's
+                                        // `PluginAction::JumpTo`; see `switch_to_target`.
+                                        switch_to_target(
+                                            mgr,
+                                            &mut renderer,
+                                            &mut chrome,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut mouse_grab,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                            JumpTarget::Pane { conn: server, session, tab_index, pane_id },
                                         ).await?;
                                     }
                                     // Structural edits target the server carried by the
@@ -4693,6 +4701,22 @@ async fn run_client_loop(
                     }
                     Incoming::Closed(src) => {
                         log::debug!("srv: connection closed src={:?}", src);
+                        // Panels scope their state by connection: tell them
+                        // before anything else here can `continue` or return.
+                        if wants_session_tree {
+                            chrome.broadcast(&crate::client::sidebar::PluginEvent::ConnectionLost {
+                                conn: src.clone(),
+                            });
+                            // Repaint so the dropped server's rows go away.
+                            // Skipped over a live view: the cells below are
+                            // about to be marked disconnected, and painting
+                            // twice would show the stale half first.
+                            if active_view.is_none() {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                renderer.flush()?;
+                            }
+                        }
                         // Mark every view cell (across ALL views) that aliases a
                         // pane on the dropped connection as disconnected. Done at
                         // the very top of the arm, before the several early
@@ -5133,6 +5157,52 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
+                        // Hand every panel the tree BEFORE the overlay branches
+                        // below move it. Unconditional: a tree arrives whether
+                        // it was asked for (`ListSessionTree`) or pushed
+                        // (`SubscribeSessionTree`), and the panel wants both.
+                        if wants_session_tree {
+                            chrome.broadcast(&crate::client::sidebar::PluginEvent::SessionTree {
+                                conn: src.clone(),
+                                folders: folders.clone(),
+                                unfiled: unfiled.clone(),
+                                dormant: dormant.clone(),
+                            });
+                            // Repaint the panels. Over a live view `paint_view`
+                            // ends with `chrome.paint`, so it is the one that
+                            // has to run; otherwise panels are painted straight
+                            // into the front buffer and the overlays re-laid on
+                            // top, exactly as a server frame does it.
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &chrome,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &compositor_theme,
+                                    &view_border_style,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            } else {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                relay_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    tc,
+                                    tr,
+                                )?;
+                            }
+                        }
                         // Resolve a pending "add focused pane to a view" request
                         // BEFORE `folders`/`unfiled` are moved into the session
                         // manager below. `is_focused` is per-tab (every tab reports
