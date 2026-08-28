@@ -240,6 +240,29 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         ),
     );
 
+    // b: sideBar (client-only chrome). `b` was the old Buffer group, freed by
+    // the search-mode refactor, and nothing else claims it at root.
+    //
+    // Cycle sits on `b` rather than the Tab key the plan named: the which-key
+    // tree is keyed by `char` and `handle_command_key` only ever dispatches an
+    // unmodified `KeyCode::Char`, so `KeyCode::Tab` never reaches the tree and
+    // a `'\t'` entry would be unreachable. `b b` reads as "sidebar again".
+    root.insert(
+        'b',
+        group(
+            "Sidebar",
+            vec![
+                ('h', leaf("toggle left", "SidebarToggleLeft")),
+                ('l', leaf("toggle right", "SidebarToggleRight")),
+                ('j', leaf("toggle bottom", "SidebarToggleBottom")),
+                ('H', leaf("focus left", "SidebarFocusLeft")),
+                ('L', leaf("focus right", "SidebarFocusRight")),
+                ('J', leaf("focus bottom", "SidebarFocusBottom")),
+                ('b', leaf("cycle focus", "SidebarCycle")),
+            ],
+        ),
+    );
+
     // Layout toggle bindings.
     root.insert(
         'g',
@@ -1751,10 +1774,43 @@ mod tests {
         assert!(tree.root.contains_key(&'f')); // Zoom pane toggle
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
-        // 'b' (Buffer group) was removed in the search-mode refactor.
-        assert!(!tree.root.contains_key(&'b'));
+        // 'b' was the Buffer group, removed in the search-mode refactor and
+        // reclaimed by the Sidebar group.
+        assert!(tree.root.contains_key(&'b'));
         // 'i' (EnterInsertMode) was removed in the leader-key-modes refactor.
         assert!(!tree.root.contains_key(&'i'));
+    }
+
+    /// Every leaf in the Sidebar group must name an action the registry knows,
+    /// or the key is silently inert. `contains_key(&'b')` alone would not catch
+    /// a typo in an action string.
+    #[test]
+    fn sidebar_group_leaves_all_resolve() {
+        let tree = KeybindingTree::default();
+        let expected = [
+            ('h', "SidebarToggleLeft"),
+            ('l', "SidebarToggleRight"),
+            ('j', "SidebarToggleBottom"),
+            ('H', "SidebarFocusLeft"),
+            ('L', "SidebarFocusRight"),
+            ('J', "SidebarFocusBottom"),
+            ('b', "SidebarCycle"),
+        ];
+        for (key, name) in expected {
+            let node = tree
+                .lookup(&['b', key])
+                .unwrap_or_else(|| panic!("no leaf at 'b {key}'"));
+            match node {
+                KeyNode::Leaf { action, .. } => {
+                    assert_eq!(action, &vec![name.to_string()], "'b {key}'");
+                    assert!(
+                        resolve_action(name).is_some(),
+                        "'b {key}' names an action the registry does not have"
+                    );
+                }
+                other => panic!("expected a leaf at 'b {key}', got {other:?}"),
+            }
+        }
     }
 
     #[test]

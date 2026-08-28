@@ -56,6 +56,10 @@
 # [appearance]
 
 # Where the status bar is placed: "top" | "bottom" (default: "bottom").
+#
+# KNOWN GAP: this option is parsed and validated but NOT honoured. The status
+# bar is composited by the server onto the frame's last row unconditionally, so
+# "top" behaves exactly like "bottom". Do not build on it until it is wired up.
 # status_bar_position = "bottom"
 
 # Pane border rendering style: "zellij_style" (borders with pane names) |
@@ -348,6 +352,24 @@
 # q = "ViewClose"
 # d = "ViewDelete"
 
+# --- Sidebar (b) ---
+# Sidebars are client-side chrome docked to a terminal edge; see the SIDEBARS
+# section near the bottom of this file for how to declare them. `b` was the
+# old Buffer group, freed by the search-mode refactor.
+#
+# NOTE ON `b b`: cycling lives on `b`, not on Tab. The command-mode tree is
+# keyed by single characters and only plain character keys reach it, so Tab
+# (and any other named key) cannot be bound inside a group.
+# [keybindings.command.b]
+# _label = "Sidebar"
+# h = "SidebarToggleLeft"
+# l = "SidebarToggleRight"
+# j = "SidebarToggleBottom"
+# H = "SidebarFocusLeft"
+# L = "SidebarFocusRight"
+# J = "SidebarFocusBottom"
+# b = "SidebarCycle"
+
 # --- Direct bindings (root level) ---
 # These are top-level keys pressed right after the leader, not inside a group.
 # They live directly under [keybindings.command] as single-character keys.
@@ -510,6 +532,79 @@
 # Remote commands:
 #   RemoteConnect <dest|alias>      — Connect to a remote server (SSH destination
 #                                     or a `[remotes.<name>]` alias)
+
+# -----------------------------------------------------------------------------
+# SIDEBARS
+# -----------------------------------------------------------------------------
+# A sidebar is client-side chrome docked to an edge of the terminal. It is NOT
+# a pane: the server never sees it, it is not part of any session, and it is not
+# persisted with your sessions. The panes get whatever rectangle is left over
+# once every visible sidebar has taken its slice.
+#
+# Declare one `[[sidebar]]` table per sidebar. All three edges may be used at
+# once; a left and a right sidebar bracket the panes, and a bottom one spans
+# only the columns between them. Several sidebars may share an edge — they stack
+# inward from it in declaration order, they do not overlap.
+#
+# Sizes are clamped, not honoured blindly: a sidebar is shrunk so the panes keep
+# a minimum of 20 columns and 5 rows, and one that cannot fit even shrunk is
+# hidden for as long as the terminal is that small. Verticals are resolved
+# before the bottom sidebar, so they own the corners.
+#
+# Per-sidebar fields:
+#   edge    — "left" | "right" | "bottom". Required. There is no "top": that row
+#             belongs to the tab bar. An unknown edge is a hard parse error,
+#             because a typo there has no sensible forward-compatible reading.
+#   size    — how thick the sidebar is: COLUMNS for "left"/"right", ROWS for
+#             "bottom". Required. It is a starting size, not a fixed one — a
+#             sidebar is resizable at runtime and its live size is remembered.
+#   visible — whether it starts open (default: true). Toggling it at runtime
+#             also persists, so this is only the very first run's state.
+#
+# Runtime state (each sidebar's visibility and size, and each panel's weight)
+# is saved to `$XDG_STATE_HOME/remux/sidebar.json` and restored on the next
+# start, so what you left on screen is what you come back to. Edit the config
+# and the declared `size`/`visible` become the defaults for a sidebar that has
+# no saved state yet.
+#
+# Each `[[sidebar.panel]]` stacks one plugin inside its sidebar, in the order
+# written. Panel fields:
+#   plugin  — registry name of the plugin. Required. See the list below.
+#   weight  — this panel's share of the sidebar's length relative to its
+#             siblings (default: 1). Two panels at weights 2 and 1 split the
+#             sidebar two-thirds / one-third. A single panel takes it all, so
+#             the weight is irrelevant until there are two.
+#
+# Available plugins:
+#   sessions    — a live tree of every session, tab and pane across the local
+#                 server and every connected remote. It refreshes by itself when
+#                 the server's tree changes; Enter jumps to whatever is selected.
+#   placeholder — a fixed test fixture that paints its own name and size. Useful
+#                 for checking geometry; there is no reason to configure it.
+#
+# An UNKNOWN plugin name is skipped with a warning rather than rejected, so a
+# config written for a plugin a later version adds still loads on this build —
+# you lose that panel, not the whole config. A sidebar left with no usable
+# panels (none declared, or every name unknown) is dropped entirely, also with
+# a warning: an empty strip of chrome would just be stolen space.
+#
+# Keys: the `b` group under [keybindings.command] toggles, focuses and cycles
+# the sidebars, and `Alt+h/j/k/l` move focus into and out of one exactly as they
+# move between panes. While a panel has focus, the `Resize*` commands re-target:
+# the axis perpendicular to the edge resizes the SIDEBAR, and the parallel axis
+# adjusts the focused PANEL's weight.
+#
+# There are NO sidebars by default — omit this section entirely and Remux looks
+# exactly as it did before the feature existed.
+#
+# [[sidebar]]
+# edge = "left"
+# size = 30
+# visible = true
+#
+#   [[sidebar.panel]]
+#   plugin = "sessions"
+#   weight = 1
 
 # -----------------------------------------------------------------------------
 # REMOTES

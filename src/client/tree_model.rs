@@ -474,7 +474,7 @@ impl TreeModel {
         dormant: Vec<String>,
     ) {
         log::debug!(
-            "session_manager: update_tree server={:?} folders={} unfiled={} dormant={}",
+            "tree_model: update_tree server={:?} folders={} unfiled={} dormant={}",
             server,
             folders.len(),
             unfiled.len(),
@@ -875,7 +875,7 @@ impl TreeModel {
             return;
         }
         self.selected = (self.selected + 1) % self.rows.len();
-        log::debug!("session_manager: select_next selected={}", self.selected);
+        log::debug!("tree_model: select_next selected={}", self.selected);
     }
 
     /// Move selection up, wrapping to the bottom.
@@ -888,7 +888,7 @@ impl TreeModel {
         } else {
             self.selected -= 1;
         }
-        log::debug!("session_manager: select_prev selected={}", self.selected);
+        log::debug!("tree_model: select_prev selected={}", self.selected);
     }
 
     /// Toggle the expand/collapse state of the selected node.

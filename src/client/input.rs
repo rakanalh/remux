@@ -1889,25 +1889,43 @@ impl InputHandler {
                 self.mode = Mode::Normal;
                 InputAction::ViewDelete
             }
+            // Every sidebar action drops back to Normal first, exactly as the
+            // `View*` actions above do. Until the `b` which-key group existed
+            // these were only ever reached from a Normal-mode Alt shortcut, so
+            // the mode reset was invisible; reached from the command tree
+            // without it, the client would toggle the sidebar and then sit in
+            // Command mode swallowing the next keystroke. `EnterNormal` cannot
+            // patch this from the binding side -- `execute_action_chain`
+            // returns at the first client action, so a trailing `EnterNormal`
+            // in the chain never runs.
             ClientAction::SidebarToggleLeft => {
+                self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Left))
             }
             ClientAction::SidebarToggleRight => {
+                self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Right))
             }
             ClientAction::SidebarToggleBottom => {
+                self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Bottom))
             }
             ClientAction::SidebarFocusLeft => {
+                self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Left))
             }
             ClientAction::SidebarFocusRight => {
+                self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Right))
             }
             ClientAction::SidebarFocusBottom => {
+                self.mode = Mode::Normal;
                 InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Bottom))
             }
-            ClientAction::SidebarCycle => InputAction::Sidebar(SidebarIntent::Cycle),
+            ClientAction::SidebarCycle => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Cycle)
+            }
         }
     }
 
@@ -4297,6 +4315,43 @@ mod tests {
         let action = handler.handle_key(esc_key());
         assert_eq!(action, InputAction::SendToPty(vec![0x1b]));
         assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    // -- Sidebar which-key tests --------------------------------------------
+
+    /// The `b` group's leaves must both fire the intent AND leave Command mode.
+    /// A sidebar action that returned its intent without resetting the mode
+    /// would toggle the sidebar and then eat the user's next keystroke as a
+    /// which-key key -- and no `EnterNormal` in the binding could fix it,
+    /// because `execute_action_chain` returns at the first client action.
+    #[test]
+    fn sidebar_group_leaves_fire_and_return_to_normal() {
+        let expected = [
+            ('h', SidebarIntent::Toggle(SidebarEdge::Left)),
+            ('l', SidebarIntent::Toggle(SidebarEdge::Right)),
+            ('j', SidebarIntent::Toggle(SidebarEdge::Bottom)),
+            ('H', SidebarIntent::Focus(SidebarEdge::Left)),
+            ('L', SidebarIntent::Focus(SidebarEdge::Right)),
+            ('J', SidebarIntent::Focus(SidebarEdge::Bottom)),
+            ('b', SidebarIntent::Cycle),
+        ];
+        for (key, intent) in expected {
+            let mut handler = InputHandler::with_defaults();
+            handler.mode = Mode::Command;
+            assert!(
+                matches!(
+                    handler.handle_key(char_key('b')),
+                    InputAction::ShowWhichKey { ref label, .. } if label == "Sidebar"
+                ),
+                "'b' should open the Sidebar which-key menu"
+            );
+            assert_eq!(
+                handler.handle_key(char_key(key)),
+                InputAction::Sidebar(intent),
+                "'b {key}'"
+            );
+            assert_eq!(handler.mode, Mode::Normal, "'b {key}' left Command mode on");
+        }
     }
 
     // -- Rename overlay tests -----------------------------------------------

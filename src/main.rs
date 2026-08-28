@@ -101,6 +101,42 @@ enum Commands {
     Relay,
 }
 
+/// Route panics into the role's log file, in addition to stderr.
+///
+/// `env_logger` only ever sees what goes through the `log` crate, and every
+/// harness runs the server with its stderr on `/dev/null` -- so before this
+/// hook existed a panic left NO trace in `server.log`, and the ~15 harness
+/// assertions that grep that file for "panic" were searching a file the
+/// evidence could never reach. They passed on an empty search.
+///
+/// The message deliberately opens with the literal `panicked at`, because the
+/// harnesses split between grepping a case-sensitive `"panicked"` and a
+/// lowercased `"panic"`; that prefix satisfies both.
+///
+/// The previous hook is chained rather than replaced, so an interactive run
+/// still prints the standard panic message (and any backtrace) to stderr.
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `payload_as_str` is not stable yet, so downcast the two types the
+        // standard `panic!` paths actually produce.
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic payload>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>").to_string();
+        log::error!("panicked at {location} (thread '{thread}'): {payload}");
+        previous(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -127,6 +163,8 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
+
+    install_panic_logger();
 
     let role = match cli.command {
         Some(Commands::Server) => "server",
