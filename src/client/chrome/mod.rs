@@ -312,10 +312,12 @@ impl Chrome {
     /// largest per-panel minimum on the axis `size` measures (columns for a
     /// vertical sidebar, rows for the bottom one).
     ///
-    /// Shrinking past this is not merely ugly: `split_panels` DROPS a panel
-    /// whose share is below its minimum, so the sidebar would keep its columns
-    /// and paint nothing in them, and the stranded-focus guard would eject the
-    /// user mid-resize.
+    /// This does NOT prevent a panel being dropped -- `split_panels` drops on
+    /// the STACK axis, which `size` does not touch (a vertical sidebar's
+    /// `bar.height` is `term_rows` whatever its width is). It is the simpler
+    /// rule it looks like: never paint a plugin narrower (or shorter) than the
+    /// size it says it needs. The vanish check in `resize_focused` is what
+    /// keeps panels on screen.
     fn min_size(&self, i: usize) -> u16 {
         let vertical = !matches!(self.sidebars[i].edge, SidebarEdge::Bottom);
         self.sidebars[i]
@@ -380,18 +382,27 @@ impl Chrome {
             .max(self.min_size(i));
 
             let old = self.sidebars[i].size;
+            let before = self.laid_out_panels(term_cols, term_rows);
             self.sidebars[i].size = want;
-            // What the layout would actually grant. Storing THAT rather than
-            // the request keeps the content rect's minimum (`effective_sizes`
-            // enforces it on the read side) and keeps a stored size from
-            // outgrowing the terminal, which a later smaller terminal would
-            // turn into a silently force-hidden sidebar.
             let granted = effective_sizes(&self.geoms(), term_cols, term_rows)[i];
-            if granted == 0 {
+            // The layout could not give what was asked. Refuse rather than
+            // store the clamped value: at a terminal too narrow to honour the
+            // press, nothing moves on screen, and rewriting the stored size
+            // would silently discard a width the user chose at a bigger one.
+            if granted != want {
                 self.sidebars[i].size = old;
                 return false;
             }
-            self.sidebars[i].size = granted;
+            // A size change is not local. `effective_sizes` shares one column
+            // budget between the verticals in declaration order, so growing
+            // this sidebar eats the NEXT one's -- and a vertical's growth also
+            // narrows `content.width`, which IS the bottom sidebar's bar, whose
+            // panels are then dropped on `min_cols`. Checking only this
+            // sidebar's granted size sees neither.
+            if !none_vanished(&before, &self.laid_out_panels(term_cols, term_rows)) {
+                self.sidebars[i].size = old;
+                return false;
+            }
             return granted != old;
         }
 
@@ -414,7 +425,7 @@ impl Chrome {
         // itself, which then ejects the user from the sidebar.
         let before = self.laid_out_panels(term_cols, term_rows);
         self.sidebars[i].panels[p].weight = new_weight;
-        if self.laid_out_panels(term_cols, term_rows) != before {
+        if !none_vanished(&before, &self.laid_out_panels(term_cols, term_rows)) {
             self.sidebars[i].panels[p].weight = old_weight;
             return false;
         }
@@ -432,6 +443,17 @@ impl Chrome {
 
 /// One press of a directional resize, in weight units.
 const WEIGHT_STEP: u16 = 1;
+
+/// Whether every panel laid out before a resize is still laid out after it.
+///
+/// A SUBSET test, not equality: a panel APPEARING is a resize rescuing one that
+/// did not fit, and refusing that would trap the user. A config (or a persisted
+/// state, or a terminal that shrank) can leave a sidebar force-hidden or a panel
+/// dropped, and shrinking back is exactly how it is recovered -- under an
+/// equality test the recovering press would be refused for changing the set.
+fn none_vanished(before: &[(usize, usize)], after: &[(usize, usize)]) -> bool {
+    before.iter().all(|p| after.contains(p))
+}
 
 /// Intercept a directional resize command. Returns `true` when the chrome
 /// consumed it and it must NOT be forwarded to the server.
@@ -1350,11 +1372,13 @@ mod resize_tests {
             c.resize_focused(Left, 5, 100, 30);
         }
         assert_eq!(c.sidebars[0].size, 8);
-        assert_eq!(
-            c.panel_rects(100, 30).len(),
-            1,
-            "shrinking emptied the sidebar"
-        );
+        // Asserting the panel is still LAID OUT would be vacuous: `split_panels`
+        // drops on the stack axis, which a vertical sidebar's width does not
+        // touch, and it never drops the last panel anyway. What the floor
+        // actually buys is the painted WIDTH.
+        let rects = c.panel_rects(100, 30);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].2.width, 8, "the panel is painted at the floor");
     }
 
     #[test]
@@ -1383,6 +1407,131 @@ mod resize_tests {
         assert_eq!(effective_sizes(&c.geoms(), 60, 30)[0], 40);
         assert!(c.resize_focused(Left, 5, 60, 30));
         assert_eq!(c.sidebars[0].size, 35);
+    }
+
+    /// Two sidebars, focus on the first. The single-sidebar helper cannot see
+    /// any of the cross-sidebar cases -- `effective_sizes` only starts sharing
+    /// a budget when there is something to share it with.
+    fn focused_two(a: SidebarConfig, b: SidebarConfig) -> Chrome {
+        let edge = a.edge;
+        let mut c = Chrome::from_config(&[a, b]);
+        assert!(c.focus_edge(edge, 100, 30), "the test sidebar must focus");
+        c
+    }
+
+    fn bar(edge: SidebarEdge, size: u16, panels: usize) -> SidebarConfig {
+        SidebarConfig {
+            edge,
+            size,
+            visible: true,
+            panel: (0..panels)
+                .map(|_| PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn growing_one_sidebar_never_force_hides_another() {
+        // 100 columns, `MIN_CONTENT_COLS` 20: the verticals share an 80-column
+        // budget in declaration order, so a left sidebar grown to 80 leaves the
+        // right one a budget of zero and it disappears -- while the left's own
+        // granted size is a perfectly healthy 80.
+        let mut c = focused_two(
+            bar(SidebarEdge::Left, 30, 1),
+            bar(SidebarEdge::Right, 40, 1),
+        );
+        for _ in 0..40 {
+            c.resize_focused(Right, 5, 100, 30);
+        }
+        let bars: Vec<usize> = c
+            .panel_rects(100, 30)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
+        assert!(
+            bars.contains(&1),
+            "growing the left sidebar force-hid the right one (left is now {})",
+            c.sidebars[0].size
+        );
+        assert_eq!(
+            c.sidebars[0].size, 75,
+            "the left sidebar should stop one step short of erasing its neighbour"
+        );
+    }
+
+    #[test]
+    fn growing_a_vertical_never_drops_the_bottom_sidebars_panels() {
+        // The second face of the same hole: a vertical's width is subtracted
+        // from `content.width`, which IS the bottom sidebar's bar, and ITS
+        // panels are dropped on `min_cols` (8 for the placeholder). Three
+        // panels need 24 columns between them.
+        let mut c = focused_two(
+            bar(SidebarEdge::Left, 30, 1),
+            bar(SidebarEdge::Bottom, 6, 3),
+        );
+        let bottom_panels = |c: &Chrome| {
+            c.panel_rects(100, 30)
+                .into_iter()
+                .filter(|(s, _, _)| *s == 1)
+                .count()
+        };
+        assert_eq!(bottom_panels(&c), 3, "all three must start laid out");
+        for _ in 0..40 {
+            c.resize_focused(Right, 5, 100, 30);
+        }
+        assert_eq!(
+            bottom_panels(&c),
+            3,
+            "growing the left sidebar dropped a panel out of the bottom one \
+             (left is now {})",
+            c.sidebars[0].size
+        );
+    }
+
+    #[test]
+    fn a_resize_that_rescues_a_dropped_panel_is_allowed() {
+        // The vanish check must be a SUBSET test, not equality. A config can
+        // arrive with a sidebar already force-hidden (or a panel already
+        // dropped), and shrinking back is exactly how the user recovers it --
+        // under an equality test the recovering press would be refused for
+        // changing the laid-out set, trapping them.
+        let mut c = focused_two(
+            bar(SidebarEdge::Left, 80, 1),
+            bar(SidebarEdge::Right, 40, 1),
+        );
+        let bars = |c: &Chrome| -> Vec<usize> {
+            c.panel_rects(100, 30)
+                .into_iter()
+                .map(|(s, _, _)| s)
+                .collect()
+        };
+        assert!(
+            !bars(&c).contains(&1),
+            "the right sidebar starts force-hidden"
+        );
+        assert!(
+            c.resize_focused(Left, 5, 100, 30),
+            "the shrink must be allowed"
+        );
+        assert_eq!(c.sidebars[0].size, 75);
+        assert!(
+            bars(&c).contains(&1),
+            "shrinking did not bring the right sidebar back"
+        );
+    }
+
+    #[test]
+    fn a_grow_the_terminal_cannot_honour_keeps_the_remembered_size() {
+        // Stored 60, granted 40 at a 60-column terminal. The press cannot move
+        // anything on screen, so it must not rewrite 60 down to 40 either --
+        // the user chose that width at a bigger terminal and will want it back.
+        let mut c = focused(SidebarEdge::Left, 60, &[1]);
+        assert_eq!(effective_sizes(&c.geoms(), 60, 30)[0], 40);
+        assert!(!c.resize_focused(Right, 5, 60, 30));
+        assert_eq!(c.sidebars[0].size, 60, "a clamped grow discarded the size");
     }
 
     #[test]

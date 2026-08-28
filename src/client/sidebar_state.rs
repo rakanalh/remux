@@ -118,7 +118,9 @@ pub fn save(chrome: &Chrome) {
 ///
 /// Writes a sibling temp file and renames it over the target, so a client that
 /// dies mid-write leaves the previous state intact rather than a truncated file
-/// the next start has to discard.
+/// the next start has to discard. The temp name carries the pid: two clients
+/// sharing an `XDG_STATE_HOME` would otherwise write the SAME temp file and
+/// rename a torn interleaving of the two into place.
 pub fn save_to(path: &Path, state: &SidebarState) {
     let Some(dir) = path.parent() else {
         log::warn!("sidebar state: {} has no parent directory", path.display());
@@ -135,7 +137,7 @@ pub fn save_to(path: &Path, state: &SidebarState) {
             return;
         }
     };
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     if let Err(e) = std::fs::write(&tmp, body) {
         log::warn!("sidebar state: cannot write {}: {e}", tmp.display());
         return;
@@ -144,6 +146,15 @@ pub fn save_to(path: &Path, state: &SidebarState) {
         log::warn!("sidebar state: cannot rename into {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// The scratch file `save_to` renames into place.
+///
+/// Per-process: two clients sharing an `XDG_STATE_HOME` writing the same temp
+/// name can interleave and rename a torn file into place, which would narrow
+/// the "never corrupt" property to a single writer.
+fn tmp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("{}.tmp", std::process::id()))
 }
 
 /// Overlay persisted state onto a config-built `Chrome`.
@@ -317,8 +328,25 @@ mod tests {
         assert!(!fresh.sidebars[0].visible);
         assert_eq!(fresh.sidebars[0].size, 41);
         assert_eq!(fresh.sidebars[0].panels[0].weight, 6);
-        // The temp file is renamed, not left behind.
-        assert!(!path.with_extension("tmp").exists());
+        // The temp file is renamed, not left behind -- and the name is
+        // per-process, so check the directory rather than one fixed name.
+        let left: Vec<_> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("read_dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(left.len(), 1, "a temp file was left behind: {left:?}");
+    }
+
+    #[test]
+    fn the_temp_file_is_per_process() {
+        let t = tmp_path(Path::new("/x/sidebar.json"));
+        let name = t.file_name().expect("name").to_string_lossy().into_owned();
+        assert!(name.ends_with(".tmp"), "{name}");
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "two clients sharing a state dir would write the same temp file: {name}"
+        );
+        assert_ne!(t, PathBuf::from("/x/sidebar.json"));
     }
 
     #[test]
