@@ -961,7 +961,12 @@ fn paint_view(
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
 ) -> Result<()> {
-    let (c, r) = crossterm::terminal::size()?;
+    // `Renderer::size`, not `terminal::size()`: the panels beside the view have
+    // to be laid out against the front buffer (its own doc says so), and inside
+    // the SIGWINCH-to-`Resize` window the two disagree. The view's hit tests
+    // read the same source, so what is composited and what a click resolves
+    // against can never be laid out for different terminal sizes.
+    let (c, r) = renderer.size();
     let content = chrome.content_rect(c, r);
     // The view composites in content-relative coordinates; the renderer's
     // origin places it on screen, exactly as it does for server frames. Keep
@@ -1072,10 +1077,14 @@ fn paint_view(
 async fn subscribe_view_cells(
     mgr: &mut ConnectionManager,
     chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
     view: &mut crate::client::view::ClientView,
     border_style: &crate::config::BorderStyle,
 ) -> Result<()> {
-    let (c, r) = crossterm::terminal::size()?;
+    // `Renderer::size` for the same reason `paint_view` uses it: the cells are
+    // demanded at the size they are DRAWN at, and inside the SIGWINCH window
+    // the front buffer is what is on screen.
+    let (c, r) = renderer.size();
     // The cells are laid out in the SAME rect `paint_view` composites into.
     // Subscribing at the full terminal instead would reflow every source pane
     // to an interior wider than the cell it is drawn in -- borders in the right
@@ -1300,7 +1309,7 @@ async fn enter_view(
     // (see `sync_content_rect`).
     let content = chrome.content_rect(c, r);
     sync_content_rect(renderer, &content);
-    subscribe_view_cells(mgr, chrome, &mut views[target_idx], border_style).await?;
+    subscribe_view_cells(mgr, chrome, renderer, &mut views[target_idx], border_style).await?;
     paint_view(
         renderer,
         chrome,
@@ -1593,7 +1602,7 @@ async fn handle_view_command(
             hide_whichkey!();
             // The interior a cell paints changed size (a border was gained or
             // lost on every edge), so re-demand the new content size.
-            subscribe_view_cells(mgr, chrome, &mut views[av], border_style).await?;
+            subscribe_view_cells(mgr, chrome, renderer, &mut views[av], border_style).await?;
             repaint!();
             Ok(true)
         }
@@ -3830,6 +3839,7 @@ async fn run_client_loop(
                                         subscribe_view_cells(
                                             mgr,
                                             &chrome,
+                                            &renderer,
                                             &mut views[av],
                                             &view_border_style,
                                         )
@@ -4408,7 +4418,7 @@ async fn run_client_loop(
                         // (the other geometry changes -- layout/resize/move/zoom --
                         // arrive as `ViewList` and re-subscribe there).
                         if let Some(av) = active_view {
-                            subscribe_view_cells(mgr, &chrome, &mut views[av], &view_border_style).await?;
+                            subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                             paint_view(
                                 &mut renderer,
                                 &chrome,
@@ -4499,7 +4509,7 @@ async fn run_client_loop(
                         let connected = mgr.finish_remote_dial(&name, result);
                         log::debug!("srv: RemoteDialed '{name}' connected={connected}");
                         if let Some(av) = active_view {
-                            subscribe_view_cells(mgr, &chrome, &mut views[av], &view_border_style).await?;
+                            subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                             paint_view(
                                 &mut renderer,
                                 &chrome,
@@ -4815,11 +4825,13 @@ async fn run_client_loop(
                             renderer.resize(cols, rows);
                             // See the resize arm: origin and content size move
                             // together, and `resize` only moves one of them.
-                            let content = if active_view.is_some() {
-                                crate::server::layout::Rect { x: 0, y: 0, width: cols, height: rows }
-                            } else {
-                                chrome.content_rect(cols, rows)
-                            };
+                            // A live view goes through the content rect like
+                            // everything else -- see `content_rect_now`. This is
+                            // not reachable with a view up today (`enter_view`
+                            // detaches, and the server answers `RequestScrollback`
+                            // only for an attached client), but the rect must not
+                            // be the one place that still disagrees.
+                            let content = chrome.content_rect(cols, rows);
                             sync_content_rect(&mut renderer, &content);
                             mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
                             if active_view.is_none() {
@@ -5311,7 +5323,7 @@ async fn run_client_loop(
                                 // Re-subscribe the whole active view so the flipped
                                 // cell's size_demand is recomputed (see
                                 // `subscribe_view_cells`).
-                                subscribe_view_cells(mgr, &chrome, &mut views[av], &view_border_style).await?;
+                                subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                             }
                         }
                         if active_touched {
@@ -5491,7 +5503,7 @@ async fn run_client_loop(
                                                 .await;
                                         }
                                     }
-                                    subscribe_view_cells(mgr, &chrome, &mut views[av], &view_border_style).await?;
+                                    subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                                     paint_view(
                                         &mut renderer,
                                         &chrome,

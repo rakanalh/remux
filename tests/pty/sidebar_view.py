@@ -306,28 +306,30 @@ def test_view_cells_are_sized_to_the_content_rect():
     tail_rows = [i for i, r in enumerate(t.rows_text()) if WRAP_TAIL in r]
     # The command echo carries the tail too; the WRAPPED OUTPUT row is the one
     # that starts with the tail at the cell's left content edge.
-    # ...i.e. nothing but the panel, padding and the cell's own border sits to
-    # its left. The echoed command also carries the tail, but never at the edge.
+    # ...i.e. it begins at the focused (left) cell's first content column:
+    # the sidebar, then that cell's left border. Anchored on that KNOWN edge
+    # rather than on "nothing but blanks to my left" -- the latter passes only
+    # while the placeholder leaves its column mostly empty, and would start
+    # rejecting real matches the moment a plugin that prints text on every row
+    # (the Task 12 session tree) takes its place. The echoed command carries
+    # the tail too, but never at the content edge.
+    content_edge = SIDEBAR_W + 1
     wrapped = [
         i
         for i in tail_rows
-        if not t.rows_text()[i][: t.rows_text()[i].index(WRAP_TAIL)]
-        .strip("".join(BOX) + " ")
+        if t.rows_text()[i].index(WRAP_TAIL) == content_edge
     ]
     if not wrapped:
         t.dump("no wrapped tail")
         fails.append(
-            f"{WRAP_TAIL!r} never wrapped onto its own row inside the cell: the "
-            f"pane did not wrap at the cell's width and the blit cropped the "
-            f"tail away (tail seen on rows {tail_rows})"
+            f"{WRAP_TAIL!r} never wrapped onto its own row at the cell's "
+            f"content edge (column {content_edge}): the pane did not wrap at "
+            f"the cell's width and the blit cropped the tail away (tail seen "
+            f"on rows {tail_rows}, at columns "
+            f"{[t.rows_text()[i].index(WRAP_TAIL) for i in tail_rows]})"
         )
     else:
-        row = t.rows_text()[wrapped[0]]
-        at = row.index(WRAP_TAIL)
-        if at < SIDEBAR_W:
-            fails.append(f"the wrapped tail painted at column {at}, in the sidebar")
-        else:
-            print(f"  wrapped tail painted at column {at}")
+        print(f"  wrapped tail painted at column {content_edge}")
 
     return finish(t, name, fails)
 
@@ -493,6 +495,16 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
             f"the view did not shrink back to the seam: "
             f"{leftmost_box_column(t)}"
         )
+    # The frame alone is not enough on this direction either -- that blindness
+    # is the whole reason this task exists. Re-read the cell's own content.
+    back = stty_reading(t)
+    if back != CELL_STTY:
+        fails.append(
+            f"the cells were not re-demanded when the sidebar came back: "
+            f"{back!r}, expected {CELL_STTY!r}"
+        )
+    else:
+        print(f"  after showing the sidebar again the cell reports {back!r}")
 
     return finish(t, name, fails)
 
