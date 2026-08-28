@@ -136,6 +136,21 @@ CFG_ACTIONS_NO_SIDEBAR = """
 "Alt-1" = "SidebarToggleLeft"
 """
 
+# `Resize*` bound to NORMAL-mode shortcuts, pure and mixed. A focused sidebar
+# re-targets a pure resize at itself; a mixed chain earns no exemption and goes
+# to the plugin like any other key, or its `SetMaster` half would reach the
+# server while a panel has the keyboard.
+CFG_ALT_RESIZE = f"""
+[keybindings.command]
+"Alt-7" = "ResizeRight 5"
+"Alt-8" = "ResizeRight 5; SetMaster"
+
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+{PANEL}"""
+
 # A RIGHT sidebar, closed. Paired with state written for the LEFT edge, this is
 # what makes "unmatched state is ignored" observable on screen: an `apply` that
 # matched positionally instead of by edge would open this bar to the left bar's
@@ -1037,6 +1052,215 @@ def test_with_no_sidebar_a_toggle_writes_no_state_file():
     print("PASS test_with_no_sidebar_a_toggle_writes_no_state_file")
 
 
+def seam(screen):
+    """The column the server's frame starts at: its pane border's top-left.
+
+    The sidebar's own width is not readable from the panel content (the
+    placeholder pads), so the seam is what proves a resize actually moved the
+    boundary rather than only the stored number.
+    """
+    row = screen.display[0]
+    return row.index("\u256d") if "\u256d" in row else None
+
+
+def resize_cols(log: str):
+    """Every content width the SERVER was resized to, in order."""
+    return [int(c) for c in re.findall(r"resize cols=(\d+) rows=", log)]
+
+
+def test_the_resize_chord_moves_a_focused_sidebars_edge():
+    """`Prefix p R l` with the left sidebar focused grows the SIDEBAR.
+
+    The seam is asserted on screen and the width is asserted in the server's
+    log, because those are two different bugs: a stored size that never reached
+    `Resize` leaves the server rendering at the old width behind a repainted
+    sidebar.
+
+    The Resize group is STICKY, so the second `l` repeats without the chord.
+    """
+    env = make_env(CFG_LEFT)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    assert seam(screen) == SIDEBAR_W, f"the frame did not start at the seam: {seam(screen)}"
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen), "the sidebar never took focus"
+
+    child.send(b"\x01pRl")
+    pump(1.5)
+    child.send(b"l")
+    pump(1.5)
+    child.send(b"\x1b")
+    pump(1.0)
+
+    assert seam(screen) == SIDEBAR_W + 10, (
+        f"two sticky `l` presses did not grow the sidebar by 10: seam={seam(screen)}\n"
+        + "\n".join(screen.display[:3])
+    )
+    widths = resize_cols(server_log())
+    assert COLS - SIDEBAR_W - 5 in widths and COLS - SIDEBAR_W - 10 in widths, (
+        f"the server was never resized to the new content widths: {widths}"
+    )
+    # Nothing leaked: the server must not have been asked to resize a PANE.
+    assert "msg=Command(Resize" not in server_log(), (
+        "a resize inside a sidebar leaked to the server as a pane resize"
+    )
+
+    # The keyboard is still the PANEL's -- the Escape above left the sticky
+    # group, not the sidebar -- so leave it the normal way and check the shell
+    # is reachable at the sidebar's new width.
+    child.send(ALT_L)
+    pump(1.0)
+    assert not focused_rows(screen), f"Alt+l did not leave the panel: {markers(screen)}"
+    child.send(b"echo nav12\r")
+    pump(1.2)
+    assert any("nav12" in r[SIDEBAR_W + 10 :] for r in screen.display), (
+        "the keyboard was stranded after resizing:\n" + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_the_resize_chord_moves_a_focused_sidebars_edge")
+
+
+def test_the_resize_chord_reweights_along_the_stack():
+    """`Prefix p R j` moves the focused PANEL's weight, not the sidebar's size.
+
+    Down grows the focused panel downward -- the same thing it does to a focused
+    pane on the server -- so the second panel's marker moves DOWN the screen and
+    the seam does not move at all.
+    """
+    env = make_env(CFG_LEFT_TWO_PANELS)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    before = [y for (y, _) in markers(screen)]
+    assert len(before) == 2, f"expected two stacked panels: {markers(screen)}"
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen) == [before[0]], "the top panel never took focus"
+
+    child.send(b"\x01pRj")
+    pump(1.5)
+    child.send(b"\x1b")
+    pump(1.0)
+
+    after = [y for (y, _) in markers(screen)]
+    assert len(after) == 2, f"reweighting dropped a panel: {markers(screen)}"
+    assert after[1] > before[1], (
+        f"the second panel did not move down: {before} -> {after}"
+    )
+    assert seam(screen) == SIDEBAR_W, (
+        f"the stack axis moved the sidebar's SIZE: seam={seam(screen)}"
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_the_resize_chord_reweights_along_the_stack")
+
+
+def test_an_alt_bound_resize_reaches_the_sidebar_not_the_plugin():
+    """A pure `Resize*` shortcut earns the same exemption `PaneFocus*` does.
+
+    Without it, a user whose only resize binding is a Normal-mode shortcut
+    cannot resize the sidebar from inside it -- the plugin eats the key. The
+    mixed chain in the same config must NOT earn it: its `SetMaster` half would
+    reach the server while a panel has the keyboard.
+    """
+    env = make_env(CFG_ALT_RESIZE)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen), "the sidebar never took focus"
+
+    child.send(b"\x1b7")
+    pump(1.5)
+    assert seam(screen) == SIDEBAR_W + 5, (
+        f"an Alt-bound resize never reached the sidebar: seam={seam(screen)}\n"
+        + "\n".join(screen.display[:3])
+    )
+    assert "msg=Command(Resize" not in server_log(), (
+        "the Alt-bound resize leaked to the server"
+    )
+
+    # The mixed chain goes to the plugin: no resize, and no `SetMaster`.
+    at = seam(screen)
+    child.send(b"\x1b8")
+    pump(1.5)
+    assert seam(screen) == at, (
+        f"a mixed chain earned the resize exemption: {at} -> {seam(screen)}"
+    )
+    assert "SetMaster" not in server_log(), (
+        "a mixed chain forwarded its other half to the server from inside a panel"
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_an_alt_bound_resize_reaches_the_sidebar_not_the_plugin")
+
+
+def test_a_resize_with_focus_on_the_content_still_reaches_the_server():
+    """The regression gate: unfocused sidebar, resize behaves exactly as before."""
+    env = make_env(CFG_LEFT)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    assert not focused_rows(screen), "the sidebar must start unfocused"
+
+    child.send(b"\x01pRl")
+    pump(1.5)
+    child.send(b"\x1b")
+    pump(1.0)
+
+    assert "msg=Command(ResizeRight(5))" in server_log(), (
+        "a resize with focus on the content did not reach the server:\n"
+        + server_log()[-1500:]
+    )
+    assert seam(screen) == SIDEBAR_W, (
+        f"a content resize moved the SIDEBAR: seam={seam(screen)}"
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_resize_with_focus_on_the_content_still_reaches_the_server")
+
+
+def test_a_resized_sidebar_survives_a_client_restart():
+    """The size the user dragged to is remembered, like the visibility is."""
+    env = make_env(CFG_LEFT)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(ALT_H)
+    pump(1.0)
+    child.send(b"\x01pRl")
+    pump(1.5)
+    child.send(b"\x1b")
+    pump(1.0)
+    grown = seam(screen)
+    assert grown == SIDEBAR_W + 5, f"the sidebar did not grow: seam={grown}"
+    assert os.path.exists(state_file()), (
+        "resizing a sidebar wrote no state file:\n" + client_log()[-2000:]
+    )
+    body = open(state_file()).read()
+    assert f'"size": {SIDEBAR_W + 5}' in body, f"the new size was not saved: {body}"
+
+    child.close(force=True)
+    child, screen, pump = spawn(env)
+    pump(2.0)
+    assert child.isalive(), "the client died on restart:\n" + client_log()[-2000:]
+    assert seam(screen) == grown, (
+        f"the resized sidebar came back at its config width: seam={seam(screen)}\n"
+        + "\n".join(screen.display[:3])
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_resized_sidebar_survives_a_client_restart")
+
+
 if __name__ == "__main__":
     if not os.path.exists(BIN):
         sys.exit(f"build first: {BIN} missing")
@@ -1054,6 +1278,11 @@ if __name__ == "__main__":
     test_a_paste_does_not_leak_past_a_focused_sidebar()
     test_a_mixed_chain_does_not_earn_the_directional_exemption()
     test_a_group_prefix_shortcut_still_opens_command_mode()
+    test_the_resize_chord_moves_a_focused_sidebars_edge()
+    test_the_resize_chord_reweights_along_the_stack()
+    test_an_alt_bound_resize_reaches_the_sidebar_not_the_plugin()
+    test_a_resize_with_focus_on_the_content_still_reaches_the_server()
+    test_a_resized_sidebar_survives_a_client_restart()
     test_a_toggled_sidebar_survives_a_client_restart()
     test_a_persisted_size_and_weight_are_restored()
     test_a_corrupt_state_file_falls_back_to_the_config()

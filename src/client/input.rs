@@ -1618,6 +1618,42 @@ impl InputHandler {
         })
     }
 
+    /// Whether this key resolves to a `Resize*` command in the current mode.
+    ///
+    /// A focused sidebar RE-TARGETS these rather than swallowing them: the
+    /// resize adjusts the sidebar's own size or its focused panel's weight
+    /// (`chrome::intercept_resize`), which is the only way to adjust either.
+    /// Swallowing them would make a sidebar's own size unadjustable from the
+    /// one place the user is looking at it.
+    ///
+    /// Nothing leaks: `intercept_resize` consumes every `Resize*` while a
+    /// sidebar has focus, including one clamped to a no-op.
+    ///
+    /// EVERY action in the chain must be a `Resize*`, for the same reason
+    /// `resolves_to_pane_focus` demands it: the exemption passes the whole key
+    /// through, so a mixed chain would forward its other half to the server
+    /// while a panel has the keyboard.
+    pub fn resolves_to_resize(&self, key: &KeyEvent) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
+            return false;
+        };
+        !actions.is_empty()
+            && actions.iter().all(|a| {
+                matches!(
+                    resolve_action(a),
+                    Some(Action::Server(
+                        RemuxCommand::ResizeLeft(_)
+                            | RemuxCommand::ResizeRight(_)
+                            | RemuxCommand::ResizeUp(_)
+                            | RemuxCommand::ResizeDown(_)
+                    ))
+                )
+            })
+    }
+
     /// Whether this key resolves to a `PaneFocus*` command in the current mode.
     ///
     /// Directional keys are the one command a focused sidebar does not take:

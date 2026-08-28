@@ -683,6 +683,69 @@ fn focus_direction_of(cmd: &RemuxCommand) -> Option<crate::server::layout::Focus
     }
 }
 
+/// The direction and amount a `Resize*` command asks for, if it is one.
+///
+/// A focused sidebar re-targets these at itself; every other command is `None`
+/// and falls straight through to the server.
+fn resize_of(cmd: &RemuxCommand) -> Option<(crate::server::layout::FocusDirection, u16)> {
+    use crate::server::layout::FocusDirection;
+    match cmd {
+        RemuxCommand::ResizeLeft(n) => Some((FocusDirection::Left, *n)),
+        RemuxCommand::ResizeRight(n) => Some((FocusDirection::Right, *n)),
+        RemuxCommand::ResizeUp(n) => Some((FocusDirection::Up, *n)),
+        RemuxCommand::ResizeDown(n) => Some((FocusDirection::Down, *n)),
+        _ => None,
+    }
+}
+
+/// Re-target a `Resize*` at the focused sidebar. Returns `true` when the chrome
+/// consumed the command and it must NOT be forwarded to the server.
+///
+/// Perpendicular to the sidebar's edge this moves its `size`, so the CONTENT
+/// RECT moves with it: the origin and the `Resize` travel together (see
+/// `sync_content_rect`), exactly as they do for a toggle. Parallel to the edge
+/// it reweights the focused panel, which leaves the content rect alone and only
+/// needs a repaint.
+///
+/// There is deliberately no live-view branch. A view cannot coexist with panel
+/// focus -- `SidebarIntent::Focus` is refused while one is up and `enter_view`
+/// drops panel focus -- and this runs AFTER `handle_view_command`, which
+/// consumes `Resize*` for the view's cells. So a resize while a view is live
+/// never reaches here, and one that did would find focus on the content and
+/// fall through.
+async fn handle_chrome_resize(
+    cmd: &RemuxCommand,
+    chrome: &mut crate::client::chrome::Chrome,
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    compositor_theme: &crate::config::theme::CompositorTheme,
+) -> Result<bool> {
+    let Some((dir, amount)) = resize_of(cmd) else {
+        return Ok(false);
+    };
+    let (tc, tr) = renderer.size();
+    let before = chrome.content_rect(tc, tr);
+    let persisted_before = crate::client::sidebar_state::SidebarState::from_chrome(chrome);
+    if !crate::client::chrome::intercept_resize(chrome, dir, amount, tc, tr) {
+        return Ok(false);
+    }
+    if crate::client::sidebar_state::SidebarState::from_chrome(chrome) != persisted_before {
+        crate::client::sidebar_state::save(chrome);
+    }
+    let content = chrome.content_rect(tc, tr);
+    if content != before {
+        sync_content_rect(renderer, &content);
+        mgr.send_foreground(ClientMessage::Resize {
+            cols: content.width,
+            rows: content.height,
+        })
+        .await?;
+    }
+    chrome.paint(renderer, tc, tr, compositor_theme)?;
+    renderer.flush()?;
+    Ok(true)
+}
+
 /// Go to a pane anywhere: leave any live view, re-point the renderer at the
 /// content rect, hand the screen to `server`, attach and switch.
 ///
@@ -1935,6 +1998,7 @@ async fn run_client_loop(
                                     }
                                     let passes_through = input.is_prefix_key(&key)
                                         || input.resolves_to_pane_focus(&key)
+                                        || input.resolves_to_resize(&key)
                                         || input.resolves_to_sidebar_action(&key);
                                     if !passes_through {
                                         let plugin_action = chrome.sidebars[sidebar].panels[panel]
@@ -2119,6 +2183,22 @@ async fn run_client_loop(
                                         continue;
                                     }
                                 }
+                                // A focused sidebar re-targets `Resize*` at
+                                // itself: its own size across the edge, its
+                                // focused panel's weight along it. With focus on
+                                // the content this is a no-op and the command
+                                // reaches the server exactly as before.
+                                if handle_chrome_resize(
+                                    &cmd,
+                                    &mut chrome,
+                                    mgr,
+                                    &mut renderer,
+                                    &compositor_theme,
+                                )
+                                .await?
+                                {
+                                    continue;
+                                }
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
                                     mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
@@ -2217,6 +2297,21 @@ async fn run_client_loop(
                                             renderer.flush()?;
                                             continue;
                                         }
+                                    }
+                                    // Re-targeted at the sidebar exactly as in
+                                    // the single-command arm; `continue` skips
+                                    // only this command, so the rest of the
+                                    // chain still runs.
+                                    if handle_chrome_resize(
+                                        &cmd,
+                                        &mut chrome,
+                                        mgr,
+                                        &mut renderer,
+                                        &compositor_theme,
+                                    )
+                                    .await?
+                                    {
+                                        continue;
                                     }
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
@@ -2508,6 +2603,23 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                         cols,
                                         rows,
+                                    )
+                                    .await?;
+                                }
+                                if !consumed {
+                                    // A focused sidebar re-targets `Resize*` at
+                                    // itself. This arm is where the DEFAULT
+                                    // resize keys land -- `p R h/j/k/l` is a
+                                    // sticky group, so its leaves never reach
+                                    // `Execute` -- which makes it the primary
+                                    // path for the sidebar resize, not an
+                                    // afterthought of it.
+                                    consumed = handle_chrome_resize(
+                                        &command,
+                                        &mut chrome,
+                                        mgr,
+                                        &mut renderer,
+                                        &compositor_theme,
                                     )
                                     .await?;
                                 }

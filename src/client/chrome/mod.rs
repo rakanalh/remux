@@ -307,6 +307,162 @@ impl Chrome {
         }
         self.focus = ChromeFocus::Content;
     }
+
+    /// The smallest `size` that still lets this sidebar's panels render: the
+    /// largest per-panel minimum on the axis `size` measures (columns for a
+    /// vertical sidebar, rows for the bottom one).
+    ///
+    /// Shrinking past this is not merely ugly: `split_panels` DROPS a panel
+    /// whose share is below its minimum, so the sidebar would keep its columns
+    /// and paint nothing in them, and the stranded-focus guard would eject the
+    /// user mid-resize.
+    fn min_size(&self, i: usize) -> u16 {
+        let vertical = !matches!(self.sidebars[i].edge, SidebarEdge::Bottom);
+        self.sidebars[i]
+            .panels
+            .iter()
+            .map(|p| {
+                let (min_cols, min_rows) = p.plugin.min_size();
+                if vertical {
+                    min_cols
+                } else {
+                    min_rows
+                }
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// Re-target a directional resize at the focused sidebar. Returns `true` if
+    /// anything actually changed.
+    ///
+    /// The axis decides which field moves: PERPENDICULAR to the sidebar's edge
+    /// is its `size`, PARALLEL to it (the axis its panels stack along) is the
+    /// focused panel's `weight`.
+    ///
+    /// Direction is SPATIAL, not signed by name -- the user is dragging an edge,
+    /// not incrementing a number -- so `ResizeRight` grows a left sidebar and
+    /// shrinks a right one, and `ResizeDown` grows the focused panel downward
+    /// exactly as it grows a focused pane downward on the server.
+    pub fn resize_focused(
+        &mut self,
+        dir: FocusDirection,
+        amount: u16,
+        term_cols: u16,
+        term_rows: u16,
+    ) -> bool {
+        use FocusDirection::*;
+        let Some((i, p)) = self.focused_panel(term_cols, term_rows) else {
+            return false;
+        };
+        let edge = self.sidebars[i].edge;
+        let perpendicular = match edge {
+            SidebarEdge::Left | SidebarEdge::Right => matches!(dir, Left | Right),
+            SidebarEdge::Bottom => matches!(dir, Up | Down),
+        };
+
+        if perpendicular {
+            let grow = matches!(
+                (edge, &dir),
+                (SidebarEdge::Left, Right) | (SidebarEdge::Right, Left) | (SidebarEdge::Bottom, Up)
+            );
+            // Arithmetic starts from the EFFECTIVE size, not the stored one. A
+            // sidebar whose stored 30 was granted 25 must move on the first
+            // press: shrinking the stored value would land back on 25 and look
+            // like a dropped keystroke.
+            let current = effective_sizes(&self.geoms(), term_cols, term_rows)[i];
+            let want = if grow {
+                current.saturating_add(amount)
+            } else {
+                current.saturating_sub(amount)
+            }
+            .max(self.min_size(i));
+
+            let old = self.sidebars[i].size;
+            self.sidebars[i].size = want;
+            // What the layout would actually grant. Storing THAT rather than
+            // the request keeps the content rect's minimum (`effective_sizes`
+            // enforces it on the read side) and keeps a stored size from
+            // outgrowing the terminal, which a later smaller terminal would
+            // turn into a silently force-hidden sidebar.
+            let granted = effective_sizes(&self.geoms(), term_cols, term_rows)[i];
+            if granted == 0 {
+                self.sidebars[i].size = old;
+                return false;
+            }
+            self.sidebars[i].size = granted;
+            return granted != old;
+        }
+
+        // Along the stack axis: the focused panel's weight. `amount` is a cell
+        // count, which means nothing to a proportional weight, so a press is
+        // one unit.
+        let grow = matches!(dir, Down | Right);
+        let old_weight = self.sidebars[i].panels[p].weight;
+        let new_weight = if grow {
+            old_weight.saturating_add(WEIGHT_STEP)
+        } else {
+            old_weight.saturating_sub(WEIGHT_STEP).max(1)
+        };
+        if new_weight == old_weight {
+            return false;
+        }
+        // No panel may vanish because of a resize. `split_panels` drops a panel
+        // whose share falls below its minimum, so an unbounded weight change
+        // makes a NEIGHBOUR disappear -- or, shrinking, the focused panel
+        // itself, which then ejects the user from the sidebar.
+        let before = self.laid_out_panels(term_cols, term_rows);
+        self.sidebars[i].panels[p].weight = new_weight;
+        if self.laid_out_panels(term_cols, term_rows) != before {
+            self.sidebars[i].panels[p].weight = old_weight;
+            return false;
+        }
+        true
+    }
+
+    /// The `(sidebar, panel)` pairs currently laid out, for the no-vanish check.
+    fn laid_out_panels(&self, term_cols: u16, term_rows: u16) -> Vec<(usize, usize)> {
+        self.panel_rects(term_cols, term_rows)
+            .into_iter()
+            .map(|(s, p, _)| (s, p))
+            .collect()
+    }
+}
+
+/// One press of a directional resize, in weight units.
+const WEIGHT_STEP: u16 = 1;
+
+/// Intercept a directional resize command. Returns `true` when the chrome
+/// consumed it and it must NOT be forwarded to the server.
+///
+/// Consumed means consumed: a resize clamped to a no-op is swallowed, never
+/// leaked to the server as a pane resize the user cannot see. With focus on the
+/// content -- including every client with no sidebar configured -- this returns
+/// `false` and the command forwards exactly as before.
+pub fn intercept_resize(
+    chrome: &mut Chrome,
+    dir: FocusDirection,
+    amount: u16,
+    term_cols: u16,
+    term_rows: u16,
+) -> bool {
+    // Same stranded-focus release as `intercept_focus`, for the same reason: a
+    // SIGWINCH between the prefix and the chord key can force-hide the sidebar
+    // while `chrome.focus` still names it.
+    if matches!(chrome.focus, ChromeFocus::Sidebar { .. })
+        && chrome.focused_panel(term_cols, term_rows).is_none()
+    {
+        log::debug!("sidebar: resize focus was stranded by a resize; releasing it to the content");
+        chrome.leave_sidebar();
+    }
+    if !matches!(chrome.focus, ChromeFocus::Sidebar { .. }) {
+        return false;
+    }
+    let described = format!("{dir:?}");
+    let changed = chrome.resize_focused(dir, amount, term_cols, term_rows);
+    log::debug!("sidebar: resize {described} by {amount} -> changed={changed}");
+    true
 }
 
 /// The largest border inset the server can apply to a pane on one side.
@@ -1077,5 +1233,193 @@ mod focus_tests {
                 panel: 0
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    use crate::config::sidebar::{PanelConfig, SidebarConfig};
+    use crate::server::layout::FocusDirection::{Down, Left, Right, Up};
+
+    fn focused(edge: SidebarEdge, size: u16, weights: &[u16]) -> Chrome {
+        let mut c = Chrome::from_config(&[SidebarConfig {
+            edge,
+            size,
+            visible: true,
+            panel: weights
+                .iter()
+                .map(|w| PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: *w,
+                })
+                .collect(),
+        }]);
+        assert!(c.focus_edge(edge, 100, 30), "the test sidebar must focus");
+        c
+    }
+
+    #[test]
+    fn direction_is_spatial_for_a_left_sidebar() {
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        assert!(c.resize_focused(Right, 5, 100, 30));
+        assert_eq!(c.sidebars[0].size, 35, "Right must GROW a left sidebar");
+        assert!(c.resize_focused(Left, 5, 100, 30));
+        assert_eq!(c.sidebars[0].size, 30, "Left must SHRINK a left sidebar");
+    }
+
+    #[test]
+    fn direction_is_spatial_for_a_right_sidebar() {
+        // The mirror image: the same key that grows a left sidebar shrinks this
+        // one. Signing the arithmetic by the command's NAME rather than by the
+        // edge is exactly the bug this catches.
+        let mut c = focused(SidebarEdge::Right, 30, &[1]);
+        assert!(c.resize_focused(Left, 5, 100, 30));
+        assert_eq!(c.sidebars[0].size, 35, "Left must GROW a right sidebar");
+        assert!(c.resize_focused(Right, 5, 100, 30));
+        assert_eq!(c.sidebars[0].size, 30, "Right must SHRINK a right sidebar");
+    }
+
+    #[test]
+    fn direction_is_spatial_for_a_bottom_sidebar() {
+        let mut c = focused(SidebarEdge::Bottom, 8, &[1]);
+        assert!(c.resize_focused(Up, 2, 100, 30));
+        assert_eq!(c.sidebars[0].size, 10, "Up must GROW a bottom sidebar");
+        assert!(c.resize_focused(Down, 2, 100, 30));
+        assert_eq!(c.sidebars[0].size, 8, "Down must SHRINK a bottom sidebar");
+    }
+
+    #[test]
+    fn the_stack_axis_moves_the_focused_panels_weight() {
+        let mut c = focused(SidebarEdge::Left, 30, &[1, 1]);
+        assert!(c.resize_focused(Down, 5, 100, 30));
+        assert_eq!(
+            c.sidebars[0].panels[0].weight, 2,
+            "Down must grow the focused panel, as it grows a focused pane"
+        );
+        assert_eq!(
+            c.sidebars[0].size, 30,
+            "the stack axis must not move `size`"
+        );
+        assert!(c.resize_focused(Up, 5, 100, 30));
+        assert_eq!(c.sidebars[0].panels[0].weight, 1);
+    }
+
+    #[test]
+    fn a_bottom_sidebars_stack_axis_is_horizontal() {
+        let mut c = focused(SidebarEdge::Bottom, 8, &[1, 1]);
+        assert!(c.resize_focused(Right, 5, 100, 30));
+        assert_eq!(c.sidebars[0].panels[0].weight, 2);
+        assert_eq!(c.sidebars[0].size, 8);
+    }
+
+    #[test]
+    fn a_weight_never_falls_below_one() {
+        let mut c = focused(SidebarEdge::Left, 30, &[1, 1]);
+        assert!(!c.resize_focused(Up, 5, 100, 30), "nothing to shrink");
+        assert_eq!(c.sidebars[0].panels[0].weight, 1);
+    }
+
+    #[test]
+    fn a_weight_change_that_would_drop_a_panel_is_refused() {
+        // The placeholder needs 2 rows. In a 30-row sidebar a 14:1 split still
+        // leaves the second panel 2 rows; 15:1 does not, and dropping it is
+        // exactly what the user did not ask for.
+        let mut c = focused(SidebarEdge::Left, 30, &[1, 1]);
+        let mut last = 1;
+        for _ in 0..40 {
+            if !c.resize_focused(Down, 5, 100, 30) {
+                break;
+            }
+            last = c.sidebars[0].panels[0].weight;
+        }
+        assert!(last > 1, "the weight never grew at all");
+        assert_eq!(
+            c.panel_rects(100, 30).len(),
+            2,
+            "growing one panel dropped its neighbour off the screen"
+        );
+    }
+
+    #[test]
+    fn a_size_never_shrinks_below_what_the_panels_need() {
+        // The placeholder's `min_size` is 8 columns; below that `split_panels`
+        // drops it and the sidebar paints nothing at all.
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        for _ in 0..20 {
+            c.resize_focused(Left, 5, 100, 30);
+        }
+        assert_eq!(c.sidebars[0].size, 8);
+        assert_eq!(
+            c.panel_rects(100, 30).len(),
+            1,
+            "shrinking emptied the sidebar"
+        );
+    }
+
+    #[test]
+    fn a_size_never_grows_past_what_the_terminal_can_give() {
+        // `MIN_CONTENT_COLS` is 20, so at 100 columns the sidebar stops at 80.
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        for _ in 0..40 {
+            c.resize_focused(Right, 5, 100, 30);
+        }
+        assert_eq!(c.sidebars[0].size, 80);
+        assert!(
+            c.content_rect(100, 30).width >= 20,
+            "the content rect lost its minimum"
+        );
+        // And the stored value must not have run ahead of what was granted: a
+        // later, smaller terminal would silently force-hide the sidebar.
+        assert!(c.has_any_visible(100, 30));
+    }
+
+    #[test]
+    fn the_arithmetic_starts_from_the_granted_size_not_the_stored_one() {
+        // Stored 60 but only 40 granted at this width. One shrink must move the
+        // edge the user can actually see, not walk the stored number down to a
+        // value that changes nothing on screen.
+        let mut c = focused(SidebarEdge::Left, 60, &[1]);
+        assert_eq!(effective_sizes(&c.geoms(), 60, 30)[0], 40);
+        assert!(c.resize_focused(Left, 5, 60, 30));
+        assert_eq!(c.sidebars[0].size, 35);
+    }
+
+    #[test]
+    fn with_focus_on_the_content_nothing_is_consumed() {
+        // The regression gate: this is every client without a sidebar, and
+        // every client whose sidebar is not focused.
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        c.leave_sidebar();
+        assert!(!intercept_resize(&mut c, Right, 5, 100, 30));
+        assert_eq!(c.sidebars[0].size, 30);
+
+        let mut empty = Chrome::from_config(&[]);
+        assert!(!intercept_resize(&mut empty, Right, 5, 100, 30));
+    }
+
+    #[test]
+    fn a_clamped_resize_is_still_consumed() {
+        // Nothing inside a sidebar reaches the server -- a resize with nowhere
+        // to go is a swallowed no-op, never a leaked pane resize.
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        for _ in 0..20 {
+            c.resize_focused(Left, 5, 100, 30);
+        }
+        assert!(!c.resize_focused(Left, 5, 100, 30), "already at the floor");
+        assert!(
+            intercept_resize(&mut c, Left, 5, 100, 30),
+            "a clamped resize must still be consumed"
+        );
+    }
+
+    #[test]
+    fn focus_stranded_by_a_resize_is_released_rather_than_consumed() {
+        // A SIGWINCH between the prefix and the chord key can force-hide the
+        // sidebar while `chrome.focus` still names it. The command must reach
+        // the server, not vanish into a panel nobody can see.
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        assert!(!intercept_resize(&mut c, Right, 5, 20, 30));
+        assert_eq!(c.focus, ChromeFocus::Content);
     }
 }
