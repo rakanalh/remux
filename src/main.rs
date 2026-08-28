@@ -105,9 +105,9 @@ enum Commands {
 ///
 /// `env_logger` only ever sees what goes through the `log` crate, and every
 /// harness runs the server with its stderr on `/dev/null` -- so before this
-/// hook existed a panic left NO trace in `server.log`, and the ~15 harness
-/// assertions that grep that file for "panic" were searching a file the
-/// evidence could never reach. They passed on an empty search.
+/// hook existed a panic left NO trace in `server.log`. 53 of the 62 harnesses
+/// grep that file for "panic" (66 sites); every one was searching a file the
+/// evidence could never reach, and passed on an empty search.
 ///
 /// The message deliberately opens with the literal `panicked at`, because the
 /// harnesses split between grepping a case-sensitive `"panicked"` and a

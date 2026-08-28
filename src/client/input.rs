@@ -1831,7 +1831,7 @@ impl InputHandler {
     /// `InputAction` the main loop acts on.
     ///
     /// Every path that can name an action -- a keybinding leaf, an Alt
-    /// shortcut, the command palette -- funnels through here, so the nine
+    /// shortcut, the command palette -- funnels through here, so all sixteen
     /// client actions behave identically however they are reached.
     fn begin_client_action(&mut self, action: ClientAction) -> InputAction {
         match action {

@@ -241,28 +241,34 @@ fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool) -> Vec<(usize, 
     out
 }
 
-/// The content rect minus the status-bar row.
+/// The content rect minus the status-bar row -- the rect directional edge tests
+/// must run against, rather than the content rect itself.
 ///
-/// The server draws its status bar as the first or last row of the frame it
-/// composites (per `status_bar_position`), so directional edge tests must run
-/// against this rect, not against the content rect.
-pub fn pane_area(content: Rect, status_bar: &StatusBarPosition) -> Rect {
+/// **The bar is always the LAST row, whatever `status_bar_position` says.** The
+/// server composites it onto the final row of the frame unconditionally
+/// (`compositor.rs`, `draw_status_bar`); nothing in the compositor consults the
+/// option. `status_bar_position` is parsed and validated but not honoured, so
+/// `"top"` is inert.
+///
+/// This used to reserve the FIRST row under `Top`, on the assumption that the
+/// option worked. It does not, so that arm moved the pane area off the actual
+/// panes: with a sidebar configured, `"top"` made directional entry into it off
+/// by one. Reserving the last row unconditionally makes the setting harmlessly
+/// inert instead of quietly wrong.
+///
+/// `_status_bar` is kept in the signature deliberately: it is the seam to
+/// restore when the server learns to honour the option, and every caller
+/// already threads it. Re-branch on it only together with that server change,
+/// or this bug comes back.
+pub fn pane_area(content: Rect, _status_bar: &StatusBarPosition) -> Rect {
     if content.height == 0 {
         return content;
     }
-    match status_bar {
-        StatusBarPosition::Top => Rect {
-            x: content.x,
-            y: content.y + 1,
-            width: content.width,
-            height: content.height - 1,
-        },
-        StatusBarPosition::Bottom => Rect {
-            x: content.x,
-            y: content.y,
-            width: content.width,
-            height: content.height - 1,
-        },
+    Rect {
+        x: content.x,
+        y: content.y,
+        width: content.width,
+        height: content.height - 1,
     }
 }
 
@@ -574,23 +580,40 @@ mod tests {
         );
     }
 
+    /// `Top` is INERT, and that is the assertion -- not an oversight.
+    ///
+    /// This test previously pinned `y: 1, height: 33`, encoding the belief that
+    /// the server honours `status_bar_position`. It does not: the bar is always
+    /// composited on the last row, so reserving the first row pointed the pane
+    /// area one row off the real panes and made directional entry into a
+    /// configured sidebar off by one under `"top"`.
+    ///
+    /// Pinned as an EQUIVALENCE rather than as literal numbers, so that wiring
+    /// the server up to honour the option fails here loudly and deliberately,
+    /// instead of silently reintroducing the skew.
     #[test]
-    fn pane_area_excludes_the_status_bar_row_at_the_top() {
+    fn pane_area_ignores_status_bar_position_because_the_server_does() {
         let content = Rect {
             x: 30,
             y: 0,
             width: 70,
             height: 34,
         };
-        let pa = pane_area(content, &StatusBarPosition::Top);
+        let top = pane_area(content, &StatusBarPosition::Top);
+        let bottom = pane_area(content, &StatusBarPosition::Bottom);
         assert_eq!(
-            pa,
+            top, bottom,
+            "`top` must be inert while the server ignores it"
+        );
+        assert_eq!(
+            top,
             Rect {
                 x: 30,
-                y: 1,
+                y: 0,
                 width: 70,
                 height: 33
-            }
+            },
+            "the reserved row is the LAST one, where the server actually draws"
         );
     }
 

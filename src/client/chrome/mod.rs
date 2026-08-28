@@ -120,7 +120,11 @@ impl Chrome {
     }
 
     /// The content rect minus the status-bar row -- the rect directional edge
-    /// tests run against. Consumed by the navigation task (Task 7).
+    /// tests run against.
+    ///
+    /// The row dropped is always the LAST one: the server composites the status
+    /// bar there unconditionally and never reads `status_bar_position`. See
+    /// [`geometry::pane_area`] for why the argument is threaded anyway.
     pub fn pane_area(
         &self,
         term_cols: u16,
@@ -532,8 +536,12 @@ const BORDER_INSET: u16 = 1;
 /// consumed by the chrome and must NOT be forwarded to the server.
 ///
 /// Edge tests run against `pane_area` -- the content rect minus the status-bar
-/// row -- because `status_bar_position` is configurable, and using the content
-/// rect directly is off by one for whichever setting is not in use.
+/// row -- because using the content rect directly is off by one: the server
+/// spends its last row on the status bar, so the bottom-most pane never reaches
+/// the content rect's final row.
+///
+/// That row is always the last one. `status_bar_position` is NOT honoured by
+/// the server, so `Top` and `Bottom` produce an identical `pane_area`.
 ///
 /// Nothing inside a sidebar ever falls through to the server: a direction with
 /// nowhere to go is a swallowed no-op, never a leaked `PaneFocus*`.
@@ -1155,27 +1163,53 @@ mod focus_tests {
         ));
     }
 
+    /// Spec assertion 14, rewritten: the original encoded a model of
+    /// `status_bar_position` that turned out to be false.
+    ///
+    /// It asserted that under `Top` the pane area starts at y=1. The server
+    /// never honours the option -- it always draws the bar on the LAST row --
+    /// so that shifted the edge threshold one row down and a full-height pane
+    /// stopped registering as the bottom edge. The old test still passed,
+    /// because its pane (`y: 1, height: 24`) cleared BOTH thresholds; it could
+    /// not discriminate, which is why the bug survived it.
+    ///
+    /// Rebuilt around a pane that DOES discriminate: content is 25 rows, less
+    /// the status row leaves 24 usable (0..=23), so a bordered full-height pane
+    /// has interior `y: 1, height: 22`. Against the old `Top` threshold of 25
+    /// that is `1 + 22 + 1 = 24 >= 25` -> false, and entering the bottom sidebar
+    /// from a maximised pane would have silently failed under `"top"`.
     #[test]
-    fn the_bottom_edge_test_accounts_for_a_top_status_bar() {
-        // Spec assertion 14: with the status bar on top, pane_area starts at
-        // y=1, so a pane ending at the terminal's last row is still the bottom
-        // edge and must enter the bottom sidebar.
-        let mut c = chrome_with(SidebarEdge::Bottom, 5);
-        // Content is 25 tall; with a top status bar pane_area is y=1..25.
-        let pane = PaneRect {
+    fn the_bottom_edge_test_is_unaffected_by_status_bar_position() {
+        // A bordered full-height pane's interior, flush to the bottom edge.
+        let at_edge = PaneRect {
             x: 0,
             y: 1,
             width: 100,
-            height: 24,
+            height: 22,
         };
-        assert!(intercept_focus(
-            &mut c,
-            FocusDirection::Down,
-            Some(&pane),
-            100,
-            30,
-            &StatusBarPosition::Top
-        ));
+        for sb in [StatusBarPosition::Top, StatusBarPosition::Bottom] {
+            let mut c = chrome_with(SidebarEdge::Bottom, 5);
+            assert!(
+                intercept_focus(&mut c, FocusDirection::Down, Some(&at_edge), 100, 30, &sb),
+                "a full-height pane is at the bottom edge under {sb:?}"
+            );
+        }
+
+        // The discriminating negative: a short pane is NOT at the bottom edge,
+        // so the command must fall through to the server under either setting.
+        let mid = PaneRect {
+            x: 0,
+            y: 1,
+            width: 100,
+            height: 10,
+        };
+        for sb in [StatusBarPosition::Top, StatusBarPosition::Bottom] {
+            let mut c = chrome_with(SidebarEdge::Bottom, 5);
+            assert!(
+                !intercept_focus(&mut c, FocusDirection::Down, Some(&mid), 100, 30, &sb),
+                "a mid-screen pane must not be captured under {sb:?}"
+            );
+        }
     }
 
     #[test]

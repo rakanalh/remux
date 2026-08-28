@@ -78,9 +78,15 @@ def main():
     print(f"A({A}) fresh PaneContent on re-subscribe: {a_ok}")
     print(f"B({B}) fresh PaneContent on re-subscribe: {b_ok}")
 
-    if "panic" in srv.log().lower():
+    # Gate on it, do not merely print it: this line used to announce a panic
+    # and then exit 0 anyway, so a panicking server still passed the run.
+    panicked = "panic" in srv.log().lower()
+    if panicked:
         print("SERVER PANIC in log")
     srv.kill()
+    if panicked:
+        print("RESULT: the server panicked")
+        sys.exit(2)
     if a_ok and b_ok:
         print("RESULT: server emits fresh PaneContent for BOTH on re-subscribe "
               "=> issue1 server path already correct")

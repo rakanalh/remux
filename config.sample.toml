@@ -57,9 +57,10 @@
 
 # Where the status bar is placed: "top" | "bottom" (default: "bottom").
 #
-# KNOWN GAP: this option is parsed and validated but NOT honoured. The status
-# bar is composited by the server onto the frame's last row unconditionally, so
-# "top" behaves exactly like "bottom". Do not build on it until it is wired up.
+# KNOWN GAP: `status_bar_position` never moves the bar. The server composites it
+# onto the frame's last row unconditionally and no compositor code reads this
+# option, so setting "top" has no effect. Wire the server up before specifying
+# against it.
 # status_bar_position = "bottom"
 
 # Pane border rendering style: "zellij_style" (borders with pane names) |
