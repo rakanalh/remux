@@ -118,7 +118,7 @@ def main():
     # -- Now reach that pane THROUGH the relay, as a remote client would. --
     relay = Relay(srv.env)
     welcome = None
-    relay.send({"protocol_version": 5, "remux_version": "t"})
+    relay.send({"protocol_version": 6, "remux_version": "t"})
     welcome = relay.recv()
     print("relay handshake:", name_of(welcome))
 

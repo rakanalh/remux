@@ -83,7 +83,7 @@ def newconn():
     s.connect(SOCK)
     s.settimeout(1.0)
     buf = [b""]
-    send(s, {"protocol_version": 5, "remux_version": "t"})
+    send(s, {"protocol_version": 6, "remux_version": "t"})
     recv(s, buf)  # Welcome
     return s, buf
 

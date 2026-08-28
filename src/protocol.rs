@@ -36,7 +36,15 @@ pub enum ConnDescriptor {
 
 /// The wire protocol version. Bump when a breaking change is made to the
 /// framed message shapes exchanged between client and server.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// Went 4 -> 6, skipping 5, deliberately. Two lines of work each bumped 4 -> 5
+/// independently and with DIFFERENT message sets -- `ViewSetMaster` on master,
+/// `SubscribeSessionTree`/`UnsubscribeSessionTree` on the sidebar branch. Two
+/// peers both claiming 5 while speaking different wires would complete the
+/// `Hello`/`Welcome` handshake and only then disagree, which is precisely what
+/// this number exists to prevent. Merging the two therefore resolves to 6 so
+/// that no build of either lineage can be mistaken for the merged protocol.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
