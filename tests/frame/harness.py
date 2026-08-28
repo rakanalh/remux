@@ -6,7 +6,7 @@ server with isolated XDG dirs and a short socket path.
 import json, os, shutil, socket, struct, subprocess, time
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 
 class Server:
@@ -68,12 +68,21 @@ class Client:
         b = json.dumps(obj).encode()
         self.s.sendall(struct.pack(">I", len(b)) + b)
 
+    def _fill(self):
+        """Read one chunk; EOF raises rather than spinning forever (the server
+        drops the connection on an undecodable message, and a bare `recv` would
+        then return b"" in a tight loop instead of surfacing the close)."""
+        chunk = self.s.recv(65536)
+        if not chunk:
+            raise ConnectionError("server closed the connection")
+        self.buf += chunk
+
     def recv(self):
         while len(self.buf) < 4:
-            self.buf += self.s.recv(65536)
+            self._fill()
         n = struct.unpack(">I", self.buf[:4])[0]
         while len(self.buf) < 4 + n:
-            self.buf += self.s.recv(65536)
+            self._fill()
         body, self.buf = self.buf[4:4 + n], self.buf[4 + n:]
         return json.loads(body)
 

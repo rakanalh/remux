@@ -153,6 +153,19 @@ pub enum ClientMessage {
     SearchInfo { current: usize, total: usize },
     /// Request the full session tree (folders, sessions, tabs, panes).
     ListSessionTree,
+    /// Subscribe to unsolicited [`ServerMessage::SessionTree`] pushes whenever
+    /// the structure changes, instead of polling with `ListSessionTree`.
+    ///
+    /// Per-connection and independent of attachment, exactly like
+    /// [`ClientMessage::SubscribePane`]: a client that has no session in the
+    /// foreground still receives them. One `SessionTree` is sent immediately in
+    /// answer, so a subscriber's panel is populated at once rather than staying
+    /// blank until the next change. Dropped automatically when the connection
+    /// goes away.
+    SubscribeSessionTree,
+    /// Stop receiving [`ServerMessage::SessionTree`] pushes. A no-op for a
+    /// client that never subscribed.
+    UnsubscribeSessionTree,
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the
     /// server was started with `save_sessions = true` and
@@ -1369,6 +1382,37 @@ mod tests {
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         assert!(matches!(decoded, ClientMessage::ListSessionTree));
+    }
+
+    #[test]
+    fn round_trip_subscribe_session_tree() {
+        for msg in [
+            ClientMessage::SubscribeSessionTree,
+            ClientMessage::UnsubscribeSessionTree,
+        ] {
+            let encoded = encode_message(&msg).unwrap();
+            let len = decode_message_length(encoded[..4].try_into().unwrap());
+            let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+            match (&msg, &decoded) {
+                (ClientMessage::SubscribeSessionTree, ClientMessage::SubscribeSessionTree) => {}
+                (ClientMessage::UnsubscribeSessionTree, ClientMessage::UnsubscribeSessionTree) => {}
+                _ => panic!("round trip changed the variant: {decoded:?}"),
+            }
+        }
+    }
+
+    /// Both new variants are unit variants, so they ride the wire as bare
+    /// JSON strings -- the shape the frame harness sends.
+    #[test]
+    fn subscribe_session_tree_is_a_bare_string_on_the_wire() {
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::SubscribeSessionTree).unwrap(),
+            "\"SubscribeSessionTree\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::UnsubscribeSessionTree).unwrap(),
+            "\"UnsubscribeSessionTree\""
+        );
     }
 
     #[test]

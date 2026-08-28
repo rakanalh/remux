@@ -231,6 +231,16 @@ struct ClientConnection {
     /// start_y, end_x, end_y)` in the pane's content coordinates, replayed by
     /// the ticker task while a cell drag rests on a scrollable content edge.
     pane_autoscroll_repeat: Option<(PaneId, u16, u16, u16, u16)>,
+    /// Set by `SubscribeSessionTree`: this client receives an unsolicited
+    /// [`ServerMessage::SessionTree`] whenever the structure changes, instead
+    /// of polling with `ListSessionTree`.
+    ///
+    /// Per-connection and independent of attachment, exactly like
+    /// [`ClientConnection::subscribed_panes`]. Living here rather than in a
+    /// side table is what makes disconnect cleanup automatic: dropping the
+    /// `ClientConnection` in [`handle_client_disconnect`] drops the
+    /// subscription with it, so there is no second registry to leak.
+    session_tree_subscribed: bool,
 }
 
 /// The Remux server.
@@ -339,6 +349,27 @@ impl RemuxServer {
             .context("registering SIGTERM handler")?;
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("registering SIGINT handler")?;
+
+        // Session-tree push task. Sleeping a full interval after each broadcast
+        // is the coalescing: every change arriving during that sleep collapses
+        // into the single permit `Notify` holds, so a burst of structural
+        // commands costs subscribers one extra push rather than one per
+        // command. The first change after a quiet period goes out immediately
+        // (the task is parked on `notified()`, which consumes the permit at
+        // once), so the common case is not delayed. Idle costs nothing.
+        {
+            let state = Arc::clone(&server.state);
+            let panes = Arc::clone(&server.panes);
+            let clients = Arc::clone(&server.clients);
+            let dormant = Arc::clone(&server.dormant);
+            tokio::spawn(async move {
+                loop {
+                    SESSION_TREE_DIRTY.notified().await;
+                    broadcast_session_tree(&state, &panes, &clients, &dormant).await;
+                    tokio::time::sleep(SESSION_TREE_PUSH_INTERVAL).await;
+                }
+            });
+        }
 
         // Periodic tick that promotes quiet background `Activity` tabs to
         // `Silent` ("finished"). Runs in the real server binary, so
@@ -514,6 +545,7 @@ impl RemuxServer {
                     pane_selection: std::collections::HashMap::new(),
                     pane_drag: None,
                     pane_autoscroll_repeat: None,
+                    session_tree_subscribed: false,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -731,7 +763,7 @@ async fn handle_client_message(
 
     match msg {
         ClientMessage::Attach { session_name } => {
-            handle_attach(
+            let result = handle_attach(
                 client_id,
                 &session_name,
                 state,
@@ -741,10 +773,16 @@ async fn handle_client_message(
                 prev_frames,
                 dormant,
             )
-            .await
+            .await;
+            // The tree's `client_count` and `is_current` are derived from the
+            // client map, so attaching changes what every subscriber renders --
+            // not only what this client renders.
+            mark_session_tree_dirty();
+            result
         }
         ClientMessage::Detach => {
             handle_detach(client_id, clients).await;
+            mark_session_tree_dirty();
             // Detaching may make this client's active-tab panes no longer
             // session-visible; re-evaluate subscribed panes so any View cell on
             // them flips from the "Active in session" placeholder to live content.
@@ -798,16 +836,37 @@ async fn handle_client_message(
             )
             .await;
             save_if_enabled(state, panes, config, dormant).await;
+            mark_session_tree_dirty();
             result
         }
         ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
         ClientMessage::KillSession { name } => {
             let result = handle_kill_session(&name, state, panes, clients).await;
             save_if_enabled(state, panes, config, dormant).await;
+            mark_session_tree_dirty();
             result
         }
         ClientMessage::ListSessionTree => {
             handle_list_session_tree(client_id, state, panes, clients, dormant).await
+        }
+        ClientMessage::SubscribeSessionTree => {
+            {
+                let mut cls = clients.lock().await;
+                if let Some(conn) = cls.get_mut(&client_id) {
+                    conn.session_tree_subscribed = true;
+                }
+            }
+            // Answer at once, so a subscriber's panel is populated immediately
+            // rather than staying blank until the next structural change.
+            send_session_tree_to(&[client_id], state, panes, clients, dormant).await;
+            Ok(())
+        }
+        ClientMessage::UnsubscribeSessionTree => {
+            let mut cls = clients.lock().await;
+            if let Some(conn) = cls.get_mut(&client_id) {
+                conn.session_tree_subscribed = false;
+            }
+            Ok(())
         }
         ClientMessage::ResurrectSession { name } => {
             let result = handle_resurrect_session(
@@ -821,6 +880,7 @@ async fn handle_client_message(
             )
             .await;
             save_if_enabled(state, panes, config, dormant).await;
+            mark_session_tree_dirty();
             result
         }
         ClientMessage::RequestScrollback => {
@@ -2843,8 +2903,14 @@ async fn handle_command(
         }
     }
 
-    // Persist state after every command that may have changed structure.
+    // Persist state after every command that may have changed structure. The
+    // same hook feeds the session-tree push: a command that may have changed
+    // structure is exactly a command that may have changed what a subscriber's
+    // tree shows. Deliberately here rather than inside `save_if_enabled`, whose
+    // body is skipped entirely when `save_sessions = false` -- pushes must not
+    // depend on the persistence toggle.
     save_if_enabled(state, panes, config, dormant).await;
+    mark_session_tree_dirty();
 
     Ok(())
 }
@@ -2926,23 +2992,71 @@ async fn handle_list_sessions(
     Ok(())
 }
 
-async fn handle_list_session_tree(
-    client_id: u64,
+// ---------------------------------------------------------------------------
+// Session-tree push
+// ---------------------------------------------------------------------------
+
+/// Minimum spacing between two `SessionTree` broadcasts, so a burst of
+/// structural commands costs subscribers one extra push rather than one push
+/// per command.
+const SESSION_TREE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wakes the session-tree push task when something a subscriber's tree
+/// *displays* has changed.
+///
+/// A process-global signal rather than a handle threaded through the call
+/// graph, for two reasons:
+///
+/// 1. One of the change points is [`update_auto_pane_names`], reached from
+///    `broadcast_full_render` and `send_full_render_to_client` -- some fifty
+///    call sites that would each have to carry a handle they have no other use
+///    for.
+/// 2. More importantly it keeps [`mark_session_tree_dirty`] *synchronous*. The
+///    change points run while the `state`/`panes` guards are held; an async
+///    broadcast there would relock them on the same task and deadlock, whereas
+///    a bare `notify_one` cannot.
+///
+/// The coalescing falls out of `Notify`'s semantics: it stores at most one
+/// permit, so any number of changes arriving while the pusher is asleep wake it
+/// exactly once. The server is a singleton process, which is the scope a global
+/// is correct at here.
+static SESSION_TREE_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Record that the session tree has changed. Cheap and non-blocking; safe to
+/// call while holding any server lock. With no subscribers the pusher wakes,
+/// finds none, and parks again.
+fn mark_session_tree_dirty() {
+    SESSION_TREE_DIRTY.notify_one();
+}
+
+/// Build and send [`ServerMessage::SessionTree`] to each client in `targets`,
+/// skipping ids that are no longer connected.
+///
+/// The expensive inputs -- the dormant name list, per-session client counts and
+/// one `get_process_name` per live pane -- are snapshotted once and shared;
+/// only `build_session_tree` runs per recipient, because `is_current` is
+/// recipient-relative. Backpressure is a non-issue and deliberately so: `tx` is
+/// an unbounded channel, so the send cannot block the daemon on a slow client,
+/// and a send to a dead connection returns `Err`, which is discarded exactly as
+/// [`broadcast_view_list`] does.
+///
+/// Locks in the codebase's `dormant` -> `state` -> `clients` -> `panes` order.
+async fn send_session_tree_to(
+    targets: &[u64],
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     dormant: &DormantStore,
-) -> Result<()> {
+) {
+    if targets.is_empty() {
+        return;
+    }
+
     let dormant_names: Vec<String> = {
         let d = dormant.lock().await;
         let mut names: Vec<String> = d.state.sessions.keys().cloned().collect();
         names.sort();
         names
-    };
-
-    let current_session = {
-        let cls = clients.lock().await;
-        cls.get(&client_id).and_then(|c| c.session_name.clone())
     };
 
     let st = state.lock().await;
@@ -2976,16 +3090,55 @@ async fn handle_list_session_tree(
         }
     }
 
-    let (folders, unfiled) =
-        st.build_session_tree(current_session.as_deref(), &client_counts, &pane_names);
-
-    if let Some(client) = cls.get(&client_id) {
+    for &target in targets {
+        let Some(client) = cls.get(&target) else {
+            continue;
+        };
+        // `is_current` is per-recipient, so the tree is built per target from
+        // the one shared snapshot above.
+        let (folders, unfiled) =
+            st.build_session_tree(client.session_name.as_deref(), &client_counts, &pane_names);
         let _ = client.tx.send(ServerMessage::SessionTree {
             folders,
             unfiled,
-            dormant: dormant_names,
+            dormant: dormant_names.clone(),
         });
     }
+}
+
+/// Push the current tree to every `SubscribeSessionTree` subscriber.
+///
+/// Subscribers are read here, at fire time, rather than captured when the
+/// change was recorded: a client that unsubscribed (or disconnected) in the
+/// meantime is simply not in the list, so a coalesced push can never arrive
+/// after an `UnsubscribeSessionTree`.
+async fn broadcast_session_tree(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    dormant: &DormantStore,
+) {
+    let targets: Vec<u64> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| c.session_tree_subscribed)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    send_session_tree_to(&targets, state, panes, clients, dormant).await;
+}
+
+async fn handle_list_session_tree(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    dormant: &DormantStore,
+) -> Result<()> {
+    send_session_tree_to(&[client_id], state, panes, clients, dormant).await;
     Ok(())
 }
 
@@ -3034,6 +3187,10 @@ async fn handle_client_disconnect(
         let mut pf = prev_frames.lock().await;
         pf.remove(&client_id);
     }
+    // Removing the `ClientConnection` above dropped any session-tree
+    // subscription with it -- but it also changed the `client_count` every
+    // *remaining* subscriber displays, so the survivors need a push.
+    mark_session_tree_dirty();
 }
 
 async fn handle_request_scrollback(
@@ -5989,6 +6146,14 @@ async fn broadcast_full_render(
 
 /// Update display names for panes that don't have a custom name by
 /// reading the process name from `/proc/<pid>/comm`.
+/// Refresh the auto-detected (process-derived) name of every pane in the
+/// session's active tab.
+///
+/// Also marks the session tree dirty, but ONLY when a name actually changed.
+/// This runs on every render and every mouse event, so notifying
+/// unconditionally would be a push storm that the coalescing would merely hide;
+/// a process name changing (a shell becoming `vim`) is a real change to the
+/// pane labels a subscriber's tree displays, and is rare.
 async fn update_auto_pane_names(
     session_name: &str,
     state: &Arc<Mutex<ServerState>>,
@@ -6011,6 +6176,7 @@ async fn update_auto_pane_names(
     // Skip the pane being actively renamed -- its name is managed by the rename flow.
     let renaming_pane = sess.rename_state.as_ref().map(|(pid, _)| *pid);
 
+    let mut changed = false;
     for pane_id in pane_ids {
         if renaming_pane == Some(pane_id) {
             continue;
@@ -6021,9 +6187,18 @@ async fn update_auto_pane_names(
             // No custom name -- auto-detect from process.
             if let Some(pane_data) = ps.get(&pane_id) {
                 let name = get_process_name(pane_data.pty.child_pid.as_raw());
+                if layout::get_pane_name(&tab.layout, pane_id).as_deref() != Some(name.as_str()) {
+                    changed = true;
+                }
                 layout::set_pane_name(&mut tab.layout, pane_id, &name);
             }
         }
+    }
+
+    // Synchronous, so calling it under the `state`/`panes` guards still held
+    // here is safe -- an async broadcast would relock them and deadlock.
+    if changed {
+        mark_session_tree_dirty();
     }
 }
 
@@ -6830,6 +7005,9 @@ async fn start_pty_forwarding(
                         .await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
+                        // A pane dying on its own removes a row from every
+                        // subscriber's tree, and no command ran to say so.
+                        mark_session_tree_dirty();
                         break;
                     }
                     None => {
@@ -7098,6 +7276,9 @@ async fn materialize_session(
                         .await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
+                        // A pane dying on its own removes a row from every
+                        // subscriber's tree, and no command ran to say so.
+                        mark_session_tree_dirty();
                         break;
                     }
                     None => {

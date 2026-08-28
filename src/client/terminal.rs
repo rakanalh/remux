@@ -295,3 +295,60 @@ fn client_message_summary(msg: &ClientMessage) -> String {
         other => format!("{:?}", other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive [`handshake`] against a scripted peer that answers with `welcome`.
+    /// The client's Hello is read (and returned) so the test can also assert
+    /// what this binary announces.
+    async fn handshake_against(welcome: Welcome) -> (Hello, Result<String>) {
+        let (mut client_side, mut peer) = tokio::io::duplex(4096);
+        let peer_task = tokio::spawn(async move {
+            let hello: Hello = read_message(&mut peer)
+                .await
+                .unwrap()
+                .expect("client sent no Hello");
+            write_message(&mut peer, &welcome).await.unwrap();
+            hello
+        });
+        let (mut r, mut w) = tokio::io::split(&mut client_side);
+        let result = handshake(&mut r, &mut w).await;
+        (peer_task.await.unwrap(), result)
+    }
+
+    /// The client announces the current protocol version and accepts a peer
+    /// that speaks it, returning the peer's build stamp for skew display.
+    #[tokio::test]
+    async fn handshake_accepts_a_matching_protocol_version() {
+        let (hello, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            remux_version: "0.1.0+peer".to_string(),
+        })
+        .await;
+        assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(result.unwrap(), "0.1.0+peer");
+    }
+
+    /// Version skew is HARD-rejected here, on the client. The server is
+    /// deliberately lenient (it logs the mismatch and answers anyway), so this
+    /// bail is the whole enforcement -- a `PROTOCOL_VERSION` bump only keeps
+    /// old peers out because of it. The frozen `Hello`/`Welcome` shape is what
+    /// lets the rejection be a clean error rather than a decode failure.
+    #[tokio::test]
+    async fn handshake_rejects_an_older_protocol_version() {
+        let (_, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION - 1,
+            remux_version: "0.1.0+old".to_string(),
+        })
+        .await;
+        let err = result
+            .expect_err("a skewed peer must be rejected")
+            .to_string();
+        assert!(
+            err.contains("incompatible remux") && err.contains("0.1.0+old"),
+            "the rejection must name the peer it refused: {err}"
+        );
+    }
+}

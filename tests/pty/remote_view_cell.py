@@ -161,7 +161,7 @@ def seed_remote_pane():
     """Create a session on the 'remote' server, print the marker in its pane,
     then detach so the pane is NOT session-visible."""
     w = Wire(SOCK2)
-    w.send({"protocol_version": 4, "remux_version": "t"})
+    w.send({"protocol_version": 5, "remux_version": "t"})
     w.recv()
     w.send({"CreateSession": {"name": "rbox", "folder": None}})
     w.send({"Attach": {"session_name": "rbox"}})
