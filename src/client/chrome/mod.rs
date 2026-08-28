@@ -385,14 +385,26 @@ impl Chrome {
             let before = self.laid_out_panels(term_cols, term_rows);
             self.sidebars[i].size = want;
             let granted = effective_sizes(&self.geoms(), term_cols, term_rows)[i];
-            // The layout could not give what was asked. Refuse rather than
-            // store the clamped value: at a terminal too narrow to honour the
-            // press, nothing moves on screen, and rewriting the stored size
-            // would silently discard a width the user chose at a bigger one.
-            if granted != want {
+            // Refuse only when the press moves NOTHING. Rewriting the stored
+            // size to a value the layout merely clamped would silently discard
+            // a width the user chose at a bigger terminal, with nothing moving
+            // on screen to explain it.
+            //
+            // The test is against `current`, not `want`: a partial grant is a
+            // real move. Asking for 83 against a ceiling of 80 from a current
+            // 78 gives 80, and refusing that because it is not 83 would wedge
+            // the sidebar at 78 forever -- `current` is re-read from
+            // `effective_sizes` every press, so the same refusal repeats. That
+            // trap opens wherever the distance to the ceiling is not a whole
+            // number of steps.
+            if granted == current {
                 self.sidebars[i].size = old;
                 return false;
             }
+            // Store what was GRANTED, not what was asked: a partial grant must
+            // not leave an unreachable number in the config's place, and the
+            // vanish check below has to run against the size actually in force.
+            self.sidebars[i].size = granted;
             // A size change is not local. `effective_sizes` shares one column
             // budget between the verticals in declaration order, so growing
             // this sidebar eats the NEXT one's -- and a vertical's growth also
@@ -1521,6 +1533,24 @@ mod resize_tests {
             bars(&c).contains(&1),
             "shrinking did not bring the right sidebar back"
         );
+    }
+
+    #[test]
+    fn a_grow_takes_a_partial_grant_rather_than_stalling() {
+        // 100 columns, ceiling 80, stored 78: the step of 5 does not divide the
+        // 2 columns left, so the press asks for 83 and the layout gives 80.
+        // That is a real move and must be taken -- refusing it wedges the
+        // sidebar at 78 for good, since every later press asks the same
+        // question and gets the same answer.
+        let mut c = focused(SidebarEdge::Left, 78, &[1]);
+        assert!(
+            c.resize_focused(Right, 5, 100, 30),
+            "the partial grant was refused"
+        );
+        assert_eq!(c.sidebars[0].size, 80);
+        // And THEN it is genuinely stuck, which is the no-op case.
+        assert!(!c.resize_focused(Right, 5, 100, 30));
+        assert_eq!(c.sidebars[0].size, 80);
     }
 
     #[test]
