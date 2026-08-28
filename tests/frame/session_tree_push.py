@@ -122,6 +122,16 @@ def run(srv):
             1 <= len(burst) < 5,
             f"5 structural commands coalesce to fewer pushes: got {len(burst)}",
         )
+        # Coalescing must not swallow the END of a burst: a leading-edge-only
+        # gate would push the state after the FIRST command and drop the rest,
+        # which is the state that actually matters. The last push must show all
+        # five new tabs (the session started with one).
+        if burst:
+            actor = [
+                e for e in burst[-1]["SessionTree"]["unfiled"] if e["name"] == "actor"
+            ]
+            tabs = len(actor[0]["tabs"]) if actor else -1
+            check(tabs == 6, f"the trailing push carries the burst's final state: {tabs} tabs, want 6")
 
         # --- 3b. mere rendering is not a structural change ---------------------
         # `update_auto_pane_names` runs on every render and every mouse event.
