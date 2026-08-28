@@ -87,19 +87,25 @@ class Client:
         return json.loads(body)
 
     def drain(self, t=0.6):
-        """Collect all messages arriving within t seconds."""
+        """Collect all messages arriving within t seconds.
+
+        A closed connection is RAISED, not swallowed. Returning `[]` for it
+        would make every "no messages arrived" assertion pass unconditionally
+        once the server dropped the peer -- a zero-count check that cannot tell
+        "nothing was sent" from "there is nobody to send to" is not a check.
+        """
         out = []
         end = time.time() + t
         old = self.s.gettimeout()
-        while time.time() < end:
-            self.s.settimeout(0.1)
-            try:
-                out.append(self.recv())
-            except socket.timeout:
-                pass
-            except Exception:
-                break
-        self.s.settimeout(old)
+        try:
+            while time.time() < end:
+                self.s.settimeout(0.1)
+                try:
+                    out.append(self.recv())
+                except socket.timeout:
+                    pass
+        finally:
+            self.s.settimeout(old)
         return out
 
     def hello(self):

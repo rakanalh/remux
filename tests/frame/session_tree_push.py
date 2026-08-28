@@ -148,6 +148,97 @@ def run(srv):
         idle = trees(c1.drain(0.6))
         check(len(idle) == 0, f"repainting alone pushes nothing: got {len(idle)}")
 
+        # --- 3bb. click-to-focus is a tree change ------------------------------
+        # `PaneTreeEntry.is_focused` is in the payload, so a mouse focus change
+        # must push exactly as a keyboard one does. Under polling this staleness
+        # was invisible; under push it is precisely what the feature promises.
+        def split_tab(msg):
+            """The `actor` tab holding two panes, as {pane_id: is_focused}."""
+            for e in msg["SessionTree"]["unfiled"]:
+                if e["name"] != "actor":
+                    continue
+                for t in e["tabs"]:
+                    if len(t["panes"]) == 2:
+                        return {p["id"]: p["is_focused"] for p in t["panes"]}
+            return None
+
+        c2.send({"Command": "PaneSplitVertical"})
+        before = wait_for_tree(c1, 1.5)
+        panes_before = split_tab(before) if before else None
+        check(panes_before is not None, "a vertical split shows two panes in the pushed tree")
+        if panes_before:
+            focused = [pid for pid, f in panes_before.items() if f]
+            unfocused = [pid for pid, f in panes_before.items() if not f]
+            # Click deep inside the left half; whichever pane lives there, the
+            # assertion below only cares that focus MOVED and was pushed.
+            c1.drain(0.4)
+            c2.send({"MouseClick": {"x": 5, "y": 5, "pane_id": None, "release": False}})
+            after = wait_for_tree(c1, 1.5)
+            panes_after = split_tab(after) if after else None
+            moved = (
+                panes_after is not None
+                and panes_before is not None
+                and panes_after != panes_before
+            )
+            check(
+                moved,
+                f"click-to-focus pushes the new is_focused: {panes_before} -> {panes_after}",
+            )
+            # Guard the guard: if the click had landed on the already-focused
+            # pane there would be nothing to detect, and the check above would
+            # be vacuous rather than passing.
+            check(
+                bool(focused) and bool(unfocused),
+                "the split really did leave one pane focused and one not",
+            )
+
+        # --- 3c. a REAL process-name change does push --------------------------
+        # The mirror of 3b, and the half that would rot silently: if
+        # `get_pane_name`'s semantics ever drift, the gate goes permanently
+        # false and pane-label pushes stop, with every other check still green.
+        # `get_process_name` reads the pane's own /proc/<pid>/comm, so a plain
+        # `sleep` (a child) would not change it -- `exec` replaces the shell's
+        # process image in place, which does.
+        c1.drain(0.4)
+        c2.send({"Input": {"data": list(b"exec sleep 60\n")}})
+        time.sleep(0.5)
+        # Force a render WITHOUT a structural command: `Resize` re-runs
+        # `update_auto_pane_names` but never marks the tree dirty itself, so the
+        # push below can only come from the name gate.
+        c2.send({"Resize": {"cols": 96, "rows": 30}})
+        named = wait_for_tree(c1, 1.5)
+        pane_names = []
+        if named is not None:
+            for e in named["SessionTree"]["unfiled"]:
+                if e["name"] == "actor":
+                    for t in e["tabs"]:
+                        pane_names += [p["name"] for p in t["panes"]]
+        check(
+            named is not None and "sleep" in pane_names,
+            f"a real process-name change pushes, naming the new process: {pane_names}",
+        )
+
+        # --- 3d/3e. attach and detach change the tree --------------------------
+        # `client_count` and `is_current` are rendered from the client map, so
+        # attaching/detaching changes what EVERY subscriber sees.
+        def actor_count(msgs):
+            for m in reversed(msgs):
+                for e in m["SessionTree"]["unfiled"]:
+                    if e["name"] == "actor":
+                        return e["client_count"]
+            return None
+
+        c1.drain(0.4)
+        c2.send("Detach")
+        detached = actor_count(trees(c1.drain(0.8)))
+        check(detached == 0, f"Detach pushes an updated client_count: got {detached}, want 0")
+
+        c1.drain(0.4)
+        c2.send({"Attach": {"session_name": "actor"}})
+        c2.send({"Resize": {"cols": 100, "rows": 30}})
+        attached = actor_count(trees(c1.drain(0.8)))
+        check(attached == 1, f"Attach pushes an updated client_count: got {attached}, want 1")
+
         # --- 4. unsubscribe stops the pushes ----------------------------------
         c1.send("UnsubscribeSessionTree")
         c1.drain(0.4)  # let any push scheduled before the unsubscribe land

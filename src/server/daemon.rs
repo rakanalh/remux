@@ -998,19 +998,25 @@ async fn handle_client_message(
             Ok(())
         }
         ClientMessage::RequestScrollbackInfo => {
-            let (session_name, focused_pane_id) = {
+            // Take `clients` and RELEASE it before touching `state`. Holding it
+            // across the `state` lock would be a `clients -> state` order, and
+            // every other path here -- `handle_list_sessions`, `handle_attach`,
+            // `send_session_tree_to` -- takes `state -> clients`. Two tasks on
+            // the two orders deadlock the whole daemon, and the session-tree
+            // pusher now runs `state -> clients` on a background task whenever
+            // anyone is subscribed, which a sidebar does permanently.
+            let session_name = {
                 let cls = clients.lock().await;
-                let session_name = cls.get(&client_id).and_then(|c| c.session_name.clone());
-                if let Some(ref sn) = session_name {
+                cls.get(&client_id).and_then(|c| c.session_name.clone())
+            };
+            let focused_pane_id = match session_name {
+                Some(ref sn) => {
                     let st = state.lock().await;
-                    let fp = st
-                        .sessions
+                    st.sessions
                         .get(sn)
-                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane));
-                    (session_name, fp)
-                } else {
-                    (None, None)
+                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
                 }
+                None => None,
             };
             if let (Some(_sn), Some(fp)) = (session_name, focused_pane_id) {
                 let total_lines = {
@@ -3109,9 +3115,13 @@ async fn send_session_tree_to(
 /// Push the current tree to every `SubscribeSessionTree` subscriber.
 ///
 /// Subscribers are read here, at fire time, rather than captured when the
-/// change was recorded: a client that unsubscribed (or disconnected) in the
-/// meantime is simply not in the list, so a coalesced push can never arrive
-/// after an `UnsubscribeSessionTree`.
+/// change was recorded, so a client that unsubscribed during the coalescing
+/// window is simply not in the list. That narrows the race but does not close
+/// it: an `UnsubscribeSessionTree` landing between this collect and the send
+/// inside [`send_session_tree_to`] still gets one last `SessionTree`. Harmless
+/// -- a stale tree is the same payload the client asked for a moment ago -- but
+/// a client must tolerate one trailing push rather than treat it as a protocol
+/// violation.
 async fn broadcast_session_tree(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
@@ -4085,6 +4095,9 @@ async fn handle_mouse_click(
             if tab.focused_pane != pane_id {
                 tab.focus_pane(pane_id);
                 drop(st);
+                // `PaneTreeEntry::is_focused` is in the pushed payload, so
+                // click-to-focus is a tree change exactly as keyboard focus is.
+                mark_session_tree_dirty();
                 broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
                     .await;
             }
@@ -4111,6 +4124,9 @@ async fn handle_mouse_click(
             activate_pane_in_stack(&mut tab.layout, pane_id);
             tab.focus_pane(pane_id);
             drop(st);
+            // Changes both the stack's active pane and `is_focused`; both are
+            // in the pushed payload.
+            mark_session_tree_dirty();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         ClickTarget::None => {}
