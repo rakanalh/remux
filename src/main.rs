@@ -1126,6 +1126,7 @@ async fn send_to_focused_cell(
 /// - `Resize{Left,Right,Up,Down}` -> `ViewResizeCell { dir, amount }`.
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
 /// - `PaneToggleZoom` -> `ViewToggleZoom`.
+/// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
 /// - `ToggleStyle` -> repaint the view's cells in the (already flipped, see
@@ -1293,6 +1294,20 @@ async fn handle_view_command(
                     ClientMessage::ViewToggleZoom { id: view_id },
                 )
                 .await?;
+            }
+            repaint!();
+            Ok(true)
+        }
+        RemuxCommand::SetMaster => {
+            // Both halves of the tab behaviour, server-side: switch the view to
+            // the Master layout AND promote the focused cell into the master
+            // slot. Sent to the LOCAL server, which owns the shared-view
+            // registry even when the cells alias remote panes; the authoritative
+            // repaint arrives with the resulting `ViewList`.
+            hide_whichkey!();
+            if !views[av].cells.is_empty() {
+                mgr.send(&ConnId::Local, ClientMessage::ViewSetMaster { id: view_id })
+                    .await?;
             }
             repaint!();
             Ok(true)

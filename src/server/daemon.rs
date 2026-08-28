@@ -1235,6 +1235,14 @@ async fn handle_client_message(
             broadcast_view_list(state, clients).await;
             Ok(())
         }
+        ClientMessage::ViewSetMaster { id } => {
+            {
+                let mut st = state.lock().await;
+                st.view_set_master(id);
+            }
+            broadcast_view_list(state, clients).await;
+            Ok(())
+        }
         ClientMessage::ViewResizeCell {
             id,
             cell_id,

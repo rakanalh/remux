@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::layout::{
     self, find_neighbor, relocate_pane_to_edge, swap_panes, Direction, FocusDirection, GridLayout,
-    LayoutMode, LayoutNode, PaneId, Rect,
+    LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::config::BorderStyle;
 use crate::protocol::{
@@ -627,6 +627,32 @@ impl ServerState {
     pub fn view_toggle_zoom(&mut self, id: ViewId) {
         if let Some(v) = self.find_view_mut(id) {
             v.zoomed = !v.zoomed;
+        }
+    }
+
+    /// Switch view `id` to the Master layout and promote its focused cell into
+    /// the master slot. Mirrors `RemuxCommand::SetMaster` on a real tab: the
+    /// promotion rebuilds the arrangement, so any manual tree is dropped (a view
+    /// has no `saved_custom_layout` slot, exactly as `view_cycle_layout` drops
+    /// it) and the zoom is released. An existing Master layout is mutated in
+    /// place so the user's `master_ratio` survives. Fail-silent on an unknown or
+    /// empty view.
+    pub fn view_set_master(&mut self, id: ViewId) {
+        let v = match self.find_view_mut(id) {
+            Some(v) => v,
+            None => return,
+        };
+        if v.cells.is_empty() {
+            return;
+        }
+        let focused = v.focused_id();
+        v.custom_tree = None;
+        v.zoomed = false;
+        if !matches!(v.layout, LayoutMode::Master(_)) {
+            v.layout = LayoutMode::Master(MasterLayout::default());
+        }
+        if let LayoutMode::Master(ref mut master) = v.layout {
+            master.master_pane = Some(focused);
         }
     }
 
@@ -1565,6 +1591,60 @@ mod tests {
         assert!(st.views[0].zoomed);
         st.view_toggle_zoom(id);
         assert!(!st.views[0].zoomed);
+    }
+
+    #[test]
+    fn view_set_master_promotes_focused_cell() {
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into());
+        st.view_add_cells(
+            id,
+            vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
+        );
+        let c1 = st.views[0].cells[1].id;
+        st.view_set_focus(id, c1);
+        // A manual arrangement and a zoom are both live before the promotion.
+        {
+            let v = st.find_view_mut(id).unwrap();
+            v.custom_tree = Some(v.auto_tree());
+            v.zoomed = true;
+        }
+        assert_eq!(st.views[0].layout_name(), "custom");
+
+        st.view_set_master(id);
+
+        assert_eq!(st.views[0].layout_name(), "master");
+        assert!(
+            st.views[0].custom_tree.is_none(),
+            "promoting a master rebuilds the arrangement"
+        );
+        assert!(!st.views[0].zoomed, "promoting a master releases the zoom");
+        match st.views[0].layout {
+            LayoutMode::Master(ref m) => assert_eq!(m.master_pane, Some(c1)),
+            ref other => panic!("expected Master, got {other:?}"),
+        }
+
+        // Re-promoting inside Master keeps the user's ratio and re-points the
+        // master slot at the newly focused cell.
+        if let LayoutMode::Master(ref mut m) = st.find_view_mut(id).unwrap().layout {
+            m.master_ratio = 0.25;
+        }
+        let c0 = st.views[0].cells[0].id;
+        st.view_set_focus(id, c0);
+        st.view_set_master(id);
+        match st.views[0].layout {
+            LayoutMode::Master(ref m) => {
+                assert_eq!(m.master_pane, Some(c0));
+                assert_eq!(m.master_ratio, 0.25, "an existing Master keeps its ratio");
+            }
+            ref other => panic!("expected Master, got {other:?}"),
+        }
+
+        // Unknown view / empty view are fail-silent.
+        st.view_set_master(999);
+        let empty = st.view_create("E".into());
+        st.view_set_master(empty);
+        assert_eq!(st.views[1].layout_name(), "grid");
     }
 
     #[test]

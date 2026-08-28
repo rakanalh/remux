@@ -36,7 +36,7 @@ pub enum ConnDescriptor {
 
 /// The wire protocol version. Bump when a breaking change is made to the
 /// framed message shapes exchanged between client and server.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -244,6 +244,11 @@ pub enum ClientMessage {
     ViewCycleLayout { id: ViewId },
     /// Toggle focus-cell zoom for view `id`.
     ViewToggleZoom { id: ViewId },
+    /// Switch view `id` to the Master layout and promote its focused cell into
+    /// the master slot (dropping any custom tree). The view's own `focused` is
+    /// authoritative -- focus is server-owned and set by `ViewSetFocus` -- so no
+    /// cell id travels, mirroring `ViewToggleZoom`.
+    ViewSetMaster { id: ViewId },
     /// Resize the cell `cell_id` in view `id` by `amount` percent toward `dir`.
     ViewResizeCell {
         id: ViewId,
@@ -1484,6 +1489,7 @@ mod tests {
             ClientMessage::ViewSetFocus { id: 7, cell_id: 2 },
             ClientMessage::ViewCycleLayout { id: 7 },
             ClientMessage::ViewToggleZoom { id: 7 },
+            ClientMessage::ViewSetMaster { id: 7 },
             ClientMessage::ViewResizeCell {
                 id: 7,
                 cell_id: 2,
