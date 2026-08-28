@@ -3369,7 +3369,7 @@ async fn run_client_loop(
                                     }
                                     SessionManagerAction::Close => {
                                         let has_sessions = input.session_manager.as_ref()
-                                            .map(|sm| sm.rows.iter().any(|r| matches!(r.node_type, NodeType::Session { .. })))
+                                            .map(|sm| sm.model.rows.iter().any(|r| matches!(r.node_type, NodeType::Session { .. })))
                                             .unwrap_or(false);
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;

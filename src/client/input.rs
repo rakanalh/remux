@@ -4971,13 +4971,14 @@ mod tests {
         ]);
         // Select the connected remote server node.
         let idx = sm
+            .model
             .rows
             .iter()
             .position(
                 |r| matches!(&r.node_type, NodeType::Server { id, .. } if *id == remote("mini")),
             )
             .unwrap();
-        sm.selected = idx;
+        sm.model.selected = idx;
         // The overlay opens with the search bar focused; this test drives the
         // tree, so hand focus over first (as Tab/Down/Enter would).
         sm.focus_tree();
@@ -5045,23 +5046,25 @@ mod tests {
         sm.update_tree(remote("pi"), folders, Vec::new(), Vec::new());
         // Expand the remote server node so its session/tab rows appear.
         let sidx = sm
+            .model
             .rows
             .iter()
             .position(
                 |r| matches!(&r.node_type, NodeType::Server { id, .. } if *id == remote("pi")),
             )
             .unwrap();
-        sm.selected = sidx;
+        sm.model.selected = sidx;
         sm.expand_selected();
         // Select the remote tab row.
         let tidx = sm
+            .model
             .rows
             .iter()
             .position(
                 |r| matches!(&r.node_type, NodeType::Tab { server, .. } if *server == remote("pi")),
             )
             .unwrap();
-        sm.selected = tidx;
+        sm.model.selected = tidx;
         sm.focus_tree();
         handler.session_manager = Some(sm);
 
@@ -5139,7 +5142,7 @@ mod tests {
             assert!(matches!(a, InputAction::SessionManagerUpdate));
         }
         let sm = handler.session_manager.as_ref().unwrap();
-        assert_eq!(sm.query, "qd");
+        assert_eq!(sm.model.query, "qd");
         assert!(matches!(
             sm.sub_mode,
             crate::client::session_manager::SubMode::Navigate
@@ -5147,12 +5150,12 @@ mod tests {
 
         // Ctrl-U clears; Backspace pops.
         let _ = handler.handle_session_manager_key(ctrl_key('u'));
-        assert_eq!(handler.session_manager.as_ref().unwrap().query, "");
+        assert_eq!(handler.session_manager.as_ref().unwrap().model.query, "");
         let _ = handler.handle_session_manager_key(char_key('a'));
         let _ = handler.handle_session_manager_key(char_key('b'));
         let _ =
             handler.handle_session_manager_key(make_key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(handler.session_manager.as_ref().unwrap().query, "a");
+        assert_eq!(handler.session_manager.as_ref().unwrap().model.query, "a");
     }
 
     #[test]
@@ -5162,13 +5165,13 @@ mod tests {
         let sm = handler.session_manager.as_ref().unwrap();
         assert!(!sm.search_focused);
         // Focus moved without also moving the selection.
-        assert_eq!(sm.selected, 0);
+        assert_eq!(sm.model.selected, 0);
 
         // `j` now navigates instead of typing.
         let _ = handler.handle_session_manager_key(char_key('j'));
         let sm = handler.session_manager.as_ref().unwrap();
-        assert_eq!(sm.selected, 1);
-        assert!(sm.query.is_empty());
+        assert_eq!(sm.model.selected, 1);
+        assert!(sm.model.query.is_empty());
     }
 
     #[test]
@@ -5194,7 +5197,10 @@ mod tests {
             "expected the delete confirm for the filtered session, got {:?}",
             sm.sub_mode
         );
-        assert_eq!(sm.query, "alpha", "the query must survive the sub-mode");
+        assert_eq!(
+            sm.model.query, "alpha",
+            "the query must survive the sub-mode"
+        );
     }
 
     #[test]
@@ -5214,7 +5220,7 @@ mod tests {
         assert!(sm.search_focused);
         assert_eq!(sm.pending_chord(), None);
         assert!(
-            sm.query.is_empty(),
+            sm.model.query.is_empty(),
             "`/` must not type itself into the query"
         );
     }
