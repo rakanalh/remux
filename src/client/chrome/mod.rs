@@ -56,9 +56,25 @@ impl Chrome {
     /// Build from config. An unknown plugin name logs a warning and is skipped
     /// so a config written for a later phase still loads; a sidebar left with
     /// no panels is dropped.
+    ///
+    /// **At most one sidebar per edge.** A second entry on an edge already
+    /// claimed is warned about and dropped. `panel_rects` would happily stack
+    /// them, but nothing else can address the inner one: `sidebar_on`,
+    /// `toggle_edge` and `focus_edge` all resolve an edge to its FIRST match, so
+    /// `SidebarToggleLeft` could never reach it and `Alt+h` would jump straight
+    /// over it into the outer one. Silently accepting config that produces an
+    /// unreachable sidebar is worse than refusing it.
     pub fn from_config(cfg: &[SidebarConfig]) -> Self {
-        let mut sidebars = Vec::new();
+        let mut sidebars: Vec<Sidebar> = Vec::new();
         for sc in cfg {
+            if sidebars.iter().any(|s: &Sidebar| s.edge == sc.edge) {
+                log::warn!(
+                    "sidebar: a sidebar is already configured on the {:?} edge; \
+                     dropping the extra one (only one sidebar per edge is addressable)",
+                    sc.edge
+                );
+                continue;
+            }
             let mut panels = Vec::new();
             for pc in &sc.panel {
                 match make_plugin(&pc.plugin) {

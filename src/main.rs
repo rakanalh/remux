@@ -755,10 +755,26 @@ fn resize_of(cmd: &RemuxCommand) -> Option<(crate::server::layout::FocusDirectio
 async fn handle_chrome_resize(
     cmd: &RemuxCommand,
     chrome: &mut crate::client::chrome::Chrome,
+    active_view: Option<usize>,
     mgr: &mut ConnectionManager,
     renderer: &mut Renderer,
     compositor_theme: &crate::config::theme::CompositorTheme,
 ) -> Result<bool> {
+    // The unasserted invariant this function's safety rests on. It neither
+    // re-subscribes view cells nor consults the view's geometry, so if a panel
+    // could hold focus while a view is live, a sidebar resize would move the
+    // content rect out from under that view without re-subscribing its cells.
+    // Three call sites depend on this and none of them check it, so assert it
+    // where the damage would happen -- a future view-entry path that forgets
+    // `chrome.leave_sidebar()` should trip here in debug, not corrupt a view.
+    debug_assert!(
+        !(matches!(
+            chrome.focus,
+            crate::client::chrome::ChromeFocus::Sidebar { .. }
+        ) && active_view.is_some()),
+        "panel focus while a view is live: a sidebar resize would move the \
+         content rect under the view without re-subscribing its cells"
+    );
     let Some((dir, amount)) = resize_of(cmd) else {
         return Ok(false);
     };
@@ -2056,6 +2072,21 @@ async fn run_client_loop(
                         // Panels are laid out against the front buffer, so the
                         // sizes come from `Renderer::size` -- see `panel_at` for
                         // the SIGWINCH window a fresh `terminal::size()` reopens.
+                        // The other half of the `handle_chrome_resize`
+                        // invariant: panel focus and a live view must never
+                        // coexist. Asserted on the gate itself, so a new
+                        // view-entry path that forgets `leave_sidebar()` trips
+                        // here in debug rather than silently stranding the
+                        // keyboard in a panel no key can reach.
+                        debug_assert!(
+                            !(matches!(
+                                chrome.focus,
+                                crate::client::chrome::ChromeFocus::Sidebar { .. }
+                            ) && active_view.is_some()),
+                            "panel focus survived into a live view: the sidebar key gate \
+                             requires `active_view.is_none()`, so the panel would hold \
+                             focus that no keystroke can reach"
+                        );
                         if active_view.is_none() && input.mode == Mode::Normal && !input.has_overlay() {
                             let (tc, tr) = renderer.size();
                             match chrome.focused_panel(tc, tr) {
@@ -2261,6 +2292,7 @@ async fn run_client_loop(
                                 if handle_chrome_resize(
                                     &cmd,
                                     &mut chrome,
+                                    active_view,
                                     mgr,
                                     &mut renderer,
                                     &compositor_theme,
@@ -2375,6 +2407,7 @@ async fn run_client_loop(
                                     if handle_chrome_resize(
                                         &cmd,
                                         &mut chrome,
+                                        active_view,
                                         mgr,
                                         &mut renderer,
                                         &compositor_theme,
@@ -2414,6 +2447,32 @@ async fn run_client_loop(
                             }
                             InputAction::ModeChanged(mode) => {
                                 log::debug!("input: ModeChanged to {:?}", mode);
+                                // A panel keeps the keyboard only in Normal
+                                // mode: the sidebar key gate is
+                                // `active_view.is_none() && mode == Normal`.
+                                // Leaving Normal (a chord into Visual/Search,
+                                // the palette, the session manager) therefore
+                                // routes every key to the server while
+                                // `chrome.focus` still names a panel -- which
+                                // kept painting a focused header for a panel
+                                // that no longer had the keyboard. Drop the
+                                // focus so the invariant holds in every mode,
+                                // not just the one it was written for.
+                                // `leave_sidebar` mirrors `focused_panel`
+                                // first, so returning re-enters the same panel.
+                                if mode != Mode::Normal
+                                    && matches!(
+                                        chrome.focus,
+                                        crate::client::chrome::ChromeFocus::Sidebar { .. }
+                                    )
+                                {
+                                    log::debug!(
+                                        "sidebar: releasing panel focus on mode change to {mode:?}"
+                                    );
+                                    chrome.leave_sidebar();
+                                    let (tc, tr) = renderer.size();
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                }
                                 let mode_str = match mode {
                                     Mode::Normal => "NORMAL",
                                     Mode::Command => "COMMAND",
@@ -2717,6 +2776,7 @@ async fn run_client_loop(
                                     consumed = handle_chrome_resize(
                                         &command,
                                         &mut chrome,
+                                        active_view,
                                         mgr,
                                         &mut renderer,
                                         &compositor_theme,

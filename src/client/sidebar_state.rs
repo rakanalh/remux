@@ -349,8 +349,17 @@ mod tests {
         assert_ne!(t, PathBuf::from("/x/sidebar.json"));
     }
 
+    /// A duplicate edge is dropped at config time, and a `sidebar.json` written
+    /// before that rule existed must not resurrect it.
+    ///
+    /// This test used to assert the opposite -- that two left sidebars were
+    /// matched positionally. `panel_rects` does stack them, but nothing can
+    /// ADDRESS the inner one: `sidebar_on` / `toggle_edge` / `focus_edge` all
+    /// resolve an edge to its first match. So the config now keeps one per edge,
+    /// and the surplus saved entry is ignored rather than applied to a sidebar
+    /// on some other edge.
     #[test]
-    fn two_sidebars_on_one_edge_are_matched_positionally() {
+    fn a_duplicate_edge_is_dropped_and_its_saved_state_ignored() {
         let cfg = SidebarConfig {
             edge: SidebarEdge::Left,
             size: 30,
@@ -361,6 +370,13 @@ mod tests {
             }],
         };
         let mut c = Chrome::from_config(&[cfg.clone(), cfg]);
+        assert_eq!(
+            c.sidebars.len(),
+            1,
+            "the second left sidebar must be dropped"
+        );
+
+        // State written when duplicates were allowed: two left bars.
         apply(
             &mut c,
             &SidebarState {
@@ -380,11 +396,11 @@ mod tests {
                 ],
             },
         );
-        assert_eq!(c.sidebars[0].size, 11);
-        assert_eq!(c.sidebars[1].size, 22);
+        assert_eq!(c.sidebars.len(), 1);
+        assert_eq!(c.sidebars[0].size, 11, "the first saved bar still applies");
         assert!(
-            !c.sidebars[1].visible,
-            "the second entry took the second bar"
+            c.sidebars[0].visible,
+            "the orphaned second bar must not leak its state onto the survivor"
         );
     }
 

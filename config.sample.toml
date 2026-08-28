@@ -542,10 +542,15 @@
 # persisted with your sessions. The panes get whatever rectangle is left over
 # once every visible sidebar has taken its slice.
 #
-# Declare one `[[sidebar]]` table per sidebar. All three edges may be used at
-# once; a left and a right sidebar bracket the panes, and a bottom one spans
-# only the columns between them. Several sidebars may share an edge — they stack
-# inward from it in declaration order, they do not overlap.
+# Declare one `[[sidebar]]` table per edge. All three edges may be used at once;
+# a left and a right sidebar bracket the panes, and a bottom one spans only the
+# columns between them.
+#
+# ONE SIDEBAR PER EDGE. A second entry on an edge already taken is dropped with
+# a warning. Stacking two on one edge would lay out, but nothing could reach the
+# inner one — the toggle/focus commands and `Alt+h/j/k/l` all resolve an edge to
+# a single sidebar — so it is refused rather than left unreachable. To show two
+# things on one edge, give that sidebar two `[[sidebar.panel]]` entries.
 #
 # Sizes are clamped, not honoured blindly: a sidebar is shrunk so the panes keep
 # a minimum of 20 columns and 5 rows, and one that cannot fit even shrunk is

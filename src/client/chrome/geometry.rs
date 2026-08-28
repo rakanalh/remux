@@ -60,7 +60,16 @@ pub fn effective_sizes(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16)
         let budget = cols_left.saturating_sub(MIN_CONTENT_COLS);
         let granted = s.size.min(budget);
         if granted == 0 {
-            continue; // force-hidden
+            // Logged because there is no other trace: a sidebar restored at a
+            // persisted size that no longer fits simply is not painted, and to
+            // the user that is indistinguishable from the feature being broken.
+            log::debug!(
+                "sidebar: force-hiding the {:?} sidebar -- size {} does not fit in \
+                 {term_cols}x{term_rows} while keeping {MIN_CONTENT_COLS} content columns",
+                s.edge,
+                s.size
+            );
+            continue;
         }
         sizes[i] = granted;
         cols_left -= granted;
@@ -75,6 +84,11 @@ pub fn effective_sizes(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16)
         let budget = rows_left.saturating_sub(MIN_CONTENT_ROWS);
         let granted = s.size.min(budget);
         if granted == 0 {
+            log::debug!(
+                "sidebar: force-hiding the bottom sidebar -- size {} does not fit in \
+                 {term_cols}x{term_rows} while keeping {MIN_CONTENT_ROWS} content rows",
+                s.size
+            );
             continue;
         }
         sizes[i] = granted;

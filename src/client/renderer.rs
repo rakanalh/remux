@@ -2109,8 +2109,15 @@ mod origin_tests {
         // Content rect is columns 0..6, rows 0..4.
         r.set_origin(0, 0);
         r.set_content_size(6, 4);
-        // Seed the content area so the shift has something to move.
-        r.render_full(&grid("CCCCCC", 4), 0, 0, false, 0).unwrap();
+        // Seed the content area with DISTINCT rows. A uniform fill (this test
+        // used to seed "CCCCCC" on every row) cannot tell a correct one-row
+        // shift from no shift at all: every post-shift assertion would hold
+        // even if the rows never moved.
+        let seeded: Vec<Vec<RenderCell>> = ["000000", "111111", "222222", "333333"]
+            .iter()
+            .map(|row| row.chars().map(cell).collect())
+            .collect();
+        r.render_full(&seeded, 0, 0, false, 0).unwrap();
         // A stale pane rect: 10x6, the whole pre-resize terminal.
         let new_row = grid("NNNNNNNNNN", 1);
         r.render_scroll(0, 0, 10, 6, 1, &new_row, 0, 0, false, 0)
@@ -2120,9 +2127,15 @@ mod origin_tests {
         assert_eq!(front[0][9].c, 'T', "scroll wrote into the right panel");
         assert_eq!(front[4][0].c, 'B', "scroll shifted into the bottom panel");
         assert_eq!(front[5][9].c, 'B', "scroll shifted into the bottom panel");
-        // The content rect still scrolled: the new row landed at its top.
-        assert_eq!(front[0][0].c, 'N');
+        // The content rect still scrolled: the new row landed at its top AND
+        // every seeded row moved down exactly one. These are the assertions the
+        // uniform seed could not make.
+        assert_eq!(front[0][0].c, 'N', "new row at the top of the content rect");
         assert_eq!(front[0][5].c, 'N');
+        assert_eq!(front[1][0].c, '0', "row 0 shifted down to row 1");
+        assert_eq!(front[2][0].c, '1', "row 1 shifted down to row 2");
+        assert_eq!(front[3][0].c, '2', "row 2 shifted down to row 3");
+        assert_eq!(front[3][5].c, '2', "the shift covers the content width");
     }
 
     #[test]

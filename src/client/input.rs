@@ -2365,7 +2365,7 @@ impl InputHandler {
 
         // Handle sub-modes first.
         match &sm.sub_mode {
-            SubMode::ConfirmDelete(_) => {
+            SubMode::ConfirmDelete { .. } => {
                 return match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         let action = sm.handle_confirm_delete(true);
@@ -5286,7 +5286,7 @@ mod tests {
         // Named exactly: `contains("alpha")` also passes for "tab 0 in 'alpha'",
         // which is what the old two-`j` navigation was actually landing on.
         assert!(
-            matches!(&sm.sub_mode, SubMode::ConfirmDelete(d) if d == "session 'alpha'"),
+            matches!(&sm.sub_mode, SubMode::ConfirmDelete { description: d, .. } if d == "session 'alpha'"),
             "expected the delete confirm for the filtered session, got {:?}",
             sm.sub_mode
         );

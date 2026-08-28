@@ -37,8 +37,19 @@ pub enum RenameKind {
 pub enum SubMode {
     /// Normal navigation.
     Navigate,
-    /// Waiting for delete confirmation. String describes the item.
-    ConfirmDelete(String),
+    /// Waiting for delete confirmation.
+    ///
+    /// Carries the TARGET NODE, not just its description. The tree rebuilds on
+    /// every server push, so between `d` and `y` the row under the selection
+    /// index can become a different node -- and when the selected key is gone
+    /// `rebuild_rows` deliberately leaves the index where it was, so the
+    /// selection silently slides onto a neighbour. Re-reading the selection at
+    /// confirm time would then delete something the prompt never named.
+    ConfirmDelete {
+        target: NodeType,
+        /// What the prompt says, captured with the target so the two agree.
+        description: String,
+    },
     /// Creating a new folder -- text buffer for the name.
     CreateFolder(String),
     /// Creating a new session.
@@ -610,7 +621,10 @@ impl SessionManagerState {
             return SessionManagerAction::None;
         }
         self.sub_mode_server = server;
-        self.sub_mode = SubMode::ConfirmDelete(description);
+        self.sub_mode = SubMode::ConfirmDelete {
+            target: row.node_type.clone(),
+            description,
+        };
         SessionManagerAction::None
     }
 
@@ -621,18 +635,42 @@ impl SessionManagerState {
             return SessionManagerAction::None;
         }
 
-        let row = match self.model.rows.get(self.model.selected) {
-            Some(r) => r.clone(),
-            None => {
+        // Act on the node captured when `d` was pressed, NEVER on whatever the
+        // selection index points at now. A `SubscribeSessionTree` push can
+        // rebuild the tree between the two keystrokes, and a rebuild that loses
+        // the selected key leaves the index parked on a neighbour -- so
+        // re-reading the selection here would delete a session the prompt did
+        // not name, with no second confirmation.
+        let target = match &self.sub_mode {
+            SubMode::ConfirmDelete { target, .. } => target.clone(),
+            // Not in the prompt: nothing was confirmed.
+            _ => {
                 self.sub_mode = SubMode::Navigate;
                 return SessionManagerAction::None;
             }
         };
         self.sub_mode = SubMode::Navigate;
 
+        // The captured node may itself have disappeared while the prompt was
+        // up. Deleting by name regardless would resurrect a race the capture
+        // exists to close, so abort instead.
+        let key = self.model.node_key(&target);
+        if !self
+            .model
+            .rows
+            .iter()
+            .any(|r| self.model.node_key(&r.node_type) == key)
+        {
+            log::warn!(
+                "session_manager: delete aborted -- {key:?} disappeared while the \
+                 confirmation prompt was open"
+            );
+            return SessionManagerAction::None;
+        }
+
         // Route the delete to the server captured when the sub-mode was entered.
         let server = self.sub_mode_server.clone();
-        match &row.node_type {
+        match &target {
             NodeType::Folder { name, .. } => SessionManagerAction::DeleteFolder {
                 server,
                 name: name.clone(),
@@ -1278,8 +1316,8 @@ impl SessionManagerState {
                 };
                 format!(" Rename {label}: {buffer}_ ")
             }
-            SubMode::ConfirmDelete(desc) => {
-                format!(" Delete {}? (y/n) ", desc)
+            SubMode::ConfirmDelete { description, .. } => {
+                format!(" Delete {}? (y/n) ", description)
             }
             SubMode::CreateFolder(buf) => {
                 format!(" Folder name: {}_ ", buf)
@@ -1580,6 +1618,110 @@ mod tests {
         assert_eq!(state.model.rows.len(), 1);
     }
 
+    /// A confirmed delete must act on the node the PROMPT named, even if the
+    /// tree was rebuilt underneath the prompt.
+    ///
+    /// The window is two keystrokes wide (`d` then `y`) and a sidebar holding a
+    /// standing `SubscribeSessionTree` rebuilds the tree on ANY structural
+    /// change on ANY connected server. When the selected key disappears,
+    /// `rebuild_rows` deliberately leaves the index where it was -- so the
+    /// selection slides onto the next row, and a confirm that re-read the
+    /// selection would delete a session the user never saw named, with no
+    /// second confirmation.
+    #[test]
+    fn a_delete_never_retargets_when_the_tree_rebuilds_under_the_prompt() {
+        let unfiled = |names: &[&str]| -> Vec<SessionTreeEntry> {
+            names
+                .iter()
+                .map(|n| SessionTreeEntry {
+                    name: (*n).to_string(),
+                    tabs: vec![],
+                    client_count: 0,
+                    is_current: false,
+                })
+                .collect()
+        };
+
+        let mut state = SessionManagerState::new(None);
+        state.update_tree(
+            ConnId::Local,
+            Vec::new(),
+            unfiled(&["beta", "gamma"]),
+            Vec::new(),
+        );
+
+        let beta_idx = session_row(&state, "beta");
+        state.model.selected = beta_idx;
+
+        // Arm the prompt on `beta`.
+        state.handle_delete_key();
+        assert!(
+            matches!(&state.sub_mode, SubMode::ConfirmDelete { description, .. }
+                     if description == "session 'beta'"),
+            "the prompt must name beta, got {:?}",
+            state.sub_mode
+        );
+
+        // Another client kills `beta`; the push rebuilds the tree. `gamma` now
+        // occupies the index the selection is parked on.
+        state.update_tree(ConnId::Local, Vec::new(), unfiled(&["gamma"]), Vec::new());
+        assert_eq!(
+            state.model.selected, beta_idx,
+            "precondition: the stale index is what makes this dangerous"
+        );
+        assert!(
+            matches!(&state.model.rows[beta_idx].node_type,
+                     NodeType::Session { name, .. } if name == "gamma"),
+            "precondition: the selection must now sit on gamma"
+        );
+
+        // Confirming must delete NOTHING -- beta is gone, and gamma was never
+        // named by the prompt.
+        let action = state.handle_confirm_delete(true);
+        assert!(
+            matches!(action, SessionManagerAction::None),
+            "a vanished target must abort, not retarget -- got {action:?}"
+        );
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    /// The companion case: the target still exists but the rows moved around it.
+    ///
+    /// This one is a GUARD, not a bug-catcher -- it passes against the old
+    /// re-read-the-selection code too, because identity-preserving
+    /// `rebuild_rows` already moved the index onto `beta`. It is here so the
+    /// capture cannot regress the ordinary path while fixing the dangerous
+    /// one.
+    #[test]
+    fn a_delete_follows_its_target_when_rows_shift_under_the_prompt() {
+        let entry = |n: &str| SessionTreeEntry {
+            name: n.to_string(),
+            tabs: vec![],
+            client_count: 0,
+            is_current: false,
+        };
+
+        let mut state = SessionManagerState::new(None);
+        state.update_tree(
+            ConnId::Local,
+            Vec::new(),
+            vec![entry("alpha"), entry("beta")],
+            Vec::new(),
+        );
+        state.model.selected = session_row(&state, "beta");
+        state.handle_delete_key();
+
+        // `alpha` disappears: every row below it shifts up, so the index that
+        // named `beta` now names something else -- but `beta` is still there.
+        state.update_tree(ConnId::Local, Vec::new(), vec![entry("beta")], Vec::new());
+
+        let action = state.handle_confirm_delete(true);
+        assert!(
+            matches!(&action, SessionManagerAction::DeleteSession { name, .. } if name == "beta"),
+            "the delete must follow beta, not the index -- got {action:?}"
+        );
+    }
+
     #[test]
     fn test_delete_confirmation_flow() {
         let mut state = SessionManagerState::new(None);
@@ -1590,7 +1732,7 @@ mod tests {
         // Press 'd'.
         let action = state.handle_delete_key();
         assert!(matches!(action, SessionManagerAction::None));
-        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
 
         // Confirm with 'y'.
         let action = state.handle_confirm_delete(true);
@@ -1751,7 +1893,7 @@ mod tests {
         state.model.selected = remote_session_idx;
         let action = state.handle_delete_key();
         assert!(matches!(action, SessionManagerAction::None));
-        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
 
         let action = state.handle_confirm_delete(true);
         assert!(matches!(
@@ -2241,7 +2383,7 @@ mod tests {
         state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::SessionClose);
         assert!(matches!(action, SessionManagerAction::None));
-        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
     }
 
     #[test]
