@@ -1010,7 +1010,32 @@ impl SessionSwitchOverlay {
                 }
             }
         }
+        // Keep the highlight on the entry the user had chosen, by IDENTITY
+        // (`(server, name)`), not by index.
+        //
+        // `rebuild` runs on every `SessionTree`, which is now also an
+        // unsolicited push on any structural change (the sidebar's session-tree
+        // panel subscribes to it). Local is prepended ahead of the remotes, so a
+        // merge for one server shifts every entry below it -- an index-preserved
+        // highlight silently retargets. A view row's index is stable here,
+        // because `rebuild` never touches `views`.
+        let previously_selected = self
+            .selected
+            .checked_sub(self.views.len())
+            .and_then(|i| self.entries.get(i))
+            .map(|e| (e.server.clone(), e.name.clone()));
+
         self.entries = entries;
+
+        if let Some((server, name)) = previously_selected {
+            if let Some(idx) = self
+                .entries
+                .iter()
+                .position(|e| e.server == server && e.name == name)
+            {
+                self.selected = self.views.len() + idx;
+            }
+        }
         // On the first merge that carries the current session, snap the
         // highlight to it so the popup opens showing which session is current.
         // If no current entry has arrived yet, leave `selection_initialized`
@@ -2792,9 +2817,22 @@ impl InputHandler {
         if current_folder.is_none() {
             folders.retain(|f| f != "(none)");
         }
+        // Keep the highlight on the folder the user had chosen, by NAME.
+        //
+        // This runs on every `SessionTree` the client receives, and since the
+        // sidebar's session-tree panel subscribes to the server's push, that is
+        // now every structural change anywhere -- not just the reply this
+        // overlay asked for. Rebuilding at index 0 would yank the selection back
+        // to the top whenever somebody else created a session.
+        let selected = self
+            .folder_select
+            .as_ref()
+            .and_then(|prev| prev.folders.get(prev.selected))
+            .and_then(|name| folders.iter().position(|f| f == name))
+            .unwrap_or(0);
         self.folder_select = Some(FolderSelectOverlay {
             folders,
-            selected: 0,
+            selected,
             session_name,
         });
     }
@@ -5330,6 +5368,84 @@ mod tests {
         // highlight back to the current entry.
         handler.merge_session_switch(remote("mini"), vec![("x".to_string(), true, None)]);
         assert_eq!(handler.session_switch.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn session_switch_selection_follows_its_entry_when_the_list_shifts() {
+        // `rebuild` runs on every `SessionTree` -- which is now also an
+        // unsolicited push, because the sidebar's session-tree panel subscribes
+        // to it. Local is prepended ahead of the remotes, so a later Local merge
+        // shifts every remote entry down; an index-preserved highlight would
+        // silently retarget.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            remote("mini"),
+            vec![
+                ("x".to_string(), false, None),
+                ("y".to_string(), false, None),
+            ],
+        );
+        handler.session_switch = Some(overlay);
+
+        // The user lands on the remote's second entry (moving also locks the
+        // preselect, so the snap cannot explain the result).
+        let _ = handler.handle_session_switch_key(char_key('j'));
+        let ss = handler.session_switch.as_ref().unwrap();
+        assert_eq!(ss.entries[ss.selected].name, "y");
+        assert!(ss.selection_initialized);
+
+        // A push for LOCAL arrives and prepends two entries.
+        handler.merge_session_switch(
+            ConnId::Local,
+            vec![
+                ("a".to_string(), false, None),
+                ("b".to_string(), false, None),
+            ],
+        );
+        let ss = handler.session_switch.as_ref().unwrap();
+        assert_eq!(ss.selected, 3, "the list must actually have shifted");
+        assert_eq!(ss.entries[ss.selected].name, "y");
+        assert_eq!(ss.entries[ss.selected].server, remote("mini"));
+    }
+
+    #[test]
+    fn folder_select_keeps_its_highlight_across_a_refresh() {
+        // Same reason: this rebuilds on every `SessionTree`, so a structural
+        // change made by anyone would otherwise yank the highlight to the top.
+        let mut handler = InputHandler::with_defaults();
+        handler.update_folder_list(
+            vec!["work".to_string(), "play".to_string()],
+            None,
+            "sess".to_string(),
+        );
+        let fs = handler.folder_select.as_mut().unwrap();
+        fs.selected = 1;
+        let want = fs.folders[1].clone();
+
+        handler.update_folder_list(
+            vec!["work".to_string(), "play".to_string()],
+            None,
+            "sess".to_string(),
+        );
+        let fs = handler.folder_select.as_ref().unwrap();
+        assert_eq!(fs.folders[fs.selected], want);
+    }
+
+    #[test]
+    fn folder_select_falls_back_to_the_top_when_its_folder_is_gone() {
+        let mut handler = InputHandler::with_defaults();
+        handler.update_folder_list(
+            vec!["work".to_string(), "play".to_string()],
+            None,
+            "sess".to_string(),
+        );
+        handler.folder_select.as_mut().unwrap().selected = 1;
+        handler.update_folder_list(vec!["work".to_string()], None, "sess".to_string());
+        let fs = handler.folder_select.as_ref().unwrap();
+        assert_eq!(fs.selected, 0);
+        assert!(fs.selected < fs.folders.len());
     }
 
     #[test]

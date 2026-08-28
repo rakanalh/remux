@@ -24,6 +24,8 @@ What it covers:
      keystroke at all (the `SubscribeSessionTree` push)
   8  a connection that drops takes its subtree with it
   9  with no sidebar configured the client never subscribes
+ 10  a push that removes a row ABOVE the selection does not retarget it --
+     Enter still jumps to the session the user picked
 
 Run from the repo root:
     python3 tests/pty/sidebar_sessions.py [-v]
@@ -535,10 +537,86 @@ def scenario_no_sidebar():
         w.close()
 
 
+def scenario_selection_identity():
+    """10: a push that removes a row ABOVE the selection must not retarget it.
+
+    The panel rebuilds on every push and Enter is its primary action, so an
+    index-preserved selection is a wrong-JUMP bug here, not a cosmetic one.
+
+    The fixture is built so the two behaviours land on DIFFERENT sessions. The
+    server lists sessions alphabetically -- alpha, beta, delta, gamma -- so with
+    `beta` (2 rows) deleted from above a selected `delta`, the old index lands
+    on `gamma`. Selecting the LAST session instead would not discriminate: the
+    clamp would land inside that same session's own tab row.
+    """
+    print("selection survives a row disappearing above it")
+    start_server(SOCK1, env_local())
+    seeds = seed_four()
+    child, screen, pump = spawn(env_local())
+    pump(2.0)
+
+    rows = panel_rows(screen)
+    log("panel:", rows)
+    for want in ("alpha", "beta", "gamma", "delta"):
+        assert any(want in r for r in rows), f"{want} missing: {rows}"
+
+    child.send(b"\x1b2")           # focus the panel
+    pump(0.5)
+    select_row(child, screen, pump, "delta")
+
+    # Somebody else deletes `beta` -- two rows above the selection.
+    w = Wire(SOCK1)
+    w.send({"KillSession": {"name": "beta"}})
+    pump(2.0)
+    rows = panel_rows(screen)
+    log("panel after the delete:", rows)
+    check("10 the deleted session is gone from the panel",
+          not any("beta" in r for r in rows), rows)
+
+    child.send(b"\r")
+    pump(2.0)
+    body = "\n".join(content_rows(screen))
+    check("10 Enter still jumps to the session that was selected",
+          "D_ONE" in body and "G_ONE" not in body,
+          f"expected D_ONE (delta), not G_ONE (gamma): {body[-400:]!r}")
+
+    check_no_panic(f"{RUN}/state")
+    teardown(child)
+    w.close()
+    for x in seeds:
+        x.close()
+
+
+def seed_four():
+    """alpha (2 tabs, the session the client attaches to and nobody deletes),
+    then beta / gamma / delta, one pane each with a unique marker."""
+    out = []
+    w = Wire(SOCK1)
+    w.send({"CreateSession": {"name": "alpha", "folder": None}})
+    w.send({"Attach": {"session_name": "alpha"}})
+    w.send({"Resize": {"cols": 74, "rows": 29}})
+    time.sleep(0.4)
+    w.type("echo A_ONE\n")
+    w.send({"Command": "TabNew"})
+    time.sleep(0.4)
+    w.type("echo A_TAB1\n")
+    out.append(w)
+    for name, mark in (("beta", "B_ONE"), ("gamma", "G_ONE"), ("delta", "D_ONE")):
+        c = Wire(SOCK1)
+        c.send({"CreateSession": {"name": name, "folder": None}})
+        c.send({"Attach": {"session_name": name}})
+        c.send({"Resize": {"cols": 74, "rows": 29}})
+        time.sleep(0.4)
+        c.type(f"echo {mark}\n")
+        out.append(c)
+    return out
+
+
 def main():
     if not os.path.exists(BIN):
         raise SystemExit(f"{BIN} not found; run `cargo build` first")
-    for scenario in (scenario_local, scenario_remote, scenario_no_sidebar):
+    for scenario in (scenario_local, scenario_remote, scenario_no_sidebar,
+                     scenario_selection_identity):
         setup_dirs()
         try:
             scenario()

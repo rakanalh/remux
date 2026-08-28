@@ -663,6 +663,9 @@ impl TreeModel {
 
     /// Rebuild the flat row list from the roster + per-server tree data.
     fn rebuild_rows(&mut self) {
+        // What the selection NAMES, before the rows it indexes into are thrown
+        // away. See the re-resolve at the end of this function.
+        let previously_selected = self.selected_row().map(|r| self.row_key(r));
         let mut rows = Vec::new();
         let filter = self.compute_filter();
         let filter = filter.as_ref();
@@ -764,7 +767,29 @@ impl TreeModel {
         // collapse / tree updates, and leaving a previous query's hits behind
         // would let a stale set outlive the query that produced it.
         self.filter_hits = filter.map(|f| f.hits.clone()).unwrap_or_default();
-        // Clamp selection.
+
+        // Re-resolve the selection by IDENTITY, not by index.
+        //
+        // Expansion survives a rebuild by key and the manager's marks survive by
+        // identity; the selection used to survive only as an index, which is not
+        // the same thing once the rows above it can change. Deleting a session
+        // above the selection shifts every row up and the highlight silently
+        // lands on a different node -- and the sidebar panel rebuilds on EVERY
+        // server push, so that is a wrong-jump bug there rather than a cosmetic
+        // one (Enter is its primary action).
+        //
+        // A node that is genuinely gone falls back to the clamp: the index stays
+        // put, which is the usual "the cursor does not move when the thing under
+        // it is deleted" behaviour.
+        //
+        // Caveat: a tab's identity is its INDEX within its session
+        // (`NodeType::Tab` carries `tab_index`; the wire's tab ids never reach
+        // the model), so reordering tabs still retargets a tab-row selection.
+        if let Some(key) = previously_selected {
+            if let Some(idx) = self.rows.iter().position(|r| self.row_key(r) == key) {
+                self.selected = idx;
+            }
+        }
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
         }
@@ -1309,6 +1334,57 @@ mod tests {
             "a new session did not auto-expand: {:?}",
             labels(&model)
         );
+    }
+
+    #[test]
+    fn the_selection_follows_its_node_when_a_row_above_it_disappears() {
+        // The panel rebuilds on EVERY server push, so a session deleted above
+        // the selection shifts every row up. Preserved by index, the highlight
+        // would silently land on a different node -- and Enter jumps.
+        let mut model = TreeModel::new();
+        model.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            None,
+        )]);
+        let alpha = session("alpha", vec![tab(1, "atab", vec![pane(10, "sh")])]);
+        let beta = session("beta", vec![tab(2, "btab", vec![pane(20, "sh")])]);
+        model.update_tree(
+            ConnId::Local,
+            Vec::new(),
+            vec![alpha, beta.clone()],
+            Vec::new(),
+        );
+
+        model.selected = row_of(&model, "beta");
+        let before = model.selected;
+
+        // "alpha" (and its tab row) go away above the selection.
+        model.update_tree(ConnId::Local, Vec::new(), vec![beta], Vec::new());
+
+        assert_ne!(
+            model.selected, before,
+            "the fixture must actually shift the row, or this proves nothing"
+        );
+        assert_eq!(
+            model.selected_row().map(|r| r.display_name.as_str()),
+            Some("beta"),
+            "the selection retargeted: {:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn a_selection_whose_node_is_gone_falls_back_to_the_index() {
+        // The usual "the cursor does not move when the thing under it is
+        // deleted" behaviour, and the clamp still applies at the end.
+        let (mut model, _) = two_conn_fixture();
+        model.selected = row_of(&model, "alpha");
+        let before = model.selected;
+        model.update_tree(ConnId::Local, Vec::new(), Vec::new(), Vec::new());
+        assert!(model.selected <= before);
+        assert!(model.selected < model.rows.len());
     }
 
     #[test]
