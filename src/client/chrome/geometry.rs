@@ -8,7 +8,7 @@ use crate::config::StatusBarPosition;
 use crate::server::layout::Rect;
 
 /// Which terminal edge a sidebar is docked to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarEdge {
     Left,

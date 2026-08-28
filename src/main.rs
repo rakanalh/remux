@@ -1718,6 +1718,13 @@ async fn run_client_loop(
     // it gets back. Built once here -- plugins carry state, so a config
     // hot-reload deliberately leaves the existing chrome in place.
     let mut chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
+    // The config supplies the defaults; anything the user changed at runtime
+    // last time -- which sidebars are open, how wide, how the panels are
+    // weighted -- is layered on top. Applied here, BEFORE the first
+    // `content_rect`/`Resize` below, so the opening frame is already sized for
+    // the sidebars the user will actually see. Never fails: a missing,
+    // unreadable, or corrupt state file degrades to the config defaults.
+    crate::client::sidebar_state::apply(&mut chrome, &crate::client::sidebar_state::load());
     let mut which_key_position = config.appearance.which_key_position.clone();
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
@@ -3806,6 +3813,17 @@ async fn run_client_loop(
                                 }
                                 let (tc, tr) = renderer.size();
                                 let before = chrome.content_rect(tc, tr);
+                                // Snapshot of everything that OUTLIVES this
+                                // client, so the save below fires on a real
+                                // change and only on a real change. Comparing
+                                // state rather than naming the intents keeps
+                                // this correct for `Focus` (which opens a hidden
+                                // sidebar) and for the resize/weight commands a
+                                // later phase adds, and keeps a no-op toggle --
+                                // including every toggle with no sidebar
+                                // configured -- from writing a file at all.
+                                let persisted_before =
+                                    crate::client::sidebar_state::SidebarState::from_chrome(&chrome);
                                 match intent {
                                     SidebarIntent::Toggle(edge) => {
                                         chrome.toggle_edge(edge);
@@ -3814,6 +3832,11 @@ async fn run_client_loop(
                                         chrome.focus_edge(edge, tc, tr);
                                     }
                                     SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
+                                }
+                                if crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
+                                    != persisted_before
+                                {
+                                    crate::client::sidebar_state::save(&chrome);
                                 }
                                 // Showing or hiding a sidebar moves the content
                                 // rect, which is the server's whole world: the

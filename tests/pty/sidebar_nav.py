@@ -127,6 +127,26 @@ CFG_NONE = """
 border_style = "zellij_style"
 """
 
+# The toggle action bound to a key with NO `[[sidebar]]` at all: the regression
+# gate for persistence. A toggle that finds no sidebar changes nothing, so
+# nothing may be written -- "exactly as today" includes not creating a state
+# file a previous build never had.
+CFG_ACTIONS_NO_SIDEBAR = """
+[keybindings.command]
+"Alt-1" = "SidebarToggleLeft"
+"""
+
+# A RIGHT sidebar, closed. Paired with state written for the LEFT edge, this is
+# what makes "unmatched state is ignored" observable on screen: an `apply` that
+# matched positionally instead of by edge would open this bar to the left bar's
+# saved size, and its panel would paint.
+CFG_RIGHT_HIDDEN = f"""
+[[sidebar]]
+edge = "right"
+size = 20
+visible = false
+{PANEL}"""
+
 
 def make_env(config: str) -> dict:
     shutil.rmtree(RUNDIR, ignore_errors=True)
@@ -813,6 +833,210 @@ def test_a_group_prefix_shortcut_still_opens_command_mode():
     print("PASS test_a_group_prefix_shortcut_still_opens_command_mode")
 
 
+def state_file() -> str:
+    return f"{RUNDIR}/state/remux/sidebar.json"
+
+
+def test_a_toggled_sidebar_survives_a_client_restart():
+    """Persistence, end to end: toggle, quit, come back, still toggled.
+
+    Driven BOTH ways round. A one-directional test (hide, restart, still
+    hidden) passes against a `save` that only ever writes "hidden" and against
+    an `apply` that only ever hides, so the second leg toggles back ON and
+    restarts again.
+
+    Each leg asserts twice -- the panels are gone/back AND the server's frame
+    starts at column 0 / does not -- because marker absence alone is also what a
+    dead client looks like. `child.isalive()` covers the rest.
+    """
+    env = make_env(CFG_ACTIONS)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    assert len(markers(screen)) == 2, f"expected two panels: {markers(screen)}"
+
+    # -- Hide it, and check the state actually reached disk. --
+    child.send(b"\x1b1")
+    pump(1.5)
+    assert not markers(screen), f"the sidebar did not hide: {markers(screen)}"
+    assert os.path.exists(state_file()), (
+        "toggling a sidebar wrote no state file:\n" + client_log()[-2000:]
+    )
+    body = open(state_file()).read()
+    assert '"visible": false' in body, f"the hidden sidebar was not saved: {body}"
+
+    # -- Restart the client against the SAME XDG_STATE_HOME. --
+    child.close(force=True)
+    child, screen, pump = spawn(env)
+    pump(2.0)
+    assert child.isalive(), "the client died on restart:\n" + client_log()[-2000:]
+    assert not markers(screen), (
+        "the hidden sidebar came back after a restart:\n"
+        + "\n".join(screen.display[:4])
+    )
+    assert screen.display[0].startswith("\u256d"), (
+        "the restarted client did not size the content rect for a hidden "
+        "sidebar:\n" + "\n".join(screen.display[:3])
+    )
+
+    # -- Show it again, restart again: the state is not write-once. --
+    child.send(b"\x1b1")
+    pump(1.5)
+    assert len(markers(screen)) == 2, f"the sidebar did not come back: {markers(screen)}"
+    body = open(state_file()).read()
+    assert '"visible": true' in body, f"the reopened sidebar was not saved: {body}"
+
+    child.close(force=True)
+    child, screen, pump = spawn(env)
+    pump(2.0)
+    assert child.isalive(), "the client died on the second restart"
+    assert len(markers(screen)) == 2, (
+        "the restored sidebar did not survive the second restart:\n"
+        + "\n".join(screen.display[:4])
+    )
+    assert not screen.display[0].startswith("\u256d"), (
+        "the content rect did not shrink for the restored sidebar:\n"
+        + "\n".join(screen.display[:3])
+    )
+
+    # The keyboard still works after all that.
+    child.send(b"echo nav9\r")
+    pump(1.2)
+    assert any("nav9" in r[SIDEBAR_W:] for r in screen.display), (
+        "the keyboard was stranded after restoring:\n" + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_toggled_sidebar_survives_a_client_restart")
+
+
+def test_a_persisted_size_and_weight_are_restored():
+    """A hand-written state file stands in for the resize/weight commands.
+
+    Nothing mutates `size` or `weight` at runtime yet, so this is the only way
+    to drive those two fields end to end: 30 columns in the config, 18 in the
+    state, and a 3:1 weight split that moves the second panel's marker row.
+    """
+    env = make_env(CFG_ACTIONS)
+    os.makedirs(f"{RUNDIR}/state/remux", exist_ok=True)
+    with open(state_file(), "w") as fh:
+        fh.write(
+            '{"bars":[{"edge":"left","visible":true,"size":18,'
+            '"weights":[3,1]}]}'
+        )
+
+    child, screen, pump = spawn(env)
+    pump(2.0)
+    assert child.isalive(), "the client died reading state:\n" + client_log()[-2000:]
+
+    # 18 columns wide, not 30: the panels paint inside the first 18 and the
+    # server's frame begins there.
+    assert markers(screen, 0, 18), (
+        "the panels did not paint in an 18-column sidebar:\n"
+        + "\n".join(screen.display[:4])
+    )
+    assert screen.display[0][18] == "\u256d", (
+        "the content rect was not sized for the PERSISTED width:\n"
+        + "\n".join(screen.display[:3])
+    )
+
+    # 3:1 of 30 rows puts the second panel's marker well below the halfway row
+    # a 1:1 config split would give it.
+    rows_seen = [y for (y, _) in markers(screen, 0, 18)]
+    assert len(rows_seen) == 2, f"expected two panels: {markers(screen, 0, 18)}"
+    # A 1:1 config split puts it on row 16 of 30; 3:1 puts it on row 23. The
+    # threshold has to sit between the two or the assertion is blind to whether
+    # `weights` was applied at all.
+    assert rows_seen[1] >= 20, (
+        f"the persisted 3:1 weight split was not applied: {rows_seen}"
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_persisted_size_and_weight_are_restored")
+
+
+def test_a_corrupt_state_file_falls_back_to_the_config():
+    """Never fail a client start over persisted chrome state."""
+    env = make_env(CFG_ACTIONS)
+    os.makedirs(f"{RUNDIR}/state/remux", exist_ok=True)
+    with open(state_file(), "w") as fh:
+        fh.write("{ not json")
+
+    child, screen, pump = spawn(env)
+    pump(2.0)
+    assert child.isalive(), (
+        "a corrupt state file killed the client:\n" + client_log()[-2000:]
+    )
+    assert len(markers(screen)) == 2, (
+        "the config defaults were not used after a corrupt state file:\n"
+        + "\n".join(screen.display[:4])
+    )
+    assert "sidebar state" in client_log(), (
+        "the corrupt state file was discarded silently"
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_corrupt_state_file_falls_back_to_the_config")
+
+
+def test_state_for_an_edge_the_config_no_longer_declares_is_ignored():
+    """The user moved their sidebar to the other edge after state was written.
+
+    The config declares a CLOSED right sidebar; the state names the left one.
+    Neither may open: nothing on screen is a marker. Run against a config with
+    no sidebar at all this would be blind -- with an empty `chrome.sidebars`
+    even a completely broken `apply` has nothing to write to.
+    """
+    env = make_env(CFG_RIGHT_HIDDEN)
+    os.makedirs(f"{RUNDIR}/state/remux", exist_ok=True)
+    with open(state_file(), "w") as fh:
+        fh.write('{"bars":[{"edge":"left","visible":true,"size":30,"weights":[1]}]}')
+
+    child, screen, pump = spawn(env)
+    pump(2.0)
+    assert child.isalive(), (
+        "state for an undeclared edge killed the client:\n" + client_log()[-2000:]
+    )
+    assert not markers(screen, 0, COLS), (
+        "state for one edge opened a sidebar on another:\n"
+        + "\n".join(screen.display[:4])
+    )
+    child.send(b"echo nav10\r")
+    pump(1.2)
+    assert any("nav10" in r for r in screen.display), (
+        "the shell was unreachable:\n" + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_state_for_an_edge_the_config_no_longer_declares_is_ignored")
+
+
+def test_with_no_sidebar_a_toggle_writes_no_state_file():
+    """The regression gate: no `[[sidebar]]`, no new file on disk."""
+    env = make_env(CFG_ACTIONS_NO_SIDEBAR)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(b"\x1b1")
+    pump(1.5)
+    assert child.isalive(), "the client died toggling a sidebar that is not there"
+    assert not os.path.exists(state_file()), (
+        "a no-op toggle with no sidebar configured wrote a state file"
+    )
+    child.send(b"echo nav11\r")
+    pump(1.2)
+    assert any("nav11" in r for r in screen.display), (
+        "the shell was unreachable:\n" + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_with_no_sidebar_a_toggle_writes_no_state_file")
+
+
 if __name__ == "__main__":
     if not os.path.exists(BIN):
         sys.exit(f"build first: {BIN} missing")
@@ -830,5 +1054,10 @@ if __name__ == "__main__":
     test_a_paste_does_not_leak_past_a_focused_sidebar()
     test_a_mixed_chain_does_not_earn_the_directional_exemption()
     test_a_group_prefix_shortcut_still_opens_command_mode()
+    test_a_toggled_sidebar_survives_a_client_restart()
+    test_a_persisted_size_and_weight_are_restored()
+    test_a_corrupt_state_file_falls_back_to_the_config()
+    test_state_for_an_edge_the_config_no_longer_declares_is_ignored()
+    test_with_no_sidebar_a_toggle_writes_no_state_file()
     test_with_no_sidebar_every_directional_key_is_unchanged()
     print("ALL PASS")
