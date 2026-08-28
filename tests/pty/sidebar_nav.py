@@ -140,6 +140,23 @@ CFG_ACTIONS_NO_SIDEBAR = """
 # re-targets a pure resize at itself; a mixed chain earns no exemption and goes
 # to the plugin like any other key, or its `SetMaster` half would reach the
 # server while a panel has the keyboard.
+# A `PaneFocus*` merged INTO the built-in sticky Resize group. A user-declared
+# group is non-sticky, but merging into a built-in one preserves its
+# stickiness (`merge_maps`), so these leaves arrive as
+# `ExecuteAndShowWhichKey` -- the arm neither `Execute` nor `ExecuteChain`
+# covers. Task 7's invariant is stated without qualification, so it has to hold
+# here too.
+CFG_STICKY_FOCUS = f"""
+[keybindings.command.p.R]
+x = "PaneFocusLeft"
+y = "PaneFocusRight"
+
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+{PANEL}"""
+
 CFG_ALT_RESIZE = f"""
 [keybindings.command]
 "Alt-7" = "ResizeRight 5"
@@ -1261,6 +1278,62 @@ def test_a_resized_sidebar_survives_a_client_restart():
     print("PASS test_a_resized_sidebar_survives_a_client_restart")
 
 
+def test_a_directional_key_in_a_sticky_group_is_intercepted():
+    """Task 7's invariant holds in the sticky-group arm too.
+
+    Sticky-group leaves reach `ExecuteAndShowWhichKey`, never `Execute`, so the
+    two interception sites Task 7 installed do not cover them. A config that
+    merges a `PaneFocus*` into the built-in Resize group is a normal thing to
+    write, and without this the direction would reach the server from inside a
+    focused panel.
+
+    Both halves are driven: a direction with nowhere to go is SWALLOWED, and one
+    pointing at the content LEAVES the sidebar. Swallow-only would pass against
+    an interception that consumes everything and routes nothing.
+    """
+    env = make_env(CFG_STICKY_FOCUS)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+
+    child.send(ALT_H)
+    pump(1.0)
+    assert focused_rows(screen), "the sidebar never took focus"
+
+    # `p R x` = PaneFocusLeft, from inside the LEFT sidebar: nowhere to go.
+    child.send(b"\x01pRx")
+    pump(1.5)
+    leaked = pane_focus_cmds(server_log())
+    assert not leaked, (
+        f"a directional key in a sticky group leaked to the server as {leaked}"
+    )
+    assert focused_rows(screen), (
+        f"the swallowed direction moved focus out of the sidebar: {markers(screen)}"
+    )
+
+    # `p R y` = PaneFocusRight: toward the content, so it hands the keyboard
+    # back. Still sticky, so no fresh chord is needed.
+    child.send(b"y")
+    pump(1.5)
+    assert not focused_rows(screen), (
+        f"the direction toward the content did not leave the sidebar: {markers(screen)}"
+    )
+    assert not pane_focus_cmds(server_log()), (
+        "leaving the sidebar forwarded the direction to the server as well"
+    )
+
+    child.send(b"\x1b")
+    pump(1.0)
+    child.send(b"echo nav13\r")
+    pump(1.2)
+    assert any("nav13" in r[SIDEBAR_W:] for r in screen.display), (
+        "the keyboard was stranded:\n" + "\n".join(screen.display)
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_a_directional_key_in_a_sticky_group_is_intercepted")
+
+
 if __name__ == "__main__":
     if not os.path.exists(BIN):
         sys.exit(f"build first: {BIN} missing")
@@ -1278,6 +1351,7 @@ if __name__ == "__main__":
     test_a_paste_does_not_leak_past_a_focused_sidebar()
     test_a_mixed_chain_does_not_earn_the_directional_exemption()
     test_a_group_prefix_shortcut_still_opens_command_mode()
+    test_a_directional_key_in_a_sticky_group_is_intercepted()
     test_the_resize_chord_moves_a_focused_sidebars_edge()
     test_the_resize_chord_reweights_along_the_stack()
     test_an_alt_bound_resize_reaches_the_sidebar_not_the_plugin()

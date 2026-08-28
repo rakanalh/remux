@@ -2607,6 +2607,36 @@ async fn run_client_loop(
                                     .await?;
                                 }
                                 if !consumed {
+                                    // Task 7's invariant is unqualified:
+                                    // nothing inside a focused sidebar reaches
+                                    // the server. Sticky-group leaves arrive
+                                    // here and NOT at `Execute`, and a config
+                                    // can put a `PaneFocus*` in a sticky group
+                                    // -- a built-in group stays sticky when a
+                                    // user adds leaves to it (see `merge_maps`)
+                                    // -- so without this the invariant has a
+                                    // config-shaped hole in it.
+                                    if let Some(dir) = focus_direction_of(&command) {
+                                        let (tc, tr) = renderer.size();
+                                        if crate::client::chrome::intercept_focus(
+                                            &mut chrome,
+                                            dir,
+                                            focused_pane_rect.as_ref(),
+                                            tc,
+                                            tr,
+                                            &config.appearance.status_bar_position,
+                                        ) {
+                                            chrome.paint(
+                                                &mut renderer,
+                                                tc,
+                                                tr,
+                                                &compositor_theme,
+                                            )?;
+                                            consumed = true;
+                                        }
+                                    }
+                                }
+                                if !consumed {
                                     // A focused sidebar re-targets `Resize*` at
                                     // itself. This arm is where the DEFAULT
                                     // resize keys land -- `p R h/j/k/l` is a
