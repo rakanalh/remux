@@ -1059,6 +1059,51 @@ async fn enter_view(
     Ok(())
 }
 
+/// Route raw bytes to the focused cell of `view`, addressed by pane identity
+/// (never to the foreground: a client showing a view is detached, so anything
+/// sent to the foreground is dropped by the server).
+///
+/// Cells that have `exited`, are `disconnected`, or are `is_session_visible()`
+/// take no input: the first two have no pane left to write to, and the third
+/// paints a placeholder while its real session drives the pane.
+///
+/// Crash-safe by contract: a failed send (a torn-down remote writer) is NOT
+/// propagated -- an input event must never exit the client. The cell is marked
+/// disconnected instead and `true` is returned, meaning "the view changed, the
+/// caller must repaint". `label` names the input path in the warning it logs.
+async fn send_to_focused_cell(
+    mgr: &mut ConnectionManager,
+    view: &mut crate::client::view::ClientView,
+    data: Vec<u8>,
+    label: &str,
+) -> bool {
+    let focused = view.focused;
+    let target = view
+        .cells
+        .get(focused)
+        .filter(|c| !c.exited && !c.disconnected && !c.is_session_visible())
+        .map(|c| (c.conn.clone(), c.pane_id));
+    let (conn, pane_id) = match target {
+        Some(t) => t,
+        None => return false,
+    };
+    if let Err(e) = mgr
+        .send(&conn, ClientMessage::InputToPane { pane_id, data })
+        .await
+    {
+        log::warn!(
+            "view: {label} InputToPane to {:?} pane {} failed: {e}; marking cell disconnected",
+            conn,
+            pane_id
+        );
+        if let Some(cell) = view.cells.get_mut(focused) {
+            cell.disconnected = true;
+        }
+        return true;
+    }
+    false
+}
+
 /// While a view is active, decide what a `RemuxCommand` does and apply it,
 /// returning `true` when the command was consumed (the caller should `continue`
 /// and forward nothing) or `false` when it must fall through to the normal path.
@@ -1300,33 +1345,8 @@ async fn handle_view_command(
             // content, so raw input is suppressed (the pane is driven by its real
             // session); view-management shortcuts still act on the view because
             // they are separate commands handled above, not `SendKey`.
-            let focused = views[av].focused;
-            let target = views[av]
-                .cells
-                .get(focused)
-                .filter(|c| !c.exited && !c.disconnected && !c.is_session_visible())
-                .map(|c| (c.conn.clone(), c.pane_id));
-            if let Some((conn, pane_id)) = target {
-                if let Err(e) = mgr
-                    .send(
-                        &conn,
-                        ClientMessage::InputToPane {
-                            pane_id,
-                            data: bytes.clone(),
-                        },
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "view: SendKey InputToPane to {:?} pane {} failed: {e}; marking cell disconnected",
-                        conn,
-                        pane_id
-                    );
-                    if let Some(c) = views[av].cells.get_mut(focused) {
-                        c.disconnected = true;
-                    }
-                    repaint!();
-                }
+            if send_to_focused_cell(mgr, &mut views[av], bytes.clone(), "SendKey").await {
+                repaint!();
             }
             Ok(true)
         }
@@ -1604,46 +1624,24 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     // In view mode, route keystrokes to the focused
                                     // cell's pane by identity (independent of the
-                                    // server's foreground focus). No cells => drop.
-                                    // A disconnected cell drops input; a send that
-                                    // fails (torn-down remote writer) is best-effort:
-                                    // mark the cell disconnected and repaint, never
-                                    // propagate -- a keystroke must never exit the
-                                    // client. A session-visible cell also drops raw
-                                    // text: it shows a placeholder and the pane is
-                                    // driven by its real session (view-management
-                                    // shortcuts go through the command path, not here).
-                                    let focused = views[av].focused;
-                                    let target = views[av]
-                                        .cells
-                                        .get(focused)
-                                        .filter(|c| !c.exited && !c.disconnected && !c.is_session_visible())
-                                        .map(|c| (c.conn.clone(), c.pane_id));
-                                    if let Some((conn, pane_id)) = target {
-                                        if let Err(e) = mgr
-                                            .send(&conn, ClientMessage::InputToPane { pane_id, data })
-                                            .await
-                                        {
-                                            log::warn!(
-                                                "view: InputToPane to {:?} pane {} failed: {e}; marking cell disconnected",
-                                                conn, pane_id
-                                            );
-                                            if let Some(cell) = views[av].cells.get_mut(focused) {
-                                                cell.disconnected = true;
-                                            }
-                                            paint_view(
-                                                &mut renderer,
-                                                &views[av],
-                                                &input,
-                                                &whichkey,
-                                                &theme,
-                                                &compositor_theme,
-                                                &view_border_style,
-                                                &which_key_position,
-                                                viewport_top,
-                                                focused_pane_rect.as_ref(),
-                                            )?;
-                                        }
+                                    // server's foreground focus) -- see
+                                    // `send_to_focused_cell` for which cells accept
+                                    // input and why a failed send is swallowed.
+                                    if send_to_focused_cell(mgr, &mut views[av], data, "key")
+                                        .await
+                                    {
+                                        paint_view(
+                                            &mut renderer,
+                                            &views[av],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &compositor_theme,
+                                            &view_border_style,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
                                     }
                                 } else {
                                     // Reset scroll when user types (sends PTY input)
@@ -3675,7 +3673,30 @@ async fn run_client_loop(
                         data.extend_from_slice(b"\x1b[200~");
                         data.extend_from_slice(text.as_bytes());
                         data.extend_from_slice(b"\x1b[201~");
-                        mgr.send_foreground(ClientMessage::Input { data }).await?;
+                        if let Some(av) = active_view {
+                            // A client showing a view is DETACHED, so a paste sent
+                            // to the foreground would be dropped by the server.
+                            // Route it to the focused cell's pane by identity,
+                            // exactly as a keystroke is.
+                            if send_to_focused_cell(mgr, &mut views[av], data, "paste")
+                                .await
+                            {
+                                paint_view(
+                                    &mut renderer,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &compositor_theme,
+                                    &view_border_style,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            }
+                        } else {
+                            mgr.send_foreground(ClientMessage::Input { data }).await?;
+                        }
                     }
                     Some(Err(e)) => {
                         log::error!("Event error: {}", e);
