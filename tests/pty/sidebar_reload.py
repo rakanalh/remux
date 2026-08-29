@@ -540,6 +540,40 @@ def test_focus_falls_back_when_the_reload_drops_the_focused_panel():
     return finish(t, name, fails)
 
 
+def read_state(t):
+    path = f"{t.rundir}/state/remux/sidebar.json"
+    return open(path).read() if os.path.exists(path) else ""
+
+
+def test_commenting_a_block_out_and_back_in_returns_the_dragged_width():
+    """The reload's save-back must not erase state for an edge the config just
+    dropped -- `SidebarState::from_chrome` describes only what is configured
+    now, so writing it verbatim destroys the rest. Commenting a block out to
+    try something without it reads as reversible; it has to be."""
+    name = "test_commenting_a_block_out_and_back_in_returns_the_dragged_width"
+    t = Tui("/tmp/rmx-sbrl9", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    fails = []
+    t.pump(1.0)
+
+    widen_the_sidebar(t)
+    dragged = stty_cols(t)
+    if dragged is None:
+        fails.append("could not read `stty size` after the runtime resize")
+
+    write_config(t, CFG_NONE)          # the block commented out
+    state = read_state(t)
+    if '"Left"' not in state and '"left"' not in state:
+        fails.append(
+            "the reload's save-back erased the dropped edge's state: " + repr(state)
+        )
+
+    write_config(t, CFG_SESSIONS)      # and back in
+    back = stty_cols(t)
+    check_width(fails, dragged, back, dragged, "a block commented out and back in")
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -555,6 +589,7 @@ if __name__ == "__main__":
         test_one_save_is_one_reload,
         test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel,
         test_focus_falls_back_when_the_reload_drops_the_focused_panel,
+        test_commenting_a_block_out_and_back_in_returns_the_dragged_width,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")

@@ -1850,11 +1850,14 @@ async fn run_client_loop(
     // the sidebars the user will actually see. Never fails: a missing,
     // unreadable, or corrupt state file degrades to the config defaults.
     crate::client::sidebar_state::apply(&mut chrome, &crate::client::sidebar_state::load());
-    // The `[[sidebar]]` config this chrome was last built from. The hot-reload
-    // arm diffs the incoming config against it field by field (see
-    // `sidebar_state::apply_on_reload`), so it MUST advance on every reload --
-    // left at the startup value, the second edit of a field would diff against
-    // a value two reloads old and the precedence rule would invert.
+    // Every `[[sidebar]]` edge this session has seen, at its last-seen values.
+    // The hot-reload arm diffs the incoming config against it field by field
+    // (see `sidebar_state::apply_on_reload`), so it MUST advance on every
+    // reload -- left at the startup value, the second edit of a field would
+    // diff against a value two reloads old and the precedence rule would
+    // invert. It advances by UPSERT (`merge_seen_config`), not replacement, so
+    // an edge whose block is commented out is still remembered when it comes
+    // back.
     let mut prev_sidebar_cfg = config.sidebar.clone();
     let mut which_key_position = config.appearance.which_key_position.clone();
     // Border style used to frame a VIEW's cells. This is client-local, and has
@@ -6044,14 +6047,17 @@ async fn run_client_loop(
                         &prev_sidebar_cfg,
                         &new_config.sidebar,
                     );
-                    prev_sidebar_cfg = new_config.sidebar.clone();
+                    prev_sidebar_cfg = crate::client::sidebar_state::merge_seen_config(
+                        &prev_sidebar_cfg,
+                        &new_config.sidebar,
+                    );
                     // Where the config won, the persisted state now describes
                     // something the user has overridden; write the truth back
                     // so the next reload diffs against it. Skipped when nothing
                     // has ever been persisted, so a config-only session still
                     // creates no state file.
                     if !sidebar_state.bars.is_empty()
-                        && crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
+                        && crate::client::sidebar_state::merged(&chrome, &sidebar_state)
                             != sidebar_state
                     {
                         crate::client::sidebar_state::save(&chrome);

@@ -33,6 +33,15 @@
 //! A field whose config value changed takes the config value; a field whose
 //! config value is unchanged keeps the persisted runtime value. A brand-new
 //! edge takes its config wholesale, stale state for it and all.
+//!
+//! "Brand new" means *never seen this session*, not *absent from the previous
+//! file* -- which is why the caller advances its snapshot with
+//! [`merge_seen_config`] rather than replacing it. Commenting a `[[sidebar]]`
+//! block out and back in types nothing new, so it has to return the width the
+//! user dragged; a restart with the block present already does exactly that
+//! through [`apply`], and a reload disagreeing with the restart path it is
+//! meant to replace would be its own bug. An edge no config this session has
+//! ever declared is still brand new, which is what the rule was for.
 
 use std::path::{Path, PathBuf};
 
@@ -130,8 +139,37 @@ pub fn load_from(path: &Path) -> SidebarState {
 /// Persist the chrome's current state. Best effort: a failure to write is
 /// logged and otherwise ignored, because losing a remembered sidebar width is
 /// never worth interrupting the session over.
+///
+/// Entries for edges the chrome does not currently have are CARRIED FORWARD
+/// (see [`merged`]) rather than dropped, so commenting a `[[sidebar]]` block
+/// out and back in returns the width the user dragged.
 pub fn save(chrome: &Chrome) {
-    save_to(&state_path(), &SidebarState::from_chrome(chrome));
+    let path = state_path();
+    let previous = load_from(&path);
+    save_to(&path, &merged(chrome, &previous));
+}
+
+/// The state to persist for `chrome`, keeping `previous`'s entries for edges
+/// `chrome` no longer has.
+///
+/// `SidebarState::from_chrome` alone describes only what is configured right
+/// now, so writing it verbatim DESTROYS the remembered size and visibility of
+/// every edge the config has since dropped. Commenting a `[[sidebar]]` block
+/// out to try something without it, then putting it back, would hand the user
+/// the config default instead of what they had -- quiet data loss on an action
+/// that reads as reversible.
+pub fn merged(chrome: &Chrome, previous: &SidebarState) -> SidebarState {
+    let mut state = SidebarState::from_chrome(chrome);
+    for bar in &previous.bars {
+        if !state.bars.iter().any(|b| b.edge == bar.edge) {
+            log::debug!(
+                "sidebar state: keeping the saved {:?} state; that edge is not in the config now",
+                bar.edge
+            );
+            state.bars.push(bar.clone());
+        }
+    }
+    state
 }
 
 /// `save`, against an explicit path and state.
@@ -208,12 +246,34 @@ pub fn apply(chrome: &mut Chrome, state: &SidebarState) {
     }
 }
 
+/// Advance the caller's "config seen so far this session" snapshot.
+///
+/// An upsert, not a replace: `incoming`'s entries win for the edges it
+/// declares, and entries for edges it does NOT declare are carried forward.
+/// That is what makes [`apply_on_reload`] read a re-added `[[sidebar]]` block
+/// as unchanged rather than brand new -- commenting a block out and back in
+/// types nothing new, so the width the user dragged has to come back.
+///
+/// Replacing the snapshot instead loses the edge's last-seen VALUES, and
+/// without them there is nothing to diff a re-added block against.
+pub fn merge_seen_config(seen: &[SidebarConfig], incoming: &[SidebarConfig]) -> Vec<SidebarConfig> {
+    let mut out = incoming.to_vec();
+    for sc in seen {
+        if !out.iter().any(|c| c.edge == sc.edge) {
+            out.push(sc.clone());
+        }
+    }
+    out
+}
+
 /// Overlay persisted state onto a config-built `Chrome` at HOT-RELOAD time.
 ///
 /// See the module docs for why this is not [`apply`]. Per edge, per field: a
 /// config value the user just changed wins, a config value they left alone
 /// yields to whatever they set at runtime. An edge with no entry in `old_cfg`
-/// is brand new and keeps its config values untouched.
+/// is brand new and keeps its config values untouched -- and `old_cfg` is
+/// every edge seen SO FAR this session (see [`merge_seen_config`]), not just
+/// the previous file's.
 ///
 /// `chrome` must already be built from `new_cfg`, so its fields hold the new
 /// config values before this runs -- that is what makes "unchanged" mean
@@ -281,6 +341,97 @@ mod tests {
                 },
             ],
         }])
+    }
+
+    #[test]
+    fn merge_seen_config_upserts_the_incoming_values() {
+        let seen = cfg(30, true, &[1]);
+        let incoming = cfg(50, false, &[2]);
+        let out = merge_seen_config(&seen, &incoming);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].size, out[0].visible), (50, false));
+        assert_eq!(out[0].panel[0].weight, 2);
+    }
+
+    #[test]
+    fn merge_seen_config_remembers_an_edge_the_new_config_dropped() {
+        // The whole reason this is an upsert. Replaced instead, a re-added
+        // block has no last-seen values to diff against and reads as brand
+        // new, so it comes back at its config default rather than the width
+        // the user dragged.
+        let seen = cfg(30, true, &[1]);
+        let out = merge_seen_config(&seen, &[]);
+        assert_eq!(out.len(), 1, "the dropped edge was forgotten");
+        assert_eq!(out[0].edge, SidebarEdge::Left);
+        assert_eq!(out[0].size, 30);
+    }
+
+    #[test]
+    fn merge_seen_config_adds_an_edge_seen_for_the_first_time() {
+        let out = merge_seen_config(&[], &cfg(30, true, &[1]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].edge, SidebarEdge::Left);
+    }
+
+    #[test]
+    fn saving_keeps_state_for_an_edge_the_config_no_longer_declares() {
+        // Comment a `[[sidebar]]` block out to try something without it, put it
+        // back, and the width you dragged has to still be there. Writing
+        // `from_chrome` verbatim destroys it, and the reload arm now saves --
+        // so this is reachable without the user touching a sidebar at all.
+        let previous = SidebarState {
+            bars: vec![
+                BarState {
+                    edge: SidebarEdge::Left,
+                    visible: true,
+                    size: 30,
+                    weights: vec![1],
+                },
+                BarState {
+                    edge: SidebarEdge::Right,
+                    visible: false,
+                    size: 55,
+                    weights: vec![3],
+                },
+            ],
+        };
+        // A chrome with only the left edge: the right one is gone from config.
+        let c = Chrome::from_config(&cfg(30, true, &[1]));
+        let out = merged(&c, &previous);
+
+        let right = out
+            .bars
+            .iter()
+            .find(|b| b.edge == SidebarEdge::Right)
+            .expect("the dropped edge's state was erased");
+        assert_eq!((right.size, right.visible), (55, false));
+        // ...and the live edge still reports what the chrome actually has.
+        let left = out
+            .bars
+            .iter()
+            .find(|b| b.edge == SidebarEdge::Left)
+            .expect("the live edge is missing");
+        assert_eq!(left.size, 30);
+    }
+
+    #[test]
+    fn saving_does_not_resurrect_a_stale_entry_over_the_live_one() {
+        // The carried-forward entries must never shadow an edge that IS in the
+        // chrome, or a dragged width could be overwritten by an older one.
+        let previous = SidebarState {
+            bars: vec![BarState {
+                edge: SidebarEdge::Left,
+                visible: false,
+                size: 99,
+                weights: vec![8],
+            }],
+        };
+        let mut c = Chrome::from_config(&cfg(30, true, &[1]));
+        c.sidebars[0].size = 42;
+        let out = merged(&c, &previous);
+        assert_eq!(out.bars.len(), 1, "the stale entry was appended anyway");
+        assert_eq!(out.bars[0].size, 42);
+        assert!(out.bars[0].visible);
     }
 
     // -- apply_on_reload: "what you typed wins, what you didn't keeps what
