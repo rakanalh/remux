@@ -568,10 +568,26 @@ def test_commenting_a_block_out_and_back_in_returns_the_dragged_width():
     fails = []
     t.pump(1.0)
 
+    # The width claim below is self-referential -- `back == dragged` -- so it
+    # passes on a dead fixture where both are the config default. The
+    # state-file check is not a substitute: it only discriminates because a
+    # no-op resize writes no `sidebar.json` at all, and it would report an
+    # ERASURE that never happened. Anything else that starts writing the file
+    # (persisting `focused_panel`, say -- explicitly left out today) retires
+    # that accident and this scenario would pass having tested nothing.
+    start = stty_cols(t)
     widen_the_sidebar(t)
     dragged = stty_cols(t)
-    if dragged is None:
-        fails.append("could not read `stty size` after the runtime resize")
+    if start is None or dragged is None:
+        fails.append(
+            f"could not read `stty size` around the resize "
+            f"(start={start}, dragged={dragged})"
+        )
+    elif dragged >= start:
+        fails.append(
+            f"the sidebar was never widened, so the round trip has nothing to "
+            f"return: {start} -> {dragged}"
+        )
 
     write_config(t, CFG_NONE)          # the block commented out
     state = read_state(t)
