@@ -497,6 +497,25 @@ pub fn box_bottom_line(inner_width: usize) -> String {
     )
 }
 
+/// The foreground a border wears, given whether the thing it frames holds
+/// focus. **The one statement of the active/inactive rule.**
+///
+/// The glyphs are shared by [`draw_zellij_box`] and the string builders above;
+/// this is the same argument one level up. It was written out three times --
+/// `draw_zellij_panes`, `view::cell_border_fg` and the sidebar frame -- and
+/// `draw_zellij_box` cannot own the choice, because it takes the colour as a
+/// parameter. So the choice lives here instead.
+///
+/// Callers that are always focused (a popup owns input whenever it is visible)
+/// pass `true` rather than reaching for `frame_active_fg` themselves.
+pub fn border_fg(theme: &CompositorTheme, active: bool) -> CellColor {
+    if active {
+        theme.frame_active_fg.clone()
+    } else {
+        theme.frame_fg.clone()
+    }
+}
+
 /// One cell of a border, in `border_fg` on the theme's border background.
 ///
 /// **The one construction of a border cell.** Every frame drawn anywhere -- the
@@ -646,11 +665,7 @@ fn draw_zellij_panes(
         };
 
         let is_active = pane_id == focused_pane;
-        let border_fg = if is_active {
-            theme.frame_active_fg.clone()
-        } else {
-            theme.frame_fg.clone()
-        };
+        let border_fg = border_fg(theme, is_active);
 
         let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
 
@@ -1114,7 +1129,9 @@ pub fn draw_tmux_dividers(
     // A divider IS the frame in tmux style, so it wears the frame's colors --
     // built by the shared `border_cell` and drawn by the shared runs, the same
     // ones the client's sidebar seam uses.
-    let fg = theme.frame_fg.clone();
+    // tmux dividers never track focus (this function is not even told which
+    // pane is focused), so the rule is asked with `false`.
+    let fg = border_fg(theme, false);
 
     for i in 0..pane_rects.len() {
         for j in (i + 1)..pane_rects.len() {
@@ -1228,8 +1245,9 @@ pub fn draw_popup(
     }
 
     // The popup owns input whenever it is visible, so it always wears the
-    // active-frame color.
-    let border_fg = theme.frame_active_fg.clone();
+    // active-frame color -- said through the shared rule rather than by
+    // reaching for the theme role directly.
+    let border_fg = border_fg(theme, true);
     let blank = RenderCell::default();
 
     // Clear the popup's footprint so the layout underneath cannot show through.
@@ -2035,6 +2053,55 @@ mod tests {
             interior,
             pane_content_rect(&BorderStyle::ZellijStyle, rect, false)
         );
+    }
+
+    /// Every border in the program resolves its focus colour through one rule.
+    ///
+    /// The glyphs are shared; this is the same argument one level up, and it
+    /// was written out three times before (`draw_zellij_panes`,
+    /// `view::cell_border_fg`, the sidebar frame).
+    #[test]
+    fn one_rule_decides_every_borders_focus_colour() {
+        let theme = CompositorTheme::default();
+        assert_eq!(border_fg(&theme, true), theme.frame_active_fg);
+        assert_eq!(border_fg(&theme, false), theme.frame_fg);
+        assert_ne!(
+            theme.frame_fg, theme.frame_active_fg,
+            "the default theme must distinguish them or this test proves nothing"
+        );
+
+        // A focused pane's border really is what the rule returns.
+        let layout = LayoutNode::new_stack(1);
+        let screen = Screen::new(18, 8, 100);
+        let mut panes = HashMap::new();
+        panes.insert(1, &screen);
+        let status = StatusInfo {
+            mode: "NORMAL".to_string(),
+            session_name: "t".to_string(),
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
+            layout_mode: "bsp".to_string(),
+            search_info: None,
+        };
+        let (buf, _) = composite(
+            &layout,
+            &panes,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            },
+            &BorderStyle::ZellijStyle,
+            &status,
+            20,
+            11,
+            0,
+            1,
+            None,
+            &HashMap::new(),
+            &theme,
+        );
+        assert_eq!(buf[0][0].fg, border_fg(&theme, true));
     }
 
     /// The string builders and the grid drawing use the SAME glyphs.

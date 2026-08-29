@@ -167,11 +167,10 @@ impl SidebarPlugin for SessionsPlugin {
         if grid.is_empty() {
             return grid;
         }
-        let header_fg = if focused {
-            theme.frame_active_fg.clone()
-        } else {
-            theme.frame_fg.clone()
-        };
+        // A panel's header tracks focus with the SAME theme roles its frame
+        // does -- that is why they match on screen -- so it asks the same rule
+        // rather than restating the choice.
+        let header_fg = crate::server::compositor::border_fg(theme, focused);
         draw_text(&mut grid, 0, 0, self.title(), header_fg, bg.clone());
 
         // An unfocused panel still marks its selection, dimmer: the row is

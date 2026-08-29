@@ -474,11 +474,10 @@ pub fn cell_rects(view: &ClientView, area: Rect) -> Vec<Option<Rect>> {
 /// view's borders indistinguishable from a normal tab's (the previous hardcoded
 /// `Indexed(10)`/`Indexed(8)` pair did not match any theme).
 fn cell_border_fg(theme: &CompositorTheme, focused: bool) -> CellColor {
-    if focused {
-        theme.frame_active_fg.clone()
-    } else {
-        theme.frame_fg.clone()
-    }
+    // Delegates rather than restates: the active/inactive choice is one rule,
+    // shared with the panes and the sidebar frame. Kept as a named wrapper
+    // because "focused" reads better than "active" at the call site here.
+    crate::server::compositor::border_fg(theme, focused)
 }
 
 /// The interior (content) region of a cell whose outer rect is `rw` x `rh` at
@@ -1102,7 +1101,9 @@ fn draw_monocle_strip(
         );
         return;
     }
-    let border_fg = theme.frame_active_fg.clone();
+    // Always the focused colour: the strip belongs to the focused cell. Said
+    // through the shared rule rather than by naming the theme role.
+    let border_fg = crate::server::compositor::border_fg(theme, true);
     let cells = build_top_border_content(
         &stack_info,
         view.focused_id(),

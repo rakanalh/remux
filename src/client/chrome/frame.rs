@@ -28,8 +28,8 @@ use crate::config::theme::CompositorTheme;
 use crate::config::BorderStyle;
 use crate::protocol::RenderCell;
 use crate::server::compositor::{
-    border_cell, draw_divider_column, draw_divider_row, draw_zellij_box, put_cell, BOX_TEE_DOWN,
-    BOX_TEE_LEFT, BOX_TEE_RIGHT, BOX_TEE_UP,
+    border_cell, border_fg, draw_divider_column, draw_divider_row, draw_zellij_box, put_cell,
+    BOX_TEE_DOWN, BOX_TEE_LEFT, BOX_TEE_RIGHT, BOX_TEE_UP,
 };
 use crate::server::layout::Rect;
 
@@ -64,10 +64,10 @@ pub fn draw_sidebar_frame(
     }
     let w = grid[0].len();
 
-    let fg = match style {
-        BorderStyle::ZellijStyle if active => theme.frame_active_fg.clone(),
-        _ => theme.frame_fg.clone(),
-    };
+    // The active/inactive choice is the shared rule; what is local here is
+    // WHICH styles track focus at all. tmux does not (see the doc above), so
+    // it asks the rule with `false` rather than answering it differently.
+    let fg = border_fg(theme, active && matches!(style, BorderStyle::ZellijStyle));
 
     match style {
         BorderStyle::ZellijStyle => {

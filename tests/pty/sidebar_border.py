@@ -289,15 +289,23 @@ def test_tmux_style_draws_a_seam_and_no_box():
 def test_toggle_style_reframes_the_sidebar_with_the_panes():
     """One keystroke must move both, or the sidebar contradicts the panes."""
     name = "test_toggle_style_reframes_the_sidebar_with_the_panes"
-    env = make_env(cfg("zellij_style"))
+    # size=10 so the panel's own content proves which frame is in force: the
+    # zellij box leaves an 8-column interior ("Placehol"), the tmux seam a
+    # 9-column one ("Placehold"). Asserting only on corner/seam GLYPHS would
+    # pass on a build that flipped the frame and kept the old interior -- the
+    # frame-right-content-wrong shape this branch keeps producing.
+    env = make_env(cfg("zellij_style", size=10))
     child, screen, pump = spawn(env)
     pump(1.5)
     rows = screen.display
     bad = []
     if rows[0][0] != TL:
-        bad.append(f"the sidebar did not start framed: {rows[0][:SIDEBAR_W]!r}")
-    if rows[0][SIDEBAR_W] != TL:
-        bad.append(f"the pane did not start framed: {rows[0][SIDEBAR_W:][:12]!r}")
+        bad.append(f"the sidebar did not start framed: {rows[0][:10]!r}")
+    if rows[0][10] != TL:
+        bad.append(f"the pane did not start framed: {rows[0][10:][:12]!r}")
+    # The zellij interior: 8 columns, then the box's right edge.
+    if rows[1][:10] != VERT + "Placehol" + VERT:
+        bad.append(f"zellij interior wrong before the toggle: {rows[1][:10]!r}")
 
     child.send(b"\x01")
     time.sleep(0.2)
@@ -307,11 +315,18 @@ def test_toggle_style_reframes_the_sidebar_with_the_panes():
     # tmux style: neither the sidebar nor the pane has a box any more, and the
     # sidebar's seam is the only divider left on the left of the screen.
     if rows[0][0] in BOX:
-        bad.append(f"the sidebar kept its box after the toggle: {rows[0][:SIDEBAR_W]!r}")
-    if rows[0][SIDEBAR_W - 1] != VERT:
-        bad.append(f"the sidebar has no tmux seam: {rows[0][:SIDEBAR_W]!r}")
-    if rows[0][SIDEBAR_W] == TL:
+        bad.append(f"the sidebar kept its box after the toggle: {rows[0][:10]!r}")
+    if rows[0][9] != VERT:
+        bad.append(f"the sidebar has no tmux seam: {rows[0][:10]!r}")
+    if rows[0][10] == TL:
         bad.append("the panes kept their box after the toggle")
+    # ...and the INTERIOR really moved with the frame: 9 columns now, starting
+    # at column 0. This is the assertion a frame-only test would miss.
+    if rows[0][:10] != "Placehold" + VERT:
+        bad.append(
+            f"the panel interior did not follow the toggle: {rows[0][:10]!r}, "
+            f"expected 'Placehold' + the seam"
+        )
 
     # ... and back again, in one keystroke.
     child.send(b"\x01")
@@ -320,9 +335,11 @@ def test_toggle_style_reframes_the_sidebar_with_the_panes():
     pump(1.5)
     rows = screen.display
     if rows[0][0] != TL:
-        bad.append(f"the sidebar did not come back framed: {rows[0][:SIDEBAR_W]!r}")
-    if rows[0][SIDEBAR_W] != TL:
+        bad.append(f"the sidebar did not come back framed: {rows[0][:10]!r}")
+    if rows[0][10] != TL:
         bad.append("the panes did not come back framed")
+    if rows[1][:10] != VERT + "Placehol" + VERT:
+        bad.append(f"the interior did not come back with it: {rows[1][:10]!r}")
 
     if bad:
         fail(name, "; ".join(bad), screen)
@@ -487,6 +504,14 @@ def test_a_config_reload_keeps_the_toggled_style():
     pump(1.5)
     if screen.display[0][SIDEBAR_W - 1] != VERT or screen.display[0][0] in BOX:
         bad.append(f"the toggle did not reach the sidebar: {screen.display[0][:SIDEBAR_W]!r}")
+    # The interior moved with the frame, not just the glyphs: a 30-column tmux
+    # sidebar leaves 29 columns, so the seam sits immediately after the panel's
+    # own content band rather than one column further in.
+    if screen.display[0][:SIDEBAR_W].rstrip(" ")[-1] != VERT:
+        bad.append(
+            f"the tmux seam is not the last cell of the bar: "
+            f"{screen.display[0][:SIDEBAR_W]!r}"
+        )
 
     narrower = 26
     baseline = client_log().count("client: config reloaded")
@@ -500,6 +525,14 @@ def test_a_config_reload_keeps_the_toggled_style():
     if rows[0][narrower - 1] != VERT:
         bad.append(
             f"the reload did not apply the new size: {rows[0][:SIDEBAR_W]!r}"
+        )
+    # ...and the INTERIOR is the tmux one at the NEW size: 25 columns of panel
+    # then the seam, with no box column at 0. Glyph-only assertions would pass
+    # on a build that kept the zellij interior behind a tmux-looking seam.
+    if rows[0][:narrower] != "Placeholder".ljust(narrower - 1) + VERT:
+        bad.append(
+            f"the panel interior is not the tmux one at the new size: "
+            f"{rows[0][:narrower]!r}"
         )
     # ...and the sidebar is still in the TOGGLED style, not the config's.
     if rows[0][0] in BOX:
