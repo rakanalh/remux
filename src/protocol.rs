@@ -44,7 +44,12 @@ pub enum ConnDescriptor {
 /// `Hello`/`Welcome` handshake and only then disagree, which is precisely what
 /// this number exists to prevent. Merging the two therefore resolves to 6 so
 /// that no build of either lineage can be mistaken for the merged protocol.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 6 -> 7: the file-manager sidebar plugin. Adds
+/// [`ClientMessage::SpawnAuxPane`]/[`ClientMessage::KillAuxPane`] and
+/// [`ServerMessage::AuxPaneSpawned`], the `cwd`/`is_active` session-tree fields
+/// those need to follow the focused pane.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -217,6 +222,37 @@ pub enum ClientMessage {
     /// explicitly -- this is what a focused View cell uses to type into the
     /// real pane it aliases, wherever that pane actually lives.
     InputToPane { pane_id: PaneId, data: Vec<u8> },
+    /// Spawn an **auxiliary pane**: a PTY that belongs to no layout tree, owned
+    /// by the requesting client and reaped when that client goes away.
+    ///
+    /// This is the server half of a sidebar panel that hosts a full-screen TUI
+    /// (the `files` plugin's file manager). It is not a new concept on the
+    /// server: `spawn_pane` already inserts into the flat pane map and touches
+    /// no layout, and everything that enumerates panes for display or
+    /// persistence walks a `LayoutNode` -- so an aux pane is invisible to the
+    /// session tree, to `remux` layouts and to save/restore by construction.
+    ///
+    /// `command` is REQUIRED (no default shell fallback): the plugin exists to
+    /// host a specific program, and a wrong guess spawns something the user then
+    /// has to hunt down and kill. `cwd` is the directory to start it in; `None`
+    /// inherits the server's.
+    ///
+    /// Answered with [`ServerMessage::AuxPaneSpawned`]. The client then
+    /// `SubscribePane`s the returned id exactly as a View cell does -- the whole
+    /// streaming half is the Views machinery unchanged.
+    SpawnAuxPane {
+        cols: u16,
+        rows: u16,
+        command: String,
+        cwd: Option<String>,
+    },
+    /// Kill an auxiliary pane this client spawned. Ignored for a pane this
+    /// connection does not own, so one client can never reap another's.
+    ///
+    /// The clean counterpart to the disconnect reap: a panel re-targeting to a
+    /// new directory kills its old pane rather than waiting for the client to
+    /// exit.
+    KillAuxPane { pane_id: PaneId },
     /// Scroll a subscribed pane's own scroll view by `lines` (per-subscriber,
     /// by pane identity), independent of this client's foreground scroll. Used
     /// by a View cell's mouse wheel: the server adjusts a per-(client, pane)
@@ -393,6 +429,14 @@ pub enum ServerMessage {
     ScrollbackContent { lines: Vec<String> },
     /// Response to a `RequestScrollbackInfo` request with the total line count.
     ScrollbackInfo { total_lines: usize },
+    /// Answer to [`ClientMessage::SpawnAuxPane`]: the id of the pane just
+    /// spawned.
+    ///
+    /// No correlation id. A client requests at most one aux pane per panel and
+    /// its requests are serialised by the single per-connection writer task, so
+    /// answers arrive in request order; the client matches them against a FIFO
+    /// of pending requesters.
+    AuxPaneSpawned { pane_id: PaneId },
     /// Response to a `ListSessionTree` request with the full hierarchy.
     SessionTree {
         folders: Vec<FolderTreeEntry>,
@@ -612,6 +656,15 @@ pub struct TabTreeEntry {
     pub id: u64,
     pub name: String,
     pub panes: Vec<PaneTreeEntry>,
+    /// Whether this is its session's ACTIVE tab.
+    ///
+    /// Needed because [`PaneTreeEntry::is_focused`] is per-tab -- every tab
+    /// marks its own focused pane -- so without this a consumer cannot tell
+    /// which of them is *the* focused pane of the session. `#[serde(default)]`
+    /// decodes an older peer's tree as "no active tab", which reads as "unknown"
+    /// rather than lying about one.
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 /// A pane entry in the session tree.
@@ -620,6 +673,15 @@ pub struct PaneTreeEntry {
     pub id: u64,
     pub name: String,
     pub is_focused: bool,
+    /// The pane's current working directory, for the `files` sidebar plugin to
+    /// follow.
+    ///
+    /// Filled ONLY for the focused pane of an active tab: resolving it is a
+    /// `/proc` readlink per pane (`persistence::get_pane_cwd`), and no consumer
+    /// wants the other panes' directories. `None` everywhere else, and for a
+    /// pane whose cwd could not be read.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,9 +1493,11 @@ mod tests {
                 sessions: vec![SessionTreeEntry {
                     name: "proj".to_string(),
                     tabs: vec![TabTreeEntry {
+                        is_active: true,
                         id: 1,
                         name: "Tab 1".to_string(),
                         panes: vec![PaneTreeEntry {
+                            cwd: None,
                             id: 10,
                             name: "zsh".to_string(),
                             is_focused: true,

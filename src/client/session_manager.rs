@@ -1477,9 +1477,11 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "project-a".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
+                        cwd: None,
                         id: 10,
                         name: "zsh".to_string(),
                         is_focused: true,
@@ -1492,6 +1494,7 @@ mod tests {
         let unfiled = vec![SessionTreeEntry {
             name: "scratch".to_string(),
             tabs: vec![TabTreeEntry {
+                is_active: true,
                 id: 2,
                 name: "Tab 1".to_string(),
                 panes: vec![],
@@ -2573,15 +2576,18 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "multi".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![
                         PaneTreeEntry {
+                            cwd: None,
                             id: 10,
                             name: "p10".to_string(),
                             is_focused: true,
                         },
                         PaneTreeEntry {
+                            cwd: None,
                             id: 11,
                             name: "p11".to_string(),
                             is_focused: false,
@@ -2679,9 +2685,11 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "multi".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
+                        cwd: None,
                         id: 10,
                         name: "p10".to_string(),
                         is_focused: true,
@@ -2735,6 +2743,7 @@ mod tests {
     /// so a query can be aimed at exactly one depth.
     fn search_tree() -> (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>) {
         let pane = |id: u64, name: &str| PaneTreeEntry {
+            cwd: None,
             id,
             name: name.to_string(),
             is_focused: false,
@@ -2746,11 +2755,13 @@ mod tests {
                     name: "alpha".to_string(),
                     tabs: vec![
                         TabTreeEntry {
+                            is_active: true,
                             id: 1,
                             name: "editor".to_string(),
                             panes: vec![pane(10, "vim"), pane(11, "logtail")],
                         },
                         TabTreeEntry {
+                            is_active: true,
                             id: 2,
                             name: "shell".to_string(),
                             panes: vec![pane(12, "bash")],
@@ -2765,6 +2776,7 @@ mod tests {
                 sessions: vec![SessionTreeEntry {
                     name: "beta".to_string(),
                     tabs: vec![TabTreeEntry {
+                        is_active: true,
                         id: 3,
                         name: "notes".to_string(),
                         panes: vec![pane(13, "nvim")],
@@ -2777,6 +2789,7 @@ mod tests {
         let unfiled = vec![SessionTreeEntry {
             name: "gamma".to_string(),
             tabs: vec![TabTreeEntry {
+                is_active: true,
                 id: 4,
                 name: "build".to_string(),
                 panes: vec![pane(14, "cargo")],

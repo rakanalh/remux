@@ -5666,6 +5666,13 @@ async fn run_client_loop(
                             }
                         }
                     }
+                    Some(ServerMessage::AuxPaneSpawned { pane_id }) => {
+                        // Answer to a `SpawnAuxPane` this client sent. Nothing
+                        // sends one yet -- the `files` sidebar plugin is the only
+                        // requester and it is not wired up here yet -- so an
+                        // arrival is a server talking to the wrong client.
+                        log::debug!("srv: AuxPaneSpawned pane_id={pane_id} (unclaimed)");
+                    }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);
                         // Update visual state with accurate total line count.

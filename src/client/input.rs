@@ -5119,9 +5119,11 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "proj".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
+                        cwd: None,
                         id: 10,
                         name: "zsh".to_string(),
                         is_focused: true,
@@ -5201,9 +5203,11 @@ mod tests {
                 sessions: vec![SessionTreeEntry {
                     name: "alpha".to_string(),
                     tabs: vec![TabTreeEntry {
+                        is_active: true,
                         id: 1,
                         name: "editor".to_string(),
                         panes: vec![PaneTreeEntry {
+                            cwd: None,
                             id: 10,
                             name: "zsh".to_string(),
                             is_focused: true,

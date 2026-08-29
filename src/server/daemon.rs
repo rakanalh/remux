@@ -241,6 +241,19 @@ struct ClientConnection {
     /// `ClientConnection` in [`handle_client_disconnect`] drops the
     /// subscription with it, so there is no second registry to leak.
     session_tree_subscribed: bool,
+    /// Auxiliary panes this client asked the server to spawn
+    /// ([`ClientMessage::SpawnAuxPane`]) -- PTYs that belong to no layout tree,
+    /// backing a sidebar panel that hosts a full-screen TUI.
+    ///
+    /// The list is the OWNERSHIP record, and it lives here for the same reason
+    /// `session_tree_subscribed` does: a pane in no layout is reachable from
+    /// nothing else, so a connection that went away without taking its aux panes
+    /// with it would leave PTYs running with no route to them and no way to find
+    /// them -- a leaked process, the headline risk of the feature.
+    /// [`handle_client_disconnect`] reaps whatever is left here, which is what
+    /// makes an ABRUPT disconnect as safe as a clean
+    /// [`ClientMessage::KillAuxPane`](crate::protocol::ClientMessage::KillAuxPane).
+    aux_panes: Vec<PaneId>,
 }
 
 /// The Remux server.
@@ -546,6 +559,7 @@ impl RemuxServer {
                     pane_drag: None,
                     pane_autoscroll_repeat: None,
                     session_tree_subscribed: false,
+                    aux_panes: Vec::new(),
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -621,7 +635,7 @@ impl RemuxServer {
                     }
                     Ok(None) => {
                         log::info!("client {client_id} disconnected");
-                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        handle_client_disconnect(client_id, &panes, &clients, &prev_frames).await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -631,7 +645,7 @@ impl RemuxServer {
                     }
                     Err(e) => {
                         log::error!("error reading from client {client_id}: {e}");
-                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        handle_client_disconnect(client_id, &panes, &clients, &prev_frames).await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -1082,6 +1096,55 @@ async fn handle_client_message(
             // The new/updated demand may shrink (or release) the pane's effective
             // size; recompute and re-stream if it changed.
             recompute_pane_size(pane_id, state, panes, clients, config).await;
+            Ok(())
+        }
+        ClientMessage::SpawnAuxPane {
+            cols,
+            rows,
+            command,
+            cwd,
+        } => {
+            handle_spawn_aux_pane(
+                client_id,
+                cols,
+                rows,
+                &command,
+                cwd.as_deref(),
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await;
+            Ok(())
+        }
+        ClientMessage::KillAuxPane { pane_id } => {
+            // Owned-only: forget it first (under `clients` alone), and reap only
+            // if this connection was in fact the owner. A client must not be able
+            // to kill another client's panel, and a repeat kill must be a no-op
+            // rather than a second `PaneExited` for an id already gone.
+            let owned = {
+                let mut cls = clients.lock().await;
+                match cls.get_mut(&client_id) {
+                    Some(conn) => {
+                        let before = conn.aux_panes.len();
+                        conn.aux_panes.retain(|&p| p != pane_id);
+                        conn.aux_panes.len() != before
+                    }
+                    None => false,
+                }
+            };
+            if owned {
+                log::debug!("server: KillAuxPane client_id={client_id} pane_id={pane_id}");
+                reap_panes(&[pane_id], panes, clients).await;
+            } else {
+                log::warn!(
+                    "server: KillAuxPane client_id={client_id} pane_id={pane_id} \
+                     is not owned by this connection; ignoring"
+                );
+            }
             Ok(())
         }
         ClientMessage::UnsubscribePane { pane_id } => {
@@ -3031,7 +3094,16 @@ static SESSION_TREE_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new(
 /// Record that the session tree has changed. Cheap and non-blocking; safe to
 /// call while holding any server lock. With no subscribers the pusher wakes,
 /// finds none, and parks again.
-fn mark_session_tree_dirty() {
+///
+/// `pub(crate)` so the two state mutators that move focus -- [`Tab::focus_pane`]
+/// and [`ServerState::goto_tab`] -- can call it directly. Focus is the one thing
+/// the tree shows that no command handler used to mark: a `PaneFocus*` reshapes
+/// nothing, so the tree a subscriber holds kept its old focus marker until some
+/// unrelated structural change happened to redraw it.
+///
+/// [`Tab::focus_pane`]: crate::server::session::Tab::focus_pane
+/// [`ServerState::goto_tab`]: crate::server::session::ServerState::goto_tab
+pub(crate) fn mark_session_tree_dirty() {
     SESSION_TREE_DIRTY.notify_one();
 }
 
@@ -3096,14 +3168,35 @@ async fn send_session_tree_to(
         }
     }
 
+    // Working directories, for the `files` sidebar plugin to follow. Resolved
+    // ONLY for the pane `build_session_tree` will actually attach one to -- the
+    // focused pane of each session's ACTIVE tab -- because `get_pane_cwd` is a
+    // `/proc` readlink (or a `sysinfo` process refresh on macOS) per call and a
+    // whole-map sweep would pay it for every pane on every push.
+    let mut pane_cwds: HashMap<PaneId, String> = HashMap::new();
+    for sess in st.sessions.values() {
+        let Some(tab) = sess.tabs.get(sess.active_tab) else {
+            continue;
+        };
+        if let Some(pane) = ps.get(&tab.focused_pane) {
+            if let Some(cwd) = crate::server::persistence::get_pane_cwd(pane.pty.child_pid) {
+                pane_cwds.insert(tab.focused_pane, cwd);
+            }
+        }
+    }
+
     for &target in targets {
         let Some(client) = cls.get(&target) else {
             continue;
         };
         // `is_current` is per-recipient, so the tree is built per target from
         // the one shared snapshot above.
-        let (folders, unfiled) =
-            st.build_session_tree(client.session_name.as_deref(), &client_counts, &pane_names);
+        let (folders, unfiled) = st.build_session_tree(
+            client.session_name.as_deref(),
+            &client_counts,
+            &pane_names,
+            &pane_cwds,
+        );
         let _ = client.tx.send(ServerMessage::SessionTree {
             folders,
             unfiled,
@@ -3183,13 +3276,29 @@ async fn handle_kill_session(
 
 async fn handle_client_disconnect(
     client_id: u64,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     prev_frames: &PrevFrameCache,
 ) {
     log::debug!("server: client_id={client_id} disconnected, removing from client map");
-    {
+    // Take the departing client's aux panes OUT of the removed connection, then
+    // reap them once the lock is released: `reap_panes` takes `panes` and then
+    // `clients` itself, so reaping inside this critical section would nest them
+    // the wrong way round.
+    //
+    // This runs for EVERY disconnect, clean or abrupt -- it is the half of
+    // aux-pane lifetime that a `KillAuxPane` the client never got to send cannot
+    // cover, and the reason a killed terminal does not leave a file manager
+    // running forever.
+    let orphans = {
         let mut cls = clients.lock().await;
-        cls.remove(&client_id);
+        cls.remove(&client_id)
+            .map(|c| c.aux_panes)
+            .unwrap_or_default()
+    };
+    if !orphans.is_empty() {
+        log::info!("server: client_id={client_id} left; reaping aux panes {orphans:?}");
+        reap_panes(&orphans, panes, clients).await;
     }
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
@@ -5057,6 +5166,96 @@ async fn create_pane_in_tab(
     Ok(Some(new_pane_id))
 }
 
+/// Spawn an auxiliary pane for `client_id` and answer with its id.
+///
+/// The whole handler is composition: [`spawn_pane`] already produces exactly "a
+/// pane outside the layout tree" -- it inserts into the flat `panes` map and
+/// touches no `LayoutNode` -- and [`start_forwarding_for_pane`] already pumps a
+/// PTY that belongs to no session. The only thing added here is the OWNERSHIP
+/// record on the connection, which is what makes the pane reapable.
+///
+/// `command` is passed through as-is with no shell fallback: the client is
+/// required to name the program, because a wrong guess spawns something in a PTY
+/// the user then has to hunt down.
+///
+/// Nothing is sent on failure beyond a log line; the client's panel stays in its
+/// "waiting" state, which is the honest reading of "no pane came back".
+#[allow(clippy::too_many_arguments)]
+async fn handle_spawn_aux_pane(
+    client_id: u64,
+    cols: u16,
+    rows: u16,
+    command: &str,
+    cwd: Option<&str>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) {
+    // A zero-sized PTY is a pane no content can be rendered into; the client
+    // asks only once its panel has a real rect, so this is belt and braces.
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let pane_id = {
+        let mut st = state.lock().await;
+        st.next_pane_id()
+    };
+    log::info!(
+        "server: SpawnAuxPane client_id={client_id} pane_id={pane_id}          dims={cols}x{rows} command={command:?} cwd={cwd:?}"
+    );
+    if let Err(e) = spawn_pane(
+        pane_id,
+        cols,
+        rows,
+        Some(command),
+        cwd.map(std::path::Path::new),
+        panes,
+        config,
+    )
+    .await
+    {
+        log::error!("server: SpawnAuxPane failed for client_id={client_id}: {e:#}");
+        return;
+    }
+    // Record ownership BEFORE the forwarding task can report the pane's death:
+    // an aux pane whose command exits instantly would otherwise be reaped while
+    // no connection claims it, and the `AuxPaneSpawned` below would name an id
+    // the client can never kill.
+    {
+        let mut cls = clients.lock().await;
+        match cls.get_mut(&client_id) {
+            Some(conn) => conn.aux_panes.push(pane_id),
+            // The client vanished between its request and here. Nothing owns the
+            // PTY, so reap it rather than leak it.
+            None => {
+                drop(cls);
+                log::warn!(
+                    "server: SpawnAuxPane requester client_id={client_id} is gone;                      reaping pane_id={pane_id}"
+                );
+                reap_panes(&[pane_id], panes, clients).await;
+                return;
+            }
+        }
+    }
+    start_forwarding_for_pane(
+        pane_id,
+        None,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await;
+    let cls = clients.lock().await;
+    if let Some(conn) = cls.get(&client_id) {
+        let _ = conn.tx.send(ServerMessage::AuxPaneSpawned { pane_id });
+    }
+}
+
 async fn spawn_pane(
     pane_id: PaneId,
     cols: u16,
@@ -6882,34 +7081,76 @@ async fn start_pty_forwarding(
 
     log::debug!("server: start_pty_forwarding session={session_name:?} pane_ids={pane_ids:?}");
 
-    let session_name = session_name.to_string();
-
     for pane_id in pane_ids {
-        // Enforce exactly one forwarding task per pane. Check-and-set the
-        // guard under the panes lock before spawning: if a task already
-        // exists, skip this pane so we don't spawn a competing task that
-        // could process PTY chunks out of order.
-        {
-            let mut ps = panes.lock().await;
-            match ps.get_mut(&pane_id) {
-                Some(pane_data) => {
-                    if pane_data.forwarding_started {
-                        continue; // already has its forwarding task
-                    }
-                    pane_data.forwarding_started = true;
+        start_forwarding_for_pane(
+            pane_id,
+            Some(session_name.to_string()),
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            dormant,
+        )
+        .await;
+    }
+}
+
+/// Start the one forwarding task for `pane_id`: pump its PTY into its `Screen`,
+/// stream the result to subscribers, and handle the pane's death.
+///
+/// `session_name` is what distinguishes a normal pane from an **auxiliary** one,
+/// and it is the only difference between the two:
+/// - `Some(name)`: the pane belongs to that session's layout, so each batch also
+///   re-composites the session's frame, and the pane's death runs the full
+///   `close_pane` path (layout repair, persistence, the tree push).
+/// - `None`: an aux pane
+///   ([`SpawnAuxPane`](crate::protocol::ClientMessage::SpawnAuxPane)), in no
+///   layout and on no frame. There is nothing to composite, and its death is
+///   just [`reap_panes`] -- drop it from the pane table and tell its
+///   subscribers, which is the only part of `close_pane` that would have
+///   applied.
+///
+/// Split out of [`start_pty_forwarding`] rather than copied for the aux case:
+/// the loop body is the emulator's whole ingest path (batching, DSR replies,
+/// OSC 52, activity marking, subscriber streaming), and a second copy of it
+/// would drift.
+#[allow(clippy::too_many_arguments)]
+async fn start_forwarding_for_pane(
+    pane_id: PaneId,
+    session_name: Option<String>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) {
+    // Enforce exactly one forwarding task per pane. Check-and-set the
+    // guard under the panes lock before spawning: if a task already
+    // exists, skip this pane so we don't spawn a competing task that
+    // could process PTY chunks out of order.
+    {
+        let mut ps = panes.lock().await;
+        match ps.get_mut(&pane_id) {
+            Some(pane_data) => {
+                if pane_data.forwarding_started {
+                    return; // already has its forwarding task
                 }
-                None => continue,
+                pane_data.forwarding_started = true;
             }
+            None => return,
         }
+    }
 
-        let state = Arc::clone(state);
-        let panes = Arc::clone(panes);
-        let clients = Arc::clone(clients);
-        let config = Arc::clone(config);
-        let prev_frames = Arc::clone(prev_frames);
-        let dormant = Arc::clone(dormant);
-        let session_name = session_name.clone();
+    let state = Arc::clone(state);
+    let panes = Arc::clone(panes);
+    let clients = Arc::clone(clients);
+    let config = Arc::clone(config);
+    let prev_frames = Arc::clone(prev_frames);
+    let dormant = Arc::clone(dormant);
 
+    {
         tokio::spawn(async move {
             loop {
                 let recv_result = {
@@ -6993,37 +7234,52 @@ async fn start_pty_forwarding(
                         // subscriber it returns before snapshotting, so a pane
                         // nobody watches costs nothing per PTY batch.
                         stream_pane_content(pane_id, &state, &panes, &clients).await;
-                        broadcast_full_render(
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
+                        // An aux pane is on no session's frame; its subscribers
+                        // (the sidebar panel) were just served above.
+                        if let Some(sn) = &session_name {
+                            broadcast_full_render(
+                                sn,
+                                &state,
+                                &panes,
+                                &clients,
+                                &config,
+                                &prev_frames,
+                            )
+                            .await;
+                        }
                     }
                     Some(Err(())) => {
                         // Channel disconnected - process has exited.
                         log::debug!(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name:?}"
                         );
-                        // Close the pane automatically.
-                        close_pane(
-                            pane_id,
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
-                        notify_if_close_declined(pane_id, &panes, &clients).await;
-                        save_if_enabled(&state, &panes, &config, &dormant).await;
-                        // A pane dying on its own removes a row from every
-                        // subscriber's tree, and no command ran to say so.
-                        mark_session_tree_dirty();
+                        match &session_name {
+                            Some(sn) => {
+                                // Close the pane automatically.
+                                close_pane(
+                                    pane_id,
+                                    sn,
+                                    &state,
+                                    &panes,
+                                    &clients,
+                                    &config,
+                                    &prev_frames,
+                                )
+                                .await;
+                                notify_if_close_declined(pane_id, &panes, &clients).await;
+                                save_if_enabled(&state, &panes, &config, &dormant).await;
+                                // A pane dying on its own removes a row from every
+                                // subscriber's tree, and no command ran to say so.
+                                mark_session_tree_dirty();
+                            }
+                            // An aux pane is in no layout and no tree, so its
+                            // death is the notification half alone. The owning
+                            // client keeps the id in its `aux_panes` list; a
+                            // later reap of it is a no-op, and the `PaneExited`
+                            // this sends is what tells the panel to show its
+                            // exited state.
+                            None => reap_panes(&[pane_id], &panes, &clients).await,
+                        }
                         break;
                     }
                     None => {

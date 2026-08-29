@@ -345,6 +345,7 @@ mod tests {
 
     fn pane(id: u64, name: &str) -> PaneTreeEntry {
         PaneTreeEntry {
+            cwd: None,
             id,
             name: name.to_string(),
             is_focused: false,
@@ -353,6 +354,7 @@ mod tests {
 
     fn tab(id: u64, name: &str, panes: Vec<PaneTreeEntry>) -> TabTreeEntry {
         TabTreeEntry {
+            is_active: true,
             id,
             name: name.to_string(),
             panes,
