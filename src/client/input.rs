@@ -4330,9 +4330,10 @@ mod tests {
             ('h', SidebarIntent::Toggle(SidebarEdge::Left)),
             ('l', SidebarIntent::Toggle(SidebarEdge::Right)),
             ('j', SidebarIntent::Toggle(SidebarEdge::Bottom)),
-            ('H', SidebarIntent::Focus(SidebarEdge::Left)),
-            ('L', SidebarIntent::Focus(SidebarEdge::Right)),
-            ('J', SidebarIntent::Focus(SidebarEdge::Bottom)),
+            // The `SidebarFocus*` leaves have no default binding -- see
+            // `sidebar_focus_actions_are_unbound_by_default_but_still_bindable`
+            // in `config::keybindings`. Bound from config they still produce
+            // `SidebarIntent::Focus`; the PTY harnesses bind them to `Alt-2`.
             ('b', SidebarIntent::Cycle),
         ];
         for (key, intent) in expected {

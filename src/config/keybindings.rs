@@ -255,9 +255,11 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('h', leaf("toggle left", "SidebarToggleLeft")),
                 ('l', leaf("toggle right", "SidebarToggleRight")),
                 ('j', leaf("toggle bottom", "SidebarToggleBottom")),
-                ('H', leaf("focus left", "SidebarFocusLeft")),
-                ('L', leaf("focus right", "SidebarFocusRight")),
-                ('J', leaf("focus bottom", "SidebarFocusBottom")),
+                // No default FOCUS leaves. `Alt+h/j/k/l` already enter and
+                // leave a sidebar exactly as they move between panes, so a
+                // second way in would be redundant surface on the busiest
+                // group. The `SidebarFocus*` actions stay registered and
+                // bindable from config for anyone who wants them.
                 ('b', leaf("cycle focus", "SidebarCycle")),
             ],
         ),
@@ -1791,9 +1793,6 @@ mod tests {
             ('h', "SidebarToggleLeft"),
             ('l', "SidebarToggleRight"),
             ('j', "SidebarToggleBottom"),
-            ('H', "SidebarFocusLeft"),
-            ('L', "SidebarFocusRight"),
-            ('J', "SidebarFocusBottom"),
             ('b', "SidebarCycle"),
         ];
         for (key, name) in expected {
@@ -1810,6 +1809,30 @@ mod tests {
                 }
                 other => panic!("expected a leaf at 'b {key}', got {other:?}"),
             }
+        }
+    }
+
+    /// The `SidebarFocus*` actions are deliberately UNBOUND by default --
+    /// `Alt+h/j/k/l` already enter and leave a sidebar -- but they stay in the
+    /// action registry so a user can bind them from config. Both halves matter:
+    /// dropping the leaves while leaving a dangling action name, or removing
+    /// the action outright, would each be wrong in a different direction.
+    #[test]
+    fn sidebar_focus_actions_are_unbound_by_default_but_still_bindable() {
+        let tree = KeybindingTree::default();
+        for (key, name) in [
+            ('H', "SidebarFocusLeft"),
+            ('L', "SidebarFocusRight"),
+            ('J', "SidebarFocusBottom"),
+        ] {
+            assert!(
+                tree.lookup(&['b', key]).is_none(),
+                "'b {key}' still has a default binding"
+            );
+            assert!(
+                resolve_action(name).is_some(),
+                "{name} is no longer bindable from config"
+            );
         }
     }
 

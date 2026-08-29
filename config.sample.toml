@@ -366,10 +366,14 @@
 # h = "SidebarToggleLeft"
 # l = "SidebarToggleRight"
 # j = "SidebarToggleBottom"
+# b = "SidebarCycle"
+#
+# There are no default FOCUS bindings: Alt+h/j/k/l enter and leave a sidebar
+# exactly as they move between panes. The SidebarFocus* actions are still in
+# the registry, so add them here if you want a second way in:
 # H = "SidebarFocusLeft"
 # L = "SidebarFocusRight"
 # J = "SidebarFocusBottom"
-# b = "SidebarCycle"
 
 # --- Direct bindings (root level) ---
 # These are top-level keys pressed right after the leader, not inside a group.
