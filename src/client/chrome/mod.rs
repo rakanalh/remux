@@ -280,6 +280,47 @@ impl Chrome {
         true
     }
 
+    /// Put focus back on `edge`'s panel `panel` after a rebuild, without
+    /// opening anything.
+    ///
+    /// The difference from [`Chrome::focus_edge`] is the missing
+    /// `visible = true`: this restores focus the user already had, so a
+    /// sidebar the new config hides must stay hidden. Everything else is the
+    /// same, and for the same reason -- the target is checked against
+    /// `panel_rects`, not against `panels.len()`, because `split_panels` drops
+    /// a panel whose weighted share falls below its `min_size`. A surviving
+    /// edge whose stack changed shape can leave `panel` naming something that
+    /// is never painted, and focusing that swallows every keystroke into a
+    /// panel nobody can see.
+    ///
+    /// Falls back to the sidebar's first laid-out panel, and returns `false`
+    /// (leaving focus alone) when the edge is gone or none of its panels are
+    /// laid out.
+    pub fn refocus_edge(
+        &mut self,
+        edge: SidebarEdge,
+        panel: usize,
+        term_cols: u16,
+        term_rows: u16,
+    ) -> bool {
+        let Some(i) = self.sidebars.iter().position(|s| s.edge == edge) else {
+            return false;
+        };
+        let rects = self.panel_rects(term_cols, term_rows);
+        let mut mine = rects.iter().filter(|(s, _, _)| *s == i).map(|(_, p, _)| *p);
+        let Some(first) = mine.next() else {
+            return false;
+        };
+        let panel = if rects.iter().any(|(s, p, _)| *s == i && *p == panel) {
+            panel
+        } else {
+            first
+        };
+        self.focus = ChromeFocus::Sidebar { sidebar: i, panel };
+        self.sidebars[i].focused_panel = panel;
+        true
+    }
+
     /// Cycle focus through every visible panel, then back to the content area.
     pub fn cycle_focus(&mut self, term_cols: u16, term_rows: u16) {
         let rects = self.panel_rects(term_cols, term_rows);
@@ -1507,6 +1548,80 @@ mod resize_tests {
                 })
                 .collect(),
         }
+    }
+
+    // -- refocus_edge -------------------------------------------------------
+
+    fn weighted(edge: SidebarEdge, size: u16, weights: &[u16]) -> SidebarConfig {
+        SidebarConfig {
+            edge,
+            size,
+            visible: true,
+            panel: weights
+                .iter()
+                .map(|w| PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: *w,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn refocus_edge_falls_back_when_the_target_panel_is_not_laid_out() {
+        // The regression this exists for. A 100:1 split over 30 rows gives the
+        // second panel a share below the placeholder's `min_rows`, so
+        // `split_panels` DROPS it -- while `panels.len()` is still 2. Clamping
+        // on the count would restore focus to a panel that is never painted.
+        let mut c = Chrome::from_config(&[weighted(SidebarEdge::Left, 30, &[100, 1])]);
+        let laid_out: Vec<usize> = c
+            .panel_rects(100, 30)
+            .into_iter()
+            .map(|(_, p, _)| p)
+            .collect();
+        assert_eq!(laid_out, vec![0], "the fixture did not drop a panel");
+
+        assert!(c.refocus_edge(SidebarEdge::Left, 1, 100, 30));
+        assert_eq!(
+            c.focus,
+            ChromeFocus::Sidebar {
+                sidebar: 0,
+                panel: 0
+            },
+            "focus landed on a panel that is not painted"
+        );
+        assert_eq!(c.sidebars[0].focused_panel, 0);
+    }
+
+    #[test]
+    fn refocus_edge_restores_the_exact_panel_when_it_is_still_laid_out() {
+        let mut c = Chrome::from_config(&[weighted(SidebarEdge::Left, 30, &[1, 1])]);
+        assert!(c.refocus_edge(SidebarEdge::Left, 1, 100, 30));
+        assert_eq!(
+            c.focus,
+            ChromeFocus::Sidebar {
+                sidebar: 0,
+                panel: 1
+            }
+        );
+    }
+
+    #[test]
+    fn refocus_edge_refuses_a_hidden_sidebar_without_opening_it() {
+        // The one behavioural difference from `focus_edge`: this restores focus
+        // the user already had, so a config that just hid the sidebar must win.
+        let mut c = Chrome::from_config(&[weighted(SidebarEdge::Left, 30, &[1])]);
+        c.sidebars[0].visible = false;
+        assert!(!c.refocus_edge(SidebarEdge::Left, 0, 100, 30));
+        assert!(!c.sidebars[0].visible, "refocus_edge opened the sidebar");
+        assert_eq!(c.focus, ChromeFocus::Content);
+    }
+
+    #[test]
+    fn refocus_edge_refuses_an_edge_the_config_no_longer_declares() {
+        let mut c = Chrome::from_config(&[weighted(SidebarEdge::Left, 30, &[1])]);
+        assert!(!c.refocus_edge(SidebarEdge::Right, 0, 100, 30));
+        assert_eq!(c.focus, ChromeFocus::Content);
     }
 
     #[test]

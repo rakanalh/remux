@@ -84,6 +84,34 @@ CFG_PLACEHOLDER_TOUCHED = CFG_PLACEHOLDER + """
 [appearance.unused_marker_section]
 """
 
+def _stacked(w1, w2):
+    return f"""
+[appearance]
+border_style = "zellij_style"
+
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+
+  [[sidebar.panel]]
+  plugin = "placeholder"
+  weight = {w1}
+
+  [[sidebar.panel]]
+  plugin = "placeholder"
+  weight = {w2}
+"""
+
+
+# Two evenly split panels, then the same stack reweighted 100:1. Over ROWS rows
+# the second panel's share falls below the placeholder's `min_rows`, so
+# `split_panels` DROPS it -- while `panels.len()` is still 2. That gap is the
+# whole point: a restore clamped on the COUNT lands focus on a panel that is
+# never painted.
+CFG_STACKED = _stacked(1, 1)
+CFG_STACKED_SECOND_DROPPED = _stacked(100, 1)
+
 WIDER_W = 40
 
 # The same sidebar with `size` retyped. Once `sidebar.json` exists -- and it
@@ -459,6 +487,59 @@ def test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel():
     return finish(t, name, fails)
 
 
+def panel_markers(t):
+    """(row, "focused"/"idle") for every placeholder marker on screen."""
+    out = []
+    for y, row in enumerate(t.rows_text()):
+        cell = row[:SIDEBAR_W]
+        if "focused" in cell:
+            out.append((y, "focused"))
+        elif "idle" in cell:
+            out.append((y, "idle"))
+    return out
+
+
+def test_focus_falls_back_when_the_reload_drops_the_focused_panel():
+    """The focused panel can survive in `panels` and vanish from `panel_rects`.
+
+    `split_panels` drops a panel whose weighted share falls below its
+    `min_size`, so a stack the user just reweighted can leave the restored
+    index naming something that is never painted. Restoring focus there
+    swallows the keyboard into a panel nobody can see.
+    """
+    name = "test_focus_falls_back_when_the_reload_drops_the_focused_panel"
+    t = Tui("/tmp/rmx-sbrl8", cols=COLS, rows=ROWS, config=CFG_STACKED).start()
+    fails = []
+    t.pump(1.0)
+
+    if len(panel_markers(t)) != 2:
+        fails.append(f"the stack did not start with two panels: {panel_markers(t)}")
+    t.send(b"\x1bh", 1.0)          # Alt+h enters the sidebar, on panel 0
+    t.send(b"\x1bj", 1.0)          # Alt+j walks down to panel 1
+    focused = [y for (y, m) in panel_markers(t) if m == "focused"]
+    if focused != [panel_markers(t)[1][0]]:
+        fails.append(f"the SECOND panel never took focus: {panel_markers(t)}")
+
+    write_config(t, CFG_STACKED_SECOND_DROPPED)
+
+    marks = panel_markers(t)
+    if len(marks) != 1:
+        fails.append(f"the reweighted stack did not drop a panel: {marks}")
+    if marks and marks[0][1] != "focused":
+        fails.append(
+            f"focus was restored to the panel that is no longer painted: {marks}"
+        )
+    # And it is real focus: a plain key has to reach the surviving plugin.
+    t.send(b"j", 0.8)
+    if not any("focused 1" in r[:SIDEBAR_W] for r in t.rows_text()):
+        fails.append(
+            "a plain key did not reach the surviving panel: "
+            + repr([r[:SIDEBAR_W].rstrip() for r in t.rows_text() if r[:SIDEBAR_W].strip()])
+        )
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -473,6 +554,7 @@ if __name__ == "__main__":
         test_a_visible_flip_typed_into_the_config_beats_the_persisted_one,
         test_one_save_is_one_reload,
         test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel,
+        test_focus_falls_back_when_the_reload_drops_the_focused_panel,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")

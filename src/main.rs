@@ -6056,23 +6056,18 @@ async fn run_client_loop(
                     {
                         crate::client::sidebar_state::save(&chrome);
                     }
-                    // Put the keyboard back where it was, if that edge
-                    // survived the rebuild and is still on screen. The panel
-                    // index is clamped: the stack may have lost a panel.
+                    // Put the keyboard back where it was. `refocus_edge`
+                    // resolves the target against `panel_rects`, so a stack
+                    // that changed shape cannot leave focus on a panel that is
+                    // never painted -- `split_panels` drops one whose weighted
+                    // share falls below its `min_size`, and the panel COUNT
+                    // says nothing about that.
                     if let Some((edge, panel)) = focused_edge {
-                        match chrome.sidebar_on(edge, tc, tr) {
-                            Some(i) if chrome.sidebars[i].visible => {
-                                let panel = panel.min(chrome.sidebars[i].panels.len().saturating_sub(1));
-                                chrome.sidebars[i].focused_panel = panel;
-                                chrome.focus = crate::client::chrome::ChromeFocus::Sidebar {
-                                    sidebar: i,
-                                    panel,
-                                };
-                            }
-                            _ => log::debug!(
-                                "sidebar: the focused {edge:?} sidebar did not survive the \
+                        if !chrome.refocus_edge(edge, panel, tc, tr) {
+                            log::debug!(
+                                "sidebar: no panel on the focused {edge:?} edge survived the \
                                  reload; focus returns to the content"
-                            ),
+                            );
                         }
                     }
 
