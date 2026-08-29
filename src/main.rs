@@ -5963,7 +5963,29 @@ async fn run_client_loop(
             // require a restart. The channel is kept open by `_cfg_keepalive`,
             // so `None` only appears on a genuine full teardown.
             maybe_cfg = cfg_rx.recv() => {
-                if let Some(new_config) = maybe_cfg {
+                if let Some(mut new_config) = maybe_cfg {
+                    // Coalesce the burst. One editor save typically produces
+                    // several Create/Modify events (write, rename, chmod), and
+                    // the watcher sends a `Config` for each -- so without this
+                    // the whole arm below (chrome rebuild, subscription
+                    // give-back and re-subscribe of every connection, plugin
+                    // state wiped, repaint) ran two to five times per save,
+                    // with a visible flash each time.
+                    //
+                    // Trailing edge, so the LAST config written wins: sleep out
+                    // the burst, then drain everything that queued behind it.
+                    // The event loop is parked for the sleep, but only ever
+                    // right after a config save, where 150ms is imperceptible.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let mut coalesced = 0usize;
+                    while let Ok(later) = cfg_rx.try_recv() {
+                        new_config = later;
+                        coalesced += 1;
+                    }
+                    if coalesced > 0 {
+                        log::debug!("client: coalesced {coalesced} extra config events");
+                    }
+
                     // Revalidate cross-references (logs on bad refs, like startup).
                     new_config.validate();
 

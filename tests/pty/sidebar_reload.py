@@ -359,6 +359,39 @@ def test_a_visible_flip_typed_into_the_config_beats_the_persisted_one():
     return finish(t, name, fails)
 
 
+def test_one_save_is_one_reload():
+    """The watcher fires per Create/Modify event, and one editor save typically
+    produces several. Undebounced, the whole reload arm -- chrome rebuild,
+    subscription give-back and re-subscribe of every connection, plugin state
+    wiped, repaint -- ran once per event, with a visible flash each time."""
+    name = "test_one_save_is_one_reload"
+    t = Tui("/tmp/rmx-sbrl6", cols=COLS, rows=ROWS, config=CFG_NONE).start()
+    fails = []
+    t.pump(1.0)
+
+    baseline = t.log("client").count("client: config reloaded")
+
+    # Three writes inside one debounce window, spaced the way an editor's
+    # write/rename/chmod burst is.
+    path = f"{t.rundir}/config/remux/config.toml"
+    for _ in range(3):
+        with open(path, "w") as fh:
+            fh.write(CFG_SESSIONS)
+        time.sleep(0.04)
+    t.pump(3.0)
+
+    reloads = t.log("client").count("client: config reloaded") - baseline
+    if reloads != 1:
+        fails.append(f"one burst of saves produced {reloads} reloads, expected 1")
+    else:
+        print(f"  three writes in one window produced {reloads} reload")
+    # ...and it still has to actually take effect.
+    if not t.has("Sessions"):
+        fails.append("the coalesced reload did not apply the config")
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -371,6 +404,7 @@ if __name__ == "__main__":
         test_a_reload_keeps_the_width_the_user_set_by_hand,
         test_a_size_typed_into_the_config_beats_the_persisted_one,
         test_a_visible_flip_typed_into_the_config_beats_the_persisted_one,
+        test_one_save_is_one_reload,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")
