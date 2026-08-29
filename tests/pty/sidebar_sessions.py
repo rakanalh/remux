@@ -370,7 +370,7 @@ def scenario_local():
           alpha_y is not None
           and rows[alpha_y + 1].startswith("    ")
           and rows[alpha_y + 2].startswith("    "), rows)
-    check("1 the server row is marked expanded", rows[1].startswith("v "), rows)
+    check("1 the server row is marked expanded", rows[1].startswith("\u25bc "), rows)
 
     # -- 7: a structural change nobody in this terminal asked for -------------
     w3 = Wire(SOCK1)

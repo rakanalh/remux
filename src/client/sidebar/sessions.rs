@@ -209,14 +209,13 @@ impl SidebarPlugin for SessionsPlugin {
                     row_bg.clone(),
                 );
             }
-            // `v`/`>` rather than the overlay's ▼/▶: a panel is narrow enough
-            // that ASCII's guaranteed single column is worth more than the
-            // glyph, and an expandable node with nothing under it still says
-            // so.
+            // The same ▼/▶ the session-manager overlay draws, so one tree
+            // reads the same on both surfaces. An expandable node with nothing
+            // under it still carries a marker.
             let marker = match &row.node_type {
                 NodeType::Pane { .. } | NodeType::DormantSession { .. } => "  ".to_string(),
-                _ if row.is_expanded => "v ".to_string(),
-                _ => "> ".to_string(),
+                _ if row.is_expanded => "\u{25BC} ".to_string(),
+                _ => "\u{25B6} ".to_string(),
             };
             let current = if row.is_current { "* " } else { "" };
             let text = format!(
@@ -645,14 +644,14 @@ mod tests {
         p.on_event(&local_tree());
         let open = painted(&p, 24, 12);
         assert!(
-            open.iter().any(|r| r.starts_with("v local")),
+            open.iter().any(|r| r.starts_with("\u{25BC} local")),
             "an expanded server is not marked open: {open:?}"
         );
         select(&mut p, "local");
         p.on_key(key(KeyCode::Char('h')));
         let shut = painted(&p, 24, 12);
         assert!(
-            shut.iter().any(|r| r.starts_with("> local")),
+            shut.iter().any(|r| r.starts_with("\u{25B6} local")),
             "a collapsed server is not marked shut: {shut:?}"
         );
     }
@@ -795,7 +794,7 @@ mod tests {
         let mut p = SessionsPlugin::new();
         p.on_event(&remote_tree());
         let rows = painted(&p, 40, 12);
-        assert!(rows.iter().any(|r| r.trim() == "v gpu"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "\u{25BC} gpu"), "{rows:?}");
     }
 
     #[test]
