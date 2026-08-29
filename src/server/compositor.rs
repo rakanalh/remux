@@ -2162,6 +2162,36 @@ mod tests {
         assert_eq!(buf[0][0].fg, border_fg(&theme, true));
     }
 
+    /// Every string builder, pinned to LITERAL glyphs.
+    ///
+    /// Deliberately literal rather than written in terms of the constants: a
+    /// golden that moves when the constant moves pins nothing. This is what
+    /// makes a typo in `BOX_TEE_LEFT`, or in the sharp family, fail here --
+    /// probing found that a drifted `box_rule_line` reached the
+    /// command-palette PTY harness without a single assertion noticing.
+    #[test]
+    fn the_string_builders_are_pinned_to_literal_glyphs() {
+        assert_eq!(box_top_line(3), "\u{256D}\u{2500}\u{2500}\u{2500}\u{256E}");
+        assert_eq!(
+            box_bottom_line(3),
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{256F}"
+        );
+        assert_eq!(box_rule_line(3), "\u{251C}\u{2500}\u{2500}\u{2500}\u{2524}");
+        assert_eq!(
+            box_top_line_titled(1, "x", 1),
+            "\u{256D}\u{2500}x\u{2500}\u{256E}"
+        );
+        // The second family. Sharp corners, and they must stay sharp.
+        assert_eq!(
+            sharp_box_top_line(3),
+            "\u{250C}\u{2500}\u{2500}\u{2500}\u{2510}"
+        );
+        assert_eq!(
+            sharp_box_bottom_line(3),
+            "\u{2514}\u{2500}\u{2500}\u{2500}\u{2518}"
+        );
+    }
+
     /// The string builders and the grid drawing use the SAME glyphs.
     ///
     /// The overlays cannot share a drawing routine with the compositor -- they
