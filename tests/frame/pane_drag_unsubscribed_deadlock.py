@@ -31,6 +31,7 @@ failures = []
 def probe(c, who, timeout=4.0):
     """Ask for the session tree and wait, bounded, for the reply."""
     c.send("ListSessionTree")
+    old = c.s.gettimeout()
     c.s.settimeout(timeout)
     try:
         for _ in range(200):
@@ -41,6 +42,10 @@ def probe(c, who, timeout=4.0):
     except socket.timeout:
         failures.append(f"{who}: no reply within {timeout}s -- daemon wedged")
         return False
+    finally:
+        # Restore the harness default the way `drain()` does, so a later
+        # non-probe read is not silently given the probe's longer patience.
+        c.s.settimeout(old)
 
 
 srv = Server(RUNDIR)
@@ -78,6 +83,14 @@ try:
     a.close()
     b.close()
 
+    # INERT ON `master`, deliberately kept: there is no panic hook in `src/` on
+    # this branch, `env_logger` only ever forwards log-crate output to
+    # server.log, and the harness runs the server with stderr on DEVNULL -- so a
+    # panic goes to the discarded stderr and can never reach the file grepped
+    # here. (CLAUDE.md describes panic detection as working; that description is
+    # ahead of this branch.) The check arms itself the moment
+    # `install_panic_logger()` lands from feat/sidebar-plugins. Until then, do
+    # not read a green run as evidence the server did not panic.
     log = srv.log()
     if "panicked at" in log:
         failures.append("server panicked: " + log[log.index("panicked at"):][:200])
