@@ -525,13 +525,21 @@ def test_focus_falls_back_when_the_reload_drops_the_focused_panel():
     fails = []
     t.pump(1.0)
 
+    # A regressed fixture must FAIL this test, not abort the whole run: the
+    # index below is unconditional, so a stack that starts with one panel
+    # would raise out of the harness with a traceback and take the remaining
+    # tests with it.
     if len(panel_markers(t)) != 2:
         fails.append(f"the stack did not start with two panels: {panel_markers(t)}")
+        return finish(t, name, fails)
+
     t.send(b"\x1bh", 1.0)          # Alt+h enters the sidebar, on panel 0
     t.send(b"\x1bj", 1.0)          # Alt+j walks down to panel 1
-    focused = [y for (y, m) in panel_markers(t) if m == "focused"]
-    if focused != [panel_markers(t)[1][0]]:
-        fails.append(f"the SECOND panel never took focus: {panel_markers(t)}")
+    marks = panel_markers(t)
+    focused = [y for (y, m) in marks if m == "focused"]
+    if len(marks) < 2 or focused != [marks[1][0]]:
+        fails.append(f"the SECOND panel never took focus: {marks}")
+        return finish(t, name, fails)
 
     write_config(t, CFG_STACKED_SECOND_DROPPED)
 
