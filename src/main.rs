@@ -4041,6 +4041,31 @@ async fn run_client_loop(
                             }
                             InputAction::Sidebar(intent) => {
                                 log::debug!("input: Sidebar {intent:?}");
+                                let (tc, tr) = renderer.size();
+                                // Tear the which-key popup down HERE -- before
+                                // the refusal gate below can `continue`, and
+                                // unconditionally, the way every other
+                                // client-action arm does it.
+                                //
+                                // This arm used to have no `whichkey` teardown
+                                // at all and lean on a side effect: a toggle
+                                // that moves the content rect sends a `Resize`,
+                                // the server answers with a `FullRender`, and
+                                // the full repaint incidentally erased the
+                                // popup. Every intent that changes NOTHING --
+                                // a toggle for an edge with no sidebar
+                                // configured, a cycle with no sidebars, a focus
+                                // refused because a view owns the keyboard --
+                                // repainted nothing (`Chrome::paint` over zero
+                                // panel rects emits zero bytes) and stranded
+                                // the popup on screen forever, while the mode
+                                // reset underneath it fed the next keystroke
+                                // straight to the shell.
+                                let tore_down_popup = whichkey.visible;
+                                if tore_down_popup {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(tc, tr)?;
+                                }
                                 // FOCUS intents are refused while a view is live.
                                 // The sidebar key gate is `active_view.is_none()`,
                                 // so a focused panel could not receive a keystroke
@@ -4057,9 +4082,29 @@ async fn run_client_loop(
                                     log::debug!(
                                         "sidebar: ignoring {intent:?} -- a view owns the keyboard"
                                     );
+                                    // Nothing else runs, so the popup teardown
+                                    // above needs its own repaint: `paint_view`
+                                    // is what puts the view's cells and its
+                                    // cursor back after `clear_overlay`.
+                                    if tore_down_popup {
+                                        if let Some(av) = active_view {
+                                            paint_view(
+                                                &mut renderer,
+                                                &chrome,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &compositor_theme,
+                                                &view_border_style,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        }
+                                    }
                                     continue;
                                 }
-                                let (tc, tr) = renderer.size();
                                 let before = chrome.content_rect(tc, tr);
                                 // Snapshot of everything that OUTLIVES this
                                 // client, so the save below fires on a real
@@ -4131,6 +4176,19 @@ async fn run_client_loop(
                                     }
                                     None => {
                                         chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                        // `clear_overlay` replays the front
+                                        // buffer with the cursor hidden, and
+                                        // only `paint_panel` puts it back --
+                                        // so with no panel on screen (which is
+                                        // exactly the no-op case above) the
+                                        // shell would be left with no cursor.
+                                        if tore_down_popup {
+                                            renderer.restore_cursor(
+                                                last_cursor_x,
+                                                last_cursor_y,
+                                                last_cursor_visible,
+                                            )?;
+                                        }
                                         renderer.flush()?;
                                     }
                                 }

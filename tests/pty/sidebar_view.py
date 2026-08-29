@@ -82,6 +82,15 @@ visible = true
   weight = 1
 """
 
+# The same sidebar plus a which-key leaf for a FOCUS intent. `SidebarFocus*`
+# has no default binding, and reaching the refusal path below needs the intent
+# to arrive from the which-key TREE (so a popup is up when it is refused), not
+# from a flat Alt- shortcut.
+CFG_FOCUS_LEAF = CFG + """
+[keybindings.command.b]
+H = "SidebarFocusLeft"
+"""
+
 
 # SGR mouse reports. Coordinates are 1-based, as a real terminal sends them.
 def sgr_press(col, row):
@@ -509,6 +518,52 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
     return finish(t, name, fails)
 
 
+def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
+    """A view owns the keyboard, so a `SidebarFocus*` is refused -- and a
+    refusal repaints NOTHING, which is how the popup used to be stranded.
+
+    The `InputAction::Sidebar` arm had no `whichkey` teardown; it leaned on the
+    `FullRender` that a real content-rect change provokes. This path changes no
+    geometry at all, so that repaint never comes.
+    """
+    name = "test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup"
+    t = Tui("/tmp/rmx-sbv6", cols=COLS, rows=ROWS, config=CFG_FOCUS_LEAF).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    seam_before = leftmost_box_column(t)
+
+    t.send(b"\x01", 0.5)   # prefix
+    t.send(b"b", 0.8)      # the Sidebar group
+    if not t.has("cycle focus"):
+        fails.append("the Sidebar which-key popup never opened")
+    t.send(b"H", 1.2)      # SidebarFocusLeft -- refused while a view is live
+
+    if t.has("cycle focus") or t.has("toggle left"):
+        fails.append("the popup survived a focus intent refused by the live view")
+        t.dump("popup stranded")
+    if not t.alive():
+        fails.append("the client died")
+    # `clear_overlay` replays the front buffer with the cursor hidden, and in a
+    # view only `paint_view` puts it back. Nothing else runs on this path.
+    if t.screen.cursor.hidden:
+        fails.append("the overlay teardown left the terminal cursor hidden")
+    # The refusal must stay a refusal: the view keeps the screen and the panel
+    # keeps its idle marker.
+    if panel_marker(t) != "idle":
+        fails.append(f"the panel took focus anyway: {panel_marker(t)!r}")
+    if leftmost_box_column(t) != seam_before:
+        fails.append(
+            f"the view moved: seam {leftmost_box_column(t)} vs {seam_before}"
+        )
+    if "View 1" not in t.rows_text()[-1]:
+        fails.append(f"no longer in the view: {t.rows_text()[-1].rstrip()!r}")
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -521,6 +576,7 @@ if __name__ == "__main__":
         test_clicking_a_view_cell_uses_content_coordinates,
         test_entering_a_view_releases_sidebar_focus,
         test_toggling_a_sidebar_inside_a_view_reflows_the_cells,
+        test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")
