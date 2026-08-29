@@ -292,8 +292,51 @@ impl Drop for Pty {
     fn drop(&mut self) {
         // Best-effort kill of the child process.
         let _ = signal::kill(self.child_pid, Signal::SIGHUP);
-        let _ = waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG));
+        reap_child(self.child_pid);
     }
+}
+
+/// How long [`reap_child`] waits for a signalled child before escalating, and
+/// again before giving up. Deliberately short: this runs from `Drop`, which the
+/// server reaches while holding the `panes` lock, so it is a hard bound on how
+/// long a pane close can stall the daemon.
+const REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Wait for an already-signalled child so it does not linger as a zombie.
+///
+/// A single `waitpid(WNOHANG)` right after the signal is not enough, and that is
+/// what this replaced: the child has not exited yet at that instant, so the wait
+/// reports `StillAlive`, the child dies a moment later, and nothing ever collects
+/// its status. Every pane closed while its shell was still running left a
+/// `<defunct>` entry behind for the life of the server -- which the file-manager
+/// sidebar panel turns from a curiosity into a real leak, since it kills and
+/// respawns its pane every time the focused pane's directory changes.
+///
+/// Bounded at both stages and never blocking indefinitely: a child that will not
+/// die is worth one leaked zombie, but a `Drop` that can hang is worth nothing at
+/// all -- the daemon holds locks across it.
+fn reap_child(pid: Pid) {
+    for stage in 0..2 {
+        let deadline = std::time::Instant::now() + REAP_WAIT;
+        loop {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                // Collected, or somebody else already did (`ECHILD`).
+                Ok(WaitStatus::StillAlive) => {}
+                _ => return,
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(REAP_POLL);
+        }
+        // SIGHUP was declined (or arrived while the child was blocked on a
+        // signal-ignoring path); escalate once.
+        if stage == 0 {
+            let _ = signal::kill(pid, Signal::SIGKILL);
+        }
+    }
+    log::warn!("pty: child {pid} did not exit after SIGKILL; leaving it unreaped");
 }
 
 /// Spawn a background tokio task that continuously reads from the PTY master
