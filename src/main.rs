@@ -1850,6 +1850,12 @@ async fn run_client_loop(
     // the sidebars the user will actually see. Never fails: a missing,
     // unreadable, or corrupt state file degrades to the config defaults.
     crate::client::sidebar_state::apply(&mut chrome, &crate::client::sidebar_state::load());
+    // The `[[sidebar]]` config this chrome was last built from. The hot-reload
+    // arm diffs the incoming config against it field by field (see
+    // `sidebar_state::apply_on_reload`), so it MUST advance on every reload --
+    // left at the startup value, the second edit of a field would diff against
+    // a value two reloads old and the precedence rule would invert.
+    let mut prev_sidebar_cfg = config.sidebar.clone();
     let mut which_key_position = config.appearance.which_key_position.clone();
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
@@ -5990,15 +5996,34 @@ async fn run_client_loop(
                     let (tc, tr) = renderer.size();
                     let chrome_before = chrome.content_rect(tc, tr);
                     chrome = crate::client::chrome::Chrome::from_config(&new_config.sidebar);
-                    // Runtime state is layered back on exactly as startup does
-                    // it, so an unrelated config edit does not throw away the
-                    // sizes and visibility the user set by hand. State for an
-                    // edge the new config does not declare is ignored, so a
-                    // newly added sidebar opens on its config defaults.
-                    crate::client::sidebar_state::apply(
+                    // Runtime state is layered back on -- but NOT the way
+                    // startup does it. `sidebar.json` holds a size for every
+                    // edge from the first toggle or resize onward, so a
+                    // startup-style overlay would silently revert every
+                    // `size = ...` the user then typed, which is the very
+                    // complaint hot-reload exists to answer. `apply_on_reload`
+                    // diffs old config against new, field by field: what the
+                    // user just typed wins, what they did not type keeps what
+                    // they dragged.
+                    let sidebar_state = crate::client::sidebar_state::load();
+                    crate::client::sidebar_state::apply_on_reload(
                         &mut chrome,
-                        &crate::client::sidebar_state::load(),
+                        &sidebar_state,
+                        &prev_sidebar_cfg,
+                        &new_config.sidebar,
                     );
+                    prev_sidebar_cfg = new_config.sidebar.clone();
+                    // Where the config won, the persisted state now describes
+                    // something the user has overridden; write the truth back
+                    // so the next reload diffs against it. Skipped when nothing
+                    // has ever been persisted, so a config-only session still
+                    // creates no state file.
+                    if !sidebar_state.bars.is_empty()
+                        && crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
+                            != sidebar_state
+                    {
+                        crate::client::sidebar_state::save(&chrome);
+                    }
                     // The panel that wants the session tree may have just
                     // appeared or gone. Recompute, and forget the existing
                     // subscriptions so the reconcile at the top of the loop

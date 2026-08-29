@@ -63,6 +63,27 @@ CFG_SESSIONS_TOUCHED = CFG_SESSIONS + """
 [appearance.unused_marker_section]
 """
 
+WIDER_W = 40
+
+# The same sidebar with `size` retyped. Once `sidebar.json` exists -- and it
+# exists from the first toggle or resize onward -- a startup-style overlay
+# makes this edit dead, which is the "I edited my config and nothing happened"
+# complaint hot-reload exists to answer.
+CFG_SESSIONS_WIDER = CFG_SESSIONS.replace(
+    f"size = {SIDEBAR_W}", f"size = {WIDER_W}"
+)
+
+# The same sidebar with `visible` retyped to false.
+CFG_SESSIONS_HIDDEN = CFG_SESSIONS.replace("visible = true", "visible = false")
+
+# `CFG_SESSIONS_WIDER` plus an unrelated edit: `size` is UNCHANGED since the
+# previous reload, so a width dragged after that reload has to survive. This is
+# what catches a caller that keeps diffing against the STARTUP config instead of
+# advancing its snapshot -- `size` would read as changed forever.
+CFG_SESSIONS_WIDER_TOUCHED = CFG_SESSIONS_WIDER + """
+[appearance.unused_marker_section]
+"""
+
 STTY_RE = re.compile(r"\b(\d+) (\d+)\b")
 
 
@@ -218,10 +239,7 @@ def test_a_reload_keeps_the_width_the_user_set_by_hand():
     start = stty_cols(t)
 
     # Focus the panel and widen the sidebar, which persists to sidebar.json.
-    t.send(b"\x1bh", 0.8)          # Alt+h enters the left sidebar
-    t.prefix(b"pRl", 1.5)          # Resize right: the sidebar's own edge
-    t.send(b"\x1b", 0.6)           # leave the sticky Resize group
-    t.send(b"\x1bl", 0.8)          # Alt+l back to the content
+    widen_the_sidebar(t)
     widened = stty_cols(t)
     if start is None or widened is None:
         fails.append(
@@ -250,6 +268,97 @@ def test_a_reload_keeps_the_width_the_user_set_by_hand():
     return finish(t, name, fails)
 
 
+def widen_the_sidebar(t):
+    """Drag the sidebar wider at runtime, which writes `sidebar.json`."""
+    t.send(b"\x1bh", 0.8)          # Alt+h enters the left sidebar
+    t.prefix(b"pRl", 1.5)          # Resize right: the sidebar's own edge
+    t.send(b"\x1b", 0.6)           # leave the sticky Resize group
+    t.send(b"\x1bl", 0.8)          # Alt+l back to the content
+
+
+def test_a_size_typed_into_the_config_beats_the_persisted_one():
+    """The precedence rule's whole point. `sidebar.json` holds a size the
+    moment anyone resizes, so without "config wins on edit" every later
+    `size = ...` in the config is dead -- and hot-reload made that WORSE, since
+    the reload now fires and silently reverts the width."""
+    name = "test_a_size_typed_into_the_config_beats_the_persisted_one"
+    t = Tui("/tmp/rmx-sbrl4", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    fails = []
+    t.pump(1.0)
+
+    widen_the_sidebar(t)
+    dragged = stty_cols(t)
+    if dragged is None:
+        fails.append("could not read `stty size` after the runtime resize")
+
+    write_config(t, CFG_SESSIONS_WIDER)
+
+    after = stty_cols(t)
+    check_width(fails, dragged, after, COLS - WIDER_W - 2, "a retyped size")
+    if not t.has("Sessions"):
+        fails.append("the panel vanished across the reload")
+
+    # Second reload, and the reason the client has to ADVANCE its old-config
+    # snapshot. Drag again, then make an edit that leaves `size` alone: diffed
+    # against the config as of the previous reload, `size` is unchanged and the
+    # drag survives. Diffed against the STARTUP config it reads as changed
+    # forever, and every later drag is snapped back.
+    widen_the_sidebar(t)
+    dragged_again = stty_cols(t)
+    if dragged_again is None or after is None:
+        fails.append("could not read `stty size` around the second resize")
+    elif dragged_again >= after:
+        fails.append(f"the second resize did nothing: {after} -> {dragged_again}")
+
+    write_config(t, CFG_SESSIONS_WIDER_TOUCHED)
+
+    final = stty_cols(t)
+    check_width(
+        fails, dragged_again, final, dragged_again, "a second, unrelated edit"
+    )
+
+    return finish(t, name, fails)
+
+
+def test_a_visible_flip_typed_into_the_config_beats_the_persisted_one():
+    """`visible = false` on a sidebar the user opened at runtime must hide it.
+
+    This is the masking the reviewer called out: the persisted `visible` was
+    overwriting the config's unconditionally, so the edit appeared to do
+    nothing at all.
+    """
+    name = "test_a_visible_flip_typed_into_the_config_beats_the_persisted_one"
+    t = Tui("/tmp/rmx-sbrl5", cols=COLS, rows=ROWS, config=CFG_SESSIONS).start()
+    fails = []
+    t.pump(1.0)
+
+    # Close and reopen it, so `sidebar.json` carries `visible = true` for this
+    # edge -- state that would otherwise mask the config edit below.
+    t.prefix(b"bh", 1.2)
+    if t.has("Sessions"):
+        fails.append("the toggle did not close the sidebar")
+    t.prefix(b"bh", 1.2)
+    if not t.has("Sessions"):
+        fails.append("the toggle did not reopen the sidebar")
+    open_cols = stty_cols(t)
+
+    write_config(t, CFG_SESSIONS_HIDDEN)
+
+    if t.has("Sessions"):
+        fails.append("`visible = false` in the config was masked by the saved state")
+        t.dump("after the visible flip")
+    after = stty_cols(t)
+    check_width(
+        fails,
+        open_cols,
+        after,
+        None if open_cols is None else open_cols + SIDEBAR_W,
+        "a retyped visible = false",
+    )
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -260,6 +369,8 @@ if __name__ == "__main__":
         test_a_sidebar_added_to_the_config_appears_without_a_restart,
         test_a_sidebar_removed_from_the_config_goes_away_without_a_restart,
         test_a_reload_keeps_the_width_the_user_set_by_hand,
+        test_a_size_typed_into_the_config_beats_the_persisted_one,
+        test_a_visible_flip_typed_into_the_config_beats_the_persisted_one,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")

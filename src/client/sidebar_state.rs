@@ -14,12 +14,32 @@
 //! defaults" with a `warn!`. State written for an edge the config no longer
 //! declares is ignored rather than applied or rejected -- people edit their
 //! config after state has been written, and the client has to survive it.
+//!
+//! # Precedence, and why a hot-reload does not use `apply`
+//!
+//! At STARTUP the persisted state wins outright ([`apply`]): the config is the
+//! default, and what the user last dragged is what they expect to come back to.
+//!
+//! A hot-reload cannot use that rule. `sidebar.json` is written the moment
+//! anyone toggles or resizes a sidebar, so from then on it holds a `size` for
+//! every edge -- and a startup-style overlay would silently revert every
+//! `size = ...` the user then typed into their config, reproducing the "I
+//! edited my config and nothing happened" complaint that hot-reload exists to
+//! fix. [`apply_on_reload`] therefore compares the OLD config against the NEW
+//! one, field by field:
+//!
+//! > **What you just typed wins; what you did not type keeps what you dragged.**
+//!
+//! A field whose config value changed takes the config value; a field whose
+//! config value is unchanged keeps the persisted runtime value. A brand-new
+//! edge takes its config wholesale, stale state for it and all.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::client::chrome::{Chrome, SidebarEdge};
+use crate::config::sidebar::SidebarConfig;
 
 /// Everything about the chrome that outlives a client process.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +208,57 @@ pub fn apply(chrome: &mut Chrome, state: &SidebarState) {
     }
 }
 
+/// Overlay persisted state onto a config-built `Chrome` at HOT-RELOAD time.
+///
+/// See the module docs for why this is not [`apply`]. Per edge, per field: a
+/// config value the user just changed wins, a config value they left alone
+/// yields to whatever they set at runtime. An edge with no entry in `old_cfg`
+/// is brand new and keeps its config values untouched.
+///
+/// `chrome` must already be built from `new_cfg`, so its fields hold the new
+/// config values before this runs -- that is what makes "unchanged" mean
+/// "restore the persisted value" rather than "leave whatever is there".
+pub fn apply_on_reload(
+    chrome: &mut Chrome,
+    state: &SidebarState,
+    old_cfg: &[SidebarConfig],
+    new_cfg: &[SidebarConfig],
+) {
+    for sb in &mut chrome.sidebars {
+        // `Chrome::from_config` resolves an edge to its FIRST config entry and
+        // drops the rest, so both lookups have to do the same.
+        let Some(old) = old_cfg.iter().find(|c| c.edge == sb.edge) else {
+            log::debug!(
+                "sidebar state: the {:?} edge is new in this config; taking it wholesale",
+                sb.edge
+            );
+            continue;
+        };
+        let Some(new) = new_cfg.iter().find(|c| c.edge == sb.edge) else {
+            continue;
+        };
+        let Some(bar) = state.bars.iter().find(|b| b.edge == sb.edge) else {
+            continue;
+        };
+        if old.size == new.size {
+            sb.size = bar.size;
+        }
+        if old.visible == new.visible {
+            sb.visible = bar.visible;
+        }
+        // Weights are compared as a LIST: a panel added, removed or reordered
+        // is itself something the user just typed, and the saved weights no
+        // longer describe the stack they were written for.
+        let old_weights: Vec<u16> = old.panel.iter().map(|p| p.weight).collect();
+        let new_weights: Vec<u16> = new.panel.iter().map(|p| p.weight).collect();
+        if old_weights == new_weights {
+            for (panel, weight) in sb.panels.iter_mut().zip(bar.weights.iter()) {
+                panel.weight = *weight;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +281,164 @@ mod tests {
                 },
             ],
         }])
+    }
+
+    // -- apply_on_reload: "what you typed wins, what you didn't keeps what
+    //    you dragged" ------------------------------------------------------
+
+    /// One left sidebar, parameterised on the fields the rule turns on.
+    fn cfg(size: u16, visible: bool, weights: &[u16]) -> Vec<SidebarConfig> {
+        vec![SidebarConfig {
+            edge: SidebarEdge::Left,
+            size,
+            visible,
+            panel: weights
+                .iter()
+                .map(|w| PanelConfig {
+                    plugin: "placeholder".into(),
+                    weight: *w,
+                })
+                .collect(),
+        }]
+    }
+
+    /// What the user dragged out at runtime: a wider, hidden bar with the
+    /// weights swapped, so every field differs from every config below.
+    fn dragged() -> SidebarState {
+        SidebarState {
+            bars: vec![BarState {
+                edge: SidebarEdge::Left,
+                visible: false,
+                size: 44,
+                weights: vec![7, 9],
+            }],
+        }
+    }
+
+    fn reloaded(old: &[SidebarConfig], new: &[SidebarConfig], state: &SidebarState) -> Chrome {
+        let mut c = Chrome::from_config(new);
+        apply_on_reload(&mut c, state, old, new);
+        c
+    }
+
+    #[test]
+    fn an_untouched_size_keeps_the_width_the_user_dragged() {
+        // The config's `size` did not change, so the runtime width stands --
+        // this is what stops an unrelated edit from snapping a hand-dragged
+        // sidebar back to its config default.
+        let old = cfg(30, true, &[2, 1]);
+        let new = cfg(30, true, &[2, 1]);
+        let c = reloaded(&old, &new, &dragged());
+        assert_eq!(c.sidebars[0].size, 44, "the dragged width was reverted");
+    }
+
+    #[test]
+    fn a_size_the_user_just_typed_wins_over_the_persisted_one() {
+        // The exact complaint this rule exists for: `sidebar.json` holds a
+        // size from the first resize onward, and a startup-style overlay makes
+        // every later `size = ...` in the config dead.
+        let old = cfg(30, true, &[2, 1]);
+        let new = cfg(50, true, &[2, 1]);
+        let c = reloaded(&old, &new, &dragged());
+        assert_eq!(c.sidebars[0].size, 50, "the typed width lost to the state");
+    }
+
+    #[test]
+    fn a_visible_flip_in_the_config_wins_over_the_persisted_one() {
+        let old = cfg(30, true, &[2, 1]);
+        let new = cfg(30, false, &[2, 1]);
+        let mut state = dragged();
+        state.bars[0].visible = true;
+        let c = reloaded(&old, &new, &state);
+        assert!(!c.sidebars[0].visible, "the typed visibility lost");
+    }
+
+    #[test]
+    fn an_untouched_visible_keeps_the_runtime_state() {
+        let old = cfg(30, true, &[2, 1]);
+        let new = cfg(30, true, &[2, 1]);
+        let c = reloaded(&old, &new, &dragged());
+        assert!(
+            !c.sidebars[0].visible,
+            "a sidebar the user closed reopened on an unrelated edit"
+        );
+    }
+
+    #[test]
+    fn untouched_weights_keep_the_runtime_ones_and_typed_weights_win() {
+        let old = cfg(30, true, &[2, 1]);
+        let same = reloaded(&old, &cfg(30, true, &[2, 1]), &dragged());
+        assert_eq!(
+            (
+                same.sidebars[0].panels[0].weight,
+                same.sidebars[0].panels[1].weight
+            ),
+            (7, 9),
+            "unchanged weights did not keep the runtime values"
+        );
+        let typed = reloaded(&old, &cfg(30, true, &[3, 1]), &dragged());
+        assert_eq!(
+            (
+                typed.sidebars[0].panels[0].weight,
+                typed.sidebars[0].panels[1].weight
+            ),
+            (3, 1),
+            "typed weights lost to the persisted ones"
+        );
+    }
+
+    #[test]
+    fn a_panel_added_to_the_stack_counts_as_a_typed_weight_change() {
+        // The saved weights describe a stack that no longer exists, so they do
+        // not get to apply positionally to a different one.
+        let old = cfg(30, true, &[2, 1]);
+        let new = cfg(30, true, &[2, 1, 1]);
+        let c = reloaded(&old, &new, &dragged());
+        let got: Vec<u16> = c.sidebars[0].panels.iter().map(|p| p.weight).collect();
+        assert_eq!(got, vec![2, 1, 1], "stale weights applied to a new stack");
+    }
+
+    #[test]
+    fn a_brand_new_edge_takes_its_config_wholesale() {
+        // Stale state for an edge the previous config never declared must not
+        // reach through and resize or hide a sidebar the user just added.
+        let old: Vec<SidebarConfig> = vec![];
+        let new = cfg(30, true, &[2, 1]);
+        let c = reloaded(&old, &new, &dragged());
+        assert_eq!(c.sidebars[0].size, 30, "stale state sized a new sidebar");
+        assert!(c.sidebars[0].visible, "stale state hid a new sidebar");
+        let got: Vec<u16> = c.sidebars[0].panels.iter().map(|p| p.weight).collect();
+        assert_eq!(got, vec![2, 1], "stale state reweighted a new sidebar");
+    }
+
+    #[test]
+    fn the_old_config_must_advance_across_two_reloads() {
+        // The regression this pins: if the caller keeps diffing against the
+        // STARTUP config, the second edit of the same field still reads as
+        // "changed" forever and the runtime value can never win again.
+        let startup = cfg(30, true, &[2, 1]);
+        let first = cfg(50, true, &[2, 1]);
+
+        // Reload 1: the user typed 50, so 50 wins over the persisted 44.
+        let mut chrome = Chrome::from_config(&first);
+        let mut state = dragged();
+        apply_on_reload(&mut chrome, &state, &startup, &first);
+        assert_eq!(chrome.sidebars[0].size, 50);
+
+        // The user then drags it to 60, which persists.
+        chrome.sidebars[0].size = 60;
+        state = SidebarState::from_chrome(&chrome);
+
+        // Reload 2: an unrelated edit, `size` unchanged since reload 1, so the
+        // dragged 60 must survive. Diffed against `startup` instead of
+        // `first`, `size` would read as changed (30 -> 50) and snap back.
+        let second = cfg(50, false, &[2, 1]);
+        let mut chrome2 = Chrome::from_config(&second);
+        apply_on_reload(&mut chrome2, &state, &first, &second);
+        assert_eq!(
+            chrome2.sidebars[0].size, 60,
+            "the old-config snapshot did not advance; a dragged width was lost"
+        );
     }
 
     #[test]
