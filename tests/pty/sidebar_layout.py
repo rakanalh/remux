@@ -214,7 +214,7 @@ def test_seam_has_no_background_bleed():
 
     assert (
         str(screen.buffer[y][SIDEBAR_W - 1].bg) == FRAME_BG
-    ), f"the panel does not own its last column: {screen.buffer[y][SIDEBAR_W - 1]!r}"
+    ), f"the sidebar does not own its last column: {screen.buffer[y][SIDEBAR_W - 1]!r}"
     assert (
         rows[y][SIDEBAR_W] == "│"
     ), f"the pane border is not on the seam: {rows[y][SIDEBAR_W]!r}"
@@ -240,22 +240,40 @@ def test_all_three_edges_corner_ownership():
     rows = screen.display
 
     left_w, right_w = 20, 16
-    # The verticals are painted at the terminal's edges, from row 0.
-    assert rows[0].startswith("Placeholder"), f"left panel missing: {rows[0][:24]!r}"
+    # The verticals are painted at the terminal's edges, from row 0 -- but each
+    # sidebar is now FRAMED, so its box owns row 0 and column 0 and the panel
+    # inside it starts one cell in. The bar rects are unchanged; only where the
+    # panel content lands moved.
+    assert rows[0][0] == "\u256d", f"left sidebar's box missing: {rows[0][:24]!r}"
+    assert rows[1][1:].startswith("Placeholder"), f"left panel missing: {rows[1][:24]!r}"
     assert (
-        rows[0][COLS - right_w :].startswith("Placeholder")
-    ), f"right panel missing: {rows[0][COLS - right_w:]!r}"
+        rows[0][COLS - right_w] == "\u256d"
+    ), f"right sidebar's box missing: {rows[0][COLS - right_w:]!r}"
+    assert (
+        rows[1][COLS - right_w + 1 :].startswith("Placeholder")
+    ), f"right panel missing: {rows[1][COLS - right_w:]!r}"
 
     # The bottom sidebar occupies the last 5 rows, inset between the verticals:
-    # its panel starts at the content origin and never claims a corner.
-    band = rows[ROWS - 5]
-    assert band[:left_w].strip() == "", f"bottom sidebar claimed the left corner: {band!r}"
+    # its BOX starts at the content origin and never claims a corner. The
+    # corner test is now on the box's top-left glyph rather than on where the
+    # panel text begins -- the box is what claims the space.
+    top = rows[ROWS - 5]
     assert (
-        band[COLS - right_w :].strip() == ""
-    ), f"bottom sidebar claimed the right corner: {band!r}"
+        top[left_w] == "\u256d"
+    ), f"bottom sidebar's box does not start at the content origin: {top!r}"
     assert (
-        band.index("Placeholder") == left_w
-    ), f"bottom panel not at the content origin: {band!r}"
+        top[COLS - right_w - 1] == "\u256e"
+    ), f"bottom sidebar's box does not stop before the right sidebar: {top!r}"
+    assert (
+        "\u256d" not in top[:left_w]
+    ), f"bottom sidebar claimed the left corner: {top!r}"
+    assert (
+        "\u256e" not in top[COLS - right_w :]
+    ), f"bottom sidebar claimed the right corner: {top!r}"
+    band = rows[ROWS - 4]
+    assert (
+        band.index("Placeholder") == left_w + 1
+    ), f"bottom panel not one cell inside the content origin: {band!r}"
 
     # And the content shrank vertically to make room: the server's frame and
     # status bar must both end above the bottom band.

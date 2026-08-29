@@ -4,6 +4,7 @@
 //! sends it as `Resize`, blits server frames at its origin, and paints the
 //! panels around them.
 
+pub mod frame;
 pub mod geometry;
 
 use anyhow::Result;
@@ -12,14 +13,16 @@ use anyhow::Result;
 // is a binary crate, so a `pub use` nothing outside `geometry` imports trips
 // `unused_imports` under `-D warnings`.
 pub use geometry::{
-    content_rect, effective_sizes, pane_area, panel_rects, PanelGeom, SidebarEdge, SidebarGeom,
+    bar_rects, content_rect, effective_sizes, frame_size_inset, pane_area, panel_rects,
+    sidebar_frame, PanelGeom, SidebarEdge, SidebarGeom,
 };
 
 use crate::client::renderer::Renderer;
+use crate::client::sidebar::blank_grid;
 use crate::client::sidebar::{make_plugin, PluginEvent, SidebarPlugin};
 use crate::config::sidebar::SidebarConfig;
 use crate::config::theme::CompositorTheme;
-use crate::config::StatusBarPosition;
+use crate::config::{BorderStyle, StatusBarPosition};
 use crate::server::layout::{FocusDirection, Rect};
 
 /// One plugin panel plus its layout weight.
@@ -50,6 +53,18 @@ pub enum ChromeFocus {
 pub struct Chrome {
     pub sidebars: Vec<Sidebar>,
     pub focus: ChromeFocus,
+    /// The border style the sidebars are framed in -- the SAME value the panes
+    /// beside them are currently drawn with, so `ToggleStyle` reframes both in
+    /// one keystroke.
+    ///
+    /// Held here rather than passed in because the style is not only a painting
+    /// concern: the frame is drawn inside the bar, so `panel_rects` returns
+    /// interiors, and every consumer of those -- mouse hit-testing, directional
+    /// focus, the no-vanish resize check -- would otherwise have to thread it
+    /// too. The client's live value lives in `run_client_loop`'s
+    /// `view_border_style`; [`Chrome::set_border_style`] is what keeps the two
+    /// in step, called at each site that flips it.
+    pub border_style: BorderStyle,
 }
 
 impl Chrome {
@@ -103,7 +118,21 @@ impl Chrome {
         Self {
             sidebars,
             focus: ChromeFocus::Content,
+            // `AppearanceConfig`'s own default. The real value arrives via
+            // `set_border_style` from the client's live style, which is what
+            // `ToggleStyle` flips; this is only what a `Chrome` built outside
+            // the client loop (the unit tests) frames with.
+            border_style: BorderStyle::ZellijStyle,
         }
+    }
+
+    /// Adopt the border style the panes are being drawn with.
+    ///
+    /// Called wherever the client flips its live style (`ToggleStyle`, and on a
+    /// config reload that rebuilds the chrome), so the sidebar frame never
+    /// disagrees with the pane borders it sits against.
+    pub fn set_border_style(&mut self, style: BorderStyle) {
+        self.border_style = style;
     }
 
     /// Geometry descriptors for the pure layout functions.
@@ -150,9 +179,30 @@ impl Chrome {
         pane_area(self.content_rect(term_cols, term_rows), status_bar)
     }
 
-    /// Absolute screen rects for every visible panel.
+    /// Absolute screen rects for every visible panel -- INTERIORS, inside the
+    /// frame. See [`geometry::panel_rects`].
     pub fn panel_rects(&self, term_cols: u16, term_rows: u16) -> Vec<(usize, usize, Rect)> {
-        panel_rects(&self.geoms(), term_cols, term_rows)
+        panel_rects(&self.geoms(), term_cols, term_rows, &self.border_style)
+    }
+
+    /// Absolute screen rects for every visible sidebar's full extent, frame
+    /// included.
+    pub fn bar_rects(&self, term_cols: u16, term_rows: u16) -> Vec<(usize, Rect)> {
+        bar_rects(&self.geoms(), term_cols, term_rows)
+    }
+
+    /// Which sidebar, if any, a screen coordinate falls inside -- counting the
+    /// frame, which belongs to no panel.
+    ///
+    /// The frame is what makes this different from a `panel_rects` hit test: a
+    /// click on a sidebar's border is inside the sidebar and inside no panel,
+    /// and must be swallowed rather than translated into the content rect and
+    /// forwarded to the server as a click on a pane.
+    pub fn sidebar_at(&self, term_cols: u16, term_rows: u16, x: u16, y: u16) -> Option<usize> {
+        self.bar_rects(term_cols, term_rows)
+            .into_iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(i, _)| i)
     }
 
     /// Whether any sidebar currently occupies space.
@@ -162,7 +212,19 @@ impl Chrome {
             .any(|s| *s > 0)
     }
 
-    /// Render every visible panel into the renderer's front buffer.
+    /// Render every visible sidebar -- its frame and the panels inside it --
+    /// into the renderer's front buffer.
+    ///
+    /// A framed sidebar is composed into ONE bar-sized grid and painted in a
+    /// single `paint_panel`: the frame ring and the rules between panels are
+    /// drawn first, then each plugin's grid is blitted at its interior offset.
+    /// Painting the frame and the panels separately would write the interior
+    /// twice per repaint, and would leave the frame's rows to be reconstructed
+    /// from panel rects at every call site that needs them.
+    ///
+    /// A bar too small for a frame takes the pre-frame path unchanged -- one
+    /// `paint_panel` per panel, nothing else touched -- so the degradation is
+    /// literally the old rendering rather than an approximation of it.
     pub fn paint(
         &self,
         renderer: &mut Renderer,
@@ -170,17 +232,85 @@ impl Chrome {
         term_rows: u16,
         theme: &CompositorTheme,
     ) -> Result<()> {
-        for (si, pi, rect) in self.panel_rects(term_cols, term_rows) {
-            let focused = self.focus
-                == ChromeFocus::Sidebar {
-                    sidebar: si,
-                    panel: pi,
-                };
-            let grid =
+        let rects = self.panel_rects(term_cols, term_rows);
+        for (si, bar) in self.bar_rects(term_cols, term_rows) {
+            let mine: Vec<Rect> = rects
+                .iter()
+                .filter(|(s, _, _)| *s == si)
+                .map(|(_, _, r)| *r)
+                .collect();
+            let panels: Vec<usize> = rects
+                .iter()
+                .filter(|(s, _, _)| *s == si)
+                .map(|(_, p, _)| *p)
+                .collect();
+            if mine.is_empty() {
+                // Every panel was dropped for being below its minimum. Painting
+                // an empty frame would advertise a sidebar with nothing in it;
+                // this is what the pre-frame code did too (it painted nothing).
+                continue;
+            }
+            let f = sidebar_frame(&self.border_style, self.sidebars[si].edge, bar);
+            let render_panel = |pi: usize, r: Rect| {
+                let focused = self.focus
+                    == ChromeFocus::Sidebar {
+                        sidebar: si,
+                        panel: pi,
+                    };
                 self.sidebars[si].panels[pi]
                     .plugin
-                    .render(rect.width, rect.height, focused, theme);
-            renderer.paint_panel(rect, &grid)?;
+                    .render(r.width, r.height, focused, theme)
+            };
+
+            if !f.framed {
+                for (pi, r) in panels.iter().copied().zip(mine.iter().copied()) {
+                    renderer.paint_panel(r, &render_panel(pi, r))?;
+                }
+                continue;
+            }
+
+            let mut grid = blank_grid(bar.width, bar.height, theme.border_bg());
+            // The rule between two panels sits in the gap `split_panels` left:
+            // immediately after the earlier panel ends, in bar-local
+            // coordinates along the stack axis.
+            let vertical = !matches!(self.sidebars[si].edge, SidebarEdge::Bottom);
+            let rules: Vec<u16> = mine
+                .windows(2)
+                .map(|w| {
+                    if vertical {
+                        (w[0].y + w[0].height).saturating_sub(bar.y)
+                    } else {
+                        (w[0].x + w[0].width).saturating_sub(bar.x)
+                    }
+                })
+                .collect();
+            let active =
+                matches!(self.focus, ChromeFocus::Sidebar { sidebar, .. } if sidebar == si);
+            frame::draw_sidebar_frame(
+                &mut grid,
+                &self.border_style,
+                self.sidebars[si].edge,
+                active,
+                &rules,
+                theme,
+            );
+            for (pi, r) in panels.iter().copied().zip(mine.iter().copied()) {
+                let cells = render_panel(pi, r);
+                let ox = r.x.saturating_sub(bar.x) as usize;
+                let oy = r.y.saturating_sub(bar.y) as usize;
+                for (dy, row) in cells.iter().enumerate() {
+                    let Some(dest) = grid.get_mut(oy + dy) else {
+                        break;
+                    };
+                    for (dx, cell) in row.iter().enumerate() {
+                        let Some(slot) = dest.get_mut(ox + dx) else {
+                            break;
+                        };
+                        *slot = cell.clone();
+                    }
+                }
+            }
+            renderer.paint_panel(bar, &grid)?;
         }
         Ok(())
     }
@@ -395,20 +525,30 @@ impl Chrome {
     /// keeps panels on screen.
     fn min_size(&self, i: usize) -> u16 {
         let vertical = !matches!(self.sidebars[i].edge, SidebarEdge::Bottom);
-        self.sidebars[i]
-            .panels
-            .iter()
-            .map(|p| {
-                let (min_cols, min_rows) = p.plugin.min_size();
-                if vertical {
-                    min_cols
-                } else {
-                    min_rows
-                }
-            })
-            .max()
-            .unwrap_or(1)
-            .max(1)
+        // The frame is drawn INSIDE `size`, so the plugins' minimums are
+        // minimums on the INTERIOR: a sidebar shrunk to exactly the largest of
+        // them would hand that plugin a rect two columns narrower than it asked
+        // for. The floor is raised by what the frame takes on this axis.
+        //
+        // This bounds the interactive resize only. `effective_sizes` can still
+        // grant less -- it clamps against the content minimum and knows nothing
+        // about frames -- which is exactly why the unframed degrade path in
+        // `paint` has to keep working.
+        frame_size_inset(&self.border_style)
+            + self.sidebars[i]
+                .panels
+                .iter()
+                .map(|p| {
+                    let (min_cols, min_rows) = p.plugin.min_size();
+                    if vertical {
+                        min_cols
+                    } else {
+                        min_rows
+                    }
+                })
+                .max()
+                .unwrap_or(1)
+                .max(1)
     }
 
     /// Re-target a directional resize at the focused sidebar. Returns `true` if
@@ -1074,9 +1214,13 @@ mod focus_tests {
         // the laid-out indices are non-contiguous. Walking `panels.len()` would
         // move focus onto index 1 -- a panel that is never painted.
         //
-        // The placeholder's min is (8, 2). Over 5 rows with weights 10/1/10,
-        // the middle panel's share is 0 rows, so it is dropped and only panels
-        // 0 and 2 are laid out.
+        // The placeholder's min is (8, 2). The fixture used to be 5 rows; the
+        // frame now takes two of those for the box and one more for each rule
+        // between panels, so 5 rows leave a single content row and everything
+        // but the last panel is dropped. 10 rows restore the original shape: an
+        // 8-row interior, 6 rows of content after two rules, and the middle
+        // panel's weighted share of those is 0 -- so it alone is dropped and
+        // only panels 0 and 2 are laid out.
         let mut c = Chrome::from_config(&[SidebarConfig {
             edge: SidebarEdge::Left,
             size: 30,
@@ -1097,7 +1241,7 @@ mod focus_tests {
             ],
         }]);
         let laid_out: Vec<usize> = c
-            .panel_rects(100, 5)
+            .panel_rects(100, 10)
             .into_iter()
             .map(|(_, p, _)| p)
             .collect();
@@ -1112,7 +1256,7 @@ mod focus_tests {
             FocusDirection::Down,
             None,
             100,
-            5,
+            10,
             &StatusBarPosition::Bottom
         ));
         assert_eq!(
@@ -1129,7 +1273,7 @@ mod focus_tests {
             FocusDirection::Up,
             None,
             100,
-            5,
+            10,
             &StatusBarPosition::Bottom
         ));
         assert_eq!(
@@ -1484,17 +1628,36 @@ mod resize_tests {
     fn a_size_never_shrinks_below_what_the_panels_need() {
         // The placeholder's `min_size` is 8 columns; below that `split_panels`
         // drops it and the sidebar paints nothing at all.
+        //
+        // The floor was 8 before frames. It is now 10: the zellij box takes a
+        // column on each side of the interior, so a sidebar shrunk to 8 would
+        // hand the placeholder 6 columns -- two fewer than it asked for. The
+        // PAINTED width is still exactly 8, which is what the floor is for.
         let mut c = focused(SidebarEdge::Left, 30, &[1]);
         for _ in 0..20 {
             c.resize_focused(Left, 5, 100, 30);
         }
-        assert_eq!(c.sidebars[0].size, 8);
+        assert_eq!(c.sidebars[0].size, 8 + 2);
         // Asserting the panel is still LAID OUT would be vacuous: `split_panels`
         // drops on the stack axis, which a vertical sidebar's width does not
         // touch, and it never drops the last panel anyway. What the floor
         // actually buys is the painted WIDTH.
         let rects = c.panel_rects(100, 30);
         assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].2.width, 8, "the panel is painted at the floor");
+    }
+
+    /// The tmux seam takes one column, not two, so the same sidebar's floor is
+    /// one lower -- and the painted width is still the plugin's minimum.
+    #[test]
+    fn the_size_floor_follows_the_style_the_frame_is_drawn_in() {
+        let mut c = focused(SidebarEdge::Left, 30, &[1]);
+        c.set_border_style(BorderStyle::TmuxStyle);
+        for _ in 0..20 {
+            c.resize_focused(Left, 5, 100, 30);
+        }
+        assert_eq!(c.sidebars[0].size, 8 + 1);
+        let rects = c.panel_rects(100, 30);
         assert_eq!(rects[0].2.width, 8, "the panel is painted at the floor");
     }
 

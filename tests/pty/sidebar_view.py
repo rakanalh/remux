@@ -163,11 +163,18 @@ def require_in_view(t, fails):
         sys.exit(1)
 
 
-def leftmost_box_column(t):
-    """The leftmost column any box-drawing glyph occupies, or None."""
+def leftmost_box_column(t, start=0):
+    """The leftmost column at or after `start` holding a box-drawing glyph.
+
+    `start` exists because the sidebar is now framed in the same border style as
+    the panes: its own box puts glyphs at column 0, so a caller asking "where do
+    the VIEW's cells begin" has to skip the sidebar's columns explicitly.
+    """
     best = None
     for row in t.rows_text():
         for x, ch in enumerate(row):
+            if x < start:
+                continue
             if ch in BOX:
                 if best is None or x < best:
                     best = x
@@ -240,13 +247,27 @@ def test_view_paints_inside_the_content_rect():
     compose_view(t)
     require_in_view(t, fails)
 
-    box = leftmost_box_column(t)
+    # The sidebar now has a box of its own on the two outer columns of its bar,
+    # so "the leftmost box glyph on screen" is no longer the view's. What the
+    # view must not do is paint a border in the sidebar's INTERIOR, which holds
+    # only the placeholder's text -- and its own leftmost border must sit
+    # exactly on the seam.
+    all_rows = t.rows_text()
+    intruders = [
+        (y, x)
+        for y, row in enumerate(all_rows[1 : len(all_rows) - 1], start=1)
+        for x, ch in enumerate(row[1 : SIDEBAR_W - 1], start=1)
+        if ch in BOX
+    ]
+    if intruders:
+        fails.append(f"a view cell border painted inside the sidebar at {intruders[:4]}")
+    box = leftmost_box_column(t, SIDEBAR_W)
     if box is None:
         fails.append("no cell border rendered at all")
-    elif box < SIDEBAR_W:
+    elif box != SIDEBAR_W:
         fails.append(
-            f"a view cell border painted at column {box}, inside the sidebar "
-            f"(the seam is at {SIDEBAR_W})"
+            f"the view's leftmost border is at column {box}, not on the seam "
+            f"({SIDEBAR_W})"
         )
 
     bar = t.rows_text()[-1]
@@ -257,7 +278,10 @@ def test_view_paints_inside_the_content_rect():
             f"the view status bar starts at column {bar.index('View 1')}, "
             f"inside the sidebar"
         )
-    if bar[:SIDEBAR_W].strip() not in ("", "Placeholder"):
+    # The sidebar's own bottom border owns that row now, so the band must be
+    # exactly that border -- any other glyph there is the view's status bar
+    # having run past the seam.
+    if set(bar[:SIDEBAR_W]) - set("\u2570\u2500\u256f"):
         fails.append(
             f"the view status bar overwrote the panel's bottom row: "
             f"{bar[:SIDEBAR_W]!r}"
@@ -499,7 +523,7 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
     t.send(b"\x1b1", 1.5)
     if not t.has("Placeholder"):
         fails.append("the sidebar did not come back on the second toggle")
-    if leftmost_box_column(t) != SIDEBAR_W:
+    if leftmost_box_column(t, SIDEBAR_W) != SIDEBAR_W:
         fails.append(
             f"the view did not shrink back to the seam: "
             f"{leftmost_box_column(t)}"
@@ -533,7 +557,7 @@ def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
     compose_view(t)
     require_in_view(t, fails)
 
-    seam_before = leftmost_box_column(t)
+    seam_before = leftmost_box_column(t, SIDEBAR_W)
 
     t.send(b"\x01", 0.5)   # prefix
     t.send(b"b", 0.8)      # the Sidebar group
@@ -554,9 +578,9 @@ def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
     # keeps its idle marker.
     if panel_marker(t) != "idle":
         fails.append(f"the panel took focus anyway: {panel_marker(t)!r}")
-    if leftmost_box_column(t) != seam_before:
+    if leftmost_box_column(t, SIDEBAR_W) != seam_before:
         fails.append(
-            f"the view moved: seam {leftmost_box_column(t)} vs {seam_before}"
+            f"the view moved: seam {leftmost_box_column(t, SIDEBAR_W)} vs {seam_before}"
         )
     if "View 1" not in t.rows_text()[-1]:
         fails.append(f"no longer in the view: {t.rows_text()[-1].rstrip()!r}")

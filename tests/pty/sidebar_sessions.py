@@ -244,9 +244,22 @@ def spawn(env, cols=COLS, rows=ROWS):
     return child, screen, pump
 
 
+# The sidebar is framed in the session's border style, and the frame is drawn
+# INSIDE the bar, so the panel is the bar minus one cell on every side.
+FRAME = 1
+
+
 def panel_rows(screen):
-    """The sidebar's own columns, one string per screen row."""
-    return [r[:SIDEBAR_W].rstrip() for r in screen.display]
+    """The panel's INTERIOR rows, one string per PANEL row.
+
+    Panel-relative, not screen-relative: row 0 is the plugin's own header, which
+    is what the tree navigation below counts `j` presses from. Before the
+    sidebar was framed the two coincided.
+    """
+    return [
+        r[FRAME : SIDEBAR_W - FRAME].rstrip()
+        for r in screen.display[FRAME : len(screen.display) - FRAME]
+    ]
 
 
 def content_rows(screen):
@@ -255,7 +268,7 @@ def content_rows(screen):
 
 
 def panel_row_of(screen, needle):
-    """Screen row of the first panel row containing `needle`."""
+    """PANEL row of the first panel row containing `needle`."""
     for y, r in enumerate(panel_rows(screen)):
         if needle in r:
             return y

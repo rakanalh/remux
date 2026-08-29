@@ -1874,6 +1874,12 @@ async fn run_client_loop(
     // surface the user pressed it on, the next view they open shows the style
     // they last chose.
     let mut view_border_style = config.appearance.border_style.clone();
+    // The sidebars are framed in the SAME style, so a sidebar sits beside the
+    // panes looking like one of them. Seeded here rather than in
+    // `Chrome::from_config` so there is exactly one expression of "the style
+    // the client is currently drawing with", and re-applied at every site that
+    // flips it below.
+    chrome.set_border_style(view_border_style.clone());
 
     // Spawn the config-file watcher for live hot-reload. This is best-effort:
     // if it fails to start we log and continue without hot-reload rather than
@@ -2231,6 +2237,10 @@ async fn run_client_loop(
                                 // drifting apart.
                                 if matches!(cmd, RemuxCommand::ToggleStyle) {
                                     view_border_style = toggled_border_style(&view_border_style);
+                                    // The sidebars are framed in the same style
+                                    // as the panes, so one keystroke reframes
+                                    // both. The repaint below then draws it.
+                                    chrome.set_border_style(view_border_style.clone());
                                 }
                                 // (The palette overlay was already torn down
                                 // above, before this arm and so before the view
@@ -2363,6 +2373,7 @@ async fn run_client_loop(
                                     if matches!(cmd, RemuxCommand::ToggleStyle) {
                                         view_border_style =
                                             toggled_border_style(&view_border_style);
+                                        chrome.set_border_style(view_border_style.clone());
                                     }
                                     // While a view is active, intercept structural
                                     // commands client-side (focus / layout / eject
@@ -2725,6 +2736,7 @@ async fn run_client_loop(
                                 // border style in step with the server's.
                                 if matches!(command, RemuxCommand::ToggleStyle) {
                                     view_border_style = toggled_border_style(&view_border_style);
+                                    chrome.set_border_style(view_border_style.clone());
                                 }
                                 let mut consumed = false;
                                 if let Some(av) = active_view {
@@ -4505,9 +4517,26 @@ async fn run_client_loop(
                             Some((sidebar, panel)) => MouseGrab::Panel { sidebar, panel },
                             None => MouseGrab::Content,
                         };
+                        // The sidebar's FRAME is inside the sidebar and inside
+                        // no panel: `panel_rects` returns interiors. An event
+                        // there is swallowed, never translated into the content
+                        // rect -- clamping a click on a border into the content
+                        // would land it on a pane the user did not click, one
+                        // cell away from where they pressed.
+                        //
+                        // Only routes derived from POSITION consult this. A
+                        // gesture already grabbed by the content keeps its grab
+                        // when the pointer crosses the frame, exactly as it does
+                        // when it crosses a panel.
+                        let over_frame = matches!(at_pointer, MouseGrab::Content)
+                            && chrome.sidebar_at(tc, tr, mouse.column, mouse.row).is_some();
                         let route = match mouse.kind {
                             // A press claims the region for the whole gesture.
                             MouseEventKind::Down(_) => {
+                                if over_frame {
+                                    mouse_grab = None;
+                                    continue;
+                                }
                                 mouse_grab = Some(at_pointer);
                                 at_pointer
                             }
@@ -4515,10 +4544,15 @@ async fn run_client_loop(
                             // pointer has since wandered. A stray one with no
                             // press behind it falls back to position.
                             MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
-                                mouse_grab.unwrap_or(at_pointer)
+                                match mouse_grab {
+                                    Some(g) => g,
+                                    None if over_frame => continue,
+                                    None => at_pointer,
+                                }
                             }
                             // The wheel is not part of a button gesture: it acts
                             // on whatever is under the pointer.
+                            _ if over_frame => continue,
                             _ => at_pointer,
                         };
                         if matches!(mouse.kind, MouseEventKind::Up(_)) {
@@ -6031,6 +6065,11 @@ async fn run_client_loop(
                         crate::client::chrome::ChromeFocus::Content => None,
                     };
                     chrome = crate::client::chrome::Chrome::from_config(&new_config.sidebar);
+                    // The rebuild starts from the config default; the frame has
+                    // to go back to the style the client is actually drawing
+                    // with, which a runtime `ToggleStyle` may have flipped away
+                    // from what any config says.
+                    chrome.set_border_style(view_border_style.clone());
                     // Runtime state is layered back on -- but NOT the way
                     // startup does it. `sidebar.json` holds a size for every
                     // edge from the first toggle or resize onward, so a

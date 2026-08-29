@@ -4,7 +4,8 @@
 //! client's `Resize`) and a set of absolutely-positioned panel rects. Kept free
 //! of I/O and of plugin trait objects so every edge combination is unit-tested.
 
-use crate::config::StatusBarPosition;
+use crate::config::{BorderStyle, StatusBarPosition};
+use crate::server::compositor::fits_zellij_border;
 use crate::server::layout::Rect;
 
 /// Which terminal edge a sidebar is docked to.
@@ -128,23 +129,130 @@ pub fn content_rect(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) ->
     }
 }
 
-/// Absolute screen rects for every visible panel, as
-/// `(sidebar_index, panel_index, rect)`.
+/// How a sidebar's frame divides its bar: the interior its panels share, and
+/// the gap the frame reserves between two stacked panels for the rule it draws
+/// there.
 ///
-/// Vertical sidebars span the full terminal height and stack their panels
-/// vertically; the bottom sidebar spans only the columns between the verticals
-/// and stacks its panels horizontally.
-pub fn panel_rects(
-    sidebars: &[SidebarGeom],
-    term_cols: u16,
-    term_rows: u16,
-) -> Vec<(usize, usize, Rect)> {
+/// The frame is drawn INSIDE the bar, exactly as a pane's border is drawn
+/// inside its rect. A sidebar's `size` therefore does not change when it gains
+/// a frame -- `content_rect`, and so the `Resize` the server is handed, is
+/// untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarFrame {
+    /// The rect the panels divide.
+    pub interior: Rect,
+    /// Cells between two stacked panels, for the separator rule.
+    pub gap: u16,
+    /// Whether a frame is drawn at all. `false` means the bar is too small to
+    /// carry one and renders exactly as it did before frames existed.
+    pub framed: bool,
+}
+
+/// The frame a sidebar on `edge` gets under `style`, given its bar rect.
+///
+/// **Zellij style** is a full box, so the interior is the bar inset by one cell
+/// on every side -- gated on [`fits_zellij_border`], the same threshold a pane
+/// uses, so a bar too small to hold a box plus an interior degrades to
+/// unframed instead of drawing a broken one.
+///
+/// **tmux style** has no per-pane box; content is edge-to-edge with minimal
+/// dividers (see `draw_tmux_dividers`). A sidebar therefore gets exactly one
+/// divider, at the seam against the content: the LAST column of a left sidebar,
+/// the FIRST column of a right one, the FIRST row of the bottom one. The
+/// divider is always inside the sidebar's own rect -- the server owns the
+/// content rect and would overwrite anything the client painted there on its
+/// next diff.
+pub fn sidebar_frame(style: &BorderStyle, edge: SidebarEdge, bar: Rect) -> SidebarFrame {
+    let unframed = SidebarFrame {
+        interior: bar,
+        gap: 0,
+        framed: false,
+    };
+    if bar.width == 0 || bar.height == 0 {
+        return unframed;
+    }
+    match style {
+        BorderStyle::ZellijStyle => {
+            if !fits_zellij_border(bar.width, bar.height) {
+                return unframed;
+            }
+            SidebarFrame {
+                interior: Rect {
+                    x: bar.x + 1,
+                    y: bar.y + 1,
+                    width: bar.width - 2,
+                    height: bar.height - 2,
+                },
+                gap: 1,
+                framed: true,
+            }
+        }
+        BorderStyle::TmuxStyle => {
+            let interior = match edge {
+                SidebarEdge::Left => {
+                    if bar.width < 2 {
+                        return unframed;
+                    }
+                    Rect {
+                        width: bar.width - 1,
+                        ..bar
+                    }
+                }
+                SidebarEdge::Right => {
+                    if bar.width < 2 {
+                        return unframed;
+                    }
+                    Rect {
+                        x: bar.x + 1,
+                        width: bar.width - 1,
+                        ..bar
+                    }
+                }
+                SidebarEdge::Bottom => {
+                    if bar.height < 2 {
+                        return unframed;
+                    }
+                    Rect {
+                        y: bar.y + 1,
+                        height: bar.height - 1,
+                        ..bar
+                    }
+                }
+            };
+            SidebarFrame {
+                interior,
+                gap: 1,
+                framed: true,
+            }
+        }
+    }
+}
+
+/// How many cells of the axis a sidebar's `size` measures its frame consumes.
+///
+/// Perpendicular to the edge: both sides of the zellij box, the single tmux
+/// divider. This is what a sidebar's minimum `size` has to clear on top of its
+/// plugins' own minimums, or shrinking to that minimum would leave an interior
+/// narrower than the plugin asked for.
+pub fn frame_size_inset(style: &BorderStyle) -> u16 {
+    match style {
+        BorderStyle::ZellijStyle => 2,
+        BorderStyle::TmuxStyle => 1,
+    }
+}
+
+/// Absolute screen rects for every visible sidebar's BAR -- its full extent,
+/// frame included -- as `(sidebar_index, rect)`.
+///
+/// Vertical sidebars span the full terminal height and are laid out from each
+/// edge inward, so two on the same edge stack side by side rather than
+/// overlapping; the bottom sidebar spans only the columns between the
+/// verticals, which own the corners.
+pub fn bar_rects(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Vec<(usize, Rect)> {
     let sizes = effective_sizes(sidebars, term_cols, term_rows);
     let content = content_rect(sidebars, term_cols, term_rows);
     let mut out = Vec::new();
 
-    // Verticals are laid out from each edge inward, so two left sidebars stack
-    // side by side rather than overlapping.
     let mut left_x = 0u16;
     let mut right_x = term_cols;
     let mut bottom_y = term_rows;
@@ -184,19 +292,61 @@ pub fn panel_rects(
                 }
             }
         };
-        let vertical = !matches!(s.edge, SidebarEdge::Bottom);
-        for (pi, rect) in split_panels(bar, &s.panels, vertical) {
-            out.push((i, pi, rect));
-        }
+        out.push((i, bar));
     }
 
     out
 }
 
-/// Divide `bar` among `panels` in proportion to weight, dropping any panel
-/// whose share falls below its minimum and giving the remainder to the last
-/// surviving panel so the division is exact.
-fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool) -> Vec<(usize, Rect)> {
+/// Absolute screen rects for every visible panel, as
+/// `(sidebar_index, panel_index, rect)`.
+///
+/// These are the panels' INTERIORS: the bar minus the frame `style` draws
+/// around it, and minus the rules between stacked panels. A plugin renders into
+/// exactly this rect, a mouse event hits a panel only inside it (a click on the
+/// frame itself belongs to no panel), and a panel's `min_size` is measured
+/// against it.
+///
+/// Vertical sidebars span the full terminal height and stack their panels
+/// vertically; the bottom sidebar spans only the columns between the verticals
+/// and stacks its panels horizontally.
+pub fn panel_rects(
+    sidebars: &[SidebarGeom],
+    term_cols: u16,
+    term_rows: u16,
+    style: &BorderStyle,
+) -> Vec<(usize, usize, Rect)> {
+    let mut out = Vec::new();
+    for (i, bar) in bar_rects(sidebars, term_cols, term_rows) {
+        let s = &sidebars[i];
+        let frame = sidebar_frame(style, s.edge, bar);
+        let vertical = !matches!(s.edge, SidebarEdge::Bottom);
+        for (pi, rect) in split_panels(frame.interior, &s.panels, vertical, frame.gap) {
+            out.push((i, pi, rect));
+        }
+    }
+    out
+}
+
+/// The extent left for panel CONTENT once `n` panels' separating rules have
+/// taken theirs.
+///
+/// `gap` sits BETWEEN panels, so `n` panels need `n - 1` of them.
+fn content_extent(extent: u16, gap: u16, n: usize) -> u16 {
+    let rules = (n.saturating_sub(1) as u32) * gap as u32;
+    extent.saturating_sub(rules.min(u16::MAX as u32) as u16)
+}
+
+/// Divide `bar` -- the sidebar's INTERIOR -- among `panels` in proportion to
+/// weight, leaving `gap` cells between neighbours for the frame's separator
+/// rule, dropping any panel whose share falls below its minimum, and giving the
+/// remainder to the last surviving panel so the division is exact.
+///
+/// The minimum test runs against the extent left AFTER the rules are deducted,
+/// and is recomputed on every drop: dropping a panel returns both its share and
+/// one rule to the survivors, so a rule must never be able to push a panel
+/// below its minimum without that being visible to the check.
+fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool, gap: u16) -> Vec<(usize, Rect)> {
     if panels.is_empty() {
         return Vec::new();
     }
@@ -206,9 +356,10 @@ fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool) -> Vec<(usize, 
     // dropping one enlarges everyone else's share and may rescue a neighbour.
     let mut kept: Vec<usize> = (0..panels.len()).collect();
     loop {
+        let avail = content_extent(extent, gap, kept.len());
         let total: u32 = kept.iter().map(|i| panels[*i].weight.max(1) as u32).sum();
         let Some(&victim) = kept.iter().find(|i| {
-            let share = (extent as u32 * panels[**i].weight.max(1) as u32 / total) as u16;
+            let share = (avail as u32 * panels[**i].weight.max(1) as u32 / total) as u16;
             let min = if vertical {
                 panels[**i].min_rows
             } else {
@@ -224,26 +375,30 @@ fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool) -> Vec<(usize, 
         kept.retain(|i| *i != victim);
     }
 
+    let avail = content_extent(extent, gap, kept.len());
     let total: u32 = kept.iter().map(|i| panels[*i].weight.max(1) as u32).sum();
     let mut out = Vec::with_capacity(kept.len());
+    // `offset` walks the bar (content plus rules); `used` counts content only,
+    // so the last panel's remainder is measured against `avail`.
+    let mut offset = 0u16;
     let mut used = 0u16;
     for (n, &i) in kept.iter().enumerate() {
         let last = n + 1 == kept.len();
         let span = if last {
-            extent - used
+            avail - used
         } else {
-            (extent as u32 * panels[i].weight.max(1) as u32 / total) as u16
+            (avail as u32 * panels[i].weight.max(1) as u32 / total) as u16
         };
         let rect = if vertical {
             Rect {
                 x: bar.x,
-                y: bar.y + used,
+                y: bar.y + offset,
                 width: bar.width,
                 height: span,
             }
         } else {
             Rect {
-                x: bar.x + used,
+                x: bar.x + offset,
                 y: bar.y,
                 width: span,
                 height: bar.height,
@@ -251,6 +406,7 @@ fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool) -> Vec<(usize, 
         };
         out.push((i, rect));
         used += span;
+        offset += span + if last { 0 } else { gap };
     }
     out
 }
@@ -290,6 +446,11 @@ pub fn pane_area(content: Rect, _status_bar: &StatusBarPosition) -> Rect {
 mod tests {
     use super::*;
     use crate::config::StatusBarPosition;
+
+    /// The style every geometry test that does not say otherwise runs under --
+    /// the configured default, and the one that frames most heavily (a box on
+    /// all four sides), so an interior expectation here is the tightest one.
+    const ZJ: BorderStyle = BorderStyle::ZellijStyle;
 
     fn sb(edge: SidebarEdge, size: u16, weights: &[u16]) -> SidebarGeom {
         SidebarGeom {
@@ -402,18 +563,24 @@ mod tests {
 
     #[test]
     fn verticals_own_the_corners_so_bottom_spans_between_them() {
-        // Decision 2 in the spec: the bottom panel's rect starts after the left
+        // Decision 2 in the spec: the bottom sidebar's bar starts after the left
         // sidebar and ends before the right one, while the verticals run the
         // full terminal height.
+        //
+        // Asserted on `bar_rects`, which is where this fact now lives: a
+        // sidebar's BAR is what claims terminal space, and the frame is drawn
+        // inside it. Before frames the panel rect and the bar were the same
+        // rect, so this used to read `panel_rects`; the numbers below are
+        // unchanged, only the function they are asked of.
         let sbs = [
             sb(SidebarEdge::Left, 30, &[1]),
             sb(SidebarEdge::Right, 20, &[1]),
             sb(SidebarEdge::Bottom, 6, &[1]),
         ];
-        let rects = panel_rects(&sbs, 120, 40);
-        let left = rects.iter().find(|(s, _, _)| *s == 0).unwrap().2;
-        let right = rects.iter().find(|(s, _, _)| *s == 1).unwrap().2;
-        let bottom = rects.iter().find(|(s, _, _)| *s == 2).unwrap().2;
+        let bars = bar_rects(&sbs, 120, 40);
+        let left = bars.iter().find(|(s, _)| *s == 0).unwrap().1;
+        let right = bars.iter().find(|(s, _)| *s == 1).unwrap().1;
+        let bottom = bars.iter().find(|(s, _)| *s == 2).unwrap().1;
 
         assert_eq!(
             left,
@@ -445,61 +612,240 @@ mod tests {
     }
 
     #[test]
+    fn a_framed_panel_sits_one_cell_inside_its_bar_on_every_side() {
+        // The companion to the test above, and the whole point of the frame
+        // work: the bar is unchanged, the PANEL is what shrank. A 30-column
+        // sidebar still claims 30 columns and gives its plugin 28.
+        let sbs = [
+            sb(SidebarEdge::Left, 30, &[1]),
+            sb(SidebarEdge::Right, 20, &[1]),
+            sb(SidebarEdge::Bottom, 6, &[1]),
+        ];
+        let rects = panel_rects(&sbs, 120, 40, &ZJ);
+        let left = rects.iter().find(|(s, _, _)| *s == 0).unwrap().2;
+        let right = rects.iter().find(|(s, _, _)| *s == 1).unwrap().2;
+        let bottom = rects.iter().find(|(s, _, _)| *s == 2).unwrap().2;
+
+        assert_eq!(
+            left,
+            Rect {
+                x: 1,
+                y: 1,
+                width: 28,
+                height: 38
+            }
+        );
+        assert_eq!(
+            right,
+            Rect {
+                x: 101,
+                y: 1,
+                width: 18,
+                height: 38
+            }
+        );
+        assert_eq!(
+            bottom,
+            Rect {
+                x: 31,
+                y: 35,
+                width: 68,
+                height: 4
+            }
+        );
+    }
+
+    #[test]
+    fn the_tmux_frame_takes_only_the_seam_against_the_content() {
+        // tmux style has no per-pane box, so a sidebar gets exactly one
+        // divider, on the side facing the content: the last column of a left
+        // sidebar, the first of a right one, the top row of the bottom one.
+        let sbs = [
+            sb(SidebarEdge::Left, 30, &[1]),
+            sb(SidebarEdge::Right, 20, &[1]),
+            sb(SidebarEdge::Bottom, 6, &[1]),
+        ];
+        let rects = panel_rects(&sbs, 120, 40, &BorderStyle::TmuxStyle);
+        let left = rects.iter().find(|(s, _, _)| *s == 0).unwrap().2;
+        let right = rects.iter().find(|(s, _, _)| *s == 1).unwrap().2;
+        let bottom = rects.iter().find(|(s, _, _)| *s == 2).unwrap().2;
+
+        assert_eq!(
+            left,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 29,
+                height: 40
+            }
+        );
+        assert_eq!(
+            right,
+            Rect {
+                x: 101,
+                y: 0,
+                width: 19,
+                height: 40
+            }
+        );
+        assert_eq!(
+            bottom,
+            Rect {
+                x: 30,
+                y: 35,
+                width: 70,
+                height: 5
+            }
+        );
+    }
+
+    #[test]
+    fn the_frame_never_moves_the_content_rect() {
+        // The load-bearing invariant of the whole frame change: the frame is
+        // drawn INSIDE `size`, so the rect handed to the server as `Resize` is
+        // identical in every style, and identical to what it was before frames
+        // existed. `content_rect` does not even take a style -- this pins that
+        // it never needs to.
+        let sbs = [
+            sb(SidebarEdge::Left, 30, &[1, 1]),
+            sb(SidebarEdge::Right, 20, &[1]),
+            sb(SidebarEdge::Bottom, 6, &[1, 1]),
+        ];
+        let content = content_rect(&sbs, 120, 40);
+        assert_eq!(
+            content,
+            Rect {
+                x: 30,
+                y: 0,
+                width: 70,
+                height: 34
+            }
+        );
+        for style in [ZJ, BorderStyle::TmuxStyle] {
+            for (i, bar) in bar_rects(&sbs, 120, 40) {
+                let f = sidebar_frame(&style, sbs[i].edge, bar);
+                assert!(f.interior.width <= bar.width);
+                // No panel may be laid out outside its own bar, which is what
+                // would let a frame push into the content rect.
+                for (_, _, r) in panel_rects(&sbs, 120, 40, &style)
+                    .into_iter()
+                    .filter(|(s, _, _)| *s == i)
+                {
+                    assert!(r.x >= bar.x && r.x + r.width <= bar.x + bar.width, "{r:?}");
+                    assert!(
+                        r.y >= bar.y && r.y + r.height <= bar.y + bar.height,
+                        "{r:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bar_too_small_to_frame_gives_its_panel_the_whole_bar() {
+        // The degrade path: `fits_zellij_border` is 3x3, so a 2-column sidebar
+        // renders exactly as it did before frames existed rather than drawing a
+        // box with no inside.
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 30,
+        };
+        let f = sidebar_frame(&ZJ, SidebarEdge::Left, bar);
+        assert!(!f.framed);
+        assert_eq!(f.interior, bar);
+        assert_eq!(f.gap, 0);
+        // ... and tmux, which needs only a column for its seam, still frames.
+        let t = sidebar_frame(&BorderStyle::TmuxStyle, SidebarEdge::Left, bar);
+        assert!(t.framed);
+        assert_eq!(t.interior.width, 1);
+        // A single column has nowhere to put the seam AND a panel.
+        let one = Rect { width: 1, ..bar };
+        assert!(!sidebar_frame(&BorderStyle::TmuxStyle, SidebarEdge::Left, one).framed);
+    }
+
+    #[test]
     fn stacked_panels_split_by_weight() {
+        // Was 20/10 over the full 30-row bar. The interior is 28 rows, and one
+        // of those is the rule between the two panels, so 27 rows divide 2:1
+        // into 18 and 9 with the rule at bar-local row 19.
         let sbs = [sb(SidebarEdge::Left, 30, &[2, 1])];
-        let rects = panel_rects(&sbs, 100, 30);
+        let rects = panel_rects(&sbs, 100, 30, &ZJ);
         assert_eq!(rects.len(), 2);
         assert_eq!(
             rects[0].2,
             Rect {
-                x: 0,
-                y: 0,
-                width: 30,
-                height: 20
+                x: 1,
+                y: 1,
+                width: 28,
+                height: 18
             }
         );
         assert_eq!(
             rects[1].2,
             Rect {
-                x: 0,
+                x: 1,
                 y: 20,
-                width: 30,
-                height: 10
+                width: 28,
+                height: 9
             }
+        );
+        assert_eq!(
+            rects[1].2.y,
+            rects[0].2.y + rects[0].2.height + 1,
+            "the panels must leave exactly one row for the rule between them"
         );
     }
 
     #[test]
     fn weight_remainder_goes_to_the_last_panel() {
-        // 30 rows over weights 1,1,1 divides evenly; 31 must not lose a row.
+        // Was: 31 rows over weights 1,1,1 must not lose a row. The arithmetic
+        // now runs on the INTERIOR minus the rules -- a 32-row terminal gives a
+        // 30-row interior, two rules leave 28 for content, and 28 over three
+        // equal weights is 9/9/10. The invariant is the same one: content plus
+        // rules must fill the interior exactly, with nothing lost to rounding.
         let sbs = [sb(SidebarEdge::Left, 30, &[1, 1, 1])];
-        let rects = panel_rects(&sbs, 100, 31);
-        let total: u16 = rects.iter().map(|(_, _, r)| r.height).sum();
-        assert_eq!(total, 31);
-        assert_eq!(rects[2].2.height, 11);
+        let rects = panel_rects(&sbs, 100, 32, &ZJ);
+        assert_eq!(rects.len(), 3);
+        let content: u16 = rects.iter().map(|(_, _, r)| r.height).sum();
+        let rules = rects.len() as u16 - 1;
+        assert_eq!(content + rules, 30, "the interior is not filled exactly");
+        assert_eq!(rects[2].2.height, 10, "the remainder went somewhere else");
+        // ... and the last panel ends flush against the bottom border.
+        let last = rects[2].2;
+        assert_eq!(last.y + last.height, 31);
     }
 
     #[test]
     fn bottom_sidebar_panels_split_horizontally() {
+        // Was 50/50 across the full 100-column bar. The interior is 98 columns
+        // starting at x=1; one is the rule between the panels, so 97 divide
+        // into 48 and 49 (the remainder goes to the last panel, as always).
         let sbs = [sb(SidebarEdge::Bottom, 6, &[1, 1])];
-        let rects = panel_rects(&sbs, 100, 30);
+        let rects = panel_rects(&sbs, 100, 30, &ZJ);
         assert_eq!(
             rects[0].2,
             Rect {
-                x: 0,
-                y: 24,
-                width: 50,
-                height: 6
+                x: 1,
+                y: 25,
+                width: 48,
+                height: 4
             }
         );
         assert_eq!(
             rects[1].2,
             Rect {
                 x: 50,
-                y: 24,
-                width: 50,
-                height: 6
+                y: 25,
+                width: 49,
+                height: 4
             }
+        );
+        assert_eq!(
+            rects[1].2.x,
+            rects[0].2.x + rects[0].2.width + 1,
+            "the bottom sidebar's rule is a COLUMN between horizontally stacked panels"
         );
     }
 
@@ -567,11 +913,42 @@ mod tests {
                 },
             ],
         }];
-        // 10 rows total: the second panel's weighted share is 1 row, below its
-        // min of 8, so it is dropped and the first takes everything.
-        let rects = panel_rects(&sbs, 100, 10);
+        // 10 rows total, so an 8-row interior. The second panel's weighted
+        // share of the 7 rows left after the rule is 0, below its min of 8, so
+        // it is dropped -- and dropping it returns the rule as well, leaving the
+        // survivor the whole 8-row interior (it was the whole 10-row bar before
+        // frames).
+        let rects = panel_rects(&sbs, 100, 10, &ZJ);
         assert_eq!(rects.len(), 1);
-        assert_eq!(rects[0].2.height, 10);
+        assert_eq!(rects[0].2.height, 8);
+    }
+
+    #[test]
+    fn a_panel_min_size_is_measured_against_the_interior_not_the_bar() {
+        // The discriminating case for checking mins after the frame: a 10-row
+        // bar has an 8-row interior, so a panel asking for 9 rows does NOT fit
+        // even though the bar is big enough for it. Measuring against the bar
+        // would lay out a panel one row taller than the rect it is handed.
+        let sbs = [SidebarGeom {
+            edge: SidebarEdge::Left,
+            size: 30,
+            visible: true,
+            panels: vec![
+                PanelGeom {
+                    weight: 1,
+                    min_cols: 1,
+                    min_rows: 9,
+                },
+                PanelGeom {
+                    weight: 1,
+                    min_cols: 1,
+                    min_rows: 1,
+                },
+            ],
+        }];
+        let rects = panel_rects(&sbs, 100, 10, &ZJ);
+        assert_eq!(rects.len(), 1, "both panels were kept in an 8-row interior");
+        assert_eq!(rects[0].2.height, 8);
     }
 
     #[test]
@@ -637,9 +1014,12 @@ mod tests {
             sb(SidebarEdge::Bottom, 6, &[1]),
             sb(SidebarEdge::Bottom, 4, &[1]),
         ];
-        let rects = panel_rects(&sbs, 100, 40);
-        let first = rects.iter().find(|(s, _, _)| *s == 0).unwrap().2;
-        let second = rects.iter().find(|(s, _, _)| *s == 1).unwrap().2;
+        // On `bar_rects`: overlap is a property of the BARS, which is what
+        // claims terminal space. Frames are drawn inside them and cannot make
+        // two bars overlap or stop them doing so.
+        let rects = bar_rects(&sbs, 100, 40);
+        let first = rects.iter().find(|(s, _)| *s == 0).unwrap().1;
+        let second = rects.iter().find(|(s, _)| *s == 1).unwrap().1;
         // First declared sits closest to the bottom edge; the second stacks above it.
         assert_eq!(
             first,
@@ -671,9 +1051,10 @@ mod tests {
             sb(SidebarEdge::Left, 20, &[1]),
             sb(SidebarEdge::Left, 10, &[1]),
         ];
-        let rects = panel_rects(&sbs, 100, 30);
+        // Also on `bar_rects`, and for the same reason as the test above.
+        let rects = bar_rects(&sbs, 100, 30);
         assert_eq!(
-            rects[0].2,
+            rects[0].1,
             Rect {
                 x: 0,
                 y: 0,
@@ -682,7 +1063,7 @@ mod tests {
             }
         );
         assert_eq!(
-            rects[1].2,
+            rects[1].1,
             Rect {
                 x: 20,
                 y: 0,

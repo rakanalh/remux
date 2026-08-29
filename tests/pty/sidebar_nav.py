@@ -259,6 +259,25 @@ def pane_focus_cmds(log: str):
     return re.findall(r"msg=Command\((PaneFocus\w+)\)", log)
 
 
+# How far into its bar a sidebar's panel content starts. The sidebar is framed
+# in the session's border style (zellij by default: a box on all four sides), and
+# the frame is drawn INSIDE the bar, so the panel's first row and first column
+# are one cell in. The bar itself -- and so the content rect the server is sized
+# for -- is unchanged, which is why only the marker ROWS below moved.
+FRAME = 1
+
+
+def pane_frame_column(screen, start=0):
+    """Column where the SERVER's pane frame begins, at or after `start`.
+
+    Row 0 now carries two box corners with a sidebar up: the sidebar's own
+    frame at column 0 and the pane's at the seam. `startswith("\u256d")` used
+    to mean "no sidebar"; it no longer does, so the tests below name the column
+    they mean instead.
+    """
+    return screen.display[0].find("\u256d", start)
+
+
 # Left sidebar column band, and the rows the placeholder's markers live on.
 def markers(screen, x0=0, x1=SIDEBAR_W):
     """(row_index, "focused"/"idle") for every panel marker on screen."""
@@ -285,7 +304,7 @@ def test_alt_h_enters_the_left_sidebar_and_alt_l_returns():
     child, screen, pump = spawn(env)
     pump(1.5)
 
-    assert markers(screen) == [(1, "idle")], (
+    assert markers(screen) == [(FRAME + 1, "idle")], (
         f"the panel did not start unfocused: {markers(screen)}"
     )
     child.send(ALT_H)
@@ -377,7 +396,7 @@ def test_alt_j_and_alt_k_walk_stacked_panels():
     child.send(ALT_H)
     pump(1.0)
     first = focused_rows(screen)
-    assert first == [1], f"Alt+h did not focus the top panel: {markers(screen)}"
+    assert first == [FRAME + 1], f"Alt+h did not focus the top panel: {markers(screen)}"
 
     child.send(ALT_J)
     pump(1.0)
@@ -609,7 +628,7 @@ def test_the_sidebar_actions_toggle_focus_and_cycle():
     child.send(b"\x1b1")
     pump(1.5)
     assert not markers(screen), f"the sidebar did not hide: {markers(screen)}"
-    assert screen.display[0].startswith("\u256d"), (
+    assert pane_frame_column(screen) == 0, (
         "the content rect did not grow into the freed columns:\n"
         + "\n".join(screen.display[:3])
     )
@@ -620,7 +639,7 @@ def test_the_sidebar_actions_toggle_focus_and_cycle():
     assert len(markers(screen)) == 2, (
         f"the sidebar did not come back: {markers(screen)}"
     )
-    assert not screen.display[0].startswith("\u256d"), (
+    assert pane_frame_column(screen, SIDEBAR_W) == SIDEBAR_W, (
         "the content rect did not shrink again:\n" + "\n".join(screen.display[:3])
     )
 
@@ -905,7 +924,7 @@ def test_a_toggled_sidebar_survives_a_client_restart():
         "the hidden sidebar came back after a restart:\n"
         + "\n".join(screen.display[:4])
     )
-    assert screen.display[0].startswith("\u256d"), (
+    assert pane_frame_column(screen) == 0, (
         "the restarted client did not size the content rect for a hidden "
         "sidebar:\n" + "\n".join(screen.display[:3])
     )
@@ -925,7 +944,7 @@ def test_a_toggled_sidebar_survives_a_client_restart():
         "the restored sidebar did not survive the second restart:\n"
         + "\n".join(screen.display[:4])
     )
-    assert not screen.display[0].startswith("\u256d"), (
+    assert pane_frame_column(screen, SIDEBAR_W) == SIDEBAR_W, (
         "the content rect did not shrink for the restored sidebar:\n"
         + "\n".join(screen.display[:3])
     )
@@ -1077,7 +1096,12 @@ def seam(screen):
     boundary rather than only the stored number.
     """
     row = screen.display[0]
-    return row.index("\u256d") if "\u256d" in row else None
+    # The sidebar is framed too, in the same style, and its box's top-left
+    # corner sits at column 0. The server's frame is the next corner along, so
+    # the search starts at column 1 whenever a panel is on screen.
+    start = 1 if markers(screen) else 0
+    at = row.find("\u256d", start)
+    return at if at >= 0 else None
 
 
 def resize_cols(log: str):

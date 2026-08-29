@@ -568,6 +568,9 @@
 #   size    — how thick the sidebar is: COLUMNS for "left"/"right", ROWS for
 #             "bottom". Required. It is a starting size, not a fixed one — a
 #             sidebar is resizable at runtime and its live size is remembered.
+#             The FRAME IS DRAWN INSIDE IT (see below), so a 30-column sidebar
+#             still occupies 30 columns and gives its panels 28 of them under
+#             the default border style.
 #   visible — whether it starts open (default: true). Toggling it at runtime
 #             also persists, so this is only the very first run's state.
 #
@@ -597,6 +600,22 @@
 # you lose that panel, not the whole config. A sidebar left with no usable
 # panels (none declared, or every name unknown) is dropped entirely, also with
 # a warning: an empty strip of chrome would just be stolen space.
+#
+# FRAMES. A sidebar is framed in the same border style as the panes beside it
+# (`appearance.border_style`), so it reads as part of the same screen: one frame
+# per SIDEBAR — not one per panel — with a rule between stacked panels. Under
+# "zellij_style" that is a rounded box around the whole sidebar; under
+# "tmux_style", which has no per-pane box, it is a single divider on the side
+# facing the panes plus a divider between panels. `ToggleStyle` (`Prefix g`)
+# reframes the sidebars in the same keystroke it reframes the panes, and the
+# frame takes the active border colour while any of that sidebar's panels holds
+# the keyboard (zellij style only — tmux-style dividers do not track focus for
+# panes either).
+#
+# The frame is drawn INSIDE the sidebar's `size`, exactly as a pane's border is
+# drawn inside the pane: the panes' rectangle is unchanged by it. A sidebar too
+# small to carry a frame and still leave an interior is drawn unframed rather
+# than with a broken box.
 #
 # Keys: the `b` group under [keybindings.command] toggles, focuses and cycles
 # the sidebars, and `Alt+h/j/k/l` move focus into and out of one exactly as they
