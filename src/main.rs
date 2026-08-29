@@ -1837,8 +1837,11 @@ async fn run_client_loop(
     let mut compositor_theme = config.compositor_theme();
     // Client-side sidebars. The server never learns they exist: the client
     // hands it a reduced content rect and paints the panels around the frames
-    // it gets back. Built once here -- plugins carry state, so a config
-    // hot-reload deliberately leaves the existing chrome in place.
+    // it gets back. Rebuilt from scratch by the config hot-reload arm below --
+    // that discards plugin state (the session tree's expansion and selection),
+    // which is the accepted price of a `[[sidebar]]` block appearing without a
+    // restart: the panel set can change shape entirely, so there is nothing to
+    // carry across.
     let mut chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
     // The config supplies the defaults; anything the user changed at runtime
     // last time -- which sidebars are open, how wide, how the panels are
@@ -2015,9 +2018,10 @@ async fn run_client_loop(
     })
     .await?;
 
-    // Whether a configured panel needs the server's session-tree push. Panels
-    // come from config and never change at runtime, so this is asked once.
-    let wants_session_tree = chrome.wants_session_tree();
+    // Whether a configured panel needs the server's session-tree push.
+    // Recomputed by the config hot-reload arm, which can add or remove the
+    // panel that wants it.
+    let mut wants_session_tree = chrome.wants_session_tree();
     // Connections already told to push their tree. Reconciled against
     // `connected_ids` at the top of every loop pass rather than at each connect
     // site: remotes are dialled from five different places (startup
@@ -5976,6 +5980,77 @@ async fn run_client_loop(
                     // Reconcile the remotes roster (update in place / add new /
                     // drop idle config-removed remotes).
                     mgr.update_remotes(&new_config.remotes);
+
+                    // Rebuild the client-side chrome. Plugins are rebuilt with
+                    // it, so a sessions panel loses its expansion and selection
+                    // on any config edit -- accepted, because the alternative
+                    // is a `[[sidebar]]` block that needs a client restart to
+                    // appear, and there is no meaningful way to carry state
+                    // across a panel set that may have changed shape entirely.
+                    let (tc, tr) = renderer.size();
+                    let chrome_before = chrome.content_rect(tc, tr);
+                    chrome = crate::client::chrome::Chrome::from_config(&new_config.sidebar);
+                    // Runtime state is layered back on exactly as startup does
+                    // it, so an unrelated config edit does not throw away the
+                    // sizes and visibility the user set by hand. State for an
+                    // edge the new config does not declare is ignored, so a
+                    // newly added sidebar opens on its config defaults.
+                    crate::client::sidebar_state::apply(
+                        &mut chrome,
+                        &crate::client::sidebar_state::load(),
+                    );
+                    // The panel that wants the session tree may have just
+                    // appeared or gone. Recompute, and forget the existing
+                    // subscriptions so the reconcile at the top of the loop
+                    // re-subscribes every live connection: the server answers a
+                    // subscribe with the tree at once, which is what fills a
+                    // freshly built panel that has never seen a push.
+                    wants_session_tree = chrome.wants_session_tree();
+                    tree_subscribed.clear();
+                    // Origin and `Resize` travel together (see
+                    // `sync_content_rect`): `Renderer::resize` resets the
+                    // content size but keeps the origin.
+                    let chrome_content = chrome.content_rect(tc, tr);
+                    if chrome_content != chrome_before {
+                        sync_content_rect(&mut renderer, &chrome_content);
+                        mgr.send_foreground(ClientMessage::Resize {
+                            cols: chrome_content.width,
+                            rows: chrome_content.height,
+                        })
+                        .await?;
+                    }
+                    // Repaint so the new chrome is on screen now rather than at
+                    // the next frame -- the same pair the sidebar-intent arm
+                    // runs, for the same reason.
+                    match active_view {
+                        Some(av) => {
+                            subscribe_view_cells(
+                                mgr,
+                                &chrome,
+                                &renderer,
+                                &mut views[av],
+                                &view_border_style,
+                            )
+                            .await?;
+                            paint_view(
+                                &mut renderer,
+                                &chrome,
+                                &views[av],
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &compositor_theme,
+                                &view_border_style,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                            )?;
+                        }
+                        None => {
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            renderer.flush()?;
+                        }
+                    }
 
                     // If the session-manager overlay is open, repaint it so the
                     // new theme takes effect immediately.
