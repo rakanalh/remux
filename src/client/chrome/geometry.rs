@@ -5,7 +5,7 @@
 //! of I/O and of plugin trait objects so every edge combination is unit-tested.
 
 use crate::config::{BorderStyle, StatusBarPosition};
-use crate::server::compositor::fits_zellij_border;
+use crate::server::compositor::{fits_zellij_border, pane_content_rect};
 use crate::server::layout::Rect;
 
 /// Which terminal edge a sidebar is docked to.
@@ -150,18 +150,30 @@ pub struct SidebarFrame {
 
 /// The frame a sidebar on `edge` gets under `style`, given its bar rect.
 ///
-/// **Zellij style** is a full box, so the interior is the bar inset by one cell
-/// on every side -- gated on [`fits_zellij_border`], the same threshold a pane
-/// uses, so a bar too small to hold a box plus an interior degrades to
-/// unframed instead of drawing a broken one.
+/// The style's own inset comes from [`pane_content_rect`] -- the one definition
+/// of "what is left of a rect once this border style has taken its share", the
+/// same call the compositor and the PTY-sizing path go through. A sidebar is
+/// not a stack, so `multi_stack` is `false`.
 ///
-/// **tmux style** has no per-pane box; content is edge-to-edge with minimal
-/// dividers (see `draw_tmux_dividers`). A sidebar therefore gets exactly one
-/// divider, at the seam against the content: the LAST column of a left sidebar,
-/// the FIRST column of a right one, the FIRST row of the bottom one. The
-/// divider is always inside the sidebar's own rect -- the server owns the
-/// content rect and would overwrite anything the client painted there on its
-/// next diff.
+/// **Zellij style** is a full box, and `pane_content_rect` insets by one cell
+/// on every side, gated on [`fits_zellij_border`]. The gate is repeated here
+/// explicitly rather than inferred from `interior != bar`: whether a frame is
+/// wanted is a separate question from how big it is, and the two agreeing is
+/// something to assert, not to assume.
+///
+/// **tmux style is where reuse stops, and deliberately.** `pane_content_rect`
+/// returns the rect unchanged for a non-stack tmux pane, which is correct for a
+/// PANE: tmux dividers are not inset at all, they are drawn ON TOP of the
+/// neighbour's last column (`draw_tmux_dividers` writes `buffer[row][col - 1]`,
+/// inside the LEFT rect). A sidebar cannot do that. The rect on the far side of
+/// its seam is the server's content rect; anything the client paints there is
+/// overwritten on the next diff render, and for a right or bottom sidebar the
+/// compositor's rule would put the divider inside that rect rather than inside
+/// the sidebar. So the seam is RESERVED out of the sidebar's own interior --
+/// the last column of a left sidebar, the first of a right one, the first row
+/// of the bottom one -- which is the only placement available on all three
+/// edges. That reservation is the delta; the glyphs and the cell styling still
+/// come from the shared primitives in `chrome::frame`.
 pub fn sidebar_frame(style: &BorderStyle, edge: SidebarEdge, bar: Rect) -> SidebarFrame {
     let unframed = SidebarFrame {
         interior: bar,
@@ -177,45 +189,43 @@ pub fn sidebar_frame(style: &BorderStyle, edge: SidebarEdge, bar: Rect) -> Sideb
                 return unframed;
             }
             SidebarFrame {
-                interior: Rect {
-                    x: bar.x + 1,
-                    y: bar.y + 1,
-                    width: bar.width - 2,
-                    height: bar.height - 2,
-                },
+                interior: pane_content_rect(style, bar, false),
                 gap: 1,
                 framed: true,
             }
         }
         BorderStyle::TmuxStyle => {
+            // Starts from the style's own inset (a no-op for a non-stack tmux
+            // pane), then reserves the seam. See the doc comment above.
+            let base = pane_content_rect(style, bar, false);
             let interior = match edge {
                 SidebarEdge::Left => {
-                    if bar.width < 2 {
+                    if base.width < 2 {
                         return unframed;
                     }
                     Rect {
-                        width: bar.width - 1,
-                        ..bar
+                        width: base.width - 1,
+                        ..base
                     }
                 }
                 SidebarEdge::Right => {
-                    if bar.width < 2 {
+                    if base.width < 2 {
                         return unframed;
                     }
                     Rect {
-                        x: bar.x + 1,
-                        width: bar.width - 1,
-                        ..bar
+                        x: base.x + 1,
+                        width: base.width - 1,
+                        ..base
                     }
                 }
                 SidebarEdge::Bottom => {
-                    if bar.height < 2 {
+                    if base.height < 2 {
                         return unframed;
                     }
                     Rect {
-                        y: bar.y + 1,
-                        height: bar.height - 1,
-                        ..bar
+                        y: base.y + 1,
+                        height: base.height - 1,
+                        ..base
                     }
                 }
             };
@@ -739,6 +749,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_framed_sidebars_interior_is_the_panes_content_rect() {
+        // The anti-duplication assertion: the zellij inset is not re-derived
+        // here, it IS `pane_content_rect`. If someone reintroduces a local
+        // copy that drifts, this fails.
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+        assert_eq!(
+            sidebar_frame(&ZJ, SidebarEdge::Left, bar).interior,
+            pane_content_rect(&ZJ, bar, false)
+        );
+        // ... and the tmux interior is that same shared inset MINUS the seam,
+        // which is the one documented delta: a pane's divider is drawn over its
+        // neighbour, and a sidebar has no neighbour it is allowed to paint.
+        let tm = BorderStyle::TmuxStyle;
+        let base = pane_content_rect(&tm, bar, false);
+        assert_eq!(base, bar, "a non-stack tmux pane is not inset at all");
+        assert_eq!(
+            sidebar_frame(&tm, SidebarEdge::Left, bar).interior,
+            Rect {
+                width: base.width - 1,
+                ..base
+            }
+        );
     }
 
     #[test]

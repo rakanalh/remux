@@ -140,6 +140,18 @@ def check_no_panic():
             assert "panicked" not in body, f"{name} panicked:\n{body[-2000:]}"
 
 
+def client_log() -> str:
+    path = f"{RUNDIR}/state/remux/client.log"
+    return open(path, errors="replace").read() if os.path.exists(path) else ""
+
+
+def write_config(body: str):
+    """Rewrite the live config and give the watcher time to debounce + apply."""
+    with open(f"{RUNDIR}/config/remux/config.toml", "w") as fh:
+        fh.write(body)
+    time.sleep(0.2)
+
+
 def server_log() -> str:
     path = f"{RUNDIR}/state/remux/server.log"
     return open(path, errors="replace").read() if os.path.exists(path) else ""
@@ -449,6 +461,65 @@ def test_a_click_on_the_frame_never_reaches_the_server():
     check_no_panic()
 
 
+def test_a_config_reload_keeps_the_toggled_style():
+    """A hot-reload rebuilds the `Chrome`; it must not un-toggle the frame.
+
+    `Chrome::from_config` starts from the config default, so a reload that did
+    not carry the live style across would silently put the sidebar back into
+    `appearance.border_style` while the panes stayed toggled -- the sidebar and
+    the panes disagreeing, which is the exact inconsistency this work removes.
+
+    The edit is to `size`, not to the style: that makes the reload observable on
+    screen independently of the log, so "still toggled" cannot pass because
+    nothing reloaded.
+    """
+    name = "test_a_config_reload_keeps_the_toggled_style"
+    env = make_env(cfg("zellij_style"))
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    bad = []
+    if screen.display[0][0] != TL:
+        bad.append("the sidebar did not start framed in the config's zellij style")
+
+    child.send(b"\x01")
+    time.sleep(0.2)
+    child.send(b"g")  # ToggleStyle -> tmux
+    pump(1.5)
+    if screen.display[0][SIDEBAR_W - 1] != VERT or screen.display[0][0] in BOX:
+        bad.append(f"the toggle did not reach the sidebar: {screen.display[0][:SIDEBAR_W]!r}")
+
+    narrower = 26
+    baseline = client_log().count("client: config reloaded")
+    write_config(cfg("zellij_style", size=narrower))
+    pump(3.0)
+    reloads = client_log().count("client: config reloaded") - baseline
+    if reloads < 1:
+        bad.append("the config edit never reloaded; the assertion below is vacuous")
+    rows = screen.display
+    # The reload DID take effect...
+    if rows[0][narrower - 1] != VERT:
+        bad.append(
+            f"the reload did not apply the new size: {rows[0][:SIDEBAR_W]!r}"
+        )
+    # ...and the sidebar is still in the TOGGLED style, not the config's.
+    if rows[0][0] in BOX:
+        bad.append(
+            f"the reload reverted the sidebar to the config's zellij style: "
+            f"{rows[0][:SIDEBAR_W]!r}"
+        )
+    # ...and the panes agree with it.
+    if rows[0][narrower] == TL:
+        bad.append("the panes are framed while the sidebar is not")
+    if not child.isalive():
+        bad.append("the client died across the reload")
+    if bad:
+        fail(name, "; ".join(bad), screen)
+    else:
+        ok(name)
+    teardown(child, env)
+    check_no_panic()
+
+
 if __name__ == "__main__":
     test_zellij_style_draws_a_box_around_the_sidebar()
     test_the_panel_interior_shrank_by_the_frame()
@@ -458,6 +529,7 @@ if __name__ == "__main__":
     test_the_focused_sidebars_frame_uses_the_active_colour()
     test_a_sidebar_too_small_to_frame_degrades_to_unframed()
     test_a_click_on_the_frame_never_reaches_the_server()
+    test_a_config_reload_keeps_the_toggled_style()
     if FAILURES:
         print("FAILURES")
         for f in FAILURES:

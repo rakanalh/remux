@@ -421,59 +421,134 @@ pub fn draw_zellij_border(
     let x = rect.x as usize;
     let y = rect.y as usize;
     let w = rect.width as usize;
-    let h = rect.height as usize;
-    if w == 0 || h == 0 {
+    if w == 0 || rect.height == 0 {
         return;
     }
 
-    let border_bg = theme.border_bg();
-    let border_cell = |c: char| RenderCell {
+    // The box itself is shared: the sidebar chrome draws the same one.
+    draw_zellij_box(buffer, rect, border_fg, theme);
+
+    // Then the pane-specific part, and the ONLY pane-specific part: the name /
+    // tab labels, overlaid on the top edge the box already filled with ─.
+    let available_width = w.saturating_sub(2); // inside the two corner chars
+    let top_content =
+        build_top_border_content(stack_info, pane_id, border_fg, mode, available_width, theme);
+    // The range stops at the right corner, so overlong content is clipped
+    // exactly as it was when this loop carried its own counter.
+    for (col, cell) in ((x + 1)..(x + w - 1)).zip(top_content.iter()) {
+        set_cell(buffer, y, col, cell.clone());
+    }
+}
+
+/// One cell of a border, in `border_fg` on the theme's border background.
+///
+/// **The one construction of a border cell.** Every frame drawn anywhere -- the
+/// zellij box, the tmux dividers, a View cell's border, the client's sidebar
+/// chrome -- goes through here, so a change to how a border cell is styled
+/// cannot reach one of them and miss another.
+///
+/// `draw_tmux_tab_bar` deliberately does NOT use this: a tab bar is
+/// status-bar-styled, not border-styled, and folding it in would be false
+/// sharing.
+pub fn border_cell(c: char, border_fg: &CellColor, theme: &CompositorTheme) -> RenderCell {
+    RenderCell {
         c,
         fg: border_fg.clone(),
-        bg: border_bg.clone(),
+        bg: theme.border_bg(),
         bold: false,
         italic: false,
         underline: false,
         hyperlink: None,
         width: 1,
         combining: Vec::new(),
-    };
+    }
+}
+
+/// Draw a zellij-style box: rounded corners and `─`/`│` edges, nothing inside.
+///
+/// **The one implementation of the box.** [`draw_zellij_border`] calls this and
+/// then overlays the pane's title run on the top edge; the client's sidebar
+/// chrome calls it and overlays nothing. Two callers, one set of glyphs.
+///
+/// `rect` is in BUFFER coordinates, and is NOT required to satisfy
+/// [`fits_zellij_border`] -- every write is bounds-checked, so a smaller rect
+/// draws safely and simply leaves no interior. Deciding whether a box is
+/// wanted at all is the caller's job (`draw_zellij_panes` and
+/// `chrome::geometry::sidebar_frame` both gate on `fits_zellij_border`).
+pub fn draw_zellij_box(
+    buffer: &mut [Vec<RenderCell>],
+    rect: Rect,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    let x = rect.x as usize;
+    let y = rect.y as usize;
+    let w = rect.width as usize;
+    let h = rect.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let cell = |c: char| border_cell(c, border_fg, theme);
 
     // Corners.
-    set_cell(buffer, y, x, border_cell('\u{256D}')); // ╭
-    set_cell(buffer, y, x + w - 1, border_cell('\u{256E}')); // ╮
-    set_cell(buffer, y + h - 1, x, border_cell('\u{2570}')); // ╰
-    set_cell(buffer, y + h - 1, x + w - 1, border_cell('\u{256F}')); // ╯
+    set_cell(buffer, y, x, cell('\u{256D}')); // ╭
+    set_cell(buffer, y, x + w - 1, cell('\u{256E}')); // ╮
+    set_cell(buffer, y + h - 1, x, cell('\u{2570}')); // ╰
+    set_cell(buffer, y + h - 1, x + w - 1, cell('\u{256F}')); // ╯
 
-    // Top border: the pane name / tab labels, then ─ fill to the right corner.
-    let available_width = w.saturating_sub(2); // inside the two corner chars
-    let top_content =
-        build_top_border_content(stack_info, pane_id, border_fg, mode, available_width, theme);
-    let top_start = x + 1;
-    let top_end = x + w - 1;
-    let mut col = top_start;
-    for cell in &top_content {
-        if col >= top_end {
-            break;
-        }
-        set_cell(buffer, y, col, cell.clone());
-        col += 1;
-    }
-    while col < top_end {
-        set_cell(buffer, y, col, border_cell('\u{2500}')); // ─
-        col += 1;
+    // Top and bottom edges, between the corners.
+    for col in (x + 1)..(x + w - 1) {
+        set_cell(buffer, y, col, cell('\u{2500}')); // ─
+        set_cell(buffer, y + h - 1, col, cell('\u{2500}')); // ─
     }
 
-    // Bottom border (fill between corners).
-    for col in top_start..top_end {
-        set_cell(buffer, y + h - 1, col, border_cell('\u{2500}')); // ─
-    }
-
-    // Left and right edges (between corners).
+    // Left and right edges, between the corners.
     for row in (y + 1)..(y + h - 1) {
-        set_cell(buffer, row, x, border_cell('\u{2502}')); // │
-        set_cell(buffer, row, x + w - 1, border_cell('\u{2502}')); // │
+        set_cell(buffer, row, x, cell('\u{2502}')); // │
+        set_cell(buffer, row, x + w - 1, cell('\u{2502}')); // │
     }
+}
+
+/// Draw a vertical divider run: `│` down `col`, rows `y0..y1`.
+///
+/// Shared by the tmux pane dividers and the client's sidebar seam so the glyph
+/// and the styling have one definition. Bounds-checked; an empty range draws
+/// nothing.
+pub fn draw_divider_column(
+    buffer: &mut [Vec<RenderCell>],
+    col: usize,
+    y0: usize,
+    y1: usize,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    for row in y0..y1 {
+        set_cell(buffer, row, col, border_cell('\u{2502}', border_fg, theme));
+    }
+}
+
+/// Draw a horizontal divider run: `─` along `row`, columns `x0..x1`.
+///
+/// The counterpart to [`draw_divider_column`], and shared the same way.
+pub fn draw_divider_row(
+    buffer: &mut [Vec<RenderCell>],
+    row: usize,
+    x0: usize,
+    x1: usize,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    for col in x0..x1 {
+        set_cell(buffer, row, col, border_cell('\u{2500}', border_fg, theme));
+    }
+}
+
+/// Write one already-built cell into `buffer`, bounds-checked.
+///
+/// Public so a client-side frame can overlay a junction glyph (`├┤┬┴`) onto a
+/// run drawn by the shared primitives above without restating the bounds check.
+pub fn put_cell(buffer: &mut [Vec<RenderCell>], row: usize, col: usize, cell: RenderCell) {
+    set_cell(buffer, row, col, cell);
 }
 
 /// Draw panes with full box-drawing borders using rounded corners.
@@ -969,49 +1044,36 @@ pub fn draw_tmux_dividers(
     pane_rects: &[(PaneId, Rect)],
     theme: &CompositorTheme,
 ) {
-    // A divider IS the frame in tmux style, so it wears the frame's background.
-    let divider_cell = |c: char| RenderCell {
-        c,
-        fg: theme.frame_fg.clone(),
-        bg: theme.border_bg(),
-        bold: false,
-        italic: false,
-        underline: false,
-        hyperlink: None,
-        width: 1,
-        combining: Vec::new(),
-    };
+    // A divider IS the frame in tmux style, so it wears the frame's colors --
+    // built by the shared `border_cell` and drawn by the shared runs, the same
+    // ones the client's sidebar seam uses.
+    let fg = theme.frame_fg.clone();
 
     for i in 0..pane_rects.len() {
         for j in (i + 1)..pane_rects.len() {
             let (_, r1) = pane_rects[i];
             let (_, r2) = pane_rects[j];
 
-            // Vertical divider: r1 is left of r2.
+            // Vertical divider: r1 is left of r2. It lands in r1's LAST column,
+            // overwriting content -- a pane may paint over its neighbour, which
+            // is the one thing the client's sidebar cannot do (the rect on the
+            // far side of its seam belongs to the server).
             if r1.x + r1.width == r2.x {
                 let top = r1.y.max(r2.y) as usize;
                 let bottom = (r1.y + r1.height).min(r2.y + r2.height) as usize;
                 let col = r2.x as usize;
                 if col > 0 {
-                    for row in top..bottom {
-                        if row < buffer.len() && (col - 1) < buffer[row].len() {
-                            buffer[row][col - 1] = divider_cell('\u{2502}'); // │
-                        }
-                    }
+                    draw_divider_column(buffer, col - 1, top, bottom, &fg, theme);
                 }
             }
 
-            // Horizontal divider: r1 is above r2.
+            // Horizontal divider: r1 is above r2, landing in r1's last row.
             if r1.y + r1.height == r2.y {
                 let left = r1.x.max(r2.x) as usize;
                 let right = (r1.x + r1.width).min(r2.x + r2.width) as usize;
                 let row = r2.y as usize;
                 if row > 0 {
-                    for c in left..right {
-                        if (row - 1) < buffer.len() && c < buffer[row - 1].len() {
-                            buffer[row - 1][c] = divider_cell('\u{2500}'); // ─
-                        }
-                    }
+                    draw_divider_row(buffer, row - 1, left, right, &fg, theme);
                 }
             }
         }

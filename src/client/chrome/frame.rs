@@ -3,19 +3,34 @@
 //!
 //! Sidebars are client-side chrome, so the server's compositor never draws
 //! them -- but they sit flush against panes it *did* frame, and an unframed
-//! strip of text beside a framed pane reads as a rendering bug. These glyphs,
-//! colors and thresholds therefore mirror `server::compositor` deliberately:
-//! [`crate::server::compositor::draw_zellij_border`] for the box,
-//! `draw_tmux_dividers` for the seam.
+//! strip of text beside a framed pane reads as a rendering bug. Nothing here
+//! re-implements a border: the box comes from
+//! [`draw_zellij_box`](crate::server::compositor::draw_zellij_box) and the
+//! seam from
+//! [`draw_divider_column`](crate::server::compositor::draw_divider_column) /
+//! [`draw_divider_row`](crate::server::compositor::draw_divider_row) -- the
+//! same primitives `draw_zellij_border` and `draw_tmux_dividers` call for the
+//! panes, so the two cannot drift.
 //!
-//! What is NOT mirrored is the pane title. `draw_zellij_border` writes
-//! `build_top_border_content` into the top border, which needs a `PaneId` and a
-//! stack; a sidebar has neither, and its panels put their own headings in their
-//! content. The top border is plain `─` fill.
+//! What is left here is only what a sidebar has and a pane does not:
+//!
+//! * **no title.** `draw_zellij_border` overlays `build_top_border_content` on
+//!   the top edge; a sidebar has no `PaneId` and no stack, and its panels put
+//!   their own headings in their content, so it calls the shared box and
+//!   overlays nothing.
+//! * **rules between stacked panels.** `├┤` across a vertical sidebar, `┬┴`
+//!   down the bottom one. Panes never draw these -- a pane's neighbour draws
+//!   its own border -- so the junction glyphs are new, not duplicated. The runs
+//!   between them are the shared ones, and every cell is built by the shared
+//!   [`border_cell`](crate::server::compositor::border_cell).
 
 use crate::config::theme::CompositorTheme;
 use crate::config::BorderStyle;
 use crate::protocol::RenderCell;
+use crate::server::compositor::{
+    border_cell, draw_divider_column, draw_divider_row, draw_zellij_box, put_cell,
+};
+use crate::server::layout::Rect;
 
 use super::geometry::SidebarEdge;
 
@@ -52,55 +67,47 @@ pub fn draw_sidebar_frame(
         BorderStyle::ZellijStyle if active => theme.frame_active_fg.clone(),
         _ => theme.frame_fg.clone(),
     };
-    let bg = theme.border_bg();
-    let cell = |c: char| RenderCell {
-        c,
-        fg: fg.clone(),
-        bg: bg.clone(),
-        bold: false,
-        italic: false,
-        underline: false,
-        hyperlink: None,
-        width: 1,
-        combining: Vec::new(),
-    };
 
     match style {
-        BorderStyle::ZellijStyle => draw_box(grid, w, h, edge, rules, &cell),
-        BorderStyle::TmuxStyle => draw_seam(grid, w, h, edge, rules, &cell),
+        BorderStyle::ZellijStyle => {
+            // The box, unchanged from the one the panes wear. The grid is
+            // bar-local, so the bar IS the rect.
+            draw_zellij_box(
+                grid,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: w as u16,
+                    height: h as u16,
+                },
+                &fg,
+                theme,
+            );
+            draw_box_rules(grid, w, h, edge, rules, &fg, theme);
+        }
+        BorderStyle::TmuxStyle => draw_seam(grid, w, h, edge, rules, &fg, theme),
     }
 }
 
-/// The zellij box: rounded corners, `─`/`│` edges, and `├──┤` (or `┬│┴` for the
-/// bottom sidebar's horizontal stack) rules between panels.
-fn draw_box(
+/// The `├───┤` (or `┬ │ ┴`) rules between a framed sidebar's stacked panels.
+///
+/// The run itself is the shared divider primitive; only the two junction
+/// glyphs, which tee the rule into the box's edges, are drawn here.
+fn draw_box_rules(
     grid: &mut [Vec<RenderCell>],
     w: usize,
     h: usize,
     edge: SidebarEdge,
     rules: &[u16],
-    cell: &dyn Fn(char) -> RenderCell,
+    fg: &crate::protocol::CellColor,
+    theme: &CompositorTheme,
 ) {
     // Guarded by `sidebar_frame`, which only reports `framed` above
-    // `fits_zellij_border`; belt and braces so every write below is in bounds.
+    // `fits_zellij_border`; belt and braces so every junction below lands on a
+    // box edge that exists.
     if w < 3 || h < 3 {
         return;
     }
-    grid[0][0] = cell('\u{256D}'); // ╭
-    grid[0][w - 1] = cell('\u{256E}'); // ╮
-    grid[h - 1][0] = cell('\u{2570}'); // ╰
-    grid[h - 1][w - 1] = cell('\u{256F}'); // ╯
-    let (top, rest) = grid.split_at_mut(1);
-    let bottom = &mut rest[h - 2];
-    for col in 1..w - 1 {
-        top[0][col] = cell('\u{2500}'); // ─
-        bottom[col] = cell('\u{2500}'); // ─
-    }
-    for row in grid.iter_mut().take(h - 1).skip(1) {
-        row[0] = cell('\u{2502}'); // │
-        row[w - 1] = cell('\u{2502}'); // │
-    }
-
     for &r in rules {
         let r = r as usize;
         match edge {
@@ -110,11 +117,9 @@ fn draw_box(
                 if r == 0 || r >= h - 1 {
                     continue;
                 }
-                grid[r][0] = cell('\u{251C}'); // ├
-                grid[r][w - 1] = cell('\u{2524}'); // ┤
-                for c in grid[r].iter_mut().take(w - 1).skip(1) {
-                    *c = cell('\u{2500}'); // ─
-                }
+                draw_divider_row(grid, r, 1, w - 1, fg, theme);
+                put_cell(grid, r, 0, border_cell('\u{251C}', fg, theme)); // ├
+                put_cell(grid, r, w - 1, border_cell('\u{2524}', fg, theme)); // ┤
             }
             // The bottom sidebar stacks horizontally: the rule is a full-height
             // column tee'd into the top and bottom edges.
@@ -122,11 +127,9 @@ fn draw_box(
                 if r == 0 || r >= w - 1 {
                     continue;
                 }
-                grid[0][r] = cell('\u{252C}'); // ┬
-                grid[h - 1][r] = cell('\u{2534}'); // ┴
-                for row in grid.iter_mut().take(h - 1).skip(1) {
-                    row[r] = cell('\u{2502}'); // │
-                }
+                draw_divider_column(grid, r, 1, h - 1, fg, theme);
+                put_cell(grid, 0, r, border_cell('\u{252C}', fg, theme)); // ┬
+                put_cell(grid, h - 1, r, border_cell('\u{2534}', fg, theme)); // ┴
             }
         }
     }
@@ -134,13 +137,17 @@ fn draw_box(
 
 /// The tmux seam: no box, just the one divider against the content plus a
 /// divider between stacked panels, tee'd into the seam where they meet.
+///
+/// Both runs are the shared divider primitives; the tee is the only glyph
+/// choice made here.
 fn draw_seam(
     grid: &mut [Vec<RenderCell>],
     w: usize,
     h: usize,
     edge: SidebarEdge,
     rules: &[u16],
-    cell: &dyn Fn(char) -> RenderCell,
+    fg: &crate::protocol::CellColor,
+    theme: &CompositorTheme,
 ) {
     match edge {
         SidebarEdge::Left | SidebarEdge::Right => {
@@ -153,39 +160,32 @@ fn draw_seam(
                 SidebarEdge::Right => 0,
                 _ => w - 1,
             };
-            for row in grid.iter_mut().take(h) {
-                row[seam] = cell('\u{2502}'); // │
-            }
+            draw_divider_column(grid, seam, 0, h, fg, theme);
             for &r in rules {
                 let r = r as usize;
                 if r >= h {
                     continue;
                 }
-                for c in grid[r].iter_mut().take(w) {
-                    *c = cell('\u{2500}'); // ─
-                }
-                grid[r][seam] = match edge {
-                    SidebarEdge::Right => cell('\u{251C}'), // ├
-                    _ => cell('\u{2524}'),                  // ┤
+                draw_divider_row(grid, r, 0, w, fg, theme);
+                let tee = match edge {
+                    SidebarEdge::Right => '\u{251C}', // ├
+                    _ => '\u{2524}',                  // ┤
                 };
+                put_cell(grid, r, seam, border_cell(tee, fg, theme));
             }
         }
         SidebarEdge::Bottom => {
             if h < 2 {
                 return;
             }
-            for c in grid[0].iter_mut().take(w) {
-                *c = cell('\u{2500}'); // ─
-            }
+            draw_divider_row(grid, 0, 0, w, fg, theme);
             for &r in rules {
                 let r = r as usize;
                 if r >= w {
                     continue;
                 }
-                for row in grid.iter_mut().take(h) {
-                    row[r] = cell('\u{2502}'); // │
-                }
-                grid[0][r] = cell('\u{252C}'); // ┬
+                draw_divider_column(grid, r, 0, h, fg, theme);
+                put_cell(grid, 0, r, border_cell('\u{252C}', fg, theme)); // ┬
             }
         }
     }
@@ -224,6 +224,39 @@ mod tests {
             chars(&g),
             vec!["╭────╮", "│    │", "│    │", "├────┤", "│    │", "╰────╯"]
         );
+    }
+
+    /// The box a sidebar wears is byte-for-byte the one a pane wears.
+    ///
+    /// The point of the shared primitive: if the two ever diverge, this fails
+    /// rather than the difference reaching a screen.
+    #[test]
+    fn the_sidebars_box_is_the_panes_box() {
+        let t = theme();
+        let mut sidebar = blank_grid(8, 5, CellColor::Default);
+        draw_sidebar_frame(
+            &mut sidebar,
+            &BorderStyle::ZellijStyle,
+            SidebarEdge::Left,
+            false,
+            &[],
+            &t,
+        );
+        let mut pane = blank_grid(8, 5, CellColor::Default);
+        crate::server::compositor::draw_zellij_box(
+            &mut pane,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 5,
+            },
+            &t.frame_fg,
+            &t,
+        );
+        assert_eq!(chars(&sidebar), chars(&pane));
+        assert_eq!(sidebar[0][0].fg, pane[0][0].fg);
+        assert_eq!(sidebar[0][0].bg, pane[0][0].bg);
     }
 
     #[test]
@@ -288,6 +321,27 @@ mod tests {
             &t,
         );
         assert_eq!(chars(&g), vec!["   │", "   │", "   │"]);
+    }
+
+    /// The seam cell is the cell a tmux PANE divider is made of.
+    ///
+    /// `draw_tmux_dividers` builds its dividers from the same `border_cell` in
+    /// `theme.frame_fg`; this pins that the sidebar's seam is indistinguishable
+    /// from one.
+    #[test]
+    fn the_seam_cell_is_a_tmux_pane_divider_cell() {
+        let t = theme();
+        let mut g = blank_grid(4, 3, CellColor::Default);
+        draw_sidebar_frame(
+            &mut g,
+            &BorderStyle::TmuxStyle,
+            SidebarEdge::Left,
+            false,
+            &[],
+            &t,
+        );
+        let want = crate::server::compositor::border_cell('\u{2502}', &t.frame_fg, &t);
+        assert_eq!(g[1][3], want);
     }
 
     #[test]
