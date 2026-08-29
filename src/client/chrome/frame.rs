@@ -28,7 +28,8 @@ use crate::config::theme::CompositorTheme;
 use crate::config::BorderStyle;
 use crate::protocol::RenderCell;
 use crate::server::compositor::{
-    border_cell, draw_divider_column, draw_divider_row, draw_zellij_box, put_cell,
+    border_cell, draw_divider_column, draw_divider_row, draw_zellij_box, put_cell, BOX_TEE_DOWN,
+    BOX_TEE_LEFT, BOX_TEE_RIGHT, BOX_TEE_UP,
 };
 use crate::server::layout::Rect;
 
@@ -118,8 +119,8 @@ fn draw_box_rules(
                     continue;
                 }
                 draw_divider_row(grid, r, 1, w - 1, fg, theme);
-                put_cell(grid, r, 0, border_cell('\u{251C}', fg, theme)); // ├
-                put_cell(grid, r, w - 1, border_cell('\u{2524}', fg, theme)); // ┤
+                put_cell(grid, r, 0, border_cell(BOX_TEE_LEFT, fg, theme));
+                put_cell(grid, r, w - 1, border_cell(BOX_TEE_RIGHT, fg, theme));
             }
             // The bottom sidebar stacks horizontally: the rule is a full-height
             // column tee'd into the top and bottom edges.
@@ -128,8 +129,8 @@ fn draw_box_rules(
                     continue;
                 }
                 draw_divider_column(grid, r, 1, h - 1, fg, theme);
-                put_cell(grid, 0, r, border_cell('\u{252C}', fg, theme)); // ┬
-                put_cell(grid, h - 1, r, border_cell('\u{2534}', fg, theme)); // ┴
+                put_cell(grid, 0, r, border_cell(BOX_TEE_DOWN, fg, theme));
+                put_cell(grid, h - 1, r, border_cell(BOX_TEE_UP, fg, theme));
             }
         }
     }
@@ -168,8 +169,8 @@ fn draw_seam(
                 }
                 draw_divider_row(grid, r, 0, w, fg, theme);
                 let tee = match edge {
-                    SidebarEdge::Right => '\u{251C}', // ├
-                    _ => '\u{2524}',                  // ┤
+                    SidebarEdge::Right => BOX_TEE_LEFT,
+                    _ => BOX_TEE_RIGHT,
                 };
                 put_cell(grid, r, seam, border_cell(tee, fg, theme));
             }
@@ -185,7 +186,7 @@ fn draw_seam(
                     continue;
                 }
                 draw_divider_column(grid, r, 0, h, fg, theme);
-                put_cell(grid, 0, r, border_cell('\u{252C}', fg, theme)); // ┬
+                put_cell(grid, 0, r, border_cell(BOX_TEE_DOWN, fg, theme));
             }
         }
     }
@@ -197,6 +198,7 @@ mod tests {
     use crate::client::sidebar::blank_grid;
     use crate::config::theme::{CompositorTheme, ThemeConfig};
     use crate::protocol::CellColor;
+    use crate::server::compositor::BOX_VERTICAL;
 
     fn theme() -> CompositorTheme {
         CompositorTheme::from_config(&ThemeConfig::default())
@@ -340,7 +342,7 @@ mod tests {
             &[],
             &t,
         );
-        let want = crate::server::compositor::border_cell('\u{2502}', &t.frame_fg, &t);
+        let want = crate::server::compositor::border_cell(BOX_VERTICAL, &t.frame_fg, &t);
         assert_eq!(g[1][3], want);
     }
 

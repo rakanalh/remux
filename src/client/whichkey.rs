@@ -7,6 +7,7 @@ use crossterm::style::Color;
 
 use crate::config::theme::Theme;
 use crate::config::WhichKeyPosition;
+use crate::server::compositor::{box_bottom_line, box_top_line};
 
 /// Fixed cell width for a single entry in the full-width layout:
 /// `" <key> \u{2192} <label>"`.
@@ -164,7 +165,7 @@ impl WhichKeyPopup {
         let key_fg = theme.whichkey_key_fg;
 
         // Top border.
-        let top_border = format!("\u{256D}{}\u{256E}", "\u{2500}".repeat(inner_width));
+        let top_border = box_top_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
@@ -284,7 +285,7 @@ impl WhichKeyPopup {
         }
 
         // Bottom border.
-        let bottom_border = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_border = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y + 1 + inner as u16,

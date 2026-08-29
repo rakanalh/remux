@@ -10,6 +10,7 @@ use crate::config::keybindings::{
     ShortcutBindings,
 };
 use crate::protocol::{Action, ClientAction, RemuxCommand};
+use crate::server::compositor::{box_bottom_line, box_top_line_titled};
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -651,12 +652,7 @@ impl FolderSelectOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
-            text: format!(
-                "\u{256D}{}{}{}\u{256E}",
-                "\u{2500}".repeat(left_b),
-                title,
-                "\u{2500}".repeat(right_b)
-            ),
+            text: box_top_line_titled(left_b, title, right_b),
             fg: border_fg,
             bg,
         });
@@ -747,7 +743,7 @@ impl FolderSelectOverlay {
 
         // Bottom border
         let help_line_y = start_y + popup_height - 1;
-        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_line = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_line_y,
@@ -846,12 +842,7 @@ impl ViewPickerOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
-            text: format!(
-                "\u{256D}{}{}{}\u{256E}",
-                "\u{2500}".repeat(left_b),
-                title,
-                "\u{2500}".repeat(right_b)
-            ),
+            text: box_top_line_titled(left_b, title, right_b),
             fg: border_fg,
             bg,
         });
@@ -903,7 +894,7 @@ impl ViewPickerOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: bottom_y,
-            text: format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width)),
+            text: box_bottom_line(inner_width),
             fg: border_fg,
             bg,
         });
@@ -1151,12 +1142,7 @@ impl SessionSwitchOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
-            text: format!(
-                "\u{256D}{}{}{}\u{256E}",
-                "\u{2500}".repeat(left_b),
-                title,
-                "\u{2500}".repeat(right_b)
-            ),
+            text: box_top_line_titled(left_b, title, right_b),
             fg: border_fg,
             bg,
         });
@@ -1338,7 +1324,7 @@ impl SessionSwitchOverlay {
 
         // Bottom border
         let help_line_y = start_y + popup_height - 1;
-        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_line = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_line_y,

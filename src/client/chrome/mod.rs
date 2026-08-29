@@ -534,7 +534,7 @@ impl Chrome {
         // grant less -- it clamps against the content minimum and knows nothing
         // about frames -- which is exactly why the unframed degrade path in
         // `paint` has to keep working.
-        frame_size_inset(&self.border_style)
+        frame_size_inset(&self.border_style, self.sidebars[i].edge)
             + self.sidebars[i]
                 .panels
                 .iter()

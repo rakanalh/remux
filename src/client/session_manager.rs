@@ -12,6 +12,7 @@ use crate::client::whichkey::DrawCommand;
 use crate::config::keybindings::{SessionManagerBinding, SessionManagerBindings};
 use crate::config::theme::Theme;
 use crate::protocol::{FolderTreeEntry, SessionTreeEntry};
+use crate::server::compositor::{box_bottom_line, box_top_line_titled};
 
 /// The tree node type lives in [`crate::client::tree_model`] now; re-exported
 /// here so the overlay's long-standing import path keeps working.
@@ -1123,12 +1124,7 @@ impl SessionManagerState {
         let border_len = inner_width.saturating_sub(title.len());
         let left_border = border_len / 2;
         let right_border = border_len - left_border;
-        let top_line = format!(
-            "\u{256D}{}{}{}\u{256E}",
-            "\u{2500}".repeat(left_border),
-            title,
-            "\u{2500}".repeat(right_border),
-        );
+        let top_line = box_top_line_titled(left_border, &title, right_border);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
@@ -1447,7 +1443,7 @@ impl SessionManagerState {
 
         // Bottom border.
         let bottom_y = footer_y0 + footer_n as u16;
-        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_line = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: bottom_y,

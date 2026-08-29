@@ -240,14 +240,35 @@ pub fn sidebar_frame(style: &BorderStyle, edge: SidebarEdge, bar: Rect) -> Sideb
 
 /// How many cells of the axis a sidebar's `size` measures its frame consumes.
 ///
-/// Perpendicular to the edge: both sides of the zellij box, the single tmux
-/// divider. This is what a sidebar's minimum `size` has to clear on top of its
-/// plugins' own minimums, or shrinking to that minimum would leave an interior
-/// narrower than the plugin asked for.
-pub fn frame_size_inset(style: &BorderStyle) -> u16 {
-    match style {
-        BorderStyle::ZellijStyle => 2,
-        BorderStyle::TmuxStyle => 1,
+/// This is what a sidebar's minimum `size` has to clear on top of its plugins'
+/// own minimums, or shrinking to that minimum would leave an interior narrower
+/// than the plugin asked for.
+///
+/// **Measured, not tabulated.** It used to be a hardcoded `2` for zellij and
+/// `1` for tmux -- a second statement of a fact [`sidebar_frame`] already
+/// knows, and which `sidebar_frame` in turn takes from [`pane_content_rect`].
+/// Two numbers that must agree, written in two places, is the same drift risk
+/// as two copies of the drawing code. So it asks the real function against a
+/// probe bar and measures what came back: one derivation, and it cannot
+/// disagree with the frame that is actually drawn.
+///
+/// The probe is deliberately large -- the question is what a frame costs, not
+/// what a bar too small to carry one degrades to.
+pub fn frame_size_inset(style: &BorderStyle, edge: SidebarEdge) -> u16 {
+    const PROBE: u16 = 64;
+    let bar = Rect {
+        x: 0,
+        y: 0,
+        width: PROBE,
+        height: PROBE,
+    };
+    let frame = sidebar_frame(style, edge, bar);
+    if !frame.framed {
+        return 0;
+    }
+    match edge {
+        SidebarEdge::Left | SidebarEdge::Right => PROBE.saturating_sub(frame.interior.width),
+        SidebarEdge::Bottom => PROBE.saturating_sub(frame.interior.height),
     }
 }
 
@@ -747,6 +768,56 @@ mod tests {
                         "{r:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_size_inset_is_measured_from_the_frame_not_tabulated() {
+        // Derived from `sidebar_frame`, so it cannot disagree with the frame
+        // that is actually drawn. Pinned so a change to either is deliberate.
+        for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+            assert_eq!(frame_size_inset(&ZJ, edge), 2, "zellij {edge:?}");
+            assert_eq!(
+                frame_size_inset(&BorderStyle::TmuxStyle, edge),
+                1,
+                "tmux {edge:?}"
+            );
+        }
+        // And the derivation really is the shared one: for zellij the whole
+        // inset is what `pane_content_rect` takes off the axis.
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        assert_eq!(
+            frame_size_inset(&ZJ, SidebarEdge::Left),
+            bar.width - pane_content_rect(&ZJ, bar, false).width
+        );
+    }
+
+    /// The property the inset exists for: a sidebar shrunk to its floor still
+    /// hands its plugin the interior the plugin asked for.
+    #[test]
+    fn the_size_inset_is_exactly_what_a_floor_has_to_clear() {
+        for style in [ZJ, BorderStyle::TmuxStyle] {
+            for edge in [SidebarEdge::Left, SidebarEdge::Right] {
+                let want = 8u16; // a plugin minimum, in columns
+                let size = want + frame_size_inset(&style, edge);
+                let bar = Rect {
+                    x: 0,
+                    y: 0,
+                    width: size,
+                    height: 40,
+                };
+                let interior = sidebar_frame(&style, edge, bar).interior;
+                assert_eq!(
+                    interior.width, want,
+                    "{style:?}/{edge:?}: a sidebar at its floor gave the plugin {} columns",
+                    interior.width
+                );
             }
         }
     }

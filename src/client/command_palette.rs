@@ -7,6 +7,7 @@
 use crate::client::whichkey::DrawCommand;
 use crate::config::theme::Theme;
 use crate::protocol::command_names;
+use crate::server::compositor::{box_bottom_line, box_top_line_titled};
 
 /// State for the command palette overlay.
 #[derive(Debug, Clone)]
@@ -289,12 +290,7 @@ impl CommandPaletteState {
         let fill = inner_width.saturating_sub(title_len);
         let left_fill = fill / 2;
         let right_fill = fill - left_fill;
-        let top = format!(
-            "\u{256D}{}{}{}\u{256E}",
-            "\u{2500}".repeat(left_fill),
-            title,
-            "\u{2500}".repeat(right_fill),
-        );
+        let top = box_top_line_titled(left_fill, title, right_fill);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
@@ -389,7 +385,7 @@ impl CommandPaletteState {
         } else {
             start_y + 3 + visible_count as u16
         };
-        let bottom = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: bottom_y,

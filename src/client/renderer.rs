@@ -15,6 +15,7 @@ use crossterm::{cursor, queue, terminal};
 use crate::client::input::{SelectionMode, VisualState};
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
+use crate::server::compositor::{box_bottom_line, box_top_line_titled};
 use crate::server::layout::Rect;
 
 // ---------------------------------------------------------------------------
@@ -1295,19 +1296,9 @@ impl Renderer {
         let border_fill = (popup_width as usize).saturating_sub(title_len + 2);
         let half_left = border_fill / 2;
         let half_right = border_fill - half_left;
-        let top_border = format!(
-            "\u{256d}{}\u{2500}{}\u{256e}",
-            "\u{2500}".repeat(half_left),
-            "\u{2500}".repeat(half_right),
-        );
-        // Build top border with title inserted
-        let top_with_title = format!(
-            "\u{256d}{}{}{}\u{256e}",
-            "\u{2500}".repeat(half_left),
-            title,
-            "\u{2500}".repeat(half_right),
-        );
-        let _ = top_border; // unused, we use top_with_title
+        // (A second, titleless copy of this line used to be built here and
+        // immediately discarded with `let _ = top_border`. It is gone.)
+        let top_with_title = box_top_line_titled(half_left, &title, half_right);
         queue!(stdout, style::SetAttribute(style::Attribute::Bold))?;
         queue!(stdout, Print(&top_with_title))?;
         queue!(stdout, style::SetAttribute(style::Attribute::Reset))?;
@@ -1334,10 +1325,7 @@ impl Renderer {
         queue!(stdout, MoveTo(start_x, start_y + 2))?;
         queue!(
             stdout,
-            Print(format!(
-                "\u{2570}{}\u{256f}",
-                "\u{2500}".repeat(popup_width.saturating_sub(2) as usize)
-            ))
+            Print(box_bottom_line(popup_width.saturating_sub(2) as usize))
         )?;
 
         // Position cursor at end of text
