@@ -15,7 +15,7 @@ use crossterm::{cursor, queue, terminal};
 use crate::client::input::{SelectionMode, VisualState};
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
-use crate::server::compositor::{box_bottom_line, box_top_line_titled};
+use crate::server::compositor::{box_bottom_line, box_top_line_titled, BOX_VERTICAL};
 use crate::server::layout::Rect;
 
 // ---------------------------------------------------------------------------
@@ -1315,7 +1315,7 @@ impl Renderer {
         queue!(
             stdout,
             Print(format!(
-                "\u{2502} {}{} \u{2502}",
+                "{BOX_VERTICAL} {}{} {BOX_VERTICAL}",
                 display_text,
                 " ".repeat(padding)
             ))

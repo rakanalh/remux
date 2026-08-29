@@ -440,8 +440,7 @@ pub fn draw_zellij_border(
     }
 }
 
-/// The glyphs a rounded box border is drawn from. **The one definition of
-/// each.**
+/// The glyphs the **rounded** box family is drawn from.
 ///
 /// Border chrome is drawn by two different mechanisms here: the compositor
 /// paints `RenderCell` grids (panes, popups, the client's sidebar frame), while
@@ -451,6 +450,15 @@ pub fn draw_zellij_border(
 /// routine, but the glyphs must not: a corner changed for the panes and missed
 /// for the overlays is the drift that had `\u{2570}` spelled out in seven
 /// separate `format!`s.
+///
+/// **There are TWO families, deliberately.** This rounded one is worn by
+/// everything that frames content -- panes, popups, the sidebar, and every
+/// overlay's own box. The `BOX_SHARP_*` set below is a second, lighter family
+/// used by exactly one thing: which-key's full-width band, which is a strip
+/// across the bottom of the screen rather than a box around content, and reads
+/// better square. Both families live here so neither can be changed in one
+/// place and missed in another -- but they are not interchangeable, and code
+/// picking between them is making a real choice.
 pub const BOX_TOP_LEFT: char = '\u{256D}'; // the corner glyphs
 pub const BOX_TOP_RIGHT: char = '\u{256E}';
 pub const BOX_BOTTOM_LEFT: char = '\u{2570}';
@@ -493,6 +501,42 @@ pub fn box_top_line_titled(left_fill: usize, title: &str, right_fill: usize) -> 
 pub fn box_bottom_line(inner_width: usize) -> String {
     format!(
         "{BOX_BOTTOM_LEFT}{}{BOX_BOTTOM_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// A horizontal rule ACROSS a box, tee'd into both side edges.
+///
+/// The overlays' section dividers. It was four verbatim copies of the same
+/// `format!` (the command palette, the session manager twice, the pickers).
+pub fn box_rule_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_TEE_LEFT}{}{BOX_TEE_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// The **sharp** box family: which-key's full-width band, and nothing else.
+///
+/// See the note on [`BOX_TOP_LEFT`] -- this is the second family, kept here for
+/// the same reason and NOT interchangeable with the rounded one.
+pub const BOX_SHARP_TOP_LEFT: char = '\u{250C}';
+pub const BOX_SHARP_TOP_RIGHT: char = '\u{2510}';
+pub const BOX_SHARP_BOTTOM_LEFT: char = '\u{2514}';
+pub const BOX_SHARP_BOTTOM_RIGHT: char = '\u{2518}';
+
+/// The sharp family's top edge.
+pub fn sharp_box_top_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_SHARP_TOP_LEFT}{}{BOX_SHARP_TOP_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// The sharp family's bottom edge.
+pub fn sharp_box_bottom_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_SHARP_BOTTOM_LEFT}{}{BOX_SHARP_BOTTOM_RIGHT}",
         BOX_HORIZONTAL.to_string().repeat(inner_width)
     )
 }
@@ -2049,6 +2093,20 @@ mod tests {
         let interior = draw_popup(
             &mut buf, rect, 7, &screen, "term", "NORMAL", 0, None, &theme,
         );
+        // LITERAL numbers, not `pane_content_rect(...)`. Comparing against the
+        // very function `draw_popup` calls is a tautology: re-inline the old
+        // `+1 / -2` and it would still pass. These numbers fail against a
+        // drifted local copy AND against a change to `pane_content_rect`.
+        assert_eq!(
+            interior,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 10,
+                height: 4
+            }
+        );
+        // ... and they are what the shared function says, which is the claim.
         assert_eq!(
             interior,
             pane_content_rect(&BorderStyle::ZellijStyle, rect, false)

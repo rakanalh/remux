@@ -198,7 +198,6 @@ mod tests {
     use crate::client::sidebar::blank_grid;
     use crate::config::theme::{CompositorTheme, ThemeConfig};
     use crate::protocol::CellColor;
-    use crate::server::compositor::BOX_VERTICAL;
 
     fn theme() -> CompositorTheme {
         CompositorTheme::from_config(&ThemeConfig::default())
@@ -342,7 +341,9 @@ mod tests {
             &[],
             &t,
         );
-        let want = crate::server::compositor::border_cell(BOX_VERTICAL, &t.frame_fg, &t);
+        // The LITERAL glyph, not `BOX_VERTICAL`: a golden that moves when the
+        // constant moves pins nothing.
+        let want = crate::server::compositor::border_cell('\u{2502}', &t.frame_fg, &t);
         assert_eq!(g[1][3], want);
     }
 

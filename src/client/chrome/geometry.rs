@@ -802,21 +802,39 @@ mod tests {
     /// hands its plugin the interior the plugin asked for.
     #[test]
     fn the_size_inset_is_exactly_what_a_floor_has_to_clear() {
+        // Bottom is included deliberately: it is the edge where the axis the
+        // inset measures flips from width to height, which is the whole reason
+        // `frame_size_inset` takes an `edge` at all. Left/Right alone would
+        // pass on a version that always measured width.
         for style in [ZJ, BorderStyle::TmuxStyle] {
-            for edge in [SidebarEdge::Left, SidebarEdge::Right] {
-                let want = 8u16; // a plugin minimum, in columns
+            for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+                let want = 8u16; // a plugin minimum, on the axis `size` measures
                 let size = want + frame_size_inset(&style, edge);
-                let bar = Rect {
-                    x: 0,
-                    y: 0,
-                    width: size,
-                    height: 40,
+                let vertical = !matches!(edge, SidebarEdge::Bottom);
+                let bar = if vertical {
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: size,
+                        height: 40,
+                    }
+                } else {
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: size,
+                    }
                 };
                 let interior = sidebar_frame(&style, edge, bar).interior;
-                assert_eq!(
-                    interior.width, want,
-                    "{style:?}/{edge:?}: a sidebar at its floor gave the plugin {} columns",
+                let got = if vertical {
                     interior.width
+                } else {
+                    interior.height
+                };
+                assert_eq!(
+                    got, want,
+                    "{style:?}/{edge:?}: a sidebar at its floor gave the plugin {got} cells"
                 );
             }
         }

@@ -10,7 +10,9 @@ use crate::config::keybindings::{
     ShortcutBindings,
 };
 use crate::protocol::{Action, ClientAction, RemuxCommand};
-use crate::server::compositor::{box_bottom_line, box_top_line_titled};
+use crate::server::compositor::{
+    box_bottom_line, box_rule_line, box_top_line_titled, BOX_HORIZONTAL, BOX_VERTICAL,
+};
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -680,7 +682,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -694,7 +696,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -710,7 +712,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -724,7 +726,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -732,7 +734,7 @@ impl FolderSelectOverlay {
 
         // Separator line
         let help_y = start_y + popup_height - 2;
-        let sep_line = format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width));
+        let sep_line = box_rule_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_y,
@@ -869,7 +871,7 @@ impl ViewPickerOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -883,7 +885,7 @@ impl ViewPickerOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1157,18 +1159,21 @@ impl SessionSwitchOverlay {
         // session groups, under a labeled "Views" header. Selection indices
         // `0..views.len()` map to these rows.
         if !self.views.is_empty() && row_offset < popup_height - 1 {
-            let label = "\u{2500} Views ".to_string();
+            let label = format!("{BOX_HORIZONTAL} Views ");
             let label_chars = label.chars().count();
             let sep_text = if label_chars >= inner_width {
                 label.chars().take(inner_width).collect::<String>()
             } else {
-                format!("{label}{}", "\u{2500}".repeat(inner_width - label_chars))
+                format!(
+                    "{label}{}",
+                    BOX_HORIZONTAL.to_string().repeat(inner_width - label_chars)
+                )
             };
             let sep_y = start_y + row_offset;
             commands.push(DrawCommand {
                 x: start_x,
                 y: sep_y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1182,7 +1187,7 @@ impl SessionSwitchOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y: sep_y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1208,7 +1213,7 @@ impl SessionSwitchOverlay {
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1222,7 +1227,7 @@ impl SessionSwitchOverlay {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1241,18 +1246,21 @@ impl SessionSwitchOverlay {
                 if row_offset >= popup_height - 1 {
                     break;
                 }
-                let label = format!("\u{2500} {} ", Self::server_display(&entry.server));
+                let label = format!("{BOX_HORIZONTAL} {} ", Self::server_display(&entry.server));
                 let label_chars = label.chars().count();
                 let sep_text = if label_chars >= inner_width {
                     label.chars().take(inner_width).collect::<String>()
                 } else {
-                    format!("{label}{}", "\u{2500}".repeat(inner_width - label_chars))
+                    format!(
+                        "{label}{}",
+                        BOX_HORIZONTAL.to_string().repeat(inner_width - label_chars)
+                    )
                 };
                 let sep_y = start_y + row_offset;
                 commands.push(DrawCommand {
                     x: start_x,
                     y: sep_y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1266,7 +1274,7 @@ impl SessionSwitchOverlay {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y: sep_y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1301,7 +1309,7 @@ impl SessionSwitchOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1315,7 +1323,7 @@ impl SessionSwitchOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });

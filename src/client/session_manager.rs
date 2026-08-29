@@ -12,7 +12,9 @@ use crate::client::whichkey::DrawCommand;
 use crate::config::keybindings::{SessionManagerBinding, SessionManagerBindings};
 use crate::config::theme::Theme;
 use crate::protocol::{FolderTreeEntry, SessionTreeEntry};
-use crate::server::compositor::{box_bottom_line, box_top_line_titled};
+use crate::server::compositor::{
+    box_bottom_line, box_rule_line, box_top_line_titled, BOX_TEE_LEFT, BOX_TEE_RIGHT, BOX_VERTICAL,
+};
 
 /// The tree node type lives in [`crate::client::tree_model`] now; re-exported
 /// here so the overlay's long-standing import path keeps working.
@@ -290,6 +292,10 @@ fn chord_group_rank(chord: &str) -> u8 {
 
 /// Separator between footer cells (matches the box-drawing style used across
 /// the popups).
+/// Separates footer ITEMS -- text punctuation, not a box edge, which is why it
+/// keeps its own literal rather than going through `BOX_VERTICAL`. Same
+/// reasoning that excludes the status-bar separators in the compositor and the
+/// View: those are `separator_fg` furniture, not border chrome.
 const FOOTER_SEP: &str = " \u{2502} ";
 
 /// Pack `(key, label)` cells into up to `max_lines` footer lines that each fit
@@ -1148,7 +1154,7 @@ impl SessionManagerState {
         commands.push(DrawCommand {
             x: start_x,
             y: search_y,
-            text: "\u{2502}".to_string(),
+            text: BOX_VERTICAL.to_string(),
             fg: border_fg,
             bg,
         });
@@ -1162,7 +1168,7 @@ impl SessionManagerState {
         commands.push(DrawCommand {
             x: start_x + 1 + inner_width as u16,
             y: search_y,
-            text: "\u{2502}".to_string(),
+            text: BOX_VERTICAL.to_string(),
             fg: border_fg,
             bg,
         });
@@ -1170,7 +1176,7 @@ impl SessionManagerState {
         commands.push(DrawCommand {
             x: start_x,
             y: search_y + 1,
-            text: format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width)),
+            text: box_rule_line(inner_width),
             fg: border_fg,
             bg,
         });
@@ -1248,7 +1254,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1264,7 +1270,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1273,7 +1279,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1289,7 +1295,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1342,7 +1348,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x,
                 y: sep_y,
-                text: "\u{251C}".to_string(),
+                text: BOX_TEE_LEFT.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1356,7 +1362,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y: sep_y,
-                text: "\u{2524}".to_string(),
+                text: BOX_TEE_RIGHT.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1364,7 +1370,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x,
                 y: sep_y,
-                text: format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width)),
+                text: box_rule_line(inner_width),
                 fg: border_fg,
                 bg,
             });
@@ -1381,7 +1387,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1435,7 +1441,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
