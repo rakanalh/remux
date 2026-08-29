@@ -91,6 +91,30 @@ def stty_cols(t):
     return None
 
 
+def check_width(fails, before, after, expected, what):
+    """Assert a width transition, and FAIL rather than skip on an unread size.
+
+    `stty_cols` returns None when it cannot find the size line -- a prompt that
+    scrolled, a slow reload, a panel painted over the row. A comparison guarded
+    by `is not None` turns every one of those into a silent pass, and the width
+    is the whole point of these tests: the panel frame can be in exactly the
+    right columns while the pane behind it was never resized.
+    """
+    if before is None or after is None:
+        fails.append(
+            f"could not read `stty size` across {what} (before={before}, "
+            f"after={after}) -- the width claim was never checked"
+        )
+        return
+    if after != expected:
+        fails.append(
+            f"the pane width is wrong across {what}: {before} -> {after} "
+            f"columns, expected {expected}"
+        )
+    else:
+        print(f"  across {what} the pane went from {before} to {after} columns")
+
+
 def panel_rows(t):
     """Non-blank text in the left sidebar band."""
     return [r[:SIDEBAR_W].rstrip() for r in t.rows_text() if r[:SIDEBAR_W].strip()]
@@ -121,8 +145,6 @@ def test_a_sidebar_added_to_the_config_appears_without_a_restart():
     if t.has("Sessions"):
         fails.append("a panel was painted before the config declared one")
     before = stty_cols(t)
-    if before is None:
-        fails.append("could not read `stty size` before the reload")
 
     write_config(t, CFG_SESSIONS)
 
@@ -136,13 +158,13 @@ def test_a_sidebar_added_to_the_config_appears_without_a_restart():
         fails.append(f"the rebuilt panel has no session-tree rows: {rows}")
 
     after = stty_cols(t)
-    if before is not None and after is not None and after != before - SIDEBAR_W:
-        fails.append(
-            f"the pane was not resized for the new sidebar: {before} -> {after}, "
-            f"expected {before - SIDEBAR_W}"
-        )
-    else:
-        print(f"  the pane went from {before} to {after} columns")
+    check_width(
+        fails,
+        before,
+        after,
+        None if before is None else before - SIDEBAR_W,
+        "the sidebar being added",
+    )
 
     return finish(t, name, fails)
 
@@ -163,13 +185,13 @@ def test_a_sidebar_removed_from_the_config_goes_away_without_a_restart():
         fails.append("the panel survived its removal from the config")
         t.dump("after removal")
     after = stty_cols(t)
-    if before is not None and after is not None and after != before + SIDEBAR_W:
-        fails.append(
-            f"the pane did not reclaim the sidebar's columns: {before} -> {after}, "
-            f"expected {before + SIDEBAR_W}"
-        )
-    else:
-        print(f"  the pane went from {before} to {after} columns")
+    check_width(
+        fails,
+        before,
+        after,
+        None if before is None else before + SIDEBAR_W,
+        "the sidebar being removed",
+    )
 
     return finish(t, name, fails)
 
@@ -190,19 +212,19 @@ def test_a_reload_keeps_the_width_the_user_set_by_hand():
     t.send(b"\x1b", 0.6)           # leave the sticky Resize group
     t.send(b"\x1bl", 0.8)          # Alt+l back to the content
     widened = stty_cols(t)
-    if widened is None or start is None or widened >= start:
+    if start is None or widened is None:
+        fails.append(
+            f"could not read `stty size` around the resize "
+            f"(start={start}, widened={widened})"
+        )
+    elif widened >= start:
         fails.append(f"the sidebar was never widened: {start} -> {widened}")
 
     write_config(t, CFG_SESSIONS_TOUCHED)
 
     after = stty_cols(t)
-    if after != widened:
-        fails.append(
-            f"an unrelated config edit reset the hand-set width: "
-            f"{widened} -> {after}"
-        )
-    else:
-        print(f"  the hand-set width ({after} content columns) survived the reload")
+    # Both `None` compares equal, so this needs its own guard too.
+    check_width(fails, widened, after, widened, "an unrelated config edit")
     if not t.has("Sessions"):
         fails.append("the panel vanished across the reload")
     # The panel that was already there is rebuilt too, so its plugin starts
