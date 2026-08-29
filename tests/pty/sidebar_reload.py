@@ -84,6 +84,7 @@ CFG_PLACEHOLDER_TOUCHED = CFG_PLACEHOLDER + """
 [appearance.unused_marker_section]
 """
 
+
 def _stacked(w1, w2):
     return f"""
 [appearance]
@@ -335,10 +336,22 @@ def test_a_size_typed_into_the_config_beats_the_persisted_one():
     fails = []
     t.pump(1.0)
 
+    # The fixture has to be asserted, not assumed: if the resize chord ever
+    # no-ops, no state file is written and there is nothing for the config to
+    # beat -- phase 1 would pass having tested nothing.
+    start = stty_cols(t)
     widen_the_sidebar(t)
     dragged = stty_cols(t)
-    if dragged is None:
-        fails.append("could not read `stty size` after the runtime resize")
+    if start is None or dragged is None:
+        fails.append(
+            f"could not read `stty size` around the resize "
+            f"(start={start}, dragged={dragged})"
+        )
+    elif dragged >= start:
+        fails.append(
+            f"the sidebar was never widened, so nothing was persisted for the "
+            f"config to beat: {start} -> {dragged}"
+        )
 
     write_config(t, CFG_SESSIONS_WIDER)
 
