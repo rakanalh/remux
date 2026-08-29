@@ -6017,6 +6017,16 @@ async fn run_client_loop(
                     // across a panel set that may have changed shape entirely.
                     let (tc, tr) = renderer.size();
                     let chrome_before = chrome.content_rect(tc, tr);
+                    // Where the keyboard is, by EDGE rather than by index --
+                    // the rebuild renumbers the sidebars, and an unrelated
+                    // config edit yanking the keyboard out of a panel the user
+                    // is working in reads as a dropped keypress.
+                    let focused_edge = match chrome.focus {
+                        crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel } => {
+                            Some((chrome.sidebars[sidebar].edge, panel))
+                        }
+                        crate::client::chrome::ChromeFocus::Content => None,
+                    };
                     chrome = crate::client::chrome::Chrome::from_config(&new_config.sidebar);
                     // Runtime state is layered back on -- but NOT the way
                     // startup does it. `sidebar.json` holds a size for every
@@ -6046,6 +6056,26 @@ async fn run_client_loop(
                     {
                         crate::client::sidebar_state::save(&chrome);
                     }
+                    // Put the keyboard back where it was, if that edge
+                    // survived the rebuild and is still on screen. The panel
+                    // index is clamped: the stack may have lost a panel.
+                    if let Some((edge, panel)) = focused_edge {
+                        match chrome.sidebar_on(edge, tc, tr) {
+                            Some(i) if chrome.sidebars[i].visible => {
+                                let panel = panel.min(chrome.sidebars[i].panels.len().saturating_sub(1));
+                                chrome.sidebars[i].focused_panel = panel;
+                                chrome.focus = crate::client::chrome::ChromeFocus::Sidebar {
+                                    sidebar: i,
+                                    panel,
+                                };
+                            }
+                            _ => log::debug!(
+                                "sidebar: the focused {edge:?} sidebar did not survive the \
+                                 reload; focus returns to the content"
+                            ),
+                        }
+                    }
+
                     // The panel that wants the session tree may have just
                     // appeared or gone. Recompute, and forget the existing
                     // subscriptions so the reconcile at the top of the loop

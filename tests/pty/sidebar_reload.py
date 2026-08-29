@@ -63,6 +63,27 @@ CFG_SESSIONS_TOUCHED = CFG_SESSIONS + """
 [appearance.unused_marker_section]
 """
 
+# A placeholder panel instead of the sessions tree: it renders `focused`/`idle`
+# on its second row and bumps a counter on `j`/`k`, which is how "who has the
+# keyboard" is observable at all.
+CFG_PLACEHOLDER = f"""
+[appearance]
+border_style = "zellij_style"
+
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+
+  [[sidebar.panel]]
+  plugin = "placeholder"
+  weight = 1
+"""
+
+CFG_PLACEHOLDER_TOUCHED = CFG_PLACEHOLDER + """
+[appearance.unused_marker_section]
+"""
+
 WIDER_W = 40
 
 # The same sidebar with `size` retyped. Once `sidebar.json` exists -- and it
@@ -392,6 +413,52 @@ def test_one_save_is_one_reload():
     return finish(t, name, fails)
 
 
+def panel_marker(t):
+    """The placeholder's focus marker as it currently renders, or None."""
+    for row in t.rows_text():
+        cell = row[:SIDEBAR_W]
+        if "focused" in cell:
+            return "focused"
+        if "idle" in cell:
+            return "idle"
+    return None
+
+
+def test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel():
+    """An unrelated config edit while the user is working inside a panel must
+    not hand the keyboard back to the content -- to them that is a dropped
+    keypress with no cause on screen. The rebuild renumbers the sidebars, so
+    the focus has to be carried across by EDGE, not by index."""
+    name = "test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel"
+    t = Tui("/tmp/rmx-sbrl7", cols=COLS, rows=ROWS, config=CFG_PLACEHOLDER).start()
+    fails = []
+    t.pump(1.0)
+
+    if panel_marker(t) != "idle":
+        fails.append(f"the panel did not start unfocused: {panel_marker(t)!r}")
+    t.send(b"\x1bh", 1.0)          # Alt+h enters the left sidebar
+    if panel_marker(t) != "focused":
+        fails.append(f"Alt+h did not focus the panel: {panel_marker(t)!r}")
+
+    write_config(t, CFG_PLACEHOLDER_TOUCHED)
+
+    if panel_marker(t) != "focused":
+        fails.append(
+            f"the reload yanked the keyboard out of the panel: {panel_marker(t)!r}"
+        )
+        t.dump("after the reload")
+    # And it is real focus, not just a marker: a plain key must still reach the
+    # plugin rather than the shell.
+    t.send(b"j", 0.8)
+    if not any("focused 1" in r[:SIDEBAR_W] for r in t.rows_text()):
+        fails.append(
+            "a plain key did not reach the panel after the reload: "
+            + repr([r[:SIDEBAR_W].rstrip() for r in t.rows_text() if r[:SIDEBAR_W].strip()])
+        )
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -405,6 +472,7 @@ if __name__ == "__main__":
         test_a_size_typed_into_the_config_beats_the_persisted_one,
         test_a_visible_flip_typed_into_the_config_beats_the_persisted_one,
         test_one_save_is_one_reload,
+        test_a_reload_does_not_yank_the_keyboard_out_of_a_focused_panel,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")
