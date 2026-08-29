@@ -193,6 +193,17 @@ def test_a_sidebar_removed_from_the_config_goes_away_without_a_restart():
         "the sidebar being removed",
     )
 
+    # The subscription has to be given back. The loop-top reconcile only ever
+    # ADDS, so without an explicit `UnsubscribeSessionTree` the server keeps
+    # pushing a full tree on every structural change, to nobody, for the rest
+    # of the client's life.
+    srv = t.log("server")
+    if "msg=UnsubscribeSessionTree" not in srv:
+        fails.append(
+            "the session-tree subscription was never given back after the last "
+            "sessions panel went away"
+        )
+
     return finish(t, name, fails)
 
 

@@ -6005,7 +6005,25 @@ async fn run_client_loop(
                     // re-subscribes every live connection: the server answers a
                     // subscribe with the tree at once, which is what fills a
                     // freshly built panel that has never seen a push.
+                    let wanted_session_tree_before = wants_session_tree;
                     wants_session_tree = chrome.wants_session_tree();
+                    // Removing the last panel that wanted it has to be said out
+                    // loud. The reconcile only ever ADDS subscriptions, so
+                    // without this every connection -- remotes over SSH
+                    // included -- keeps pushing a full tree on every structural
+                    // change for the rest of the client's life, to nobody.
+                    if wanted_session_tree_before && !wants_session_tree {
+                        for id in &tree_subscribed {
+                            log::debug!("sidebar: unsubscribing from the session tree on {id:?}");
+                            if let Err(e) =
+                                mgr.send(id, ClientMessage::UnsubscribeSessionTree).await
+                            {
+                                log::warn!(
+                                    "sidebar: UnsubscribeSessionTree to {id:?} failed: {e:#}"
+                                );
+                            }
+                        }
+                    }
                     tree_subscribed.clear();
                     // Origin and `Resize` travel together (see
                     // `sync_content_rect`): `Renderer::resize` resets the
