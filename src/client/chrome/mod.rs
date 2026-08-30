@@ -23,6 +23,7 @@ use crate::client::sidebar::{make_plugin, PluginEvent, PluginRequest, SidebarPlu
 use crate::config::sidebar::SidebarConfig;
 use crate::config::theme::CompositorTheme;
 use crate::config::{BorderStyle, StatusBarPosition};
+use crate::protocol::RenderCell;
 use crate::server::layout::{FocusDirection, Rect};
 
 /// One plugin panel plus its layout weight.
@@ -225,12 +226,19 @@ impl Chrome {
     /// A bar too small for a frame takes the pre-frame path unchanged -- one
     /// `paint_panel` per panel, nothing else touched -- so the degradation is
     /// literally the old rendering rather than an approximation of it.
+    /// `focused_pane_rect` is the rect the server last reported for its focused
+    /// pane, and it is here for [`Chrome::sync_focused_pane_border`]: a paint is
+    /// where the screen is made to agree with `self.focus`, and un-highlighting
+    /// the pane is half of that agreement. Pass `None` whenever the content rect
+    /// is not showing that server frame -- a live View composites its own cells,
+    /// so the rect describes a pane that is no longer on screen.
     pub fn paint(
         &self,
         renderer: &mut Renderer,
         term_cols: u16,
         term_rows: u16,
         theme: &CompositorTheme,
+        focused_pane_rect: Option<&crate::protocol::PaneRect>,
     ) -> Result<()> {
         let rects = self.panel_rects(term_cols, term_rows);
         for (si, bar) in self.bar_rects(term_cols, term_rows) {
@@ -311,6 +319,172 @@ impl Chrome {
                 }
             }
             renderer.paint_panel(bar, &grid)?;
+        }
+        self.sync_focused_pane_border(renderer, focused_pane_rect, theme)
+    }
+
+    /// Re-colour the focused pane's border so that exactly one thing on screen
+    /// reads as focused.
+    ///
+    /// The server has never heard of sidebars: it draws the session's focused
+    /// pane with an active border unconditionally, and the client lights the
+    /// focused sidebar's frame on top of that, so both rings claim the keyboard
+    /// at once. The decision cannot move to the server -- `broadcast_full_render`
+    /// composites ONE frame per session, so one client focusing its sidebar
+    /// would dim the panes for every other client attached to it.
+    ///
+    /// Only the COLOUR changes, and it changes through
+    /// [`border_fg`](crate::server::compositor::border_fg) -- the same rule
+    /// `draw_zellij_panes` and `draw_sidebar_frame` ask -- so there is still one
+    /// statement of active-vs-inactive and no second border painter here.
+    ///
+    /// Three things bound what is touched, and each one is load-bearing:
+    ///
+    /// * **zellij style only.** `draw_tmux_panes` takes the focused pane id as
+    ///   `_focused_pane` and never reads it, and every divider is asked for with
+    ///   `false` (`draw_tmux_dividers`), so under tmux nothing tracks pane focus
+    ///   and there is nothing to undo.
+    /// * **box glyphs only.** They are the only cells on a zellij border whose
+    ///   colour tracks focus: `build_top_border_content` overlays the top edge
+    ///   with labels in `label_colors`, stack tabs in `tab_inactive_fg` /
+    ///   `mode_colors`, and -- decisively -- the `" | "` tab separator in
+    ///   `theme.frame_fg`, the INACTIVE colour, on an ACTIVE pane's border.
+    ///   Swapping colours across the whole ring would promote those separators
+    ///   to the active colour on every repaint.
+    /// * **the box's own corners must be there.** A pane below
+    ///   `fits_zellij_border` has no border at all, and the ring computed for it
+    ///   is its neighbours' borders; without this check the restore direction
+    ///   would light those up.
+    fn sync_focused_pane_border(
+        &self,
+        renderer: &mut Renderer,
+        focused_pane_rect: Option<&crate::protocol::PaneRect>,
+        theme: &CompositorTheme,
+    ) -> Result<()> {
+        use crate::server::compositor::{
+            border_fg, BOX_BOTTOM_LEFT, BOX_BOTTOM_RIGHT, BOX_HORIZONTAL, BOX_TOP_LEFT,
+            BOX_TOP_RIGHT, BOX_VERTICAL,
+        };
+
+        if !matches!(self.border_style, BorderStyle::ZellijStyle) {
+            return Ok(());
+        }
+        let Some(pane) = focused_pane_rect else {
+            return Ok(());
+        };
+        // The server reports the pane's INTERIOR (see `BORDER_INSET`), so the
+        // border ring is that rect grown by one cell on each side. A rect
+        // already at row/column 0 has no room for a ring and cannot be a
+        // bordered pane's interior.
+        let (Some(rx), Some(ry)) = (
+            pane.x.checked_sub(BORDER_INSET),
+            pane.y.checked_sub(BORDER_INSET),
+        ) else {
+            return Ok(());
+        };
+        let w = pane.width as usize + 2 * BORDER_INSET as usize;
+        let h = pane.height as usize + 2 * BORDER_INSET as usize;
+
+        // Server frames are blitted at the content origin, so the reported rect
+        // is content-relative and the ring must be moved by it.
+        let (ox, oy) = renderer.origin();
+        let (ax, ay) = (ox as usize + rx as usize, oy as usize + ry as usize);
+
+        // Clipped to the content rect, not the terminal: a ring that ran past it
+        // would recolour a sidebar's columns. A real border ring is always
+        // wholly inside -- the server drew it there -- so anything that is not
+        // is a rect that does not describe what is on screen, and is skipped
+        // rather than trimmed.
+        let (cc, cr) = renderer.content_size();
+        let (right, bottom) = (ox as usize + cc as usize, oy as usize + cr as usize);
+        let (tc, tr) = renderer.size();
+        if ax + w > right.min(tc as usize) || ay + h > bottom.min(tr as usize) {
+            return Ok(());
+        }
+
+        let front = renderer.front_buffer();
+        if front[ay][ax].c != BOX_TOP_LEFT
+            || front[ay][ax + w - 1].c != BOX_TOP_RIGHT
+            || front[ay + h - 1][ax].c != BOX_BOTTOM_LEFT
+            || front[ay + h - 1][ax + w - 1].c != BOX_BOTTOM_RIGHT
+        {
+            return Ok(());
+        }
+
+        // A sidebar holding the keyboard means the pane does not: swap the
+        // border to the colour the OTHER side of that answer produces.
+        let sidebar_focused = matches!(self.focus, ChromeFocus::Sidebar { .. });
+        let from = border_fg(theme, sidebar_focused);
+        let to = border_fg(theme, !sidebar_focused);
+        if from == to {
+            return Ok(());
+        }
+
+        let is_box = |c: char| {
+            matches!(
+                c,
+                BOX_TOP_LEFT
+                    | BOX_TOP_RIGHT
+                    | BOX_BOTTOM_LEFT
+                    | BOX_BOTTOM_RIGHT
+                    | BOX_HORIZONTAL
+                    | BOX_VERTICAL
+            )
+        };
+
+        // The ring as four one-cell strips, so the pane's contents are never
+        // re-emitted. Built from the front buffer and handed back to
+        // `paint_panel`, which is what stores AND emits every other client-side
+        // cell -- the recolour cannot drift from how it is drawn.
+        let mut strips: Vec<(Rect, Vec<Vec<RenderCell>>)> = Vec::new();
+        let row_strip = |y: usize| {
+            let cells: Vec<RenderCell> = front[y][ax..ax + w].to_vec();
+            (
+                Rect {
+                    x: ax as u16,
+                    y: y as u16,
+                    width: w as u16,
+                    height: 1,
+                },
+                vec![cells],
+            )
+        };
+        strips.push(row_strip(ay));
+        strips.push(row_strip(ay + h - 1));
+        for x in [ax, ax + w - 1] {
+            let cells: Vec<Vec<RenderCell>> = (ay + 1..ay + h - 1)
+                .map(|y| vec![front[y][x].clone()])
+                .collect();
+            strips.push((
+                Rect {
+                    x: x as u16,
+                    y: (ay + 1) as u16,
+                    width: 1,
+                    height: (h - 2) as u16,
+                },
+                cells,
+            ));
+        }
+
+        let mut any = false;
+        for (_, grid) in strips.iter_mut() {
+            for row in grid.iter_mut() {
+                for cell in row.iter_mut() {
+                    if is_box(cell.c) && cell.fg == from {
+                        cell.fg = to.clone();
+                        any = true;
+                    }
+                }
+            }
+        }
+        // The steady state -- every frame while focus has not moved -- finds the
+        // ring already in the right colour. Emitting nothing then keeps this off
+        // the render hot path.
+        if !any {
+            return Ok(());
+        }
+        for (rect, grid) in strips {
+            renderer.paint_panel(rect, &grid)?;
         }
         Ok(())
     }

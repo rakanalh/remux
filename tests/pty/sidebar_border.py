@@ -612,6 +612,70 @@ def test_a_reattach_resyncs_the_style_the_server_is_drawing():
     check_no_panic()
 
 
+def test_only_one_frame_reads_as_focused():
+    """The pane and the sidebar must never both look active at once.
+
+    The server composites one frame per session and has never heard of
+    sidebars, so it draws the session's focused pane with an ACTIVE border
+    whatever the client is doing with its chrome; the client then lights the
+    focused sidebar's frame on top of that. Each half is right on its own and
+    together they are wrong -- two rings both claiming the keyboard.
+
+    Both halves are asserted in all three states. A test that checked only the
+    pane would pass on a build where NEITHER ring reads as focused, and one
+    that checked only the corner would pass on a recolour shifted by a cell
+    (`focused_pane_rect` is the pane's INTERIOR, so the ring is that rect grown
+    by one), which is why the left edge is checked at mid-height too.
+    """
+    name = "test_only_one_frame_reads_as_focused"
+    env = make_env(cfg("zellij_style"))
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    bad = []
+    mid = ROWS // 2
+    # (row, col, expected glyph, what it is) for the two rings. The pane's box
+    # starts in the first column the content rect owns.
+    probes = [
+        (0, 0, TL, "the sidebar's top-left corner"),
+        (mid, 0, VERT, "the sidebar's left edge"),
+        (0, SIDEBAR_W, TL, "the pane's top-left corner"),
+        (mid, SIDEBAR_W, VERT, "the pane's left edge"),
+    ]
+
+    def check(where, want_sidebar, want_pane):
+        for y, x, glyph, what in probes:
+            cell = screen.buffer[y][x]
+            # Not vacuous: the cell must really be the border glyph, or the
+            # colour below is the colour of whatever else landed there.
+            if cell.data != glyph:
+                bad.append(f"{where}: {what} is {cell.data!r}, not {glyph!r}")
+                continue
+            want = want_sidebar if x == 0 else want_pane
+            if str(cell.fg) != want:
+                bad.append(f"{where}: {what} is {cell.fg}, expected {want}")
+
+    check("with focus in the content", FRAME_FG, FRAME_ACTIVE_FG)
+
+    child.send(b"\x1bh")  # Alt+h -- into the left sidebar
+    pump(1.2)
+    if not [m for m in marker_rows(screen) if m[1] == "focused"]:
+        bad.append("Alt+h never focused the panel; every check below is vacuous")
+    check("with the sidebar focused", FRAME_ACTIVE_FG, FRAME_FG)
+
+    child.send(b"\x1bl")  # Alt+l -- back to the content
+    pump(1.2)
+    check("back on the content", FRAME_FG, FRAME_ACTIVE_FG)
+
+    if not child.isalive():
+        bad.append("the client died")
+    if bad:
+        fail(name, "; ".join(bad), screen)
+    else:
+        ok(name)
+    teardown(child, env)
+    check_no_panic()
+
+
 if __name__ == "__main__":
     test_zellij_style_draws_a_box_around_the_sidebar()
     test_the_panel_interior_shrank_by_the_frame()
@@ -619,6 +683,7 @@ if __name__ == "__main__":
     test_toggle_style_reframes_the_sidebar_with_the_panes()
     test_a_rule_separates_stacked_panels()
     test_the_focused_sidebars_frame_uses_the_active_colour()
+    test_only_one_frame_reads_as_focused()
     test_a_sidebar_too_small_to_frame_degrades_to_unframed()
     test_a_click_on_the_frame_never_reaches_the_server()
     test_a_config_reload_keeps_the_toggled_style()

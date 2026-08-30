@@ -756,6 +756,7 @@ async fn handle_chrome_resize(
     cmd: &RemuxCommand,
     chrome: &mut crate::client::chrome::Chrome,
     active_view: Option<usize>,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
     mgr: &mut ConnectionManager,
     renderer: &mut Renderer,
     compositor_theme: &crate::config::theme::CompositorTheme,
@@ -796,7 +797,7 @@ async fn handle_chrome_resize(
         })
         .await?;
     }
-    chrome.paint(renderer, tc, tr, compositor_theme)?;
+    chrome.paint(renderer, tc, tr, compositor_theme, focused_pane_rect)?;
     renderer.flush()?;
     Ok(true)
 }
@@ -1021,6 +1022,7 @@ async fn handle_plugin_action(
     mgr: &mut ConnectionManager,
     renderer: &mut Renderer,
     theme: &crate::config::theme::CompositorTheme,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
     views: &[crate::client::view::ClientView],
     active_view: &mut Option<usize>,
     active_view_id: &mut Option<ViewId>,
@@ -1034,13 +1036,13 @@ async fn handle_plugin_action(
     match action {
         PluginAction::None => {}
         PluginAction::Redraw => {
-            chrome.paint(renderer, c, r, theme)?;
+            chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
             renderer.flush()?;
         }
         PluginAction::LeaveTo(dir) => {
             log::debug!("sidebar: plugin asked to leave towards {dir:?}");
             chrome.leave_sidebar();
-            chrome.paint(renderer, c, r, theme)?;
+            chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
             renderer.flush()?;
         }
         PluginAction::JumpTo(target) => {
@@ -1275,7 +1277,11 @@ fn paint_view(
     // hold whatever the front buffer had -- but a repaint of the whole screen
     // (a resize, an overlay teardown) can drop them. Re-paint them with the
     // frame, as the server-frame arms do.
-    chrome.paint(renderer, c, r, compositor_theme)?;
+    // `None`: the content rect is showing the VIEW's own composite, not the
+    // server frame `focused_pane_rect` describes, so there is no pane border
+    // there to re-colour -- and the view frames its own cells through
+    // `view::cell_border_fg`, which already tracks the focused cell.
+    chrome.paint(renderer, c, r, compositor_theme, None)?;
     relay_overlays(
         renderer,
         input,
@@ -2275,7 +2281,7 @@ async fn run_client_loop(
                                 Some((sidebar, panel)) => {
                                     if key.code == crossterm::event::KeyCode::Esc {
                                         chrome.leave_sidebar();
-                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                         renderer.flush()?;
                                         continue;
                                     }
@@ -2293,6 +2299,7 @@ async fn run_client_loop(
                                             mgr,
                                             &mut renderer,
                                             &compositor_theme,
+                                            focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
                                             &views,
                                             &mut active_view,
                                             &mut active_view_id,
@@ -2465,7 +2472,7 @@ async fn run_client_loop(
                                         tr,
                                         &config.appearance.status_bar_position,
                                     ) {
-                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                         renderer.flush()?;
                                         continue;
                                     }
@@ -2479,6 +2486,7 @@ async fn run_client_loop(
                                     &cmd,
                                     &mut chrome,
                                     active_view,
+                                    focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
                                     mgr,
                                     &mut renderer,
                                     &compositor_theme,
@@ -2582,7 +2590,7 @@ async fn run_client_loop(
                                             tr,
                                             &config.appearance.status_bar_position,
                                         ) {
-                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                             renderer.flush()?;
                                             continue;
                                         }
@@ -2595,6 +2603,7 @@ async fn run_client_loop(
                                         &cmd,
                                         &mut chrome,
                                         active_view,
+                                        focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
                                         mgr,
                                         &mut renderer,
                                         &compositor_theme,
@@ -2658,7 +2667,7 @@ async fn run_client_loop(
                                     );
                                     chrome.leave_sidebar();
                                     let (tc, tr) = renderer.size();
-                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 }
                                 let mode_str = match mode {
                                     Mode::Normal => "NORMAL",
@@ -2948,6 +2957,7 @@ async fn run_client_loop(
                                                 tc,
                                                 tr,
                                                 &compositor_theme,
+                                                focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
                                             )?;
                                             consumed = true;
                                         }
@@ -2965,6 +2975,7 @@ async fn run_client_loop(
                                         &command,
                                         &mut chrome,
                                         active_view,
+                                        focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
                                         mgr,
                                         &mut renderer,
                                         &compositor_theme,
@@ -4207,7 +4218,7 @@ async fn run_client_loop(
                                         }).await?;
                                     }
                                     mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
-                                    chrome.paint(&mut renderer, c, r, &compositor_theme)?;
+                                    chrome.paint(&mut renderer, c, r, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                     renderer.flush()?;
                                 }
                             }
@@ -4363,7 +4374,7 @@ async fn run_client_loop(
                                         )?;
                                     }
                                     None => {
-                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                         // `clear_overlay` replays the front
                                         // buffer with the cursor hidden, and
                                         // only `paint_panel` puts it back --
@@ -4768,6 +4779,7 @@ async fn run_client_loop(
                                 mgr,
                                 &mut renderer,
                                 &compositor_theme,
+                                focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
                                 &views,
                                 &mut active_view,
                                 &mut active_view_id,
@@ -4778,7 +4790,7 @@ async fn run_client_loop(
                             )
                             .await?;
                             if repaint_for_focus {
-                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 renderer.flush()?;
                             }
                             continue;
@@ -4798,7 +4810,7 @@ async fn run_client_loop(
                                 chrome.sidebars[sidebar].focused_panel = panel;
                             }
                             chrome.focus = crate::client::chrome::ChromeFocus::Content;
-                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             renderer.flush()?;
                         }
                         // Content-bound: screen -> content coordinates, clamped
@@ -4947,7 +4959,7 @@ async fn run_client_loop(
                         // (`paint_view` ends with `chrome.paint`), so painting
                         // here would just be the same work twice.
                         if active_view.is_none() {
-                            chrome.paint(&mut renderer, new_cols, new_rows, &compositor_theme)?;
+                            chrome.paint(&mut renderer, new_cols, new_rows, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             renderer.flush()?;
                         }
                         // A live view owns the screen; recomposite it at the new
@@ -5106,7 +5118,7 @@ async fn run_client_loop(
                             // twice would show the stale half first.
                             if active_view.is_none() {
                                 let (tc, tr) = renderer.size();
-                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 renderer.flush()?;
                             }
                         }
@@ -5250,7 +5262,7 @@ async fn run_client_loop(
                             // `terminal::size()` disagrees with it between a
                             // SIGWINCH and the `Resize` event.
                             let (tc, tr) = renderer.size();
-                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -5289,7 +5301,7 @@ async fn run_client_loop(
                             // `terminal::size()` disagrees with it between a
                             // SIGWINCH and the `Resize` event.
                             let (tc, tr) = renderer.size();
-                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -5328,7 +5340,7 @@ async fn run_client_loop(
                             // `terminal::size()` disagrees with it between a
                             // SIGWINCH and the `Resize` event.
                             let (tc, tr) = renderer.size();
-                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -5417,7 +5429,7 @@ async fn run_client_loop(
                             sync_content_rect(&mut renderer, &content);
                             mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
                             if active_view.is_none() {
-                                chrome.paint(&mut renderer, cols, rows, &compositor_theme)?;
+                                chrome.paint(&mut renderer, cols, rows, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 renderer.flush()?;
                             }
                         } else if let Some(ref mut ss) = input.search_state {
@@ -5604,7 +5616,7 @@ async fn run_client_loop(
                                 )?;
                             } else {
                                 let (tc, tr) = renderer.size();
-                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 relay_overlays(
                                     &mut renderer,
                                     &input,
@@ -5804,7 +5816,7 @@ async fn run_client_loop(
                                 );
                                 if active_view.is_none() {
                                     let (tc, tr) = renderer.size();
-                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                     renderer.flush()?;
                                 }
                             }
@@ -5914,7 +5926,7 @@ async fn run_client_loop(
                             // a no-op diff.
                             let (tc, tr) = renderer.size();
                             if active_view.is_none() {
-                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 renderer.flush()?;
                             }
                         }
@@ -6037,7 +6049,7 @@ async fn run_client_loop(
                             );
                             let (tc, tr) = renderer.size();
                             if active_view.is_none() {
-                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                 renderer.flush()?;
                             }
                         }
@@ -6246,7 +6258,7 @@ async fn run_client_loop(
                                         rows: content.height,
                                     })
                                     .await?;
-                                    chrome.paint(&mut renderer, c, r, &compositor_theme)?;
+                                    chrome.paint(&mut renderer, c, r, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                                     renderer.flush()?;
                                 } else if let Some(av) = active_view {
                                     // Diff the pane set: unsubscribe panes fully gone,
@@ -6513,7 +6525,7 @@ async fn run_client_loop(
                             )?;
                         }
                         None => {
-                            chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             renderer.flush()?;
                         }
                     }
