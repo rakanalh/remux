@@ -29,7 +29,7 @@ use crate::server::layout::{
     self, BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::server::persistence::{self, PersistedState};
-use crate::server::pty::{self, Pty};
+use crate::server::pty::{self, PaneIdentity, Pty};
 use crate::server::session::{self, Folder, ServerState, Session};
 
 /// In-memory store of dormant (saved-but-not-live) sessions.
@@ -1309,6 +1309,27 @@ entries={} error={:?} truncated={}",
             )
             .await
         }
+        ClientMessage::CliSpawn {
+            session,
+            placement,
+            argv,
+            cwd,
+        } => {
+            handle_cli_spawn(
+                client_id,
+                &session,
+                placement,
+                &argv,
+                cwd.as_deref(),
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await
+        }
         ClientMessage::UnsubscribePane { pane_id } => {
             {
                 let mut cls = clients.lock().await;
@@ -2042,6 +2063,10 @@ async fn handle_command(
                     None,
                     &[],
                     focused_cwd.as_deref().map(std::path::Path::new),
+                    Some(PaneIdentity {
+                        session: &session_name,
+                        pane: new_id,
+                    }),
                     panes,
                     config,
                 )
@@ -2097,6 +2122,10 @@ async fn handle_command(
                 None,
                 &[],
                 focused_cwd.as_deref().map(std::path::Path::new),
+                Some(PaneIdentity {
+                    session: &session_name,
+                    pane: pane_id,
+                }),
                 panes,
                 config,
             )
@@ -2918,59 +2947,11 @@ async fn handle_command(
             }
         }
         RemuxCommand::TabNewInSession { session } => {
-            // Mirror TabNew but on the named target session, using that
-            // session's own render dimensions (the requester may be attached
-            // elsewhere or nowhere).
-            let (tcols, trows) = session_render_size(&session, clients).await;
-            // Capture the target session's source pane (its active tab's focused
-            // pane) BEFORE create_tab flips active_tab to the new empty tab.
-            let (pane_id, source_pane_id) = {
-                let mut st = state.lock().await;
-                let source_pane_id = st
-                    .sessions
-                    .get(&session)
-                    .and_then(|s| s.tabs.get(s.active_tab))
-                    .map(|t| t.focused_pane);
-                let tab_count = match st.sessions.get(&session) {
-                    Some(s) => s.tabs.len(),
-                    None => {
-                        log::info!("TabNewInSession: session '{session}' not found");
-                        return Ok(());
-                    }
-                };
-                let tab_name = format!("Tab {}", tab_count + 1);
-                match st.create_tab(&session, &tab_name, LayoutMode::default()) {
-                    Ok(pid) => (pid, source_pane_id),
-                    Err(e) => {
-                        log::info!("TabNewInSession: {e}");
-                        return Ok(());
-                    }
-                }
-            };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                source_pane_id
-                    .and_then(|id| panes_lock.get(&id))
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            log::debug!("server: TabNewInSession session={session:?} new pane_id={pane_id}");
-            spawn_pane(
-                pane_id,
-                tcols,
-                trows,
+            create_tab_in_session(
+                &session,
                 None,
                 &[],
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            // create_tab makes the new tab active, so forwarding starts for its
-            // pane here. (For a mutation on a non-active tab, forwarding would
-            // instead begin on the next SessionSwitchTab; the guard makes the
-            // repeat call safe.)
-            start_pty_forwarding(
-                &session,
+                None,
                 state,
                 panes,
                 clients,
@@ -2978,8 +2959,7 @@ async fn handle_command(
                 prev_frames,
                 dormant,
             )
-            .await;
-            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
+            .await?;
         }
         RemuxCommand::TabRenameByIndex {
             session,
@@ -3208,7 +3188,21 @@ async fn handle_create_session(
         st.create_session(name, folder, border_style, layout_mode, popup_size)?
     };
     log::debug!("server: CreateSession name={name:?} folder={folder:?} pane_id={pane_id}");
-    spawn_pane(pane_id, cols, rows, None, &[], None, panes, config).await?;
+    spawn_pane(
+        pane_id,
+        cols,
+        rows,
+        None,
+        &[],
+        None,
+        Some(PaneIdentity {
+            session: name,
+            pane: pane_id,
+        }),
+        panes,
+        config,
+    )
+    .await?;
 
     // Announce to EVERY client, not just the creator. A session manager open in
     // another terminal has no timer -- every tree refresh is event-driven -- so
@@ -5482,6 +5476,114 @@ impl PanePlacement {
 /// specific file, in that file's directory -- and it comes through HERE rather
 /// than down a second pane-creation path, because a split that skipped this
 /// function would eject neither the tab to `Custom` nor the zoom.
+/// Create a new tab in `session_name`, and spawn its first pane.
+///
+/// The counterpart to [`create_pane_in_tab`] for the one case that function
+/// cannot serve: a tab's FIRST pane is created by `ServerState::create_tab`,
+/// which mints the pane id as part of building the tab, so there is no existing
+/// pane in that tab to split. This is therefore not a second pane-creation path
+/// in the sense ruling 4 forbids -- `TabNew`/`TabNewInSession` have always
+/// worked this way -- it is that path, extracted so `remux new-tab` can hand it
+/// a command instead of copying it.
+///
+/// `command`/`args`/`cwd` mean exactly what they mean in `create_pane_in_tab`:
+/// `None`/empty gives the login shell, and a `None` cwd inherits the session's
+/// previously-focused pane, so a new tab opens where the old one was.
+///
+/// Returns the new pane's id, or `None` when the session does not exist or the
+/// tab could not be created -- both logged, neither an error to the caller,
+/// matching how every other session-targeted command treats a name that has
+/// gone away.
+#[allow(clippy::too_many_arguments)]
+async fn create_tab_in_session(
+    session_name: &str,
+    command: Option<&str>,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<Option<PaneId>> {
+    // Use the TARGET session's own render dimensions: the requester may be
+    // attached elsewhere, or -- for a CLI invocation -- nowhere at all.
+    let (tcols, trows) = session_render_size(session_name, clients).await;
+    // Capture the source pane (the active tab's focused pane) BEFORE create_tab
+    // flips active_tab to the new empty tab.
+    let (pane_id, source_pane_id) = {
+        let mut st = state.lock().await;
+        let source_pane_id = st
+            .sessions
+            .get(session_name)
+            .and_then(|s| s.tabs.get(s.active_tab))
+            .map(|t| t.focused_pane);
+        let tab_count = match st.sessions.get(session_name) {
+            Some(s) => s.tabs.len(),
+            None => {
+                log::info!("create_tab_in_session: session '{session_name}' not found");
+                return Ok(None);
+            }
+        };
+        let tab_name = format!("Tab {}", tab_count + 1);
+        match st.create_tab(session_name, &tab_name, LayoutMode::default()) {
+            Ok(pid) => (pid, source_pane_id),
+            Err(e) => {
+                log::info!("create_tab_in_session: {e}");
+                return Ok(None);
+            }
+        }
+    };
+    // An explicit `cwd` wins over inheritance and the inheritance is not even
+    // computed then -- the same rule `create_pane_in_tab` follows, for the same
+    // reason.
+    let focused_cwd = match cwd {
+        Some(_) => None,
+        None => {
+            let panes_lock = panes.lock().await;
+            source_pane_id
+                .and_then(|id| panes_lock.get(&id))
+                .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+        }
+    };
+    log::debug!(
+        "server: create_tab_in_session session={session_name:?} new pane_id={pane_id} \
+command={command:?} args={args:?}"
+    );
+    spawn_pane(
+        pane_id,
+        tcols,
+        trows,
+        command,
+        args,
+        cwd.or(focused_cwd.as_deref().map(std::path::Path::new)),
+        Some(PaneIdentity {
+            session: session_name,
+            pane: pane_id,
+        }),
+        panes,
+        config,
+    )
+    .await?;
+    // create_tab makes the new tab active, so forwarding starts for its
+    // pane here. (For a mutation on a non-active tab, forwarding would
+    // instead begin on the next SessionSwitchTab; the guard makes the
+    // repeat call safe.)
+    start_pty_forwarding(
+        session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await;
+    refresh_target_session(session_name, state, panes, clients, config, prev_frames).await?;
+    Ok(Some(pane_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_pane_in_tab(
     session_name: &str,
@@ -5575,6 +5677,10 @@ async fn create_pane_in_tab(
         command,
         args,
         cwd.or(source_cwd.as_deref().map(std::path::Path::new)),
+        Some(PaneIdentity {
+            session: session_name,
+            pane: new_pane_id,
+        }),
         panes,
         config,
     )
@@ -5669,6 +5775,118 @@ program={program:?} args={argv:?} vertical={vertical}"
     Ok(())
 }
 
+/// Create a pane in `session` on behalf of a command line -- `remux split`,
+/// `remux new-tab`.
+///
+/// The only pane-creating handler that takes its session as an ARGUMENT rather
+/// than reading it off the connection, because its sender is a CLI invocation
+/// that never attaches: it connects, asks, reads the answer and exits. The name
+/// reaches it as the `REMUX_SESSION` the pane's own `Pty::spawn` exported.
+///
+/// The target within the session is the **active tab's focused pane**, which is
+/// what `create_pane_in_tab` already splits when handed no `tab_index`. That is
+/// deliberate and is not the caller's `REMUX_PANE`: an environment variable is
+/// fixed at spawn time, and for an aux pane it was fixed at a moment that may be
+/// hours stale, whereas focus is where the user is looking now. tmux resolves
+/// `split-window` the same way.
+///
+/// A `Some(pane_id)` answer becomes [`ServerMessage::CliSpawned`]; every failure
+/// becomes a [`ServerMessage::Error`] that NAMES the session, since the failure
+/// this will actually hit is a `REMUX_SESSION` left over from a renamed or
+/// closed session, and "session not found" without the name explains nothing.
+#[allow(clippy::too_many_arguments)]
+async fn handle_cli_spawn(
+    client_id: u64,
+    session: &str,
+    placement: CliPlacement,
+    argv: &[String],
+    cwd: Option<&str>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<()> {
+    // An empty argv means the login shell, exactly as an interactive split gets
+    // it: `spawn_pane` falls back to the configured default shell, then $SHELL.
+    let (command, args) = match argv.split_first() {
+        Some((program, rest)) => (Some(program.as_str()), rest),
+        None => (None, &[][..]),
+    };
+    let cwd_path = cwd.map(std::path::Path::new);
+    log::info!(
+        "server: CliSpawn client_id={client_id} session={session:?} placement={placement:?} \
+argv={argv:?} cwd={cwd:?}"
+    );
+
+    let spawned = match placement {
+        CliPlacement::NewTab => {
+            create_tab_in_session(
+                session,
+                command,
+                args,
+                cwd_path,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await?
+        }
+        CliPlacement::SplitHorizontal | CliPlacement::SplitVertical => {
+            // The session's own render size, not the caller's: this connection is
+            // attached to nothing, so it has no dimensions worth the name. The
+            // `resize_session_panes` tail corrects whatever this was anyway.
+            let (cols, rows) = session_render_size(session, clients).await;
+            let placement = if matches!(placement, CliPlacement::SplitVertical) {
+                PanePlacement::SplitVertical
+            } else {
+                PanePlacement::SplitHorizontal
+            };
+            let created = create_pane_in_tab(
+                session,
+                None,
+                placement,
+                cols,
+                rows,
+                command,
+                args,
+                cwd_path,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await?;
+            if created.is_some() {
+                // The refresh tail the `PaneSplit*` arm runs. Without it the pane
+                // exists and no attached client repaints -- the split would appear
+                // only on the next unrelated redraw.
+                resize_session_panes(session, state, panes, clients, config).await?;
+                broadcast_full_render(session, state, panes, clients, config, prev_frames).await;
+            }
+            created
+        }
+    };
+
+    let cls = clients.lock().await;
+    if let Some(conn) = cls.get(&client_id) {
+        let msg = match spawned {
+            Some(pane_id) => ServerMessage::CliSpawned { pane_id },
+            None => ServerMessage::Error {
+                message: format!("no session named '{session}' on this server"),
+            },
+        };
+        let _ = conn.tx.send(msg);
+    }
+    Ok(())
+}
+
 /// Spawn an auxiliary pane for `client_id` and answer with its id.
 ///
 /// The whole handler is composition: [`spawn_pane`] already produces exactly "a
@@ -5705,8 +5923,38 @@ async fn handle_spawn_aux_pane(
         let mut st = state.lock().await;
         st.next_pane_id()
     };
+    // The identity this aux pane advertises names the pane it was spawned FOR:
+    // the requester's session, and that session's active tab's focused pane.
+    // An aux pane is in no layout tree, so "split me" has no meaning -- and
+    // pointing `REMUX_PANE` at itself is not merely useless but wrong, because
+    // it is what an `nnn` opener inside a `files` panel would try to subdivide.
+    //
+    // Resolved with the two locks taken SEQUENTIALLY, never nested: this daemon
+    // has a recorded ABBA hazard between `clients` and `state`, and the handler
+    // held neither before this block.
+    let requester_session = {
+        let cls = clients.lock().await;
+        cls.get(&client_id).and_then(|c| c.session_name.clone())
+    };
+    let identity = match &requester_session {
+        Some(session) => {
+            let st = state.lock().await;
+            st.sessions
+                .get(session)
+                .and_then(|s| s.tabs.get(s.active_tab))
+                .map(|t| t.focused_pane)
+                .map(|focused| PaneIdentity {
+                    session: session.as_str(),
+                    pane: focused,
+                })
+        }
+        // An unattached requester has no session to name, so the pane gets
+        // neither variable and `remux split` inside it refuses politely rather
+        // than guessing. That is the honest answer, not a missing one.
+        None => None,
+    };
     log::info!(
-        "server: SpawnAuxPane client_id={client_id} pane_id={pane_id} dims={cols}x{rows} command={command:?} cwd={cwd:?}"
+        "server: SpawnAuxPane client_id={client_id} pane_id={pane_id} dims={cols}x{rows} command={command:?} cwd={cwd:?} identity={identity:?}"
     );
     if let Err(e) = spawn_pane(
         pane_id,
@@ -5715,6 +5963,7 @@ async fn handle_spawn_aux_pane(
         Some(command),
         &[],
         cwd.map(std::path::Path::new),
+        identity,
         panes,
         config,
     )
@@ -5779,6 +6028,11 @@ async fn handle_spawn_aux_pane(
 /// editor" -- and it exists because `Pty::spawn` execs a single-element argv:
 /// without it, a `command` of `"vim /tmp/x"` would look for a BINARY of that
 /// name rather than running `vim` on the file.
+///
+/// `identity` is what the child is told it is, as `REMUX_SESSION`/`REMUX_PANE`.
+/// It is a PARAMETER rather than derived from `pane_id` here because the two
+/// disagree for an aux pane, which names the pane it was spawned FOR -- see
+/// [`PaneIdentity`]. Only the caller knows which case it is in.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_pane(
     pane_id: PaneId,
@@ -5787,14 +6041,15 @@ async fn spawn_pane(
     command: Option<&str>,
     args: &[String],
     cwd: Option<&std::path::Path>,
+    identity: Option<PaneIdentity<'_>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
 ) -> Result<()> {
     let cmd = command.or(config.general.default_shell.as_deref());
     log::debug!(
-        "server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} args={args:?} cwd={cwd:?}"
+        "server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} args={args:?} cwd={cwd:?} identity={identity:?}"
     );
-    let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd)?;
+    let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd, identity)?;
     // The reader gets its OWN descriptor (a dup), so the fd number cannot be
     // reissued to a later PTY while the reader's epoll registration still
     // exists. See `start_reader`.
@@ -7986,6 +8241,10 @@ async fn materialize_session(
             None,
             &[],
             cwd_path,
+            Some(PaneIdentity {
+                session: session_name,
+                pane: *pane_id,
+            }),
             panes,
             config,
         )

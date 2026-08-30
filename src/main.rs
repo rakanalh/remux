@@ -11,7 +11,7 @@ mod server;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
 use futures::StreamExt;
 
@@ -27,7 +27,9 @@ use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
 use crate::client::tree_model::JumpTarget;
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::{Config, RemoteConfig};
-use crate::protocol::{ClientMessage, ConnDescriptor, RemuxCommand, ServerMessage, ViewId};
+use crate::protocol::{
+    CliPlacement, ClientMessage, ConnDescriptor, RemuxCommand, ServerMessage, ViewId,
+};
 use crate::server::daemon::{self, socket_path, RemuxServer};
 
 /// Data captured while computing search matches, used to transition from
@@ -92,6 +94,67 @@ enum Commands {
         remux_path: String,
     },
 
+    /// Split the focused pane of the session named by $REMUX_SESSION
+    ///
+    /// `disable_help_flag` because `-h` is claimed here for the split
+    /// orientation, as it is in tmux. `--help` is re-added by hand below, so the
+    /// only thing lost is the SHORT help flag on this one subcommand.
+    #[command(
+        disable_help_flag = true,
+        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session to split.\n\
+                      With no COMMAND the new pane runs the login shell.\n\n\
+                      Examples:\n  \
+                        remux split\n  \
+                        remux split -v -- nvim /tmp/notes.md"
+    )]
+    Split {
+        /// Split top/bottom: the new pane goes BELOW (the default)
+        ///
+        /// Note this is the opposite of tmux's `split-window -h`. The flag names
+        /// the DIVIDER, matching remux's own `PaneSplitHorizontal` command.
+        #[arg(short = 'h', long)]
+        horizontal: bool,
+
+        /// Split side by side: the new pane goes to the RIGHT
+        #[arg(short = 'v', long, conflicts_with = "horizontal")]
+        vertical: bool,
+
+        /// Working directory for the new pane (default: the target pane's)
+        #[arg(short = 'c', long, value_name = "DIR")]
+        cwd: Option<String>,
+
+        /// Print help
+        #[arg(long, action = ArgAction::Help)]
+        help: Option<bool>,
+
+        /// Command to run, after `--`; empty runs the login shell
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        argv: Vec<String>,
+    },
+
+    /// Create a new tab in the session named by $REMUX_SESSION
+    #[command(
+        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session.\n\
+                            With no COMMAND the new pane runs the login shell."
+    )]
+    NewTab {
+        /// Working directory for the new tab's pane (default: the focused pane's)
+        #[arg(short = 'c', long, value_name = "DIR")]
+        cwd: Option<String>,
+
+        /// Command to run, after `--`; empty runs the login shell
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        argv: Vec<String>,
+    },
+
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
     Server,
@@ -99,6 +162,79 @@ enum Commands {
     /// Internal: relay stdio to the local server socket (used over SSH)
     #[command(hide = true)]
     Relay,
+}
+
+/// Ask the running server to create a pane, on behalf of `remux split` /
+/// `remux new-tab`.
+///
+/// The whole point of the subcommand is that it is run from INSIDE a pane, by a
+/// script or a file manager's opener hook, so the session comes from the
+/// `$REMUX_SESSION` that `Pty::spawn` exported into that pane -- the
+/// `TMUX`/`TMUX_PANE` arrangement.
+///
+/// **An unset `$REMUX_SESSION` is refused, never guessed.** There is usually a
+/// plausible guess available ("the only session", "the most recent one"), and
+/// taking it is how a script splits a window the user was not looking at. The
+/// message says which variable is missing so the fix is obvious.
+///
+/// Note what this deliberately does NOT read: `$REMUX_PANE`. The server splits
+/// the session's active tab's FOCUSED pane, because the variable is fixed at
+/// spawn time -- and for an aux pane it names a pane chosen at a moment that may
+/// be long past -- whereas focus is where the user is now. `$REMUX_PANE` is
+/// exported for callers that want that precision by other means.
+///
+/// Exits the process non-zero on every failure, since the caller is a script.
+async fn run_cli_spawn(
+    placement: CliPlacement,
+    cwd: Option<String>,
+    argv: Vec<String>,
+) -> Result<()> {
+    let Some(session) = std::env::var_os("REMUX_SESSION") else {
+        eprintln!(
+            "remux: not inside a remux pane ($REMUX_SESSION is unset).\n\
+             Run this from a shell running in a remux pane."
+        );
+        std::process::exit(1);
+    };
+    let session = session.to_string_lossy().into_owned();
+    log::debug!(
+        "cmd: cli-spawn session={session:?} placement={placement:?} argv={argv:?} cwd={cwd:?}"
+    );
+
+    // Deliberately no `ensure_server_running()`: a set $REMUX_SESSION means a
+    // pane exists, which means a server does. Starting one here would create an
+    // EMPTY server that could not possibly hold the named session, and then
+    // report that the session does not exist -- a confusing answer to a
+    // situation that is really "the server this pane belongs to has gone away".
+    if !socket_path().exists() {
+        eprintln!("remux: no server running on this machine.");
+        std::process::exit(1);
+    }
+    let mut client = RemuxClient::connect().await?;
+    client
+        .send(ClientMessage::CliSpawn {
+            session: session.clone(),
+            placement,
+            argv,
+            cwd,
+        })
+        .await?;
+
+    match client.recv_skip_views().await? {
+        Some(ServerMessage::CliSpawned { pane_id }) => {
+            log::debug!("cmd: cli-spawn created pane_id={pane_id}");
+        }
+        Some(ServerMessage::Error { message }) => {
+            eprintln!("remux: {message}");
+            std::process::exit(1);
+        }
+        other => {
+            log::warn!("cmd: cli-spawn unexpected reply: {other:?}");
+            eprintln!("remux: unexpected response from server.");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 /// Route panics into the role's log file, in addition to stderr.
@@ -402,6 +538,28 @@ async fn main() -> Result<()> {
                     println!("Killed session '{}'.", name);
                 }
             }
+        }
+        Some(Commands::Split {
+            horizontal: _,
+            vertical,
+            cwd,
+            help: _,
+            argv,
+        }) => {
+            // `-h` and the default are the same placement, so `horizontal` is
+            // accepted and then ignored: it exists so that a user who wants to
+            // be explicit can be, and so that `-h`/`-v` read as the pair they
+            // are. `conflicts_with` on `-v` is what makes "both" an error rather
+            // than a silent winner.
+            let placement = if vertical {
+                CliPlacement::SplitVertical
+            } else {
+                CliPlacement::SplitHorizontal
+            };
+            run_cli_spawn(placement, cwd, argv).await?;
+        }
+        Some(Commands::NewTab { cwd, argv }) => {
+            run_cli_spawn(CliPlacement::NewTab, cwd, argv).await?;
         }
         Some(Commands::Stop) => {
             log::debug!("cmd: stop server");
@@ -6111,6 +6269,15 @@ async fn run_client_loop(
                                 renderer.flush()?;
                             }
                         }
+                    }
+                    Some(ServerMessage::CliSpawned { pane_id }) => {
+                        // The interactive client never sends `CliSpawn`; only
+                        // the unattached `remux split`/`remux new-tab` path
+                        // does, and that one reads its own answer without ever
+                        // reaching this loop. Logged rather than ignored so that
+                        // if it ever DOES arrive here, the log says so instead of
+                        // the message vanishing into a catch-all.
+                        log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
                     }
                     Some(ServerMessage::AuxPaneSpawned { pane_id }) => {
                         // The requester is the head of this connection's pending

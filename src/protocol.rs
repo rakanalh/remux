@@ -54,7 +54,16 @@ pub enum ConnDescriptor {
 /// 7 -> 8: the agents sidebar plugin. Adds
 /// [`ClientMessage::SubscribeAgents`]/[`ClientMessage::UnsubscribeAgents`] and
 /// [`ServerMessage::AgentList`].
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// 8 -> 9: the built-in `browser` sidebar plugin. Adds
+/// [`ClientMessage::ListDirectory`]/[`ServerMessage::DirectoryListing`] and
+/// [`ClientMessage::OpenInSplit`]. (Recorded after the fact, so the list has no
+/// gap where the next entry begins.)
+///
+/// 9 -> 10: the CLI subcommands. Adds [`ClientMessage::CliSpawn`] and
+/// [`ServerMessage::CliSpawned`], the pair that lets a process INSIDE a pane ask
+/// the server for a new one -- `remux split`, `remux new-tab`.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -90,6 +99,31 @@ pub struct Welcome {
 // ---------------------------------------------------------------------------
 // Client -> Server
 // ---------------------------------------------------------------------------
+
+/// Where a [`ClientMessage::CliSpawn`] puts the pane it asks for.
+///
+/// A separate enum from the server's internal `PanePlacement` on purpose: this
+/// one is the CLI's vocabulary and only ever grows a variant when a *subcommand*
+/// grows one, whereas `PanePlacement` also carries `Stack` and `Auto`, which no
+/// command line names. Keeping them apart means adding a layout placement server
+/// side is not automatically a wire change.
+///
+/// The two split names follow **Remux's** convention, in which the name is the
+/// DIVIDER rather than the arrangement -- `SplitHorizontal` puts the new pane
+/// below, `SplitVertical` puts it beside. That is the opposite of tmux's
+/// `split-window -h`, and the mapping is spelled out in the subcommand's help
+/// text for exactly that reason. It matches
+/// [`RemuxCommand::PaneSplitHorizontal`]/[`RemuxCommand::PaneSplitVertical`],
+/// which is the consistency that matters here: the same server runs both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CliPlacement {
+    /// Split the focused pane top/bottom; the new pane goes below.
+    SplitHorizontal,
+    /// Split the focused pane side by side; the new pane goes to the right.
+    SplitVertical,
+    /// Create a new tab in the session, rather than splitting anything.
+    NewTab,
+}
 
 /// Messages sent from a Remux client to the server over the Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +355,44 @@ pub enum ClientMessage {
         #[serde(default)]
         vertical: bool,
     },
+    /// Create a pane in `session` on behalf of a command line -- `remux split`,
+    /// `remux new-tab` -- run from INSIDE a pane.
+    ///
+    /// The one message whose sender is not an attached client. Every other
+    /// pane-creating message resolves its session from the CONNECTION, and a CLI
+    /// invocation has none: it connects, sends this, reads the answer and exits
+    /// without ever attaching. Hence the explicit `session`, which the caller
+    /// gets from the `REMUX_SESSION` that [`Pty::spawn`](crate::server::pty::Pty)
+    /// exported into its pane.
+    ///
+    /// **The target is the session's ACTIVE TAB's FOCUSED pane, not the pane the
+    /// caller is sitting in.** `REMUX_SESSION` picks the machine and the session;
+    /// live focus picks the spot. This is tmux's behaviour, and it is the
+    /// behaviour that survives the user moving focus after the calling process
+    /// started -- an environment variable is fixed at spawn time, and an aux
+    /// pane's is fixed at a moment that may be hours stale.
+    ///
+    /// `argv` is the program and its arguments; **empty means the login shell**,
+    /// exactly as an interactive split gets. `cwd` of `None` inherits the target
+    /// pane's directory, as a split does.
+    ///
+    /// Like [`OpenInSplit`](ClientMessage::OpenInSplit), this runs a program
+    /// named by the client, and for the same reason that is not a new grant: a
+    /// connected client can already [`Input`](ClientMessage::Input) arbitrary
+    /// bytes into any pane's shell. The trust boundary is the SOCKET, and it has
+    /// not moved. Written down so nobody later narrows it into uselessness or
+    /// widens it without noticing.
+    ///
+    /// Answered with [`ServerMessage::CliSpawned`] on success and
+    /// [`ServerMessage::Error`] on failure, so the command can exit non-zero.
+    CliSpawn {
+        session: String,
+        placement: CliPlacement,
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Scroll a subscribed pane's own scroll view by `lines` (per-subscriber,
     /// by pane identity), independent of this client's foreground scroll. Used
     /// by a View cell's mouse wheel: the server adjusts a per-(client, pane)
@@ -525,6 +597,20 @@ pub enum ServerMessage {
     /// `files` panels, so `None` is not a formality: it is what keeps the
     /// correlation-free matching honest.
     AuxPaneSpawned { pane_id: Option<PaneId> },
+    /// Answer to a successful [`ClientMessage::CliSpawn`]: the id of the pane
+    /// that was created.
+    ///
+    /// Failure is reported as [`ServerMessage::Error`] instead, carrying a
+    /// human sentence that NAMES the session it could not find -- a
+    /// `REMUX_SESSION` left over from a renamed session is the failure this
+    /// message exists to explain, and "not found" without the name explains
+    /// nothing.
+    ///
+    /// The id is not currently used by any caller; `remux split` prints nothing
+    /// on success. It is here because the alternative -- a bare ack -- makes
+    /// "which pane did I just get?" a wire change rather than a client change,
+    /// and a script that wants to send the new pane input needs the answer.
+    CliSpawned { pane_id: PaneId },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches

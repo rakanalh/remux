@@ -18,6 +18,32 @@ pub struct Pty {
     pub child_pid: Pid,
 }
 
+/// Who the pane about to be spawned IS, as the child is told it.
+///
+/// Exported into the child's environment as `REMUX_SESSION` and `REMUX_PANE`,
+/// the pair that makes `remux split` possible from inside a pane -- the
+/// `TMUX`/`TMUX_PANE` equivalent. Without them a process in a pane knows only
+/// that it is in *some* remux (`REMUX=1`), which is not enough to ask the server
+/// for anything.
+///
+/// Borrowed rather than owned because it is consumed entirely before the fork
+/// and never outlives the call.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneIdentity<'a> {
+    /// The session the pane belongs to, by name -- the same name `remux attach`
+    /// takes, which is what makes it a usable CLI argument.
+    pub session: &'a str,
+    /// The pane id the child should report as its own.
+    ///
+    /// For an ordinary pane this is the pane's own id. For an **aux pane** it is
+    /// deliberately NOT: an aux pane is in no layout tree, so "split me" has no
+    /// meaning, and it names instead the pane the panel was spawned FOR. That is
+    /// the whole point of the variable for a `files` user -- an `nnn` opener
+    /// inside the panel lands the editor next to the user's work rather than
+    /// trying to subdivide a sidebar.
+    pub pane: u64,
+}
+
 impl Pty {
     /// Spawn a new PTY with the given dimensions, optional command and
     /// arguments, and optional working directory.
@@ -38,6 +64,12 @@ impl Pty {
     ///   `vim` it is an unrecognised program name, and there is no reason to
     ///   hand one to a program that was invoked to edit a file.
     ///
+    /// `identity` names the pane to the child via `REMUX_SESSION`/`REMUX_PANE`.
+    /// `None` leaves both UNSET, which is a real answer and not a missing one:
+    /// an aux pane requested by a client that is attached to nothing has no
+    /// session to name, and `remux split` refuses politely on an unset
+    /// `$REMUX_SESSION` rather than guessing one.
+    ///
     /// # Safety
     ///
     /// This function uses `fork()` internally, which is inherently unsafe in
@@ -50,14 +82,16 @@ impl Pty {
         command: Option<&str>,
         args: &[String],
         cwd: Option<&std::path::Path>,
+        identity: Option<PaneIdentity<'_>>,
     ) -> Result<Pty> {
         log::debug!(
-            "pty: spawn cols={}, rows={}, command={:?}, args={:?}, cwd={:?}",
+            "pty: spawn cols={}, rows={}, command={:?}, args={:?}, cwd={:?}, identity={:?}",
             cols,
             rows,
             command,
             args,
-            cwd
+            cwd,
+            identity
         );
 
         // Built BEFORE the fork. `CString::new` allocates, and the child of a
@@ -70,6 +104,12 @@ impl Pty {
             .map(|a| std::ffi::CString::new(a.as_str()))
             .collect::<std::result::Result<_, _>>()
             .context("an argument for the pane's command contains a NUL byte")?;
+
+        // Formatted BEFORE the fork, for the same reason `c_args` is: `format!`
+        // allocates, and the child of a fork in a multi-threaded process may only
+        // call async-signal-safe functions. The child below just hands these two
+        // strings to `set_var`.
+        let identity_env = identity.map(|id| (id.session.to_string(), id.pane.to_string()));
 
         let winsize = Winsize {
             ws_row: rows,
@@ -130,6 +170,21 @@ impl Pty {
                 // zellij's $ZELLIJ). Set here in the child, alongside TERM, so it
                 // is inherited by the pane's shell and its descendants.
                 std::env::set_var("REMUX", "1");
+
+                // Name the pane to whatever runs in it, mirroring tmux's
+                // $TMUX/$TMUX_PANE. `REMUX=1` only says "you are inside SOME
+                // remux"; these two say which, and that is the difference
+                // between a script knowing it is nested and a script being able
+                // to ask the server for a split.
+                //
+                // Left UNSET when there is no identity, rather than set to an
+                // empty string: `remux split` distinguishes "not in a pane" from
+                // "in a pane" by PRESENCE, and an empty value would read as a
+                // session whose name is "".
+                if let Some((session, pane)) = &identity_env {
+                    std::env::set_var("REMUX_SESSION", session);
+                    std::env::set_var("REMUX_PANE", pane);
+                }
 
                 // Determine which shell/command to execute.
                 let shell = match command {
@@ -557,7 +612,8 @@ mod tests {
     #[test]
     fn spawn_and_exit() {
         // Spawn a shell that immediately exits.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.write_input(b"exit\n").expect("write_input failed");
 
         // Wait for the child to exit.
@@ -568,7 +624,8 @@ mod tests {
 
     #[test]
     fn resize_does_not_error() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.resize(120, 40).expect("resize should not fail");
         pty.write_input(b"exit\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -576,7 +633,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_output_returns_data() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.write_input(b"echo hello\n").expect("write failed");
 
         // Give the shell a moment to produce output.
@@ -591,7 +649,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_reader_receives_output() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
 
         let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
@@ -638,7 +697,8 @@ mod tests {
         // The sentinel is split across a shell string concatenation
         // ("AR""GV0=") so the assembled token "ARGV0=" appears only in the
         // shell's actual output, never in the (terminal-echoed) command line.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
 
         let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
@@ -731,7 +791,8 @@ mod tests {
     /// through this path.
     #[tokio::test]
     async fn empty_args_still_spawn_a_dash_prefixed_login_shell() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         // The sentinel is split across a shell concatenation so the assembled
         // token appears only in the shell's OUTPUT, never in the command line
         // the terminal echoes back.
@@ -760,7 +821,8 @@ mod tests {
         // needs no concatenation trick: it can only reach the output by being
         // printed.
         let args = vec!["-c".to_string(), "echo ARGV0=$0".to_string()];
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &args, None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &args, None, None).expect("failed to spawn PTY");
         let argv0 = sentinel(&pty, None, "ARGV0=")
             .await
             .expect("the script never ran, so its arguments never reached exec");
