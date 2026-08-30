@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use nix::pty::{openpty, OpenptyResult, Winsize};
@@ -9,19 +9,6 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-
-/// A thin wrapper around a raw file descriptor that implements `AsRawFd`.
-///
-/// This is used to register a borrowed raw fd with tokio's `AsyncFd`
-/// without transferring ownership. The caller is responsible for ensuring
-/// the underlying fd outlives this wrapper.
-struct RawFdWrapper(RawFd);
-
-impl AsRawFd for RawFdWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
 
 /// Represents an allocated PTY with a running child process.
 pub struct Pty {
@@ -142,16 +129,29 @@ impl Pty {
                 let c_argv0 =
                     std::ffi::CString::new(login_argv0.as_str()).expect("CString::new failed");
 
-                // exec the shell. On success this does not return.
-                // On failure, expect() panics (which is appropriate for a
-                // post-fork child process).
-                #[allow(unreachable_code)]
-                {
-                    unistd::execvp(&c_shell, &[&c_argv0]).expect("execvp failed");
-                    // SAFETY: execvp either succeeds (never returns) or expect()
-                    // panics. This line is unreachable but satisfies the type
-                    // checker.
-                    unsafe { libc::_exit(1) }
+                // exec the shell. On success this does not return; on failure
+                // say so on the terminal and leave immediately.
+                //
+                // Deliberately NOT a panic. This is a forked child, so unwinding
+                // runs the parent's hooks and atexit handlers in a process that
+                // shares its memory image -- and the panic message goes to the
+                // pane, where the user reads a Rust backtrace instead of the
+                // name of the program that could not be started. Reachable by
+                // ordinary config since the `files` sidebar plugin takes a
+                // user-supplied `command`: one typo in `command = "yazi"` used
+                // to paint a panic into the panel.
+                let _ = unistd::execvp(&c_shell, &[&c_argv0]);
+                let err = std::io::Error::last_os_error();
+                let msg = format!("remux: cannot run {shell:?}: {err}\r\n");
+                // SAFETY: a plain `write` to fd 2, which is the PTY slave here.
+                // Async-signal-safe, which `println!` and unwinding are not.
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        msg.as_ptr() as *const libc::c_void,
+                        msg.len(),
+                    );
+                    libc::_exit(127) // 127 = "command not found", as a shell reports it
                 }
             }
             ForkResult::Parent { child } => {
@@ -182,8 +182,18 @@ impl Pty {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        let wrapper = RawFdWrapper(fd);
-        let async_fd = AsyncFd::with_interest(wrapper, Interest::READABLE)
+        // A `BorrowedFd` rather than a bare `RawFd` in a wrapper: this genuinely
+        // IS a borrow -- `&self` outlives the await -- and saying so in the type
+        // is what makes it safe. The wrapper it replaced carried no lifetime, so
+        // the compiler could not tell this legitimate borrow from the one in
+        // `start_reader` that outlived its descriptor and cost a pane every byte
+        // of its output. Dropping a `BorrowedFd` closes nothing, so the
+        // `into_inner()` dance that used to guard each exit is gone too.
+        //
+        // SAFETY: `fd` comes from `self.master_fd`, which `&self` keeps alive
+        // for the whole of this function.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let async_fd = AsyncFd::with_interest(borrowed, Interest::READABLE)
             .context("AsyncFd creation failed")?;
 
         let mut buf = vec![0u8; 4096];
@@ -211,16 +221,12 @@ impl Pty {
                 }
             }) {
                 Ok(Ok(0)) => {
-                    // Prevent AsyncFd from closing the fd (we don't own it).
-                    let _ = async_fd.into_inner();
                     return Ok(Vec::new());
                 }
                 Ok(Ok(n)) => {
-                    let _ = async_fd.into_inner();
                     return Ok(buf[..n].to_vec());
                 }
                 Ok(Err(e)) => {
-                    let _ = async_fd.into_inner();
                     return Err(e).context("read from PTY master failed");
                 }
                 Err(_would_block) => {
@@ -372,10 +378,12 @@ fn reap_child(pid: Pid) {
 ///
 /// Returns the task handle and the receiving end of the channel.
 ///
-/// # Safety
-///
-/// The caller must ensure that `master_fd` remains valid for the lifetime of
-/// the returned task. The task does not own the fd and will not close it.
+/// Takes an **owned** descriptor -- give it a `dup` of the master, not the
+/// master itself -- and closes it when the task ends. There is no safety
+/// contract left for the caller to honour, and that is the point: this used to
+/// ask the caller to keep a borrowed fd alive for the task's lifetime, nobody
+/// could, and the fd number was reissued to the next PTY while this task's epoll
+/// registration still held it. See the comment on `AsyncFd` below.
 pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
     let raw = master_fd.as_raw_fd();
     log::debug!("pty: start_reader watching fd={raw}");
@@ -457,8 +465,10 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
             }
         }
 
-        // Prevent the AsyncFd from closing the borrowed fd on drop.
-        let _ = async_fd.into_inner();
+        // `async_fd` drops here: it deregisters from the reactor FIRST and only
+        // then closes the descriptor it owns, which is the ordering that makes
+        // the fd number safe to reissue. Nothing to do by hand -- the previous
+        // `into_inner()` here existed to stop it closing a fd it did not own.
     });
 
     (handle, rx)
