@@ -129,8 +129,12 @@ def main():
     try:
         try:
             run(srv)
-        except (BrokenPipeError, ConnectionError) as e:
-            check(False, f"the connection stayed alive throughout ({e})")
+        except Exception as e:  # noqa: BLE001 -- see below
+            # Deliberately broad. A server that dies mid-run takes the rest of
+            # the checks with it, and the most useful thing left to say is in
+            # the LOG -- so the run must reach the panic check below rather than
+            # ending in a traceback that never looks at it.
+            check(False, f"the run completed without an exception ({e!r})")
     finally:
         log = srv.log()
         srv.kill()
@@ -165,7 +169,7 @@ def run(srv):
     time.sleep(1.0)
     got = latest(c, 1.2)
     check(
-        got == [] or all(a["command"] != "notanagent" for a in got),
+        all(a["command"] != "notanagent" for a in got or []),
         "3 a pane running an unlisted command is not listed",
     )
     # Leave it running in its own pane so it stays a live negative for the rest
@@ -184,7 +188,7 @@ def run(srv):
     check(entry["session"] == "main", "2 the entry names its session")
     check(entry["tab_index"] == 0, "2 the entry names its tab")
     check(
-        all(a["command"] != "notanagent" for a in got),
+        all(a["command"] != "notanagent" for a in got or []),
         "3 and the unlisted one is still absent",
     )
     agent_pane = entry["pane_id"]
