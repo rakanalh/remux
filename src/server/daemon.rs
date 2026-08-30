@@ -1455,6 +1455,25 @@ async fn handle_attach(
         st.clear_active_tab_activity(session_name);
     }
 
+    // Tell the client which border style this session is composited in, BEFORE
+    // its first frame. The client seeds its own style from config once and
+    // never re-learns it, so without this an attach to a session whose style was
+    // toggled leaves the sidebar frame and the pane borders disagreeing.
+    {
+        let style = {
+            let st = state.lock().await;
+            st.sessions
+                .get(session_name)
+                .map(|s| s.border_style.clone())
+        };
+        if let Some(style) = style {
+            let cls = clients.lock().await;
+            if let Some(client) = cls.get(&client_id) {
+                let _ = client.tx.send(ServerMessage::SessionBorderStyle { style });
+            }
+        }
+    }
+
     // Resize panes to match the attaching client's terminal dimensions.
     resize_session_panes(session_name, state, panes, clients, config).await?;
 

@@ -553,6 +553,65 @@ def test_a_config_reload_keeps_the_toggled_style():
     check_no_panic()
 
 
+def test_a_reattach_resyncs_the_style_the_server_is_drawing():
+    """The style is per-SESSION server state; a fresh client must learn it.
+
+    `ToggleStyle` flips `Session::border_style` on the server AND the client's
+    own copy. The client's copy is seeded once from `appearance.border_style`,
+    so a client that attaches AFTER a toggle used to come up in the config's
+    style while the server kept compositing the panes in the toggled one: panes
+    tmux, sidebar zellij, and no way to resync short of toggling twice.
+
+    Two clients rather than a detach/reattach of one, because the second client
+    is the honest test: it has never seen the toggle, so nothing but the
+    server's answer can tell it what style to frame in.
+    """
+    name = "test_a_reattach_resyncs_the_style_the_server_is_drawing"
+    env = make_env(cfg("zellij_style", size=10))
+    first, screen, pump = spawn(env)
+    pump(1.5)
+    bad = []
+    if screen.display[0][0] != TL:
+        bad.append("the first client did not start framed in zellij style")
+
+    first.send(b"\x01")
+    time.sleep(0.2)
+    first.send(b"g")  # ToggleStyle -> tmux, on the server's session
+    pump(1.5)
+    if screen.display[0][0] in BOX:
+        bad.append(f"the toggle did not take: {screen.display[0][:10]!r}")
+    first.close(force=True)
+    time.sleep(0.5)
+
+    # A brand-new client attaches to the same (toggled) session.
+    second, screen2, pump2 = spawn(env)
+    pump2(2.0)
+    rows = screen2.display
+    # The PANES are tmux (the server's session state survived).
+    if rows[0][10] == TL:
+        bad.append(f"the panes are not in the toggled style: {rows[0][:22]!r}")
+    # ...and the SIDEBAR agrees, rather than reverting to the config's zellij.
+    if rows[0][0] in BOX:
+        bad.append(
+            f"the reattached client framed the sidebar in the config's style "
+            f"while the panes are in the session's: {rows[0][:12]!r}"
+        )
+    # The interior moved with it: tmux leaves 9 columns then the seam.
+    if rows[0][:10] != "Placehold" + VERT:
+        bad.append(
+            f"the panel interior is not the tmux one after the reattach: "
+            f"{rows[0][:10]!r}"
+        )
+    if not second.isalive():
+        bad.append("the second client died")
+    if bad:
+        fail(name, "; ".join(bad), screen2)
+    else:
+        ok(name)
+    teardown(second, env)
+    check_no_panic()
+
+
 if __name__ == "__main__":
     test_zellij_style_draws_a_box_around_the_sidebar()
     test_the_panel_interior_shrank_by_the_frame()
@@ -563,6 +622,7 @@ if __name__ == "__main__":
     test_a_sidebar_too_small_to_frame_degrades_to_unframed()
     test_a_click_on_the_frame_never_reaches_the_server()
     test_a_config_reload_keeps_the_toggled_style()
+    test_a_reattach_resyncs_the_style_the_server_is_drawing()
     if FAILURES:
         print("FAILURES")
         for f in FAILURES:

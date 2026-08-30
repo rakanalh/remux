@@ -5858,6 +5858,27 @@ async fn run_client_loop(
                             }
                         }
                     }
+                    Some(ServerMessage::SessionBorderStyle { style }) => {
+                        // The style the server draws the session we just
+                        // attached to. Only the FOREGROUND connection's answer
+                        // applies: a background server attaching a session of
+                        // its own must not reframe what this terminal is
+                        // showing.
+                        if mgr.is_foreground(&src) && style != view_border_style {
+                            log::debug!("srv: SessionBorderStyle {style:?} (was {view_border_style:?})");
+                            view_border_style = style;
+                            chrome.set_border_style(view_border_style.clone());
+                            // The frame is repainted by the attach's own
+                            // FullRender, which follows this; painting here as
+                            // well keeps the sidebar right even if the frame is
+                            // a no-op diff.
+                            let (tc, tr) = renderer.size();
+                            if active_view.is_none() {
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                renderer.flush()?;
+                            }
+                        }
+                    }
                     Some(ServerMessage::AuxPaneSpawned { pane_id }) => {
                         // The requester is the head of this connection's pending
                         // queue: requests are serialised by the connection's

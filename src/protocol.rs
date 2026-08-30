@@ -48,7 +48,8 @@ pub enum ConnDescriptor {
 /// 6 -> 7: the file-manager sidebar plugin. Adds
 /// [`ClientMessage::SpawnAuxPane`]/[`ClientMessage::KillAuxPane`] and
 /// [`ServerMessage::AuxPaneSpawned`], the `cwd`/`is_active` session-tree fields
-/// those need to follow the focused pane.
+/// those need to follow the focused pane, and
+/// [`ServerMessage::SessionBorderStyle`].
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -429,6 +430,19 @@ pub enum ServerMessage {
     ScrollbackContent { lines: Vec<String> },
     /// Response to a `RequestScrollbackInfo` request with the total line count.
     ScrollbackInfo { total_lines: usize },
+    /// The border style the server composites the client's newly attached
+    /// session with.
+    ///
+    /// Sent on every successful `Attach`, BEFORE that attach's first frame.
+    /// `Session::border_style` is per-session SERVER state that the server's own
+    /// `ToggleStyle` handler flips, while the client's copy -- the one that
+    /// frames the sidebars -- is seeded once from `appearance.border_style` and
+    /// was never re-learned. Two reachable consequences, both on default
+    /// keybindings: toggle, detach, reattach, and the panes come back in tmux
+    /// style while the sidebar is still framed in zellij; or toggle in one
+    /// session and switch to another, and they disagree the other way round.
+    /// This is the message that lets an attach resync them.
+    SessionBorderStyle { style: crate::config::BorderStyle },
     /// Answer to [`ClientMessage::SpawnAuxPane`]: the id of the pane just
     /// spawned.
     ///
