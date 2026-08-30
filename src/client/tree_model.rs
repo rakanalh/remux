@@ -680,11 +680,20 @@ impl TreeModel {
                 RemoteState::Connecting => " (connecting…)".to_string(),
                 RemoteState::Failed(msg) => format!(" (failed: {msg})"),
             };
-            // A connected-but-outdated server (e.g. the local daemon still
-            // running an older binary after a rebuild) is flagged so the user
-            // knows to restart it rather than silently hitting version skew.
+            // A connected server built from different source than this client
+            // is flagged so the user knows before silently hitting version skew.
+            //
+            // NOT "outdated: restart remux server". Nothing here knows WHICH
+            // side is behind -- a stale daemon that has not been restarted since
+            // a rebuild, and a client older than the machine it dialled, produce
+            // the identical mismatch -- and "restart the server" is a lie in the
+            // second case AND in the case this comparison used to invent, where
+            // the server was already running the right build. Both halves must
+            // be true whichever way round it is: to match, the two must be built
+            // from the same commit (rebuild), and a rebuilt server binary only
+            // takes effect once the running process is replaced (restart).
             if mismatch.is_some() {
-                suffix.push_str(" (outdated: restart remux server)");
+                suffix.push_str(" (build mismatch: rebuild + restart)");
             }
             rows.push(TreeRow {
                 indent: 0,

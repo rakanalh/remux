@@ -72,6 +72,39 @@ pub fn build_version() -> String {
     format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("REMUX_GIT_HASH"))
 }
 
+/// Whether two [`build_version`] stamps describe the SAME source tree.
+///
+/// The `-dirty` suffix is stripped from both sides first, because it does not
+/// describe the source: `build.rs` appends it whenever `git status --porcelain`
+/// is non-empty in the tree being built, and **`cargo install --git` touches
+/// `Cargo.lock` in its own checkout**. So a machine installed with
+/// `cargo install --force --git <url> --branch <b>` stamps `<hash>-dirty` while
+/// a `--path` build of the very same commit stamps `<hash>`, and a whole-string
+/// comparison called them different builds. That false positive is worse than a
+/// missed skew: the warning it fires ("restart the server") cannot possibly fix
+/// it, so the user restarts, sees it again, and learns to ignore the one message
+/// that matters when the skew is real.
+///
+/// This is NOT the same as basing the check on [`PROTOCOL_VERSION`], which was
+/// the standing candidate fix. That would make the check DEAD: the client
+/// `bail!`s on a protocol mismatch during the handshake (both the local and the
+/// remote dial path go through the same `handshake()`), so every server that is
+/// connected at all necessarily agrees on the protocol. Same-protocol,
+/// different-build skew -- a server rebuilt but not restarted -- is exactly what
+/// is left to detect, and only the stamp can see it.
+///
+/// The residual blind spot is deliberate: two builds of the same commit, one
+/// with real uncommitted edits, now compare equal. Detecting that would need the
+/// stamp to carry a content hash of the working tree, and a false "you are out
+/// of date" on every clean install costs more than a missed warning on a tree
+/// the user is actively editing.
+pub fn stamps_match(a: &str, b: &str) -> bool {
+    fn clean(s: &str) -> &str {
+        s.strip_suffix("-dirty").unwrap_or(s)
+    }
+    clean(a) == clean(b)
+}
+
 /// First frame sent by a connecting client, announcing its protocol/build.
 ///
 /// FROZEN WIRE SHAPE — never rename/remove/retype existing fields; only add
@@ -1896,6 +1929,36 @@ mod tests {
             !suffix.is_empty(),
             "build id after '+' must be non-empty: {v}"
         );
+    }
+
+    /// The exact scenario reported from 10.0.0.2: `cargo install --force --git
+    /// … --branch feat/sidebar-plugins` at the same commit as this tree, whose
+    /// checkout cargo dirties by touching `Cargo.lock`. These two stamps MUST
+    /// compare equal or the session manager cries skew for ever.
+    ///
+    /// Fixed strings, never `build_version()`: that function's dirtiness depends
+    /// on the state of the working tree the test happens to run in, which would
+    /// make this pass or fail for reasons that have nothing to do with the code.
+    #[test]
+    fn a_dirty_install_of_the_same_commit_is_not_a_mismatch() {
+        assert!(stamps_match("0.1.0+0f954b2", "0.1.0+0f954b2-dirty"));
+        assert!(stamps_match("0.1.0+0f954b2-dirty", "0.1.0+0f954b2"));
+        assert!(stamps_match("0.1.0+0f954b2-dirty", "0.1.0+0f954b2-dirty"));
+        assert!(stamps_match("0.1.0+0f954b2", "0.1.0+0f954b2"));
+    }
+
+    /// The check must still DO something: a real skew is a different hash, and
+    /// stripping `-dirty` must not turn that into a match.
+    #[test]
+    fn a_different_commit_is_still_a_mismatch() {
+        assert!(!stamps_match("0.1.0+0f954b2", "0.1.0+e47397d"));
+        assert!(!stamps_match("0.1.0+0f954b2-dirty", "0.1.0+e47397d-dirty"));
+        assert!(!stamps_match("0.1.0+0f954b2", "0.1.0+e47397d-dirty"));
+        // A different crate version at the same hash is a mismatch too.
+        assert!(!stamps_match("0.1.0+0f954b2", "0.2.0+0f954b2"));
+        // "-dirty" is stripped as a SUFFIX, not searched for: a hash that
+        // merely contains the word is left alone.
+        assert!(!stamps_match("0.1.0+0f954b2", "0.1.0+0f954b2-dirtyx"));
     }
 
     #[test]
