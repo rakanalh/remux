@@ -613,6 +613,13 @@
 #                 where you had navigated to. If the program exits, the panel
 #                 says so and `r` restarts it — it is never respawned
 #                 automatically, or a command that dies instantly would spin.
+#   agents      — the panes running an AI coding agent (`claude`, `codex`, ...),
+#                 on the local server and every connected remote, each with a
+#                 colour-coded state: RED needs your input, YELLOW is working,
+#                 dim is idle. `j`/`k`/`g`/`G` move and Enter jumps to that
+#                 pane, wherever it is. Configure WHICH commands count as an
+#                 agent, and what a blocked one looks like, under `[agents]`
+#                 below — the defaults cover `claude` and `codex` with no setup.
 #   placeholder — a fixed test fixture that paints its own name and size. Useful
 #                 for checking geometry; there is no reason to configure it.
 #
@@ -660,6 +667,70 @@
 #   plugin = "files"
 #   command = "yazi"
 #   weight = 1
+
+# -----------------------------------------------------------------------------
+# AGENTS
+# -----------------------------------------------------------------------------
+# What the `agents` sidebar panel counts as an agent, and how it decides what
+# one is doing. Read by the SERVER (it owns the PTYs and the screens), so an
+# edit here needs `remux restart`, not just a config reload.
+#
+# Everything below has a default that works, so this whole section is optional.
+#
+#   commands   — the foreground commands that count as an agent. A pane running
+#                anything else is not listed at all.
+#                (default: ["claude", "codex", "aider", "gemini"])
+#   working_ms — how recently output must have reached a pane for it to read as
+#                "working" (default: 500).
+#   scan_rows  — how many lines up from the bottom of the pane's LIVE screen the
+#                patterns below are matched against (default: 12). The live
+#                screen, never the scrollback: a prompt you have scrolled past is
+#                not what the agent is showing now.
+#
+# STATES. Three, in this precedence:
+#
+#   needs input — a pattern below matches the bottom of the pane's screen. This
+#                 state NEVER decays on silence, and does not need to: a blocked
+#                 agent's prompt is still on screen, so it keeps matching. It
+#                 also outranks "working" — a spinner underneath an approval
+#                 prompt is still blocked.
+#   working     — output reached the pane within `working_ms`.
+#   idle        — neither.
+#
+# PATTERNS. Each `[[agents.pattern]]` is a Rust regex matched line by line
+# against the bottom of the screen; a match means the agent is blocked on you.
+# They are configuration rather than code precisely because they rot: when an
+# agent changes the wording of its approval prompt, the fix should be an edit
+# here, not a new build.
+#
+#   name    — a short label, reported in the log when this pattern decides a
+#             pane's state. Run with RUST_LOG=debug to see WHY a pane was
+#             classified as it was; a classifier that cannot tell you that
+#             cannot be tuned.
+#   command — the agent this applies to. Omit it to apply to every agent.
+#   regex   — the pattern. An invalid one is warned about and skipped; it never
+#             takes the server down, and the other patterns still work.
+#
+# Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
+# is no merge, so you own the whole list and cannot be surprised by a built-in
+# pattern you cannot see. The shipped ones recognise Claude Code's "Do you want
+# to proceed?" menu and Codex's command-approval prompt.
+#
+# Soft-wrapped lines are rejoined before matching, so a pattern does not have to
+# survive being cut in half by a narrow pane.
+#
+# Detection reads the pane's foreground process group from `/proc`, so it is
+# Linux-only; on macOS the panel lists nothing.
+#
+# [agents]
+# commands = ["claude", "codex", "aider", "gemini"]
+# working_ms = 500
+# scan_rows = 12
+#
+#   [[agents.pattern]]
+#   name = "claude-proceed"
+#   command = "claude"
+#   regex = "(?i)do you want to (proceed|continue|create|make)"
 
 # -----------------------------------------------------------------------------
 # REMOTES
