@@ -51,16 +51,86 @@ pub type DormantStore = Arc<Mutex<PersistedState>>;
 /// mixes differently-sized frames.
 pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
 
-/// Read the process name from `/proc/<pid>/comm`.
+/// The name of the process with this pid, e.g. `"zsh"` or `"claude"`.
 ///
-/// Falls back to `"shell"` if the file is unreadable.
+/// Falls back to `"shell"` when it cannot be determined, which is what a pane
+/// with no readable process is labelled in the session tree.
 ///
 /// Shared with [`crate::server::agents`], which hands it a foreground process
-/// GROUP id rather than a pane's child pid. One `/proc` reader, two callers.
+/// GROUP id rather than a pane's child pid. One reader, two callers -- and the
+/// reason this is platform-split rather than Linux-only: agent detection reads
+/// `/proc/<pgid>/comm` THROUGH here, so a macOS server that always answered
+/// `"shell"` could never match a configured agent command, and
+/// [`crate::server::agents::DETECTION_SUPPORTED`] had to report `false` to stop
+/// the panel from looking merely empty. Teaching this function macOS is what
+/// lets that constant say `true` there. It fixes macOS pane NAMES at the same
+/// time, which had the identical fallback.
+///
+/// The Linux arm: `/proc/<pid>/comm`.
+#[cfg(target_os = "linux")]
 pub(crate) fn get_process_name(pid: i32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "shell".to_string())
+}
+
+/// See the Linux variant for documentation. macOS reads the name through
+/// `sysinfo` because there is no `/proc` filesystem.
+///
+/// The `System` is built ONCE and reused, for the reason
+/// [`crate::server::persistence::get_pane_cwd`]'s macOS arm gives at length:
+/// `System::new()` on macOS calls `mach_host_self()`, reads the host clock
+/// info, enumerates CPUs and allocates a 200-slot process map before the
+/// refresh that does the work. This one is called once per candidate pane on
+/// the agents pusher's cadence -- up to 10 Hz while an agent is `Working` --
+/// so a per-call construction would put all of that on a timer.
+///
+/// A SECOND `System` rather than sharing `get_pane_cwd`'s: that one is private
+/// to its function, the two refresh different fields (`cwd` there, nothing but
+/// the base info here), and they are driven by different pushes. The cost is one
+/// more retained `Process` entry per pid ever queried, bounded by the panes this
+/// server has looked at and dropped as soon as a refresh finds the process dead.
+///
+/// `ProcessRefreshKind::nothing()` is deliberate and sufficient: the process
+/// NAME is base information populated when `sysinfo` first sees the process, not
+/// one of the opt-in fields (`cwd`, `cmd`, `exe`, `environ`, `user`) that need a
+/// `with_*`. Asking for more would refresh data nothing here reads.
+///
+/// A poisoned lock is recovered from rather than propagated, as there: a
+/// panicking caller must not cost every later pane its name.
+#[cfg(target_os = "macos")]
+pub(crate) fn get_process_name(pid: i32) -> String {
+    use std::sync::{Mutex, OnceLock};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
+    if pid <= 0 {
+        return "shell".to_string();
+    }
+    let spid = Pid::from_u32(pid as u32);
+    let mut system = SYSTEM
+        .get_or_init(|| Mutex::new(System::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(spid)
+        .map(|p| p.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| "shell".to_string())
+}
+
+/// Fallback for platforms with no known way to name a foreign process. Always
+/// `"shell"` -- and [`crate::server::agents::DETECTION_SUPPORTED`] is `false`
+/// there, so the agents panel says it cannot know rather than showing an empty
+/// list that reads as "no agents".
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn get_process_name(_pid: i32) -> String {
+    "shell".to_string()
 }
 
 /// Return the runtime directory used for the socket and pid files.

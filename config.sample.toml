@@ -819,11 +819,12 @@
 # Soft-wrapped lines are rejoined before matching, so a pattern does not have to
 # survive being cut in half by a narrow pane.
 #
-# Detection reads the pane's foreground process group from `/proc`, so it is
-# Linux-only. A server that cannot detect says so — the panel shows
-# "<server>: needs Linux" rather than an empty list that would read as "you have
-# no agents running". A macOS CLIENT attached to a Linux server is unaffected;
-# it is the server's platform that decides.
+# Detection reads the pane's foreground process group and then asks the OS to
+# name that process — `/proc/<pid>/comm` on Linux, `sysinfo` on macOS. Both work;
+# every other platform cannot, and says so rather than pretending: the panel
+# shows "<server>: no detection" instead of an empty list that would read
+# as "you have no agents running". It is the SERVER's platform that decides, so
+# a macOS client attached to a Linux server (or the reverse) detects fine.
 #
 # [agents]
 # commands = ["claude", "codex", "aider", "gemini"]

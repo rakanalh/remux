@@ -47,19 +47,23 @@ use crate::screen::Screen;
 /// Whether this build can detect agents at all.
 ///
 /// [`foreground_command`] resolves the foreground process group through
-/// `/proc/<pgid>/comm`, which does not exist off Linux -- `get_process_name`
-/// falls back to `"shell"` there, so no pane could ever match a configured
-/// command. Reported to the client (`ServerMessage::AgentList`) so the panel can
-/// say why it is empty rather than looking broken.
+/// `get_process_name`, which knows Linux (`/proc/<pgid>/comm`) and macOS
+/// (`sysinfo`) and falls back to `"shell"` on anything else -- and a server that
+/// always answers `"shell"` can never match a configured command, so no pane
+/// could ever be classified. Reported to the client
+/// (`ServerMessage::AgentList`) so the panel can say why it is empty rather than
+/// looking broken.
 ///
-/// Mirrors `get_process_name`'s existing platform fallback rather than inventing
-/// a second platform split.
+/// `tcgetpgrp` is POSIX and needs no split; the platform question is only ever
+/// "can this build NAME a pid". So this mirrors `get_process_name`'s cfg arms
+/// exactly rather than inventing a second platform split -- if the two ever
+/// disagree, the panel is lying in one direction or the other.
 ///
 /// COMPILE-TIME, so it reports what this BUILD could do, never what a given
 /// sample actually did: a Linux server with no `/proc` mounted, or one whose
 /// `commands` list is empty, still reports `true` with nothing listed. See
 /// `ServerMessage::AgentList`'s field docs.
-pub const DETECTION_SUPPORTED: bool = cfg!(target_os = "linux");
+pub const DETECTION_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 /// The command running in the foreground of this PTY, e.g. `"claude"`.
 ///

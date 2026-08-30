@@ -231,7 +231,7 @@ impl BrowserPlugin {
     ///
     /// Explanations, not destinations. They are deliberately not rows, so the
     /// selection can never land on one and `Enter` can never act on one -- the
-    /// lesson the agents panel's "needs Linux" note cost two review rounds.
+    /// lesson the agents panel's "no detection" note cost two review rounds.
     fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         if let Some(e) = &self.error {

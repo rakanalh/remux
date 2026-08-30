@@ -139,8 +139,16 @@ impl AgentsPlugin {
                 };
                 // Short, because this panel is often twenty columns wide, and
                 // specific, because "unavailable" invites a bug report where
-                // "needs Linux" answers the question.
-                format!("{host}: needs Linux")
+                // naming the missing capability answers the question.
+                //
+                // NOT "needs Linux" any more: macOS detects agents too (the
+                // server names a pid through `sysinfo` where Linux reads
+                // `/proc/<pid>/comm`), so the old note would have sent a macOS
+                // user hunting for a Linux box to fix a panel that works. What
+                // is left unsupported is every OTHER platform, and there is no
+                // short true name for that set -- so the note says what is
+                // missing rather than what to go and install.
+                format!("{host}: no detection")
             })
             .collect()
     }
@@ -212,7 +220,7 @@ impl SidebarPlugin for AgentsPlugin {
         let notes: Vec<String> = if all_notes.len() <= budget {
             all_notes
         } else if budget >= 1 {
-            vec![format!("{} servers: needs Linux", all_notes.len())]
+            vec![format!("{} servers: no detection", all_notes.len())]
         } else {
             // A panel with one usable row and agents in it: the agent wins.
             Vec::new()
@@ -629,7 +637,7 @@ mod tests {
         p.on_event(&unsupported(ConnId::Local));
         let rows = painted(&p, 24, 5);
         assert_eq!(
-            rows[1], "local: needs Linux",
+            rows[1], "local: no detection",
             "an empty list there is indistinguishable from having no agents"
         );
         assert_ne!(rows[1], "no agents");
@@ -645,7 +653,7 @@ mod tests {
         p.on_event(&unsupported(remote("mac")));
         let rows = painted(&p, 24, 6);
         assert!(rows[1].contains("claude here/0"), "got {:?}", rows[1]);
-        assert_eq!(rows[2], "mac: needs Linux", "got {:?}", rows[2]);
+        assert_eq!(rows[2], "mac: no detection", "got {:?}", rows[2]);
     }
 
     /// The note is an explanation, not a destination.
@@ -690,7 +698,7 @@ mod tests {
         // Header + 2 rows + the note: the list alone would fill this and more.
         let rows = painted(&p, 24, 4);
         assert_eq!(
-            rows[3], "local: needs Linux",
+            rows[3], "local: no detection",
             "a full list must not push the explanation off the panel, got {rows:?}"
         );
         assert!(
@@ -743,7 +751,7 @@ mod tests {
             "the notes took the panel from the agents: {rows:?}"
         );
         assert_eq!(
-            rows[3], "3 servers: needs Linux",
+            rows[3], "3 servers: no detection",
             "and the three collapse to one line rather than being truncated: {rows:?}"
         );
     }
@@ -755,10 +763,10 @@ mod tests {
             p.on_event(&unsupported(remote(host)));
         }
         let rows = painted(&p, 24, 5);
-        assert_eq!(rows[1], "mac1: needs Linux");
-        assert_eq!(rows[2], "mac2: needs Linux");
+        assert_eq!(rows[1], "mac1: no detection");
+        assert_eq!(rows[2], "mac2: no detection");
         assert_eq!(
-            rows[3], "mac3: needs Linux",
+            rows[3], "mac3: no detection",
             "nothing to crowd out: {rows:?}"
         );
     }
