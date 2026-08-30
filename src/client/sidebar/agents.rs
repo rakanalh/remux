@@ -207,26 +207,19 @@ impl SidebarPlugin for AgentsPlugin {
             return grid;
         }
 
-        let top = self.nav.top_for(rows);
-        for i in 0..(rows as usize).saturating_sub(HEADER_ROWS) {
+        // Space for the notes is RESERVED, not left over. Painting them only
+        // where the rows ran out dropped the explanation entirely whenever the
+        // list filled the panel -- which is exactly the case where a whole
+        // server is missing from a list that otherwise looks complete. The list
+        // gets the shorter height, so its scrolling accounts for the
+        // reservation too.
+        let note_rows = notes.len().min((rows as usize).saturating_sub(HEADER_ROWS));
+        let list_height = rows.saturating_sub(note_rows as u16);
+        let list_capacity = (list_height as usize).saturating_sub(HEADER_ROWS);
+
+        let top = self.nav.top_for(list_height, self.rows.len());
+        for i in 0..list_capacity {
             let Some(row) = self.rows.get(top + i) else {
-                // Past the last agent: the notes, if any. A server that cannot
-                // detect agents says so here rather than contributing silence
-                // that reads as "you have none".
-                for (n, note) in notes.iter().enumerate() {
-                    let y = (HEADER_ROWS + i + n) as u16;
-                    if (y as usize) >= rows as usize {
-                        break;
-                    }
-                    draw_text(
-                        &mut grid,
-                        0,
-                        y,
-                        note,
-                        theme.status_bar_fg.clone(),
-                        bg.clone(),
-                    );
-                }
                 break;
             };
             let y = (HEADER_ROWS + i) as u16;
@@ -248,6 +241,21 @@ impl SidebarPlugin for AgentsPlugin {
             );
             draw_text(&mut grid, 2, y, &Self::label(row), fg, row_bg);
         }
+
+        // Directly under the last row when the list is short, and at the bottom
+        // of the panel when it is not -- either way, on screen.
+        let painted = self.rows.len().saturating_sub(top).min(list_capacity);
+        for (n, note) in notes.iter().take(note_rows).enumerate() {
+            let y = (HEADER_ROWS + painted + n) as u16;
+            draw_text(
+                &mut grid,
+                0,
+                y,
+                note,
+                theme.status_bar_fg.clone(),
+                bg.clone(),
+            );
+        }
         grid
     }
 
@@ -266,7 +274,7 @@ impl SidebarPlugin for AgentsPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        match self.nav.hit(y, self.rows.len()) {
+        match self.nav.hit(y) {
             Hit::Nothing => PluginAction::None,
             Hit::Select(idx) => {
                 self.nav.set_selected(idx);
@@ -641,6 +649,54 @@ mod tests {
         // And a click on the note's row selects nothing.
         let down = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(p.on_mouse(0, 2, down), PluginAction::None);
+    }
+
+    /// The note must survive a panel with NO slack. The three tests above all
+    /// use panels roomy enough that the note landed in leftover space, so none
+    /// of them could fail for the reason they were written.
+    #[test]
+    fn the_note_survives_a_panel_the_agent_list_already_fills() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            remote("linux"),
+            (1..=6)
+                .map(|i| agent(i, "claude", &format!("s{i}"), AgentState::Idle))
+                .collect(),
+        ));
+        p.on_event(&unsupported(ConnId::Local));
+        // Header + 2 rows + the note: the list alone would fill this and more.
+        let rows = painted(&p, 24, 4);
+        assert_eq!(
+            rows[3], "local: needs Linux",
+            "a full list must not push the explanation off the panel, got {rows:?}"
+        );
+        assert!(
+            rows[1].contains("claude"),
+            "and the rows still paint: {rows:?}"
+        );
+    }
+
+    /// With the note pinned at the bottom, a click there no longer lines up
+    /// with a row index by accident.
+    #[test]
+    fn a_click_on_the_note_selects_nothing_even_with_rows_scrolled_under_it() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            remote("linux"),
+            (1..=6)
+                .map(|i| agent(i, "claude", &format!("s{i}"), AgentState::Idle))
+                .collect(),
+        ));
+        p.on_event(&unsupported(ConnId::Local));
+        let _ = painted(&p, 24, 4);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        // Rows are painted at y=1..2; the note is at y=3.
+        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
+        assert_eq!(
+            p.on_mouse(0, 3, down),
+            PluginAction::None,
+            "the note is not a row, however many rows exist below the fold"
+        );
     }
 
     #[test]

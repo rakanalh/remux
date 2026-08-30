@@ -23,7 +23,8 @@ What it covers:
   7  a structural change made by somebody else repaints the panel with no
      keystroke at all (the `SubscribeSessionTree` push)
   8  a connection that drops takes its subtree with it
-  9  with no sidebar configured the client never subscribes
+  9  with no sidebar configured the client never subscribes -- to the session
+     tree OR to the agent list
  10  a push that removes a row ABOVE the selection does not retarget it --
      Enter still jumps to the session the user picked
 
@@ -541,6 +542,11 @@ def scenario_no_sidebar():
     check("9 no session-tree subscription is sent",
           "SubscribeSessionTree" not in server_log(),
           "the client subscribed with no sessions panel configured")
+    # The agents panel's push is gated on its own flag, and the same way. With
+    # no sidebar at all, neither subscription may go out.
+    check("9 no agents subscription is sent either",
+          "SubscribeAgents" not in server_log(),
+          "the client subscribed to the agent list with no agents panel configured")
     check("9 no panel is painted",
           not any("Sessions" in r for r in screen.display),
           "a panel painted with no sidebar configured")

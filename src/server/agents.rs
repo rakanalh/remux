@@ -206,12 +206,16 @@ impl AgentRules {
     /// **`scan_rows` is a COST bound as well as a correctness one, and widening
     /// it is not a free "improvement".** Every configured pattern is run against
     /// every returned line, for every agent pane, on every sample -- up to ten
-    /// samples a second. Matching four unanchored patterns over the last twelve
-    /// lines is a different cost from matching them over a full eighty-row
-    /// alt-screen, and the difference is paid continuously by a server that is
-    /// otherwise asleep. Whoever wants a bigger window should raise `scan_rows`
+    /// samples a second. Whoever wants a bigger window should raise `scan_rows`
     /// in their own config, which is exactly why it is configurable; do not
     /// widen the default, and do not turn this into a whole-screen scan.
+    ///
+    /// Note what the number actually bounds: **logical LINES, not rows of
+    /// text.** Soft-wrapped rows are joined first, so on a narrow pane twelve
+    /// lines can be many more than twelve rows, and each line can be several
+    /// hundred characters. Twelve lines of a 200-column pane is a haystack of a
+    /// couple of thousand characters per pattern per sample -- still small, and
+    /// still the quantity that grows if this is widened.
     ///
     /// (The line-BUILDING pass below does walk the whole grid, because a
     /// soft-wrapped line has to be assembled from its start. That is character
@@ -228,11 +232,13 @@ impl AgentRules {
             }
             continuing = row.wrapped;
             if !continuing {
-                lines.push(std::mem::take(&mut current));
+                // Trimmed HERE, once, and never per row: a wrapped row's
+                // trailing space is content (see `row_text`).
+                lines.push(trim_line_end(std::mem::take(&mut current)));
             }
         }
         if continuing {
-            lines.push(current);
+            lines.push(trim_line_end(current));
         }
         let end = match lines.iter().rposition(|line| !line.is_empty()) {
             Some(last) => last + 1,
@@ -244,7 +250,16 @@ impl AgentRules {
     }
 }
 
-/// The text of one screen row, with trailing blanks removed.
+/// The text of one screen row, VERBATIM -- trailing blanks included.
+///
+/// Trimming belongs to the logical LINE, not to a row, and doing it here was a
+/// real bug: a space written in the last column fills that cell and sets
+/// `pending_wrap` (`screen.rs`), so the row is flagged `wrapped` and its final
+/// cell is a genuine space that is INTERIOR to the line. Stripping it rejoined
+/// `Do you want to proceed?` as `Do you want toproceed?`, which no pattern
+/// matches -- a visible blocked prompt reading `Idle`, at roughly one pane width
+/// in ten (four of the prompt's own spaces, each with its own unlucky width).
+/// [`AgentRules::visible_bottom`] trims once, after the line is assembled.
 ///
 /// Continuation cells of a wide glyph (`width == 0` after a `width == 2` lead)
 /// are skipped so a CJK character contributes one char and not a spurious space
@@ -260,6 +275,11 @@ fn row_text(row: &crate::screen::Row) -> String {
             s.push(*m);
         }
     }
+    s
+}
+
+/// Drop trailing spaces from a finished logical line.
+fn trim_line_end(mut s: String) -> String {
     while s.ends_with(' ') {
         s.pop();
     }
@@ -457,18 +477,36 @@ mod tests {
         );
     }
 
+    /// The shipped patterns against the prompt wordings actually present in the
+    /// installed Claude Code binary (2.1.251, read with `strings`).
     #[test]
-    fn the_shipped_patterns_recognise_claudes_permission_prompt() {
+    fn the_shipped_patterns_recognise_claudes_real_permission_prompts() {
         let r = shipped();
-        let screen = vec![
-            "Do you want to proceed?".to_string(),
-            "❯ 1. Yes".to_string(),
-            "  2. No".to_string(),
-        ];
+        for question in [
+            "Do you want to proceed?",
+            "Do you want to continue?",
+            "Do you want to allow this connection?",
+            "Do you want to allow Claude to fetch this content?",
+            "Do you want to use this API key?",
+        ] {
+            let screen = vec![question.to_string(), "❯ 1. Yes".to_string()];
+            assert_eq!(
+                r.classify("claude", &screen, Duration::from_secs(30)).state,
+                AgentState::NeedsInput,
+                "the panel has to work with zero configuration: {question:?}"
+            );
+        }
+    }
+
+    /// The menu marker alone is enough, since it sits BELOW the question and so
+    /// survives a question that has scrolled past the window.
+    #[test]
+    fn the_choice_marker_alone_is_enough() {
+        let r = shipped();
+        let screen = vec!["❯ 2. Yes, and don't ask again".to_string()];
         assert_eq!(
             r.classify("claude", &screen, Duration::from_secs(30)).state,
-            AgentState::NeedsInput,
-            "the panel has to work with zero configuration"
+            AgentState::NeedsInput
         );
     }
 
@@ -527,7 +565,67 @@ mod tests {
         );
     }
 
-    /// The second bug a probe found: a prompt that soft-wraps in a narrow pane.
+    /// The THIRD bug a probe found, and the one the test below could not catch.
+    ///
+    /// At 15 columns `Do you want to proceed?` breaks on the SPACE at index 14:
+    /// the space fills the last cell, sets `pending_wrap`, and the row is
+    /// flagged `wrapped` with a trailing space that is interior to the line.
+    /// Trimming per row ate it and rejoined the line as `Do you want toproceed?`.
+    ///
+    /// The prompt has four spaces, so four widths per screen size are unlucky --
+    /// about one pane width in ten, and MORE for a real agent's longer prompt,
+    /// not fewer.
+    #[test]
+    fn a_prompt_that_wraps_on_a_space_keeps_the_space() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["claude".to_string()],
+            working_ms: 500,
+            scan_rows: 12,
+            pattern: vec![pattern("approval", None, r"Do you want to proceed")],
+        });
+        let mut screen = Screen::new(15, 10, 100);
+        screen.process_output(b"Do you want to proceed?");
+        let bottom = r.visible_bottom(&screen);
+        assert!(
+            bottom.iter().any(|l| l.contains("Do you want to proceed")),
+            "the wrap point's space is content, not padding; got {bottom:?}"
+        );
+        assert_eq!(
+            r.classify("claude", &bottom, Duration::from_secs(60)).state,
+            AgentState::NeedsInput
+        );
+    }
+
+    /// Every width, so no lucky alignment can hide a failure. This is the shape
+    /// of the review probe that found the bug, as a unit test.
+    #[test]
+    fn a_visible_prompt_matches_at_every_pane_width() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["claude".to_string()],
+            working_ms: 500,
+            scan_rows: 12,
+            pattern: vec![pattern("approval", None, r"Do you want to proceed")],
+        });
+        for cols in 8..=60u16 {
+            let mut screen = Screen::new(cols, 12, 100);
+            screen.process_output(b"Do you want to proceed?");
+            assert_eq!(
+                r.classify(
+                    "claude",
+                    &r.visible_bottom(&screen),
+                    Duration::from_secs(60)
+                )
+                .state,
+                AgentState::NeedsInput,
+                "a prompt plainly on screen read as not-blocked at {cols} columns: {:?}",
+                r.visible_bottom(&screen)
+            );
+        }
+    }
+
+    /// A prompt that soft-wraps MID-WORD. Kept beside the space case above
+    /// because it is a different alignment, and because on its own it claimed
+    /// to cover "wrapping" while covering only the lucky half of it.
     #[test]
     fn a_prompt_wrapped_across_two_rows_is_matched_as_one_line() {
         let r = AgentRules::from_config(&AgentsConfig {
@@ -577,6 +675,16 @@ mod tests {
             .state,
             AgentState::Idle
         );
+    }
+
+    /// Trailing padding on a line that does NOT continue is still dropped --
+    /// the fix for the wrapped case must not stop trimming the ordinary one.
+    #[test]
+    fn an_unwrapped_line_still_loses_its_padding() {
+        let r = shipped();
+        let mut screen = Screen::new(40, 4, 100);
+        screen.process_output(b"hi");
+        assert_eq!(r.visible_bottom(&screen), vec!["hi".to_string()]);
     }
 
     #[test]

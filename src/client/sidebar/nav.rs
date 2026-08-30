@@ -215,6 +215,15 @@ pub struct NavList {
     /// A `Cell` rather than a `&mut self` render: this is a record of what was
     /// drawn, not state the panel reasons with, and `render` takes `&self`.
     last_top: Cell<usize>,
+    /// How many rows that render actually PAINTED.
+    ///
+    /// Recorded because "is there a row under this click?" is not answerable
+    /// from the list's length: a panel may paint fewer rows than it holds (it
+    /// ran out of height) and may put something else -- a note, a footer -- in
+    /// the space below them. Bounding the hit test by the length alone would
+    /// resolve a click on that something else to whatever row index happened to
+    /// sit at the same offset.
+    last_shown: Cell<usize>,
 }
 
 impl NavList {
@@ -243,17 +252,27 @@ impl NavList {
         true
     }
 
-    /// The window start for a panel `rows` tall, recording it for
-    /// [`NavList::hit`].
-    pub fn top_for(&self, rows: u16) -> usize {
+    /// The window start for a panel `rows` tall holding `len` rows, recording
+    /// what this paint will show for [`NavList::hit`].
+    pub fn top_for(&self, rows: u16, len: usize) -> usize {
         let top = scroll_offset(self.selected, rows);
+        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
         self.last_top.set(top);
+        self.last_shown.set(len.saturating_sub(top).min(capacity));
         top
     }
 
     /// Resolve a click at panel-local row `y` against the last painted window.
-    pub fn hit(&self, y: u16, len: usize) -> Hit {
-        hit_test(y, self.last_top.get(), self.selected, len)
+    ///
+    /// Bounded by what was PAINTED, not by how many rows exist -- see
+    /// [`NavList::last_shown`].
+    pub fn hit(&self, y: u16) -> Hit {
+        hit_test(
+            y,
+            self.last_top.get(),
+            self.selected,
+            self.last_top.get() + self.last_shown.get(),
+        )
     }
 
     /// Re-point the cursor at the row it was on, by IDENTITY, after the rows
@@ -417,16 +436,38 @@ mod tests {
     fn a_click_is_resolved_against_the_window_the_last_paint_used() {
         let nav = NavList::new();
         // A 4-row panel showing rows 0..3 of a 20-row list, selection at 0.
-        assert_eq!(nav.top_for(4), 0);
-        assert_eq!(nav.hit(2, 20), Hit::Select(1));
+        assert_eq!(nav.top_for(4, 20), 0);
+        assert_eq!(nav.hit(2), Hit::Select(1));
 
         let mut nav = NavList::new();
         nav.set_selected(10);
-        assert_eq!(nav.top_for(4), 8, "scrolled to show row 10");
+        assert_eq!(nav.top_for(4, 20), 8, "scrolled to show row 10");
+        assert_eq!(nav.hit(1), Hit::Select(8), "the top visible row is row 8");
+    }
+
+    /// A click below the last PAINTED row is not a row, even when the list has
+    /// more rows that a taller panel would have shown there. A panel may put
+    /// something else in that space -- the agents panel puts its "this server
+    /// cannot detect" note there -- and a click on it must select nothing.
+    #[test]
+    fn a_click_past_the_painted_rows_hits_nothing() {
+        let nav = NavList::new();
+        // A 3-row panel: header + 2 rows, out of a 20-row list.
+        nav.top_for(3, 20);
+        assert_eq!(nav.hit(1), Hit::Activate(0));
+        assert_eq!(nav.hit(2), Hit::Select(1));
         assert_eq!(
-            nav.hit(1, 20),
-            Hit::Select(8),
-            "the top visible row is row 8"
+            nav.hit(3),
+            Hit::Nothing,
+            "row 2 was never painted; whatever is drawn there is not this list"
         );
+    }
+
+    #[test]
+    fn a_panel_shorter_than_its_list_reports_only_what_it_painted() {
+        let nav = NavList::new();
+        nav.top_for(5, 2); // room for 4 rows, only 2 exist
+        assert_eq!(nav.hit(2), Hit::Select(1));
+        assert_eq!(nav.hit(3), Hit::Nothing);
     }
 }

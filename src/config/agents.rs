@@ -28,7 +28,16 @@ fn default_working_ms() -> u64 {
 }
 
 fn default_scan_rows() -> u16 {
-    12
+    // 24, not 12. A real agent's blocked prompt is not one line: Claude Code
+    // renders the question, three or four options, a box border, a blank, a
+    // three-row input box and a hint line, which puts the QUESTION about a
+    // dozen rows above the bottom of the screen -- so a twelve-line window sat
+    // exactly on the boundary, and a window one line too short fails precisely
+    // when the user needs it. The option count is measured (the binary carries
+    // the labels); the surrounding box geometry is inferred, so the margin is
+    // deliberate rather than tuned. Doubling it is cheap: the cost is linear,
+    // and the failure it prevents is silent.
+    24
 }
 
 /// A pattern that, when it matches the visible bottom of an agent pane's
@@ -62,8 +71,9 @@ pub struct AgentsConfig {
     /// How recently output must have reached a pane for it to read as
     /// `Working`.
     pub working_ms: u64,
-    /// How many rows up from the bottom of the live screen the patterns are
-    /// matched against.
+    /// How many LOGICAL LINES up from the bottom of the live screen the
+    /// patterns are matched against (soft-wrapped rows are joined first, so on
+    /// a narrow pane this is more rows than it is lines).
     ///
     /// The bottom, not the scrollback: an approval prompt the user has scrolled
     /// past is not what the agent is showing now. Bounded rather than
@@ -95,14 +105,30 @@ fn default_patterns() -> Vec<AgentPattern> {
         regex: regex.to_string(),
     };
     vec![
-        // Claude Code's permission/approval prompt: a question followed by a
-        // numbered menu whose first entry is the affirmative.
+        // Claude Code's permission/approval prompts. The alternation is
+        // MEASURED, not guessed: `strings` over the installed 2.1.251 binary
+        // reports "Do you want to proceed?" (x6), "...to continue?",
+        // "...to allow this connection?", "...to allow Claude to fetch this
+        // content?" and "...to use this API key?". An earlier version of this
+        // pattern listed `create` and `make`, neither of which appears anywhere
+        // in the binary.
+        //
+        // The binary also carries a bare "Do you want to " prefix, completed at
+        // render time. It is deliberately NOT matched on the prefix alone: an
+        // agent's own prose can contain that phrase, and a false `NeedsInput`
+        // cries wolf on a panel whose whole value is that red means red.
         p(
             "claude-proceed",
             "claude",
-            r"(?i)do you want to (proceed|continue|create|make)",
+            r"(?i)do you want to (proceed|continue|allow|use this api key)",
         ),
-        p("claude-choice", "claude", r"❯\s*1\.\s*Yes"),
+        // The selected row of a numbered choice menu, which is what a blocking
+        // prompt draws. `❯` is present in the binary; the "1. Yes" text is not,
+        // because the number and the label are composed at render time -- so
+        // this matches the SHAPE (marker, digit, dot) rather than assuming a
+        // label. It also sits a row or two BELOW the question, which is what
+        // makes it a useful second chance if the question itself is off-window.
+        p("claude-choice", "claude", r"❯\s*\d+\."),
         // Codex's command-approval prompt.
         p(
             "codex-allow",

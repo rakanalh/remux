@@ -18,7 +18,13 @@ Covers `SubscribeAgents` / `UnsubscribeAgents` / `AgentList`:
      state that decayed on silence would vanish at the moment the user needs it;
   8. clearing the prompt off the screen lets it move on;
   9. an agent in a BACKGROUND tab is listed too, with its own tab index;
- 10. `UnsubscribeAgents` stops the pushes.
+ 10. `UnsubscribeAgents` stops the pushes;
+ 11. a client that subscribes while an agent is `Working` still sees it decay to
+     `Idle`. The pusher's decay tick is armed by what `broadcast_agents` returns,
+     so a subscribe arriving after the pusher parked with nothing to do has to
+     wake it -- otherwise the entry sits on `Working` for ever, because
+     `Working -> Idle` is caused by the ABSENCE of output and nothing else is
+     coming.
 
 Uses a stand-in `claude` script on `PATH`, so nothing here needs a real agent
 installed.
@@ -64,7 +70,7 @@ NOT_AGENT = AGENT
 CONFIG = """
 [agents]
 commands = ["claude"]
-working_ms = 600
+working_ms = 1000
 scan_rows = 12
 
   [[agents.pattern]]
@@ -121,6 +127,21 @@ def wait_for(c, predicate, timeout=4.0):
             if predicate(got):
                 return got
     return last
+
+
+def first_list(c, timeout=1.5):
+    """The FIRST `AgentList` to arrive, not the last.
+
+    `latest` would collect for its whole window and hand back whatever the state
+    had settled to, which is the opposite of what a "what were you told on
+    subscribe" check is asking.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        got = lists(c.drain(0.1))
+        if got:
+            return got[0]
+    return None
 
 
 def states(agents):
@@ -225,7 +246,7 @@ def run(srv):
     )
 
     # 5. Silence decays it.
-    time.sleep(1.5)
+    time.sleep(1.8)
     got = latest(c, 1.2)
     check(
         ("claude", "Idle") in states(got or []),
@@ -252,7 +273,7 @@ def run(srv):
     #    remembered saying it would fail this, and a classifier that re-derives
     #    the state from the screen with no memory at all passes it.
     #
-    #    The silence first is 5x the 600ms working window.
+    #    The silence first is 2.5x the 1000ms working window.
     c.drain(0.5)
     quiet = lists(c.drain(2.5))
     check(
@@ -305,6 +326,32 @@ def run(srv):
     c.send({"Input": {"data": list(b"hello\n")}})
     time.sleep(1.0)
     check(lists(c.drain(0.8)) == [], "10 UnsubscribeAgents stops the pushes")
+
+    # -- 11: subscribing while an agent is Working must not strand it ---------
+    #
+    # Nobody is subscribed now (case 10 unsubscribed), which is the whole
+    # setup: output arrives, the pusher wakes, finds no targets, and parks.
+    # Whether it parked ARMED is what decides if the state below ever moves.
+    c.send({"Input": {"data": list(b"ping\n")}})
+    # Long enough for the pusher to wake, find no targets and park; short enough
+    # that the 1000ms working window is still open when the subscribe lands.
+    time.sleep(0.3)
+    c.send("SubscribeAgents")
+    first = first_list(c)
+    check(
+        ("claude", "Working") in states(first or []),
+        f"11 a fresh subscriber is told Working while the window is open ({first})",
+    )
+    # No further input is sent, so only the decay tick can deliver this.
+    decayed = wait_for(
+        c,
+        lambda ags: any(a["command"] == "claude" and a["state"] == "Idle" for a in ags),
+        timeout=4.0,
+    )
+    check(
+        ("claude", "Idle") in states(decayed or []),
+        "11 and it decays to Idle rather than sitting on Working for ever",
+    )
 
     c.close()
 

@@ -960,7 +960,24 @@ async fn handle_client_message(
             }
             // Answer at once, so a subscriber's panel is populated immediately
             // rather than staying blank until the next agent output.
-            send_agents_to(&[client_id], state, panes, clients, config).await;
+            let any_working = send_agents_to(&[client_id], state, panes, clients, config).await;
+            // And WAKE THE PUSHER, whatever that answer was.
+            //
+            // The pusher's decay tick is armed only by what `broadcast_agents`
+            // returns. If it last ran with nobody subscribed it parked
+            // unarmed -- and `Working` -> `Idle` is caused by the ABSENCE of
+            // output, so nothing else was ever going to wake it. A client
+            // subscribing inside the working window would be told `Working` and
+            // then sit on it for ever, self-healing only if some pane happened
+            // to produce output. Narrow at the 500ms default and proportionally
+            // wider for anyone who raises `working_ms` to stop flapping.
+            //
+            // Unconditional rather than `if any_working`: this reply went to ONE
+            // client, and the pusher's own next pass is what re-reads the whole
+            // subscriber set. `any_working` is logged rather than acted on here
+            // because acting on it would be reasoning about the wrong set.
+            log::debug!("server: SubscribeAgents client_id={client_id} any_working={any_working}");
+            mark_agents_dirty();
             Ok(())
         }
         ClientMessage::UnsubscribeAgents => {
@@ -3346,8 +3363,17 @@ const AGENTS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// Needed for that ONE transition and no other: every other change is caused by
 /// output, and output calls [`mark_agents_dirty`]. So the tick is armed only
 /// while the last list contained a `Working` entry -- an agent sitting on
-/// `NeedsInput` overnight (the case this whole panel exists for) costs zero
-/// wakeups, and a server nobody has subscribed to costs zero always.
+/// `NeedsInput` overnight, the case this whole panel exists for, costs zero
+/// wakeups.
+///
+/// A server with NO subscriber costs nearly nothing, which is not the same as
+/// nothing and should not be claimed as such: `mark_agents_dirty` is called from
+/// the PTY forwarding loops unconditionally, so any pane producing output still
+/// wakes this task at up to ten times a second. Each of those wakeups finds an
+/// empty subscriber set under one `clients` lock and parks again -- deliberately
+/// cheap, deliberately not free. Gating the mark on "is anyone subscribed?"
+/// would mean taking that lock in the output path instead, which is the more
+/// expensive half of the trade.
 const AGENTS_DECAY_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Wakes the agent push task. See [`SESSION_TREE_DIRTY`] for why this shape.

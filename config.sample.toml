@@ -682,10 +682,16 @@
 #                (default: ["claude", "codex", "aider", "gemini"])
 #   working_ms — how recently output must have reached a pane for it to read as
 #                "working" (default: 500).
-#   scan_rows  — how many lines up from the bottom of the pane's LIVE screen the
-#                patterns below are matched against (default: 12). The live
-#                screen, never the scrollback: a prompt you have scrolled past is
-#                not what the agent is showing now.
+#   scan_rows  — how many LOGICAL LINES up from the bottom of the pane's LIVE
+#                screen the patterns below are matched against (default: 24).
+#                The live screen, never the scrollback: a prompt you have
+#                scrolled past is not what the agent is showing now. Soft-wrapped
+#                rows are joined first, so on a narrow pane this is more rows
+#                than it is lines. The default is generous on purpose — a real
+#                agent's blocked prompt sits a dozen or so rows above the bottom
+#                of the screen, under its options, its input box and a hint
+#                line — and it is also the cost bound, since every pattern runs
+#                against every line in the window on every sample.
 #
 # STATES. Three, in this precedence:
 #
@@ -713,8 +719,12 @@
 #
 # Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
 # is no merge, so you own the whole list and cannot be surprised by a built-in
-# pattern you cannot see. The shipped ones recognise Claude Code's "Do you want
-# to proceed?" menu and Codex's command-approval prompt.
+# pattern you cannot see. The shipped Claude ones are taken from the wordings
+# actually present in the Claude Code binary ("Do you want to proceed?",
+# "...continue?", "...allow this connection?", "...use this API key?") plus the
+# selected row of its numbered choice menu. The Codex ones are a best-effort
+# guess at its approval prompt and have NOT been checked against a real Codex —
+# if you run it and they are wrong, this is the section to correct.
 #
 # Soft-wrapped lines are rejoined before matching, so a pattern does not have to
 # survive being cut in half by a narrow pane.
@@ -728,12 +738,12 @@
 # [agents]
 # commands = ["claude", "codex", "aider", "gemini"]
 # working_ms = 500
-# scan_rows = 12
+# scan_rows = 24
 #
 #   [[agents.pattern]]
 #   name = "claude-proceed"
 #   command = "claude"
-#   regex = "(?i)do you want to (proceed|continue|create|make)"
+#   regex = "(?i)do you want to (proceed|continue|allow|use this api key)"
 
 # -----------------------------------------------------------------------------
 # REMOTES
