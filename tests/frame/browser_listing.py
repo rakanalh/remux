@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Frame-level test: `ListDirectory` and `OpenInSplit`, the browser panel's
+"""Frame-level test: `ListDirectory` and `OpenInSplit`, the `files` panel's
 server half (PROTOCOL_VERSION 9).
 
 The panel itself is client-composited and only a PTY can see it
-(`tests/pty/sidebar_browser.py`); this covers the half that lives on the SERVER,
+(`tests/pty/sidebar_files.py`); this covers the half that lives on the SERVER,
 which is where the listing and the editor resolution deliberately happen.
 
 What it covers:

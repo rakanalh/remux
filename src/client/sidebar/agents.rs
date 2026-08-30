@@ -340,14 +340,11 @@ impl SidebarPlugin for AgentsPlugin {
                     self.rebuild();
                 }
             }
-            // The session tree is the sessions panel's; the aux-pane events are
-            // panel-targeted and belong to `files`.
+            // The session tree is the sessions panel's, and the directory
+            // events are the `files` panel's.
             PluginEvent::SessionTree { .. }
             | PluginEvent::FocusedCwd { .. }
-            | PluginEvent::DirectoryListing { .. }
-            | PluginEvent::AuxPaneReady
-            | PluginEvent::AuxPaneContent { .. }
-            | PluginEvent::AuxPaneExited => {}
+            | PluginEvent::DirectoryListing { .. } => {}
         }
     }
 }

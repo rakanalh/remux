@@ -1,4 +1,4 @@
-//! Directory listing and editor resolution for the `browser` sidebar panel.
+//! Directory listing and editor resolution for the `files` sidebar panel.
 //!
 //! Both halves live on the SERVER, and for the same reason: the panel follows
 //! the focused pane's directory, that pane is routinely on a remote, and both

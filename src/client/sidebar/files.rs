@@ -1,135 +1,273 @@
-//! The `files` plugin: a real file manager (`yazi`, `nnn`, `ranger`, …) hosted
-//! in a sidebar panel, showing the focused pane's directory.
+//! The `files` panel: a file browser with no external configuration.
 //!
-//! A file manager is a full-screen TUI, so it needs a PTY, and the server owns
-//! every PTY. The panel is therefore backed by a server-spawned **auxiliary
-//! pane** -- a pane in no layout tree -- streamed back over exactly the
-//! machinery a View cell uses: `SpawnAuxPane` → `SubscribePane` → `PaneContent`,
-//! with keys routed by `InputToPane`. None of that addressing appears here: the
-//! panel says what it wants through [`PluginRequest`] and the client resolves
-//! the connection and the pane id (see [`PluginRequest`]'s own note).
+//! Vim-like navigation of a directory tree, and `Enter` on a file opens it in a
+//! **split running `$EDITOR`**. That is the whole feature, and the reason it can
+//! exist at all is that this panel is INSIDE the client: it already has a socket
+//! to the server, so "open a split" is a message, not a CLI invocation.
 //!
-//! What is left in this file is a state machine and a header row. The content is
-//! painted by [`blit_snapshot`], the SAME function that paints a View cell,
-//! because a file-manager panel is a pane snapshot in a rect and nothing more.
+//! ## There used to be two of these
+//!
+//! `files` hosted a real file manager -- `nnn`, `yazi`, `ranger` -- in an
+//! auxiliary pane, and `browser` was this. They have been merged: this one took
+//! the `files` name, and the hosted-file-manager plugin is gone along with the
+//! whole aux-pane machinery on both sides of the wire that existed for it alone.
+//!
+//! The field that was supposed to choose between them is what made the pair
+//! actively harmful rather than merely redundant: `command` meant "the file
+//! manager to run" to one and "the editor to open a file with" to the other, so
+//! a config written for the first silently taught the second to open every file
+//! in `nnn`. That is the bug that prompted the merge. The field is now `editor`,
+//! which can only mean one thing; see `make_plugin` for what happens to a
+//! `command` left over from before.
+//!
+//! What is actually lost is a hosted file manager's own key bindings and
+//! previews. What is kept is a panel that works with nothing configured, over a
+//! remote, without an opener hook (`NNN_OPENER`, yazi's `[opener]`,
+//! `rifle.conf`) pointed at a `remux split` -- which is exactly the external
+//! configuration the built-in browser existed to avoid.
+//!
+//! ## Two things are deliberately NOT done here
+//!
+//! **The listing is not read locally.** [`PluginRequest::ListDirectory`] goes to
+//! the server over the wire, because the panel follows the FOCUSED pane's
+//! directory and that pane is routinely on a remote. A `std::fs::read_dir` here
+//! would list the machine the user is sitting at and look entirely plausible
+//! while describing a different filesystem. `files` gets this right for free by
+//! running its file manager on the server; this panel has to earn it.
+//!
+//! **The editor is not resolved here.** The server picks it (`command`, else its
+//! own `$EDITOR`, else `vi`), because the editor must exist where the FILE is.
+//!
+//! ## What is borrowed
+//!
+//! Navigation, selection, the scrolled window, click hit-testing and the
+//! selection that survives a refresh by IDENTITY are all [`super::nav`], the
+//! same code the agents panel uses. This panel is the second consumer that
+//! extraction was made for; the identity here is the entry NAME, which is what
+//! makes a selection survive a file appearing above it.
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
+use super::nav::{self, NavKey, NavList, HEADER_ROWS};
 use super::{
     blank_grid, draw_text, shorten_path, PluginAction, PluginEvent, PluginRequest, SidebarPlugin,
 };
 use crate::client::registry::ConnId;
-use crate::client::view::{blit_snapshot, draw_centered, PaneSnapshot};
 use crate::config::theme::CompositorTheme;
-use crate::protocol::RenderCell;
+use crate::protocol::{CellColor, DirEntry, RenderCell};
 
-/// Rows the panel keeps for its own header (the directory being shown).
-const HEADER_ROWS: u16 = 1;
-
-/// The key that restarts an exited file manager.
-const RESTART_KEY: char = 'r';
-
-/// Where the panel's aux pane is in its life.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuxState {
-    /// No pane, and none asked for. The panel spawns out of this state as soon
-    /// as it is laid out at a usable size, so a hidden panel costs nothing.
-    Idle,
-    /// A `Spawn` is out; waiting for [`PluginEvent::AuxPaneReady`].
-    Spawning,
-    /// The pane exists. It may not have produced a snapshot yet.
-    Live,
-    /// The program exited. Deliberately NOT auto-respawned: a file manager that
-    /// dies instantly (a bad `command`, a missing binary) would otherwise spin
-    /// forever. The user restarts it with [`RESTART_KEY`].
-    Exited,
-}
+/// The key that toggles hidden entries.
+const HIDDEN_KEY: char = '.';
 
 pub struct FilesPlugin {
-    /// The program to run. Required by config; there is no default.
-    command: String,
-    state: AuxState,
-    /// The target the CURRENT pane was spawned for -- the connection it lives on
-    /// and the directory it was opened in. Compared against
-    /// [`FilesPlugin::target`] to decide whether a focus change actually moved
-    /// anywhere: without it, every focus move between two panes in one directory
-    /// would kill and respawn the file manager and throw away the user's
-    /// navigation. The CONNECTION is half of it because two machines routinely
-    /// share a directory name.
-    spawned: Option<(ConnId, Option<String>)>,
-    /// Where the focused pane is, as last reported.
-    target: Option<(ConnId, Option<String>)>,
-    /// Whether a [`PluginEvent::FocusedCwd`] has arrived at all.
+    /// The editor override from `[[sidebar.panel]]`'s `editor`, or `None` to let
+    /// the server choose. OPTIONAL, and normally absent: a panel that names no
+    /// editor is the intended configuration, and the server already knows
+    /// `$EDITOR`.
+    editor: Option<String>,
+    /// The connection the panel is showing a directory ON. Half of a listing's
+    /// identity: two machines routinely have a `/home/you`, and a panel matching
+    /// on the path alone would accept the wrong server's answer.
+    conn: Option<ConnId>,
+    /// The directory being shown, absolute.
+    cwd: Option<String>,
+    /// The directory the FOCUSED PANE was last reported to be in.
     ///
-    /// The first spawn waits for it. The panel is laid out before the first
-    /// session tree comes back, so spawning on the first rect would start the
-    /// program in the wrong directory and then immediately kill and respawn it
-    /// -- a visible flash and a pointless PTY. `None` is a legitimate answer
-    /// (an unreadable cwd), which is why this is a separate flag rather than
-    /// `target_cwd.is_some()`.
-    cwd_known: bool,
-    /// The last size the chrome laid this panel out at, and the size the aux
-    /// pane is currently subscribed at. They differ for exactly one pass after a
-    /// resize, which is what triggers the re-subscribe.
-    size: (u16, u16),
-    subscribed_size: Option<(u16, u16)>,
-    snapshot: Option<PaneSnapshot>,
-    pending: Vec<PluginRequest>,
+    /// The whole of ruling 5 lives in the comparison `cwd == followed`: while it
+    /// holds, the panel is still showing the pane's own directory and follows
+    /// the focus; once the user has navigated anywhere else it stops, and a
+    /// focus change does not yank them back. Losing a user's place in a tree is
+    /// the exact cost the `files` panel's dedup exists to avoid, and this is the
+    /// same cost one level up.
+    followed: Option<String>,
+    /// Everything the server sent, unfiltered -- hidden entries included, so the
+    /// `.` toggle is instant rather than a round trip.
+    entries: Vec<DirEntry>,
+    /// The rows actually rendered: [`FilesPlugin::entries`] after the hidden
+    /// filter. Rebuilt whenever either changes.
+    rows: Vec<DirEntry>,
+    /// Why the current directory could not be listed. Shown, not swallowed.
+    error: Option<String>,
+    /// Whether the server capped this listing.
+    truncated: bool,
+    show_hidden: bool,
+    /// The `(conn, path)` of the listing request in flight, if any. A
+    /// `DirectoryListing` that does not match it belongs to another panel.
+    pending: Option<(ConnId, String)>,
+    /// The entry name the NEXT listing should land the selection on, if any.
+    ///
+    /// Set by `h`: the directory being left is where the selection belongs once
+    /// the parent's listing arrives, so `h` then `l` is a round trip rather than
+    /// a jump to the top of the parent. It is a separate field rather than a
+    /// pre-seeded row because a row would be PAINTED -- a fabricated entry sitting
+    /// in a directory whose real contents have not arrived yet.
+    pending_select: Option<String>,
+    nav: NavList,
+    requests: Vec<PluginRequest>,
 }
 
 impl FilesPlugin {
-    pub fn new(command: String) -> Self {
+    pub fn new(editor: Option<String>) -> Self {
         Self {
-            command,
-            state: AuxState::Idle,
-            spawned: None,
-            target: None,
-            cwd_known: false,
-            size: (0, 0),
-            subscribed_size: None,
-            snapshot: None,
-            pending: Vec::new(),
+            editor,
+            conn: None,
+            cwd: None,
+            followed: None,
+            entries: Vec::new(),
+            rows: Vec::new(),
+            error: None,
+            truncated: false,
+            show_hidden: false,
+            pending: None,
+            pending_select: None,
+            nav: NavList::new(),
+            requests: Vec::new(),
         }
     }
 
-    /// The `(cols, rows)` the aux pane should be, given the panel's size: the
-    /// panel minus its header row.
-    fn content_size(&self) -> (u16, u16) {
-        (self.size.0, self.size.1.saturating_sub(HEADER_ROWS))
-    }
-
-    /// Ask for a pane at the current target directory, on the machine that
-    /// directory is on.
+    /// Rebuild the rendered rows, keeping the selection on the entry it was on.
     ///
-    /// The connection and the cwd come from ONE read of `self.target`, which is
-    /// the whole point: they are two halves of one fact -- "where the focused
-    /// pane is" -- and taking the directory from the panel while letting the
-    /// client supply the machine from its own `foreground()` is what let them
-    /// disagree.
-    fn spawn(&mut self) {
-        let (cols, rows) = self.content_size();
-        if cols == 0 || rows == 0 {
-            return;
-        }
-        // No target means no `FocusedCwd` has arrived, and `cwd_known` gates
-        // every caller on exactly that -- so this cannot fire in practice. It is
-        // a `let else` rather than an `expect` because "nowhere to spawn it" is
-        // an ordinary answer, and a panel that quietly stays in `Idle` is
-        // recoverable where a panic is not.
-        let Some((conn, cwd)) = self.target.clone() else {
+    /// By NAME, which is the entry's identity within one directory. An index
+    /// would move the selection onto a different file whenever one above it was
+    /// created or removed -- and here that means `Enter` opening a file the user
+    /// did not choose, in an editor.
+    fn rebuild(&mut self) {
+        let previous = self
+            .pending_select
+            .take()
+            .or_else(|| self.rows.get(self.nav.selected()).map(|e| e.name.clone()));
+        self.rows = self
+            .entries
+            .iter()
+            .filter(|e| self.show_hidden || !e.name.starts_with('.'))
+            .cloned()
+            .collect();
+        let keys: Vec<String> = self.rows.iter().map(|e| e.name.clone()).collect();
+        self.nav.reselect(&keys, previous.as_ref());
+    }
+
+    /// Show `path`, asking the server for its contents.
+    ///
+    /// The old contents are dropped rather than left on screen under a new
+    /// header: a listing takes a round trip, and over a remote at 200ms RTT that
+    /// is long enough for a user to press `Enter` on a row belonging to the
+    /// directory they just left.
+    fn open_dir(&mut self, path: String) {
+        self.cwd = Some(path.clone());
+        self.entries.clear();
+        self.rows.clear();
+        self.error = None;
+        self.truncated = false;
+        self.pending_select = None;
+        self.nav.set_selected(0);
+        let Some(conn) = self.conn.clone() else {
             return;
         };
-        self.snapshot = None;
-        self.subscribed_size = None;
-        self.spawned = self.target.clone();
-        self.state = AuxState::Spawning;
-        self.pending.push(PluginRequest::Spawn {
+        // The SAME conn goes into `pending` and into the request, from one
+        // clone. That is the whole fix for the routing race: the client used to
+        // resolve the destination itself, from `foreground()`, which moves
+        // before `FocusedCwd` does.
+        self.pending = Some((conn.clone(), path.clone()));
+        self.requests
+            .push(PluginRequest::ListDirectory { conn, path });
+    }
+
+    /// The absolute path of `name` inside the current directory.
+    fn child_path(&self, name: &str) -> Option<String> {
+        let cwd = self.cwd.as_deref()?;
+        Some(if cwd.ends_with('/') {
+            format!("{cwd}{name}")
+        } else {
+            format!("{cwd}/{name}")
+        })
+    }
+
+    /// Go up one level, if there is one.
+    ///
+    /// Lexical, not `canonicalize`: the path is on the SERVER, so there is
+    /// nothing here to resolve it against. It also matches what a shell's `cd
+    /// ..` does through a symlinked directory, which is the behaviour a user of
+    /// this panel already has in the pane beside it.
+    fn go_up(&mut self) -> PluginAction {
+        let Some(parent) = self.cwd.as_deref().and_then(parent_of) else {
+            return PluginAction::None;
+        };
+        // The directory being left is what the selection should land on once the
+        // parent's listing arrives, so `h` then `l` is a round trip rather than
+        // a jump to the parent's first entry.
+        let leaving = self
+            .cwd
+            .as_deref()
+            .map(|c| c.trim_end_matches('/'))
+            .and_then(|c| c.rsplit('/').next())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
+        self.open_dir(parent);
+        self.pending_select = leaving;
+        PluginAction::Redraw
+    }
+
+    /// `Enter`, or a second click: descend into a directory, or open a file.
+    fn activate(&mut self) -> PluginAction {
+        let Some(entry) = self.rows.get(self.nav.selected()).cloned() else {
+            return PluginAction::None;
+        };
+        let Some(path) = self.child_path(&entry.name) else {
+            return PluginAction::None;
+        };
+        if entry.is_dir {
+            self.open_dir(path);
+            return PluginAction::Redraw;
+        }
+        // The panel's own conn, not the client's foreground. `self.cwd` came
+        // from a listing on THIS connection, so `path` names a file on that
+        // machine and nowhere else; opening it anywhere else creates a file
+        // rather than editing one. `None` cannot happen with rows on screen --
+        // rows only ever arrive from a listing, which needs a conn -- but a
+        // `let else` that returns is the honest shape for "there is nothing to
+        // address this to".
+        let Some(conn) = self.conn.clone() else {
+            return PluginAction::None;
+        };
+        self.requests.push(PluginRequest::OpenInSplit {
             conn,
-            cols,
-            rows,
-            command: self.command.clone(),
-            cwd,
+            path,
+            command: self.editor.clone(),
+            vertical: true,
         });
+        // Leave the sidebar. The user asked for this file to be OPEN; a split
+        // running an editor that their keystrokes cannot reach -- because `j`
+        // and `k` are still scrolling this panel -- is the same as not having
+        // opened it.
+        PluginAction::Leave
+    }
+
+    /// The lines drawn below the list: the listing error and the cap notice.
+    ///
+    /// Explanations, not destinations. They are deliberately not rows, so the
+    /// selection can never land on one and `Enter` can never act on one -- the
+    /// lesson the agents panel's "no detection" note cost two review rounds.
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some(e) = &self.error {
+            notes.push(e.clone());
+        }
+        if self.truncated {
+            notes.push("… list truncated".to_string());
+        }
+        notes
+    }
+
+    /// The label for one row: `dir/`, `file`, `link@`, `dirlink/@`.
+    fn label(entry: &DirEntry) -> String {
+        let mut s = entry.name.clone();
+        if entry.is_dir {
+            s.push('/');
+        }
+        if entry.is_symlink {
+            s.push('@');
+        }
+        s
     }
 }
 
@@ -139,9 +277,15 @@ impl SidebarPlugin for FilesPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        // One header row plus enough content for a file manager to draw
-        // something recognisable.
-        (12, 4)
+        (8, 3)
+    }
+
+    /// Yes -- indirectly. This panel never reads a `SessionTree`, but
+    /// [`PluginEvent::FocusedCwd`] is derived from one, so a client whose only
+    /// panel is this one must still subscribe or the directory it starts in
+    /// would never arrive.
+    fn wants_session_tree(&self) -> bool {
+        true
     }
 
     fn render(
@@ -151,193 +295,238 @@ impl SidebarPlugin for FilesPlugin {
         focused: bool,
         theme: &CompositorTheme,
     ) -> Vec<Vec<RenderCell>> {
-        let bg = theme
-            .frame_bg
-            .clone()
-            .unwrap_or(crate::protocol::CellColor::Default);
+        let bg = theme.frame_bg.clone().unwrap_or(CellColor::Default);
         let mut grid = blank_grid(cols, rows, bg.clone());
         if grid.is_empty() {
             return grid;
         }
-
-        // The header tracks focus with the SAME theme roles the panel frame
-        // does, exactly as every other panel's does.
-        let header_fg = crate::server::compositor::border_fg(theme, focused);
-        let header = match self.spawned.as_ref().and_then(|(_, cwd)| cwd.as_deref()) {
+        let header = match self.cwd.as_deref() {
             Some(cwd) => shorten_path(cwd, cols as usize),
             None => self.title().to_string(),
         };
-        draw_text(&mut grid, 0, 0, &header, header_fg, bg);
+        nav::draw_header(&mut grid, &header, focused, theme, &bg);
 
-        let ih = rows.saturating_sub(HEADER_ROWS) as usize;
-        if ih == 0 {
-            return grid;
-        }
-        let iy = HEADER_ROWS as usize;
-        let iw = cols as usize;
-        match (&self.snapshot, self.state) {
-            (_, AuxState::Exited) => {
-                draw_centered(
-                    &mut grid,
-                    0,
-                    iy,
-                    iw,
-                    ih,
-                    &format!("exited — {RESTART_KEY} to restart"),
-                );
-            }
-            (Some(snap), _) => blit_snapshot(&mut grid, 0, iy, iw, ih, snap),
-            (None, _) => draw_centered(
+        // The same budget rule the agents panel arrived at: at most half the
+        // rows when there is a list to crowd out, all of them when there is not.
+        // An error means there are no entries anyway, so this only ever binds on
+        // the truncation notice -- which appears exactly when the list is
+        // longest.
+        //
+        // ...but never fewer than ONE row while there is a row at all. Plain
+        // `capacity / 2` is 0 in a two-row panel (one header, one line), and
+        // `take(0)` dropped the truncation notice entirely -- silently, in the
+        // one case where `DirectoryListing::truncated` promises it is "reported,
+        // never silent". A single line showing "… list truncated" instead of one
+        // filename is a poor panel; a single line showing one filename out of
+        // five thousand with nothing to say so is a WRONG one.
+        //
+        // The agents panel does not have this bug despite the shared rule: its
+        // note appears only when it has no rows, so the halving never binds
+        // there. That is why this floor lives here and not in `nav`.
+        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let all_notes = self.notes();
+        let budget = if self.rows.is_empty() {
+            capacity
+        } else {
+            (capacity / 2).max(1).min(capacity)
+        };
+        let notes: Vec<String> = all_notes.into_iter().take(budget).collect();
+
+        if self.rows.is_empty() && notes.is_empty() {
+            // Said out loud. An empty panel and a broken one look identical, and
+            // "waiting for the server" and "this directory is empty" are
+            // different answers a user is entitled to tell apart.
+            let msg = if self.pending.is_some() {
+                "loading…"
+            } else if self.cwd.is_some() {
+                "empty"
+            } else {
+                "no directory"
+            };
+            draw_text(
                 &mut grid,
                 0,
-                iy,
-                iw,
-                ih,
-                &format!("starting {}…", self.command),
-            ),
+                HEADER_ROWS as u16,
+                msg,
+                theme.status_bar_fg.clone(),
+                bg,
+            );
+            return grid;
+        }
+
+        // Space for the notes is RESERVED, not left over: painting them only
+        // where the rows ran out drops them entirely whenever the list fills the
+        // panel, which for the truncation notice is every single time. The list
+        // gets the shorter height, so its scrolling accounts for the reservation
+        // and `nav`'s hit test records the smaller painted window.
+        let note_rows = notes.len();
+        let list_height = rows.saturating_sub(note_rows as u16);
+        let list_capacity = (list_height as usize).saturating_sub(HEADER_ROWS);
+
+        let top = self.nav.top_for(list_height, self.rows.len());
+        for i in 0..list_capacity {
+            let Some(entry) = self.rows.get(top + i) else {
+                break;
+            };
+            let y = (HEADER_ROWS + i) as u16;
+            let selected = top + i == self.nav.selected();
+            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+            if selected {
+                nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
+            }
+            draw_text(&mut grid, 0, y, &Self::label(entry), fg, row_bg);
+        }
+
+        let painted = self.rows.len().saturating_sub(top).min(list_capacity);
+        for (n, note) in notes.iter().enumerate() {
+            let y = (HEADER_ROWS + painted + n) as u16;
+            draw_text(
+                &mut grid,
+                0,
+                y,
+                note,
+                theme.status_bar_fg.clone(),
+                bg.clone(),
+            );
         }
         grid
     }
 
     fn on_key(&mut self, key: KeyEvent) -> PluginAction {
-        if self.state == AuxState::Exited {
-            if key.code == KeyCode::Char(RESTART_KEY) {
-                self.spawn();
+        // `h`/`l` before `nav_key`, which has no opinion about either. `l`
+        // descends only into a directory: on a file it is not "open", because
+        // `Enter` is, and a key that sometimes opens an editor is a key nobody
+        // presses confidently.
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Left => return self.go_up(),
+            KeyCode::Char('l') | KeyCode::Right => {
+                let is_dir = self
+                    .rows
+                    .get(self.nav.selected())
+                    .map(|e| e.is_dir)
+                    .unwrap_or(false);
+                return if is_dir {
+                    self.activate()
+                } else {
+                    PluginAction::None
+                };
+            }
+            KeyCode::Char(HIDDEN_KEY) => {
+                self.show_hidden = !self.show_hidden;
+                // Through `rebuild`, so the selection stays on the entry it was
+                // on: hiding the dotfiles above it must not slide it onto
+                // another file.
+                self.rebuild();
                 return PluginAction::Redraw;
             }
-            return PluginAction::None;
+            _ => {}
         }
-        if self.state != AuxState::Live {
-            return PluginAction::None;
-        }
-        // Encoded by the ONE key encoder the client has, with this pane's own
-        // DECCKM state, so arrows and navigation keys reach the file manager
-        // encoded the way it asked for them rather than the way the foreground
-        // session did.
-        //
-        // Not quite what a focused View cell gets, and the difference is worth
-        // naming: the sidebar key gate handles Escape before `on_key` is ever
-        // reached, so a file manager hosted here can never receive one. That is
-        // deliberate -- Escape is how the user leaves the panel, in this plugin
-        // as in every other -- but it does constrain `yazi` and `ranger`, which
-        // both use Escape to back out of a mode.
-        let ack = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.application_cursor_keys)
-            .unwrap_or(false);
-        match crate::client::input::key_event_to_bytes(&key, ack) {
-            Some(data) => {
-                self.pending.push(PluginRequest::Input { data });
-                // The repaint comes from the `PaneContent` the keystroke
-                // provokes, not from here: nothing local changed.
-                PluginAction::None
+        match nav::nav_key(&key) {
+            Some(NavKey::Activate) => self.activate(),
+            Some(cmd) => {
+                self.nav.apply(cmd, self.rows.len());
+                PluginAction::Redraw
             }
             None => PluginAction::None,
         }
     }
 
-    fn on_mouse(&mut self, _x: u16, _y: u16, _kind: MouseEventKind) -> PluginAction {
-        // Deliberately inert. Forwarding a click means translating panel
-        // coordinates into the pane's and speaking its mouse-tracking mode; the
-        // file managers this hosts are all keyboard-driven, so the plumbing
-        // would be untested weight.
-        PluginAction::None
+    fn on_mouse(&mut self, _x: u16, y: u16, kind: MouseEventKind) -> PluginAction {
+        if !nav::is_select_click(kind) {
+            return PluginAction::None;
+        }
+        match self.nav.click(y, self.rows.len()) {
+            nav::HitOutcome::Ignore => PluginAction::None,
+            nav::HitOutcome::Moved => PluginAction::Redraw,
+            nav::HitOutcome::Activate => self.activate(),
+        }
     }
 
     fn on_event(&mut self, ev: &PluginEvent) {
         match ev {
             PluginEvent::FocusedCwd { conn, cwd } => {
-                // An unreadable cwd is UNKNOWN, not "the daemon's directory".
-                // The client broadcasts on every foreground tree push, and a
-                // push can legitimately carry `None`: the focused pane's shell
-                // has just exited so the `readlink` fails for its zombie, or the
-                // push landed mid-session-switch with no `is_current` session.
-                // Treating that as a move would kill the file manager, respawn
-                // it wherever the SERVER happens to be running, and then restart
-                // it a third time when the next push restored the path -- losing
-                // the user's place twice over, which is the exact cost that
-                // re-targeting is rationed to avoid.
-                if cwd.is_none() && self.target.is_some() {
+                // An unreadable cwd is UNKNOWN, not a move. The client
+                // broadcasts on every foreground tree push and one can carry
+                // `None` (the focused pane's shell just exited, or the push
+                // landed mid-switch); treating that as a directory change would
+                // throw the user out of wherever they were.
+                let Some(dir) = cwd.as_deref() else {
+                    return;
+                };
+                let conn_changed = self.conn.as_ref() != Some(conn);
+                // Read BEFORE `followed` is updated: it is the comparison
+                // between where the panel is and where the pane WAS.
+                let anchored = self.cwd == self.followed;
+                self.followed = Some(dir.to_string());
+                // A different machine always re-targets, whatever the user was
+                // browsing: the tree on screen belongs to a filesystem the
+                // focused pane is no longer on, and going on showing it is not
+                // "keeping their place", it is showing them the wrong computer.
+                if conn_changed {
+                    self.conn = Some(conn.clone());
+                } else if !anchored || self.cwd.as_deref() == Some(dir) {
                     return;
                 }
-                let first = !self.cwd_known;
-                self.cwd_known = true;
-                self.target = Some((conn.clone(), cwd.clone()));
-                if first {
-                    // The panel was waiting for this to make its first spawn;
-                    // `on_size` picks it up on the next pass.
+                self.open_dir(dir.to_string());
+            }
+            PluginEvent::DirectoryListing {
+                conn,
+                path,
+                entries,
+                error,
+                truncated,
+            } => {
+                // Claim only the answer to the request THIS panel has out. The
+                // event is broadcast, so every other files panel's listing
+                // arrives here too.
+                if self.pending.as_ref() != Some(&(conn.clone(), path.clone())) {
                     return;
                 }
-                // Re-target only when the target actually moved. Focus moves
-                // between panes far more often than it moves between
-                // directories, and a respawn costs the user their place.
-                if self.state != AuxState::Idle && self.target != self.spawned {
-                    self.pending.push(PluginRequest::Kill);
-                    self.state = AuxState::Idle;
-                    self.snapshot = None;
-                    self.subscribed_size = None;
+                self.pending = None;
+                self.entries = entries.clone();
+                self.error = error.clone();
+                self.truncated = *truncated;
+                self.rebuild();
+            }
+            PluginEvent::ConnectionLost { conn } => {
+                if self.conn.as_ref() == Some(conn) {
+                    // Everything on screen described that machine. Keeping it
+                    // would leave a browsable-looking tree that answers nothing.
+                    self.conn = None;
+                    self.cwd = None;
+                    self.followed = None;
+                    self.entries.clear();
+                    self.rows.clear();
+                    self.error = None;
+                    self.truncated = false;
+                    self.pending = None;
+                    self.nav.set_selected(0);
                 }
             }
-            PluginEvent::AuxPaneReady => {
-                self.state = AuxState::Live;
-                // Subscribe at whatever size the panel is NOW: the panel may
-                // have been resized between the request and the answer.
-                let (cols, rows) = self.content_size();
-                if cols > 0 && rows > 0 {
-                    self.subscribed_size = Some((cols, rows));
-                    self.pending.push(PluginRequest::Subscribe { cols, rows });
-                }
-            }
-            PluginEvent::AuxPaneContent { snapshot } => {
-                self.snapshot = Some((**snapshot).clone());
-            }
-            PluginEvent::AuxPaneExited => {
-                self.state = AuxState::Exited;
-                self.snapshot = None;
-                self.subscribed_size = None;
-            }
-            PluginEvent::SessionTree { .. }
-            | PluginEvent::Agents { .. }
-            | PluginEvent::DirectoryListing { .. }
-            | PluginEvent::ConnectionLost { .. } => {}
-        }
-    }
-
-    fn on_size(&mut self, cols: u16, rows: u16) {
-        self.size = (cols, rows);
-        let (ccols, crows) = self.content_size();
-        if ccols == 0 || crows == 0 {
-            return;
-        }
-        match self.state {
-            // Lazy spawn: the first pass that gives this panel a usable rect
-            // AND a directory to open in.
-            AuxState::Idle if self.cwd_known => self.spawn(),
-            // Re-subscribe at the new size, exactly as a View cell does, so the
-            // pane reflows to the panel through the server's existing
-            // min-across-viewers sizing rather than a second policy.
-            AuxState::Live if self.subscribed_size != Some((ccols, crows)) => {
-                self.subscribed_size = Some((ccols, crows));
-                self.pending.push(PluginRequest::Subscribe {
-                    cols: ccols,
-                    rows: crows,
-                });
-            }
-            _ => {}
+            // The session tree is the sessions panel's and the agent list the
+            // agents panel's.
+            PluginEvent::SessionTree { .. } | PluginEvent::Agents { .. } => {}
         }
     }
 
     fn take_requests(&mut self) -> Vec<PluginRequest> {
-        std::mem::take(&mut self.pending)
+        std::mem::take(&mut self.requests)
     }
+}
 
-    /// Yes -- indirectly. This panel never looks at a `SessionTree`, but
-    /// [`PluginEvent::FocusedCwd`] is derived from one, so a client whose only
-    /// panel is this one must still subscribe or the directory it exists to
-    /// follow would never arrive.
-    fn wants_session_tree(&self) -> bool {
-        true
+/// The parent of an absolute path, lexically. `None` at the root.
+fn parent_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // `path` was "/" (or ""): there is nowhere above it.
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(0) => Some("/".to_string()),
+        Some(i) => Some(trimmed[..i].to_string()),
+        // A relative path with no separator. Not something the server sends,
+        // but answering "nowhere above" beats fabricating one.
+        None => None,
     }
 }
 
@@ -346,47 +535,50 @@ mod tests {
     use super::*;
     use crate::client::sidebar::make_plugin;
     use crate::config::sidebar::PanelConfig;
-    use crate::protocol::RenderCell;
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers, MouseButton};
 
-    fn cfg(plugin: &str, command: Option<&str>) -> PanelConfig {
-        PanelConfig {
-            plugin: plugin.to_string(),
-            weight: 1,
-            command: command.map(str::to_string),
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
         }
     }
 
-    fn snapshot(rows: &[&str], cols: u16) -> PaneSnapshot {
-        let cells: Vec<Vec<RenderCell>> = rows
+    fn entry(name: &str, is_dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            is_dir,
+            is_symlink: false,
+            size: 0,
+        }
+    }
+
+    fn cwd(conn: ConnId, dir: &str) -> PluginEvent {
+        PluginEvent::FocusedCwd {
+            conn,
+            cwd: Some(dir.to_string()),
+        }
+    }
+
+    fn listing(conn: ConnId, path: &str, entries: Vec<DirEntry>) -> PluginEvent {
+        PluginEvent::DirectoryListing {
+            conn,
+            path: path.to_string(),
+            entries,
+            error: None,
+            truncated: false,
+        }
+    }
+
+    /// The panel's visible rows, from a real render.
+    fn painted(p: &FilesPlugin, cols: u16, rows: u16) -> Vec<String> {
+        let theme = CompositorTheme::default();
+        p.render(cols, rows, true, &theme)
             .iter()
-            .map(|r| {
-                let mut row: Vec<RenderCell> = r
-                    .chars()
-                    .map(|c| RenderCell {
-                        c,
-                        ..RenderCell::default()
-                    })
-                    .collect();
-                row.resize(cols as usize, RenderCell::default());
-                row
-            })
-            .collect();
-        PaneSnapshot {
-            cols,
-            rows: rows.len() as u16,
-            cells,
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visible: false,
-            application_cursor_keys: false,
-            session_visible: false,
-        }
-    }
-
-    fn text(grid: &[Vec<RenderCell>]) -> Vec<String> {
-        grid.iter()
-            .map(|r| {
-                r.iter()
+            .map(|row| {
+                row.iter()
                     .map(|c| c.c)
                     .collect::<String>()
                     .trim_end()
@@ -395,394 +587,607 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_files_panel_without_a_command_is_refused() {
-        assert!(make_plugin(&cfg("files", None)).is_none());
-        assert!(make_plugin(&cfg("files", Some("yazi"))).is_some());
+    /// Drive a panel to a listed directory, returning it ready to navigate.
+    fn at(dir: &str, entries: Vec<DirEntry>) -> FilesPlugin {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, dir));
+        p.take_requests();
+        p.on_event(&listing(ConnId::Local, dir, entries));
+        p
+    }
+
+    fn panel(plugin: &str, editor: Option<&str>, command: Option<&str>) -> PanelConfig {
+        PanelConfig {
+            plugin: plugin.to_string(),
+            weight: 1,
+            editor: editor.map(str::to_string),
+            command: command.map(str::to_string),
+        }
     }
 
     #[test]
-    fn a_command_on_another_plugin_is_ignored_not_rejected() {
-        assert!(make_plugin(&cfg("sessions", Some("yazi"))).is_some());
-    }
-
-    #[test]
-    fn nothing_is_spawned_before_a_directory_is_known() {
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_size(20, 6);
+    fn a_files_panel_needs_no_configuration_at_all() {
         assert!(
-            p.take_requests().is_empty(),
-            "spawning before the first FocusedCwd would open the wrong directory and then immediately respawn"
+            make_plugin(&panel("files", None, None)).is_some(),
+            "zero configuration is the whole point of this panel"
         );
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_size(20, 6);
-        assert!(matches!(
-            p.take_requests().as_slice(),
-            [PluginRequest::Spawn { .. }]
-        ));
     }
 
+    /// The old name for THIS panel. It has to keep working: falling through to
+    /// the unknown-plugin rule would SKIP the panel, so a user who upgrades
+    /// would find their sidebar quietly missing a panel.
     #[test]
-    fn the_first_layout_asks_for_a_pane_at_the_focused_cwd() {
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/tmp/here".into()),
-        });
-        assert!(p.take_requests().is_empty(), "no rect yet, no pane");
-        p.on_size(20, 6);
+    fn the_old_browser_name_still_loads_this_panel() {
+        assert!(
+            make_plugin(&panel("browser", None, None)).is_some(),
+            "`plugin = \"browser\"` must still resolve, or an upgrade silently \
+             drops the panel it names"
+        );
+    }
+
+    /// The old aux-pane `files` plugin required `command` and is gone. A config
+    /// still naming a file manager there must LOAD -- and must not treat `nnn`
+    /// as an editor, which is the bug that prompted the merge.
+    #[test]
+    fn a_leftover_command_is_ignored_rather_than_read_as_the_editor() {
+        for plugin in ["files", "browser"] {
+            let mut p = make_plugin(&panel(plugin, None, Some("nnn")))
+                .unwrap_or_else(|| panic!("`{plugin}` with a stale `command` must still load"));
+            p.on_event(&cwd(ConnId::Local, "/w"));
+            p.take_requests();
+            p.on_event(&listing(ConnId::Local, "/w", vec![entry("f", false)]));
+            p.on_key(key(KeyCode::Enter));
+            assert_eq!(
+                p.take_requests(),
+                vec![PluginRequest::OpenInSplit {
+                    conn: ConnId::Local,
+                    path: "/w/f".to_string(),
+                    command: None,
+                    vertical: true,
+                }],
+                "`command = \"nnn\"` was read as the editor, which is exactly the \
+                 report this merge exists to fix: Enter on a file opened nnn"
+            );
+        }
+    }
+
+    /// And `editor`, the field that replaced it, IS read.
+    #[test]
+    fn the_editor_field_is_what_overrides_the_editor_now() {
+        let mut p = make_plugin(&panel("files", Some("hx"), None)).expect("panel must load");
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        p.on_event(&listing(ConnId::Local, "/w", vec![entry("f", false)]));
+        p.on_key(key(KeyCode::Enter));
         assert_eq!(
             p.take_requests(),
-            vec![PluginRequest::Spawn {
+            vec![PluginRequest::OpenInSplit {
                 conn: ConnId::Local,
-                cols: 20,
-                rows: 5, // the header row is not the pane's
-                command: "yazi".into(),
-                cwd: Some("/tmp/here".into()),
+                path: "/w/f".to_string(),
+                command: Some("hx".to_string()),
+                vertical: true,
             }]
         );
-        // Still only one request: a laid-out panel must not re-ask every pass.
-        p.on_size(20, 6);
-        assert!(p.take_requests().is_empty());
     }
 
     #[test]
-    fn a_hidden_panel_asks_for_nothing() {
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_size(0, 0);
-        p.on_size(20, 1); // header only, no content rows
-        assert!(p.take_requests().is_empty());
-    }
-
-    #[test]
-    fn a_resize_resubscribes_at_the_new_size() {
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_size(20, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
+    fn the_first_focused_cwd_asks_the_server_for_that_directory() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/home/me"));
         assert_eq!(
             p.take_requests(),
-            vec![PluginRequest::Subscribe { cols: 20, rows: 5 }]
-        );
-        p.on_size(20, 6);
-        assert!(p.take_requests().is_empty(), "same size, no re-subscribe");
-        p.on_size(30, 9);
-        assert_eq!(
-            p.take_requests(),
-            vec![PluginRequest::Subscribe { cols: 30, rows: 8 }]
-        );
-    }
-
-    #[test]
-    fn the_same_directory_does_not_respawn() {
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(20, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.take_requests();
-        // Focus moved to another pane in the SAME directory.
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(20, 6);
-        assert!(
-            p.take_requests().is_empty(),
-            "a focus move within one directory must not restart the file manager"
-        );
-    }
-
-    #[test]
-    fn the_same_directory_on_another_server_does_respawn() {
-        // Two machines routinely have a pane in a directory of the same name.
-        // Comparing the path alone would decide nothing had moved and leave the
-        // panel showing the OLD machine's files.
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/home/you".into()),
-        });
-        p.on_size(20, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.take_requests();
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Remote("pi".into()),
-            cwd: Some("/home/you".into()),
-        });
-        assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
-        p.on_size(20, 6);
-        // The whole request, not `matches!(.., [Spawn { .. }])`. The loose form
-        // is what let the third instance of the routing race sit here unseen:
-        // the respawn was asserted to HAPPEN, never to be addressed anywhere in
-        // particular, and the client was filling the address in from its own
-        // `foreground()`. `on_size` is also the exact trigger that made it
-        // reachable -- a resize inside the switch window spawns while the
-        // panel's target is the new machine and `foreground()` may not be.
-        assert_eq!(
-            p.take_requests(),
-            vec![PluginRequest::Spawn {
-                conn: ConnId::Remote("pi".into()),
-                cols: 20,
-                rows: 5,
-                command: "yazi".into(),
-                cwd: Some("/home/you".into()),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/home/me".to_string()
             }],
-            "the respawn must be addressed to the machine the panel moved to"
+            "the listing must go over the wire, not through a local read_dir"
         );
     }
 
     #[test]
-    fn a_new_directory_kills_and_respawns() {
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(20, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.take_requests();
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/b".into()),
-        });
-        assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
-        p.on_size(20, 6);
+    fn entries_render_with_directories_marked() {
+        let p = at("/w", vec![entry("src", true), entry("main.rs", false)]);
+        let rows = painted(&p, 20, 5);
+        assert_eq!(rows[0], "/w");
+        assert_eq!(rows[1], "src/");
+        assert_eq!(rows[2], "main.rs");
+    }
+
+    #[test]
+    fn a_symlink_is_marked_and_a_symlinked_directory_is_marked_as_both() {
+        let mut link = entry("link", false);
+        link.is_symlink = true;
+        let mut dirlink = entry("dirlink", true);
+        dirlink.is_symlink = true;
+        let p = at("/w", vec![dirlink, link]);
+        let rows = painted(&p, 20, 5);
+        assert_eq!(rows[1], "dirlink/@");
+        assert_eq!(rows[2], "link@");
+    }
+
+    #[test]
+    fn hidden_entries_are_hidden_until_the_toggle() {
+        let mut p = at("/w", vec![entry(".git", true), entry("src", true)]);
+        assert_eq!(painted(&p, 20, 5)[1], "src/");
+        p.on_key(key(KeyCode::Char(HIDDEN_KEY)));
+        let rows = painted(&p, 20, 5);
+        assert_eq!(rows[1], ".git/");
+        assert_eq!(rows[2], "src/");
+        p.on_key(key(KeyCode::Char(HIDDEN_KEY)));
+        assert_eq!(painted(&p, 20, 5)[1], "src/");
+    }
+
+    /// Toggling must not move the cursor onto a different file. With the
+    /// dotfiles ABOVE the selection, an index-preserving toggle slides the
+    /// selection down -- and here the selection decides which file `Enter`
+    /// opens in an editor.
+    #[test]
+    fn the_toggle_keeps_the_selection_on_its_entry() {
+        let mut p = at(
+            "/w",
+            vec![
+                entry(".a", false),
+                entry(".b", false),
+                entry("keep.rs", false),
+                entry("other.rs", false),
+            ],
+        );
+        p.on_key(key(KeyCode::Char('j'))); // -> other.rs (rows: keep.rs, other.rs)
+        assert_eq!(p.rows[p.nav.selected()].name, "other.rs");
+        p.on_key(key(KeyCode::Char(HIDDEN_KEY)));
+        assert_eq!(
+            p.rows[p.nav.selected()].name,
+            "other.rs",
+            "two dotfiles appeared above it; an index would have slid the cursor"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_directory_descends_and_asks_for_it() {
+        let mut p = at("/w", vec![entry("src", true)]);
+        assert_eq!(p.on_key(key(KeyCode::Enter)), PluginAction::Redraw);
         assert_eq!(
             p.take_requests(),
-            vec![PluginRequest::Spawn {
+            vec![PluginRequest::ListDirectory {
                 conn: ConnId::Local,
-                cols: 20,
-                rows: 5,
-                command: "yazi".into(),
-                cwd: Some("/b".into()),
+                path: "/w/src".to_string()
             }]
         );
+        assert_eq!(painted(&p, 20, 5)[0], "/w/src");
     }
 
     #[test]
-    fn an_unknown_cwd_never_becomes_a_new_target() {
-        // A push can legitimately carry `None` -- the focused pane's shell has
-        // just exited, or the push landed mid-session-switch. Treating that as a
-        // move would respawn the file manager in the SERVER's directory and then
-        // restart it again when the next push restored the path.
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(20, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.take_requests();
-
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_size(20, 6);
-        assert!(
-            p.take_requests().is_empty(),
-            "an unreadable cwd must read as `unknown`, not as a move to the daemon's \
-directory"
+    fn enter_on_a_file_opens_a_split_and_leaves_the_sidebar() {
+        let mut p = at("/w", vec![entry("main.rs", false)]);
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PluginAction::Leave,
+            "an editor the keyboard cannot reach is not an opened file"
         );
-        // ...and the real path coming back is likewise not a move.
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(20, 6);
-        assert!(
-            p.take_requests().is_empty(),
-            "and the path returning is not a second move either"
-        );
-    }
-
-    #[test]
-    fn an_unknown_cwd_before_any_target_still_starts_the_program() {
-        // The other half: `None` must not wedge a panel that has never had a
-        // directory. A best-effort spawn beats a panel that never starts.
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_size(20, 6);
-        assert!(matches!(
-            p.take_requests().as_slice(),
-            [PluginRequest::Spawn { cwd: None, .. }]
-        ));
-    }
-
-    #[test]
-    fn a_retarget_mid_spawn_still_asks_for_the_kill() {
-        // The plugin has no pane id yet, so the client cannot address one -- but
-        // the panel must still SAY it is giving the pane up, or the client has
-        // nothing to cancel and the pane that arrives is orphaned.
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(20, 6);
-        assert!(matches!(
-            p.take_requests().as_slice(),
-            [PluginRequest::Spawn { .. }]
-        ));
-        // Still `Spawning`: no `AuxPaneReady` has arrived.
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/b".into()),
-        });
-        assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
-        p.on_size(20, 6);
         assert_eq!(
             p.take_requests(),
-            vec![PluginRequest::Spawn {
+            vec![PluginRequest::OpenInSplit {
                 conn: ConnId::Local,
-                cols: 20,
-                rows: 5,
-                command: "yazi".into(),
-                cwd: Some("/b".into()),
+                path: "/w/main.rs".to_string(),
+                command: None,
+                vertical: true,
             }]
         );
     }
 
     #[test]
-    fn a_failed_spawn_leaves_the_panel_restartable() {
-        // The client reports a server-side spawn failure as `AuxPaneExited`, so
-        // the panel must not sit on "starting…" for ever.
-        let theme = CompositorTheme::default();
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/a".into()),
-        });
-        p.on_size(24, 6);
+    fn a_configured_editor_travels_with_the_request_but_is_not_resolved_here() {
+        let mut p = FilesPlugin::new(Some("hx".to_string()));
+        p.on_event(&cwd(ConnId::Local, "/w"));
         p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneExited);
-        let rendered = text(&p.render(24, 6, true, &theme));
-        assert!(
-            rendered.iter().any(|r| r.contains("exited")),
-            "a failed spawn must leave a restartable panel: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn keys_are_forwarded_only_while_the_pane_is_live() {
-        use crossterm::event::{KeyEventKind, KeyModifiers};
-        let key = |c: char| KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
-        };
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_key(key('j'));
-        assert!(p.take_requests().is_empty(), "no pane, no input");
-
-        p.on_size(20, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.take_requests();
-        p.on_key(key('j'));
+        p.on_event(&listing(ConnId::Local, "/w", vec![entry("f", false)]));
+        p.on_key(key(KeyCode::Enter));
         assert_eq!(
             p.take_requests(),
-            vec![PluginRequest::Input {
-                data: b"j".to_vec()
-            }]
+            vec![PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
+                path: "/w/f".to_string(),
+                command: Some("hx".to_string()),
+                vertical: true,
+            }],
+            "the server resolves the editor; the panel only forwards an override"
         );
     }
 
     #[test]
-    fn an_exited_pane_shows_a_restart_hint_and_restarts_on_the_key() {
-        use crossterm::event::{KeyEventKind, KeyModifiers};
-        let theme = CompositorTheme::default();
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: None,
-        });
-        p.on_size(24, 6);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneExited);
-        let rendered = text(&p.render(24, 6, true, &theme));
-        assert!(
-            rendered.iter().any(|r| r.contains("exited")),
-            "an exited panel must say so, not sit blank: {rendered:?}"
+    fn l_descends_into_a_directory_but_does_nothing_on_a_file() {
+        let mut p = at("/w", vec![entry("src", true), entry("f", false)]);
+        assert_eq!(p.on_key(key(KeyCode::Char('l'))), PluginAction::Redraw);
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/w/src".to_string()
+            }]
         );
-        // No auto-respawn: a command that dies instantly must not spin.
-        p.on_size(24, 6);
+
+        let mut p = at("/w", vec![entry("f", false)]);
+        assert_eq!(p.on_key(key(KeyCode::Char('l'))), PluginAction::None);
+        assert!(p.take_requests().is_empty(), "l must not open an editor");
+    }
+
+    #[test]
+    fn h_goes_up_a_level_and_lands_on_the_directory_it_left() {
+        let mut p = at("/home/me/work", vec![entry("f", false)]);
+        assert_eq!(p.on_key(key(KeyCode::Char('h'))), PluginAction::Redraw);
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/home/me".to_string()
+            }]
+        );
+        p.on_event(&listing(
+            ConnId::Local,
+            "/home/me",
+            vec![entry("other", true), entry("work", true)],
+        ));
+        assert_eq!(
+            p.rows[p.nav.selected()].name,
+            "work",
+            "h then l should be a round trip, not a jump to the top"
+        );
+    }
+
+    #[test]
+    fn h_at_the_root_does_nothing() {
+        let mut p = at("/", vec![entry("etc", true)]);
+        assert_eq!(p.on_key(key(KeyCode::Char('h'))), PluginAction::None);
         assert!(p.take_requests().is_empty());
-
-        p.on_key(KeyEvent {
-            code: KeyCode::Char(RESTART_KEY),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
-        });
-        assert!(matches!(
-            p.take_requests().as_slice(),
-            [PluginRequest::Spawn { .. }]
-        ));
     }
 
     #[test]
-    fn the_snapshot_is_painted_below_the_header() {
-        let theme = CompositorTheme::default();
-        let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd {
-            conn: ConnId::Local,
-            cwd: Some("/tmp/proj".into()),
-        });
-        p.on_size(16, 4);
-        p.take_requests();
-        p.on_event(&PluginEvent::AuxPaneReady);
-        p.on_event(&PluginEvent::AuxPaneContent {
-            snapshot: Box::new(snapshot(&["alpha", "beta", "gamma"], 16)),
-        });
-        let rendered = text(&p.render(16, 4, false, &theme));
-        assert_eq!(rendered[0], "/tmp/proj", "the header names the directory");
+    fn a_child_of_the_root_is_not_a_double_slash() {
+        let mut p = at("/", vec![entry("etc", true)]);
+        p.on_key(key(KeyCode::Enter));
         assert_eq!(
-            &rendered[1..],
-            &["alpha", "beta", "gamma"],
-            "the pane's content is painted under it"
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/etc".to_string()
+            }]
         );
     }
 
     #[test]
-    fn a_long_path_keeps_its_tail() {
-        assert_eq!(shorten_path("/a/b/c", 10), "/a/b/c");
-        assert_eq!(shorten_path("/very/long/path/here", 8), "…th/here");
+    fn the_parent_of_a_path_is_lexical() {
+        assert_eq!(parent_of("/a/b/c").as_deref(), Some("/a/b"));
+        assert_eq!(parent_of("/a").as_deref(), Some("/"));
+        assert_eq!(parent_of("/"), None);
+        assert_eq!(parent_of("/a/b/").as_deref(), Some("/a"));
     }
 
     #[test]
-    fn the_panel_needs_the_session_tree_push() {
-        // Indirectly: the panel never reads a `SessionTree`, but `FocusedCwd`
-        // is derived from one, so a client with only this panel must still
-        // subscribe or the directory would never be learned.
-        assert!(FilesPlugin::new("yazi".into()).wants_session_tree());
+    fn a_listing_error_is_shown_rather_than_looking_like_an_empty_directory() {
+        let mut p = at("/w", vec![entry("secret", true)]);
+        p.on_key(key(KeyCode::Enter));
+        p.take_requests();
+        p.on_event(&PluginEvent::DirectoryListing {
+            conn: ConnId::Local,
+            path: "/w/secret".to_string(),
+            entries: Vec::new(),
+            error: Some("permission denied".to_string()),
+            truncated: false,
+        });
+        let rows = painted(&p, 24, 5);
+        assert_eq!(rows[1], "permission denied");
+        assert_ne!(rows[1], "empty");
+    }
+
+    #[test]
+    fn a_genuinely_empty_directory_says_empty_and_a_pending_one_says_loading() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        assert_eq!(painted(&p, 20, 4)[1], "loading…");
+        p.on_event(&listing(ConnId::Local, "/w", Vec::new()));
+        assert_eq!(painted(&p, 20, 4)[1], "empty");
+    }
+
+    /// The truncation notice appears exactly when the list is longest, so it
+    /// must survive a panel the list already fills -- the trap the agents panel
+    /// fell into, where every test had slack and none could fail.
+    #[test]
+    fn the_truncation_notice_survives_a_panel_the_list_already_fills() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        p.on_event(&PluginEvent::DirectoryListing {
+            conn: ConnId::Local,
+            path: "/w".to_string(),
+            entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
+            error: None,
+            truncated: true,
+        });
+        // Header + 2 rows + the note: the list alone would fill this and more.
+        let rows = painted(&p, 24, 4);
+        assert_eq!(
+            rows[3], "… list truncated",
+            "a full list must not push the notice off the panel, got {rows:?}"
+        );
+        assert!(
+            rows[1].starts_with("f0"),
+            "and the rows still paint: {rows:?}"
+        );
+    }
+
+    /// ...and it survives a panel with only ONE line to give it.
+    ///
+    /// `capacity / 2` is 0 at two rows, and `take(0)` dropped the notice
+    /// entirely -- exactly the silence `DirectoryListing::truncated` exists to
+    /// prevent, in the smallest panel a user can drag to.
+    #[test]
+    fn the_truncation_notice_survives_a_panel_with_one_line() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        p.on_event(&PluginEvent::DirectoryListing {
+            conn: ConnId::Local,
+            path: "/w".to_string(),
+            entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
+            error: None,
+            truncated: true,
+        });
+        // Header + exactly one content line.
+        let rows = painted(&p, 24, 2);
+        assert_eq!(
+            rows[1], "… list truncated",
+            "the one line goes to the notice, not to one filename out of five \
+             thousand with nothing to say so: got {rows:?}"
+        );
+    }
+
+    /// The notice is an explanation, not a destination.
+    #[test]
+    fn a_click_on_the_truncation_notice_selects_nothing() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        p.on_event(&PluginEvent::DirectoryListing {
+            conn: ConnId::Local,
+            path: "/w".to_string(),
+            entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
+            error: None,
+            truncated: true,
+        });
+        let _ = painted(&p, 24, 4);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        // Rows are painted at y=1..2; the notice is at y=3.
+        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
+        assert_eq!(
+            p.on_mouse(0, 3, down),
+            PluginAction::None,
+            "the notice is not a row, however many rows exist below the fold"
+        );
+    }
+
+    #[test]
+    fn a_click_selects_and_a_second_click_activates() {
+        let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
+        let _ = painted(&p, 24, 5);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
+        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Leave);
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
+                path: "/w/b".to_string(),
+                command: None,
+                vertical: true,
+            }]
+        );
+        assert_eq!(p.on_mouse(0, 0, down), PluginAction::None, "not the header");
+    }
+
+    // -- Ruling 5: following the focused pane, and knowing when to stop -------
+
+    #[test]
+    fn a_focus_move_within_one_directory_does_not_disturb_the_panel() {
+        let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
+        p.on_key(key(KeyCode::Char('j')));
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        assert!(
+            p.take_requests().is_empty(),
+            "the same directory is not a move"
+        );
+        assert_eq!(p.rows[p.nav.selected()].name, "b");
+    }
+
+    #[test]
+    fn the_panel_follows_the_focused_pane_while_it_is_still_showing_its_directory() {
+        let mut p = at("/w", vec![entry("a", false)]);
+        p.on_event(&cwd(ConnId::Local, "/elsewhere"));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/elsewhere".to_string()
+            }]
+        );
+    }
+
+    /// Ruling 5, the one that matters: once the user has navigated away, a
+    /// focus change must NOT yank them back.
+    #[test]
+    fn once_the_user_has_navigated_away_a_focus_change_does_not_yank_them_back() {
+        let mut p = at("/w", vec![entry("src", true)]);
+        p.on_key(key(KeyCode::Enter)); // -> /w/src, by the user's own hand
+        p.take_requests();
+        p.on_event(&listing(ConnId::Local, "/w/src", vec![entry("f", false)]));
+        // The focused pane moves to a third directory.
+        p.on_event(&cwd(ConnId::Local, "/elsewhere"));
+        assert!(
+            p.take_requests().is_empty(),
+            "the user's place must survive a focus move"
+        );
+        assert_eq!(painted(&p, 20, 5)[0], "/w/src");
+    }
+
+    /// ...and following RESUMES once the panel is showing the pane's directory
+    /// again -- here because the pane caught up to where the user browsed.
+    #[test]
+    fn following_resumes_when_the_panel_and_the_pane_agree_again() {
+        let mut p = at("/w", vec![entry("src", true)]);
+        p.on_key(key(KeyCode::Enter)); // -> /w/src, by the user's own hand
+        p.take_requests();
+        p.on_event(&listing(ConnId::Local, "/w/src", Vec::new()));
+        // The pane cds to where the user is browsing. Nothing to re-list...
+        p.on_event(&cwd(ConnId::Local, "/w/src"));
+        assert!(
+            p.take_requests().is_empty(),
+            "the panel is already showing it"
+        );
+        // ...but the panel is anchored again, so the pane's NEXT move is
+        // followed.
+        p.on_event(&cwd(ConnId::Local, "/third"));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/third".to_string()
+            }]
+        );
+    }
+
+    /// A different MACHINE re-targets whatever the user was browsing: the tree
+    /// on screen belongs to a filesystem the focus is no longer on.
+    #[test]
+    fn a_move_to_another_server_re_targets_even_mid_navigation() {
+        let mut p = at("/w", vec![entry("src", true)]);
+        p.on_key(key(KeyCode::Enter));
+        p.take_requests();
+        p.on_event(&listing(ConnId::Local, "/w/src", Vec::new()));
+        p.on_event(&cwd(ConnId::Remote("pi".to_string()), "/w/src"));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Remote("pi".to_string()),
+                path: "/w/src".to_string()
+            }],
+            "the same PATH on another machine is a different directory, and the \
+             request must be ADDRESSED to that machine -- the client used to \
+             resolve the destination from its own foreground instead"
+        );
+    }
+
+    /// The worst case in the plugin surface, pinned: `Enter` must address the
+    /// machine the PANEL is on.
+    ///
+    /// The client used to route this to its own `foreground()`, on the argument
+    /// that the two are equal by construction. They are equal in the steady
+    /// state; the construction has a window, because `foreground()` moves on the
+    /// switch and the panel only learns of it from the new connection's first
+    /// tree push. An `OpenInSplit` sent into that window opens an editor on the
+    /// NEW machine at a path from the OLD one -- which does not fail, it creates
+    /// an empty file with an entirely plausible name.
+    #[test]
+    fn enter_opens_the_file_on_the_machine_the_panel_is_looking_at() {
+        let mut p = FilesPlugin::new(None);
+        let pi = ConnId::Remote("pi".to_string());
+        p.on_event(&cwd(pi.clone(), "/w"));
+        p.take_requests();
+        p.on_event(&listing(pi.clone(), "/w", vec![entry("f", false)]));
+        p.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::OpenInSplit {
+                conn: pi,
+                path: "/w/f".to_string(),
+                command: None,
+                vertical: true,
+            }],
+            "the request must name the panel's own connection; a path from one \
+             machine opened on another creates a file rather than editing one"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cwd_is_not_a_move() {
+        let mut p = at("/w", vec![entry("a", false)]);
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
+        assert!(p.take_requests().is_empty());
+        assert_eq!(painted(&p, 20, 4)[0], "/w");
+    }
+
+    // -- Correlation ---------------------------------------------------------
+
+    #[test]
+    fn a_listing_for_another_path_is_not_claimed() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        p.on_event(&listing(
+            ConnId::Local,
+            "/somewhere/else",
+            vec![entry("x", false)],
+        ));
+        assert_eq!(
+            painted(&p, 20, 4)[1],
+            "loading…",
+            "another panel's answer must not populate this one"
+        );
+    }
+
+    /// The same path on two machines is two different directories, and the
+    /// panel must not accept the wrong server's answer for it.
+    #[test]
+    fn a_listing_from_another_server_for_the_same_path_is_not_claimed() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/home/me"));
+        p.take_requests();
+        p.on_event(&listing(
+            ConnId::Remote("pi".to_string()),
+            "/home/me",
+            vec![entry("wrong-machine", false)],
+        ));
+        assert_eq!(painted(&p, 24, 4)[1], "loading…");
+        p.on_event(&listing(
+            ConnId::Local,
+            "/home/me",
+            vec![entry("right-machine", false)],
+        ));
+        assert_eq!(painted(&p, 24, 4)[1], "right-machine");
+    }
+
+    #[test]
+    fn a_dropped_connection_clears_the_tree_it_described() {
+        let mut p = at("/w", vec![entry("a", false)]);
+        p.on_event(&PluginEvent::ConnectionLost {
+            conn: ConnId::Local,
+        });
+        assert_eq!(painted(&p, 20, 4)[1], "no directory");
+    }
+
+    #[test]
+    fn another_connection_dropping_leaves_the_panel_alone() {
+        let mut p = at("/w", vec![entry("a", false)]);
+        p.on_event(&PluginEvent::ConnectionLost {
+            conn: ConnId::Remote("pi".to_string()),
+        });
+        assert_eq!(painted(&p, 20, 4)[1], "a");
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_selection_visible() {
+        let p_entries: Vec<DirEntry> = (1..=10).map(|i| entry(&format!("f{i}"), false)).collect();
+        let mut p = at("/w", p_entries);
+        p.on_key(key(KeyCode::Char('G')));
+        // 4 rows tall: header + 3 list rows, showing f8, f9, f10.
+        let rows = painted(&p, 20, 4);
+        assert_eq!(rows[3], "f10", "the selection must be on screen: {rows:?}");
+    }
+
+    #[test]
+    fn the_header_keeps_the_end_of_a_path_too_long_to_fit() {
+        let p = at("/home/me/a/very/deep/place", vec![entry("f", false)]);
+        assert_eq!(painted(&p, 8, 3)[0], "…p/place");
     }
 }

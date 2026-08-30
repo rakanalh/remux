@@ -10,14 +10,12 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
-use crate::client::view::PaneSnapshot;
 use crate::config::sidebar::PanelConfig;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
 
 pub mod agents;
-pub mod browser;
 pub mod files;
 pub mod nav;
 pub mod placeholder;
@@ -35,7 +33,7 @@ pub enum PluginAction {
     /// Move focus out of the sidebar, with no direction to offer.
     ///
     /// Distinct from [`PluginAction::LeaveTo`] on purpose. A panel that has been
-    /// asked to leave BECAUSE it did something -- `browser` opening a file in a
+    /// asked to leave BECAUSE it did something -- `files` opening a file in a
     /// split -- has no direction to give: it does not know which edge it is
     /// docked to, and the pane it wants the user in is the one the server just
     /// created, not a spatial neighbour. The two happen to be handled
@@ -91,20 +89,11 @@ pub enum PluginEvent {
     /// foreground moved to a remote -- and go on showing the OLD machine's
     /// directory.
     FocusedCwd { conn: ConnId, cwd: Option<String> },
-    /// The auxiliary pane this panel asked for exists. Delivered ONLY to the
-    /// panel that requested it; the pane id itself stays with the client, which
-    /// is what addresses the pane on the panel's behalf.
-    AuxPaneReady,
-    /// A fresh snapshot of this panel's auxiliary pane. Panel-targeted.
-    AuxPaneContent { snapshot: Box<PaneSnapshot> },
-    /// This panel's auxiliary pane is gone -- its program exited, or the
-    /// connection carrying it dropped. Panel-targeted.
-    AuxPaneExited,
     /// The contents of a directory on `conn`, as that server reported them.
     ///
     /// Broadcast rather than panel-targeted, and correlated by `(conn, path)`
     /// instead: a panel claims the listing it asked for and ignores the rest.
-    /// That is cheaper AND more honest than a correlation queue -- two browser
+    /// That is cheaper AND more honest than a correlation queue -- two `files`
     /// panels sitting in the same directory both genuinely want this answer, and
     /// a queue would hand it to one of them.
     DirectoryListing {
@@ -125,64 +114,28 @@ pub enum PluginEvent {
 /// Panels do not speak to servers: a panel says what it wants and the client
 /// sends it. What the client is allowed to RESOLVE, though, is narrower than it
 /// looks, and the difference is a correctness boundary rather than a style
-/// preference:
+/// preference: **the connection is NOT the client's to pick.** A panel driven by
+/// [`PluginEvent::FocusedCwd`] knows exactly which machine the path it is
+/// holding came from, and the client's `foreground()` is a DIFFERENT fact that
+/// moves first. Between a foreground switch and the `FocusedCwd` derived from
+/// the new connection's first tree push, the two disagree -- and a request
+/// routed by `foreground()` then carries one machine's path to another machine.
+/// For `OpenInSplit` that means an editor opening at a path that does not exist
+/// there, silently creating an empty file with a plausible name.
 ///
-/// * **The pane id** is genuinely the client's to resolve. A panel cannot know
-///   it -- it is assigned by whichever server answered -- which is what lets
-///   [`PluginEvent::AuxPaneReady`] and friends carry no addressing at all.
-///   `Subscribe`/`Input`/`Kill` therefore name no connection: the client looks
-///   both up together from its aux-pane table, so they cannot disagree.
-///   `Spawn` is the exception among the aux-pane requests -- there is no pane
-///   yet to look up, so it must say where the pane goes.
-/// * **The connection is NOT.** A panel driven by
-///   [`PluginEvent::FocusedCwd`] knows exactly which machine the path it is
-///   holding came from, and the client's `foreground()` is a DIFFERENT fact that
-///   moves first. Between a foreground switch and the `FocusedCwd` derived from
-///   the new connection's first tree push, the two disagree -- and a request
-///   routed by `foreground()` then carries one machine's path to another
-///   machine. For `OpenInSplit` that means an editor opening at a path that does
-///   not exist there, silently creating an empty file with a plausible name.
-///   So [`ListDirectory`](PluginRequest::ListDirectory),
-///   [`OpenInSplit`](PluginRequest::OpenInSplit) and
-///   [`Spawn`](PluginRequest::Spawn) carry the conn the PANEL is looking at, and
-///   the client routes where it is told. Those are all three of them; the class
-///   is closed, so a fourth reader of `foreground()` appearing here should be
-///   read as a bug rather than as a decision.
+/// So both [`ListDirectory`](PluginRequest::ListDirectory) and
+/// [`OpenInSplit`](PluginRequest::OpenInSplit) carry the conn the PANEL is
+/// looking at, and the client routes where it is told. Those are both of them;
+/// the class is closed, so a third reader of `foreground()` appearing here
+/// should be read as a bug rather than as a decision. (It was three until the
+/// two file panels merged: the deleted `Spawn` carried a conn for the identical
+/// reason.)
 ///
 /// This was reasoned away once, in a comment claiming the two were equal "by
 /// construction". They are equal in the steady state; the construction has a
 /// window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginRequest {
-    /// Spawn this panel's auxiliary pane on `conn`. Replaces any pane the panel
-    /// already has (the client kills the old one first), which is how a
-    /// re-target to a new directory works.
-    ///
-    /// `conn` for the same reason `ListDirectory` carries one: `cwd` came from
-    /// this panel's [`PluginEvent::FocusedCwd`], so it names a directory on that
-    /// machine, and the client's `foreground()` may already have moved on. The
-    /// usual re-target is safe by luck -- it is triggered BY a `FocusedCwd`, so
-    /// the target is current -- but a panel RESIZE inside the switch window
-    /// spawns too, and would have started the file manager on the new machine in
-    /// the old machine's directory. Nothing is created; it lands in `$HOME`, or
-    /// in a same-named directory that happens to exist there, which is a
-    /// plausible-looking wrong answer rather than an error.
-    Spawn {
-        conn: ConnId,
-        cols: u16,
-        rows: u16,
-        command: String,
-        cwd: Option<String>,
-    },
-    /// (Re-)subscribe to this panel's aux pane at this size. Sent on every size
-    /// change, exactly as a View cell re-subscribes: the size demand is folded
-    /// into the pane's min-across-viewers effective size, so the pane reflows to
-    /// the panel with no second sizing policy.
-    Subscribe { cols: u16, rows: u16 },
-    /// Raw bytes for this panel's aux pane.
-    Input { data: Vec<u8> },
-    /// Kill this panel's aux pane and forget it.
-    Kill,
     /// List this directory on `conn`. Answered by a
     /// [`PluginEvent::DirectoryListing`] broadcast, which the panel claims by
     /// `(conn, path)` -- so this must be the SAME conn the panel will correlate
@@ -241,18 +194,11 @@ pub trait SidebarPlugin: Send {
     /// The panel has been laid out at this size. Called once per repaint pass
     /// for every panel the chrome actually placed, before anything is drawn.
     ///
-    /// This is where a panel that owns a resource learns it has somewhere to put
-    /// it: `render` takes `&self`, so a lazily-spawned aux pane cannot be
-    /// started from there. A panel dropped for being below its minimum is not
-    /// called at all, so one that has never been laid out never starts anything.
-    ///
-    /// That is NOT the same as "a hidden panel costs nothing", and `files` is
-    /// where the difference shows. Hiding the sidebar stops the `on_size` calls
-    /// but changes nothing else: the aux pane stays spawned and subscribed, and
-    /// every `PaneContent` it produces still drives a paint. Deliberate --
-    /// keeping the pane is exactly what makes un-hiding instant, and killing it
-    /// would cost the user their place in the file manager every time the
-    /// sidebar was toggled.
+    /// This is where a panel that needs to ACT on being visible does so:
+    /// `render` takes `&self`, so nothing can be started from there. A panel
+    /// dropped for being below its minimum is not called at all, so one that has
+    /// never been laid out never starts anything -- and a hidden sidebar stops
+    /// the calls, which is what makes a hidden panel free.
     fn on_size(&mut self, _cols: u16, _rows: u16) {}
 
     /// Hand over anything the plugin needs the client to do. Drained once per
@@ -287,29 +233,57 @@ pub trait SidebarPlugin: Send {
 /// panel, so a config naming a not-yet-implemented plugin still loads.
 ///
 /// The whole entry rather than just the name, because a plugin may need options
-/// from it -- and may REFUSE the entry. `files` does: it has no default command,
-/// so a panel that names no program is skipped with a warning rather than
-/// spawning an arbitrary one in a PTY the user then has to hunt down.
+/// from it -- and because two of its fields are now MIGRATIONS, which is a
+/// decision this function is the only place to make.
+///
+/// ## `plugin = "browser"` is aliased; `command` is not
+///
+/// The two file panels merged: the built-in browser took the `files` name, and
+/// the plugin that hosted `nnn`/`yazi`/`ranger` in an auxiliary pane is gone.
+/// Two things in an existing config point at the old world, and they are
+/// treated in OPPOSITE ways on purpose -- alias where the old spelling maps to
+/// the right behaviour, ignore where it maps to the wrong one:
+///
+/// * **`plugin = "browser"` is accepted**, with a warning. It named this exact
+///   panel, so honouring it is correct; and refusing it would fall through to
+///   the unknown-plugin rule, which SKIPS the panel -- the user's sidebar would
+///   quietly come back missing a panel with only a log line to say why.
+/// * **`command` is accepted and then IGNORED**, with a warning naming `editor`.
+///   Aliasing it to `editor` was the obvious move and is wrong in both
+///   directions. On an old `browser` panel `command` was already the editor, and
+///   it is precisely the field that made a `command = "nnn"` copied from a
+///   `files` panel open every file in `nnn` -- the reported bug, preserved. On
+///   an old `files` panel it named a FILE MANAGER, and calling that an editor is
+///   nonsense. Ignored, both configs fall back to the server's `$EDITOR`, which
+///   is what the user wanted in each case.
+///
+/// The field is still declared in [`PanelConfig`] rather than deleted: serde
+/// ignores unknown keys silently, so deleting it would take the warning with it
+/// and leave the user with a config line that does nothing and says nothing.
 pub fn make_plugin(cfg: &PanelConfig) -> Option<Box<dyn SidebarPlugin>> {
+    if cfg.command.is_some() {
+        log::warn!(
+            "sidebar: `command` is no longer read (panel plugin = {:?}). It meant the file \
+manager to the old `files` plugin, which has been removed, and the editor to `browser`, \
+which is now `files` -- one field, two meanings, which is why a `command` copied between \
+them opened files in a file manager. Use `editor` to override the editor; delete it to use \
+the server's $EDITOR.",
+            cfg.plugin
+        );
+    }
     match cfg.plugin.as_str() {
         "placeholder" => Some(Box::new(placeholder::PlaceholderPlugin::new())),
         "sessions" => Some(Box::new(sessions::SessionsPlugin::new())),
         "agents" => Some(Box::new(agents::AgentsPlugin::new())),
-        // `command` is OPTIONAL here, and means the opposite of what it means
-        // to `files`: not "the program this panel hosts" (there is none -- the
-        // browser is built in) but "the editor to open a file with", overriding
-        // the server's own `$EDITOR`. A panel that names none is perfectly
-        // usable, which is the whole point of shipping it.
-        "browser" => Some(Box::new(browser::BrowserPlugin::new(cfg.command.clone()))),
-        "files" => match &cfg.command {
-            Some(command) => Some(Box::new(files::FilesPlugin::new(command.clone()))),
-            None => {
-                log::warn!(
-                    "sidebar: the `files` plugin requires a `command` (e.g. command = \"yazi\"); skipping this panel"
-                );
-                None
-            }
-        },
+        "files" => Some(Box::new(files::FilesPlugin::new(cfg.editor.clone()))),
+        "browser" => {
+            log::warn!(
+                "sidebar: the `browser` plugin has been renamed to `files` (and the old \
+`files` plugin, which hosted nnn/yazi/ranger, has been removed). Loading it as `files`; \
+rename it in your config."
+            );
+            Some(Box::new(files::FilesPlugin::new(cfg.editor.clone())))
+        }
         _ => None,
     }
 }
@@ -410,7 +384,8 @@ pub fn draw_text(
 /// is what identifies where you are, and it is the part a left-truncating
 /// header would throw away first.
 ///
-/// Shared by every panel whose header is a directory (`files`, `browser`).
+/// Used by the `files` panel's header, and kept general for anything else whose
+/// header is a directory.
 pub fn shorten_path(path: &str, width: usize) -> String {
     let chars: Vec<char> = path.chars().collect();
     if chars.len() <= width || width == 0 {

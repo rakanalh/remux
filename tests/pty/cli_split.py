@@ -25,10 +25,14 @@ What is covered:
   5. `remux split` **outside** a pane refuses, names `$REMUX_SESSION`, and exits
      non-zero -- it must never guess a session, because guessing is how a script
      splits a window nobody was looking at.
-  6. An **aux pane**'s `REMUX_PANE` names the pane it was spawned FOR, not
-     itself. This is ruling 2, and it is the whole feature for a `files` user:
-     it is what makes an opener hook land the editor beside the user's work
-     rather than trying to subdivide a sidebar.
+  6. `remux split` still works from a pane with a SIDEBAR up -- the layout a
+     `files` user is actually sitting in, and the one where the pane the
+     command lands in is not the one occupying the whole terminal.
+
+     This case used to assert ruling 2 as well: that an **aux pane**'s
+     `REMUX_PANE` named the pane it was spawned FOR rather than itself, which is
+     what made an `nnn` opener land the editor beside the user's work. Aux panes
+     went with the old `files` plugin, and every pane now names itself.
 
 **A note on every marker below.** A shell ECHOES the line it is given, so a
 marker that appears literally in the typed command is on screen whether or not
@@ -299,9 +303,8 @@ finally:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 -- ruling 2: an aux pane names the pane it was spawned FOR
+# Phase 2 -- `remux split` from a pane with a sidebar up
 # ---------------------------------------------------------------------------
-STANDIN = f"{RUNDIR}/standin.sh"
 CONFIG = f"""
 [[sidebar]]
 edge = "left"
@@ -310,51 +313,16 @@ visible = true
 
   [[sidebar.panel]]
   plugin = "files"
-  command = "{STANDIN}"
 """
 
 env2 = make_env(CONFIG)
-# Written after make_env, which wipes RUNDIR. The stand-in prints the identity
-# it was given and then sits still, exactly like the `files` stand-in elsewhere.
-# It assembles `AUX:[...]` itself; nothing types that string.
-with open(STANDIN, "w") as fh:
-    fh.write('#!/bin/sh\n'
-             'printf "AUX:[%s][%s]\\n" "$REMUX_SESSION" "$REMUX_PANE"\n'
-             'while IFS= read -r line; do echo "K:$line"; done\n')
-os.chmod(STANDIN, 0o755)
-
 child2, screen2, pump2 = spawn(env2)
 try:
-    def panel_line(prefix):
-        for row in screen2.display:
-            cell = row[:SIDEBAR_W].strip("│╭╮╰╯─├┤ ")
-            if cell.startswith(prefix):
-                return cell
-        return None
+    # Give the sidebar a moment to paint before splitting behind it.
+    pump2(2.0)
 
-    end = time.time() + 10
-    line = None
-    while time.time() < end and line is None:
-        pump2(0.4)
-        line = panel_line("AUX:[")
-    check(line is not None, "the files panel's aux pane printed its identity")
-    if line is None:
-        dump(screen2, "aux panel")
-
-    check(line is not None and line.startswith("AUX:[main]["),
-          f"an aux pane's REMUX_SESSION is the requesting client's session (got {line!r})")
-
-    # The session's real pane is the FIRST pane the server ever minted, so it is
-    # id 1; the aux pane is minted afterwards and cannot be. Asserting the exact
-    # value is what makes this a test of ruling 2 rather than of "some number is
-    # present" -- pointing REMUX_PANE at the aux pane itself would print a 2 here
-    # and an `nnn` opener would then try to subdivide the sidebar.
-    check(line == "AUX:[main][1]",
-          f"an aux pane's REMUX_PANE names the pane it was spawned FOR, not itself "
-          f"(got {line!r}, want 'AUX:[main][1]')")
-
-    # And the whole thing still works in the configuration a `files` user is
-    # actually in: a sidebar up, splitting from the real pane beside it.
+    # The configuration a `files` user is actually in: a sidebar up, splitting
+    # from the real pane beside it.
     child2.send(b"\x1bl")  # Alt+l: into the pane, if focus happens to be in the sidebar
     pump2(0.5)
     child2.send(f"{BIN} split -- {RUNNER} charlie".encode() + b"\r")

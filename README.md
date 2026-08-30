@@ -75,8 +75,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 
 - **Sidebars** — client-side panels docked to the **left**, **right**, and/or **bottom** edge; one sidebar per edge, up to three at once, each stacking one or more plugin **panels**. They are chrome, not panes: the server never sees them, they take their slice of the terminal and hand the panes what is left. There are none by default — declare `[[sidebar]]` / `[[sidebar.panel]]` to opt in.
 - **`sessions` panel** — the session-manager tree, live in a sidebar instead of an overlay: every session, tab, and pane across the local server and every connected remote, refreshed by the server as things change. `Enter` jumps to whatever is selected.
-- **`browser` panel** — a built-in file browser with **nothing to configure**. `j`/`k` move, `l`/`h` (or the arrows) descend and go up, `.` toggles hidden entries, and **`Enter` on a file opens it in a split running an editor** — taking the keyboard with it, so you land in the editor rather than in the sidebar. The listing and the editor both come from the **server**, so pointing it at a pane on a remote browses and edits *that* machine.
-- **`files` panel** — your own file manager (`yazi`, `nnn`, `ranger`, …) running live in a panel, in the focused pane's directory. `command` is required and names the program. Use this instead of `browser` when you have already tuned a file manager to your liking.
+- **`files` panel** — a built-in file browser with **nothing to configure**, following the focused pane's directory. `j`/`k` move, `l`/`h` (or the arrows) descend and go up, `.` toggles hidden entries, and **`Enter` on a file opens it in a split running an editor** — taking the keyboard with it, so you land in the editor rather than in the sidebar. The listing and the editor both come from the **server**, so pointing it at a pane on a remote browses and edits *that* machine. (It was called `browser` until the two file panels merged; the old name still loads, with a warning. See [Migrating](#migrating-from-browser--the-old-files).)
 - **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
 - **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` cycles focus between them. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
 - **They follow the focused pane** — the file panels show the directory of the pane you are focused **on**, and it updates when **focus** moves, not when you `cd`. Focus a pane on a remote and they list that machine.
@@ -192,7 +191,7 @@ remux new-tab -c ~/project                     # a new tab, starting in ~/projec
 
 Run outside a pane, both refuse and say so rather than guessing a session — guessing is how a script splits a window you were not looking at.
 
-This is what makes an external file manager's opener hook work: point `NNN_OPENER`, yazi's `[opener]`, or ranger's `rifle.conf` at `remux split -- $EDITOR "$1"` and files open beside your work. The built-in [`browser` panel](#sidebars--plugins) needs none of this — it is part of the client and talks to the server directly.
+This is what makes an external file manager's opener hook work: point `NNN_OPENER`, yazi's `[opener]`, or ranger's `rifle.conf` at `remux split -- $EDITOR "$1"` and files open beside your work — run your file manager in an ordinary pane and it behaves as it always did. The built-in [`files` panel](#sidebars--plugins) needs none of this: it is part of the client and talks to the server directly.
 
 ### Configuration file
 
@@ -507,7 +506,7 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `[appearance.theme]` — per-role colors (named / hex / `{ ansi = N }` / `{ rgb = [r,g,b] }`); defaults are Catppuccin Mocha.
 - **`[modes.command]`**
   - `timeout_ms` — delay before the which-key popup appears (default 500).
-- **`[[sidebar]]` / `[[sidebar.panel]]`** — dock panels to an edge. One sidebar per edge; `edge` and `size` are required, `visible` defaults to true. Each panel names a `plugin` (`sessions`, `browser`, `files`, `agents`) and optionally a `weight` (its share of the sidebar) and a `command`. Nothing is docked by default:
+- **`[[sidebar]]` / `[[sidebar.panel]]`** — dock panels to an edge. One sidebar per edge; `edge` and `size` are required, `visible` defaults to true. Each panel names a `plugin` (`sessions`, `files`, `agents`) and optionally a `weight` (its share of the sidebar) and, for `files`, an `editor`. Nothing is docked by default:
 
 ```toml
 [[sidebar]]
@@ -518,10 +517,21 @@ size = 30
   plugin = "sessions"
 
   [[sidebar.panel]]
-  plugin = "browser"        # zero-config; `command` here would override $EDITOR
+  plugin = "files"          # zero-config; `editor = "hx"` would override $EDITOR
 ```
 
-  `command` means different things to the two file panels: to `files` it is the file manager to run and is **required**; to `browser` it is an optional editor override. An unknown plugin name is skipped with a warning rather than rejected, so a config written for a newer Remux still loads.
+  An unknown plugin name is skipped with a warning rather than rejected, so a config written for a newer Remux still loads.
+
+#### Migrating from `browser` / the old `files`
+
+  There used to be two file panels: `browser` (built in) and `files` (which ran `yazi`/`nnn`/`ranger` inside the panel). They have merged — the built-in one took the `files` name and the hosted-file-manager plugin is gone. Two lines in an older config point at the old world:
+
+  | Old | Now |
+  |---|---|
+  | `plugin = "browser"` | still loads, with a warning — rename it to `"files"` |
+  | `command = "…"` | **ignored**, with a warning — delete it (use `editor` if you meant an editor override) |
+
+  `command` is ignored rather than renamed because it meant opposite things to the two panels: the *file manager to run* to old-`files`, the *editor to open a file with* to `browser`. That is precisely how a `command = "nnn"` copied between them ended up opening every file in `nnn`. Ignored, `Enter` falls back to the server's `$EDITOR` — which is what you wanted in either case. To keep a file manager, run it in an ordinary pane and point its opener hook at [`remux split`](#talking-to-remux-from-inside-a-pane).
 - **`[agents]` / `[[agents.pattern]]`** — what the `agents` panel counts as an agent and how it decides one is blocked on you. `commands` lists the programs (default `claude`, `codex`, `aider`, `gemini`); each `[[agents.pattern]]` is a regex matched against the bottom of the pane's screen, and a match means *needs input*. Defaults ship for `claude` and `codex`, so this is optional. Two things worth knowing:
   - **The `codex` patterns are an unverified guess.** The `claude` ones are taken from wordings actually present in the Claude Code binary; Codex was not installed to check against. If you run Codex and the panel never turns red, this is the section to correct.
   - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings, theme, and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.

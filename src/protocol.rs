@@ -45,17 +45,19 @@ pub enum ConnDescriptor {
 /// this number exists to prevent. Merging the two therefore resolves to 6 so
 /// that no build of either lineage can be mistaken for the merged protocol.
 ///
-/// 6 -> 7: the file-manager sidebar plugin. Adds
-/// [`ClientMessage::SpawnAuxPane`]/[`ClientMessage::KillAuxPane`] and
-/// [`ServerMessage::AuxPaneSpawned`], the `cwd`/`is_active` session-tree fields
-/// those need to follow the focused pane, and
-/// [`ServerMessage::SessionBorderStyle`].
+/// 6 -> 7: the file-manager sidebar plugin. Added `SpawnAuxPane`/`KillAuxPane`
+/// and `AuxPaneSpawned` (all three removed again at 11), the `cwd`/`is_active`
+/// session-tree fields those needed to follow the focused pane, and
+/// [`ServerMessage::SessionBorderStyle`]. The session-tree fields stayed: the
+/// `files` panel still follows the focused pane's directory, it just lists it
+/// over the wire now instead of running a file manager in a PTY.
 ///
 /// 7 -> 8: the agents sidebar plugin. Adds
 /// [`ClientMessage::SubscribeAgents`]/[`ClientMessage::UnsubscribeAgents`] and
 /// [`ServerMessage::AgentList`].
 ///
-/// 8 -> 9: the built-in `browser` sidebar plugin. Adds
+/// 8 -> 9: the built-in file-browser sidebar plugin, then called `browser` and
+/// since renamed `files`. Adds
 /// [`ClientMessage::ListDirectory`]/[`ServerMessage::DirectoryListing`] and
 /// [`ClientMessage::OpenInSplit`]. (Recorded after the fact, so the list has no
 /// gap where the next entry begins.)
@@ -63,7 +65,16 @@ pub enum ConnDescriptor {
 /// 9 -> 10: the CLI subcommands. Adds [`ClientMessage::CliSpawn`] and
 /// [`ServerMessage::CliSpawned`], the pair that lets a process INSIDE a pane ask
 /// the server for a new one -- `remux split`, `remux new-tab`.
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// 10 -> 11: the two file panels merged into one. REMOVES
+/// `ClientMessage::SpawnAuxPane`, `ClientMessage::KillAuxPane` and
+/// `ServerMessage::AuxPaneSpawned` -- the aux-pane machinery existed solely to
+/// host the old `files` plugin's `nnn`/`yazi`/`ranger`, and that plugin is gone;
+/// the built-in browser took its name. A removal is exactly as breaking as an
+/// addition in the direction that matters here: an old client sending
+/// `SpawnAuxPane` to a new server gets a message the server cannot parse, so the
+/// bump is what turns that into a refused handshake instead.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -316,46 +327,13 @@ pub enum ClientMessage {
     /// explicitly -- this is what a focused View cell uses to type into the
     /// real pane it aliases, wherever that pane actually lives.
     InputToPane { pane_id: PaneId, data: Vec<u8> },
-    /// Spawn an **auxiliary pane**: a PTY that belongs to no layout tree, owned
-    /// by the requesting client and reaped when that client goes away.
-    ///
-    /// This is the server half of a sidebar panel that hosts a full-screen TUI
-    /// (the `files` plugin's file manager). It is not a new concept on the
-    /// server: `spawn_pane` already inserts into the flat pane map and touches
-    /// no layout, and everything that enumerates panes for display or
-    /// persistence walks a `LayoutNode` -- so an aux pane is invisible to the
-    /// session tree, to `remux` layouts and to save/restore by construction.
-    ///
-    /// `command` is REQUIRED (no default shell fallback): the plugin exists to
-    /// host a specific program, and a wrong guess spawns something the user then
-    /// has to hunt down and kill. `cwd` is the directory to start it in; `None`
-    /// inherits the server's.
-    ///
-    /// Answered with [`ServerMessage::AuxPaneSpawned`]. The client then
-    /// `SubscribePane`s the returned id exactly as a View cell does -- the whole
-    /// streaming half is the Views machinery unchanged.
-    SpawnAuxPane {
-        cols: u16,
-        rows: u16,
-        command: String,
-        cwd: Option<String>,
-    },
-    /// Kill an auxiliary pane this client spawned. Ignored for a pane this
-    /// connection does not own, so one client can never reap another's.
-    ///
-    /// The clean counterpart to the disconnect reap: a panel re-targeting to a
-    /// new directory kills its old pane rather than waiting for the client to
-    /// exit.
-    KillAuxPane { pane_id: PaneId },
     /// List the contents of `path` **on this server's filesystem**.
     ///
-    /// The `browser` sidebar panel's one question. It goes over the wire rather
+    /// The `files` sidebar panel's one question. It goes over the wire rather
     /// than being a client-side `read_dir` because the panel follows the FOCUSED
     /// pane's directory, and that pane is routinely on a remote: a client-side
     /// listing would show the client's own `/home/you` and look entirely
-    /// plausible while describing the wrong machine. `files` gets this right for
-    /// free by running its file manager on the server; the built-in browser has
-    /// to earn it.
+    /// plausible while describing the wrong machine.
     ///
     /// `path` must be absolute, and the server ENFORCES it rather than trusting
     /// this sentence: a relative path would resolve against the server PROCESS's
@@ -412,8 +390,8 @@ pub enum ClientMessage {
     /// caller is sitting in.** `REMUX_SESSION` picks the machine and the session;
     /// live focus picks the spot. This is tmux's behaviour, and it is the
     /// behaviour that survives the user moving focus after the calling process
-    /// started -- an environment variable is fixed at spawn time, and an aux
-    /// pane's is fixed at a moment that may be hours stale.
+    /// started -- an environment variable is fixed at spawn time and may be
+    /// hours stale.
     ///
     /// `argv` is the program and its arguments; **empty means the login shell**,
     /// exactly as an interactive split gets. `cwd` of `None` inherits the target
@@ -625,21 +603,6 @@ pub enum ServerMessage {
     /// session and switch to another, and they disagree the other way round.
     /// This is the message that lets an attach resync them.
     SessionBorderStyle { style: crate::config::BorderStyle },
-    /// Answer to [`ClientMessage::SpawnAuxPane`]: the id of the pane just
-    /// spawned, or `None` if the spawn failed.
-    ///
-    /// No correlation id. A client requests at most one aux pane per panel and
-    /// its requests are serialised by the single per-connection writer task, so
-    /// answers arrive in request order; the client matches them against a FIFO
-    /// of pending requesters.
-    ///
-    /// **That design is why failure must still be answered.** A request that got
-    /// no reply would sit at the head of the client's queue for ever and claim
-    /// the NEXT panel's answer -- one panel showing another's directory, the
-    /// other waiting on "starting…" with no way back. Nothing forbids two
-    /// `files` panels, so `None` is not a formality: it is what keeps the
-    /// correlation-free matching honest.
-    AuxPaneSpawned { pane_id: Option<PaneId> },
     /// Answer to a successful [`ClientMessage::CliSpawn`]: the id of the pane
     /// that was created.
     ///

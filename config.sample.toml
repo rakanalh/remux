@@ -587,29 +587,21 @@
 #             siblings (default: 1). Two panels at weights 2 and 1 split the
 #             sidebar two-thirds / one-third. A single panel takes it all, so
 #             the weight is irrelevant until there are two.
-#   command — means DIFFERENT things to the two plugins that read it, and is
-#             ignored by the rest:
-#               `files`   — the file manager to run. REQUIRED; there is no
-#                           default.
-#               `browser` — the editor to open a file with, OVERRIDING the
-#                           server's own $EDITOR. Optional; the point of the
-#                           built-in browser is that it needs no configuration.
+#   editor  — the editor the `files` panel opens a file with, OVERRIDING the
+#             server's own $EDITOR. Optional and usually absent; the server
+#             already knows $EDITOR. Ignored by every other plugin.
+#   command — REMOVED. See "Migrating from `browser` / the old `files`" below.
 #
 # Available plugins:
-#
-# `browser` and `files` both give you files in a sidebar and you want ONE of
-# them, not both. The short version: **`browser` is the zero-config default;
-# `files` is for people who have already tuned yazi, nnn or ranger and want that
-# instead.** Start with `browser`. Nothing is lost by switching later.
 #
 #   sessions    — a live tree of every session, tab and pane across the local
 #                 server and every connected remote. It refreshes by itself when
 #                 the server's tree changes; Enter jumps to whatever is selected.
-#   browser     — a built-in file browser. NO configuration: no `command`, no
-#                 opener hook, nothing to install.
+#   files       — a built-in file browser. NO configuration: nothing to set,
+#                 no opener hook, nothing to install.
 #
 #                   [[sidebar.panel]]
-#                   plugin = "browser"
+#                   plugin = "files"
 #
 #                 `j`/`k` (or the arrows) move, `g`/`G` jump to the ends, `l` or
 #                 Right descends into the selected directory, `h` or Left goes
@@ -624,7 +616,7 @@
 #                 open a file; only Enter does. A key that sometimes launches an
 #                 editor is a key nobody presses confidently.
 #
-#                 The editor is resolved ON THE SERVER: `command` here if you
+#                 The editor is resolved ON THE SERVER: `editor` here if you
 #                 set one, else the server's own $EDITOR, else `vi`. That is not
 #                 a detail — the file is on the server, so the editor has to be
 #                 too, and your own $EDITOR may name a binary the remote has
@@ -635,27 +627,6 @@
 #                 cannot read shows the reason — "permission denied" is an
 #                 answer, and an empty panel that might mean "empty" and might
 #                 mean "denied" is not.
-#   files       — a real file manager, running in the directory of the pane you
-#                 are focused on. Use this instead of `browser` when you already
-#                 have a file manager configured the way you like it.
-#                 `command` is REQUIRED and names the program:
-#
-#                   command = "yazi"     command = "nnn"     command = "ranger"
-#
-#                 There is no default and no auto-detection on purpose — the
-#                 three take different flags and behave differently, and a wrong
-#                 guess spawns the wrong program in a terminal you then have to
-#                 find and kill. A `files` panel with no `command` is skipped
-#                 with a warning.
-#
-#                 Keys go straight to the program while the panel has focus, so
-#                 it is driven exactly as it is in a pane; Escape leaves the
-#                 panel, as it does for every other one. The directory is
-#                 followed when the FOCUSED PANE CHANGES, not on every `cd`:
-#                 re-targeting restarts the program, which would throw away
-#                 where you had navigated to. If the program exits, the panel
-#                 says so and `r` restarts it — it is never respawned
-#                 automatically, or a command that dies instantly would spin.
 #   agents      — the panes running an AI coding agent (`claude`, `codex`, ...),
 #                 on the local server and every connected remote, each with a
 #                 colour-coded state: RED needs your input, YELLOW is working,
@@ -666,15 +637,38 @@
 #   placeholder — a fixed test fixture that paints its own name and size. Useful
 #                 for checking geometry; there is no reason to configure it.
 #
-# THE DIRECTORY BOTH FILE PANELS FOLLOW IS THE FOCUSED PANE'S, and it updates
+# Migrating from `browser` / the old `files`
+# ------------------------------------------
+# There used to be TWO file panels: `browser` (this one, built in) and `files`
+# (which ran yazi/nnn/ranger in the panel). They have merged — the built-in one
+# took the `files` name, and the hosted-file-manager plugin is gone. Two lines
+# in an older config point at the old world, and they are treated differently on
+# purpose:
+#
+#   plugin = "browser"   still works, with a warning. Rename it to "files".
+#   command = "..."      is IGNORED, with a warning. Delete it.
+#
+# `command` is ignored rather than renamed because it meant two opposite things:
+# the FILE MANAGER to run to the old `files`, and the EDITOR to open a file with
+# to `browser`. That is exactly how a `command = "nnn"` copied from one to the
+# other ended up opening every file in nnn. With it ignored, Enter falls back to
+# the server's $EDITOR, which is what you wanted either way. If you did mean to
+# override the editor, say `editor = "hx"`.
+#
+# What you lose by the merge is a file manager's own key bindings and previews.
+# What you keep is a panel that works with nothing installed, over a remote, and
+# with no opener hook (NNN_OPENER, yazi's [opener], rifle.conf) wired up to
+# `remux split`.
+#
+# THE DIRECTORY THE FILE PANEL FOLLOWS IS THE FOCUSED PANE'S, and it updates
 # when FOCUS moves — not when you `cd`. This is the first thing that looks
 # broken: you type `cd ~/project` in a pane, the panel does not move, and it
 # reads as a bug. It is not. Remux learns a pane's directory by asking the
 # operating system where that pane's process is, and it asks when the tree
 # changes — a pane gaining or losing focus, being created, or exiting. To point
-# a panel somewhere, move the focus there (or, in `browser`, just navigate:
-# `h`/`l` go wherever you like, and the panel stops following focus for as long
-# as you are somewhere you chose yourself).
+# a panel somewhere, move the focus there (or just navigate: `h`/`l` go wherever
+# you like, and the panel stops following focus for as long as you are somewhere
+# you chose yourself).
 #
 # It also follows the pane's MACHINE. Focus a pane on a remote and the panel
 # lists that remote's filesystem, because that is where the pane is; the same
@@ -725,17 +719,10 @@
 #   weight = 1
 #
 #   [[sidebar.panel]]
-#   plugin = "browser"
-#   weight = 1
-#
-# Swap that second panel for `files` if you would rather drive your own file
-# manager, and add an `agents` panel on another edge to watch what your AI
-# agents are doing:
-#
-#   [[sidebar.panel]]
 #   plugin = "files"
-#   command = "yazi"
 #   weight = 1
+#
+# Add an `agents` panel on another edge to watch what your AI agents are doing:
 #
 # [[sidebar]]
 # edge = "right"

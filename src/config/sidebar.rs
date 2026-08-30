@@ -26,14 +26,27 @@ pub struct PanelConfig {
     /// Share of the sidebar this panel claims relative to its siblings.
     #[serde(default = "default_weight")]
     pub weight: u16,
-    /// The program a plugin that hosts one should run, e.g. `"yazi"`, `"nnn"`
-    /// or `"ranger"` for the `files` plugin.
+    /// The editor the `files` panel should open a file with, overriding the
+    /// server's own `$EDITOR`. Optional, and normally absent -- the server
+    /// already knows `$EDITOR`, and it is the server's answer that matters
+    /// because the editor has to exist where the FILE is.
     ///
-    /// REQUIRED by `files` and ignored by every other plugin. There is
-    /// deliberately no default and no auto-detection: the three file managers
-    /// take different flags and behave differently, and a wrong guess spawns the
-    /// wrong program in a PTY the user then has to find and kill. A `files`
-    /// panel without one is skipped with a warning (see `make_plugin`).
+    /// Ignored by every other plugin.
+    #[serde(default)]
+    pub editor: Option<String>,
+    /// DEPRECATED and ignored. Parsed only so that a config still carrying it
+    /// gets a warning naming [`PanelConfig::editor`] instead of silence.
+    ///
+    /// It used to mean two different things: the FILE MANAGER to run to the old
+    /// `files` plugin (required), and the EDITOR to open a file with to
+    /// `browser` (optional). The two panels have since merged, and that
+    /// ambiguity is why -- a `command = "nnn"` copied from one to the other
+    /// dutifully opened every file in `nnn`. See `make_plugin`, which is where
+    /// the warning lives and where the decision NOT to alias it to `editor` is
+    /// argued.
+    ///
+    /// Kept in the struct rather than deleted because serde ignores unknown keys
+    /// silently: deleting it would take the warning with it.
     #[serde(default)]
     pub command: Option<String>,
 }
@@ -46,6 +59,7 @@ impl PanelConfig {
         Self {
             plugin: plugin.to_string(),
             weight: 1,
+            editor: None,
             command: None,
         }
     }
@@ -112,6 +126,7 @@ visible = true
         assert_eq!(cfg[0].panel[0].plugin, "sessions");
         assert_eq!(cfg[0].panel[0].weight, 2);
         assert_eq!(cfg[0].panel[1].plugin, "agents");
+        assert_eq!(cfg[0].panel[0].editor, None);
         assert_eq!(cfg[0].panel[0].command, None);
     }
 
@@ -164,7 +179,7 @@ size = 4
     }
 
     #[test]
-    fn a_panel_command_is_parsed_and_optional() {
+    fn a_panel_editor_is_parsed_and_optional() {
         let cfg = parse(
             r#"
 [[sidebar]]
@@ -173,14 +188,38 @@ size = 40
 
   [[sidebar.panel]]
   plugin = "files"
-  command = "yazi"
+  editor = "hx"
 
   [[sidebar.panel]]
   plugin = "sessions"
 "#,
         );
-        assert_eq!(cfg[0].panel[0].command.as_deref(), Some("yazi"));
-        assert_eq!(cfg[0].panel[1].command, None);
+        assert_eq!(cfg[0].panel[0].editor.as_deref(), Some("hx"));
+        assert_eq!(cfg[0].panel[1].editor, None);
+    }
+
+    /// A config still carrying the removed field must LOAD -- rejecting it
+    /// would cost the user their whole sidebar over a line that is merely
+    /// stale. It is `make_plugin` that warns about it and declines to read it.
+    #[test]
+    fn a_leftover_command_still_parses_and_is_kept_for_the_warning() {
+        let cfg = parse(
+            r#"
+[[sidebar]]
+edge = "right"
+size = 40
+
+  [[sidebar.panel]]
+  plugin = "files"
+  command = "nnn"
+"#,
+        );
+        assert_eq!(cfg[0].panel[0].command.as_deref(), Some("nnn"));
+        assert_eq!(
+            cfg[0].panel[0].editor, None,
+            "`command` must NOT be aliased to `editor`: that is what made a \
+             file manager copied from the old `files` plugin open every file in it"
+        );
     }
 
     #[test]

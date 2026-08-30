@@ -33,14 +33,14 @@ pub struct PaneIdentity<'a> {
     /// The session the pane belongs to, by name -- the same name `remux attach`
     /// takes, which is what makes it a usable CLI argument.
     pub session: &'a str,
-    /// The pane id the child should report as its own.
+    /// The pane id the child should report as its own, normally the pane's own.
     ///
-    /// For an ordinary pane this is the pane's own id. For an **aux pane** it is
-    /// deliberately NOT: an aux pane is in no layout tree, so "split me" has no
-    /// meaning, and it names instead the pane the panel was spawned FOR. That is
-    /// the whole point of the variable for a `files` user -- an `nnn` opener
-    /// inside the panel lands the editor next to the user's work rather than
-    /// trying to subdivide a sidebar.
+    /// A PARAMETER rather than the pane's id because it has not always been the
+    /// same thing: an **aux pane** -- a PTY in no layout tree, which is what the
+    /// old file-manager `files` plugin ran -- named the pane it was spawned FOR,
+    /// since "split me" is meaningless for a pane that is in no layout. Aux
+    /// panes are gone, but the parameter stays honest about being the CALLER's
+    /// answer rather than a derived one.
     pub pane: u64,
 }
 
@@ -56,19 +56,19 @@ impl Pty {
     /// `nvim -R /tmp/f`. It also decides how argv[0] itself is presented, and
     /// the two cases are genuinely different programs:
     ///
-    /// * **Empty** (every pane shell, and the `files` plugin's file manager):
-    ///   argv[0] is `-<basename>`, the leading-dash LOGIN convention, exactly as
-    ///   before this parameter existed.
-    /// * **Non-empty** (the `browser` plugin's editor): argv[0] is the plain
+    /// * **Empty** (every pane shell): argv[0] is `-<basename>`, the
+    ///   leading-dash LOGIN convention, exactly as before this parameter
+    ///   existed.
+    /// * **Non-empty** (the `files` plugin's editor): argv[0] is the plain
     ///   basename. A leading dash tells a SHELL to source its login files; to
     ///   `vim` it is an unrecognised program name, and there is no reason to
     ///   hand one to a program that was invoked to edit a file.
     ///
     /// `identity` names the pane to the child via `REMUX_SESSION`/`REMUX_PANE`.
     /// `None` leaves both UNSET, which is a real answer and not a missing one:
-    /// an aux pane requested by a client that is attached to nothing has no
-    /// session to name, and `remux split` refuses politely on an unset
-    /// `$REMUX_SESSION` rather than guessing one.
+    /// a pane the server cannot attribute to a session has no session to name,
+    /// and `remux split` refuses politely on an unset `$REMUX_SESSION` rather
+    /// than guessing one.
     ///
     /// # Safety
     ///
@@ -807,7 +807,7 @@ mod tests {
         );
     }
 
-    /// The complement, and the case the `browser` panel needs: a command given
+    /// The complement, and the case the `files` panel needs: a command given
     /// arguments RECEIVES them, and loses the login dash.
     ///
     /// One line proves both. `sh -c <script>` reaches the shell only through

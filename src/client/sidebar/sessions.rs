@@ -273,15 +273,12 @@ impl SidebarPlugin for SessionsPlugin {
                     self.refresh_model();
                 }
             }
-            // The agent list is the `agents` panel's; the aux-pane events are
-            // panel-targeted and belong to `files`; the pre-resolved focused
-            // cwd is already in the tree this panel holds.
+            // The agent list is the `agents` panel's and the directory events
+            // are the `files` panel's; the pre-resolved focused cwd is already
+            // in the tree this panel holds.
             PluginEvent::Agents { .. }
             | PluginEvent::FocusedCwd { .. }
-            | PluginEvent::DirectoryListing { .. }
-            | PluginEvent::AuxPaneReady
-            | PluginEvent::AuxPaneContent { .. }
-            | PluginEvent::AuxPaneExited => {}
+            | PluginEvent::DirectoryListing { .. } => {}
         }
     }
 }

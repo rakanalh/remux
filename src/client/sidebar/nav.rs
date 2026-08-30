@@ -1,7 +1,7 @@
 //! The navigable-list behaviour every list-shaped sidebar panel shares.
 //!
 //! Three panels want the same thing: `sessions` (a tree), `agents` (a flat list
-//! of panes running an AI agent) and the browser panel after it. "The same
+//! of panes running an AI agent) and the `files` panel after it. "The same
 //! thing" is `j`/`k` to move, `g`/`G` to jump to the ends, `Enter` to act, a
 //! header row above a window scrolled just far enough to keep the selection on
 //! screen, a click that selects and a second click that activates -- and, the
@@ -33,7 +33,7 @@
 //!   [`TreeModel::selected`]: crate::client::tree_model::TreeModel::selected
 //! * **[`NavList`]** is those functions with a cursor and a viewport attached,
 //!   for a panel whose rows are a plain `Vec` and which therefore has no model
-//!   to keep the cursor in. `agents` uses it; the browser panel will.
+//!   to keep the cursor in. Both `agents` and `files` use it.
 //!
 //! Movement WRAPS, because `TreeModel::select_next` wraps and the two panels
 //! must not disagree about what `j` on the last row does.

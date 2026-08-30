@@ -1,32 +1,52 @@
 #!/usr/bin/env python3
-"""The `files` sidebar plugin: a real program in a panel, following the cwd.
+"""The `files` sidebar panel: does it navigate, and does Enter really open an
+editor on the file?
 
-The panel is CLIENT-composited from a `PaneContent` snapshot, so only a real
-PTY sees the result -- a frame-level harness sees the content rect alone and
-would pass on a panel that never drew a glyph. Every test here runs with a
-`[[sidebar]]` configured; with none, nothing is laid out and every assertion
-below would be vacuous.
+This panel used to be called `browser`, alongside a DIFFERENT `files` plugin
+that hosted `nnn`/`yazi`/`ranger` in an auxiliary pane. The two merged; this one
+took the name. Cases 8 and 9 below cover what an existing config does about it.
 
-The file manager is a DETERMINISTIC STAND-IN, not a real `yazi`: a script that
-prints its cwd and echoes the keys it is sent. What is under test is the
-plumbing -- spawn, stream, route, re-target, reap -- not whether yazi renders.
+A real PTY, because the panel is painted by the CLIENT around a server frame:
+the frame harness sees the content rect alone and would pass on a panel that
+never drew a thing. (`tests/frame/browser_listing.py` covers the server half --
+the listing and the editor resolution.)
 
-What is covered:
-  * the panel paints the aux pane's own output, and its header names the
-    directory (asserted on the CONTENT, not on the panel's existence)
-  * the aux pane starts in the FOCUSED pane's directory
-  * a keystroke typed into the focused panel reaches the program
-  * moving focus to a pane in another directory re-targets the panel, and
-    moving focus within one directory does NOT restart it
-  * the aux pane never appears in the session tree
-  * killing the client reaps the aux pane -- asked of the OS, not the server
-  * a `files` panel with no `command` is refused with a warning and spawns
-    nothing
+What it covers:
 
-Run: python3 tests/pty/sidebar_files.py
+  0  the panel headers itself with the directory the FOCUSED PANE is in
+  1  entries render, directories are marked, hidden ones are absent
+  2  `.` reveals the hidden entry and hides it again
+  3  `j` moves the selection -- proved by where Enter LANDS, not by reading a
+     highlight
+  4  `l` descends, `h` goes back up, and `h` lands the selection on the
+     directory it just left, so `h` then Enter is a round trip
+  5  a directory that cannot be read shows the ERROR rather than an empty panel
+  6  the one that matters: Enter on a FILE opens a split RUNNING THE EDITOR on
+     that file. The pane count going up is checked too, but on its own it would
+     pass on a split running a plain shell
+  7  and the keyboard has left the sidebar -- typing reaches the editor, which
+     an Enter that opened a pane nobody could type into would fail
+  8  a config still saying `plugin = "browser"` LOADS this panel, rather than
+     falling through the unknown-plugin rule and silently vanishing
+  9  the reported bug: a config still carrying `command = <a file manager>` does
+     NOT open files with it. `command` is ignored, so Enter falls back to the
+     server's `$EDITOR`. Proved by running a stand-in in the `command` slot and
+     asserting its marker never reaches the screen while the editor's does --
+     "no nnn" would pass on a machine with no nnn installed
+
+The stand-in `$EDITOR` lives in the SERVER's environment and is deliberately
+REMOVED from the client's: the editor is resolved server-side on purpose (it has
+to exist where the file is), and a harness that exported it on both sides would
+pass whichever side resolved it.
+
+Run from the repo root:
+    python3 tests/pty/sidebar_files.py [-v]
 """
+import json
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -34,30 +54,20 @@ import time
 import pexpect
 import pyte
 
-BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-RUNDIR = "/tmp/rmx-sbf"
+BIN = os.path.abspath("target/debug/remux")
+RUN = "/tmp/rmx-sbb"
+FIX = f"{RUN}/fixture"
+SOCK = f"{RUN}/run/remux.sock"
+VERBOSE = "-v" in sys.argv
+
 COLS, ROWS = 100, 30
-SIDEBAR_W = 34
-PREFIX = b"\x01"
+SIDEBAR_W = 30
+FRAME = 1  # the sidebar's border is drawn INSIDE the bar
 
-# Short enough that `FM-HERE:<dir>` fits the panel interior on one row.
-DIR_START = f"{RUNDIR}/start"
-DIR_A = f"{RUNDIR}/alpha"
-DIR_B = f"{RUNDIR}/bravo"
-STANDIN = f"{RUNDIR}/standin.sh"
-PIDFILE = f"{RUNDIR}/standin.pids"
+CFG = f"""
+[keybindings.command]
+"Alt-2" = "SidebarFocusLeft"
 
-FAILURES = []
-
-
-def check(cond, label):
-    print(("PASS  " if cond else "FAIL  ") + label)
-    if not cond:
-        FAILURES.append(label)
-
-
-def cfg(command='command = "STANDIN"'):
-    return f"""
 [[sidebar]]
 edge = "left"
 size = {SIDEBAR_W}
@@ -65,51 +75,245 @@ visible = true
 
   [[sidebar.panel]]
   plugin = "files"
-  {command.replace("STANDIN", STANDIN)}
+  weight = 1
 """
 
+# What an un-migrated config looks like: the OLD plugin name, plus the field
+# that used to mean "the file manager to run" and now means nothing. Both must
+# leave a working panel that opens files in `$EDITOR`.
+#
+# `command` points at a stand-in rather than at a real `nnn`, so the assertion
+# is "this program did not run" rather than "nnn is not installed" -- the latter
+# passes on any machine without nnn, which is most of them.
+CFG_STALE = f"""
+[keybindings.command]
+"Alt-2" = "SidebarFocusLeft"
 
-def make_env(config: str) -> dict:
-    shutil.rmtree(RUNDIR, ignore_errors=True)
-    for sub in ("run", "state", "data", "config"):
-        os.makedirs(f"{RUNDIR}/{sub}", exist_ok=True)
-    os.makedirs(f"{RUNDIR}/config/remux", exist_ok=True)
-    os.makedirs(DIR_START, exist_ok=True)
-    os.makedirs(DIR_A, exist_ok=True)
-    os.makedirs(DIR_B, exist_ok=True)
-    # The stand-in records its own PID so liveness can be asked of the OS.
-    # `kill(pid, 0)` succeeds for a zombie, so /proc's state field is read
-    # instead: a reap that leaves a `<defunct>` behind is still a leak.
-    with open(STANDIN, "w") as fh:
-        fh.write(
-            f'#!/bin/sh\necho "$$" >> "{PIDFILE}"\n'
-            'echo "FM-HERE:$(pwd)"\n'
-            'while IFS= read -r line; do echo "FM-KEY:$line"; done\n'
-        )
-    os.chmod(STANDIN, 0o755)
-    with open(f"{RUNDIR}/config/remux/config.toml", "w") as fh:
-        fh.write(config)
-    env = dict(os.environ)
-    env.update(
-        XDG_RUNTIME_DIR=f"{RUNDIR}/run",
-        XDG_STATE_HOME=f"{RUNDIR}/state",
-        XDG_DATA_HOME=f"{RUNDIR}/data",
-        XDG_CONFIG_HOME=f"{RUNDIR}/config",
-        SHELL="/bin/sh",
-        ENV="/dev/null",
-        TERM="xterm-256color",
-        REMUX_ALLOW_NESTED="1",
-        PS1="> ",
-    )
-    return env
+[[sidebar]]
+edge = "left"
+size = {SIDEBAR_W}
+visible = true
+
+  [[sidebar.panel]]
+  plugin = "browser"
+  weight = 1
+  command = "{RUN}/bin/stand-in-file-manager"
+"""
+
+# The stand-in editor. It prints a marker and the file's BASENAME on separate
+# short lines (neither can be broken by the wrap of a narrow split), then ECHOES
+# WHAT IT READS -- which is how case 7 can tell that the keyboard reached it.
+#
+# It BLOCKS rather than exiting: one that printed and exited would leave a dead
+# pane before the assertion ran, and the failure would read as a flake.
+EDITOR = """#!/bin/sh
+printf 'EDITING\\n'
+printf 'F=%s\\n' "$(basename "$1")"
+while read line; do printf 'GOT[%s]\\n' "$line"; done
+"""
+
+# The stand-in for a stale `command`. If `command` were still read as the editor
+# -- the reported bug -- THIS is what a split would be running, and its marker
+# would be on screen. It blocks for the same reason the editor does.
+#
+# The marker is ASSEMBLED by the script rather than written anywhere the shell
+# could echo it: `WRONG` and `EDITOR` are separate strings in the config and in
+# this file, and only a running process ever joins them.
+FILE_MANAGER = """#!/bin/sh
+printf 'WRONG%s\\n' 'EDITOR'
+while :; do sleep 1; done
+"""
+
+FAILURES = []
 
 
-def spawn(env, cols=COLS, rows=ROWS, cwd=None):
-    screen = pyte.Screen(cols, rows)
+def log(*a):
+    if VERBOSE:
+        print(*a)
+
+
+def check(name, cond, detail=""):
+    if cond:
+        print(f"  PASS  {name}")
+    else:
+        print(f"  FAIL  {name}\n        {detail}")
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# environment
+# ---------------------------------------------------------------------------
+
+def base_env():
+    return {
+        **os.environ,
+        "XDG_RUNTIME_DIR": f"{RUN}/run",
+        "XDG_STATE_HOME": f"{RUN}/state",
+        "XDG_DATA_HOME": f"{RUN}/data",
+        "XDG_CONFIG_HOME": f"{RUN}/cfg",
+        "SHELL": "/bin/sh",
+        "ENV": "/dev/null",
+        "TERM": "xterm-256color",
+        "PS1": "$ ",
+        "REMUX_ALLOW_NESTED": "1",
+    }
+
+
+def env_server():
+    """The server's environment -- and the ONLY side with an `$EDITOR`."""
+    return {**base_env(), "EDITOR": f"{RUN}/bin/stand-in-editor"}
+
+
+def env_client():
+    """The client's environment, with `$EDITOR` explicitly REMOVED.
+
+    Not merely "not set": the resolution is meant to happen on the server, so
+    the client must be a place where an editor could not have been found.
+    """
+    e = base_env()
+    e.pop("EDITOR", None)
+    return e
+
+
+def write_config(body):
+    """(Re)write the client's config. The sidebar is client-side, so a new
+    client picks this up with no server restart."""
+    with open(f"{RUN}/cfg/remux/config.toml", "w") as f:
+        f.write(body)
+
+
+def setup_dirs():
+    # Un-lock the fixture BEFORE the wipe. A run killed by a timeout leaves
+    # `locked/` at mode 000, and `rmtree` cannot descend it -- the next run
+    # would inherit a half-deleted fixture and fail somewhere unrelated.
+    try:
+        os.chmod(f"{FIX}/locked", 0o755)
+    except Exception:
+        pass
+    shutil.rmtree(RUN, ignore_errors=True)
+    for s in ("run", "state", "data", "bin", "cfg"):
+        os.makedirs(f"{RUN}/{s}", exist_ok=True)
+    os.makedirs(f"{RUN}/cfg/remux", exist_ok=True)
+    write_config(CFG)
+    for name, body in (("stand-in-editor", EDITOR),
+                       ("stand-in-file-manager", FILE_MANAGER)):
+        p = f"{RUN}/bin/{name}"
+        with open(p, "w") as f:
+            f.write(body)
+        os.chmod(p, 0o755)
+
+    # The fixture. Visible, in the server's sort order: alpha/ beta/ locked/
+    # notes.txt -- with `.hidden` between `locked/` and `notes.txt` once shown.
+    for d in ("alpha", "beta", "locked"):
+        os.makedirs(f"{FIX}/{d}", exist_ok=True)
+    with open(f"{FIX}/alpha/inside.txt", "w") as f:
+        f.write("x\n")
+    for f_ in ("notes.txt", ".hidden"):
+        with open(f"{FIX}/{f_}", "w") as f:
+            f.write("x\n")
+    os.chmod(f"{FIX}/locked", 0o000)
+
+
+def start_server():
+    # `cwd=FIX` is what puts the client's first pane in the fixture directory,
+    # which is what the panel then follows. A `cd` typed into the pane would not
+    # do: the session tree is pushed when it is DIRTIED, and a plain `cd`
+    # dirties nothing.
+    p = subprocess.Popen([BIN, "server"], env=env_server(), cwd=FIX,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(200):
+        if os.path.exists(SOCK):
+            time.sleep(0.3)
+            return p
+        time.sleep(0.05)
+    p.kill()
+    raise SystemExit("server socket never appeared")
+
+
+def stop_server():
+    try:
+        subprocess.run([BIN, "stop"], env=env_server(), stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        pass
+
+
+def check_no_panic():
+    for name in ("client.log", "server.log"):
+        path = f"{RUN}/state/remux/{name}"
+        if os.path.exists(path):
+            body = open(path, errors="replace").read()
+            check(f"no panic in {name}", "panicked at" not in body, body[-1500:])
+
+
+# ---------------------------------------------------------------------------
+# a minimal wire client, used only to COUNT panes
+# ---------------------------------------------------------------------------
+
+def protocol_version():
+    for line in open("src/protocol.rs"):
+        if "pub const PROTOCOL_VERSION" in line:
+            return int(line.split("=")[1].strip().rstrip(";"))
+    raise SystemExit("could not read PROTOCOL_VERSION")
+
+
+PROTOCOL_VERSION = protocol_version()
+
+
+class Wire:
+    def __init__(self, sock):
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.connect(sock)
+        self.s.settimeout(3.0)
+        self.buf = b""
+        self.send({"protocol_version": PROTOCOL_VERSION, "remux_version": "harness"})
+        self.recv()
+
+    def send(self, obj):
+        b = json.dumps(obj).encode()
+        self.s.sendall(struct.pack(">I", len(b)) + b)
+
+    def recv(self):
+        while len(self.buf) < 4:
+            self.buf += self.s.recv(65536)
+        n = struct.unpack(">I", self.buf[:4])[0]
+        while len(self.buf) < 4 + n:
+            self.buf += self.s.recv(65536)
+        body, self.buf = self.buf[4:4 + n], self.buf[4 + n:]
+        return json.loads(body)
+
+    def pane_count(self):
+        self.send("ListSessionTree")
+        end = time.time() + 4.0
+        while time.time() < end:
+            msg = self.recv()
+            if not (isinstance(msg, dict) and "SessionTree" in msg):
+                continue
+            body = msg["SessionTree"]
+            sessions = list(body["unfiled"]) + [
+                s for f in body["folders"] for s in f["sessions"]
+            ]
+            return sum(len(t["panes"]) for s in sessions for t in s["tabs"])
+        raise SystemExit("no SessionTree")
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# PTY client
+# ---------------------------------------------------------------------------
+
+def spawn():
+    screen = pyte.Screen(COLS, ROWS)
     stream = pyte.ByteStream(screen)
-    child = pexpect.spawn(BIN, [], env=env, dimensions=(rows, cols), encoding=None, cwd=cwd)
+    child = pexpect.spawn(BIN, [], env=env_client(), dimensions=(ROWS, COLS),
+                          encoding=None)
 
-    def pump(t=0.8):
+    def pump(t=0.7):
         end = time.time() + t
         while time.time() < end:
             try:
@@ -121,247 +325,233 @@ def spawn(env, cols=COLS, rows=ROWS, cwd=None):
     return child, screen, pump
 
 
-def teardown(child, env):
-    try:
-        child.close(force=True)
-    except Exception:
-        pass
-    try:
-        subprocess.run([BIN, "stop"], env=env, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=10)
-    except Exception:
-        pass
-
-
 def panel_rows(screen):
-    """The sidebar's columns of every row, frame glyphs stripped."""
+    """The panel's INTERIOR rows, panel-relative (row 0 is the plugin header)."""
+    return [
+        r[FRAME:SIDEBAR_W - FRAME].rstrip()
+        for r in screen.display[FRAME:len(screen.display) - FRAME]
+    ]
+
+
+def entry_rows(screen):
+    """Just the list rows: everything under the header, up to the first blank."""
     out = []
-    for row in screen.display:
-        cell = row[:SIDEBAR_W]
-        out.append(cell.strip("│╭╮╰╯─├┤ "))
+    for r in panel_rows(screen)[1:]:
+        if not r.strip():
+            break
+        out.append(r)
     return out
 
 
-def panel_has(screen, want):
-    return any(want in r for r in panel_rows(screen))
+def header(screen):
+    return panel_rows(screen)[0]
 
 
-def wait_panel(pump, screen, want, timeout=8.0):
+def content_rows(screen):
+    return [r[SIDEBAR_W:] for r in screen.display]
+
+
+def content(screen):
+    return "\n".join(content_rows(screen))
+
+
+def wait_until(pump, cond, timeout=8.0):
     end = time.time() + timeout
     while time.time() < end:
-        pump(0.4)
-        if panel_has(screen, want):
+        pump(0.3)
+        if cond():
             return True
     return False
 
 
-def live_standins():
-    """PIDs of stand-ins that have not been fully reaped.
+def keys(child, pump, *seq, settle=0.35):
+    for k in seq:
+        child.send(k if isinstance(k, bytes) else k.encode())
+        pump(settle)
 
-    A zombie counts. `kill(pid, 0)` succeeds for one -- a `<defunct>` child keeps
-    its pid and its name until somebody waits for it -- so "not in the process
-    table under its old command name" is the WEAK check that passes on exactly
-    the leak under test. The state field is read instead, and the two outcomes
-    are reported separately so a failure says which one happened.
+
+# ---------------------------------------------------------------------------
+# the scenario
+# ---------------------------------------------------------------------------
+
+def scenario():
+    start_server()
+    wire = Wire(SOCK)
+    child, screen, pump = spawn()
+    pump(2.5)
+
+    # -- 0/1: the panel is showing the focused pane's directory ---------------
+    ok = wait_until(pump, lambda: header(screen).endswith("fixture"))
+    check("0 the panel headers itself with the focused pane's directory",
+          ok, (header(screen), panel_rows(screen)))
+
+    rows = entry_rows(screen)
+    log("panel:", rows)
+    check("1 directories are listed and marked, files are not",
+          rows[:4] == ["alpha/", "beta/", "locked/", "notes.txt"], rows)
+    check("1 hidden entries are hidden by default",
+          all(".hidden" not in r for r in rows), rows)
+
+    child.send(b"\x1b2")  # Alt-2: focus the panel
+    pump(0.5)
+
+    # -- 2: the hidden toggle ------------------------------------------------
+    keys(child, pump, ".")
+    shown = entry_rows(screen)
+    check("2 `.` reveals the hidden entries",
+          shown == ["alpha/", "beta/", "locked/", ".hidden", "notes.txt"], shown)
+    keys(child, pump, ".")
+    check("2 and `.` again hides them",
+          all(".hidden" not in r for r in entry_rows(screen)), entry_rows(screen))
+
+    # -- 3: `j` moves the selection, proved by where Enter lands -------------
+    keys(child, pump, "g", "j", "\r")
+    ok = wait_until(pump, lambda: header(screen).endswith("/beta"))
+    check("3 after `j`, Enter descends into the SECOND entry, not the first",
+          ok, (header(screen), entry_rows(screen)))
+
+    # -- 4: `h` goes up AND lands on the directory it left -------------------
+    keys(child, pump, "h")
+    ok = wait_until(pump, lambda: header(screen).endswith("fixture"))
+    check("4 `h` goes back up", ok, header(screen))
+    keys(child, pump, "\r")
+    ok = wait_until(pump, lambda: header(screen).endswith("/beta"))
+    check("4 and lands the selection on the directory it left, so `h` then "
+          "Enter is a round trip", ok, (header(screen), entry_rows(screen)))
+    keys(child, pump, "h")
+    wait_until(pump, lambda: header(screen).endswith("fixture"))
+
+    # `l` on a directory descends too, and shows what is inside it.
+    keys(child, pump, "g", "\r")
+    ok = wait_until(pump, lambda: entry_rows(screen) == ["inside.txt"])
+    check("4 `l`/Enter descends and the new directory's contents appear",
+          ok and header(screen).endswith("/alpha"),
+          (header(screen), entry_rows(screen)))
+    keys(child, pump, "h")
+    wait_until(pump, lambda: header(screen).endswith("fixture"))
+
+    # -- 5: an unreadable directory says WHY ---------------------------------
+    if os.geteuid() == 0:
+        print("  SKIP  5 (running as root: mode 000 is still readable)")
+    else:
+        keys(child, pump, "g", "j", "j", "\r")
+        ok = wait_until(pump, lambda: any("permission denied" in r
+                                          for r in panel_rows(screen)))
+        check("5 an unreadable directory shows the error, not an empty panel",
+              ok, (header(screen), panel_rows(screen)))
+        keys(child, pump, "h")
+        wait_until(pump, lambda: header(screen).endswith("fixture"))
+
+    # -- 6: THE ONE THAT MATTERS --------------------------------------------
+    before = wire.pane_count()
+    keys(child, pump, "G")
+    check("6 the last visible row is the file", entry_rows(screen)[-1] == "notes.txt",
+          entry_rows(screen))
+    keys(child, pump, "\r", settle=0.5)
+    ok = wait_until(pump, lambda: "EDITING" in content(screen))
+    after = wire.pane_count()
+    body = content(screen)
+    log(body)
+    check("6 the split exists", after == before + 1, (before, after))
+    check("6 and the new pane is RUNNING THE EDITOR, on the file the user chose",
+          ok and "F=notes.txt" in body, repr(body[-600:]))
+
+    # -- 7: and the keyboard went with it ------------------------------------
+    keys(child, pump, "zz\r", settle=0.6)
+    ok = wait_until(pump, lambda: "GOT[zz]" in content(screen))
+    check("7 the keyboard left the sidebar: typing reaches the editor",
+          ok, repr(content(screen)[-600:]))
+
+    check("client still alive", child.isalive())
+    try:
+        child.close(force=True)
+    except Exception:
+        pass
+    wire.close()
+
+
+def stale_config_scenario():
+    """Cases 8 and 9: what happens to a config written for the old two plugins.
+
+    A fresh CLIENT against the same server -- the sidebar is client-side, so the
+    config is re-read on startup with nothing to restart.
     """
-    if not os.path.exists(PIDFILE):
-        return []
-    leaked = []
-    for line in open(PIDFILE):
-        line = line.strip()
-        if not line:
-            continue
-        pid = int(line)
-        try:
-            stat = open(f"/proc/{pid}/stat").read()
-        except OSError:
-            continue  # gone: reaped, which is the outcome we want
-        # `rsplit`, not `split`: `comm` is the only parenthesised field and
-        # everything after it is fixed, so splitting from the RIGHT is exact
-        # even for a process whose name contains `") "`.
-        state = stat.rsplit(") ", 1)[1][0]
-        leaked.append(f"{pid}{'(zombie)' if state == 'Z' else ''}")
-    return leaked
-
-
-def logs():
-    out = ""
-    for name in ("client.log", "server.log"):
-        p = f"{RUNDIR}/state/remux/{name}"
-        if os.path.exists(p):
-            out += open(p, errors="replace").read()
-    return out
-
-
-def aux_pane_ids():
-    """Aux pane ids, read out of the client's own log of what it was handed."""
-    import re
-    return [int(m) for m in re.findall(r"AuxPaneSpawned pane_id=(\d+) -> panel", logs())]
-
-
-def session_tree_pane_ids():
-    """Pane ids the SERVER reports in its tree, via a second wire client."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
-    from harness import Client, name_of  # noqa: E402
-    c = Client(f"{RUNDIR}/run/remux.sock")
-    c.hello()
-    c.send("ListSessionTree")
-    ids = []
-    for msg in c.drain(1.5):
-        if name_of(msg) != "SessionTree":
-            continue
-        t = msg["SessionTree"]
-        groups = list(t["unfiled"]) + [s for f in t["folders"] for s in f["sessions"]]
-        for s in groups:
-            for tab in s["tabs"]:
-                ids += [p["id"] for p in tab["panes"]]
-    c.close()
-    return ids
-
-
-# ---------------------------------------------------------------------------
-# Test 1: the panel hosts the program, follows the focused pane's directory,
-#         takes keys, stays out of the tree, and is reaped with the client.
-# ---------------------------------------------------------------------------
-env = make_env(cfg())
-child, screen, pump = spawn(env, cwd=DIR_START)
-try:
-    pump(2.0)
-    # The panel spawns as soon as it is laid out, in whatever directory the
-    # focused pane is in at the time -- here the one the client started in.
-    check(wait_panel(pump, screen, f"FM-HERE:{DIR_START}"),
-          f"the panel paints the program's own output, from the focused pane's"
-          f" directory\n      panel={panel_rows(screen)[:6]}")
-    header = next((r for r in panel_rows(screen)[:3] if r.startswith("/")), "")
-    check(header == DIR_START,
-          f"the panel header names the directory\n      header={header!r}")
-
-    # Ruling 3: the directory is followed at FOCUS-CHANGE granularity, not per
-    # `cd`. A bare `cd` with focus unmoved must NOT restart the program -- doing
-    # so would need a polling cwd watcher, which this deliberately does not have.
-    child.send(f"cd {DIR_A}\r".encode())
-    pump(2.0)
-    check(panel_has(screen, f"FM-HERE:{DIR_START}"),
-          f"a bare `cd` does not re-target the panel (focus-change granularity)"
-          f"\n      panel={panel_rows(screen)[:6]}")
-
-    # --- keys reach the program -------------------------------------------
-    child.send(b"\x1bh")   # Alt+h: focus the left sidebar
-    pump(0.8)
-    child.send(b"q\r")     # the stand-in reads LINES, so the Enter matters
-    check(wait_panel(pump, screen, "FM-KEY:q"),
-          f"a keystroke typed into the focused panel reaches the program"
-          f"\n      panel={panel_rows(screen)[:8]}")
-    child.send(b"\x1b")    # Escape: back to the content area
-    pump(0.6)
-
-    # --- three tabs: two in DIR_A, one in DIR_B ---------------------------
-    # Tabs, not splits: `Alt+<n>` is a deterministic jump, so which pane ends up
-    # focused does not depend on the split geometry.
-    child.send(PREFIX + b"tn")
-    pump(1.5)
-    child.send(f"cd {DIR_A}\r".encode())
-    pump(1.0)
-    child.send(PREFIX + b"tn")
-    pump(1.5)
-    child.send(f"cd {DIR_B}\r".encode())
-    pump(1.0)
-
-    child.send(b"\x1b1")   # tab 1 -- DIR_A
-    check(wait_panel(pump, screen, f"FM-HERE:{DIR_A}", timeout=8.0),
-          f"a focus change re-targets the panel to that pane's directory"
-          f"\n      panel={panel_rows(screen)[:6]}")
-    header = next((r for r in panel_rows(screen)[:3] if r.startswith("/")), "")
-    check(header == DIR_A, f"the header follows too\n      header={header!r}")
-
-    # --- the aux pane is invisible to the session tree ---------------------
-    aux_ids = aux_pane_ids()
-    check(aux_ids, "the client log records the aux pane ids it was given")
-    tree_ids = session_tree_pane_ids()
-    check(len(tree_ids) == 3, f"the session tree shows the three real panes (got {tree_ids})")
-    check(not (set(aux_ids) & set(tree_ids)),
-          f"no aux pane appears in the session tree (aux={aux_ids} tree={tree_ids})")
-
-    # --- a focus move WITHIN one directory must not restart the program ----
-    same_dir_pid = live_standins()
-    check(len(same_dir_pid) == 1, f"exactly one program is running (got {same_dir_pid})")
-    child.send(b"\x1b2")   # tab 2 -- also DIR_A
+    write_config(CFG_STALE)
+    wire = Wire(SOCK)
+    child, screen, pump = spawn()
     pump(2.5)
-    check(live_standins() == same_dir_pid,
-          f"a focus move within one directory does not restart the program"
-          f"\n      before={same_dir_pid} after={live_standins()}")
 
-    # --- and a move to the other directory DOES re-target ------------------
-    child.send(b"\x1b3")   # tab 3 -- DIR_B
-    check(wait_panel(pump, screen, f"FM-HERE:{DIR_B}", timeout=8.0),
-          f"moving to another directory re-targets the panel"
-          f"\n      panel={panel_rows(screen)[:6]}")
-    check(live_standins() != same_dir_pid,
-          "the re-target really replaced the program")
-    check(len(live_standins()) == 1,
-          f"a re-target kills the old program rather than stacking them"
-          f" (live={live_standins()})")
+    # -- 8: the old plugin NAME still resolves to this panel -----------------
+    #
+    # Checked by the panel PAINTING, not by the absence of a warning: an
+    # unresolved plugin is skipped, so the failure mode is a sidebar that is
+    # simply missing a panel, which only the screen can see.
+    ok = wait_until(pump, lambda: header(screen).endswith("fixture"))
+    check("8 `plugin = \"browser\"` still loads this panel",
+          ok, (header(screen), panel_rows(screen)))
 
-    # --- reap on client exit ----------------------------------------------
-    child.close(force=True)
-    end = time.time() + 6
-    while time.time() < end and live_standins():
-        time.sleep(0.1)
-    check(not live_standins(),
-          f"killing the client reaps the program (leftover={live_standins()})")
+    # -- 9: THE REPORTED BUG -------------------------------------------------
+    #
+    # Enter on a file must run the server's `$EDITOR`, NOT the program left in
+    # `command`. Both halves are asserted: the editor's marker present AND the
+    # file manager's absent. Either alone is weak -- a panel that opened nothing
+    # at all would satisfy the second.
+    before = wire.pane_count()
+    child.send(b"\x1b2")  # Alt-2: focus the panel
+    pump(0.5)
+    keys(child, pump, "G")
+    check("9 the last visible row is the file",
+          entry_rows(screen)[-1] == "notes.txt", entry_rows(screen))
+    keys(child, pump, "\r", settle=0.5)
+    ok = wait_until(pump, lambda: "EDITING" in content(screen))
+    after = wire.pane_count()
+    body = content(screen)
+    log(body)
+    check("9 the split exists", after == before + 1, (before, after))
+    check("9 a stale `command` does NOT become the editor: Enter opened "
+          "$EDITOR on the file", ok and "F=notes.txt" in body, repr(body[-600:]))
+    check("9 and the program named by `command` never ran",
+          "WRONGEDITOR" not in body, repr(body[-600:]))
 
-    check("panicked at" not in logs(), "no panic in either log")
-finally:
-    teardown(child, env)
-    for entry in live_standins():
+    # The user is told, in the log, what to change.
+    client_log = open(f"{RUN}/state/remux/client.log", errors="replace").read()
+    check("9 the client warns that `command` is no longer read, naming `editor`",
+          "`command` is no longer read" in client_log and "editor" in client_log,
+          client_log[-800:])
+    check("8 the client warns that `browser` has been renamed to `files`",
+          "has been renamed to `files`" in client_log, client_log[-800:])
+
+    check("client still alive", child.isalive())
+    try:
+        child.close(force=True)
+    except Exception:
+        pass
+    wire.close()
+
+
+def main():
+    if not os.path.exists(BIN):
+        raise SystemExit(f"{BIN} not found; run `cargo build` first")
+    setup_dirs()
+    try:
+        scenario()
+        stale_config_scenario()
+    finally:
+        check_no_panic()
+        stop_server()
+        # Restore the mode so a later `rm -rf` of the fixture can descend it.
         try:
-            os.kill(int(entry.split("(")[0]), 9)
-        except OSError:
+            os.chmod(f"{FIX}/locked", 0o755)
+        except Exception:
             pass
+        time.sleep(0.3)
+    if FAILURES:
+        print(f"\nFAILED: {len(FAILURES)}")
+        for f in FAILURES:
+            print(f"  - {f}")
+        sys.exit(1)
+    print("\nOK")
 
-# ---------------------------------------------------------------------------
-# Test 2: a `files` panel with no command is refused, loudly, and spawns
-#         nothing.
-# ---------------------------------------------------------------------------
-env = make_env(cfg(command="# no command"))
-child, screen, pump = spawn(env)
-try:
-    pump(2.5)
-    log = logs()
-    check("the `files` plugin requires a `command`" in log,
-          "a files panel with no command is refused with a warning")
-    check(not live_standins(), "and spawns nothing")
-    check(child.isalive(), "the client is still alive with the panel skipped")
-    check("panicked at" not in log, "no panic in either log")
-finally:
-    teardown(child, env)
 
-# ---------------------------------------------------------------------------
-# Test 3: a command that cannot run leaves a RESTARTABLE panel, not a permanent
-#         "starting…".
-# ---------------------------------------------------------------------------
-env = make_env(cfg(command='command = "/nonexistent/not-a-file"'))
-child, screen, pump = spawn(env, cwd=DIR_START)
-try:
-    pump(3.0)
-    rows = panel_rows(screen)
-    # The exited label is centred in the panel's content area, so slicing the
-    # first few rows would hide the very thing under test.
-    said = [r for r in rows if r]
-    check(any("exited" in r for r in rows),
-          f"a command that cannot run leaves the panel in its exited state"
-          f"\n      panel={said}")
-    check(not any("starting" in r for r in rows),
-          f"...and not waiting on `starting…` for ever\n      panel={said}")
-    check(child.isalive(), "the client survives a spawn that fails")
-    check("panicked at" not in logs(), "no panic in either log")
-finally:
-    teardown(child, env)
-
-print()
-if FAILURES:
-    print(f"{len(FAILURES)} FAILED:")
-    for f in FAILURES:
-        print("  - " + f)
-    sys.exit(1)
-print("all checks passed")
+if __name__ == "__main__":
+    main()

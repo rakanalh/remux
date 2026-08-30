@@ -351,19 +351,6 @@ struct ClientConnection {
     /// the two payloads are dirtied by different things -- structure versus
     /// pane output -- and a client wanting one must not pay for the other.
     agents_subscribed: bool,
-    /// Auxiliary panes this client asked the server to spawn
-    /// ([`ClientMessage::SpawnAuxPane`]) -- PTYs that belong to no layout tree,
-    /// backing a sidebar panel that hosts a full-screen TUI.
-    ///
-    /// The list is the OWNERSHIP record, and it lives here for the same reason
-    /// `session_tree_subscribed` does: a pane in no layout is reachable from
-    /// nothing else, so a connection that went away without taking its aux panes
-    /// with it would leave PTYs running with no route to them and no way to find
-    /// them -- a leaked process, the headline risk of the feature.
-    /// [`handle_client_disconnect`] reaps whatever is left here, which is what
-    /// makes an ABRUPT disconnect as safe as a clean
-    /// [`ClientMessage::KillAuxPane`](crate::protocol::ClientMessage::KillAuxPane).
-    aux_panes: Vec<PaneId>,
 }
 
 /// The Remux server.
@@ -699,7 +686,6 @@ impl RemuxServer {
                     pane_autoscroll_repeat: None,
                     session_tree_subscribed: false,
                     agents_subscribed: false,
-                    aux_panes: Vec::new(),
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -775,7 +761,7 @@ impl RemuxServer {
                     }
                     Ok(None) => {
                         log::info!("client {client_id} disconnected");
-                        handle_client_disconnect(client_id, &panes, &clients, &prev_frames).await;
+                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -785,7 +771,7 @@ impl RemuxServer {
                     }
                     Err(e) => {
                         log::error!("error reading from client {client_id}: {e}");
-                        handle_client_disconnect(client_id, &panes, &clients, &prev_frames).await;
+                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -1272,55 +1258,6 @@ async fn handle_client_message(
             // The new/updated demand may shrink (or release) the pane's effective
             // size; recompute and re-stream if it changed.
             recompute_pane_size(pane_id, state, panes, clients, config).await;
-            Ok(())
-        }
-        ClientMessage::SpawnAuxPane {
-            cols,
-            rows,
-            command,
-            cwd,
-        } => {
-            handle_spawn_aux_pane(
-                client_id,
-                cols,
-                rows,
-                &command,
-                cwd.as_deref(),
-                state,
-                panes,
-                clients,
-                config,
-                prev_frames,
-                dormant,
-            )
-            .await;
-            Ok(())
-        }
-        ClientMessage::KillAuxPane { pane_id } => {
-            // Owned-only: forget it first (under `clients` alone), and reap only
-            // if this connection was in fact the owner. A client must not be able
-            // to kill another client's panel, and a repeat kill must be a no-op
-            // rather than a second `PaneExited` for an id already gone.
-            let owned = {
-                let mut cls = clients.lock().await;
-                match cls.get_mut(&client_id) {
-                    Some(conn) => {
-                        let before = conn.aux_panes.len();
-                        conn.aux_panes.retain(|&p| p != pane_id);
-                        conn.aux_panes.len() != before
-                    }
-                    None => false,
-                }
-            };
-            if owned {
-                log::debug!("server: KillAuxPane client_id={client_id} pane_id={pane_id}");
-                reap_panes(&[pane_id], panes, clients).await;
-            } else {
-                log::warn!(
-                    "server: KillAuxPane client_id={client_id} pane_id={pane_id} \
-is not owned by this connection; ignoring"
-                );
-            }
             Ok(())
         }
         ClientMessage::ListDirectory { path } => {
@@ -3738,31 +3675,23 @@ async fn handle_kill_session(
     Ok(())
 }
 
+/// Forget a departed client: its connection, and its diff baseline.
+///
+/// It used to reap the client's **aux panes** here too -- PTYs in no layout
+/// tree, reachable from nothing but this connection, so a disconnect that left
+/// them behind leaked processes. That was the whole reason this function took
+/// `panes`. The old `files` plugin was the only thing that ever asked for one,
+/// and it is gone: every pane is now in a session's layout, where a disconnect
+/// is not supposed to kill anything.
 async fn handle_client_disconnect(
     client_id: u64,
-    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     prev_frames: &PrevFrameCache,
 ) {
     log::debug!("server: client_id={client_id} disconnected, removing from client map");
-    // Take the departing client's aux panes OUT of the removed connection, then
-    // reap them once the lock is released: `reap_panes` takes `panes` and then
-    // `clients` itself, so reaping inside this critical section would nest them
-    // the wrong way round.
-    //
-    // This runs for EVERY disconnect, clean or abrupt -- it is the half of
-    // aux-pane lifetime that a `KillAuxPane` the client never got to send cannot
-    // cover, and the reason a killed terminal does not leave a file manager
-    // running forever.
-    let orphans = {
+    {
         let mut cls = clients.lock().await;
-        cls.remove(&client_id)
-            .map(|c| c.aux_panes)
-            .unwrap_or_default()
-    };
-    if !orphans.is_empty() {
-        log::info!("server: client_id={client_id} left; reaping aux panes {orphans:?}");
-        reap_panes(&orphans, panes, clients).await;
+        cls.remove(&client_id);
     }
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
@@ -5856,9 +5785,8 @@ program={program:?} args={argv:?} vertical={vertical}"
 /// The target within the session is the **active tab's focused pane**, which is
 /// what `create_pane_in_tab` already splits when handed no `tab_index`. That is
 /// deliberate and is not the caller's `REMUX_PANE`: an environment variable is
-/// fixed at spawn time, and for an aux pane it was fixed at a moment that may be
-/// hours stale, whereas focus is where the user is looking now. tmux resolves
-/// `split-window` the same way.
+/// fixed at spawn time and may be hours stale, whereas focus is where the user
+/// is looking now. tmux resolves `split-window` the same way.
 ///
 /// A `Some(pane_id)` answer becomes [`ServerMessage::CliSpawned`]; every failure
 /// becomes a [`ServerMessage::Error`] that NAMES the session, since the failure
@@ -5963,152 +5891,18 @@ argv={argv:?} cwd={cwd:?}"
     Ok(())
 }
 
-/// Spawn an auxiliary pane for `client_id` and answer with its id.
-///
-/// The whole handler is composition: [`spawn_pane`] already produces exactly "a
-/// pane outside the layout tree" -- it inserts into the flat `panes` map and
-/// touches no `LayoutNode` -- and [`start_forwarding_for_pane`] already pumps a
-/// PTY that belongs to no session. The only thing added here is the OWNERSHIP
-/// record on the connection, which is what makes the pane reapable.
-///
-/// `command` is passed through as-is with no shell fallback: the client is
-/// required to name the program, because a wrong guess spawns something in a PTY
-/// the user then has to hunt down.
-///
-/// Nothing is sent on failure beyond a log line; the client's panel stays in its
-/// "waiting" state, which is the honest reading of "no pane came back".
-#[allow(clippy::too_many_arguments)]
-async fn handle_spawn_aux_pane(
-    client_id: u64,
-    cols: u16,
-    rows: u16,
-    command: &str,
-    cwd: Option<&str>,
-    state: &Arc<Mutex<ServerState>>,
-    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
-    config: &Arc<Config>,
-    prev_frames: &PrevFrameCache,
-    dormant: &DormantStore,
-) {
-    // A zero-sized PTY is a pane no content can be rendered into; the client
-    // asks only once its panel has a real rect, so this is belt and braces.
-    let cols = cols.max(1);
-    let rows = rows.max(1);
-    let pane_id = {
-        let mut st = state.lock().await;
-        st.next_pane_id()
-    };
-    // The identity this aux pane advertises names the pane it was spawned FOR:
-    // the requester's session, and that session's active tab's focused pane.
-    // An aux pane is in no layout tree, so "split me" has no meaning -- and
-    // pointing `REMUX_PANE` at itself is not merely useless but wrong, because
-    // it is what an `nnn` opener inside a `files` panel would try to subdivide.
-    //
-    // Resolved with the two locks taken SEQUENTIALLY, never nested: this daemon
-    // has a recorded ABBA hazard between `clients` and `state`, and the handler
-    // held neither before this block.
-    let requester_session = {
-        let cls = clients.lock().await;
-        cls.get(&client_id).and_then(|c| c.session_name.clone())
-    };
-    let identity = match &requester_session {
-        Some(session) => {
-            let st = state.lock().await;
-            st.sessions
-                .get(session)
-                .and_then(|s| s.tabs.get(s.active_tab))
-                .map(|t| t.focused_pane)
-                .map(|focused| PaneIdentity {
-                    session: session.as_str(),
-                    pane: focused,
-                })
-        }
-        // An unattached requester has no session to name, so the pane gets
-        // neither variable and `remux split` inside it refuses politely rather
-        // than guessing. That is the honest answer, not a missing one.
-        None => None,
-    };
-    log::info!(
-        "server: SpawnAuxPane client_id={client_id} pane_id={pane_id} dims={cols}x{rows} command={command:?} cwd={cwd:?} identity={identity:?}"
-    );
-    if let Err(e) = spawn_pane(
-        pane_id,
-        cols,
-        rows,
-        Some(command),
-        &[],
-        cwd.map(std::path::Path::new),
-        identity,
-        panes,
-        config,
-    )
-    .await
-    {
-        log::error!("server: SpawnAuxPane failed for client_id={client_id}: {e:#}");
-        // Answer anyway. A request left unanswered stays at the head of the
-        // client's pending queue and claims the next panel's reply -- see
-        // `AuxPaneSpawned`.
-        let cls = clients.lock().await;
-        if let Some(conn) = cls.get(&client_id) {
-            let _ = conn
-                .tx
-                .send(ServerMessage::AuxPaneSpawned { pane_id: None });
-        }
-        return;
-    }
-    // Record ownership BEFORE the forwarding task can report the pane's death:
-    // an aux pane whose command exits instantly would otherwise be reaped while
-    // no connection claims it, and the `AuxPaneSpawned` below would name an id
-    // the client can never kill.
-    {
-        let mut cls = clients.lock().await;
-        match cls.get_mut(&client_id) {
-            Some(conn) => conn.aux_panes.push(pane_id),
-            // The client vanished between its request and here. Nothing owns the
-            // PTY, so reap it rather than leak it.
-            None => {
-                drop(cls);
-                log::warn!(
-                    "server: SpawnAuxPane requester client_id={client_id} is gone; reaping pane_id={pane_id}"
-                );
-                reap_panes(&[pane_id], panes, clients).await;
-                return;
-            }
-        }
-    }
-    start_forwarding_for_pane(
-        pane_id,
-        None,
-        state,
-        panes,
-        clients,
-        config,
-        prev_frames,
-        dormant,
-    )
-    .await;
-    let cls = clients.lock().await;
-    if let Some(conn) = cls.get(&client_id) {
-        let _ = conn.tx.send(ServerMessage::AuxPaneSpawned {
-            pane_id: Some(pane_id),
-        });
-    }
-}
-
 /// Spawn the PTY for `pane_id` and register it.
 ///
 /// `args` is the command's argument vector after argv[0], and is empty for
 /// every pane whose command is a shell or a self-contained TUI. It is non-empty
-/// for exactly one caller -- the `browser` panel's "open this file in an
-/// editor" -- and it exists because `Pty::spawn` execs a single-element argv:
-/// without it, a `command` of `"vim /tmp/x"` would look for a BINARY of that
-/// name rather than running `vim` on the file.
+/// for exactly one caller -- the `files` panel's "open this file in an editor"
+/// -- and it exists because `Pty::spawn` execs a single-element argv: without
+/// it, a `command` of `"vim /tmp/x"` would look for a BINARY of that name rather
+/// than running `vim` on the file.
 ///
 /// `identity` is what the child is told it is, as `REMUX_SESSION`/`REMUX_PANE`.
-/// It is a PARAMETER rather than derived from `pane_id` here because the two
-/// disagree for an aux pane, which names the pane it was spawned FOR -- see
-/// [`PaneIdentity`]. Only the caller knows which case it is in.
+/// A PARAMETER rather than derived from `pane_id` here because only the caller
+/// knows what the pane should call itself -- see [`PaneIdentity`].
 #[allow(clippy::too_many_arguments)]
 async fn spawn_pane(
     pane_id: PaneId,
@@ -7955,7 +7749,7 @@ async fn start_pty_forwarding(
     for pane_id in pane_ids {
         start_forwarding_for_pane(
             pane_id,
-            Some(session_name.to_string()),
+            session_name.to_string(),
             state,
             panes,
             clients,
@@ -7970,26 +7764,22 @@ async fn start_pty_forwarding(
 /// Start the one forwarding task for `pane_id`: pump its PTY into its `Screen`,
 /// stream the result to subscribers, and handle the pane's death.
 ///
-/// `session_name` is what distinguishes a normal pane from an **auxiliary** one,
-/// and it is the only difference between the two:
-/// - `Some(name)`: the pane belongs to that session's layout, so each batch also
-///   re-composites the session's frame, and the pane's death runs the full
-///   `close_pane` path (layout repair, persistence, the tree push).
-/// - `None`: an aux pane
-///   ([`SpawnAuxPane`](crate::protocol::ClientMessage::SpawnAuxPane)), in no
-///   layout and on no frame. There is nothing to composite, and its death is
-///   just [`reap_panes`] -- drop it from the pane table and tell its
-///   subscribers, which is the only part of `close_pane` that would have
-///   applied.
+/// `session_name` is the session whose layout the pane belongs to: each batch
+/// re-composites that session's frame, and the pane's death runs the full
+/// `close_pane` path (layout repair, persistence, the tree push).
 ///
-/// Split out of [`start_pty_forwarding`] rather than copied for the aux case:
-/// the loop body is the emulator's whole ingest path (batching, DSR replies,
-/// OSC 52, activity marking, subscriber streaming), and a second copy of it
-/// would drift.
+/// It used to be an `Option`, `None` meaning an **auxiliary** pane -- one in no
+/// layout and on no frame, whose death was `reap_panes` alone. Aux panes existed
+/// only to host the old `files` plugin's file manager and went with it; every
+/// pane now belongs to a session, so the parameter no longer asks a question.
+///
+/// Split out of [`start_pty_forwarding`] rather than inlined: the loop body is
+/// the emulator's whole ingest path (batching, DSR replies, OSC 52, activity
+/// marking, subscriber streaming), and it is spawned once per pane id.
 #[allow(clippy::too_many_arguments)]
 async fn start_forwarding_for_pane(
     pane_id: PaneId,
-    session_name: Option<String>,
+    session_name: String,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -8111,52 +7901,37 @@ async fn start_forwarding_for_pane(
                         // subscriber it returns before snapshotting, so a pane
                         // nobody watches costs nothing per PTY batch.
                         stream_pane_content(pane_id, &state, &panes, &clients).await;
-                        // An aux pane is on no session's frame; its subscribers
-                        // (the sidebar panel) were just served above.
-                        if let Some(sn) = &session_name {
-                            broadcast_full_render(
-                                sn,
-                                &state,
-                                &panes,
-                                &clients,
-                                &config,
-                                &prev_frames,
-                            )
-                            .await;
-                        }
+                        broadcast_full_render(
+                            &session_name,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                     }
                     Some(Err(())) => {
                         // Channel disconnected - process has exited.
                         log::debug!(
-                            "server: PTY channel disconnected for pane_id={pane_id} session={session_name:?}"
+                            "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
-                        match &session_name {
-                            Some(sn) => {
-                                // Close the pane automatically.
-                                close_pane(
-                                    pane_id,
-                                    sn,
-                                    &state,
-                                    &panes,
-                                    &clients,
-                                    &config,
-                                    &prev_frames,
-                                )
-                                .await;
-                                notify_if_close_declined(pane_id, &panes, &clients).await;
-                                save_if_enabled(&state, &panes, &config, &dormant).await;
-                                // A pane dying on its own removes a row from every
-                                // subscriber's tree, and no command ran to say so.
-                                mark_session_tree_dirty();
-                            }
-                            // An aux pane is in no layout and no tree, so its
-                            // death is the notification half alone. The owning
-                            // client keeps the id in its `aux_panes` list; a
-                            // later reap of it is a no-op, and the `PaneExited`
-                            // this sends is what tells the panel to show its
-                            // exited state.
-                            None => reap_panes(&[pane_id], &panes, &clients).await,
-                        }
+                        // Close the pane automatically.
+                        close_pane(
+                            pane_id,
+                            &session_name,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
+                        notify_if_close_declined(pane_id, &panes, &clients).await;
+                        save_if_enabled(&state, &panes, &config, &dormant).await;
+                        // A pane dying on its own removes a row from every
+                        // subscriber's tree, and no command ran to say so.
+                        mark_session_tree_dirty();
                         break;
                     }
                     None => {
