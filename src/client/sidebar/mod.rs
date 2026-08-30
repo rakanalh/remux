@@ -141,7 +141,15 @@ pub trait SidebarPlugin: Send {
     /// This is where a panel that owns a resource learns it has somewhere to put
     /// it: `render` takes `&self`, so a lazily-spawned aux pane cannot be
     /// started from there. A panel dropped for being below its minimum is not
-    /// called, which is what makes "a hidden panel costs nothing" true.
+    /// called at all, so one that has never been laid out never starts anything.
+    ///
+    /// That is NOT the same as "a hidden panel costs nothing", and `files` is
+    /// where the difference shows. Hiding the sidebar stops the `on_size` calls
+    /// but changes nothing else: the aux pane stays spawned and subscribed, and
+    /// every `PaneContent` it produces still drives a paint. Deliberate --
+    /// keeping the pane is exactly what makes un-hiding instant, and killing it
+    /// would cost the user their place in the file manager every time the
+    /// sidebar was toggled.
     fn on_size(&mut self, _cols: u16, _rows: u16) {}
 
     /// Hand over anything the plugin needs the client to do. Drained once per
@@ -177,7 +185,7 @@ pub fn make_plugin(cfg: &PanelConfig) -> Option<Box<dyn SidebarPlugin>> {
             Some(command) => Some(Box::new(files::FilesPlugin::new(command.clone()))),
             None => {
                 log::warn!(
-                    "sidebar: the `files` plugin requires a `command`                      (e.g. command = \"yazi\"); skipping this panel"
+                    "sidebar: the `files` plugin requires a `command` (e.g. command = \"yazi\"); skipping this panel"
                 );
                 None
             }

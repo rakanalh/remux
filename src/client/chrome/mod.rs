@@ -437,7 +437,7 @@ impl Chrome {
             // Logged rather than silent: to the user this looks like a dropped
             // keypress, and `client.log` is where that gets diagnosed.
             log::debug!(
-                "sidebar: focus_edge({edge:?}) refused -- no panel is laid out at                  {term_cols}x{term_rows}; leaving focus on the content"
+                "sidebar: focus_edge({edge:?}) refused -- no panel is laid out at {term_cols}x{term_rows}; leaving focus on the content"
             );
             self.sidebars[i].visible = was_visible;
             return false;
