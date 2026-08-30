@@ -64,6 +64,19 @@ def focused_of(tree):
     return None, None
 
 
+def active_tab_id_by_request(cli):
+    """Ask for the tree outright. Independent of whether a push happened, which
+    is the whole point: it separates "the server did not switch" from "the
+    server switched and told nobody"."""
+    cli.send("ListSessionTree")
+    for msg in cli.drain(1.5):
+        if name_of(msg) == "SessionTree":
+            tab, _ = focused_of(msg["SessionTree"])
+            if tab is not None:
+                return tab
+    return None
+
+
 srv = Server(RUNDIR)
 try:
     srv.start()
@@ -107,31 +120,105 @@ try:
     check(tab_back == tab0,
           f"the pushed tree moved `is_active` back to the first tab "
           f"({tab_back} vs {tab0})")
+    # Land back on the FIRST tab, which is the two-pane one. Load-bearing for
+    # the burst below: the alternating `PaneFocusLeft`/`Right` only move focus
+    # because that tab has two panes. Edit this sequence and the burst silently
+    # becomes 60 no-ops while the test keeps passing.
     cli.send({"Command": "TabNext"})
     cli.drain(1.0)
     cli.send({"Command": "TabPrev"})
     cli.drain(1.0)
 
+    # --- the MOUSE route pushes too ---------------------------------------
+    # Everything above sends `Command` messages, so it pins the KEYBOARD route
+    # only. `handle_mouse_click` arrives via `ClientMessage::MouseClick` and
+    # never reaches `handle_command`'s tail marker, so the tab-bar click is a
+    # separate route needing its own coverage -- and it was the one route left
+    # uncovered when `ServerState::goto_tab`'s own marker was removed.
+    #
+    # The click goes on the status row, where the tab strip lives. Nothing else
+    # is hit-testable there: a miss is `ClickTarget::None` and does nothing, so
+    # scanning for the tab's column cannot disturb anything.
+    bar_row = 29  # rows - 1, for the 100x30 negotiated above
+    here = active_tab_id_by_request(cli)
+    other_x = None
+    for x in range(0, 40):
+        cli.send({"MouseClick": {"x": x, "y": bar_row, "pane_id": None, "release": False}})
+        cli.drain(0.25)
+        if active_tab_id_by_request(cli) != here:
+            other_x = x
+            break
+    check(other_x is not None,
+          "a click on the status row can reach a tab (the scan found one)")
+
+    if other_x is not None:
+        # Back to a known tab, then drain everything so the only tree that can
+        # arrive below is one this click caused.
+        cli.send({"Command": {"TabGoto": 0}})
+        cli.drain(1.2)
+        before_tab = active_tab_id_by_request(cli)
+        cli.drain(1.2)
+
+        cli.send({"MouseClick": {"x": other_x, "y": bar_row, "pane_id": None, "release": False}})
+        pushed = trees(cli.drain(2.0))
+
+        # Independent of the push: did the server actually switch? Without this,
+        # a red result could not tell "no push" from "no switch".
+        after_tab = active_tab_id_by_request(cli)
+        check(after_tab != before_tab,
+              f"the click really switched tab server-side ({before_tab} -> {after_tab})")
+        check(pushed,
+              "a tab-bar CLICK pushes a tree, as the keyboard route does")
+        if pushed:
+            clicked_tab, _ = focused_of(pushed[-1])
+            check(clicked_tab == after_tab,
+                  f"and the pushed tree carries the new active tab "
+                  f"({clicked_tab} vs {after_tab})")
+
     # --- a burst must not outrun the 100 ms gate --------------------------
     # What a held-down Alt+h looks like: focus commands as fast as the socket
     # takes them. The push count must be governed by the interval, not by how
     # many commands arrived.
+    # The bound is measured against how long the server took to PROCESS the
+    # burst, not how fast it was written. Writing is the wrong quantity: each
+    # command runs a `broadcast_full_render` over a 100x30 grid plus JSON
+    # serialisation, in a DEBUG build, so on a loaded machine the burst can take
+    # far longer to work through than to send -- and a fixed constant would then
+    # go red while the gate was doing its job perfectly.
+    #
+    # Processing time is measured by a round-trip that can only be answered
+    # after every queued command has been handled, since the server processes
+    # one connection's messages in order.
     burst = 60
     start = time.time()
     for i in range(burst):
         cli.send({"Command": "PaneFocusLeft" if i % 2 else "PaneFocusRight"})
-    pushes = len(trees(cli.drain(2.0)))
-    elapsed = time.time() - start
-    # The whole burst is written before anything is drained, so every change
-    # lands within a few milliseconds of the last: the gate can only fire once
-    # for the burst, once for whatever was already in flight, and once trailing.
-    # A ceiling derived from the DRAIN window (elapsed / interval, ~22 here)
-    # would be satisfied by a build that pushed fifteen times, which is the
-    # regression this is guarding against; the constant is the real claim.
-    ceiling = 4
+    # A barrier that is NOT a tree, so every `SessionTree` counted below is
+    # unambiguously a push. The server handles one connection's messages in
+    # order, so this reply cannot arrive until the whole burst has been worked
+    # through -- which makes its arrival the measurement of processing time.
+    cli.send("RequestScrollbackInfo")
+    pushes, processing = 0, None
+    while processing is None and time.time() - start < 30:
+        for msg in cli.drain(0.3):
+            if name_of(msg) == "SessionTree":
+                pushes += 1
+            elif name_of(msg) == "ScrollbackInfo":
+                processing = time.time() - start
+                break
+    check(processing is not None, "the burst was processed within 30s")
+    processing = processing or 30.0
+    # Whatever trails the last change.
+    pushes += len(trees(cli.drain(1.5)))
+    # One push per interval the PROCESSING spanned, plus one already in flight
+    # when the burst began and one trailing the last change. The `+ 2` is the
+    # real claim; the interval term is only what keeps a slow machine from
+    # failing a gate that is working.
+    ceiling = int(processing / PUSH_INTERVAL) + 2
     check(pushes <= ceiling,
-          f"{burst} focus moves in {elapsed:.2f}s produced {pushes} pushes, "
-          f"at most {ceiling} — the gate governs the rate, not the key repeat")
+          f"{burst} focus moves took {processing:.2f}s to process and produced "
+          f"{pushes} pushes, within the {ceiling} the {int(PUSH_INTERVAL * 1000)}ms "
+          f"gate allows -- the gate governs the rate, not the key repeat")
     check(pushes >= 1, f"...and at least one push still arrived (got {pushes})")
 
     check("panicked at" not in srv.log(), "no panic in the server log")

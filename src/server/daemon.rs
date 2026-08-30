@@ -4242,6 +4242,12 @@ async fn handle_mouse_click(
                 let mut st = state.lock().await;
                 let _ = st.goto_tab(&session_name, tab_index);
             }
+            // `TabTreeEntry::is_active` is in the pushed payload, so a tab-bar
+            // click is a tree change exactly as the keyboard routes are -- and
+            // this arm has to say so itself. `handle_mouse_click` is reached
+            // from `ClientMessage::MouseClick`, never from `handle_command`,
+            // whose tail is what marks the tree dirty for every command.
+            mark_session_tree_dirty();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         ClickTarget::StackLabel(pane_id) => {
