@@ -58,10 +58,17 @@ def rows_text(msg):
 
 
 def standin_pids():
-    """PIDs of stand-ins that are still alive."""
+    """PIDs of stand-ins that have not been fully reaped.
+
+    A zombie counts. `kill(pid, 0)` succeeds for one -- a `<defunct>` child keeps
+    its pid and its name until somebody waits for it -- so "not in the process
+    table under its old command name" is the WEAK check that passes on exactly
+    the leak under test. The state field is read instead, and the two outcomes
+    are reported separately so a failure says which one happened.
+    """
     if not os.path.exists(PIDFILE):
         return []
-    alive = []
+    leaked = []
     with open(PIDFILE) as fh:
         for line in fh:
             line = line.strip()
@@ -71,12 +78,10 @@ def standin_pids():
             try:
                 stat = open(f"/proc/{pid}/stat").read()
             except OSError:
-                continue
-            # A zombie is NOT alive -- but it is not gone either, and a reap that
-            # leaves one is a leak, so it counts here. `kill(pid, 0)` cannot tell
-            # the two apart, which is why the state field is read instead.
-            alive.append(pid)
-    return alive
+                continue  # gone: reaped, which is the outcome we want
+            state = stat.split(") ", 1)[1][0]
+            leaked.append(f"{pid}{'(zombie)' if state == 'Z' else ''}")
+    return leaked
 
 
 def wait_for(pred, timeout=3.0):
@@ -191,7 +196,7 @@ try:
             exited = True
     check(exited, "KillAuxPane reports PaneExited to the subscriber")
     check(wait_for(lambda: not standin_pids()),
-          "KillAuxPane leaves no stand-in process behind")
+          f"KillAuxPane leaves no stand-in process behind (left={standin_pids()})")
 
     # --- 4b: abrupt disconnect -------------------------------------------
     aux2 = spawn_aux(cli, WORKDIR)
@@ -202,15 +207,16 @@ try:
     # Drop the socket with no KillAuxPane: this is the abrupt path.
     cli.close()
     check(wait_for(lambda: not standin_pids(), 5.0),
-          "an abrupt client disconnect reaps the aux pane (no orphan process)")
+          f"an abrupt client disconnect reaps the aux pane "
+          f"(no orphan process; left={standin_pids()})")
 
     log = srv.log()
     check("panicked at" not in log, "no panic in the server log")
 finally:
     srv.kill()
-    for pid in standin_pids():
+    for entry in standin_pids():
         try:
-            os.kill(pid, 9)
+            os.kill(int(entry.split("(")[0]), 9)
         except OSError:
             pass
 

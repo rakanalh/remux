@@ -3129,16 +3129,7 @@ static SESSION_TREE_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new(
 /// Record that the session tree has changed. Cheap and non-blocking; safe to
 /// call while holding any server lock. With no subscribers the pusher wakes,
 /// finds none, and parks again.
-///
-/// `pub(crate)` so the two state mutators that move focus -- [`Tab::focus_pane`]
-/// and [`ServerState::goto_tab`] -- can call it directly. Focus is the one thing
-/// the tree shows that no command handler used to mark: a `PaneFocus*` reshapes
-/// nothing, so the tree a subscriber holds kept its old focus marker until some
-/// unrelated structural change happened to redraw it.
-///
-/// [`Tab::focus_pane`]: crate::server::session::Tab::focus_pane
-/// [`ServerState::goto_tab`]: crate::server::session::ServerState::goto_tab
-pub(crate) fn mark_session_tree_dirty() {
+fn mark_session_tree_dirty() {
     SESSION_TREE_DIRTY.notify_one();
 }
 

@@ -340,12 +340,6 @@ impl Tab {
         if self.zoomed_pane.is_some() {
             self.zoomed_pane = Some(pane_id);
         }
-        // The tree shows which pane is focused (and, since the `files` sidebar
-        // plugin, that pane's cwd), so every route that moves focus -- eleven
-        // call sites, plus a mouse click -- has to wake the pusher. Doing it in
-        // the one funnel rather than at each of them is what keeps a new focus
-        // path from silently going stale.
-        crate::server::daemon::mark_session_tree_dirty();
     }
 
     /// Make `pane_order` agree with the layout tree, keeping the existing order
@@ -1281,9 +1275,6 @@ impl ServerState {
             tab.activity = TabActivity::None;
             tab.last_output = None;
         }
-        // Which tab is active decides `TabTreeEntry::is_active`, and with it
-        // which pane the tree calls THE focused one.
-        crate::server::daemon::mark_session_tree_dirty();
         Ok(())
     }
 

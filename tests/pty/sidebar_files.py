@@ -156,19 +156,29 @@ def wait_panel(pump, screen, want, timeout=8.0):
 
 
 def live_standins():
+    """PIDs of stand-ins that have not been fully reaped.
+
+    A zombie counts. `kill(pid, 0)` succeeds for one -- a `<defunct>` child keeps
+    its pid and its name until somebody waits for it -- so "not in the process
+    table under its old command name" is the WEAK check that passes on exactly
+    the leak under test. The state field is read instead, and the two outcomes
+    are reported separately so a failure says which one happened.
+    """
     if not os.path.exists(PIDFILE):
         return []
-    alive = []
+    leaked = []
     for line in open(PIDFILE):
         line = line.strip()
         if not line:
             continue
+        pid = int(line)
         try:
-            open(f"/proc/{int(line)}/stat").read()
+            stat = open(f"/proc/{pid}/stat").read()
         except OSError:
-            continue
-        alive.append(int(line))
-    return alive
+            continue  # gone: reaped, which is the outcome we want
+        state = stat.split(") ", 1)[1][0]
+        leaked.append(f"{pid}{'(zombie)' if state == 'Z' else ''}")
+    return leaked
 
 
 def logs():
@@ -300,9 +310,9 @@ try:
     check("panicked at" not in logs(), "no panic in either log")
 finally:
     teardown(child, env)
-    for pid in live_standins():
+    for entry in live_standins():
         try:
-            os.kill(pid, 9)
+            os.kill(int(entry.split("(")[0]), 9)
         except OSError:
             pass
 
