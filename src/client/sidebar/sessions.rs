@@ -277,6 +277,7 @@ impl SidebarPlugin for SessionsPlugin {
             // cwd is already in the tree this panel holds.
             PluginEvent::Agents { .. }
             | PluginEvent::FocusedCwd { .. }
+            | PluginEvent::DirectoryListing { .. }
             | PluginEvent::AuxPaneReady
             | PluginEvent::AuxPaneContent { .. }
             | PluginEvent::AuxPaneExited => {}

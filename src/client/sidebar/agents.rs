@@ -339,6 +339,7 @@ impl SidebarPlugin for AgentsPlugin {
             // panel-targeted and belong to `files`.
             PluginEvent::SessionTree { .. }
             | PluginEvent::FocusedCwd { .. }
+            | PluginEvent::DirectoryListing { .. }
             | PluginEvent::AuxPaneReady
             | PluginEvent::AuxPaneContent { .. }
             | PluginEvent::AuxPaneExited => {}

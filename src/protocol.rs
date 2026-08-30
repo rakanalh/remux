@@ -54,7 +54,7 @@ pub enum ConnDescriptor {
 /// 7 -> 8: the agents sidebar plugin. Adds
 /// [`ClientMessage::SubscribeAgents`]/[`ClientMessage::UnsubscribeAgents`] and
 /// [`ServerMessage::AgentList`].
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -276,6 +276,51 @@ pub enum ClientMessage {
     /// new directory kills its old pane rather than waiting for the client to
     /// exit.
     KillAuxPane { pane_id: PaneId },
+    /// List the contents of `path` **on this server's filesystem**.
+    ///
+    /// The `browser` sidebar panel's one question. It goes over the wire rather
+    /// than being a client-side `read_dir` because the panel follows the FOCUSED
+    /// pane's directory, and that pane is routinely on a remote: a client-side
+    /// listing would show the client's own `/home/you` and look entirely
+    /// plausible while describing the wrong machine. `files` gets this right for
+    /// free by running its file manager on the server; the built-in browser has
+    /// to earn it.
+    ///
+    /// `path` must be absolute and is echoed back VERBATIM in the answer, so a
+    /// panel with a request in flight can tell its own reply from another
+    /// panel's. Normalising it (resolving `..`) is the client's job for that
+    /// reason -- a server that answered about a different path than it was asked
+    /// about would break the match.
+    ///
+    /// Answered with [`ServerMessage::DirectoryListing`], including on failure:
+    /// a listing that cannot be produced reports WHY rather than an empty list.
+    ListDirectory { path: String },
+    /// Open `path` in a new split of this client's attached session, running an
+    /// editor.
+    ///
+    /// **The editor is resolved on the SERVER** (`command`, else the server's
+    /// `$EDITOR`, else `vi`), because the editor has to exist where the FILE is.
+    /// A client-side `$EDITOR` would name a binary installed on the client and
+    /// absent from the remote holding the file.
+    ///
+    /// `command` is the panel's configured override; `None` means "whatever this
+    /// server would use". `vertical` picks the split orientation, matching
+    /// [`RemuxCommand::PaneSplitVertical`]/[`RemuxCommand::PaneSplitHorizontal`].
+    ///
+    /// This executes a program named partly by a client-supplied string, and
+    /// that is deliberately not "hardened": a connected client can already
+    /// [`Input`](ClientMessage::Input) arbitrary bytes into any pane's shell, so
+    /// it can run anything it likes on this server already. This grants it
+    /// nothing new. The reasoning is written down so nobody later either
+    /// narrows it into uselessness or widens the trust boundary without
+    /// noticing that it moved.
+    OpenInSplit {
+        path: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        vertical: bool,
+    },
     /// Scroll a subscribed pane's own scroll view by `lines` (per-subscriber,
     /// by pane identity), independent of this client's foreground scroll. Used
     /// by a View cell's mouse wheel: the server adjusts a per-(client, pane)
@@ -480,6 +525,37 @@ pub enum ServerMessage {
     /// `files` panels, so `None` is not a formality: it is what keeps the
     /// correlation-free matching honest.
     AuxPaneSpawned { pane_id: Option<PaneId> },
+    /// The answer to a [`ClientMessage::ListDirectory`].
+    ///
+    /// `path` is the requested path echoed back unchanged -- the panel matches
+    /// on it to claim its own reply.
+    ///
+    /// `entries` and `error` are not exclusive in principle, but in practice a
+    /// failed `read_dir` yields no entries. `error` is a HUMAN string shown in
+    /// the panel rather than swallowed: "permission denied" is an ordinary
+    /// answer for a directory, and an empty panel that might mean "empty" and
+    /// might mean "denied" is the same ambiguity
+    /// [`AgentList::detection_supported`](ServerMessage::AgentList) exists to
+    /// remove.
+    ///
+    /// Entries arrive **unsorted-by-policy** in the server's chosen order
+    /// (directories first, then by name) and **unfiltered**: hidden files are
+    /// included, and the client hides them. That is what makes the `.` toggle
+    /// instant instead of a round trip.
+    DirectoryListing {
+        path: String,
+        #[serde(default)]
+        entries: Vec<DirEntry>,
+        #[serde(default)]
+        error: Option<String>,
+        /// Whether the listing hit the entry cap and is therefore INCOMPLETE.
+        ///
+        /// A directory with a hundred thousand files is real, and silently
+        /// showing the first slice of one is a lie the user cannot detect. The
+        /// panel says so on its own line.
+        #[serde(default)]
+        truncated: bool,
+    },
     /// The panes running an AI coding agent, pushed to every client subscribed
     /// with [`ClientMessage::SubscribeAgents`].
     ///
@@ -661,6 +737,23 @@ pub struct AgentEntry {
     /// entry at all.
     pub command: String,
     pub state: AgentState,
+}
+
+/// One entry in a [`ServerMessage::DirectoryListing`].
+///
+/// A name, not a path: the directory it belongs to is the listing's `path`, and
+/// repeating it on every row would put the same string on the wire a thousand
+/// times.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    /// Whether this entry can be DESCENDED INTO, following symlinks -- so a
+    /// symlink pointing at a directory is `is_dir` AND `is_symlink`, and
+    /// `Enter` on it descends, which is what a shell's `cd` does. A broken
+    /// symlink is neither.
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
 }
 
 // ---------------------------------------------------------------------------

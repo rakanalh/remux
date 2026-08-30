@@ -963,6 +963,37 @@ async fn dispatch_plugin_request(
             None => log::debug!("sidebar: panel {key:?} has no aux pane for its input yet"),
         },
         PluginRequest::Kill => cancel_aux(key, mgr, aux_panes, aux_pending).await,
+        // Both of these go to the FOREGROUND connection, and that is not a
+        // simplification: `PluginEvent::FocusedCwd` -- the only thing that ever
+        // points a browser panel at a directory -- is broadcast for the
+        // foreground connection alone, so the directory on screen is by
+        // construction the foreground server's.
+        PluginRequest::ListDirectory { path } => {
+            let conn = mgr.foreground().clone();
+            if let Err(e) = mgr.send(&conn, ClientMessage::ListDirectory { path }).await {
+                log::warn!("sidebar: ListDirectory for panel {key:?} failed: {e:#}");
+            }
+        }
+        PluginRequest::OpenInSplit {
+            path,
+            command,
+            vertical,
+        } => {
+            let conn = mgr.foreground().clone();
+            if let Err(e) = mgr
+                .send(
+                    &conn,
+                    ClientMessage::OpenInSplit {
+                        path,
+                        command,
+                        vertical,
+                    },
+                )
+                .await
+            {
+                log::warn!("sidebar: OpenInSplit for panel {key:?} failed: {e:#}");
+            }
+        }
     }
 }
 
@@ -1079,6 +1110,16 @@ async fn handle_plugin_action(
         }
         PluginAction::LeaveTo(dir) => {
             log::debug!("sidebar: plugin asked to leave towards {dir:?}");
+            chrome.leave_sidebar();
+            chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
+            renderer.flush()?;
+        }
+        PluginAction::Leave => {
+            // No direction, and none invented. The panel is leaving because it
+            // did something (`browser` opening a file in a split), and the pane
+            // it wants the user in is the one the server is about to create --
+            // which is where the server's own focus already goes.
+            log::debug!("sidebar: plugin asked to leave");
             chrome.leave_sidebar();
             chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
             renderer.flush()?;
@@ -5648,6 +5689,57 @@ async fn run_client_loop(
                             }
                             renderer.flush()?;
                         }
+                    }
+                    Some(ServerMessage::DirectoryListing { path, entries, error, truncated }) => {
+                        log::debug!(
+                            "srv: DirectoryListing src={:?} path={:?} entries={} error={:?} truncated={}",
+                            src, path, entries.len(), error, truncated
+                        );
+                        // Unguarded by any `wants_*` flag: a listing arrives
+                        // only in answer to a request, and only a browser panel
+                        // makes one. Broadcast rather than addressed -- the
+                        // panel claims it by `(conn, path)`; see
+                        // `PluginEvent::DirectoryListing`.
+                        chrome.broadcast(&crate::client::sidebar::PluginEvent::DirectoryListing {
+                            conn: src.clone(),
+                            path,
+                            entries,
+                            error,
+                            truncated,
+                        });
+                        // Repainted exactly as the agent-list and session-tree
+                        // arms do: over a live view `paint_view` ends with
+                        // `chrome.paint`, so it is the one that has to run.
+                        if let Some(av) = active_view {
+                            paint_view(
+                                &mut renderer,
+                                &chrome,
+                                &views[av],
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &compositor_theme,
+                                &view_border_style,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                            )?;
+                        } else {
+                            let (tc, tr) = renderer.size();
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                            relay_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                                tc,
+                                tr,
+                            )?;
+                        }
+                        renderer.flush()?;
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());

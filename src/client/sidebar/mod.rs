@@ -17,6 +17,7 @@ use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
 
 pub mod agents;
+pub mod browser;
 pub mod files;
 pub mod nav;
 pub mod placeholder;
@@ -31,6 +32,18 @@ pub enum PluginAction {
     Redraw,
     /// Move focus out of the sidebar in this direction.
     LeaveTo(FocusDirection),
+    /// Move focus out of the sidebar, with no direction to offer.
+    ///
+    /// Distinct from [`PluginAction::LeaveTo`] on purpose. A panel that has been
+    /// asked to leave BECAUSE it did something -- `browser` opening a file in a
+    /// split -- has no direction to give: it does not know which edge it is
+    /// docked to, and the pane it wants the user in is the one the server just
+    /// created, not a spatial neighbour. The two happen to be handled
+    /// identically today (the `LeaveTo` handler ignores its direction), and that
+    /// is exactly why this is a separate variant rather than a fabricated
+    /// direction: the day the direction starts being honoured, a made-up one
+    /// would send focus somewhere nobody chose.
+    Leave,
     /// Go to a session, a tab, or a pane, on any connected server. The client
     /// routes this through the same jump path the session manager uses.
     ///
@@ -87,6 +100,24 @@ pub enum PluginEvent {
     /// This panel's auxiliary pane is gone -- its program exited, or the
     /// connection carrying it dropped. Panel-targeted.
     AuxPaneExited,
+    /// The contents of a directory on `conn`, as that server reported them.
+    ///
+    /// Broadcast rather than panel-targeted, and correlated by `(conn, path)`
+    /// instead: a panel claims the listing it asked for and ignores the rest.
+    /// That is cheaper AND more honest than a correlation queue -- two browser
+    /// panels sitting in the same directory both genuinely want this answer, and
+    /// a queue would hand it to one of them.
+    DirectoryListing {
+        conn: ConnId,
+        path: String,
+        entries: Vec<crate::protocol::DirEntry>,
+        /// Why the directory could not be listed. Shown, never swallowed: an
+        /// empty panel that might mean "empty" and might mean "denied" is the
+        /// same ambiguity the agents panel's `supported` exists to remove.
+        error: Option<String>,
+        /// Whether the server hit its entry cap, so this listing is incomplete.
+        truncated: bool,
+    },
 }
 
 /// Something a plugin needs the client to do on its behalf.
@@ -117,6 +148,24 @@ pub enum PluginRequest {
     Input { data: Vec<u8> },
     /// Kill this panel's aux pane and forget it.
     Kill,
+    /// List this directory on the foreground server. Answered by a
+    /// [`PluginEvent::DirectoryListing`] broadcast, which the panel claims by
+    /// `(conn, path)`.
+    ///
+    /// `path` must already be absolute and normalised -- the server echoes it
+    /// back verbatim, so a panel that sent `/a/b/..` would be looking for a
+    /// reply about `/a`.
+    ListDirectory { path: String },
+    /// Open this file in a split running an editor, on the foreground server.
+    ///
+    /// `command` is the panel's configured editor override, or `None` to let the
+    /// SERVER decide -- which is the point: the editor must exist where the file
+    /// is, and the file is on the server.
+    OpenInSplit {
+        path: String,
+        command: Option<String>,
+        vertical: bool,
+    },
 }
 
 /// A panel that can live inside a sidebar.
@@ -204,6 +253,12 @@ pub fn make_plugin(cfg: &PanelConfig) -> Option<Box<dyn SidebarPlugin>> {
         "placeholder" => Some(Box::new(placeholder::PlaceholderPlugin::new())),
         "sessions" => Some(Box::new(sessions::SessionsPlugin::new())),
         "agents" => Some(Box::new(agents::AgentsPlugin::new())),
+        // `command` is OPTIONAL here, and means the opposite of what it means
+        // to `files`: not "the program this panel hosts" (there is none -- the
+        // browser is built in) but "the editor to open a file with", overriding
+        // the server's own `$EDITOR`. A panel that names none is perfectly
+        // usable, which is the whole point of shipping it.
+        "browser" => Some(Box::new(browser::BrowserPlugin::new(cfg.command.clone()))),
         "files" => match &cfg.command {
             Some(command) => Some(Box::new(files::FilesPlugin::new(command.clone()))),
             None => {
@@ -307,4 +362,21 @@ pub fn draw_text(
         last_base = Some(cx);
         cx += w;
     }
+}
+
+/// Fit a path into `width` columns, keeping the END of it -- the leaf directory
+/// is what identifies where you are, and it is the part a left-truncating
+/// header would throw away first.
+///
+/// Shared by every panel whose header is a directory (`files`, `browser`).
+pub fn shorten_path(path: &str, width: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= width || width == 0 {
+        return path.to_string();
+    }
+    if width == 1 {
+        return "\u{2026}".to_string();
+    }
+    let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
+    format!("\u{2026}{tail}")
 }

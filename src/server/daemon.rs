@@ -20,6 +20,7 @@ use crate::config::{BorderStyle, Config};
 use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
+use crate::server::browse;
 use crate::server::compositor::{
     composite, fits_zellij_border, hit_test, is_multi_stack, pane_content_rect, ClickTarget,
     HitRegions, MouseSelection, StatusInfo,
@@ -1252,6 +1253,62 @@ is not owned by this connection; ignoring"
             }
             Ok(())
         }
+        ClientMessage::ListDirectory { path } => {
+            // Blocking filesystem work off the executor. A `read_dir` over a
+            // cold NFS mount or a directory with a hundred thousand entries can
+            // take hundreds of milliseconds, and this task also drives every
+            // pane's output: blocking it would stall the whole server, not just
+            // this listing.
+            let requested = path.clone();
+            let listing = tokio::task::spawn_blocking(move || {
+                browse::list_directory(std::path::Path::new(&path))
+            })
+            .await
+            .unwrap_or_else(|e| browse::Listing {
+                entries: Vec::new(),
+                error: Some(format!("listing failed: {e}")),
+                truncated: false,
+            });
+            log::debug!(
+                "server: ListDirectory client_id={client_id} path={requested:?} \
+entries={} error={:?} truncated={}",
+                listing.entries.len(),
+                listing.error,
+                listing.truncated
+            );
+            let cls = clients.lock().await;
+            if let Some(conn) = cls.get(&client_id) {
+                let _ = conn.tx.send(ServerMessage::DirectoryListing {
+                    // The REQUESTED path, verbatim. The panel matches its
+                    // pending request against it; answering about a path we
+                    // resolved differently would leave that match unfindable.
+                    path: requested,
+                    entries: listing.entries,
+                    error: listing.error,
+                    truncated: listing.truncated,
+                });
+            }
+            Ok(())
+        }
+        ClientMessage::OpenInSplit {
+            path,
+            command,
+            vertical,
+        } => {
+            handle_open_in_split(
+                client_id,
+                &path,
+                command.as_deref(),
+                vertical,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await
+        }
         ClientMessage::UnsubscribePane { pane_id } => {
             {
                 let mut cls = clients.lock().await;
@@ -1983,6 +2040,7 @@ async fn handle_command(
                     rect.width.saturating_sub(2).max(1),
                     rect.height.saturating_sub(2).max(1),
                     None,
+                    &[],
                     focused_cwd.as_deref().map(std::path::Path::new),
                     panes,
                     config,
@@ -2037,6 +2095,7 @@ async fn handle_command(
                 cols,
                 rows,
                 None,
+                &[],
                 focused_cwd.as_deref().map(std::path::Path::new),
                 panes,
                 config,
@@ -2164,6 +2223,9 @@ async fn handle_command(
                 placement,
                 cols,
                 rows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2306,6 +2368,9 @@ async fn handle_command(
                 PanePlacement::Stack,
                 cols,
                 rows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2471,6 +2536,9 @@ async fn handle_command(
                 PanePlacement::Auto,
                 cols,
                 rows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2891,6 +2959,7 @@ async fn handle_command(
                 tcols,
                 trows,
                 None,
+                &[],
                 focused_cwd.as_deref().map(std::path::Path::new),
                 panes,
                 config,
@@ -2941,6 +3010,9 @@ async fn handle_command(
                 PanePlacement::Auto,
                 tcols,
                 trows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -3136,7 +3208,7 @@ async fn handle_create_session(
         st.create_session(name, folder, border_style, layout_mode, popup_size)?
     };
     log::debug!("server: CreateSession name={name:?} folder={folder:?} pane_id={pane_id}");
-    spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
+    spawn_pane(pane_id, cols, rows, None, &[], None, panes, config).await?;
 
     // Announce to EVERY client, not just the creator. A session manager open in
     // another terminal has no timer -- every tree refresh is event-driven -- so
@@ -5402,6 +5474,14 @@ impl PanePlacement {
 /// resolved. The caller owns the refresh tail (`resize_session_panes` +
 /// `broadcast_full_render`, or `refresh_target_session` for another session's
 /// tab), since which clients to repaint is a caller-side decision.
+///
+/// `command`/`args`/`cwd` are the OPTIONAL overrides. Every `RemuxCommand` that
+/// creates a pane passes `(None, &[], None)` and gets what it always got: the
+/// configured shell, in the previously focused pane's directory. The one caller
+/// that passes them is `OpenInSplit`, which needs a specific editor, on a
+/// specific file, in that file's directory -- and it comes through HERE rather
+/// than down a second pane-creation path, because a split that skipped this
+/// function would eject neither the tab to `Custom` nor the zoom.
 #[allow(clippy::too_many_arguments)]
 async fn create_pane_in_tab(
     session_name: &str,
@@ -5409,6 +5489,9 @@ async fn create_pane_in_tab(
     placement: PanePlacement,
     cols: u16,
     rows: u16,
+    command: Option<&str>,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -5470,19 +5553,28 @@ async fn create_pane_in_tab(
         (new_pane_id, focused)
     };
 
-    let source_cwd = {
-        let panes_lock = panes.lock().await;
-        panes_lock
-            .get(&source_pane_id)
-            .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+    // An explicit `cwd` wins over inheritance, and the inheritance is not even
+    // computed then. Inheriting the focused pane's directory is right for "give
+    // me another shell here" and wrong for "open THIS file": the editor gets an
+    // absolute path either way, but a relative `:e` inside it should resolve
+    // beside the file, not beside whatever pane happened to have focus.
+    let source_cwd = match cwd {
+        Some(_) => None,
+        None => {
+            let panes_lock = panes.lock().await;
+            panes_lock
+                .get(&source_pane_id)
+                .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+        }
     };
     let (spawn_cols, spawn_rows) = placement.spawn_size(cols, rows);
     spawn_pane(
         new_pane_id,
         spawn_cols,
         spawn_rows,
-        None,
-        source_cwd.as_deref().map(std::path::Path::new),
+        command,
+        args,
+        cwd.or(source_cwd.as_deref().map(std::path::Path::new)),
         panes,
         config,
     )
@@ -5498,6 +5590,83 @@ async fn create_pane_in_tab(
     )
     .await;
     Ok(Some(new_pane_id))
+}
+
+/// Open `path` in a new split of `client_id`'s attached session, running an
+/// editor resolved ON THIS SERVER.
+///
+/// Server-side resolution is the point rather than an implementation detail:
+/// the file is on this machine, so the editor that opens it has to be too. A
+/// client-side `$EDITOR` would name whatever the user has installed on the
+/// machine they are sitting at, which for a remote session is not where the
+/// file is.
+///
+/// The split itself goes through [`create_pane_in_tab`], the one pane-creation
+/// path, so it ejects the tab to `Custom` and clears the zoom exactly as a
+/// hand-typed `PaneSplitVertical` does. The refresh tail is this function's,
+/// matching the `PaneSplit*` command arm it mirrors.
+///
+/// A client with no attached session is ignored, as every other pane-creating
+/// path ignores it: there is no tab to split.
+#[allow(clippy::too_many_arguments)]
+async fn handle_open_in_split(
+    client_id: u64,
+    path: &str,
+    command: Option<&str>,
+    vertical: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<()> {
+    let (session_name, cols, rows) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => (c.session_name.clone(), c.cols, c.rows),
+            None => return Ok(()),
+        }
+    };
+    let Some(session_name) = session_name else {
+        log::debug!("server: OpenInSplit from client_id={client_id} with no attached session");
+        return Ok(());
+    };
+    let mut argv = browse::editor_argv(command, path);
+    // `editor_argv` always yields at least the program and the file.
+    let program = argv.remove(0);
+    // The file's own directory, so a relative `:e` inside the editor resolves
+    // beside the file rather than beside whatever pane had focus.
+    let parent = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+    let placement = if vertical {
+        PanePlacement::SplitVertical
+    } else {
+        PanePlacement::SplitHorizontal
+    };
+    log::info!(
+        "server: OpenInSplit client_id={client_id} session={session_name:?} path={path:?} \
+program={program:?} args={argv:?} vertical={vertical}"
+    );
+    create_pane_in_tab(
+        &session_name,
+        None,
+        placement,
+        cols,
+        rows,
+        Some(&program),
+        &argv,
+        parent.as_deref(),
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await?;
+    resize_session_panes(&session_name, state, panes, clients, config).await?;
+    broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+    Ok(())
 }
 
 /// Spawn an auxiliary pane for `client_id` and answer with its id.
@@ -5544,6 +5713,7 @@ async fn handle_spawn_aux_pane(
         cols,
         rows,
         Some(command),
+        &[],
         cwd.map(std::path::Path::new),
         panes,
         config,
@@ -5601,18 +5771,30 @@ async fn handle_spawn_aux_pane(
     }
 }
 
+/// Spawn the PTY for `pane_id` and register it.
+///
+/// `args` is the command's argument vector after argv[0], and is empty for
+/// every pane whose command is a shell or a self-contained TUI. It is non-empty
+/// for exactly one caller -- the `browser` panel's "open this file in an
+/// editor" -- and it exists because `Pty::spawn` execs a single-element argv:
+/// without it, a `command` of `"vim /tmp/x"` would look for a BINARY of that
+/// name rather than running `vim` on the file.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_pane(
     pane_id: PaneId,
     cols: u16,
     rows: u16,
     command: Option<&str>,
+    args: &[String],
     cwd: Option<&std::path::Path>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
 ) -> Result<()> {
     let cmd = command.or(config.general.default_shell.as_deref());
-    log::debug!("server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} cwd={cwd:?}");
-    let pty_instance = Pty::spawn(cols, rows, cmd, cwd)?;
+    log::debug!(
+        "server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} args={args:?} cwd={cwd:?}"
+    );
+    let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd)?;
     // The reader gets its OWN descriptor (a dup), so the fd number cannot be
     // reissued to a later PTY while the reader's epoll registration still
     // exists. See `start_reader`.
@@ -7802,6 +7984,7 @@ async fn materialize_session(
             default_cols,
             default_rows,
             None,
+            &[],
             cwd_path,
             panes,
             config,

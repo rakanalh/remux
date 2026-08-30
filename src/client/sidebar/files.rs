@@ -15,7 +15,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::{blank_grid, draw_text, PluginAction, PluginEvent, PluginRequest, SidebarPlugin};
+use super::{
+    blank_grid, draw_text, shorten_path, PluginAction, PluginEvent, PluginRequest, SidebarPlugin,
+};
 use crate::client::registry::ConnId;
 use crate::client::view::{blit_snapshot, draw_centered, PaneSnapshot};
 use crate::config::theme::CompositorTheme;
@@ -281,6 +283,7 @@ impl SidebarPlugin for FilesPlugin {
             }
             PluginEvent::SessionTree { .. }
             | PluginEvent::Agents { .. }
+            | PluginEvent::DirectoryListing { .. }
             | PluginEvent::ConnectionLost { .. } => {}
         }
     }
@@ -320,21 +323,6 @@ impl SidebarPlugin for FilesPlugin {
     fn wants_session_tree(&self) -> bool {
         true
     }
-}
-
-/// Fit a path into `width` columns, keeping the END of it -- the leaf directory
-/// is what identifies where you are, and it is the part a left-truncating
-/// header would throw away first.
-fn shorten_path(path: &str, width: usize) -> String {
-    let chars: Vec<char> = path.chars().collect();
-    if chars.len() <= width || width == 0 {
-        return path.to_string();
-    }
-    if width == 1 {
-        return "…".to_string();
-    }
-    let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
-    format!("…{tail}")
 }
 
 #[cfg(test)]

@@ -19,12 +19,24 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Spawn a new PTY with the given dimensions, optional command, and
-    /// optional working directory.
+    /// Spawn a new PTY with the given dimensions, optional command and
+    /// arguments, and optional working directory.
     ///
     /// If `command` is `None`, the shell from `$SHELL` is used, falling back
     /// to `/bin/sh`. If `cwd` is `Some`, the child process starts in that
     /// directory; otherwise it inherits the parent's working directory.
+    ///
+    /// `args` is the argument vector AFTER argv[0] -- `["-R", "/tmp/f"]` for
+    /// `nvim -R /tmp/f`. It also decides how argv[0] itself is presented, and
+    /// the two cases are genuinely different programs:
+    ///
+    /// * **Empty** (every pane shell, and the `files` plugin's file manager):
+    ///   argv[0] is `-<basename>`, the leading-dash LOGIN convention, exactly as
+    ///   before this parameter existed.
+    /// * **Non-empty** (the `browser` plugin's editor): argv[0] is the plain
+    ///   basename. A leading dash tells a SHELL to source its login files; to
+    ///   `vim` it is an unrecognised program name, and there is no reason to
+    ///   hand one to a program that was invoked to edit a file.
     ///
     /// # Safety
     ///
@@ -36,15 +48,28 @@ impl Pty {
         cols: u16,
         rows: u16,
         command: Option<&str>,
+        args: &[String],
         cwd: Option<&std::path::Path>,
     ) -> Result<Pty> {
         log::debug!(
-            "pty: spawn cols={}, rows={}, command={:?}, cwd={:?}",
+            "pty: spawn cols={}, rows={}, command={:?}, args={:?}, cwd={:?}",
             cols,
             rows,
             command,
+            args,
             cwd
         );
+
+        // Built BEFORE the fork. `CString::new` allocates, and the child of a
+        // fork in a multi-threaded process may only call async-signal-safe
+        // functions -- the allocator lock can be held by a thread that does not
+        // exist on this side of the fork. Everything below the fork just reads
+        // these.
+        let c_args: Vec<std::ffi::CString> = args
+            .iter()
+            .map(|a| std::ffi::CString::new(a.as_str()))
+            .collect::<std::result::Result<_, _>>()
+            .context("an argument for the pane's command contains a NUL byte")?;
 
         let winsize = Winsize {
             ws_row: rows,
@@ -121,13 +146,20 @@ impl Pty {
                 // ~/.zprofile, ~/.zlogin and ~/.bash_profile are sourced.
                 // We still exec the real binary at `c_shell`, but present its
                 // argv[0] as "-<basename>".
+                //
+                // Only when there are no ARGUMENTS, though. A program invoked
+                // with a file to edit is not a login shell, and the dash would
+                // simply be a program name it does not recognise.
                 let shell_basename = std::path::Path::new(&shell)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or(shell.as_str());
-                let login_argv0 = format!("-{shell_basename}");
-                let c_argv0 =
-                    std::ffi::CString::new(login_argv0.as_str()).expect("CString::new failed");
+                let argv0 = if c_args.is_empty() {
+                    format!("-{shell_basename}")
+                } else {
+                    shell_basename.to_string()
+                };
+                let c_argv0 = std::ffi::CString::new(argv0.as_str()).expect("CString::new failed");
 
                 // exec the shell. On success this does not return; on failure
                 // say so on the terminal and leave immediately.
@@ -140,7 +172,10 @@ impl Pty {
                 // ordinary config since the `files` sidebar plugin takes a
                 // user-supplied `command`: one typo in `command = "yazi"` used
                 // to paint a panic into the panel.
-                let _ = unistd::execvp(&c_shell, &[&c_argv0]);
+                let mut argv: Vec<&std::ffi::CStr> = Vec::with_capacity(1 + c_args.len());
+                argv.push(&c_argv0);
+                argv.extend(c_args.iter().map(|a| a.as_c_str()));
+                let _ = unistd::execvp(&c_shell, &argv);
                 let err = std::io::Error::last_os_error();
                 let msg = format!("remux: cannot run {shell:?}: {err}\r\n");
                 // SAFETY: a plain `write` to fd 2, which is the PTY slave here.
@@ -513,7 +548,7 @@ mod tests {
     #[test]
     fn spawn_and_exit() {
         // Spawn a shell that immediately exits.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
         pty.write_input(b"exit\n").expect("write_input failed");
 
         // Wait for the child to exit.
@@ -524,7 +559,7 @@ mod tests {
 
     #[test]
     fn resize_does_not_error() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
         pty.resize(120, 40).expect("resize should not fail");
         pty.write_input(b"exit\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -532,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_output_returns_data() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
         pty.write_input(b"echo hello\n").expect("write failed");
 
         // Give the shell a moment to produce output.
@@ -547,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_reader_receives_output() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
 
         let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
@@ -594,7 +629,7 @@ mod tests {
         // The sentinel is split across a shell string concatenation
         // ("AR""GV0=") so the assembled token "ARGV0=" appears only in the
         // shell's actual output, never in the (terminal-echoed) command line.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
 
         let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
