@@ -328,6 +328,12 @@ impl SidebarPlugin for SessionsPlugin {
                     self.refresh_model();
                 }
             }
+            // The aux-pane events are panel-targeted and belong to `files`; the
+            // pre-resolved focused cwd is already in the tree this panel holds.
+            PluginEvent::FocusedCwd { .. }
+            | PluginEvent::AuxPaneReady
+            | PluginEvent::AuxPaneContent { .. }
+            | PluginEvent::AuxPaneExited => {}
         }
     }
 }
@@ -445,7 +451,12 @@ mod tests {
 
     #[test]
     fn registry_resolves_the_sessions_plugin() {
-        assert!(crate::client::sidebar::make_plugin("sessions").is_some());
+        assert!(
+            crate::client::sidebar::make_plugin(&crate::config::sidebar::PanelConfig::named(
+                "sessions"
+            ))
+            .is_some()
+        );
     }
 
     #[test]
@@ -832,11 +843,19 @@ mod tests {
 
     #[test]
     fn only_the_sessions_plugin_asks_for_the_session_tree_push() {
-        assert!(crate::client::sidebar::make_plugin("sessions")
+        assert!(
+            crate::client::sidebar::make_plugin(&crate::config::sidebar::PanelConfig::named(
+                "sessions"
+            ))
             .unwrap()
-            .wants_session_tree());
-        assert!(!crate::client::sidebar::make_plugin("placeholder")
+            .wants_session_tree()
+        );
+        assert!(
+            !crate::client::sidebar::make_plugin(&crate::config::sidebar::PanelConfig::named(
+                "placeholder"
+            ))
             .unwrap()
-            .wants_session_tree());
+            .wants_session_tree()
+        );
     }
 }

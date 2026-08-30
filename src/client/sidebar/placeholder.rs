@@ -99,17 +99,20 @@ mod tests {
 
     #[test]
     fn registry_resolves_the_placeholder() {
-        assert!(make_plugin("placeholder").is_some());
+        assert!(make_plugin(&crate::config::sidebar::PanelConfig::named("placeholder")).is_some());
     }
 
     #[test]
     fn registry_returns_none_for_an_unknown_name() {
-        assert!(make_plugin("no-such-plugin").is_none());
+        assert!(make_plugin(&crate::config::sidebar::PanelConfig::named(
+            "no-such-plugin"
+        ))
+        .is_none());
     }
 
     #[test]
     fn render_returns_exactly_the_requested_dimensions() {
-        let p = make_plugin("placeholder").unwrap();
+        let p = make_plugin(&crate::config::sidebar::PanelConfig::named("placeholder")).unwrap();
         let theme = CompositorTheme::default();
         let grid = p.render(24, 7, false, &theme);
         assert_eq!(grid.len(), 7);
@@ -118,14 +121,14 @@ mod tests {
 
     #[test]
     fn render_at_zero_size_returns_an_empty_grid_and_does_not_panic() {
-        let p = make_plugin("placeholder").unwrap();
+        let p = make_plugin(&crate::config::sidebar::PanelConfig::named("placeholder")).unwrap();
         let theme = CompositorTheme::default();
         assert!(p.render(0, 0, false, &theme).is_empty());
     }
 
     #[test]
     fn the_title_appears_in_the_first_row() {
-        let p = make_plugin("placeholder").unwrap();
+        let p = make_plugin(&crate::config::sidebar::PanelConfig::named("placeholder")).unwrap();
         let theme = CompositorTheme::default();
         let grid = p.render(24, 4, false, &theme);
         let row: String = grid[0].iter().map(|c| c.c).collect();

@@ -10,10 +10,13 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
+use crate::client::view::PaneSnapshot;
+use crate::config::sidebar::PanelConfig;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
 
+pub mod files;
 pub mod placeholder;
 pub mod sessions;
 
@@ -47,6 +50,55 @@ pub enum PluginEvent {
     },
     /// A connection went away; drop anything scoped to it.
     ConnectionLost { conn: ConnId },
+    /// The working directory of the pane the user is focused on, as the
+    /// FOREGROUND server reports it, or `None` when it is not known (no
+    /// attachment, or a server too old to send one).
+    ///
+    /// Resolved by the client rather than by the plugin, even though the raw
+    /// material is in [`PluginEvent::SessionTree`]: picking the focused pane
+    /// means knowing which connection is in the foreground and which of its
+    /// sessions the client is attached to, and that is the client's knowledge,
+    /// not a panel's. Broadcast, since more than one panel may want to follow it.
+    FocusedCwd { cwd: Option<String> },
+    /// The auxiliary pane this panel asked for exists. Delivered ONLY to the
+    /// panel that requested it; the pane id itself stays with the client, which
+    /// is what addresses the pane on the panel's behalf.
+    AuxPaneReady,
+    /// A fresh snapshot of this panel's auxiliary pane. Panel-targeted.
+    AuxPaneContent { snapshot: Box<PaneSnapshot> },
+    /// This panel's auxiliary pane is gone -- its program exited, or the
+    /// connection carrying it dropped. Panel-targeted.
+    AuxPaneExited,
+}
+
+/// Something a plugin needs the client to do on its behalf.
+///
+/// Panels do not speak to servers. A panel says what it wants; the client
+/// resolves WHICH connection and WHICH pane id that means, because a panel has
+/// no way to know either -- the foreground connection can change under it, and
+/// its aux pane's id is assigned by whichever server answered. Keeping that
+/// knowledge on one side is what lets [`PluginEvent::AuxPaneReady`] and friends
+/// carry no addressing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginRequest {
+    /// Spawn this panel's auxiliary pane. Replaces any pane the panel already
+    /// has (the client kills the old one first), which is how a re-target to a
+    /// new directory works.
+    Spawn {
+        cols: u16,
+        rows: u16,
+        command: String,
+        cwd: Option<String>,
+    },
+    /// (Re-)subscribe to this panel's aux pane at this size. Sent on every size
+    /// change, exactly as a View cell re-subscribes: the size demand is folded
+    /// into the pane's min-across-viewers effective size, so the pane reflows to
+    /// the panel with no second sizing policy.
+    Subscribe { cols: u16, rows: u16 },
+    /// Raw bytes for this panel's aux pane.
+    Input { data: Vec<u8> },
+    /// Kill this panel's aux pane and forget it.
+    Kill,
 }
 
 /// A panel that can live inside a sidebar.
@@ -77,6 +129,21 @@ pub trait SidebarPlugin: Send {
     /// Receive pushed data. Called regardless of focus.
     fn on_event(&mut self, ev: &PluginEvent);
 
+    /// The panel has been laid out at this size. Called once per repaint pass
+    /// for every panel the chrome actually placed, before anything is drawn.
+    ///
+    /// This is where a panel that owns a resource learns it has somewhere to put
+    /// it: `render` takes `&self`, so a lazily-spawned aux pane cannot be
+    /// started from there. A panel dropped for being below its minimum is not
+    /// called, which is what makes "a hidden panel costs nothing" true.
+    fn on_size(&mut self, _cols: u16, _rows: u16) {}
+
+    /// Hand over anything the plugin needs the client to do. Drained once per
+    /// pass; a plugin that wants nothing returns an empty vec (the default).
+    fn take_requests(&mut self) -> Vec<PluginRequest> {
+        Vec::new()
+    }
+
     /// Whether this panel needs `PluginEvent::SessionTree`.
     ///
     /// The client subscribes to the server's session-tree push only when some
@@ -87,14 +154,28 @@ pub trait SidebarPlugin: Send {
     }
 }
 
-/// Resolve a config `plugin` name to an instance.
+/// Resolve a `[[sidebar.panel]]` entry to a plugin instance.
 ///
 /// Returns `None` for an unknown name; the caller logs a warning and skips the
 /// panel, so a config naming a not-yet-implemented plugin still loads.
-pub fn make_plugin(name: &str) -> Option<Box<dyn SidebarPlugin>> {
-    match name {
+///
+/// The whole entry rather than just the name, because a plugin may need options
+/// from it -- and may REFUSE the entry. `files` does: it has no default command,
+/// so a panel that names no program is skipped with a warning rather than
+/// spawning an arbitrary one in a PTY the user then has to hunt down.
+pub fn make_plugin(cfg: &PanelConfig) -> Option<Box<dyn SidebarPlugin>> {
+    match cfg.plugin.as_str() {
         "placeholder" => Some(Box::new(placeholder::PlaceholderPlugin::new())),
         "sessions" => Some(Box::new(sessions::SessionsPlugin::new())),
+        "files" => match &cfg.command {
+            Some(command) => Some(Box::new(files::FilesPlugin::new(command.clone()))),
+            None => {
+                log::warn!(
+                    "sidebar: the `files` plugin requires a `command`                      (e.g. command = \"yazi\"); skipping this panel"
+                );
+                None
+            }
+        },
         _ => None,
     }
 }

@@ -884,6 +884,117 @@ async fn switch_to_target(
 /// Both focus-leaving arms go through `Chrome::leave_sidebar` so the panel the
 /// user was on is remembered: `focus_edge` comes back to it rather than
 /// resetting to the first panel.
+/// Carry out one [`PluginRequest`] on behalf of the panel at `(si, pi)`.
+///
+/// This is where a panel's "spawn me a file manager" becomes a message to a
+/// specific server about a specific pane. The mapping lives here, not in the
+/// plugin, for the reason [`PluginRequest`] gives: a panel can know neither
+/// which connection is in the foreground nor what pane id a server will assign.
+///
+/// A request that names a pane this panel does not (yet) have is dropped with a
+/// log line rather than guessed at -- an `InputToAux` arriving in the window
+/// between `SpawnAux` and `AuxPaneSpawned` has no pane to reach, and sending it
+/// anywhere else would type into a stranger's shell.
+async fn dispatch_plugin_request(
+    si: usize,
+    pi: usize,
+    req: crate::client::sidebar::PluginRequest,
+    mgr: &mut ConnectionManager,
+    aux_panes: &mut std::collections::HashMap<(usize, usize), (ConnId, crate::protocol::PaneId)>,
+    aux_pending: &mut std::collections::VecDeque<(ConnId, (usize, usize))>,
+) {
+    use crate::client::sidebar::PluginRequest;
+    let key = (si, pi);
+    match req {
+        PluginRequest::Spawn {
+            cols,
+            rows,
+            command,
+            cwd,
+        } => {
+            // Replacing a pane (a re-target to a new directory) kills the old
+            // one first: the panel can only address one, and the server would
+            // otherwise keep the orphan alive until this client exits.
+            if let Some((conn, pane_id)) = aux_panes.remove(&key) {
+                let _ = mgr
+                    .send(&conn, ClientMessage::KillAuxPane { pane_id })
+                    .await;
+            }
+            let conn = mgr.foreground().clone();
+            match mgr
+                .send(
+                    &conn,
+                    ClientMessage::SpawnAuxPane {
+                        cols,
+                        rows,
+                        command,
+                        cwd,
+                    },
+                )
+                .await
+            {
+                Ok(()) => aux_pending.push_back((conn, key)),
+                Err(e) => log::warn!("sidebar: SpawnAuxPane for panel {key:?} failed: {e:#}"),
+            }
+        }
+        PluginRequest::Subscribe { cols, rows } => {
+            if let Some((conn, pane_id)) = aux_panes.get(&key).cloned() {
+                // `size_demand: true`, exactly as a View cell that SHOWS its
+                // pane: the demand is folded into the pane's min-across-viewers
+                // effective size, so the file manager reflows to the panel with
+                // no second sizing policy. Nothing else views an aux pane, so
+                // the minimum is simply the panel.
+                let _ = mgr
+                    .send(
+                        &conn,
+                        ClientMessage::SubscribePane {
+                            pane_id,
+                            cols,
+                            rows,
+                            size_demand: true,
+                        },
+                    )
+                    .await;
+            }
+        }
+        PluginRequest::Input { data } => match aux_panes.get(&key).cloned() {
+            Some((conn, pane_id)) => {
+                let _ = mgr
+                    .send(&conn, ClientMessage::InputToPane { pane_id, data })
+                    .await;
+            }
+            None => log::debug!("sidebar: panel {key:?} has no aux pane for its input yet"),
+        },
+        PluginRequest::Kill => {
+            if let Some((conn, pane_id)) = aux_panes.remove(&key) {
+                let _ = mgr
+                    .send(&conn, ClientMessage::KillAuxPane { pane_id })
+                    .await;
+            }
+        }
+    }
+}
+
+/// The working directory of the pane the user is focused on, read out of a
+/// session tree: the current session's active tab's focused pane.
+///
+/// All three qualifiers matter. `is_focused` is per-tab, so every tab names one
+/// and `is_active` is what picks between them; `is_current` is per-recipient, so
+/// it names the session THIS client is attached to on that server.
+fn focused_pane_cwd(
+    folders: &[crate::protocol::FolderTreeEntry],
+    unfiled: &[crate::protocol::SessionTreeEntry],
+) -> Option<String> {
+    folders
+        .iter()
+        .flat_map(|f| f.sessions.iter())
+        .chain(unfiled.iter())
+        .find(|s| s.is_current)
+        .and_then(|s| s.tabs.iter().find(|t| t.is_active))
+        .and_then(|t| t.panes.iter().find(|p| p.is_focused))
+        .and_then(|p| p.cwd.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_plugin_action(
     action: crate::client::sidebar::PluginAction,
@@ -2044,8 +2155,36 @@ async fn run_client_loop(
     // dial completing, a foreground handoff), and a subscription missed at any
     // one of them is a panel that silently stops updating for that server.
     let mut tree_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+    // The auxiliary pane behind each sidebar panel that has one, keyed by the
+    // panel's `(sidebar, panel)` position. The CLIENT holds the addressing --
+    // which connection, which pane id -- because a panel can know neither: the
+    // foreground connection moves under it and the id is assigned by whichever
+    // server answered. See `PluginRequest`.
+    let mut aux_panes: std::collections::HashMap<
+        (usize, usize),
+        (ConnId, crate::protocol::PaneId),
+    > = std::collections::HashMap::new();
+    // Panels with a `SpawnAuxPane` in flight, in the order it was sent.
+    // `AuxPaneSpawned` carries no correlation id and needs none: a connection's
+    // requests are serialised by its single writer task and answered in order,
+    // so the head of this queue for the answering connection is the requester.
+    let mut aux_pending: std::collections::VecDeque<(ConnId, (usize, usize))> =
+        std::collections::VecDeque::new();
+    // The last directory broadcast as `FocusedCwd`, so an unchanged tree push
+    // does not re-announce it.
+    let mut focused_cwd: Option<String> = None;
 
     loop {
+        // Lay the panels out and act on what they ask for, before anything can
+        // block in the `select!` below. This is the pass on which a `files`
+        // panel that has just been given a rect spawns its file manager.
+        {
+            let (tc, tr) = renderer.size();
+            let requests = chrome.pump(tc, tr);
+            for (si, pi, req) in requests {
+                dispatch_plugin_request(si, pi, req, mgr, &mut aux_panes, &mut aux_pending).await;
+            }
+        }
         if wants_session_tree {
             let live = mgr.connected_ids();
             for id in &live {
@@ -4904,6 +5043,24 @@ async fn run_client_loop(
                     }
                     Incoming::Closed(src) => {
                         log::debug!("srv: connection closed src={:?}", src);
+                        // Aux panes on the dropped connection are unreachable and
+                        // the server reaps them on the disconnect; drop the
+                        // addressing and let their panels show the exited state
+                        // instead of a snapshot that can never refresh.
+                        let orphaned: Vec<(usize, usize)> = aux_panes
+                            .iter()
+                            .filter(|(_, (c, _))| *c == src)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for key in orphaned {
+                            aux_panes.remove(&key);
+                            chrome.deliver(
+                                key.0,
+                                key.1,
+                                &crate::client::sidebar::PluginEvent::AuxPaneExited,
+                            );
+                        }
+                        aux_pending.retain(|(c, _)| *c != src);
                         // Panels scope their state by connection: tell them
                         // before anything else here can `continue` or return.
                         if wants_session_tree {
@@ -5371,6 +5528,21 @@ async fn run_client_loop(
                                 unfiled: unfiled.clone(),
                                 dormant: dormant.clone(),
                             });
+                            // The focused pane's directory, resolved HERE rather
+                            // than in a panel: it takes knowing which connection
+                            // is in the foreground, which is the client's
+                            // knowledge. Only re-announced when it changes, so a
+                            // panel following it does not restart its program on
+                            // every unrelated tree push.
+                            if mgr.is_foreground(&src) {
+                                let cwd = focused_pane_cwd(&folders, &unfiled);
+                                if cwd != focused_cwd {
+                                    focused_cwd = cwd.clone();
+                                    chrome.broadcast(
+                                        &crate::client::sidebar::PluginEvent::FocusedCwd { cwd },
+                                    );
+                                }
+                            }
                             // Repaint the panels. Over a live view `paint_view`
                             // ends with `chrome.paint`, so it is the one that
                             // has to run; otherwise panels are painted straight
@@ -5576,6 +5748,26 @@ async fn run_client_loop(
                         // `waiting…` (or frozen content) forever and swallowed
                         // every keystroke.
                         if let crate::protocol::SessionEvent::PaneExited { pane_id, .. } = &event {
+                            // A sidebar panel's aux pane dying is reported the
+                            // same way. Forget the addressing and tell the panel,
+                            // which shows its exited state rather than a frozen
+                            // last snapshot.
+                            if let Some((&key, _)) = aux_panes
+                                .iter()
+                                .find(|(_, (c, p))| *c == src && p == pane_id)
+                            {
+                                aux_panes.remove(&key);
+                                chrome.deliver(
+                                    key.0,
+                                    key.1,
+                                    &crate::client::sidebar::PluginEvent::AuxPaneExited,
+                                );
+                                if active_view.is_none() {
+                                    let (tc, tr) = renderer.size();
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                    renderer.flush()?;
+                                }
+                            }
                             let mut active_touched = false;
                             for (vi, view) in views.iter_mut().enumerate() {
                                 for cell in view.cells.iter_mut() {
@@ -5667,11 +5859,37 @@ async fn run_client_loop(
                         }
                     }
                     Some(ServerMessage::AuxPaneSpawned { pane_id }) => {
-                        // Answer to a `SpawnAuxPane` this client sent. Nothing
-                        // sends one yet -- the `files` sidebar plugin is the only
-                        // requester and it is not wired up here yet -- so an
-                        // arrival is a server talking to the wrong client.
-                        log::debug!("srv: AuxPaneSpawned pane_id={pane_id} (unclaimed)");
+                        // The requester is the head of this connection's pending
+                        // queue: requests are serialised by the connection's
+                        // single writer task and answered in order, which is why
+                        // the message needs no correlation id.
+                        let claimant = aux_pending
+                            .iter()
+                            .position(|(c, _)| *c == src)
+                            .map(|i| aux_pending.remove(i).expect("index just found").1);
+                        match claimant {
+                            Some((si, pi)) => {
+                                log::debug!("srv: AuxPaneSpawned pane_id={pane_id} -> panel ({si},{pi})");
+                                aux_panes.insert((si, pi), (src.clone(), pane_id));
+                                chrome.deliver(
+                                    si,
+                                    pi,
+                                    &crate::client::sidebar::PluginEvent::AuxPaneReady,
+                                );
+                            }
+                            // Nobody is waiting: the panel was reconfigured away
+                            // (a config reload) between the request and the
+                            // answer. Kill it rather than leave the server
+                            // holding a pane this client can never address.
+                            None => {
+                                log::warn!(
+                                    "srv: AuxPaneSpawned pane_id={pane_id} has no claimant; killing it"
+                                );
+                                let _ = mgr
+                                    .send(&src, ClientMessage::KillAuxPane { pane_id })
+                                    .await;
+                            }
+                        }
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);
@@ -5717,6 +5935,27 @@ async fn run_client_loop(
                             application_cursor_keys,
                             session_visible,
                         };
+                        // A sidebar panel's aux pane is streamed by the SAME
+                        // subscription machinery a view cell uses, so its
+                        // snapshot arrives here too. Deliver it to the one panel
+                        // that owns the pane and repaint the chrome.
+                        if let Some((&(si, pi), _)) = aux_panes
+                            .iter()
+                            .find(|(_, (c, p))| *c == src && *p == pane_id)
+                        {
+                            chrome.deliver(
+                                si,
+                                pi,
+                                &crate::client::sidebar::PluginEvent::AuxPaneContent {
+                                    snapshot: Box::new(snap.clone()),
+                                },
+                            );
+                            let (tc, tr) = renderer.size();
+                            if active_view.is_none() {
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme)?;
+                                renderer.flush()?;
+                            }
+                        }
                         // Cell title = `session / tab`, host-prefixed for a remote
                         // source (`host: session / tab`). Empty session ⇒ the pane
                         // couldn't be resolved server-side; leave the title unset so

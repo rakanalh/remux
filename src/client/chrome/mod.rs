@@ -19,7 +19,7 @@ pub use geometry::{
 
 use crate::client::renderer::Renderer;
 use crate::client::sidebar::blank_grid;
-use crate::client::sidebar::{make_plugin, PluginEvent, SidebarPlugin};
+use crate::client::sidebar::{make_plugin, PluginEvent, PluginRequest, SidebarPlugin};
 use crate::config::sidebar::SidebarConfig;
 use crate::config::theme::CompositorTheme;
 use crate::config::{BorderStyle, StatusBarPosition};
@@ -92,7 +92,7 @@ impl Chrome {
             }
             let mut panels = Vec::new();
             for pc in &sc.panel {
-                match make_plugin(&pc.plugin) {
+                match make_plugin(pc) {
                     Some(plugin) => panels.push(Panel {
                         plugin,
                         weight: pc.weight.max(1),
@@ -313,6 +313,50 @@ impl Chrome {
             renderer.paint_panel(bar, &grid)?;
         }
         Ok(())
+    }
+
+    /// Lay the panels out, tell each one the size it got, and collect whatever
+    /// they need the client to do.
+    ///
+    /// Returned as `(sidebar, panel, request)` so the client can address the
+    /// requester -- a panel's aux pane is identified by its position, and the
+    /// answers ([`PluginEvent::AuxPaneReady`] and friends) go back the same way
+    /// through [`Chrome::deliver`].
+    ///
+    /// `on_size` reaches only the panels the chrome actually placed, which is
+    /// what makes a hidden panel free; `take_requests` reaches ALL of them,
+    /// because a panel that a resize just hid may still be holding a request
+    /// (a `KillAux` for the pane it no longer wants) that must not be stranded.
+    pub fn pump(&mut self, term_cols: u16, term_rows: u16) -> Vec<(usize, usize, PluginRequest)> {
+        for (si, pi, r) in self.panel_rects(term_cols, term_rows) {
+            self.sidebars[si].panels[pi]
+                .plugin
+                .on_size(r.width, r.height);
+        }
+        let mut out = Vec::new();
+        for (si, s) in self.sidebars.iter_mut().enumerate() {
+            for (pi, p) in s.panels.iter_mut().enumerate() {
+                out.extend(
+                    p.plugin
+                        .take_requests()
+                        .into_iter()
+                        .map(|req| (si, pi, req)),
+                );
+            }
+        }
+        out
+    }
+
+    /// Hand an event to ONE panel. The counterpart to [`Chrome::pump`]: an
+    /// answer belongs to the panel that asked, not to every panel.
+    pub fn deliver(&mut self, sidebar: usize, panel: usize, ev: &PluginEvent) {
+        if let Some(p) = self
+            .sidebars
+            .get_mut(sidebar)
+            .and_then(|s| s.panels.get_mut(panel))
+        {
+            p.plugin.on_event(ev);
+        }
     }
 
     /// Broadcast a pushed event to every plugin. Consumed by the session-tree
@@ -894,6 +938,7 @@ mod focus_tests {
             size,
             visible: true,
             panel: vec![PanelConfig {
+                command: None,
                 plugin: "placeholder".into(),
                 weight: 1,
             }],
@@ -907,6 +952,7 @@ mod focus_tests {
             visible: true,
             panel: (0..n)
                 .map(|_| PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 })
@@ -990,10 +1036,12 @@ mod focus_tests {
                 visible: true,
                 panel: vec![
                     PanelConfig {
+                        command: None,
                         plugin: "placeholder".into(),
                         weight: 1,
                     },
                     PanelConfig {
+                        command: None,
                         plugin: "placeholder".into(),
                         weight: 1,
                     },
@@ -1004,6 +1052,7 @@ mod focus_tests {
                 size: 20,
                 visible: true,
                 panel: vec![PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 }],
@@ -1227,14 +1276,17 @@ mod focus_tests {
             visible: true,
             panel: vec![
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 10,
                 },
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 },
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 10,
                 },
@@ -1439,10 +1491,12 @@ mod focus_tests {
             visible: true,
             panel: vec![
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 },
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 },
@@ -1533,6 +1587,7 @@ mod resize_tests {
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: *w,
                 })
@@ -1706,6 +1761,7 @@ mod resize_tests {
             visible: true,
             panel: (0..panels)
                 .map(|_| PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 })
@@ -1723,6 +1779,7 @@ mod resize_tests {
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: *w,
                 })

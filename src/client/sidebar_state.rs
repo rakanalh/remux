@@ -332,10 +332,12 @@ mod tests {
             visible: true,
             panel: vec![
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 2,
                 },
                 PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: 1,
                 },
@@ -446,6 +448,7 @@ mod tests {
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
+                    command: None,
                     plugin: "placeholder".into(),
                     weight: *w,
                 })
@@ -745,6 +748,7 @@ mod tests {
             size: 30,
             visible: true,
             panel: vec![PanelConfig {
+                command: None,
                 plugin: "placeholder".into(),
                 weight: 1,
             }],

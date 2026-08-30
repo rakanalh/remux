@@ -3101,7 +3101,7 @@ impl InputHandler {
 
 /// Convert a crossterm `KeyEvent` to the byte sequence that should be sent to
 /// a PTY. Returns `None` for key events that have no PTY representation.
-fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<Vec<u8>> {
+pub(crate) fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     // xterm's modifier parameter -- the encoding readline, vim, tmux and every

@@ -26,6 +26,29 @@ pub struct PanelConfig {
     /// Share of the sidebar this panel claims relative to its siblings.
     #[serde(default = "default_weight")]
     pub weight: u16,
+    /// The program a plugin that hosts one should run, e.g. `"yazi"`, `"nnn"`
+    /// or `"ranger"` for the `files` plugin.
+    ///
+    /// REQUIRED by `files` and ignored by every other plugin. There is
+    /// deliberately no default and no auto-detection: the three file managers
+    /// take different flags and behave differently, and a wrong guess spawns the
+    /// wrong program in a PTY the user then has to find and kill. A `files`
+    /// panel without one is skipped with a warning (see `make_plugin`).
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[cfg(test)]
+impl PanelConfig {
+    /// A minimal entry naming `plugin`, for the many tests that only care about
+    /// which plugin a panel is.
+    pub(crate) fn named(plugin: &str) -> Self {
+        Self {
+            plugin: plugin.to_string(),
+            weight: 1,
+            command: None,
+        }
+    }
 }
 
 /// One sidebar docked to a terminal edge.
@@ -89,6 +112,7 @@ visible = true
         assert_eq!(cfg[0].panel[0].plugin, "sessions");
         assert_eq!(cfg[0].panel[0].weight, 2);
         assert_eq!(cfg[0].panel[1].plugin, "agents");
+        assert_eq!(cfg[0].panel[0].command, None);
     }
 
     #[test]
@@ -137,6 +161,26 @@ size = 4
 "#,
         );
         assert!(r.is_err(), "an unknown edge must be rejected loudly");
+    }
+
+    #[test]
+    fn a_panel_command_is_parsed_and_optional() {
+        let cfg = parse(
+            r#"
+[[sidebar]]
+edge = "right"
+size = 40
+
+  [[sidebar.panel]]
+  plugin = "files"
+  command = "yazi"
+
+  [[sidebar.panel]]
+  plugin = "sessions"
+"#,
+        );
+        assert_eq!(cfg[0].panel[0].command.as_deref(), Some("yazi"));
+        assert_eq!(cfg[0].panel[1].command, None);
     }
 
     #[test]
