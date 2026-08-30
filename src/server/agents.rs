@@ -621,11 +621,14 @@ mod tests {
     /// Every width, for every question the real binary asks.
     ///
     /// One question was not enough, and the reason is arithmetic: a space lands
-    /// in the last column only at widths that divide (space index + 1), so a
+    /// in the last column only at widths that DIVIDE (space index + 1), so a
     /// single prompt exercises the bug at just a couple of the 53 widths -- for
-    /// `Do you want to proceed?` only 12 and 15. A different question has its
+    /// `Do you want to proceed?` exactly two, 12 and 15. Every question has its
     /// spaces elsewhere and so its own unlucky widths, which a one-string loop
-    /// would never visit.
+    /// would never visit: across the five shipped questions the bug is reachable
+    /// at 24 (question, width) pairs rather than 2, including widths 8, 13, 14,
+    /// 19, 21, 24, 26, 28, 31, 37 and 42 that the single-question loop missed
+    /// entirely.
     #[test]
     fn every_shipped_question_matches_at_every_pane_width() {
         let r = shipped();
