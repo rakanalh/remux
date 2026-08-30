@@ -34,7 +34,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::nav::{self, Hit, NavKey, NavList, HEADER_ROWS};
+use super::nav::{self, NavKey, NavList, HEADER_ROWS};
 use super::{
     blank_grid, draw_text, shorten_path, PluginAction, PluginEvent, PluginRequest, SidebarPlugin,
 };
@@ -148,8 +148,13 @@ impl BrowserPlugin {
         let Some(conn) = self.conn.clone() else {
             return;
         };
-        self.pending = Some((conn, path.clone()));
-        self.requests.push(PluginRequest::ListDirectory { path });
+        // The SAME conn goes into `pending` and into the request, from one
+        // clone. That is the whole fix for the routing race: the client used to
+        // resolve the destination itself, from `foreground()`, which moves
+        // before `FocusedCwd` does.
+        self.pending = Some((conn.clone(), path.clone()));
+        self.requests
+            .push(PluginRequest::ListDirectory { conn, path });
     }
 
     /// The absolute path of `name` inside the current directory.
@@ -199,7 +204,18 @@ impl BrowserPlugin {
             self.open_dir(path);
             return PluginAction::Redraw;
         }
+        // The panel's own conn, not the client's foreground. `self.cwd` came
+        // from a listing on THIS connection, so `path` names a file on that
+        // machine and nowhere else; opening it anywhere else creates a file
+        // rather than editing one. `None` cannot happen with rows on screen --
+        // rows only ever arrive from a listing, which needs a conn -- but a
+        // `let else` that returns is the honest shape for "there is nothing to
+        // address this to".
+        let Some(conn) = self.conn.clone() else {
+            return PluginAction::None;
+        };
         self.requests.push(PluginRequest::OpenInSplit {
+            conn,
             path,
             command: self.editor.clone(),
             vertical: true,
@@ -280,12 +296,24 @@ impl SidebarPlugin for BrowserPlugin {
         // An error means there are no entries anyway, so this only ever binds on
         // the truncation notice -- which appears exactly when the list is
         // longest.
+        //
+        // ...but never fewer than ONE row while there is a row at all. Plain
+        // `capacity / 2` is 0 in a two-row panel (one header, one line), and
+        // `take(0)` dropped the truncation notice entirely -- silently, in the
+        // one case where `DirectoryListing::truncated` promises it is "reported,
+        // never silent". A single line showing "… list truncated" instead of one
+        // filename is a poor panel; a single line showing one filename out of
+        // five thousand with nothing to say so is a WRONG one.
+        //
+        // The agents panel does not have this bug despite the shared rule: its
+        // note appears only when it has no rows, so the halving never binds
+        // there. That is why this floor lives here and not in `nav`.
         let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
         let all_notes = self.notes();
         let budget = if self.rows.is_empty() {
             capacity
         } else {
-            capacity / 2
+            (capacity / 2).max(1).min(capacity)
         };
         let notes: Vec<String> = all_notes.into_iter().take(budget).collect();
 
@@ -392,13 +420,10 @@ impl SidebarPlugin for BrowserPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        match self.nav.hit(y, self.rows.len()) {
-            Hit::Nothing => PluginAction::None,
-            Hit::Select(idx) => {
-                self.nav.set_selected(idx);
-                PluginAction::Redraw
-            }
-            Hit::Activate(_) => self.activate(),
+        match self.nav.click(y, self.rows.len()) {
+            nav::HitOutcome::Ignore => PluginAction::None,
+            nav::HitOutcome::Moved => PluginAction::Redraw,
+            nav::HitOutcome::Activate => self.activate(),
         }
     }
 
@@ -580,6 +605,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/home/me".to_string()
             }],
             "the listing must go over the wire, not through a local read_dir"
@@ -651,6 +677,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/w/src".to_string()
             }]
         );
@@ -668,6 +695,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
                 path: "/w/main.rs".to_string(),
                 command: None,
                 vertical: true,
@@ -685,6 +713,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
                 path: "/w/f".to_string(),
                 command: Some("hx".to_string()),
                 vertical: true,
@@ -700,6 +729,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/w/src".to_string()
             }]
         );
@@ -716,6 +746,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/home/me".to_string()
             }]
         );
@@ -745,6 +776,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/etc".to_string()
             }]
         );
@@ -811,6 +843,32 @@ mod tests {
         );
     }
 
+    /// ...and it survives a panel with only ONE line to give it.
+    ///
+    /// `capacity / 2` is 0 at two rows, and `take(0)` dropped the notice
+    /// entirely -- exactly the silence `DirectoryListing::truncated` exists to
+    /// prevent, in the smallest panel a user can drag to.
+    #[test]
+    fn the_truncation_notice_survives_a_panel_with_one_line() {
+        let mut p = BrowserPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        p.on_event(&PluginEvent::DirectoryListing {
+            conn: ConnId::Local,
+            path: "/w".to_string(),
+            entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
+            error: None,
+            truncated: true,
+        });
+        // Header + exactly one content line.
+        let rows = painted(&p, 24, 2);
+        assert_eq!(
+            rows[1], "… list truncated",
+            "the one line goes to the notice, not to one filename out of five \
+             thousand with nothing to say so: got {rows:?}"
+        );
+    }
+
     /// The notice is an explanation, not a destination.
     #[test]
     fn a_click_on_the_truncation_notice_selects_nothing() {
@@ -845,6 +903,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
                 path: "/w/b".to_string(),
                 command: None,
                 vertical: true,
@@ -874,6 +933,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/elsewhere".to_string()
             }]
         );
@@ -916,6 +976,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
                 path: "/third".to_string()
             }]
         );
@@ -933,9 +994,43 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::ListDirectory {
+                conn: ConnId::Remote("pi".to_string()),
                 path: "/w/src".to_string()
             }],
-            "the same PATH on another machine is a different directory"
+            "the same PATH on another machine is a different directory, and the \
+             request must be ADDRESSED to that machine -- the client used to \
+             resolve the destination from its own foreground instead"
+        );
+    }
+
+    /// The worst case in the plugin surface, pinned: `Enter` must address the
+    /// machine the PANEL is on.
+    ///
+    /// The client used to route this to its own `foreground()`, on the argument
+    /// that the two are equal by construction. They are equal in the steady
+    /// state; the construction has a window, because `foreground()` moves on the
+    /// switch and the panel only learns of it from the new connection's first
+    /// tree push. An `OpenInSplit` sent into that window opens an editor on the
+    /// NEW machine at a path from the OLD one -- which does not fail, it creates
+    /// an empty file with an entirely plausible name.
+    #[test]
+    fn enter_opens_the_file_on_the_machine_the_panel_is_looking_at() {
+        let mut p = BrowserPlugin::new(None);
+        let pi = ConnId::Remote("pi".to_string());
+        p.on_event(&cwd(pi.clone(), "/w"));
+        p.take_requests();
+        p.on_event(&listing(pi.clone(), "/w", vec![entry("f", false)]));
+        p.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::OpenInSplit {
+                conn: pi,
+                path: "/w/f".to_string(),
+                command: None,
+                vertical: true,
+            }],
+            "the request must name the panel's own connection; a path from one \
+             machine opened on another creates a file rather than editing one"
         );
     }
 

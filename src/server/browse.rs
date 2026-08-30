@@ -61,7 +61,19 @@ impl Listing {
 ///
 /// Hidden files are INCLUDED. The client filters them, which is what lets the
 /// `.` toggle be instant instead of a round trip.
+///
+/// `path` must be ABSOLUTE, and that is ENFORCED here rather than asserted in a
+/// doc comment. A relative path is not merely unsupported, it is meaningless
+/// across the socket: `read_dir` would resolve it against the SERVER PROCESS's
+/// working directory -- whatever directory the daemon happened to be started in,
+/// months ago -- and answer with a real, plausible listing of somewhere the
+/// client never asked about. Refusing is the only reading that cannot be
+/// mistaken for an answer, and it arrives as an ordinary `error` the panel
+/// already knows how to show.
 pub fn list_directory(path: &Path) -> Listing {
+    if !path.is_absolute() {
+        return Listing::failed(format!("not an absolute path: {}", path.to_string_lossy()));
+    }
     let dir = match std::fs::read_dir(path) {
         Ok(d) => d,
         Err(e) => return Listing::failed(describe_io_error(&e)),
@@ -202,6 +214,36 @@ mod tests {
 
     fn names(l: &Listing) -> Vec<String> {
         l.entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// A relative path is refused, not resolved.
+    ///
+    /// Probed over the wire before this check existed, `"."` and `"src"`
+    /// answered with a genuine listing of the SERVER PROCESS's working
+    /// directory -- a real answer about somewhere nobody asked about, which is
+    /// worse than an error because it looks right.
+    #[test]
+    fn a_relative_path_is_refused_rather_than_resolved_against_the_daemons_cwd() {
+        for relative in [".", "src", "../etc", ""] {
+            let l = list_directory(Path::new(relative));
+            assert!(
+                l.entries.is_empty(),
+                "a relative path must not produce a listing (got {:?} for {relative:?})",
+                names(&l)
+            );
+            let err = l.error.unwrap_or_default();
+            assert!(
+                err.contains("absolute"),
+                "the refusal must say WHY (got {err:?} for {relative:?})"
+            );
+        }
+        // And the enforcement is not simply "everything fails": an absolute path
+        // to a real directory still lists.
+        let tmp = Tmp::new("absolute");
+        std::fs::write(tmp.path().join("a.txt"), b"x").expect("write");
+        let ok = list_directory(tmp.path());
+        assert_eq!(names(&ok), vec!["a.txt".to_string()]);
+        assert_eq!(ok.error, None);
     }
 
     #[test]

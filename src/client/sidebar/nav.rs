@@ -42,7 +42,7 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
-use super::{draw_text, PluginAction};
+use super::draw_text;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
@@ -292,6 +292,13 @@ impl NavList {
         hit_test(y, self.last_top.get(), self.selected, painted.min(len))
     }
 
+    /// Resolve a click at panel-local row `y`, move the cursor, and say what is
+    /// left to do. [`NavList::hit`] paired with [`action_for_hit`].
+    pub fn click(&mut self, y: u16, len: usize) -> HitOutcome {
+        let hit = self.hit(y, len);
+        action_for_hit(hit, &mut self.selected)
+    }
+
     /// Re-point the cursor at the row it was on, by IDENTITY, after the rows
     /// were rebuilt.
     ///
@@ -321,23 +328,40 @@ impl NavList {
     }
 }
 
-/// The action a panel returns for a click, given the [`Hit`] and its own
-/// activation.
+/// What a panel still has to do about a click, once the cursor has been moved.
 ///
-/// A one-line convenience so the two panels' `on_mouse` bodies stay identical
-/// rather than merely similar.
-pub fn action_for_hit(
-    hit: Hit,
-    select: impl FnOnce(usize),
-    activate: impl FnOnce() -> PluginAction,
-) -> PluginAction {
+/// An INTENT rather than a `PluginAction`, and that is the whole reason this
+/// pair works at all. The obvious shape -- one function taking a `select`
+/// closure and an `activate` closure -- does not compile in any real caller:
+/// both closures need unique access to `*self`, so the second borrow is
+/// rejected (`E0524`). Handing the caller back a verdict and letting it call its
+/// own `self.activate()` after the borrow of the cursor has ended is not a
+/// workaround for that; it is the arrangement that has no borrow conflict to
+/// work around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitOutcome {
+    /// The click landed on no row. The panel does nothing.
+    Ignore,
+    /// The cursor moved to the clicked row. The panel repaints.
+    Moved,
+    /// The click was a second one on the already-selected row: activate it.
+    Activate,
+}
+
+/// Apply a [`Hit`] to a panel's cursor and say what is left to do.
+///
+/// Takes `&mut usize` rather than a `NavList` so it serves the `sessions` panel
+/// too, whose cursor lives in its `TreeModel` -- the same split the rest of this
+/// module is built on. [`NavList::click`] is the one-liner for panels that do
+/// own a `NavList`.
+pub fn action_for_hit(hit: Hit, selected: &mut usize) -> HitOutcome {
     match hit {
-        Hit::Nothing => PluginAction::None,
+        Hit::Nothing => HitOutcome::Ignore,
         Hit::Select(idx) => {
-            select(idx);
-            PluginAction::Redraw
+            *selected = idx;
+            HitOutcome::Moved
         }
-        Hit::Activate(_) => activate(),
+        Hit::Activate(_) => HitOutcome::Activate,
     }
 }
 
@@ -353,6 +377,56 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    /// The click primitive all three list panels now share.
+    ///
+    /// It was dead for a whole phase, and not by accident: its previous
+    /// signature took two closures, both of which needed unique access to
+    /// `*self` in any real caller, so it did not COMPILE when used (`E0524`).
+    /// `#![allow(dead_code)]` on the crate root kept the unused-function warning
+    /// from ever saying so. Returning a verdict instead is what made it usable,
+    /// so this test is as much about the shape as the behaviour.
+    #[test]
+    fn a_click_moves_the_cursor_and_hands_activation_back_to_the_caller() {
+        let mut selected = 3usize;
+        assert_eq!(
+            action_for_hit(Hit::Nothing, &mut selected),
+            HitOutcome::Ignore
+        );
+        assert_eq!(selected, 3, "a click on nothing must not move the cursor");
+
+        assert_eq!(
+            action_for_hit(Hit::Select(1), &mut selected),
+            HitOutcome::Moved
+        );
+        assert_eq!(selected, 1, "a click on a row selects it");
+
+        assert_eq!(
+            action_for_hit(Hit::Activate(1), &mut selected),
+            HitOutcome::Activate
+        );
+        assert_eq!(
+            selected, 1,
+            "activation leaves the cursor alone; the caller acts on it"
+        );
+    }
+
+    /// `NavList::click` is the same thing, bounded by what was painted.
+    #[test]
+    fn navlist_click_selects_within_the_painted_window_and_ignores_below_it() {
+        let mut nav = NavList::new();
+        // Paint a 6-row panel holding 3 rows, so rows occupy the window and the
+        // space below them belongs to whatever else the panel draws there.
+        nav.top_for(6, 3);
+        assert_eq!(nav.click(1 + HEADER_ROWS as u16, 3), HitOutcome::Moved);
+        assert_eq!(nav.selected(), 1);
+        // A second click on the SAME row activates rather than re-selecting.
+        assert_eq!(nav.click(1 + HEADER_ROWS as u16, 3), HitOutcome::Activate);
+        assert_eq!(nav.selected(), 1);
+        // Below the painted rows: nothing.
+        assert_eq!(nav.click(5 + HEADER_ROWS as u16, 3), HitOutcome::Ignore);
+        assert_eq!(nav.selected(), 1);
     }
 
     #[test]

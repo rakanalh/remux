@@ -324,11 +324,17 @@ pub enum ClientMessage {
     /// free by running its file manager on the server; the built-in browser has
     /// to earn it.
     ///
-    /// `path` must be absolute and is echoed back VERBATIM in the answer, so a
-    /// panel with a request in flight can tell its own reply from another
-    /// panel's. Normalising it (resolving `..`) is the client's job for that
-    /// reason -- a server that answered about a different path than it was asked
-    /// about would break the match.
+    /// `path` must be absolute, and the server ENFORCES it rather than trusting
+    /// this sentence: a relative path would resolve against the server PROCESS's
+    /// working directory -- whatever directory the daemon was started in -- and
+    /// come back as a real, plausible listing of somewhere the client never
+    /// asked about. It is refused as an ordinary `error` instead.
+    ///
+    /// It is echoed back VERBATIM in the answer, so a panel with a request in
+    /// flight can tell its own reply from another panel's. Normalising it
+    /// (resolving `..`) is the client's job for that reason -- a server that
+    /// answered about a different path than it was asked about would break the
+    /// match.
     ///
     /// Answered with [`ServerMessage::DirectoryListing`], including on failure:
     /// a listing that cannot be produced reports WHY rather than an empty list.

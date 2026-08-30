@@ -1123,23 +1123,30 @@ async fn dispatch_plugin_request(
             None => log::debug!("sidebar: panel {key:?} has no aux pane for its input yet"),
         },
         PluginRequest::Kill => cancel_aux(key, mgr, aux_panes, aux_pending).await,
-        // Both of these go to the FOREGROUND connection, and that is not a
-        // simplification: `PluginEvent::FocusedCwd` -- the only thing that ever
-        // points a browser panel at a directory -- is broadcast for the
-        // foreground connection alone, so the directory on screen is by
-        // construction the foreground server's.
-        PluginRequest::ListDirectory { path } => {
-            let conn = mgr.foreground().clone();
+        // Both of these are routed by the PANEL, not by `foreground()`.
+        //
+        // They used to use `mgr.foreground()`, under a comment arguing the two
+        // were equal by construction because `PluginEvent::FocusedCwd` is
+        // broadcast for the foreground connection alone. They are equal in the
+        // steady state, and the construction has a window: `foreground()` moves
+        // on the switch, while the panel only learns of it from the new
+        // connection's first tree push. Press Enter in between and `OpenInSplit`
+        // carried the OLD machine's path to the NEW machine, where the editor
+        // silently created an empty file with a plausible name. `ListDirectory`
+        // merely stuck on "loading…", because the reply's conn no longer matched
+        // what the panel was correlating on -- which is the same disagreement,
+        // showing its harmless face.
+        PluginRequest::ListDirectory { conn, path } => {
             if let Err(e) = mgr.send(&conn, ClientMessage::ListDirectory { path }).await {
                 log::warn!("sidebar: ListDirectory for panel {key:?} failed: {e:#}");
             }
         }
         PluginRequest::OpenInSplit {
+            conn,
             path,
             command,
             vertical,
         } => {
-            let conn = mgr.foreground().clone();
             if let Err(e) = mgr
                 .send(
                     &conn,

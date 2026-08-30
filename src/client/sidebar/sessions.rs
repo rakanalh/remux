@@ -25,7 +25,7 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::nav::{self, Hit, NavKey, HEADER_ROWS};
+use super::nav::{self, NavKey, HEADER_ROWS};
 use super::{blank_grid, draw_text, PluginAction, PluginEvent, SidebarPlugin};
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, NodeType, TreeModel};
@@ -221,18 +221,19 @@ impl SidebarPlugin for SessionsPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        match nav::hit_test(
+        let hit = nav::hit_test(
             y,
             self.last_top.get(),
             self.model.selected,
             self.model.rows.len(),
-        ) {
-            Hit::Nothing => PluginAction::None,
-            Hit::Select(idx) => {
-                self.model.selected = idx;
-                PluginAction::Redraw
-            }
-            Hit::Activate(_) => self.activate(),
+        );
+        // The free function, not `NavList::click`: this panel's cursor lives in
+        // its `TreeModel`, which re-points itself by identity on every refresh,
+        // so a `NavList` here would be a second reconciler on one cursor.
+        match nav::action_for_hit(hit, &mut self.model.selected) {
+            nav::HitOutcome::Ignore => PluginAction::None,
+            nav::HitOutcome::Moved => PluginAction::Redraw,
+            nav::HitOutcome::Activate => self.activate(),
         }
     }
 

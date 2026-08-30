@@ -122,12 +122,31 @@ pub enum PluginEvent {
 
 /// Something a plugin needs the client to do on its behalf.
 ///
-/// Panels do not speak to servers. A panel says what it wants; the client
-/// resolves WHICH connection and WHICH pane id that means, because a panel has
-/// no way to know either -- the foreground connection can change under it, and
-/// its aux pane's id is assigned by whichever server answered. Keeping that
-/// knowledge on one side is what lets [`PluginEvent::AuxPaneReady`] and friends
-/// carry no addressing at all.
+/// Panels do not speak to servers: a panel says what it wants and the client
+/// sends it. What the client is allowed to RESOLVE, though, is narrower than it
+/// looks, and the difference is a correctness boundary rather than a style
+/// preference:
+///
+/// * **The pane id** is genuinely the client's to resolve. A panel cannot know
+///   it -- it is assigned by whichever server answered -- which is what lets
+///   [`PluginEvent::AuxPaneReady`] and friends carry no addressing at all.
+///   `Subscribe`/`Input`/`Kill` therefore name no connection: the client looks
+///   both up together from its aux-pane table, so they cannot disagree.
+/// * **The connection is NOT.** A panel driven by
+///   [`PluginEvent::FocusedCwd`] knows exactly which machine the path it is
+///   holding came from, and the client's `foreground()` is a DIFFERENT fact that
+///   moves first. Between a foreground switch and the `FocusedCwd` derived from
+///   the new connection's first tree push, the two disagree -- and a request
+///   routed by `foreground()` then carries one machine's path to another
+///   machine. For `OpenInSplit` that means an editor opening at a path that does
+///   not exist there, silently creating an empty file with a plausible name.
+///   So [`ListDirectory`](PluginRequest::ListDirectory) and
+///   [`OpenInSplit`](PluginRequest::OpenInSplit) carry the conn the PANEL is
+///   looking at, and the client routes where it is told.
+///
+/// This was reasoned away once, in a comment claiming the two were equal "by
+/// construction". They are equal in the steady state; the construction has a
+/// window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginRequest {
     /// Spawn this panel's auxiliary pane. Replaces any pane the panel already
@@ -148,20 +167,27 @@ pub enum PluginRequest {
     Input { data: Vec<u8> },
     /// Kill this panel's aux pane and forget it.
     Kill,
-    /// List this directory on the foreground server. Answered by a
+    /// List this directory on `conn`. Answered by a
     /// [`PluginEvent::DirectoryListing`] broadcast, which the panel claims by
-    /// `(conn, path)`.
+    /// `(conn, path)` -- so this must be the SAME conn the panel will correlate
+    /// on, or the reply is never claimed and the panel waits for ever.
     ///
     /// `path` must already be absolute and normalised -- the server echoes it
     /// back verbatim, so a panel that sent `/a/b/..` would be looking for a
     /// reply about `/a`.
-    ListDirectory { path: String },
-    /// Open this file in a split running an editor, on the foreground server.
+    ListDirectory { conn: ConnId, path: String },
+    /// Open this file in a split running an editor, on `conn`.
+    ///
+    /// `conn` is the machine the panel believes `path` is on, not the client's
+    /// foreground -- see this enum's note. Getting it wrong here is the worst
+    /// case in the whole plugin surface: an editor opening a nonexistent path on
+    /// the wrong machine creates a file rather than reporting anything.
     ///
     /// `command` is the panel's configured editor override, or `None` to let the
     /// SERVER decide -- which is the point: the editor must exist where the file
     /// is, and the file is on the server.
     OpenInSplit {
+        conn: ConnId,
         path: String,
         command: Option<String>,
         vertical: bool,

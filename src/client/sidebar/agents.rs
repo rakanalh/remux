@@ -20,7 +20,7 @@
 
 use crossterm::event::{KeyEvent, MouseEventKind};
 
-use super::nav::{self, Hit, NavKey, NavList, HEADER_ROWS};
+use super::nav::{self, NavKey, NavList, HEADER_ROWS};
 use super::{blank_grid, draw_text, PluginAction, PluginEvent, SidebarPlugin};
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
@@ -299,13 +299,10 @@ impl SidebarPlugin for AgentsPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        match self.nav.hit(y, self.rows.len()) {
-            Hit::Nothing => PluginAction::None,
-            Hit::Select(idx) => {
-                self.nav.set_selected(idx);
-                PluginAction::Redraw
-            }
-            Hit::Activate(_) => self.activate(),
+        match self.nav.click(y, self.rows.len()) {
+            nav::HitOutcome::Ignore => PluginAction::None,
+            nav::HitOutcome::Moved => PluginAction::Redraw,
+            nav::HitOutcome::Activate => self.activate(),
         }
     }
 
