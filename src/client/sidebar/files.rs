@@ -16,6 +16,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
 use super::{blank_grid, draw_text, PluginAction, PluginEvent, PluginRequest, SidebarPlugin};
+use crate::client::registry::ConnId;
 use crate::client::view::{blit_snapshot, draw_centered, PaneSnapshot};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::RenderCell;
@@ -46,14 +47,16 @@ pub struct FilesPlugin {
     /// The program to run. Required by config; there is no default.
     command: String,
     state: AuxState,
-    /// The directory the CURRENT pane was spawned in. Compared against
-    /// [`FilesPlugin::target_cwd`] to decide whether a focus change actually
-    /// moved directory -- without it, every focus move between two panes in the
-    /// same directory would kill and respawn the file manager and throw away the
-    /// user's navigation.
-    spawned_cwd: Option<String>,
-    /// The directory the focused pane is in, as last reported.
-    target_cwd: Option<String>,
+    /// The target the CURRENT pane was spawned for -- the connection it lives on
+    /// and the directory it was opened in. Compared against
+    /// [`FilesPlugin::target`] to decide whether a focus change actually moved
+    /// anywhere: without it, every focus move between two panes in one directory
+    /// would kill and respawn the file manager and throw away the user's
+    /// navigation. The CONNECTION is half of it because two machines routinely
+    /// share a directory name.
+    spawned: Option<(ConnId, Option<String>)>,
+    /// Where the focused pane is, as last reported.
+    target: Option<(ConnId, Option<String>)>,
     /// Whether a [`PluginEvent::FocusedCwd`] has arrived at all.
     ///
     /// The first spawn waits for it. The panel is laid out before the first
@@ -77,8 +80,8 @@ impl FilesPlugin {
         Self {
             command,
             state: AuxState::Idle,
-            spawned_cwd: None,
-            target_cwd: None,
+            spawned: None,
+            target: None,
             cwd_known: false,
             size: (0, 0),
             subscribed_size: None,
@@ -101,13 +104,13 @@ impl FilesPlugin {
         }
         self.snapshot = None;
         self.subscribed_size = None;
-        self.spawned_cwd = self.target_cwd.clone();
+        self.spawned = self.target.clone();
         self.state = AuxState::Spawning;
         self.pending.push(PluginRequest::Spawn {
             cols,
             rows,
             command: self.command.clone(),
-            cwd: self.target_cwd.clone(),
+            cwd: self.target.as_ref().and_then(|(_, cwd)| cwd.clone()),
         });
     }
 }
@@ -142,7 +145,7 @@ impl SidebarPlugin for FilesPlugin {
         // The header tracks focus with the SAME theme roles the panel frame
         // does, exactly as every other panel's does.
         let header_fg = crate::server::compositor::border_fg(theme, focused);
-        let header = match &self.spawned_cwd {
+        let header = match self.spawned.as_ref().and_then(|(_, cwd)| cwd.as_deref()) {
             Some(cwd) => shorten_path(cwd, cols as usize),
             None => self.title().to_string(),
         };
@@ -219,19 +222,19 @@ impl SidebarPlugin for FilesPlugin {
 
     fn on_event(&mut self, ev: &PluginEvent) {
         match ev {
-            PluginEvent::FocusedCwd { cwd } => {
+            PluginEvent::FocusedCwd { conn, cwd } => {
                 let first = !self.cwd_known;
                 self.cwd_known = true;
-                self.target_cwd = cwd.clone();
+                self.target = Some((conn.clone(), cwd.clone()));
                 if first {
                     // The panel was waiting for this to make its first spawn;
                     // `on_size` picks it up on the next pass.
                     return;
                 }
-                // Re-target only when the directory actually changed. Focus
-                // moves between panes far more often than it moves between
+                // Re-target only when the target actually moved. Focus moves
+                // between panes far more often than it moves between
                 // directories, and a respawn costs the user their place.
-                if self.state != AuxState::Idle && *cwd != self.spawned_cwd {
+                if self.state != AuxState::Idle && self.target != self.spawned {
                     self.pending.push(PluginRequest::Kill);
                     self.state = AuxState::Idle;
                     self.snapshot = None;
@@ -385,7 +388,10 @@ mod tests {
             p.take_requests().is_empty(),
             "spawning before the first FocusedCwd would open the wrong directory              and then immediately respawn"
         );
-        p.on_event(&PluginEvent::FocusedCwd { cwd: None });
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
         p.on_size(20, 6);
         assert!(matches!(
             p.take_requests().as_slice(),
@@ -397,6 +403,7 @@ mod tests {
     fn the_first_layout_asks_for_a_pane_at_the_focused_cwd() {
         let mut p = FilesPlugin::new("yazi".into());
         p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
             cwd: Some("/tmp/here".into()),
         });
         assert!(p.take_requests().is_empty(), "no rect yet, no pane");
@@ -418,7 +425,10 @@ mod tests {
     #[test]
     fn a_hidden_panel_asks_for_nothing() {
         let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd { cwd: None });
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
         p.on_size(0, 0);
         p.on_size(20, 1); // header only, no content rows
         assert!(p.take_requests().is_empty());
@@ -427,7 +437,10 @@ mod tests {
     #[test]
     fn a_resize_resubscribes_at_the_new_size() {
         let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd { cwd: None });
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
         p.on_size(20, 6);
         p.take_requests();
         p.on_event(&PluginEvent::AuxPaneReady);
@@ -448,6 +461,7 @@ mod tests {
     fn the_same_directory_does_not_respawn() {
         let mut p = FilesPlugin::new("yazi".into());
         p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
             cwd: Some("/a".into()),
         });
         p.on_size(20, 6);
@@ -456,6 +470,7 @@ mod tests {
         p.take_requests();
         // Focus moved to another pane in the SAME directory.
         p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
             cwd: Some("/a".into()),
         });
         p.on_size(20, 6);
@@ -466,9 +481,36 @@ mod tests {
     }
 
     #[test]
+    fn the_same_directory_on_another_server_does_respawn() {
+        // Two machines routinely have a pane in a directory of the same name.
+        // Comparing the path alone would decide nothing had moved and leave the
+        // panel showing the OLD machine's files.
+        let mut p = FilesPlugin::new("yazi".into());
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: Some("/home/you".into()),
+        });
+        p.on_size(20, 6);
+        p.take_requests();
+        p.on_event(&PluginEvent::AuxPaneReady);
+        p.take_requests();
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Remote("pi".into()),
+            cwd: Some("/home/you".into()),
+        });
+        assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
+        p.on_size(20, 6);
+        assert!(matches!(
+            p.take_requests().as_slice(),
+            [PluginRequest::Spawn { .. }]
+        ));
+    }
+
+    #[test]
     fn a_new_directory_kills_and_respawns() {
         let mut p = FilesPlugin::new("yazi".into());
         p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
             cwd: Some("/a".into()),
         });
         p.on_size(20, 6);
@@ -476,6 +518,7 @@ mod tests {
         p.on_event(&PluginEvent::AuxPaneReady);
         p.take_requests();
         p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
             cwd: Some("/b".into()),
         });
         assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
@@ -501,7 +544,10 @@ mod tests {
             state: crossterm::event::KeyEventState::NONE,
         };
         let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd { cwd: None });
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
         p.on_key(key('j'));
         assert!(p.take_requests().is_empty(), "no pane, no input");
 
@@ -523,7 +569,10 @@ mod tests {
         use crossterm::event::{KeyEventKind, KeyModifiers};
         let theme = CompositorTheme::default();
         let mut p = FilesPlugin::new("yazi".into());
-        p.on_event(&PluginEvent::FocusedCwd { cwd: None });
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
         p.on_size(24, 6);
         p.take_requests();
         p.on_event(&PluginEvent::AuxPaneReady);
@@ -555,6 +604,7 @@ mod tests {
         let theme = CompositorTheme::default();
         let mut p = FilesPlugin::new("yazi".into());
         p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
             cwd: Some("/tmp/proj".into()),
         });
         p.on_size(16, 4);

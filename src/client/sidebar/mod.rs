@@ -59,7 +59,13 @@ pub enum PluginEvent {
     /// means knowing which connection is in the foreground and which of its
     /// sessions the client is attached to, and that is the client's knowledge,
     /// not a panel's. Broadcast, since more than one panel may want to follow it.
-    FocusedCwd { cwd: Option<String> },
+    ///
+    /// `conn` is part of the target, not decoration. Two machines routinely have
+    /// a pane in the same-named directory (`/home/you`, `/srv/app`), and a panel
+    /// comparing the path alone would decide nothing had changed when the
+    /// foreground moved to a remote -- and go on showing the OLD machine's
+    /// directory.
+    FocusedCwd { conn: ConnId, cwd: Option<String> },
     /// The auxiliary pane this panel asked for exists. Delivered ONLY to the
     /// panel that requested it; the pane id itself stays with the client, which
     /// is what addresses the pane on the panel's behalf.

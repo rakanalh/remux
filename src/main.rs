@@ -5049,7 +5049,17 @@ async fn run_client_loop(
                             .filter(|(_, (c, _))| *c == src)
                             .map(|(k, _)| *k)
                             .collect();
-                        for key in orphaned {
+                        // A panel whose spawn was still IN FLIGHT counts too:
+                        // its answer can never arrive now, and silently dropping
+                        // the claimant would leave the panel sitting on
+                        // "starting…" until the focused directory next changed.
+                        let stranded: Vec<(usize, usize)> = aux_pending
+                            .iter()
+                            .filter(|(c, _)| *c == src)
+                            .map(|(_, k)| *k)
+                            .collect();
+                        aux_pending.retain(|(c, _)| *c != src);
+                        for key in orphaned.into_iter().chain(stranded) {
                             aux_panes.remove(&key);
                             chrome.deliver(
                                 key.0,
@@ -5057,7 +5067,6 @@ async fn run_client_loop(
                                 &crate::client::sidebar::PluginEvent::AuxPaneExited,
                             );
                         }
-                        aux_pending.retain(|(c, _)| *c != src);
                         // Panels scope their state by connection: tell them
                         // before anything else here can `continue` or return.
                         if wants_session_tree {
@@ -5542,6 +5551,7 @@ async fn run_client_loop(
                             if mgr.is_foreground(&src) {
                                 chrome.broadcast(
                                     &crate::client::sidebar::PluginEvent::FocusedCwd {
+                                        conn: src.clone(),
                                         cwd: focused_pane_cwd(&folders, &unfiled),
                                     },
                                 );
