@@ -53,7 +53,10 @@ pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
 /// Read the process name from `/proc/<pid>/comm`.
 ///
 /// Falls back to `"shell"` if the file is unreadable.
-fn get_process_name(pid: i32) -> String {
+///
+/// Shared with [`crate::server::agents`], which hands it a foreground process
+/// GROUP id rather than a pane's child pid. One `/proc` reader, two callers.
+pub(crate) fn get_process_name(pid: i32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "shell".to_string())
@@ -148,6 +151,19 @@ struct PaneData {
     /// (so cells flip live between the "Active in session" placeholder and the
     /// streamed content), while steady state stays quiet.
     streamed_session_visible: bool,
+    /// When bytes last reached this pane's [`Screen`].
+    ///
+    /// Per PANE, not per tab. `Tab::activity` deliberately ignores the
+    /// foreground tab (`record_pane_activity` returns early for it), which is
+    /// exactly the tab an agents panel most needs to be right about, so it
+    /// cannot be the source for this.
+    last_output: std::time::Instant,
+    /// The last agent verdict reported for this pane, as its explain string.
+    ///
+    /// Kept only so the classification is logged when it CHANGES rather than
+    /// ten times a second. `None` for a pane that has never been classified --
+    /// which is most of them, since a pane running no agent is never sampled.
+    agent_why: Option<String>,
 }
 
 impl Drop for PaneData {
@@ -257,6 +273,13 @@ struct ClientConnection {
     /// `ClientConnection` in [`handle_client_disconnect`] drops the
     /// subscription with it, so there is no second registry to leak.
     session_tree_subscribed: bool,
+    /// Set by [`ClientMessage::SubscribeAgents`]: this client receives an
+    /// unsolicited [`ServerMessage::AgentList`] whenever agent state changes.
+    ///
+    /// A second flag rather than a mode of `session_tree_subscribed`, because
+    /// the two payloads are dirtied by different things -- structure versus
+    /// pane output -- and a client wanting one must not pay for the other.
+    agents_subscribed: bool,
     /// Auxiliary panes this client asked the server to spawn
     /// ([`ClientMessage::SpawnAuxPane`]) -- PTYs that belong to no layout tree,
     /// backing a sidebar panel that hosts a full-screen TUI.
@@ -396,6 +419,35 @@ impl RemuxServer {
                     SESSION_TREE_DIRTY.notified().await;
                     broadcast_session_tree(&state, &panes, &clients, &dormant).await;
                     tokio::time::sleep(SESSION_TREE_PUSH_INTERVAL).await;
+                }
+            });
+        }
+
+        // Agent push task: the same coalescing shape as the session tree above,
+        // on its own signal (see `AGENTS_DIRTY`), plus one addition. Output
+        // drives every transition except `Working` -> `Idle`, which is caused by
+        // the ABSENCE of output and so can wake nobody. The tick covers exactly
+        // that, and is armed only while something is actually `Working`, so an
+        // idle server -- or one with no agents panel attached -- parks on the
+        // `Notify` and costs nothing.
+        {
+            let state = Arc::clone(&server.state);
+            let panes = Arc::clone(&server.panes);
+            let clients = Arc::clone(&server.clients);
+            let config = Arc::clone(&server.config);
+            tokio::spawn(async move {
+                let mut ticking = false;
+                loop {
+                    if ticking {
+                        tokio::select! {
+                            _ = AGENTS_DIRTY.notified() => {}
+                            _ = tokio::time::sleep(AGENTS_DECAY_TICK) => {}
+                        }
+                    } else {
+                        AGENTS_DIRTY.notified().await;
+                    }
+                    ticking = broadcast_agents(&state, &panes, &clients, &config).await;
+                    tokio::time::sleep(AGENTS_PUSH_INTERVAL).await;
                 }
             });
         }
@@ -575,6 +627,7 @@ impl RemuxServer {
                     pane_drag: None,
                     pane_autoscroll_repeat: None,
                     session_tree_subscribed: false,
+                    agents_subscribed: false,
                     aux_panes: Vec::new(),
                 },
             );
@@ -895,6 +948,25 @@ async fn handle_client_message(
             let mut cls = clients.lock().await;
             if let Some(conn) = cls.get_mut(&client_id) {
                 conn.session_tree_subscribed = false;
+            }
+            Ok(())
+        }
+        ClientMessage::SubscribeAgents => {
+            {
+                let mut cls = clients.lock().await;
+                if let Some(conn) = cls.get_mut(&client_id) {
+                    conn.agents_subscribed = true;
+                }
+            }
+            // Answer at once, so a subscriber's panel is populated immediately
+            // rather than staying blank until the next agent output.
+            send_agents_to(&[client_id], state, panes, clients, config).await;
+            Ok(())
+        }
+        ClientMessage::UnsubscribeAgents => {
+            let mut cls = clients.lock().await;
+            if let Some(conn) = cls.get_mut(&client_id) {
+                conn.agents_subscribed = false;
             }
             Ok(())
         }
@@ -3260,6 +3332,209 @@ async fn broadcast_session_tree(
     send_session_tree_to(&targets, state, panes, clients, dormant).await;
 }
 
+// ---------------------------------------------------------------------------
+// Agent push
+// ---------------------------------------------------------------------------
+
+/// Minimum spacing between two `AgentList` broadcasts, the same coalescing
+/// bound the session tree uses.
+const AGENTS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How often the pusher re-samples while something is `Working`, so the
+/// `Working` -> `Idle` decay is actually delivered.
+///
+/// Needed for that ONE transition and no other: every other change is caused by
+/// output, and output calls [`mark_agents_dirty`]. So the tick is armed only
+/// while the last list contained a `Working` entry -- an agent sitting on
+/// `NeedsInput` overnight (the case this whole panel exists for) costs zero
+/// wakeups, and a server nobody has subscribed to costs zero always.
+const AGENTS_DECAY_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Wakes the agent push task. See [`SESSION_TREE_DIRTY`] for why this shape.
+///
+/// A SEPARATE signal from the session tree's, deliberately. The mechanism is
+/// shared; the signal must not be. Agent state is dirtied by pane OUTPUT, and
+/// folding that into `SESSION_TREE_DIRTY` would drive `send_session_tree_to`'s
+/// per-pane `/proc` sweep -- taken under `state` + `clients` + `panes` -- from
+/// every keystroke echo in every pane.
+static AGENTS_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Record that agent state may have changed. Cheap, non-blocking, and safe to
+/// call while holding any server lock.
+fn mark_agents_dirty() {
+    AGENTS_DIRTY.notify_one();
+}
+
+/// The compiled agent rules, built once from the config the server started with.
+///
+/// A `OnceLock` rather than a field threaded through the call graph: the server
+/// reads its config at startup and the rules are immutable for its life, so the
+/// alternative is an `Arc` clone at fifty call sites that have no other use for
+/// it. An edit to `[agents]` therefore needs `remux restart`, exactly like every
+/// other server-side setting.
+static AGENT_RULES: std::sync::OnceLock<crate::server::agents::AgentRules> =
+    std::sync::OnceLock::new();
+
+fn agent_rules(config: &Config) -> &'static crate::server::agents::AgentRules {
+    AGENT_RULES.get_or_init(|| crate::server::agents::AgentRules::from_config(&config.agents))
+}
+
+/// Every pane running a configured agent command, with its state.
+///
+/// Sampled in three phases so no `/proc` read or `tcgetpgrp` syscall ever
+/// happens under the locks -- `send_session_tree_to` already pays that cost per
+/// live pane while holding three of them, and this runs up to ten times a
+/// second:
+///
+/// 1. Under `panes` alone, DUP each PTY master (`try_clone`). Snapshotting raw
+///    fd NUMBERS instead would be the Phase C fd-recycling bug in a new place:
+///    a pane closing between the snapshot and the read hands its number to the
+///    next PTY, and the sample would name the wrong pane's process. Owning the
+///    dup is what makes the number meaningful for as long as we hold it.
+/// 2. With no locks held, ask each dup for its foreground process group and
+///    that group's `comm`. A dead or exiting PTY errors, which reads as "no
+///    agent" -- never an unwrap.
+/// 3. Only for the panes that matched, take `state` then `panes` (the
+///    codebase's order) to resolve session/tab and classify the screen.
+async fn collect_agents(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) -> Vec<AgentEntry> {
+    let rules = agent_rules(config);
+    if rules.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 1: dup the masters, briefly.
+    let masters: Vec<(PaneId, std::os::fd::OwnedFd)> = {
+        let ps = panes.lock().await;
+        ps.iter()
+            .filter_map(|(&id, pd)| pd.pty.master_fd.try_clone().ok().map(|fd| (id, fd)))
+            .collect()
+    };
+
+    // Phase 2: no locks held.
+    let matched: Vec<(PaneId, String)> = masters
+        .iter()
+        .filter_map(|(id, fd)| {
+            let comm = crate::server::agents::foreground_command(std::os::fd::AsFd::as_fd(fd))?;
+            rules.is_agent(&comm).then_some((*id, comm))
+        })
+        .collect();
+    drop(masters);
+    if matched.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 3: place each matched pane in the tree, then classify it.
+    let mut located: HashMap<PaneId, (String, usize)> = HashMap::new();
+    {
+        let st = state.lock().await;
+        for (name, sess) in &st.sessions {
+            for (tab_index, tab) in sess.tabs.iter().enumerate() {
+                for pane_id in layout::all_pane_ids(&tab.layout) {
+                    if matched.iter().any(|(id, _)| *id == pane_id) {
+                        located.insert(pane_id, (name.clone(), tab_index));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<AgentEntry> = Vec::new();
+    {
+        let now = std::time::Instant::now();
+        let mut ps = panes.lock().await;
+        for (pane_id, command) in matched {
+            // A pane in no layout tree is an AUX pane -- a sidebar's own file
+            // manager. It belongs to a panel, not to the session tree, and has
+            // no session or tab to jump to, so it is not listed.
+            let Some((session, tab_index)) = located.get(&pane_id).cloned() else {
+                continue;
+            };
+            let Some(pd) = ps.get_mut(&pane_id) else {
+                continue;
+            };
+            let bottom = rules.visible_bottom(&pd.screen);
+            let verdict = rules.classify(
+                &command,
+                &bottom,
+                now.saturating_duration_since(pd.last_output),
+            );
+            // The explain path: say WHY, but only when the answer changes.
+            if pd.agent_why.as_deref() != Some(verdict.why.as_str()) {
+                log::debug!(
+                    "agents: pane_id={pane_id} {command} -> {:?} ({})",
+                    verdict.state,
+                    verdict.why
+                );
+                pd.agent_why = Some(verdict.why.clone());
+            }
+            entries.push(AgentEntry {
+                pane_id,
+                session,
+                tab_index,
+                command,
+                state: verdict.state,
+            });
+        }
+    }
+    // A stable order, so a refresh never reshuffles the panel under the user's
+    // selection. The panel preserves the selection by identity regardless, but
+    // a list that jumped around between pushes would be unreadable.
+    entries.sort_by(|a, b| {
+        (&a.session, a.tab_index, a.pane_id).cmp(&(&b.session, b.tab_index, b.pane_id))
+    });
+    entries
+}
+
+/// Send the agent list to each client in `targets`. Returns whether any listed
+/// agent is `Working` -- what the pusher uses to decide whether to arm its
+/// decay tick.
+async fn send_agents_to(
+    targets: &[u64],
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    let agents = collect_agents(state, panes, config).await;
+    let any_working = agents
+        .iter()
+        .any(|a| a.state == crate::protocol::AgentState::Working);
+    let cls = clients.lock().await;
+    for &target in targets {
+        let Some(client) = cls.get(&target) else {
+            continue;
+        };
+        let _ = client.tx.send(ServerMessage::AgentList {
+            agents: agents.clone(),
+        });
+    }
+    any_working
+}
+
+/// Push the agent list to every `SubscribeAgents` subscriber.
+async fn broadcast_agents(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) -> bool {
+    let targets: Vec<u64> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| c.agents_subscribed)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    send_agents_to(&targets, state, panes, clients, config).await
+}
+
 async fn handle_list_session_tree(
     client_id: u64,
     state: &Arc<Mutex<ServerState>>,
@@ -5331,6 +5606,8 @@ async fn spawn_pane(
             reader: reader_handle,
             forwarding_started: false,
             streamed_session_visible: false,
+            last_output: std::time::Instant::now(),
+            agent_why: None,
         },
     );
     Ok(())
@@ -6957,6 +7234,10 @@ async fn reap_panes(
     // Taken under `clients` alone (the panes lock above is released) to keep the
     // locks unnested.
     notify_panes_exited(&exits, clients).await;
+    // Every path that destroys a pane funnels through here, so this is the one
+    // place an agent that has GONE has to be noticed. Nothing else would: the
+    // pusher is woken by output, and a dead pane produces none.
+    mark_agents_dirty();
 }
 
 /// Run the NOTIFICATION half of pane death for a pane whose PTY exited but that
@@ -7238,6 +7519,12 @@ async fn start_forwarding_for_pane(
                                 for chunk in &chunks {
                                     pane_data.screen.process_output(chunk);
                                 }
+                                pane_data.last_output = std::time::Instant::now();
+                                // Output is what makes an agent `Working`, and
+                                // what clears a `NeedsInput` prompt off the
+                                // screen. Safe under the lock for the same
+                                // reason `mark_session_tree_dirty` is.
+                                mark_agents_dirty();
                                 log::debug!(
                                     "pty_forwarding: pane_id={}, cursor=({},{}), screen.rows={}, scroll_bottom={}",
                                     pane_id,
@@ -7545,6 +7832,12 @@ async fn materialize_session(
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 pane_data.screen.process_output(&data);
+                                pane_data.last_output = std::time::Instant::now();
+                                // Output is what makes an agent `Working`, and
+                                // what clears a `NeedsInput` prompt off the
+                                // screen. Safe under the lock for the same
+                                // reason `mark_session_tree_dirty` is.
+                                mark_agents_dirty();
                                 let bell = pane_data.screen.take_bell();
                                 let clipboard = pane_data.screen.take_clipboard();
                                 (pane_data.screen.take_responses(), bell, clipboard)

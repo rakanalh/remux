@@ -5560,6 +5560,12 @@ async fn run_client_loop(
                             .await?;
                         }
                     }
+                    Some(ServerMessage::AgentList { agents }) => {
+                        // No panel consumes this yet; the `agents` plugin lands
+                        // next. Logged rather than dropped silently so the
+                        // server half is observable on its own.
+                        log::debug!("srv: AgentList src={:?} agents={}", src, agents.len());
+                    }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
                         // Hand every panel the tree BEFORE the overlay branches

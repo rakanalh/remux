@@ -50,7 +50,11 @@ pub enum ConnDescriptor {
 /// [`ServerMessage::AuxPaneSpawned`], the `cwd`/`is_active` session-tree fields
 /// those need to follow the focused pane, and
 /// [`ServerMessage::SessionBorderStyle`].
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// 7 -> 8: the agents sidebar plugin. Adds
+/// [`ClientMessage::SubscribeAgents`]/[`ClientMessage::UnsubscribeAgents`] and
+/// [`ServerMessage::AgentList`].
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -180,6 +184,24 @@ pub enum ClientMessage {
     /// Stop receiving [`ServerMessage::SessionTree`] pushes. A no-op for a
     /// client that never subscribed.
     UnsubscribeSessionTree,
+    /// Subscribe to unsolicited [`ServerMessage::AgentList`] pushes: the panes
+    /// on this server that are running an AI coding agent, and what each one is
+    /// doing.
+    ///
+    /// A SECOND subscription rather than a field on the session tree, because
+    /// the two are dirtied by different things. The tree changes structurally --
+    /// a few times a second at worst -- while agent state changes with pane
+    /// OUTPUT. Folding them together would drive the tree's per-pane `/proc`
+    /// sweep from every keystroke echo.
+    ///
+    /// Per-connection and independent of attachment, exactly like
+    /// [`ClientMessage::SubscribeSessionTree`]. One `AgentList` is sent
+    /// immediately in answer, so a subscriber's panel is populated at once.
+    /// Dropped automatically when the connection goes away.
+    SubscribeAgents,
+    /// Stop receiving [`ServerMessage::AgentList`] pushes. A no-op for a client
+    /// that never subscribed.
+    UnsubscribeAgents,
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the
     /// server was started with `save_sessions = true` and
@@ -458,6 +480,16 @@ pub enum ServerMessage {
     /// `files` panels, so `None` is not a formality: it is what keeps the
     /// correlation-free matching honest.
     AuxPaneSpawned { pane_id: Option<PaneId> },
+    /// The panes running an AI coding agent, pushed to every client subscribed
+    /// with [`ClientMessage::SubscribeAgents`].
+    ///
+    /// A full list each time, not a diff: it is a handful of entries at most,
+    /// and a diff would need the client to hold a baseline that a dropped push
+    /// could desynchronize.
+    AgentList {
+        #[serde(default)]
+        agents: Vec<AgentEntry>,
+    },
     /// Response to a `ListSessionTree` request with the full hierarchy.
     SessionTree {
         folders: Vec<FolderTreeEntry>,
@@ -563,6 +595,45 @@ pub struct ViewInfo {
     /// Whether the focused cell is zoomed to fill the view.
     #[serde(default)]
     pub zoomed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+/// What an agent pane is doing, as the server classifies it.
+///
+/// Three states, deliberately, and honestly: `Background`, `Error` and progress
+/// reporting need lifecycle hooks the agents do not give us yet, and five states
+/// that misreport are worse than three that do not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentState {
+    /// The agent is showing a visible approval, question or permission prompt
+    /// and is blocked on the user.
+    ///
+    /// **Outranks [`AgentState::Working`]**, and never decays on silence -- a
+    /// blocked agent produces no output PRECISELY BECAUSE it is waiting, so a
+    /// state that decayed would vanish at the moment the user most needs it.
+    NeedsInput,
+    /// Output reached this pane within the working window.
+    Working,
+    /// Neither of the above.
+    Idle,
+}
+
+/// One pane running an AI coding agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEntry {
+    pub pane_id: PaneId,
+    /// The session the pane lives in, for the panel's label and its jump.
+    pub session: String,
+    /// The index of the tab within that session.
+    pub tab_index: usize,
+    /// The detected foreground command, e.g. `"claude"`. One of the configured
+    /// agent commands by construction: a pane running anything else is not an
+    /// entry at all.
+    pub command: String,
+    pub state: AgentState,
 }
 
 // ---------------------------------------------------------------------------

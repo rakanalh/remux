@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod compositor;
 pub mod daemon;
 pub mod layout;

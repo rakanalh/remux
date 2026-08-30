@@ -35,6 +35,10 @@ env_logger = "0.11"
 tempfile = "3"
 base64 = "0.22"
 notify = "7"
+# Agent-state patterns are CONFIG, not code (see `config::agents`), which needs a
+# pattern language at runtime. Already in the lock file via `env_logger`, so
+# promoting it to a direct dependency adds no new crate to the build.
+regex = "1"
 
 # macOS has no /proc, so we read a foreign process's cwd via sysinfo. Scoped to
 # macOS targets only so Linux builds don't pull it in.
