@@ -6,7 +6,25 @@ server with isolated XDG dirs and a short socket path.
 import json, os, shutil, socket, struct, subprocess, time
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-PROTOCOL_VERSION = 8
+
+
+def _protocol_version():
+    """Read `PROTOCOL_VERSION` out of the source rather than restating it here.
+
+    A hard-coded copy went stale silently: the server is deliberately LENIENT
+    about skew (it logs and proceeds, see CLAUDE.md), so a harness announcing an
+    old version kept passing while claiming to speak a protocol that no longer
+    existed. Reading it is what makes the number true.
+    """
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "src", "protocol.rs")
+    for line in open(src):
+        if "pub const PROTOCOL_VERSION" in line:
+            return int(line.split("=")[1].strip().rstrip(";"))
+    raise SystemExit("could not read PROTOCOL_VERSION from src/protocol.rs")
+
+
+PROTOCOL_VERSION = _protocol_version()
 
 
 class Server:
