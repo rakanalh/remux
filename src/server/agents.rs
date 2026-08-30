@@ -164,8 +164,8 @@ impl AgentRules {
         }
     }
 
-    /// The rows [`AgentRules::classify`] should be given for `screen`: the
-    /// bottom `scan_rows` of the LIVE grid.
+    /// The rows [`AgentRules::classify`] should be given for `screen`: the last
+    /// `scan_rows` rows of the LIVE grid that have anything on them.
     ///
     /// The live grid, never the scrollback -- an approval prompt the user has
     /// scrolled past is not what the agent is showing now. It is also what makes
@@ -173,10 +173,23 @@ impl AgentRules {
     /// entirely independent of `record_pane_activity`, which returns early for
     /// the tab being viewed and would have made the classifier blind to exactly
     /// the pane the user is looking at.
+    ///
+    /// Trailing BLANK rows are skipped before the window is taken, and that is
+    /// not a nicety -- the bottom of the grid is not the bottom of the output.
+    /// An agent that has printed five lines into a thirty-row pane leaves the
+    /// last twelve rows empty, so a window anchored to the grid's last row would
+    /// scan twelve blank lines and see no prompt however plainly one was on
+    /// screen. Found by probing exactly that case. A full-screen TUI, where the
+    /// grid really is full, is unaffected.
     pub fn visible_bottom(&self, screen: &Screen) -> Vec<String> {
-        let rows = &screen.grid;
-        let start = rows.len().saturating_sub(self.scan_rows);
-        rows[start..].iter().map(row_text).collect()
+        let text: Vec<String> = screen.grid.iter().map(row_text).collect();
+        let end = match text.iter().rposition(|line| !line.is_empty()) {
+            Some(last) => last + 1,
+            // A blank screen: nothing to match, and no rows worth handing on.
+            None => return Vec::new(),
+        };
+        let start = end.saturating_sub(self.scan_rows);
+        text[start..end].to_vec()
     }
 }
 
@@ -436,6 +449,38 @@ mod tests {
         let bottom = r.visible_bottom(&screen);
         assert_eq!(bottom.len(), 2, "only the configured number of rows");
         assert_eq!(bottom, vec!["third".to_string(), "last".to_string()]);
+    }
+
+    /// The bug a frame probe found: the bottom of the GRID is not the bottom of
+    /// the OUTPUT.
+    #[test]
+    fn output_at_the_top_of_a_mostly_empty_screen_is_still_scanned() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["claude".to_string()],
+            working_ms: 500,
+            scan_rows: 4,
+            pattern: vec![pattern("approval", None, r"Do you want to proceed")],
+        });
+        // Three lines of output at the top of a thirty-row pane: the prompt is
+        // twenty-six rows above the grid's last row.
+        let mut screen = Screen::new(40, 30, 100);
+        screen.process_output(b"agent ready\r\nDo you want to proceed?\r\n> 1. Yes");
+        let bottom = r.visible_bottom(&screen);
+        assert!(
+            bottom.iter().any(|l| l.contains("Do you want to proceed")),
+            "the prompt must be in the scanned window, got {bottom:?}"
+        );
+        assert_eq!(
+            r.classify("claude", &bottom, Duration::from_secs(60)).state,
+            AgentState::NeedsInput
+        );
+    }
+
+    #[test]
+    fn a_blank_screen_scans_to_nothing() {
+        let r = shipped();
+        let screen = Screen::new(20, 10, 100);
+        assert!(r.visible_bottom(&screen).is_empty());
     }
 
     #[test]
