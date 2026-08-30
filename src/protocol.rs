@@ -108,19 +108,23 @@ pub struct Welcome {
 /// command line names. Keeping them apart means adding a layout placement server
 /// side is not automatically a wire change.
 ///
-/// The two split names follow **Remux's** convention, in which the name is the
-/// DIVIDER rather than the arrangement -- `SplitHorizontal` puts the new pane
-/// below, `SplitVertical` puts it beside. That is the opposite of tmux's
-/// `split-window -h`, and the mapping is spelled out in the subcommand's help
-/// text for exactly that reason. It matches
+/// The split variants are named for the **OUTCOME**, not for the divider:
+/// `SplitRight` puts the new pane to the right, `SplitBelow` puts it underneath.
+/// This deliberately does NOT mirror
 /// [`RemuxCommand::PaneSplitHorizontal`]/[`RemuxCommand::PaneSplitVertical`],
-/// which is the consistency that matters here: the same server runs both.
+/// and the reason is worth keeping: "horizontal" names the DIVIDER in remux and
+/// the ARRANGEMENT in tmux, so the same word means opposite geometry in the two
+/// tools -- `split-window -h` gives a pane beside, `PaneSplitHorizontal` gives
+/// one below. There is no side of that to be on. A name that says where the pane
+/// LANDS cannot be read two ways at all, so the ambiguity is not resolved here,
+/// it is absent. The mapping onto `PanePlacement` is one `match`, in
+/// `handle_cli_spawn`, and it is the only place the two vocabularies meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CliPlacement {
-    /// Split the focused pane top/bottom; the new pane goes below.
-    SplitHorizontal,
-    /// Split the focused pane side by side; the new pane goes to the right.
-    SplitVertical,
+    /// The new pane goes to the RIGHT of the focused one.
+    SplitRight,
+    /// The new pane goes BELOW the focused one.
+    SplitBelow,
     /// Create a new tab in the session, rather than splitting anything.
     NewTab,
 }

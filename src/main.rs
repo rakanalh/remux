@@ -11,7 +11,7 @@ mod server;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
 use futures::StreamExt;
 
@@ -96,40 +96,33 @@ enum Commands {
 
     /// Split the focused pane of the session named by $REMUX_SESSION
     //
-    // `disable_help_flag` because `-h` is claimed here for the split
-    // orientation, as it is in tmux. `--help` is re-added by hand below, so the
-    // only thing lost is the SHORT help flag on this one subcommand. A `///`
-    // here would print this note to the user: clap uses the doc comment's body
-    // as the subcommand's long description.
+    // No short flags for the direction, and `-h` is left to clap as the help
+    // flag. `-h`/`-v` are ambiguous in EVERY multiplexer -- "horizontal" names
+    // the divider in remux and the arrangement in tmux, so the same letter means
+    // opposite geometry in the two tools. Inheriting that spelling would have
+    // cost this subcommand its help flag in order to buy an ambiguity, which is
+    // a bad trade in both directions. `--right`/`--below` name where the pane
+    // LANDS and cannot be misread; splitting is not frequent enough in a script
+    // for four saved characters to be worth any of it.
     #[command(
-        disable_help_flag = true,
         after_help = "Run from inside a remux pane: $REMUX_SESSION names the session to split.\n\
                       With no COMMAND the new pane runs the login shell.\n\n\
                       Examples:\n  \
                         remux split\n  \
-                        remux split -v -- nvim /tmp/notes.md"
+                        remux split --right -- nvim /tmp/notes.md"
     )]
     Split {
-        /// Split top/bottom: the new pane goes BELOW (the default)
-        ///
-        /// Note this is the opposite of tmux's `split-window -h`: the flag names
-        /// the DIVIDER, matching remux's own PaneSplitHorizontal command. Said
-        /// to the USER on purpose -- a tmux user's muscle memory produces the
-        /// wrong split here, and silently.
-        #[arg(short = 'h', long)]
-        horizontal: bool,
+        /// Put the new pane to the RIGHT of the focused one
+        #[arg(long)]
+        right: bool,
 
-        /// Split side by side: the new pane goes to the RIGHT
-        #[arg(short = 'v', long, conflicts_with = "horizontal")]
-        vertical: bool,
+        /// Put the new pane BELOW the focused one (the default)
+        #[arg(long, conflicts_with = "right")]
+        below: bool,
 
         /// Working directory for the new pane (default: the target pane's)
         #[arg(short = 'c', long, value_name = "DIR")]
         cwd: Option<String>,
-
-        /// Print help
-        #[arg(long, action = ArgAction::Help)]
-        help: Option<bool>,
 
         /// Command to run, after `--`; empty runs the login shell
         #[arg(
@@ -544,21 +537,26 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Split {
-            horizontal: _,
-            vertical,
+            right,
+            below: _,
             cwd,
-            help: _,
             argv,
         }) => {
-            // `-h` and the default are the same placement, so `horizontal` is
-            // accepted and then ignored: it exists so that a user who wants to
-            // be explicit can be, and so that `-h`/`-v` read as the pair they
-            // are. `conflicts_with` on `-v` is what makes "both" an error rather
-            // than a silent winner.
-            let placement = if vertical {
-                CliPlacement::SplitVertical
+            // BELOW is the default, stated in `--help` and pinned by a harness
+            // rather than left to whatever the code happens to do: an unpinned
+            // default is exactly the thing that flips during a refactor and gets
+            // noticed months later by a script opening panes in the wrong place.
+            // `--below` is therefore accepted and then ignored -- it exists so a
+            // caller who wants to be explicit can be, and `conflicts_with` makes
+            // naming both an error rather than a silent winner.
+            //
+            // Below rather than right because a terminal is wider than it is
+            // tall, so stacking leaves both panes more usable line length. It is
+            // also what a bare `tmux split-window` does.
+            let placement = if right {
+                CliPlacement::SplitRight
             } else {
-                CliPlacement::SplitHorizontal
+                CliPlacement::SplitBelow
             };
             run_cli_spawn(placement, cwd, argv).await?;
         }

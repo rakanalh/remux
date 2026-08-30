@@ -11,10 +11,11 @@ line that never attaches. This asserts what that costs the server:
    just as happily on a split running a plain login shell, which is the trap
    Phase E caught one layer down -- so the marker the command prints is the
    assertion, and the pane count is only the setup.
-3. `-h` and `-v` really do produce different geometry, in the direction remux's
-   own naming means (`SplitHorizontal` = top/bottom, the opposite of tmux's
-   `split-window -h`). The flag mapping is the one genuinely ambiguous decision
-   in this feature; an untested mapping is a coin flip.
+3. `SplitRight` and `SplitBelow` really do land the pane where they say. The
+   variants are named for the OUTCOME precisely because "horizontal" names the
+   divider in remux and the arrangement in tmux -- so this pins the ONE place
+   the two vocabularies meet, `handle_cli_spawn`'s `match`, where pairing the
+   like-sounding names would be the natural mistake.
 4. `cwd` is honoured.
 5. An unknown session name is an ERROR that NAMES the session, and spawns
    nothing anywhere -- a `$REMUX_SESSION` left over from a rename is the failure
@@ -135,7 +136,7 @@ try:
           f"the session starts with one tab holding one pane (got {before})")
 
     # --- 1 + 2: a split from an unattached connection, running the argv ----
-    reply = cli_spawn("SplitHorizontal", argv=marker_argv("SPLIT-MARKER"))
+    reply = cli_spawn("SplitBelow", argv=marker_argv("SPLIT-MARKER"))
     check(name_of(reply) == "CliSpawned",
           f"CliSpawn from an unattached connection is answered CliSpawned (got {reply})")
     new_id = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
@@ -149,17 +150,17 @@ try:
     ok, seen, dims_h = pane_content(cli, new_id, "SPLIT-MARKER")
     check(ok, f"the requested argv actually RAN in the new pane (rows={seen})")
 
-    # --- 3: -h and -v are different geometry ------------------------------
-    # The split above was horizontal (top/bottom), so the new pane keeps roughly
-    # the session's full width. A vertical one must not.
-    reply_v = cli_spawn("SplitVertical", argv=marker_argv("VSPLIT-MARKER"))
-    check(name_of(reply_v) == "CliSpawned", f"a vertical CliSpawn is answered (got {reply_v})")
+    # --- 3: SplitRight and SplitBelow land where they say -----------------
+    # The split above was BELOW, so the new pane keeps roughly the session's full
+    # width. One placed to the RIGHT must not: it gets about half.
+    reply_v = cli_spawn("SplitRight", argv=marker_argv("VSPLIT-MARKER"))
+    check(name_of(reply_v) == "CliSpawned", f"a SplitRight CliSpawn is answered (got {reply_v})")
     v_id = reply_v["CliSpawned"]["pane_id"] if name_of(reply_v) == "CliSpawned" else None
     ok_v, seen_v, dims_v = pane_content(cli, v_id, "VSPLIT-MARKER")
-    check(ok_v, f"the vertical split's argv ran too (rows={seen_v})")
+    check(ok_v, f"the SplitRight argv ran too (rows={seen_v})")
     check(dims_h[0] > dims_v[0],
-          f"SplitHorizontal keeps the width and SplitVertical halves it "
-          f"(horizontal={dims_h}, vertical={dims_v})")
+          f"SplitBelow keeps the width and SplitRight halves it "
+          f"(below={dims_h}, right={dims_v})")
 
     # --- 4: cwd ------------------------------------------------------------
     # The pane COMPARES its cwd and prints a short verdict, rather than printing
@@ -168,7 +169,7 @@ try:
     # and a wrapped path fails a row-wise substring search while the cwd is
     # perfectly correct.
     reply_c = cli_spawn(
-        "SplitHorizontal", cwd=WORKDIR,
+        "SplitBelow", cwd=WORKDIR,
         argv=["/bin/sh", "-c",
               f'[ "$(pwd)" = "{WORKDIR}" ] && printf "CWD-OK\\n" || printf "CWD-BAD\\n"; exec /bin/sh'])
     check(name_of(reply_c) == "CliSpawned", f"a CliSpawn with a cwd is answered (got {reply_c})")
@@ -178,7 +179,7 @@ try:
 
     # --- 5: an unknown session errors and spawns nothing -------------------
     tabs_before_bad = tree_of(cli)
-    bad = cli_spawn("SplitHorizontal", argv=marker_argv("NEVER-RUNS"),
+    bad = cli_spawn("SplitBelow", argv=marker_argv("NEVER-RUNS"),
                     session="renamed-away")
     check(name_of(bad) == "Error", f"an unknown session name is an Error (got {bad})")
     msg = bad["Error"]["message"] if name_of(bad) == "Error" else ""
@@ -201,7 +202,7 @@ try:
     check(ok_t, f"the new tab's pane runs the requested argv (rows={seen_t})")
 
     # --- empty argv still gives a shell ------------------------------------
-    reply_s = cli_spawn("SplitHorizontal", argv=[])
+    reply_s = cli_spawn("SplitBelow", argv=[])
     check(name_of(reply_s) == "CliSpawned",
           f"an empty argv is accepted and means the login shell (got {reply_s})")
     s_id = reply_s["CliSpawned"]["pane_id"] if name_of(reply_s) == "CliSpawned" else None

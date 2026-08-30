@@ -15,6 +15,10 @@ What is covered:
   2. `remux split` typed in that pane splits it, focus lands on the new pane,
      and **the requested command actually runs** -- "a second pane appeared"
      passes just as well on a split running a plain login shell.
+  2b. The **default direction is BELOW**, and `--right` really goes right. Both
+     are read from the width the pane's own program reports, so the name and the
+     geometry are pinned together. An unpinned default flips in a refactor and
+     is noticed months later, by a script opening panes in the wrong place.
   3. Arguments after `--` survive the whole trip: CLI -> `CliSpawn` ->
      `create_pane_in_tab` -> `Pty::spawn`'s argv.
   4. `remux new-tab` makes a tab, not a split.
@@ -71,9 +75,17 @@ def make_env(config=None):
             fh.write(config)
     # The pane command under test. Its ARGUMENT is what proves argv survived the
     # trip, and it prints a string that does not appear in the command line that
-    # invoked it. The trailing shell keeps the pane alive and typeable.
+    # invoked it. It also reports the WIDTH its PTY was given, which is how the
+    # split DIRECTION is asserted: a pane placed below keeps the session's width,
+    # one placed to the right gets about half. Reading it from the pane itself
+    # beats hunting for a divider glyph on screen -- it is the number the program
+    # in the pane actually sees. The trailing shell keeps the pane alive.
     with open(RUNNER, "w") as fh:
-        fh.write('#!/bin/sh\nprintf "RAN:%s\\n" "$1"\nexec /bin/sh\n')
+        fh.write('#!/bin/sh\n'
+                 'arg="$1"\n'
+                 'size=$(stty size 2>/dev/null || echo "0 0")\n'
+                 'printf "RAN:%s:%s\\n" "$arg" "${size#* }"\n'
+                 'exec /bin/sh\n')
     os.chmod(RUNNER, 0o755)
     env = dict(os.environ)
     env.update(
@@ -152,6 +164,25 @@ def type_line(child, pump, line, t=0.6):
     pump(t)
 
 
+RAN_RE = re.compile(r"RAN:([a-z]+):(\d+)")
+
+
+def ran_cols(pump, screen, arg, timeout=12.0):
+    """The pane width `runner.sh <arg>` reported, or None if it never ran."""
+    end = time.time() + timeout
+    while time.time() < end:
+        pump(0.4)
+        for row in screen.display:
+            # finditer, not search: two panes side by side put two `RAN:` lines
+            # on the SAME screen row, and `search` returns only the leftmost --
+            # which reported "`--right` never ran" while its output was sitting
+            # in the right half of the very row being read.
+            for m in RAN_RE.finditer(row):
+                if m.group(1) == arg:
+                    return int(m.group(2))
+    return None
+
+
 # Ask the focused pane who it is. The FORMAT string is typed and the ANSWER is
 # assembled by the shell, so `ID:[main][3]` can only come from a pane that
 # really has the variables.
@@ -195,10 +226,20 @@ try:
     # Absolute path: the pane's shell has no reason to have the build directory
     # on its PATH. `alpha` is the argument whose arrival is under test.
     type_line(child, pump, f"{BIN} split -- {RUNNER} alpha", t=1.2)
-    check(wait_for(pump, screen, "RAN:alpha"),
+    alpha_cols = ran_cols(pump, screen, "alpha")
+    check(alpha_cols is not None,
           "`remux split -- <cmd> <arg>` runs the command WITH its argument")
-    if not has(screen, "RAN:alpha"):
+    if alpha_cols is None:
         dump(screen, "after split")
+
+    # THE DEFAULT DIRECTION, pinned. A bare `remux split` puts the pane BELOW, so
+    # it keeps very nearly the session's full width; a pane placed to the right
+    # would report about half. An unpinned default is the kind of thing that
+    # flips in a refactor and is noticed months later by a script opening panes
+    # in the wrong place, so it is asserted here rather than merely documented.
+    check(alpha_cols is not None and alpha_cols > COLS * 0.8,
+          f"a bare `remux split` puts the new pane BELOW: it keeps the full "
+          f"width (got {alpha_cols} of {COLS})")
 
     # Focus follows the split, as it does for an interactive one. Asking the
     # focused pane who it is answers both questions at once: a DIFFERENT pane id
@@ -213,9 +254,24 @@ try:
           f"focus is on the NEW pane, which has its own id "
           f"(original={orig_pane}, focused={split_ident[1] if split_ident else None})")
 
+    # --- 3b: `--right` really goes to the right ---------------------------
+    # The two flags name the OUTCOME, so this is the assertion that the name and
+    # the geometry agree. `--right` must halve the width where the default kept
+    # it; anything else means the CLI-to-`PanePlacement` mapping is inverted, and
+    # pairing the like-sounding names is the natural way to invert it.
+    type_line(child, pump, f"{BIN} split --right -- {RUNNER} delta", t=1.2)
+    delta_cols = ran_cols(pump, screen, "delta")
+    check(delta_cols is not None, "`remux split --right` runs its command")
+    check(delta_cols is not None and alpha_cols is not None
+          and delta_cols < alpha_cols * 0.75,
+          f"`--right` puts the pane BESIDE the focused one, not below "
+          f"(right={delta_cols}, default={alpha_cols})")
+    if delta_cols is None:
+        dump(screen, "after --right")
+
     # --- 4: new-tab ---------------------------------------------------------
     type_line(child, pump, f"{BIN} new-tab -- {RUNNER} bravo", t=1.2)
-    check(wait_for(pump, screen, "RAN:bravo"),
+    check(ran_cols(pump, screen, "bravo") is not None,
           "`remux new-tab` runs its command in the new tab's pane")
     # A new tab REPLACES what is on screen, so the split's output being gone is
     # the evidence that this was a tab and not a third split.
@@ -302,9 +358,9 @@ try:
     child2.send(b"\x1bl")  # Alt+l: into the pane, if focus happens to be in the sidebar
     pump2(0.5)
     child2.send(f"{BIN} split -- {RUNNER} charlie".encode() + b"\r")
-    check(wait_for(pump2, screen2, "RAN:charlie", timeout=12),
+    check(wait_for(pump2, screen2, "RAN:charlie:", timeout=12),
           "`remux split` works from a pane while a sidebar is up")
-    if not has(screen2, "RAN:charlie"):
+    if not has(screen2, "RAN:charlie:"):
         dump(screen2, "sidebar split")
 
     check(child2.isalive(), "the client survived the sidebar phase")

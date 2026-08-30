@@ -5836,15 +5836,21 @@ argv={argv:?} cwd={cwd:?}"
             )
             .await?
         }
-        CliPlacement::SplitHorizontal | CliPlacement::SplitVertical => {
+        CliPlacement::SplitRight | CliPlacement::SplitBelow => {
             // The session's own render size, not the caller's: this connection is
             // attached to nothing, so it has no dimensions worth the name. The
             // `resize_session_panes` tail corrects whatever this was anyway.
             let (cols, rows) = session_render_size(session, clients).await;
-            let placement = if matches!(placement, CliPlacement::SplitVertical) {
-                PanePlacement::SplitVertical
-            } else {
-                PanePlacement::SplitHorizontal
+            // The ONE place the CLI's vocabulary meets the layout engine's, and
+            // the mapping looks backwards until you know why: `PanePlacement`
+            // names the DIVIDER, `CliPlacement` names where the pane LANDS. A
+            // vertical divider puts the new pane to the RIGHT; a horizontal one
+            // puts it BELOW. Written out so nobody has to re-derive it, and so
+            // nobody "fixes" the apparent mismatch by pairing the like-sounding
+            // names.
+            let placement = match placement {
+                CliPlacement::SplitRight => PanePlacement::SplitVertical,
+                _ => PanePlacement::SplitHorizontal,
             };
             let created = create_pane_in_tab(
                 session,
