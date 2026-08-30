@@ -98,21 +98,37 @@ impl FilesPlugin {
         (self.size.0, self.size.1.saturating_sub(HEADER_ROWS))
     }
 
-    /// Ask for a pane at the current target directory.
+    /// Ask for a pane at the current target directory, on the machine that
+    /// directory is on.
+    ///
+    /// The connection and the cwd come from ONE read of `self.target`, which is
+    /// the whole point: they are two halves of one fact -- "where the focused
+    /// pane is" -- and taking the directory from the panel while letting the
+    /// client supply the machine from its own `foreground()` is what let them
+    /// disagree.
     fn spawn(&mut self) {
         let (cols, rows) = self.content_size();
         if cols == 0 || rows == 0 {
             return;
         }
+        // No target means no `FocusedCwd` has arrived, and `cwd_known` gates
+        // every caller on exactly that -- so this cannot fire in practice. It is
+        // a `let else` rather than an `expect` because "nowhere to spawn it" is
+        // an ordinary answer, and a panel that quietly stays in `Idle` is
+        // recoverable where a panic is not.
+        let Some((conn, cwd)) = self.target.clone() else {
+            return;
+        };
         self.snapshot = None;
         self.subscribed_size = None;
         self.spawned = self.target.clone();
         self.state = AuxState::Spawning;
         self.pending.push(PluginRequest::Spawn {
+            conn,
             cols,
             rows,
             command: self.command.clone(),
-            cwd: self.target.as_ref().and_then(|(_, cwd)| cwd.clone()),
+            cwd,
         });
     }
 }
@@ -421,6 +437,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::Spawn {
+                conn: ConnId::Local,
                 cols: 20,
                 rows: 5, // the header row is not the pane's
                 command: "yazi".into(),
@@ -510,10 +527,24 @@ mod tests {
         });
         assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
         p.on_size(20, 6);
-        assert!(matches!(
-            p.take_requests().as_slice(),
-            [PluginRequest::Spawn { .. }]
-        ));
+        // The whole request, not `matches!(.., [Spawn { .. }])`. The loose form
+        // is what let the third instance of the routing race sit here unseen:
+        // the respawn was asserted to HAPPEN, never to be addressed anywhere in
+        // particular, and the client was filling the address in from its own
+        // `foreground()`. `on_size` is also the exact trigger that made it
+        // reachable -- a resize inside the switch window spawns while the
+        // panel's target is the new machine and `foreground()` may not be.
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::Spawn {
+                conn: ConnId::Remote("pi".into()),
+                cols: 20,
+                rows: 5,
+                command: "yazi".into(),
+                cwd: Some("/home/you".into()),
+            }],
+            "the respawn must be addressed to the machine the panel moved to"
+        );
     }
 
     #[test]
@@ -536,6 +567,7 @@ mod tests {
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::Spawn {
+                conn: ConnId::Local,
                 cols: 20,
                 rows: 5,
                 command: "yazi".into(),
@@ -623,6 +655,7 @@ directory"
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::Spawn {
+                conn: ConnId::Local,
                 cols: 20,
                 rows: 5,
                 command: "yazi".into(),

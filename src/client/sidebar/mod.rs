@@ -132,6 +132,8 @@ pub enum PluginEvent {
 ///   [`PluginEvent::AuxPaneReady`] and friends carry no addressing at all.
 ///   `Subscribe`/`Input`/`Kill` therefore name no connection: the client looks
 ///   both up together from its aux-pane table, so they cannot disagree.
+///   `Spawn` is the exception among the aux-pane requests -- there is no pane
+///   yet to look up, so it must say where the pane goes.
 /// * **The connection is NOT.** A panel driven by
 ///   [`PluginEvent::FocusedCwd`] knows exactly which machine the path it is
 ///   holding came from, and the client's `foreground()` is a DIFFERENT fact that
@@ -140,19 +142,33 @@ pub enum PluginEvent {
 ///   routed by `foreground()` then carries one machine's path to another
 ///   machine. For `OpenInSplit` that means an editor opening at a path that does
 ///   not exist there, silently creating an empty file with a plausible name.
-///   So [`ListDirectory`](PluginRequest::ListDirectory) and
-///   [`OpenInSplit`](PluginRequest::OpenInSplit) carry the conn the PANEL is
-///   looking at, and the client routes where it is told.
+///   So [`ListDirectory`](PluginRequest::ListDirectory),
+///   [`OpenInSplit`](PluginRequest::OpenInSplit) and
+///   [`Spawn`](PluginRequest::Spawn) carry the conn the PANEL is looking at, and
+///   the client routes where it is told. Those are all three of them; the class
+///   is closed, so a fourth reader of `foreground()` appearing here should be
+///   read as a bug rather than as a decision.
 ///
 /// This was reasoned away once, in a comment claiming the two were equal "by
 /// construction". They are equal in the steady state; the construction has a
 /// window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginRequest {
-    /// Spawn this panel's auxiliary pane. Replaces any pane the panel already
-    /// has (the client kills the old one first), which is how a re-target to a
-    /// new directory works.
+    /// Spawn this panel's auxiliary pane on `conn`. Replaces any pane the panel
+    /// already has (the client kills the old one first), which is how a
+    /// re-target to a new directory works.
+    ///
+    /// `conn` for the same reason `ListDirectory` carries one: `cwd` came from
+    /// this panel's [`PluginEvent::FocusedCwd`], so it names a directory on that
+    /// machine, and the client's `foreground()` may already have moved on. The
+    /// usual re-target is safe by luck -- it is triggered BY a `FocusedCwd`, so
+    /// the target is current -- but a panel RESIZE inside the switch window
+    /// spawns too, and would have started the file manager on the new machine in
+    /// the old machine's directory. Nothing is created; it lands in `$HOME`, or
+    /// in a same-named directory that happens to exist there, which is a
+    /// plausible-looking wrong answer rather than an error.
     Spawn {
+        conn: ConnId,
         cols: u16,
         rows: u16,
         command: String,

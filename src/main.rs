@@ -1068,6 +1068,7 @@ async fn dispatch_plugin_request(
     let key = (si, pi);
     match req {
         PluginRequest::Spawn {
+            conn,
             cols,
             rows,
             command,
@@ -1077,7 +1078,10 @@ async fn dispatch_plugin_request(
             // one first: the panel can only address one, and the server would
             // otherwise keep the orphan alive until this client exits.
             cancel_aux(key, mgr, aux_panes, aux_pending).await;
-            let conn = mgr.foreground().clone();
+            // The panel's conn, not `foreground()` -- the third and last site of
+            // the same class as `ListDirectory`/`OpenInSplit` below. `cwd` came
+            // from the panel, so the machine has to as well; the pair is one
+            // fact and splitting it across two sources is what let them differ.
             match mgr
                 .send(
                     &conn,
