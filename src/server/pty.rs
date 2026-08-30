@@ -147,9 +147,18 @@ impl Pty {
                 // We still exec the real binary at `c_shell`, but present its
                 // argv[0] as "-<basename>".
                 //
-                // Only when there are no ARGUMENTS, though. A program invoked
-                // with a file to edit is not a login shell, and the dash would
-                // simply be a program name it does not recognise.
+                // Only when there are no ARGUMENTS, though, and the two halves
+                // of that fail in opposite and equally quiet ways -- which is
+                // why this comment is here and must not be tidied away as
+                // restating the code:
+                //
+                // * a dash-prefixed `vim` is a program name `vim` does not
+                //   recognise, so the pane dies with an error nobody expects;
+                // * a shell WITHOUT the dash starts perfectly and silently
+                //   stops sourcing `~/.zprofile`, `~/.zlogin` and
+                //   `~/.bash_profile`. Nothing fails. The user's PATH is just
+                //   quietly different in remux than everywhere else, months
+                //   after anyone would connect that to this line.
                 let shell_basename = std::path::Path::new(&shell)
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -675,6 +684,90 @@ mod tests {
         assert!(
             argv0.starts_with('-'),
             "expected a login shell (argv[0] beginning with '-'), got $0={argv0:?}"
+        );
+    }
+
+    /// Read the value of a `KEY=value` sentinel line out of a PTY.
+    ///
+    /// Deliberately NOT used by `spawns_login_shell` above. That test is the
+    /// regression witness for the behaviour that existed before `args` did, and
+    /// a witness rewritten in the same change that could have broken it is not
+    /// a witness. It keeps its own loop; everything new goes through here.
+    async fn sentinel(pty: &Pty, input: Option<&[u8]>, key: &str) -> Option<String> {
+        let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
+        if let Some(bytes) = input {
+            pty.write_input(bytes).expect("write failed");
+        }
+        let mut collected = Vec::new();
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(3));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                data = rx.recv() => match data {
+                    Some(d) => {
+                        collected.extend_from_slice(&d);
+                        let output = String::from_utf8_lossy(&collected);
+                        if let Some(start) = output.find(key) {
+                            let rest = &output[start + key.len()..];
+                            if let Some(end) = rest.find(['\r', '\n']) {
+                                return Some(rest[..end].to_string());
+                            }
+                        }
+                    }
+                    None => return None,
+                },
+                _ = &mut timeout => return None,
+            }
+        }
+    }
+
+    /// The `args` parameter must be invisible to every caller that does not use
+    /// it, and this is the exact shape of "invisible": an empty `args` still
+    /// produces the leading-dash login argv[0].
+    ///
+    /// Pinned to the FULL string rather than `starts_with('-')`, so a change
+    /// that produced `-/bin/sh` -- a plausible near-miss, and one no shell
+    /// treats as a login shell -- is caught too. Every pane in the program goes
+    /// through this path.
+    #[tokio::test]
+    async fn empty_args_still_spawn_a_dash_prefixed_login_shell() {
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &[], None).expect("failed to spawn PTY");
+        // The sentinel is split across a shell concatenation so the assembled
+        // token appears only in the shell's OUTPUT, never in the command line
+        // the terminal echoes back.
+        let argv0 = sentinel(&pty, Some(b"echo \"AR\"\"GV0=$0\"\n"), "ARGV0=")
+            .await
+            .expect("did not observe $0 output");
+        pty.write_input(b"exit\n").unwrap();
+        assert_eq!(
+            argv0.trim(),
+            "-sh",
+            "an empty `args` must reproduce the pre-`args` login argv[0] exactly"
+        );
+    }
+
+    /// The complement, and the case the `browser` panel needs: a command given
+    /// arguments RECEIVES them, and loses the login dash.
+    ///
+    /// One line proves both. `sh -c <script>` reaches the shell only through
+    /// `args`, so an argv that dropped them would leave an interactive shell
+    /// printing nothing at all and the sentinel would never appear; and `$0`
+    /// inside `-c` is the argv[0] this function chose, so the value that comes
+    /// back is what says whether the dash was applied.
+    #[tokio::test]
+    async fn an_argv_d_command_receives_its_arguments_and_loses_the_login_dash() {
+        // Nothing is written to this PTY, so nothing is echoed and the sentinel
+        // needs no concatenation trick: it can only reach the output by being
+        // printed.
+        let args = vec!["-c".to_string(), "echo ARGV0=$0".to_string()];
+        let pty = Pty::spawn(80, 24, Some("/bin/sh"), &args, None).expect("failed to spawn PTY");
+        let argv0 = sentinel(&pty, None, "ARGV0=")
+            .await
+            .expect("the script never ran, so its arguments never reached exec");
+        assert_eq!(
+            argv0.trim(),
+            "sh",
+            "a program invoked with arguments is not a login shell"
         );
     }
 }
