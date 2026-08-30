@@ -97,6 +97,10 @@ def lists(msgs):
     return [m["AgentList"]["agents"] for m in msgs if name_of(m) == "AgentList"]
 
 
+def bodies(msgs):
+    return [m["AgentList"] for m in msgs if name_of(m) == "AgentList"]
+
+
 def latest(c, timeout=1.6):
     """The most recent `AgentList` seen within `timeout`, or None."""
     seen = None
@@ -159,9 +163,20 @@ def run(srv):
 
     # 1. Subscribing is answered at once.
     c.send("SubscribeAgents")
-    first = latest(c, 1.2)
+    seen = []
+    end = time.time() + 1.2
+    while time.time() < end:
+        seen += bodies(c.drain(0.15))
+    first = seen[-1]["agents"] if seen else None
     check(first is not None, "1 subscribing yields an AgentList immediately")
     check(first == [], "1 with no agent running, the list is empty")
+    # This harness runs on Linux, where detection works. The field exists so a
+    # server that CANNOT detect (no /proc) can say so instead of sending an
+    # empty list the panel would render as "no agents".
+    check(
+        bool(seen) and seen[-1].get("detection_supported") is True,
+        f"1 the server reports that it can detect agents at all ({seen[-1:]})",
+    )
 
     # 3. An unlisted command first, so its absence is not merely "nothing has
     #    started yet" by the time the listed one is checked.

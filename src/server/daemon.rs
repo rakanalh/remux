@@ -3513,6 +3513,7 @@ async fn send_agents_to(
         };
         let _ = client.tx.send(ServerMessage::AgentList {
             agents: agents.clone(),
+            detection_supported: crate::server::agents::DETECTION_SUPPORTED,
         });
     }
     any_working

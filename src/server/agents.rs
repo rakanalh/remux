@@ -44,6 +44,18 @@ use crate::config::agents::AgentsConfig;
 use crate::protocol::AgentState;
 use crate::screen::Screen;
 
+/// Whether this build can detect agents at all.
+///
+/// [`foreground_command`] resolves the foreground process group through
+/// `/proc/<pgid>/comm`, which does not exist off Linux -- `get_process_name`
+/// falls back to `"shell"` there, so no pane could ever match a configured
+/// command. Reported to the client (`ServerMessage::AgentList`) so the panel can
+/// say why it is empty rather than looking broken.
+///
+/// Mirrors `get_process_name`'s existing platform fallback rather than inventing
+/// a second platform split.
+pub const DETECTION_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// The command running in the foreground of this PTY, e.g. `"claude"`.
 ///
 /// `None` when the PTY has no foreground group to report -- a child that is
@@ -190,6 +202,20 @@ impl AgentRules {
     ///   empty, so a window anchored to the grid's last row would scan twelve
     ///   blank lines and see nothing. A full-screen TUI, where the grid really
     ///   is full, is unaffected by either.
+    ///
+    /// **`scan_rows` is a COST bound as well as a correctness one, and widening
+    /// it is not a free "improvement".** Every configured pattern is run against
+    /// every returned line, for every agent pane, on every sample -- up to ten
+    /// samples a second. Matching four unanchored patterns over the last twelve
+    /// lines is a different cost from matching them over a full eighty-row
+    /// alt-screen, and the difference is paid continuously by a server that is
+    /// otherwise asleep. Whoever wants a bigger window should raise `scan_rows`
+    /// in their own config, which is exactly why it is configurable; do not
+    /// widen the default, and do not turn this into a whole-screen scan.
+    ///
+    /// (The line-BUILDING pass below does walk the whole grid, because a
+    /// soft-wrapped line has to be assembled from its start. That is character
+    /// copying, not regex; the bounded quantity is the matching.)
     pub fn visible_bottom(&self, screen: &Screen) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         let mut current = String::new();

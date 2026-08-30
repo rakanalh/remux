@@ -489,6 +489,20 @@ pub enum ServerMessage {
     AgentList {
         #[serde(default)]
         agents: Vec<AgentEntry>,
+        /// Whether this server can detect agents AT ALL.
+        ///
+        /// Detection reads the PTY's foreground process group out of `/proc`,
+        /// so a non-Linux server can never list anything. Without this the
+        /// panel would render an empty list there -- indistinguishable from
+        /// "you have no agents running", and exactly the sort of thing that
+        /// gets reported as a bug. The panel says so instead.
+        ///
+        /// It belongs on the wire rather than being a `cfg!` in the client:
+        /// a macOS client attached to a Linux server detects fine, and it is
+        /// the SERVER's platform that decides. Defaults to `true`, so a peer
+        /// that omits it is assumed capable.
+        #[serde(default = "default_true")]
+        detection_supported: bool,
     },
     /// Response to a `ListSessionTree` request with the full hierarchy.
     SessionTree {
@@ -619,6 +633,10 @@ pub enum AgentState {
     Working,
     /// Neither of the above.
     Idle,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One pane running an AI coding agent.

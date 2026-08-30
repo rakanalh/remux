@@ -5603,12 +5603,16 @@ async fn run_client_loop(
                             .await?;
                         }
                     }
-                    Some(ServerMessage::AgentList { agents }) => {
-                        log::debug!("srv: AgentList src={:?} agents={}", src, agents.len());
+                    Some(ServerMessage::AgentList { agents, detection_supported }) => {
+                        log::debug!(
+                            "srv: AgentList src={:?} agents={} supported={}",
+                            src, agents.len(), detection_supported
+                        );
                         if wants_agents {
                             chrome.broadcast(&crate::client::sidebar::PluginEvent::Agents {
                                 conn: src.clone(),
                                 agents,
+                                supported: detection_supported,
                             });
                             // Repaint exactly as the session tree's arm does:
                             // over a live view `paint_view` ends with

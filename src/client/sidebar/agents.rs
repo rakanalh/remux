@@ -42,10 +42,19 @@ impl Row {
     }
 }
 
+/// What one connection last reported.
+#[derive(Debug, Clone)]
+struct ConnAgents {
+    agents: Vec<AgentEntry>,
+    /// Whether that server can detect agents at all. `false` means "cannot
+    /// know", which is not the same as "none".
+    supported: bool,
+}
+
 pub struct AgentsPlugin {
     /// Per-connection lists, in arrival order. Order is stable across pushes so
     /// a refresh on one server does not reshuffle the list under the user.
-    lists: Vec<(ConnId, Vec<AgentEntry>)>,
+    lists: Vec<(ConnId, ConnAgents)>,
     /// The flattened rows, in render order.
     rows: Vec<Row>,
     nav: NavList,
@@ -68,13 +77,13 @@ impl AgentsPlugin {
         // sessions panel gives its roster, so the two panels agree about where
         // "this machine" is.
         let mut rows = Vec::new();
-        for (conn, entries) in self
+        for (conn, listed) in self
             .lists
             .iter()
             .filter(|(c, _)| *c == ConnId::Local)
             .chain(self.lists.iter().filter(|(c, _)| *c != ConnId::Local))
         {
-            for entry in entries {
+            for entry in &listed.agents {
                 rows.push(Row {
                     conn: conn.clone(),
                     entry: entry.clone(),
@@ -109,6 +118,31 @@ impl AgentsPlugin {
             }
         };
         format!("{} {}", row.entry.command, where_)
+    }
+
+    /// One line per server that cannot detect agents at all, in the same order
+    /// the rows are built in.
+    ///
+    /// Rendered BELOW the agent rows and deliberately not part of
+    /// [`AgentsPlugin::rows`]: it is an explanation, not a destination, so it
+    /// must not be selectable and Enter must never land on it.
+    fn notes(&self) -> Vec<String> {
+        self.lists
+            .iter()
+            .filter(|(c, _)| *c == ConnId::Local)
+            .chain(self.lists.iter().filter(|(c, _)| *c != ConnId::Local))
+            .filter(|(_, listed)| !listed.supported)
+            .map(|(conn, _)| {
+                let host = match conn {
+                    ConnId::Local => "local".to_string(),
+                    ConnId::Remote(name) => name.clone(),
+                };
+                // Short, because this panel is often twenty columns wide, and
+                // specific, because "unavailable" invites a bug report where
+                // "needs Linux" answers the question.
+                format!("{host}: needs Linux")
+            })
+            .collect()
     }
 
     /// Enter, or a second click: go to that pane.
@@ -158,7 +192,8 @@ impl SidebarPlugin for AgentsPlugin {
         }
         nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
 
-        if self.rows.is_empty() {
+        let notes = self.notes();
+        if self.rows.is_empty() && notes.is_empty() {
             // Said out loud rather than left blank: an empty panel and a broken
             // one look identical, and this one is empty most of the time.
             draw_text(
@@ -175,6 +210,23 @@ impl SidebarPlugin for AgentsPlugin {
         let top = self.nav.top_for(rows);
         for i in 0..(rows as usize).saturating_sub(HEADER_ROWS) {
             let Some(row) = self.rows.get(top + i) else {
+                // Past the last agent: the notes, if any. A server that cannot
+                // detect agents says so here rather than contributing silence
+                // that reads as "you have none".
+                for (n, note) in notes.iter().enumerate() {
+                    let y = (HEADER_ROWS + i + n) as u16;
+                    if (y as usize) >= rows as usize {
+                        break;
+                    }
+                    draw_text(
+                        &mut grid,
+                        0,
+                        y,
+                        note,
+                        theme.status_bar_fg.clone(),
+                        bg.clone(),
+                    );
+                }
                 break;
             };
             let y = (HEADER_ROWS + i) as u16;
@@ -226,12 +278,20 @@ impl SidebarPlugin for AgentsPlugin {
 
     fn on_event(&mut self, ev: &PluginEvent) {
         match ev {
-            PluginEvent::Agents { conn, agents } => {
+            PluginEvent::Agents {
+                conn,
+                agents,
+                supported,
+            } => {
+                let listed = ConnAgents {
+                    agents: agents.clone(),
+                    supported: *supported,
+                };
                 match self.lists.iter_mut().find(|(id, _)| id == conn) {
                     // Replaced in place: the list order is what the panel
                     // renders, and a refresh must not move a server.
-                    Some(slot) => slot.1 = agents.clone(),
-                    None => self.lists.push((conn.clone(), agents.clone())),
+                    Some(slot) => slot.1 = listed,
+                    None => self.lists.push((conn.clone(), listed)),
                 }
                 self.rebuild();
             }
@@ -273,7 +333,19 @@ mod tests {
     }
 
     fn push(conn: ConnId, agents: Vec<AgentEntry>) -> PluginEvent {
-        PluginEvent::Agents { conn, agents }
+        PluginEvent::Agents {
+            conn,
+            agents,
+            supported: true,
+        }
+    }
+
+    fn unsupported(conn: ConnId) -> PluginEvent {
+        PluginEvent::Agents {
+            conn,
+            agents: Vec::new(),
+            supported: false,
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -518,6 +590,64 @@ mod tests {
         assert!(matches!(p.on_mouse(0, 2, down), PluginAction::JumpTo(_)));
         // The header is not a row.
         assert_eq!(p.on_mouse(0, 0, down), PluginAction::None);
+    }
+
+    #[test]
+    fn a_server_that_cannot_detect_agents_says_so_instead_of_looking_empty() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&unsupported(ConnId::Local));
+        let rows = painted(&p, 24, 5);
+        assert_eq!(
+            rows[1], "local: needs Linux",
+            "an empty list there is indistinguishable from having no agents"
+        );
+        assert_ne!(rows[1], "no agents");
+    }
+
+    #[test]
+    fn the_note_names_the_server_that_cannot_detect_and_lists_the_ones_that_can() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "here", AgentState::Idle)],
+        ));
+        p.on_event(&unsupported(remote("mac")));
+        let rows = painted(&p, 24, 6);
+        assert!(rows[1].contains("claude here/0"), "got {:?}", rows[1]);
+        assert_eq!(rows[2], "mac: needs Linux", "got {:?}", rows[2]);
+    }
+
+    /// The note is an explanation, not a destination.
+    #[test]
+    fn the_note_is_not_selectable_and_enter_cannot_land_on_it() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "here", AgentState::Idle)],
+        ));
+        p.on_event(&unsupported(remote("mac")));
+        let _ = painted(&p, 24, 6);
+        // `G` goes to the last ROW; the note is not one.
+        p.on_key(key(KeyCode::Char('G')));
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PluginAction::JumpTo(JumpTarget::Pane {
+                conn: ConnId::Local,
+                session: "here".to_string(),
+                tab_index: 0,
+                pane_id: 1,
+            })
+        );
+        // And a click on the note's row selects nothing.
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(p.on_mouse(0, 2, down), PluginAction::None);
+    }
+
+    #[test]
+    fn a_supported_server_with_no_agents_still_says_no_agents() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(ConnId::Local, Vec::new()));
+        assert_eq!(painted(&p, 24, 4)[1], "no agents");
     }
 
     #[test]

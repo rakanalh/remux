@@ -55,6 +55,10 @@ pub enum PluginEvent {
     Agents {
         conn: ConnId,
         agents: Vec<crate::protocol::AgentEntry>,
+        /// Whether that server can detect agents at all; see
+        /// [`crate::protocol::ServerMessage::AgentList`]. `false` means "cannot
+        /// know", which is not the same as "none", and the panel says so.
+        supported: bool,
     },
     /// A connection went away; drop anything scoped to it.
     ConnectionLost { conn: ConnId },
