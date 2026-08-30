@@ -4,7 +4,6 @@
 //! helpers, and the main server event loop.
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -131,6 +130,13 @@ struct PaneData {
     screen: Screen,
     /// Receiving end for PTY output from the background reader task.
     pty_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// The background reader task feeding `pty_rx`.
+    ///
+    /// Held so it can be aborted when the pane goes away. Dropping a
+    /// `JoinHandle` detaches the task rather than stopping it, and a reader left
+    /// running holds an epoll registration on a descriptor number that the next
+    /// PTY will be handed -- see `pty::start_reader` for what that cost.
+    reader: tokio::task::JoinHandle<()>,
     /// True once a PTY-forwarding task has been spawned for this pane.
     /// start_pty_forwarding is called from many sites (attach, session/tab
     /// switches); without this guard each call would spawn a competing task
@@ -142,6 +148,16 @@ struct PaneData {
     /// (so cells flip live between the "Active in session" placeholder and the
     /// streamed content), while steady state stays quiet.
     streamed_session_visible: bool,
+}
+
+impl Drop for PaneData {
+    fn drop(&mut self) {
+        // Stop the reader with the pane. Its descriptor is its own, so the abort
+        // is about not leaking a task (and the dup with it) for a pane whose
+        // child left a grandchild holding the slave open -- the read would never
+        // reach EOF and the task would park forever.
+        self.reader.abort();
+    }
 }
 
 // MouseSelection is imported from compositor.
@@ -5268,8 +5284,14 @@ async fn spawn_pane(
     let cmd = command.or(config.general.default_shell.as_deref());
     log::debug!("server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} cwd={cwd:?}");
     let pty_instance = Pty::spawn(cols, rows, cmd, cwd)?;
-    let raw_fd = pty_instance.master_fd.as_raw_fd();
-    let (_reader_handle, pty_rx) = pty::start_reader(raw_fd);
+    // The reader gets its OWN descriptor (a dup), so the fd number cannot be
+    // reissued to a later PTY while the reader's epoll registration still
+    // exists. See `start_reader`.
+    let reader_fd = pty_instance
+        .master_fd
+        .try_clone()
+        .context("failed to duplicate the PTY master for the reader")?;
+    let (reader_handle, pty_rx) = pty::start_reader(reader_fd);
     let screen = Screen::new(cols, rows, config.general.scrollback_lines);
 
     let mut ps = panes.lock().await;
@@ -5279,6 +5301,7 @@ async fn spawn_pane(
             pty: pty_instance,
             screen,
             pty_rx,
+            reader: reader_handle,
             forwarding_started: false,
             streamed_session_visible: false,
         },

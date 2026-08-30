@@ -348,14 +348,15 @@ fn reap_child(pid: Pid) {
 ///
 /// The caller must ensure that `master_fd` remains valid for the lifetime of
 /// the returned task. The task does not own the fd and will not close it.
-pub fn start_reader(master_fd: RawFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
-    log::debug!("pty: start_reader watching fd={}", master_fd);
+pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
+    let raw = master_fd.as_raw_fd();
+    log::debug!("pty: start_reader watching fd={raw}");
 
     // Set the fd to non-blocking mode, which is required by AsyncFd.
-    // SAFETY: The fd is valid (caller guarantees).
+    // SAFETY: `master_fd` owns a valid descriptor for the whole call.
     unsafe {
-        let flags = libc::fcntl(master_fd, libc::F_GETFL);
-        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -363,8 +364,23 @@ pub fn start_reader(master_fd: RawFd) -> (JoinHandle<()>, mpsc::UnboundedReceive
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
 
-        let wrapper = RawFdWrapper(master_fd);
-        let async_fd = match AsyncFd::with_interest(wrapper, Interest::READABLE) {
+        // The task OWNS its descriptor -- a `dup` of the master the caller made
+        // for it -- and this is load-bearing, not tidiness.
+        //
+        // It used to borrow the raw fd. The task then outlived the descriptor:
+        // when the pane's `Pty` was dropped the fd was closed, the kernel
+        // silently dropped it from the epoll set, and `readable()` parked here
+        // forever instead of erroring. The next PTY opened got the SAME fd
+        // NUMBER back (descriptors are handed out lowest-free-first), and its
+        // reader's registration collided with the parked one's: readiness for
+        // the new pane went nowhere and the pane never produced a single byte.
+        // Reproduced exactly: fd 13, reused twice, and a file-manager panel
+        // that painted blank forever after its second re-target.
+        //
+        // Owning it closes the hole at the root: `AsyncFd` deregisters before it
+        // drops the inner descriptor, so the fd NUMBER cannot be reissued while
+        // any registration for it still exists.
+        let async_fd = match AsyncFd::with_interest(master_fd, Interest::READABLE) {
             Ok(fd) => fd,
             Err(e) => {
                 log::error!("start_reader: failed to create AsyncFd: {e}");
@@ -462,9 +478,8 @@ mod tests {
     #[tokio::test]
     async fn start_reader_receives_output() {
         let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
-        let raw_fd = pty.master_fd.as_raw_fd();
 
-        let (_handle, mut rx) = start_reader(raw_fd);
+        let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
         pty.write_input(b"echo test_marker\n")
             .expect("write failed");
@@ -510,9 +525,8 @@ mod tests {
         // ("AR""GV0=") so the assembled token "ARGV0=" appears only in the
         // shell's actual output, never in the (terminal-echoed) command line.
         let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
-        let raw_fd = pty.master_fd.as_raw_fd();
 
-        let (_handle, mut rx) = start_reader(raw_fd);
+        let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
         pty.write_input(b"echo \"AR\"\"GV0=$0\"\n")
             .expect("write failed");
