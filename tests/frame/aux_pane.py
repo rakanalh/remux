@@ -79,7 +79,10 @@ def standin_pids():
                 stat = open(f"/proc/{pid}/stat").read()
             except OSError:
                 continue  # gone: reaped, which is the outcome we want
-            state = stat.split(") ", 1)[1][0]
+            # `rsplit`, not `split`: `comm` is the only parenthesised field
+            # and everything after it is fixed, so splitting from the RIGHT is
+            # exact even for a process whose name contains `") "`.
+            state = stat.rsplit(") ", 1)[1][0]
             leaked.append(f"{pid}{'(zombie)' if state == 'Z' else ''}")
     return leaked
 
