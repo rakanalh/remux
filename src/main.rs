@@ -901,7 +901,7 @@ async fn dispatch_plugin_request(
     req: crate::client::sidebar::PluginRequest,
     mgr: &mut ConnectionManager,
     aux_panes: &mut std::collections::HashMap<(usize, usize), (ConnId, crate::protocol::PaneId)>,
-    aux_pending: &mut std::collections::VecDeque<(ConnId, (usize, usize))>,
+    aux_pending: &mut std::collections::VecDeque<(ConnId, Option<(usize, usize)>)>,
 ) {
     use crate::client::sidebar::PluginRequest;
     let key = (si, pi);
@@ -915,11 +915,7 @@ async fn dispatch_plugin_request(
             // Replacing a pane (a re-target to a new directory) kills the old
             // one first: the panel can only address one, and the server would
             // otherwise keep the orphan alive until this client exits.
-            if let Some((conn, pane_id)) = aux_panes.remove(&key) {
-                let _ = mgr
-                    .send(&conn, ClientMessage::KillAuxPane { pane_id })
-                    .await;
-            }
+            cancel_aux(key, mgr, aux_panes, aux_pending).await;
             let conn = mgr.foreground().clone();
             match mgr
                 .send(
@@ -933,7 +929,7 @@ async fn dispatch_plugin_request(
                 )
                 .await
             {
-                Ok(()) => aux_pending.push_back((conn, key)),
+                Ok(()) => aux_pending.push_back((conn, Some(key))),
                 Err(e) => log::warn!("sidebar: SpawnAuxPane for panel {key:?} failed: {e:#}"),
             }
         }
@@ -965,13 +961,36 @@ async fn dispatch_plugin_request(
             }
             None => log::debug!("sidebar: panel {key:?} has no aux pane for its input yet"),
         },
-        PluginRequest::Kill => {
-            if let Some((conn, pane_id)) = aux_panes.remove(&key) {
-                let _ = mgr
-                    .send(&conn, ClientMessage::KillAuxPane { pane_id })
-                    .await;
-            }
-        }
+        PluginRequest::Kill => cancel_aux(key, mgr, aux_panes, aux_pending).await,
+    }
+}
+
+/// Give up the aux pane belonging to the panel at `key`, whether it exists yet
+/// or not.
+///
+/// The second half is the one that is easy to miss. A panel re-targets as soon
+/// as the focused directory changes, which can land while its `SpawnAuxPane` is
+/// still in flight -- a wide window when the foreground is a remote at 50-200ms
+/// RTT. There is no pane id to kill then, and simply doing nothing loses the
+/// pane for good: the answer still arrives, the panel has already moved on, and
+/// nothing is left holding the id. The request is marked CANCELLED instead, and
+/// the arrival kills it.
+async fn cancel_aux(
+    key: (usize, usize),
+    mgr: &mut ConnectionManager,
+    aux_panes: &mut std::collections::HashMap<(usize, usize), (ConnId, crate::protocol::PaneId)>,
+    aux_pending: &mut std::collections::VecDeque<(ConnId, Option<(usize, usize)>)>,
+) {
+    if let Some((conn, pane_id)) = aux_panes.remove(&key) {
+        let _ = mgr
+            .send(&conn, ClientMessage::KillAuxPane { pane_id })
+            .await;
+        return;
+    }
+    // No pane yet: cancel the oldest request this panel still has outstanding.
+    if let Some(slot) = aux_pending.iter_mut().find(|(_, k)| *k == Some(key)) {
+        log::debug!("sidebar: panel {key:?} re-targeted mid-spawn; cancelling its request");
+        slot.1 = None;
     }
 }
 
@@ -2168,7 +2187,15 @@ async fn run_client_loop(
     // `AuxPaneSpawned` carries no correlation id and needs none: a connection's
     // requests are serialised by its single writer task and answered in order,
     // so the head of this queue for the answering connection is the requester.
-    let mut aux_pending: std::collections::VecDeque<(ConnId, (usize, usize))> =
+    //
+    // A `None` entry is a CANCELLED request: the panel re-targeted before its
+    // pane came back. The entry stays in the queue rather than being dropped,
+    // because the ANSWER is still coming and the queue's whole correctness is
+    // its ordering -- and because a pane whose requester has walked away has to
+    // be killed when it arrives, or it streams for the life of the client with
+    // nothing addressing it.
+    #[allow(clippy::type_complexity)]
+    let mut aux_pending: std::collections::VecDeque<(ConnId, Option<(usize, usize)>)> =
         std::collections::VecDeque::new();
 
     loop {
@@ -5056,7 +5083,7 @@ async fn run_client_loop(
                         let stranded: Vec<(usize, usize)> = aux_pending
                             .iter()
                             .filter(|(c, _)| *c == src)
-                            .map(|(_, k)| *k)
+                            .filter_map(|(_, k)| *k)
                             .collect();
                         aux_pending.retain(|(c, _)| *c != src);
                         for key in orphaned.into_iter().chain(stranded) {
@@ -5896,14 +5923,23 @@ async fn run_client_loop(
                         // The requester is the head of this connection's pending
                         // queue: requests are serialised by the connection's
                         // single writer task and answered in order, which is why
-                        // the message needs no correlation id.
+                        // the message needs no correlation id. Popped whether it
+                        // is live or cancelled, and whether the spawn succeeded
+                        // or not -- the queue only stays aligned if EVERY answer
+                        // consumes exactly one entry.
+                        // Flattened deliberately: "no entry at all" (reconfigured
+                        // away) and "a cancelled entry" (re-targeted mid-spawn)
+                        // both mean nobody is waiting, and both want the same
+                        // answer -- kill the pane that just arrived.
                         let claimant = aux_pending
                             .iter()
                             .position(|(c, _)| *c == src)
-                            .map(|i| aux_pending.remove(i).expect("index just found").1);
-                        match claimant {
-                            Some((si, pi)) => {
-                                log::debug!("srv: AuxPaneSpawned pane_id={pane_id} -> panel ({si},{pi})");
+                            .and_then(|i| aux_pending.remove(i).expect("index just found").1);
+                        match (claimant, pane_id) {
+                            (Some((si, pi)), Some(pane_id)) => {
+                                log::debug!(
+                                    "srv: AuxPaneSpawned pane_id={pane_id} -> panel ({si},{pi})"
+                                );
                                 aux_panes.insert((si, pi), (src.clone(), pane_id));
                                 chrome.deliver(
                                     si,
@@ -5911,18 +5947,33 @@ async fn run_client_loop(
                                     &crate::client::sidebar::PluginEvent::AuxPaneReady,
                                 );
                             }
-                            // Nobody is waiting: the panel was reconfigured away
-                            // (a config reload) between the request and the
-                            // answer. Kill it rather than leave the server
-                            // holding a pane this client can never address.
-                            None => {
+                            // The spawn FAILED. The panel is waiting on
+                            // "starting…" and nothing else will ever come, so
+                            // tell it: it shows its exited state, which carries
+                            // a restart key.
+                            (Some((si, pi)), None) => {
                                 log::warn!(
+                                    "srv: SpawnAuxPane failed for panel ({si},{pi}); reporting it as exited"
+                                );
+                                chrome.deliver(
+                                    si,
+                                    pi,
+                                    &crate::client::sidebar::PluginEvent::AuxPaneExited,
+                                );
+                            }
+                            // Nobody is waiting: the panel re-targeted while this
+                            // was in flight, or was reconfigured away by a config
+                            // reload. Kill it rather than leave the server holding
+                            // a pane this client can never address again.
+                            (None, Some(pane_id)) => {
+                                log::info!(
                                     "srv: AuxPaneSpawned pane_id={pane_id} has no claimant; killing it"
                                 );
                                 let _ = mgr
                                     .send(&src, ClientMessage::KillAuxPane { pane_id })
                                     .await;
                             }
+                            (None, None) => {}
                         }
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {

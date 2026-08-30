@@ -1158,7 +1158,7 @@ async fn handle_client_message(
             } else {
                 log::warn!(
                     "server: KillAuxPane client_id={client_id} pane_id={pane_id} \
-                     is not owned by this connection; ignoring"
+is not owned by this connection; ignoring"
                 );
             }
             Ok(())
@@ -5229,7 +5229,7 @@ async fn handle_spawn_aux_pane(
         st.next_pane_id()
     };
     log::info!(
-        "server: SpawnAuxPane client_id={client_id} pane_id={pane_id}          dims={cols}x{rows} command={command:?} cwd={cwd:?}"
+        "server: SpawnAuxPane client_id={client_id} pane_id={pane_id} dims={cols}x{rows} command={command:?} cwd={cwd:?}"
     );
     if let Err(e) = spawn_pane(
         pane_id,
@@ -5243,6 +5243,15 @@ async fn handle_spawn_aux_pane(
     .await
     {
         log::error!("server: SpawnAuxPane failed for client_id={client_id}: {e:#}");
+        // Answer anyway. A request left unanswered stays at the head of the
+        // client's pending queue and claims the next panel's reply -- see
+        // `AuxPaneSpawned`.
+        let cls = clients.lock().await;
+        if let Some(conn) = cls.get(&client_id) {
+            let _ = conn
+                .tx
+                .send(ServerMessage::AuxPaneSpawned { pane_id: None });
+        }
         return;
     }
     // Record ownership BEFORE the forwarding task can report the pane's death:
@@ -5258,7 +5267,7 @@ async fn handle_spawn_aux_pane(
             None => {
                 drop(cls);
                 log::warn!(
-                    "server: SpawnAuxPane requester client_id={client_id} is gone;                      reaping pane_id={pane_id}"
+                    "server: SpawnAuxPane requester client_id={client_id} is gone; reaping pane_id={pane_id}"
                 );
                 reap_panes(&[pane_id], panes, clients).await;
                 return;
@@ -5278,7 +5287,9 @@ async fn handle_spawn_aux_pane(
     .await;
     let cls = clients.lock().await;
     if let Some(conn) = cls.get(&client_id) {
-        let _ = conn.tx.send(ServerMessage::AuxPaneSpawned { pane_id });
+        let _ = conn.tx.send(ServerMessage::AuxPaneSpawned {
+            pane_id: Some(pane_id),
+        });
     }
 }
 

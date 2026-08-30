@@ -333,6 +333,28 @@ try:
 finally:
     teardown(child, env)
 
+# ---------------------------------------------------------------------------
+# Test 3: a command that cannot run leaves a RESTARTABLE panel, not a permanent
+#         "starting…".
+# ---------------------------------------------------------------------------
+env = make_env(cfg(command='command = "/nonexistent/not-a-file"'))
+child, screen, pump = spawn(env, cwd=DIR_START)
+try:
+    pump(3.0)
+    rows = panel_rows(screen)
+    # The exited label is centred in the panel's content area, so slicing the
+    # first few rows would hide the very thing under test.
+    said = [r for r in rows if r]
+    check(any("exited" in r for r in rows),
+          f"a command that cannot run leaves the panel in its exited state"
+          f"\n      panel={said}")
+    check(not any("starting" in r for r in rows),
+          f"...and not waiting on `starting…` for ever\n      panel={said}")
+    check(child.isalive(), "the client survives a spawn that fails")
+    check("panicked at" not in logs(), "no panic in either log")
+finally:
+    teardown(child, env)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED:")

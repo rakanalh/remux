@@ -444,13 +444,20 @@ pub enum ServerMessage {
     /// This is the message that lets an attach resync them.
     SessionBorderStyle { style: crate::config::BorderStyle },
     /// Answer to [`ClientMessage::SpawnAuxPane`]: the id of the pane just
-    /// spawned.
+    /// spawned, or `None` if the spawn failed.
     ///
     /// No correlation id. A client requests at most one aux pane per panel and
     /// its requests are serialised by the single per-connection writer task, so
     /// answers arrive in request order; the client matches them against a FIFO
     /// of pending requesters.
-    AuxPaneSpawned { pane_id: PaneId },
+    ///
+    /// **That design is why failure must still be answered.** A request that got
+    /// no reply would sit at the head of the client's queue for ever and claim
+    /// the NEXT panel's answer -- one panel showing another's directory, the
+    /// other waiting on "starting…" with no way back. Nothing forbids two
+    /// `files` panels, so `None` is not a formality: it is what keeps the
+    /// correlation-free matching honest.
+    AuxPaneSpawned { pane_id: Option<PaneId> },
     /// Response to a `ListSessionTree` request with the full hierarchy.
     SessionTree {
         folders: Vec<FolderTreeEntry>,

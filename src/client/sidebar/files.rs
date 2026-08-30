@@ -193,9 +193,16 @@ impl SidebarPlugin for FilesPlugin {
             return PluginAction::None;
         }
         // Encoded by the ONE key encoder the client has, with this pane's own
-        // DECCKM state -- the same rule a focused View cell follows, so arrows
-        // and navigation keys reach the file manager encoded the way it asked
-        // for them rather than the way the foreground session did.
+        // DECCKM state, so arrows and navigation keys reach the file manager
+        // encoded the way it asked for them rather than the way the foreground
+        // session did.
+        //
+        // Not quite what a focused View cell gets, and the difference is worth
+        // naming: the sidebar key gate handles Escape before `on_key` is ever
+        // reached, so a file manager hosted here can never receive one. That is
+        // deliberate -- Escape is how the user leaves the panel, in this plugin
+        // as in every other -- but it does constrain `yazi` and `ranger`, which
+        // both use Escape to back out of a mode.
         let ack = self
             .snapshot
             .as_ref()
@@ -223,6 +230,19 @@ impl SidebarPlugin for FilesPlugin {
     fn on_event(&mut self, ev: &PluginEvent) {
         match ev {
             PluginEvent::FocusedCwd { conn, cwd } => {
+                // An unreadable cwd is UNKNOWN, not "the daemon's directory".
+                // The client broadcasts on every foreground tree push, and a
+                // push can legitimately carry `None`: the focused pane's shell
+                // has just exited so the `readlink` fails for its zombie, or the
+                // push landed mid-session-switch with no `is_current` session.
+                // Treating that as a move would kill the file manager, respawn
+                // it wherever the SERVER happens to be running, and then restart
+                // it a third time when the next push restored the path -- losing
+                // the user's place twice over, which is the exact cost that
+                // re-targeting is rationed to avoid.
+                if cwd.is_none() && self.target.is_some() {
+                    return;
+                }
                 let first = !self.cwd_known;
                 self.cwd_known = true;
                 self.target = Some((conn.clone(), cwd.clone()));
@@ -386,7 +406,7 @@ mod tests {
         p.on_size(20, 6);
         assert!(
             p.take_requests().is_empty(),
-            "spawning before the first FocusedCwd would open the wrong directory              and then immediately respawn"
+            "spawning before the first FocusedCwd would open the wrong directory and then immediately respawn"
         );
         p.on_event(&PluginEvent::FocusedCwd {
             conn: ConnId::Local,
@@ -531,6 +551,113 @@ mod tests {
                 command: "yazi".into(),
                 cwd: Some("/b".into()),
             }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_cwd_never_becomes_a_new_target() {
+        // A push can legitimately carry `None` -- the focused pane's shell has
+        // just exited, or the push landed mid-session-switch. Treating that as a
+        // move would respawn the file manager in the SERVER's directory and then
+        // restart it again when the next push restored the path.
+        let mut p = FilesPlugin::new("yazi".into());
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: Some("/a".into()),
+        });
+        p.on_size(20, 6);
+        p.take_requests();
+        p.on_event(&PluginEvent::AuxPaneReady);
+        p.take_requests();
+
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
+        p.on_size(20, 6);
+        assert!(
+            p.take_requests().is_empty(),
+            "an unreadable cwd must read as `unknown`, not as a move to the daemon's \
+directory"
+        );
+        // ...and the real path coming back is likewise not a move.
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: Some("/a".into()),
+        });
+        p.on_size(20, 6);
+        assert!(
+            p.take_requests().is_empty(),
+            "and the path returning is not a second move either"
+        );
+    }
+
+    #[test]
+    fn an_unknown_cwd_before_any_target_still_starts_the_program() {
+        // The other half: `None` must not wedge a panel that has never had a
+        // directory. A best-effort spawn beats a panel that never starts.
+        let mut p = FilesPlugin::new("yazi".into());
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: None,
+        });
+        p.on_size(20, 6);
+        assert!(matches!(
+            p.take_requests().as_slice(),
+            [PluginRequest::Spawn { cwd: None, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_retarget_mid_spawn_still_asks_for_the_kill() {
+        // The plugin has no pane id yet, so the client cannot address one -- but
+        // the panel must still SAY it is giving the pane up, or the client has
+        // nothing to cancel and the pane that arrives is orphaned.
+        let mut p = FilesPlugin::new("yazi".into());
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: Some("/a".into()),
+        });
+        p.on_size(20, 6);
+        assert!(matches!(
+            p.take_requests().as_slice(),
+            [PluginRequest::Spawn { .. }]
+        ));
+        // Still `Spawning`: no `AuxPaneReady` has arrived.
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: Some("/b".into()),
+        });
+        assert_eq!(p.take_requests(), vec![PluginRequest::Kill]);
+        p.on_size(20, 6);
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::Spawn {
+                cols: 20,
+                rows: 5,
+                command: "yazi".into(),
+                cwd: Some("/b".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_spawn_leaves_the_panel_restartable() {
+        // The client reports a server-side spawn failure as `AuxPaneExited`, so
+        // the panel must not sit on "starting…" for ever.
+        let theme = CompositorTheme::default();
+        let mut p = FilesPlugin::new("yazi".into());
+        p.on_event(&PluginEvent::FocusedCwd {
+            conn: ConnId::Local,
+            cwd: Some("/a".into()),
+        });
+        p.on_size(24, 6);
+        p.take_requests();
+        p.on_event(&PluginEvent::AuxPaneExited);
+        let rendered = text(&p.render(24, 6, true, &theme));
+        assert!(
+            rendered.iter().any(|r| r.contains("exited")),
+            "a failed spawn must leave a restartable panel: {rendered:?}"
         );
     }
 
