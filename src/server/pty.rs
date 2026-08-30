@@ -298,19 +298,58 @@ impl Drop for Pty {
     fn drop(&mut self) {
         // Best-effort kill of the child process.
         let _ = signal::kill(self.child_pid, Signal::SIGHUP);
-        reap_child(self.child_pid);
+        // ...and then get out of the way. The signalled child needs a moment to
+        // die before its status can be collected, and this `Drop` is reached
+        // from `reap_panes` with the daemon's `panes` lock held: waiting here
+        // blocks a runtime thread while that lock is held. The file-manager
+        // sidebar panel closes a pane and opens another on every directory
+        // change, so that would put a stall under a lock on a routine user
+        // action -- harder to attribute later than the zombies it fixes.
+        //
+        // Nothing is shared with the spawned closure but the pid. That pid is
+        // not necessarily ours to collect, and it is not a race we need to win:
+        // see `reap_child`, which explains why another waiter getting there
+        // first is the expected case rather than a problem.
+        //
+        // Two properties of `spawn_blocking` worth knowing, both read out of
+        // tokio 1.50.0 rather than assumed:
+        //
+        // - On a runtime that has begun shutting down, the closure is NEVER
+        //   RUN. `blocking::pool::spawn_task` shuts the task down and returns
+        //   `SpawnError::ShuttingDown`, and the caller deliberately hands back a
+        //   `JoinHandle` that never resolves ("Compat: do not panic here"). So
+        //   the reap is LOST, not deferred -- and the `Err(_)` arm below does
+        //   not cover it, because `Handle::try_current()` still succeeds while a
+        //   runtime is shutting down. Harmless only because the process is on
+        //   its way out and init reparents and reaps every zombie it leaves.
+        // - `spawn_blocking` PANICS on `SpawnError::NoThreads`, i.e. when the OS
+        //   refuses a new thread and none is free. Remote, but a panic inside a
+        //   `Drop` that is itself running during an unwind aborts the process.
+        let pid = self.child_pid;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || reap_child(pid));
+            }
+            // No runtime at all: nothing left to stall, so wait inline. Blocking
+            // briefly is fine here; leaking is not.
+            Err(_) => reap_child(pid),
+        }
     }
 }
 
 /// How long [`reap_child`] waits for a signalled child before escalating, and
-/// again before giving up. Deliberately short: this runs from `Drop`, which the
-/// server reaches while holding the `panes` lock, so it is a hard bound on how
-/// long a pane close can stall the daemon.
+/// again before giving up.
 ///
 /// 20ms is the WORST case, not the usual one: the loop polls at 1ms and returns
 /// the instant the child is collected, so a shell exiting on SIGHUP costs 1-3ms.
 /// Only a child that survives both SIGHUP and SIGKILL -- uninterruptible sleep --
 /// pays the full bound.
+///
+/// It is bounded at all because of where this can run. On the normal path that
+/// is a blocking-pool thread, which must not be parked for ever on a child that
+/// will not die; on the no-runtime fallback it is `Drop` itself, which the
+/// daemon reaches holding the `panes` lock, and a `Drop` that can hang is worth
+/// nothing at all.
 const REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
@@ -327,18 +366,15 @@ const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 /// Always the SPECIFIC pid, never `waitpid(-1, ..)`: a wildcard reaper would
 /// steal children that other code is waiting for.
 ///
-/// **Losing the race is normal.** [`reap_panes`] calls [`Pty::try_wait`] on this
-/// same pid immediately before dropping the `Pty`, to read the exit code, and it
-/// frequently gets there first. `ECHILD` is therefore SUCCESS -- somebody else
-/// collected the child, which is the outcome this function wanted -- and it is
-/// matched explicitly rather than swept up with every other errno, so that a
+/// **This is not the only waiter, and usually not the winning one.**
+/// [`reap_panes`] calls [`Pty::try_wait`] on the same pid immediately before
+/// dropping the `Pty`, to read the exit code -- and on the commonest path of all
+/// (the PTY channel disconnected *because* the child died) that call collects it
+/// and frees the pid before this ever runs. `ECHILD` is therefore SUCCESS, and it
+/// is matched explicitly rather than swept up with every other errno, so that a
 /// genuine failure is logged instead of silently reading as "reaped".
 ///
 /// [`reap_panes`]: crate::server::daemon
-///
-/// Bounded at both stages and never blocking indefinitely: a child that will not
-/// die is worth one leaked zombie, but a `Drop` that can hang is worth nothing at
-/// all -- the daemon holds locks across it.
 fn reap_child(pid: Pid) {
     for stage in 0..2 {
         let deadline = std::time::Instant::now() + REAP_WAIT;
