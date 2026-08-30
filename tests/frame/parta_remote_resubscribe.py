@@ -14,7 +14,7 @@ UNFOCUSED cell (size_demand=false) repeatedly and assert a fresh PaneContent --
 carrying the pane's real content -- arrives through the relay every time.
 """
 import json, os, struct, subprocess, sys, time
-from harness import Server, BIN, name_of, only
+from harness import PROTOCOL_VERSION, Server, BIN, name_of, only
 
 RUNDIR = "/tmp/rmxais/parta"
 MARKER = "REMOTE_MARKER_4417"
@@ -118,7 +118,7 @@ def main():
     # -- Now reach that pane THROUGH the relay, as a remote client would. --
     relay = Relay(srv.env)
     welcome = None
-    relay.send({"protocol_version": 6, "remux_version": "t"})
+    relay.send({"protocol_version": PROTOCOL_VERSION, "remux_version": "t"})
     welcome = relay.recv()
     print("relay handshake:", name_of(welcome))
 

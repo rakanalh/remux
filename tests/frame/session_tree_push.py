@@ -275,6 +275,11 @@ def run(srv):
         # proceeds); the HARD reject lives client-side in terminal.rs. What the
         # server must guarantee is that the skew is *detectable*: the Welcome
         # carries the server's real version, and the daemon survives.
+        # The ONLY hard-coded protocol_version left in the harnesses, and it is
+        # deliberate: this is the SKEW test, so the number must be a version that
+        # is not the current one. The `PROTOCOL_VERSION != 4` check below is what
+        # keeps it honest if the real version ever reaches 4 from the other
+        # direction. Do not "sweep" this one onto the shared reader.
         old = socket.socket(socket.AF_UNIX)
         old.connect(srv.sock)
         old.settimeout(2.0)

@@ -29,6 +29,12 @@ Run from the repo root:
 import json, os, shutil, socket, struct, subprocess, sys, time
 import pexpect, pyte
 
+# Read, never restated -- see `pty_harness._protocol_version`. Hard-coded at 6,
+# this went stale through three bumps in silence, because the server logs a skew
+# and proceeds rather than rejecting it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pty_harness import PROTOCOL_VERSION  # noqa: E402
+
 BIN = os.path.abspath("target/debug/remux")
 RUN = "/tmp/rmxrv"
 SOCK1 = f"{RUN}/run/remux.sock"      # the LOCAL server both clients attach to
@@ -161,7 +167,7 @@ def seed_remote_pane():
     """Create a session on the 'remote' server, print the marker in its pane,
     then detach so the pane is NOT session-visible."""
     w = Wire(SOCK2)
-    w.send({"protocol_version": 6, "remux_version": "t"})
+    w.send({"protocol_version": PROTOCOL_VERSION, "remux_version": "t"})
     w.recv()
     w.send({"CreateSession": {"name": "rbox", "folder": None}})
     w.send({"Attach": {"session_name": "rbox"}})

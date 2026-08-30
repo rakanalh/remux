@@ -17,6 +17,14 @@ pane's session yields session_visible=false. It also documents the buggy path
 """
 import json, os, shutil, socket, struct, subprocess, sys, time
 
+# The PROTOCOL_VERSION this harness announces is READ from the source, never
+# restated. It was hard-coded at 6 here and went stale through three bumps
+# without anything going red: the server is deliberately lenient about skew (it
+# logs and proceeds), so the handshake kept succeeding while the harness claimed
+# to speak a protocol that no longer existed.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness import PROTOCOL_VERSION  # noqa: E402
+
 BIN, RUNDIR = "target/debug/remux", "/tmp/rmxbug4"
 SOCK = f"{RUNDIR}/run/remux.sock"
 
@@ -74,7 +82,7 @@ def newconn():
     s.connect(SOCK)
     s.settimeout(1.0)
     buf = [b""]
-    send(s, {"protocol_version": 6, "remux_version": "t"})
+    send(s, {"protocol_version": PROTOCOL_VERSION, "remux_version": "t"})
     recv(s, buf)  # Welcome
     return s, buf
 
