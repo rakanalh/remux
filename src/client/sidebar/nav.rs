@@ -15,9 +15,20 @@
 //!   [`row_colors`], [`fill_row`], [`draw_header`]) carry the behaviour. They
 //!   take the selection as a parameter, so a panel whose selection lives
 //!   somewhere else can still use every one of them. `sessions` is exactly that
-//!   panel: its selection is [`TreeModel::selected`], shared with the
-//!   session-manager overlay, and moving it out here to satisfy a helper would
-//!   split one cursor across two owners.
+//!   panel: its selection is [`TreeModel::selected`], and giving it a [`NavList`]
+//!   as well would put **two reconcilers on one cursor**.
+//!
+//!   `TreeModel` already does [`NavList`]'s job. It captures the selected row's
+//!   `row_key` before a rebuild and re-points by identity, clamping if the row
+//!   is gone -- the very thing [`NavList::reselect`] exists for -- and
+//!   `expand_selected`, `collapse_selected`, `toggle_expand` and the query
+//!   filter all move the cursor too. A second reconciler would disagree with
+//!   that one the first time a push rebuilt the tree, and the panel would jump.
+//!
+//!   (The session-manager overlay uses the same TYPE with its own instance;
+//!   there is no shared cursor between the two surfaces. An earlier version of
+//!   this comment claimed there was, which sent readers looking for a handle
+//!   that does not exist.)
 //!
 //!   [`TreeModel::selected`]: crate::client::tree_model::TreeModel::selected
 //! * **[`NavList`]** is those functions with a cursor and a viewport attached,

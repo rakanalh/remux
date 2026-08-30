@@ -501,6 +501,15 @@ pub enum ServerMessage {
         /// a macOS client attached to a Linux server detects fine, and it is
         /// the SERVER's platform that decides. Defaults to `true`, so a peer
         /// that omits it is assumed capable.
+        ///
+        /// **It is COMPILE-TIME, and so answers "could this build ever
+        /// detect?", not "did detection work?"** A Linux server with no `/proc`
+        /// mounted, or one configured `commands = []` (which makes the sampler
+        /// return early before it looks at a single pane), both report `true`
+        /// beside an empty list -- the exact ambiguity this field exists to
+        /// remove, surviving in the cases it cannot see. Narrowing it would mean
+        /// reporting a REASON rather than a capability; worth doing if either
+        /// case turns out to bite, and deliberately not guessed at now.
         #[serde(default = "default_true")]
         detection_supported: bool,
     },

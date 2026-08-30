@@ -54,6 +54,11 @@ use crate::screen::Screen;
 ///
 /// Mirrors `get_process_name`'s existing platform fallback rather than inventing
 /// a second platform split.
+///
+/// COMPILE-TIME, so it reports what this BUILD could do, never what a given
+/// sample actually did: a Linux server with no `/proc` mounted, or one whose
+/// `commands` list is empty, still reports `true` with nothing listed. See
+/// `ServerMessage::AgentList`'s field docs.
 pub const DETECTION_SUPPORTED: bool = cfg!(target_os = "linux");
 
 /// The command running in the foreground of this PTY, e.g. `"claude"`.

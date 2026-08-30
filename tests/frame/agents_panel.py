@@ -338,19 +338,27 @@ def run(srv):
     time.sleep(0.3)
     c.send("SubscribeAgents")
     first = first_list(c)
+    # Keyed on the PANE, not the command. By now two panes run `claude`, and the
+    # tab-1 one has been Idle for many seconds -- so a check that only asked
+    # "is some claude Idle?" would be satisfied by the wrong pane the instant
+    # any push arrived, and would pass a partial fix that pushed without
+    # re-sampling the stranded pane.
+    def state_of(ags, pane_id):
+        return next((a["state"] for a in ags or [] if a["pane_id"] == pane_id), None)
+
     check(
-        ("claude", "Working") in states(first or []),
+        state_of(first, agent_pane) == "Working",
         f"11 a fresh subscriber is told Working while the window is open ({first})",
     )
     # No further input is sent, so only the decay tick can deliver this.
     decayed = wait_for(
         c,
-        lambda ags: any(a["command"] == "claude" and a["state"] == "Idle" for a in ags),
+        lambda ags: state_of(ags, agent_pane) == "Idle",
         timeout=4.0,
     )
     check(
-        ("claude", "Idle") in states(decayed or []),
-        "11 and it decays to Idle rather than sitting on Working for ever",
+        state_of(decayed, agent_pane) == "Idle",
+        "11 and THAT pane decays to Idle rather than sitting on Working for ever",
     )
 
     c.close()

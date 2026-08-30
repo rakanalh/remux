@@ -205,9 +205,11 @@ impl SidebarPlugin for SessionsPlugin {
         match nav::nav_key(&key) {
             Some(NavKey::Activate) => self.activate(),
             Some(cmd) => {
-                // Through the model's own cursor rather than a second one: it
-                // is shared with the session-manager overlay, and two owners of
-                // one selection is how the two surfaces would drift apart.
+                // Through the model's OWN cursor rather than a second one.
+                // `TreeModel` already reconciles it -- by identity, on every
+                // rebuild -- so a `NavList` beside it would be a second
+                // reconciler for the same selection, and the two would disagree
+                // the first time a push rebuilt the tree. See `nav`'s docs.
                 nav::move_selection(&mut self.model.selected, self.model.rows.len(), cmd);
                 PluginAction::Redraw
             }
