@@ -720,7 +720,10 @@
 # survive being cut in half by a narrow pane.
 #
 # Detection reads the pane's foreground process group from `/proc`, so it is
-# Linux-only; on macOS the panel lists nothing.
+# Linux-only. A server that cannot detect says so — the panel shows
+# "<server>: needs Linux" rather than an empty list that would read as "you have
+# no agents running". A macOS CLIENT attached to a Linux server is unaffected;
+# it is the server's platform that decides.
 #
 # [agents]
 # commands = ["claude", "codex", "aider", "gemini"]
