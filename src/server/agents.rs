@@ -317,6 +317,16 @@ mod tests {
         AgentRules::from_config(&AgentsConfig::default())
     }
 
+    /// The approval questions present in the installed Claude Code 2.1.251
+    /// binary, read with `strings`. The shipped patterns exist to match these.
+    const CLAUDE_QUESTIONS: [&str; 5] = [
+        "Do you want to proceed?",
+        "Do you want to continue?",
+        "Do you want to allow this connection?",
+        "Do you want to allow Claude to fetch this content?",
+        "Do you want to use this API key?",
+    ];
+
     #[test]
     fn only_configured_commands_are_agents() {
         let r = shipped();
@@ -487,13 +497,7 @@ mod tests {
     #[test]
     fn the_shipped_patterns_recognise_claudes_real_permission_prompts() {
         let r = shipped();
-        for question in [
-            "Do you want to proceed?",
-            "Do you want to continue?",
-            "Do you want to allow this connection?",
-            "Do you want to allow Claude to fetch this content?",
-            "Do you want to use this API key?",
-        ] {
+        for question in CLAUDE_QUESTIONS {
             let screen = vec![question.to_string(), "❯ 1. Yes".to_string()];
             assert_eq!(
                 r.classify("claude", &screen, Duration::from_secs(30)).state,
@@ -503,11 +507,24 @@ mod tests {
         }
     }
 
-    /// The menu marker alone is enough, since it sits BELOW the question and so
-    /// survives a question that has scrolled past the window.
+    /// A menu row on its own is NOT a shipped blocked signal. See
+    /// `config::agents::default_patterns`: an answered menu left on screen is
+    /// indistinguishable from a waiting one, and a panel stuck red for ever is
+    /// worse than one that is slow.
     #[test]
-    fn the_choice_marker_alone_is_enough() {
+    fn a_bare_menu_row_is_not_a_shipped_blocked_signal() {
         let r = shipped();
+        let screen = vec!["❯ 2. Yes, and don't ask again".to_string()];
+        assert_eq!(
+            r.classify("claude", &screen, Duration::from_secs(30)).state,
+            AgentState::Idle
+        );
+    }
+
+    /// ...and a user who wants it can still have it, in one config entry.
+    #[test]
+    fn a_user_can_add_a_menu_pattern_back() {
+        let r = rules(vec![pattern("choice", Some("claude"), r"❯\s*\d+\.")], 500);
         let screen = vec!["❯ 2. Yes, and don't ask again".to_string()];
         assert_eq!(
             r.classify("claude", &screen, Duration::from_secs(30)).state,
@@ -601,30 +618,33 @@ mod tests {
         );
     }
 
-    /// Every width, so no lucky alignment can hide a failure. This is the shape
-    /// of the review probe that found the bug, as a unit test.
+    /// Every width, for every question the real binary asks.
+    ///
+    /// One question was not enough, and the reason is arithmetic: a space lands
+    /// in the last column only at widths that divide (space index + 1), so a
+    /// single prompt exercises the bug at just a couple of the 53 widths -- for
+    /// `Do you want to proceed?` only 12 and 15. A different question has its
+    /// spaces elsewhere and so its own unlucky widths, which a one-string loop
+    /// would never visit.
     #[test]
-    fn a_visible_prompt_matches_at_every_pane_width() {
-        let r = AgentRules::from_config(&AgentsConfig {
-            commands: vec!["claude".to_string()],
-            working_ms: 500,
-            scan_rows: 12,
-            pattern: vec![pattern("approval", None, r"Do you want to proceed")],
-        });
-        for cols in 8..=60u16 {
-            let mut screen = Screen::new(cols, 12, 100);
-            screen.process_output(b"Do you want to proceed?");
-            assert_eq!(
-                r.classify(
-                    "claude",
-                    &r.visible_bottom(&screen),
-                    Duration::from_secs(60)
-                )
-                .state,
-                AgentState::NeedsInput,
-                "a prompt plainly on screen read as not-blocked at {cols} columns: {:?}",
-                r.visible_bottom(&screen)
-            );
+    fn every_shipped_question_matches_at_every_pane_width() {
+        let r = shipped();
+        for question in CLAUDE_QUESTIONS {
+            for cols in 8..=60u16 {
+                let mut screen = Screen::new(cols, 12, 100);
+                screen.process_output(question.as_bytes());
+                assert_eq!(
+                    r.classify(
+                        "claude",
+                        &r.visible_bottom(&screen),
+                        Duration::from_secs(60)
+                    )
+                    .state,
+                    AgentState::NeedsInput,
+                    "{question:?} read as not-blocked at {cols} columns: {:?}",
+                    r.visible_bottom(&screen)
+                );
+            }
         }
     }
 

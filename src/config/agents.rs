@@ -52,9 +52,14 @@ pub struct AgentPattern {
     /// every agent.
     #[serde(default)]
     pub command: Option<String>,
-    /// A Rust `regex` pattern. Matched against each of the last `scan_rows`
-    /// rows of the LIVE screen, one row at a time -- so anchors are row
-    /// anchors, not screen anchors.
+    /// A Rust `regex` pattern, matched against the last `scan_rows` LOGICAL
+    /// LINES of the live screen, one line at a time.
+    ///
+    /// **Lines, not rows.** Soft-wrapped rows are rejoined before matching, so
+    /// `^` and `$` anchor to the start and end of a wrapped-out line, not of a
+    /// screen row. That is what lets a pattern survive a narrow pane -- and it
+    /// also means an anchored marker pattern matches only where the marker
+    /// begins a LINE, never where it happens to begin a continuation row.
     ///
     /// A pattern that fails to compile is logged and skipped; it never takes
     /// the server down.
@@ -98,6 +103,31 @@ impl Default for AgentsConfig {
 }
 
 /// The shipped patterns: enough for `claude` and `codex` to work unconfigured.
+///
+/// **Deliberately no menu-shaped pattern.** An earlier default matched the
+/// selected row of a numbered menu, as a second chance for a question that had
+/// scrolled out of the window. It is not shipped, for two reasons pointing the
+/// same way:
+///
+/// * **It is unverifiable in the way that matters.** If an agent leaves an
+///   ANSWERED menu on screen with its chosen row still marked, no pattern
+///   evaluated against a snapshot can tell it from one still waiting -- and a
+///   panel stuck red for ever is worse than one that is slow, because it trains
+///   the user to ignore the colour. Whether Claude Code clears that row after an
+///   answer is not something this project has established: a session running
+///   with permission prompts disabled never renders one, and the binary's
+///   strings do not settle it.
+/// * **Its specificity is far below the question patterns'.** A marker, a digit
+///   and a dot appear in plenty of ordinary agent output; `Do you want to
+///   proceed?` essentially does not.
+///
+/// The same staleness argument applies in principle to the question patterns,
+/// and is much weaker there: a resumed agent redraws, and its output pushes the
+/// question out of the `scan_rows` window within a screenful. A menu row is the
+/// LAST thing on screen, so it would survive longest.
+///
+/// A user who wants the second chance adds it back in one config entry; the
+/// sample config shows it with this caveat attached.
 fn default_patterns() -> Vec<AgentPattern> {
     let p = |name: &str, command: &str, regex: &str| AgentPattern {
         name: name.to_string(),
@@ -122,13 +152,6 @@ fn default_patterns() -> Vec<AgentPattern> {
             "claude",
             r"(?i)do you want to (proceed|continue|allow|use this api key)",
         ),
-        // The selected row of a numbered choice menu, which is what a blocking
-        // prompt draws. `❯` is present in the binary; the "1. Yes" text is not,
-        // because the number and the label are composed at render time -- so
-        // this matches the SHAPE (marker, digit, dot) rather than assuming a
-        // label. It also sits a row or two BELOW the question, which is what
-        // makes it a useful second chance if the question itself is off-window.
-        p("claude-choice", "claude", r"❯\s*\d+\."),
         // Codex's command-approval prompt.
         p(
             "codex-allow",

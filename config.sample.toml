@@ -719,12 +719,26 @@
 #
 # Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
 # is no merge, so you own the whole list and cannot be surprised by a built-in
-# pattern you cannot see. The shipped Claude ones are taken from the wordings
+# pattern you cannot see. The shipped Claude one is taken from the wordings
 # actually present in the Claude Code binary ("Do you want to proceed?",
-# "...continue?", "...allow this connection?", "...use this API key?") plus the
-# selected row of its numbered choice menu. The Codex ones are a best-effort
-# guess at its approval prompt and have NOT been checked against a real Codex —
-# if you run it and they are wrong, this is the section to correct.
+# "...continue?", "...allow this connection?", "...use this API key?"). The Codex
+# ones are a best-effort guess at its approval prompt and have NOT been checked
+# against a real Codex — if you run it and they are wrong, this is the section to
+# correct.
+#
+# NOT shipped, on purpose: a pattern matching the selected row of a numbered
+# menu, e.g.
+#
+#   regex = "❯\\s*\\d+\\."
+#
+# It would be a useful second chance when the question itself has scrolled out of
+# the window, and you can add it in one entry — but understand the trade first.
+# If an agent leaves an ANSWERED menu on screen with its choice still marked,
+# nothing in a screen snapshot can tell it apart from one that is still waiting,
+# and the panel stays red indefinitely. A permanently red panel is worse than a
+# slow one: it teaches you to ignore the colour. The question patterns are much
+# less exposed to this — a resumed agent's output pushes the question out of the
+# window within a screenful, while a menu row is the last thing on the screen.
 #
 # Soft-wrapped lines are rejoined before matching, so a pattern does not have to
 # survive being cut in half by a narrow pane.

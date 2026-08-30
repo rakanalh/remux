@@ -275,15 +275,21 @@ impl NavList {
 
     /// Resolve a click at panel-local row `y` against the last painted window.
     ///
-    /// Bounded by what was PAINTED, not by how many rows exist -- see
-    /// [`NavList::last_shown`].
-    pub fn hit(&self, y: u16) -> Hit {
-        hit_test(
-            y,
-            self.last_top.get(),
-            self.selected,
-            self.last_top.get() + self.last_shown.get(),
-        )
+    /// Bounded by BOTH what was painted and what still exists, and it needs both:
+    ///
+    /// * by the paint, because a panel may draw something else below its rows
+    ///   (the agents panel draws a "this server cannot detect" note there) and a
+    ///   click on that must select nothing;
+    /// * by `len`, because a click can arrive between a rebuild that SHRANK the
+    ///   list and the next paint. The recorded window is then stale and describes
+    ///   rows that no longer exist -- selecting one leaves the cursor past the
+    ///   end, where the next paint scrolls to a window with nothing in it and the
+    ///   panel goes blank. It self-heals on any later push or keypress, except
+    ///   that a list of entirely idle agents produces no pushes, so nothing is
+    ///   coming.
+    pub fn hit(&self, y: u16, len: usize) -> Hit {
+        let painted = self.last_top.get() + self.last_shown.get();
+        hit_test(y, self.last_top.get(), self.selected, painted.min(len))
     }
 
     /// Re-point the cursor at the row it was on, by IDENTITY, after the rows
@@ -448,12 +454,16 @@ mod tests {
         let nav = NavList::new();
         // A 4-row panel showing rows 0..3 of a 20-row list, selection at 0.
         assert_eq!(nav.top_for(4, 20), 0);
-        assert_eq!(nav.hit(2), Hit::Select(1));
+        assert_eq!(nav.hit(2, 20), Hit::Select(1));
 
         let mut nav = NavList::new();
         nav.set_selected(10);
         assert_eq!(nav.top_for(4, 20), 8, "scrolled to show row 10");
-        assert_eq!(nav.hit(1), Hit::Select(8), "the top visible row is row 8");
+        assert_eq!(
+            nav.hit(1, 20),
+            Hit::Select(8),
+            "the top visible row is row 8"
+        );
     }
 
     /// A click below the last PAINTED row is not a row, even when the list has
@@ -465,10 +475,10 @@ mod tests {
         let nav = NavList::new();
         // A 3-row panel: header + 2 rows, out of a 20-row list.
         nav.top_for(3, 20);
-        assert_eq!(nav.hit(1), Hit::Activate(0));
-        assert_eq!(nav.hit(2), Hit::Select(1));
+        assert_eq!(nav.hit(1, 20), Hit::Activate(0));
+        assert_eq!(nav.hit(2, 20), Hit::Select(1));
         assert_eq!(
-            nav.hit(3),
+            nav.hit(3, 20),
             Hit::Nothing,
             "row 2 was never painted; whatever is drawn there is not this list"
         );
@@ -478,7 +488,31 @@ mod tests {
     fn a_panel_shorter_than_its_list_reports_only_what_it_painted() {
         let nav = NavList::new();
         nav.top_for(5, 2); // room for 4 rows, only 2 exist
-        assert_eq!(nav.hit(2), Hit::Select(1));
-        assert_eq!(nav.hit(3), Hit::Nothing);
+        assert_eq!(nav.hit(2, 2), Hit::Select(1));
+        assert_eq!(nav.hit(3, 2), Hit::Nothing);
+    }
+
+    /// A click landing between a shrinking rebuild and the next paint. The
+    /// recorded window still describes twenty rows; five remain.
+    #[test]
+    fn a_click_against_a_stale_window_cannot_select_past_the_end() {
+        let mut nav = NavList::new();
+        nav.set_selected(19);
+        assert_eq!(
+            nav.top_for(5, 20),
+            16,
+            "scrolled to the end of a 20-row list"
+        );
+        // The list shrinks to five. No repaint yet, so the window is stale.
+        assert_eq!(
+            nav.hit(4, 5),
+            Hit::Nothing,
+            "row 19 is gone; selecting it would park the cursor past the end and \
+             paint an empty panel"
+        );
+        // The rows that DO still exist are unaffected by the staleness.
+        nav.set_selected(0);
+        assert_eq!(nav.top_for(5, 5), 0);
+        assert_eq!(nav.hit(2, 5), Hit::Select(1));
     }
 }

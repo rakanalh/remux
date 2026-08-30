@@ -192,7 +192,32 @@ impl SidebarPlugin for AgentsPlugin {
         }
         nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
 
-        let notes = self.notes();
+        // The notes are CAPPED against the list, not just against the panel.
+        // Uncapped, three unsupported remotes beside four blocked agents took
+        // the whole four-row panel and showed zero agents -- the explanation
+        // outranking the thing it explains, on a panel whose entire job is the
+        // list. Three macOS remotes is not exotic.
+        //
+        // At most half the rows when there are agents to show, all of them when
+        // there are none (there is nothing to crowd out), and one summarising
+        // line rather than a truncated set when they do not fit: partial lists
+        // invite "which servers?" with no way to ask.
+        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let all_notes = self.notes();
+        let budget = if self.rows.is_empty() {
+            capacity
+        } else {
+            capacity / 2
+        };
+        let notes: Vec<String> = if all_notes.len() <= budget {
+            all_notes
+        } else if budget >= 1 {
+            vec![format!("{} servers: needs Linux", all_notes.len())]
+        } else {
+            // A panel with one usable row and agents in it: the agent wins.
+            Vec::new()
+        };
+
         if self.rows.is_empty() && notes.is_empty() {
             // Said out loud rather than left blank: an empty panel and a broken
             // one look identical, and this one is empty most of the time.
@@ -213,7 +238,7 @@ impl SidebarPlugin for AgentsPlugin {
         // server is missing from a list that otherwise looks complete. The list
         // gets the shorter height, so its scrolling accounts for the
         // reservation too.
-        let note_rows = notes.len().min((rows as usize).saturating_sub(HEADER_ROWS));
+        let note_rows = notes.len();
         let list_height = rows.saturating_sub(note_rows as u16);
         let list_capacity = (list_height as usize).saturating_sub(HEADER_ROWS);
 
@@ -274,7 +299,7 @@ impl SidebarPlugin for AgentsPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        match self.nav.hit(y) {
+        match self.nav.hit(y, self.rows.len()) {
             Hit::Nothing => PluginAction::None,
             Hit::Select(idx) => {
                 self.nav.set_selected(idx);
@@ -696,6 +721,47 @@ mod tests {
             p.on_mouse(0, 3, down),
             PluginAction::None,
             "the note is not a row, however many rows exist below the fold"
+        );
+    }
+
+    /// The explanation must never outrank the thing it explains.
+    #[test]
+    fn notes_cannot_crowd_the_agents_out_of_the_panel() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            (1..=4)
+                .map(|i| agent(i, "claude", &format!("s{i}"), AgentState::NeedsInput))
+                .collect(),
+        ));
+        for host in ["mac1", "mac2", "mac3"] {
+            p.on_event(&unsupported(remote(host)));
+        }
+        // Four blocked agents and three unsupported remotes in a four-row panel.
+        let rows = painted(&p, 24, 4);
+        let agents_shown = rows[1..].iter().filter(|r| r.contains("claude")).count();
+        assert!(
+            agents_shown >= 2,
+            "the notes took the panel from the agents: {rows:?}"
+        );
+        assert_eq!(
+            rows[3], "3 servers: needs Linux",
+            "and the three collapse to one line rather than being truncated: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_agents_at_all_every_note_is_listed_individually() {
+        let mut p = AgentsPlugin::new();
+        for host in ["mac1", "mac2", "mac3"] {
+            p.on_event(&unsupported(remote(host)));
+        }
+        let rows = painted(&p, 24, 5);
+        assert_eq!(rows[1], "mac1: needs Linux");
+        assert_eq!(rows[2], "mac2: needs Linux");
+        assert_eq!(
+            rows[3], "mac3: needs Linux",
+            "nothing to crowd out: {rows:?}"
         );
     }
 
