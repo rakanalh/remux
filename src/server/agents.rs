@@ -164,8 +164,8 @@ impl AgentRules {
         }
     }
 
-    /// The rows [`AgentRules::classify`] should be given for `screen`: the last
-    /// `scan_rows` rows of the LIVE grid that have anything on them.
+    /// The lines [`AgentRules::classify`] should be given for `screen`: the last
+    /// `scan_rows` LOGICAL lines of the LIVE grid that have anything on them.
     ///
     /// The live grid, never the scrollback -- an approval prompt the user has
     /// scrolled past is not what the agent is showing now. It is also what makes
@@ -174,22 +174,47 @@ impl AgentRules {
     /// the tab being viewed and would have made the classifier blind to exactly
     /// the pane the user is looking at.
     ///
-    /// Trailing BLANK rows are skipped before the window is taken, and that is
-    /// not a nicety -- the bottom of the grid is not the bottom of the output.
-    /// An agent that has printed five lines into a thirty-row pane leaves the
-    /// last twelve rows empty, so a window anchored to the grid's last row would
-    /// scan twelve blank lines and see no prompt however plainly one was on
-    /// screen. Found by probing exactly that case. A full-screen TUI, where the
-    /// grid really is full, is unaffected.
+    /// Two things are done to the raw grid first, and both were found by
+    /// probing rather than reasoned out in advance:
+    ///
+    /// * **Soft-wrapped rows are joined into one line.** A pattern is matched
+    ///   against a line, and in a narrow pane `Do you want to proceed?` is two
+    ///   grid rows -- `Do you want to pro` and `ceed?` -- which no sensible
+    ///   pattern matches. Splitting one pane three ways was enough to hide a
+    ///   prompt that was plainly on screen. `Row::wrapped` is exactly the
+    ///   "this line continues" flag needed, so this costs nothing and makes
+    ///   matching independent of the pane's width.
+    /// * **Trailing BLANK rows are skipped** before the window is taken. The
+    ///   bottom of the grid is not the bottom of the output: an agent that has
+    ///   printed five lines into a thirty-row pane leaves the last twelve rows
+    ///   empty, so a window anchored to the grid's last row would scan twelve
+    ///   blank lines and see nothing. A full-screen TUI, where the grid really
+    ///   is full, is unaffected by either.
     pub fn visible_bottom(&self, screen: &Screen) -> Vec<String> {
-        let text: Vec<String> = screen.grid.iter().map(row_text).collect();
-        let end = match text.iter().rposition(|line| !line.is_empty()) {
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut continuing = false;
+        for row in &screen.grid {
+            if continuing {
+                current.push_str(&row_text(row));
+            } else {
+                current = row_text(row);
+            }
+            continuing = row.wrapped;
+            if !continuing {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+        if continuing {
+            lines.push(current);
+        }
+        let end = match lines.iter().rposition(|line| !line.is_empty()) {
             Some(last) => last + 1,
-            // A blank screen: nothing to match, and no rows worth handing on.
+            // A blank screen: nothing to match, and no lines worth handing on.
             None => return Vec::new(),
         };
         let start = end.saturating_sub(self.scan_rows);
-        text[start..end].to_vec()
+        lines[start..end].to_vec()
     }
 }
 
@@ -473,6 +498,58 @@ mod tests {
         assert_eq!(
             r.classify("claude", &bottom, Duration::from_secs(60)).state,
             AgentState::NeedsInput
+        );
+    }
+
+    /// The second bug a probe found: a prompt that soft-wraps in a narrow pane.
+    #[test]
+    fn a_prompt_wrapped_across_two_rows_is_matched_as_one_line() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["claude".to_string()],
+            working_ms: 500,
+            scan_rows: 12,
+            pattern: vec![pattern("approval", None, r"Do you want to proceed")],
+        });
+        // 18 columns: the prompt does not fit on one row.
+        let mut screen = Screen::new(18, 10, 100);
+        screen.process_output(b"Do you want to proceed?");
+        assert!(
+            r.visible_bottom(&screen)
+                .iter()
+                .any(|l| l.contains("Do you want to proceed")),
+            "soft-wrapped rows must rejoin, got {:?}",
+            r.visible_bottom(&screen)
+        );
+        assert_eq!(
+            r.classify(
+                "claude",
+                &r.visible_bottom(&screen),
+                Duration::from_secs(60)
+            )
+            .state,
+            AgentState::NeedsInput
+        );
+    }
+
+    #[test]
+    fn a_hard_newline_is_not_joined_to_the_next_line() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["claude".to_string()],
+            working_ms: 500,
+            scan_rows: 12,
+            // Only matches if two SEPARATE lines were wrongly joined.
+            pattern: vec![pattern("joined", None, r"firstsecond")],
+        });
+        let mut screen = Screen::new(40, 10, 100);
+        screen.process_output(b"first\r\nsecond");
+        assert_eq!(
+            r.classify(
+                "claude",
+                &r.visible_bottom(&screen),
+                Duration::from_secs(60)
+            )
+            .state,
+            AgentState::Idle
         );
     }
 
