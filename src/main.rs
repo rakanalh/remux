@@ -95,10 +95,12 @@ enum Commands {
     },
 
     /// Split the focused pane of the session named by $REMUX_SESSION
-    ///
-    /// `disable_help_flag` because `-h` is claimed here for the split
-    /// orientation, as it is in tmux. `--help` is re-added by hand below, so the
-    /// only thing lost is the SHORT help flag on this one subcommand.
+    //
+    // `disable_help_flag` because `-h` is claimed here for the split
+    // orientation, as it is in tmux. `--help` is re-added by hand below, so the
+    // only thing lost is the SHORT help flag on this one subcommand. A `///`
+    // here would print this note to the user: clap uses the doc comment's body
+    // as the subcommand's long description.
     #[command(
         disable_help_flag = true,
         after_help = "Run from inside a remux pane: $REMUX_SESSION names the session to split.\n\
@@ -110,8 +112,10 @@ enum Commands {
     Split {
         /// Split top/bottom: the new pane goes BELOW (the default)
         ///
-        /// Note this is the opposite of tmux's `split-window -h`. The flag names
-        /// the DIVIDER, matching remux's own `PaneSplitHorizontal` command.
+        /// Note this is the opposite of tmux's `split-window -h`: the flag names
+        /// the DIVIDER, matching remux's own PaneSplitHorizontal command. Said
+        /// to the USER on purpose -- a tmux user's muscle memory produces the
+        /// wrong split here, and silently.
         #[arg(short = 'h', long)]
         horizontal: bool,
 
