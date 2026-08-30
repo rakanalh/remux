@@ -131,6 +131,13 @@ def env_client():
 
 
 def setup_dirs():
+    # Un-lock the fixture BEFORE the wipe. A run killed by a timeout leaves
+    # `locked/` at mode 000, and `rmtree` cannot descend it -- the next run
+    # would inherit a half-deleted fixture and fail somewhere unrelated.
+    try:
+        os.chmod(f"{FIX}/locked", 0o755)
+    except Exception:
+        pass
     shutil.rmtree(RUN, ignore_errors=True)
     for s in ("run", "state", "data", "bin", "cfg"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
