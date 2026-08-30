@@ -23,16 +23,14 @@
 
 use std::cell::Cell;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
+use super::nav::{self, Hit, NavKey, HEADER_ROWS};
 use super::{blank_grid, draw_text, PluginAction, PluginEvent, SidebarPlugin};
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
-
-/// Rows of chrome above the tree: the panel header.
-const HEADER_ROWS: usize = 1;
 
 pub struct SessionsPlugin {
     /// Per-connection tree data, in arrival order. Order is stable across
@@ -92,26 +90,6 @@ impl SessionsPlugin {
         }
     }
 
-    /// Row index the tree window starts at, given a panel `rows` tall.
-    ///
-    /// Same formula as the session manager's (`session_manager.rs`, the
-    /// `scroll_offset` above its content loop): scroll only far enough to keep
-    /// the selection on screen. Parity beats invention -- the two surfaces
-    /// share a selection model, so they should scroll the same way -- and it is
-    /// a pure function of `(selected, height)`, which `render(&self)` needs
-    /// since the panel's height is not known until it is asked to paint.
-    fn scroll_offset(&self, rows: u16) -> usize {
-        let visible = (rows as usize).saturating_sub(HEADER_ROWS);
-        if visible == 0 {
-            return 0;
-        }
-        if self.model.selected >= visible {
-            self.model.selected + 1 - visible
-        } else {
-            0
-        }
-    }
-
     /// Whether the selected node has children to show or hide.
     fn selected_is_expandable(&self) -> bool {
         !matches!(
@@ -167,22 +145,9 @@ impl SidebarPlugin for SessionsPlugin {
         if grid.is_empty() {
             return grid;
         }
-        // A panel's header tracks focus with the SAME theme roles its frame
-        // does -- that is why they match on screen -- so it asks the same rule
-        // rather than restating the choice.
-        let header_fg = crate::server::compositor::border_fg(theme, focused);
-        draw_text(&mut grid, 0, 0, self.title(), header_fg, bg.clone());
+        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
 
-        // An unfocused panel still marks its selection, dimmer: the row is
-        // where the keyboard would land on re-entry, so losing it entirely
-        // would make focusing the panel feel like it moved.
-        let (sel_fg, sel_bg) = if focused {
-            (theme.tab_active_fg.clone(), theme.tab_active_bg.clone())
-        } else {
-            (theme.tab_inactive_fg.clone(), theme.tab_inactive_bg.clone())
-        };
-
-        let top = self.scroll_offset(rows);
+        let top = nav::scroll_offset(self.model.selected, rows);
         self.last_top.set(top);
         for i in 0..(rows as usize).saturating_sub(HEADER_ROWS) {
             let Some(row) = self.model.rows.get(top + i) else {
@@ -190,23 +155,9 @@ impl SidebarPlugin for SessionsPlugin {
             };
             let y = (HEADER_ROWS + i) as u16;
             let selected = top + i == self.model.selected;
-            let (fg, row_bg) = if selected {
-                (sel_fg.clone(), sel_bg.clone())
-            } else {
-                (theme.status_bar_fg.clone(), bg.clone())
-            };
-            // The selection is a full-width bar, not just behind the text:
-            // a highlight that stopped at the label would read as a smear in a
-            // column this narrow.
+            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
             if selected {
-                draw_text(
-                    &mut grid,
-                    0,
-                    y,
-                    &" ".repeat(cols as usize),
-                    fg.clone(),
-                    row_bg.clone(),
-                );
+                nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
             // The same ▼/▶ the session-manager overlay draws, so one tree
             // reads the same on both surfaces. An expandable node with nothing
@@ -230,66 +181,57 @@ impl SidebarPlugin for SessionsPlugin {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> PluginAction {
+        // The tree's OWN keys first -- only a tree can expand, so these have no
+        // place in the shared vocabulary and are matched before it.
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.model.move_down();
-                PluginAction::Redraw
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.model.move_up();
-                PluginAction::Redraw
-            }
             // `h`/`l` collapse and expand rather than toggling, so holding a
             // direction cannot flap a node open and shut.
             KeyCode::Char('h') | KeyCode::Left => {
                 self.model.collapse_selected();
-                PluginAction::Redraw
+                return PluginAction::Redraw;
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.model.expand_selected();
-                PluginAction::Redraw
+                return PluginAction::Redraw;
             }
             KeyCode::Char(' ') => {
                 if self.selected_is_expandable() {
                     self.model.toggle_expand();
                 }
+                return PluginAction::Redraw;
+            }
+            _ => {}
+        }
+        match nav::nav_key(&key) {
+            Some(NavKey::Activate) => self.activate(),
+            Some(cmd) => {
+                // Through the model's own cursor rather than a second one: it
+                // is shared with the session-manager overlay, and two owners of
+                // one selection is how the two surfaces would drift apart.
+                nav::move_selection(&mut self.model.selected, self.model.rows.len(), cmd);
                 PluginAction::Redraw
             }
-            KeyCode::Enter => self.activate(),
-            KeyCode::Char('g') => {
-                self.model.selected = 0;
-                PluginAction::Redraw
-            }
-            KeyCode::Char('G') => {
-                self.model.selected = self.model.rows.len().saturating_sub(1);
-                PluginAction::Redraw
-            }
-            _ => PluginAction::None,
+            None => PluginAction::None,
         }
     }
 
     fn on_mouse(&mut self, _x: u16, y: u16, kind: MouseEventKind) -> PluginAction {
-        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+        if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        let Some(offset) = (y as usize).checked_sub(HEADER_ROWS) else {
-            // The header row: not a tree row, so nothing to select.
-            return PluginAction::None;
-        };
-        // The click's row is resolved against the window the LAST render used.
-        // `on_mouse` is not told the panel's height, and the selection cannot
-        // have moved since -- a click is what moves it.
-        let idx = self.last_top.get() + offset;
-        if idx >= self.model.rows.len() {
-            return PluginAction::None;
+        match nav::hit_test(
+            y,
+            self.last_top.get(),
+            self.model.selected,
+            self.model.rows.len(),
+        ) {
+            Hit::Nothing => PluginAction::None,
+            Hit::Select(idx) => {
+                self.model.selected = idx;
+                PluginAction::Redraw
+            }
+            Hit::Activate(_) => self.activate(),
         }
-        if idx == self.model.selected {
-            // A second click on the row already under the selection activates
-            // it, the way a double click does in a file tree.
-            return self.activate();
-        }
-        self.model.selected = idx;
-        PluginAction::Redraw
     }
 
     fn on_event(&mut self, ev: &PluginEvent) {
@@ -343,6 +285,7 @@ mod tests {
     use super::*;
     use crate::client::tree_model::JumpTarget;
     use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+    use crossterm::event::MouseButton;
     use crossterm::event::{KeyEventKind, KeyModifiers};
 
     fn remote(name: &str) -> ConnId {

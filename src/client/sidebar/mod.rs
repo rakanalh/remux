@@ -17,6 +17,7 @@ use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
 
 pub mod files;
+pub mod nav;
 pub mod placeholder;
 pub mod sessions;
 
