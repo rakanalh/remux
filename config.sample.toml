@@ -587,11 +587,32 @@
 #             siblings (default: 1). Two panels at weights 2 and 1 split the
 #             sidebar two-thirds / one-third. A single panel takes it all, so
 #             the weight is irrelevant until there are two.
+#   command — the program a plugin that hosts one should run. Required by
+#             `files`, ignored by the others.
 #
 # Available plugins:
 #   sessions    — a live tree of every session, tab and pane across the local
 #                 server and every connected remote. It refreshes by itself when
 #                 the server's tree changes; Enter jumps to whatever is selected.
+#   files       — a real file manager, running in the directory of the pane you
+#                 are focused on. `command` is REQUIRED and names the program:
+#
+#                   command = "yazi"     command = "nnn"     command = "ranger"
+#
+#                 There is no default and no auto-detection on purpose — the
+#                 three take different flags and behave differently, and a wrong
+#                 guess spawns the wrong program in a terminal you then have to
+#                 find and kill. A `files` panel with no `command` is skipped
+#                 with a warning.
+#
+#                 Keys go straight to the program while the panel has focus, so
+#                 it is driven exactly as it is in a pane; Escape leaves the
+#                 panel, as it does for every other one. The directory is
+#                 followed when the FOCUSED PANE CHANGES, not on every `cd`:
+#                 re-targeting restarts the program, which would throw away
+#                 where you had navigated to. If the program exits, the panel
+#                 says so and `r` restarts it — it is never respawned
+#                 automatically, or a command that dies instantly would spin.
 #   placeholder — a fixed test fixture that paints its own name and size. Useful
 #                 for checking geometry; there is no reason to configure it.
 #
@@ -633,6 +654,11 @@
 #
 #   [[sidebar.panel]]
 #   plugin = "sessions"
+#   weight = 1
+#
+#   [[sidebar.panel]]
+#   plugin = "files"
+#   command = "yazi"
 #   weight = 1
 
 # -----------------------------------------------------------------------------
