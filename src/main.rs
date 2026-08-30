@@ -1015,6 +1015,44 @@ fn focused_pane_cwd(
         .and_then(|p| p.cwd.clone())
 }
 
+/// Make sure every live connection carries this push subscription, and forget
+/// the ones that went away.
+///
+/// Reconciled once per loop pass rather than at each connect site: remotes are
+/// dialled from five different places (startup auto-connect, the session
+/// manager, a lazy view-cell connect, a background dial completing, a foreground
+/// handoff), and a subscription missed at any one of them is a panel that
+/// silently stops updating for that server.
+///
+/// One function for both pushes. They differ only in the message and the label,
+/// and the part that is easy to get wrong -- forgetting a dropped connection, so
+/// that reconnecting re-subscribes -- should exist once.
+async fn reconcile_push_subscription(
+    wanted: bool,
+    subscribed: &mut std::collections::HashSet<ConnId>,
+    mgr: &mut ConnectionManager,
+    subscribe: ClientMessage,
+    what: &str,
+) {
+    if !wanted {
+        return;
+    }
+    let live = mgr.connected_ids();
+    for id in &live {
+        if subscribed.insert(id.clone()) {
+            log::debug!("sidebar: subscribing to {what} on {id:?}");
+            if let Err(e) = mgr.send(id, subscribe.clone()).await {
+                log::warn!("sidebar: subscribing to {what} on {id:?} failed: {e:#}");
+                subscribed.remove(id);
+            }
+        }
+    }
+    // A dropped connection must be forgotten, or reconnecting it would never
+    // re-subscribe (the server forgets the subscription along with the client
+    // that held it).
+    subscribed.retain(|id| live.contains(id));
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_plugin_action(
     action: crate::client::sidebar::PluginAction,
@@ -2180,6 +2218,11 @@ async fn run_client_loop(
     // dial completing, a foreground handoff), and a subscription missed at any
     // one of them is a panel that silently stops updating for that server.
     let mut tree_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+    // The same, for the agents panel's push. A second set rather than a second
+    // meaning for the first: the two subscriptions are independent on the wire,
+    // and a client may configure either panel without the other.
+    let mut wants_agents = chrome.wants_agents();
+    let mut agents_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
     // The auxiliary pane behind each sidebar panel that has one, keyed by the
     // panel's `(sidebar, panel)` position. The CLIENT holds the addressing --
     // which connection, which pane id -- because a panel can know neither: the
@@ -2215,22 +2258,22 @@ async fn run_client_loop(
                 dispatch_plugin_request(si, pi, req, mgr, &mut aux_panes, &mut aux_pending).await;
             }
         }
-        if wants_session_tree {
-            let live = mgr.connected_ids();
-            for id in &live {
-                if tree_subscribed.insert(id.clone()) {
-                    log::debug!("sidebar: subscribing to the session tree on {id:?}");
-                    if let Err(e) = mgr.send(id, ClientMessage::SubscribeSessionTree).await {
-                        log::warn!("sidebar: SubscribeSessionTree to {id:?} failed: {e:#}");
-                        tree_subscribed.remove(id);
-                    }
-                }
-            }
-            // A dropped connection must be forgotten, or reconnecting it would
-            // never re-subscribe (the server forgets the subscription along with
-            // the client that held it).
-            tree_subscribed.retain(|id| live.contains(id));
-        }
+        reconcile_push_subscription(
+            wants_session_tree,
+            &mut tree_subscribed,
+            mgr,
+            ClientMessage::SubscribeSessionTree,
+            "the session tree",
+        )
+        .await;
+        reconcile_push_subscription(
+            wants_agents,
+            &mut agents_subscribed,
+            mgr,
+            ClientMessage::SubscribeAgents,
+            "the agent list",
+        )
+        .await;
         tokio::select! {
             // Keyboard events
             event = event_stream.next() => {
@@ -5108,7 +5151,7 @@ async fn run_client_loop(
                         }
                         // Panels scope their state by connection: tell them
                         // before anything else here can `continue` or return.
-                        if wants_session_tree {
+                        if wants_session_tree || wants_agents {
                             chrome.broadcast(&crate::client::sidebar::PluginEvent::ConnectionLost {
                                 conn: src.clone(),
                             });
@@ -5561,10 +5604,46 @@ async fn run_client_loop(
                         }
                     }
                     Some(ServerMessage::AgentList { agents }) => {
-                        // No panel consumes this yet; the `agents` plugin lands
-                        // next. Logged rather than dropped silently so the
-                        // server half is observable on its own.
                         log::debug!("srv: AgentList src={:?} agents={}", src, agents.len());
+                        if wants_agents {
+                            chrome.broadcast(&crate::client::sidebar::PluginEvent::Agents {
+                                conn: src.clone(),
+                                agents,
+                            });
+                            // Repaint exactly as the session tree's arm does:
+                            // over a live view `paint_view` ends with
+                            // `chrome.paint`, so it is the one that has to run.
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &chrome,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &compositor_theme,
+                                    &view_border_style,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            } else {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                relay_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    tc,
+                                    tr,
+                                )?;
+                            }
+                            renderer.flush()?;
+                        }
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
@@ -6491,6 +6570,19 @@ async fn run_client_loop(
                         }
                     }
                     tree_subscribed.clear();
+
+                    // The same for the agents push, for the same reasons.
+                    let wanted_agents_before = wants_agents;
+                    wants_agents = chrome.wants_agents();
+                    if wanted_agents_before && !wants_agents {
+                        for id in &agents_subscribed {
+                            log::debug!("sidebar: unsubscribing from the agent list on {id:?}");
+                            if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
+                                log::warn!("sidebar: UnsubscribeAgents to {id:?} failed: {e:#}");
+                            }
+                        }
+                    }
+                    agents_subscribed.clear();
                     // Origin and `Resize` travel together (see
                     // `sync_content_rect`): `Renderer::resize` resets the
                     // content size but keeps the origin.

@@ -16,6 +16,7 @@ use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 use crate::server::layout::FocusDirection;
 
+pub mod agents;
 pub mod files;
 pub mod nav;
 pub mod placeholder;
@@ -48,6 +49,12 @@ pub enum PluginEvent {
         folders: Vec<crate::protocol::FolderTreeEntry>,
         unfiled: Vec<crate::protocol::SessionTreeEntry>,
         dormant: Vec<String>,
+    },
+    /// The panes running an AI coding agent on `conn`, and their states. A
+    /// full list, replacing whatever that connection last reported.
+    Agents {
+        conn: ConnId,
+        agents: Vec<crate::protocol::AgentEntry>,
     },
     /// A connection went away; drop anything scoped to it.
     ConnectionLost { conn: ConnId },
@@ -167,6 +174,16 @@ pub trait SidebarPlugin: Send {
     fn wants_session_tree(&self) -> bool {
         false
     }
+
+    /// Whether this panel needs [`PluginEvent::Agents`].
+    ///
+    /// Separate from [`SidebarPlugin::wants_session_tree`] for the same reason
+    /// the server has two subscriptions: the payloads are dirtied by different
+    /// things, and a client with only a sessions panel must put no agent
+    /// traffic on the wire at all (nor the reverse).
+    fn wants_agents(&self) -> bool {
+        false
+    }
 }
 
 /// Resolve a `[[sidebar.panel]]` entry to a plugin instance.
@@ -182,6 +199,7 @@ pub fn make_plugin(cfg: &PanelConfig) -> Option<Box<dyn SidebarPlugin>> {
     match cfg.plugin.as_str() {
         "placeholder" => Some(Box::new(placeholder::PlaceholderPlugin::new())),
         "sessions" => Some(Box::new(sessions::SessionsPlugin::new())),
+        "agents" => Some(Box::new(agents::AgentsPlugin::new())),
         "files" => match &cfg.command {
             Some(command) => Some(Box::new(files::FilesPlugin::new(command.clone()))),
             None => {

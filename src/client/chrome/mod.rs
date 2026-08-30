@@ -557,6 +557,15 @@ impl Chrome {
             .any(|s| s.panels.iter().any(|p| p.plugin.wants_session_tree()))
     }
 
+    /// Whether any configured panel wants the server's agent push. The same
+    /// reconcile as the tree's, on its own flag: the two subscriptions are
+    /// independent and a client may want either alone.
+    pub fn wants_agents(&self) -> bool {
+        self.sidebars
+            .iter()
+            .any(|s| s.panels.iter().any(|p| p.plugin.wants_agents()))
+    }
+
     /// Index of the first visible sidebar on `edge`, if any. Consumed by the
     /// navigation task (Task 7).
     pub fn sidebar_on(&self, edge: SidebarEdge, term_cols: u16, term_rows: u16) -> Option<usize> {

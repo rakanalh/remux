@@ -279,7 +279,9 @@ impl SidebarPlugin for FilesPlugin {
                 self.snapshot = None;
                 self.subscribed_size = None;
             }
-            PluginEvent::SessionTree { .. } | PluginEvent::ConnectionLost { .. } => {}
+            PluginEvent::SessionTree { .. }
+            | PluginEvent::Agents { .. }
+            | PluginEvent::ConnectionLost { .. } => {}
         }
     }
 
