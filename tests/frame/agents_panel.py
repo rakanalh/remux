@@ -64,7 +64,7 @@ NOT_AGENT = AGENT
 CONFIG = """
 [agents]
 commands = ["claude"]
-working_ms = 400
+working_ms = 600
 scan_rows = 12
 
   [[agents.pattern]]
@@ -193,6 +193,12 @@ def run(srv):
     )
     agent_pane = entry["pane_id"]
 
+    # 4. Output flips it to Working. Provoked here rather than relying on the
+    #    agent's start-up output: by the time the entry has been NOTICED that
+    #    output can already be older than the working window, which made this
+    #    check pass or fail on how quickly the pane happened to start.
+    c.drain(0.4)
+    c.send({"Input": {"data": list(b"ping\n")}})
     got = wait_for(
         c,
         lambda ags: any(a["command"] == "claude" and a["state"] == "Working" for a in ags),
@@ -204,7 +210,7 @@ def run(srv):
     )
 
     # 5. Silence decays it.
-    time.sleep(1.2)
+    time.sleep(1.5)
     got = latest(c, 1.2)
     check(
         ("claude", "Idle") in states(got or []),
@@ -231,7 +237,7 @@ def run(srv):
     #    remembered saying it would fail this, and a classifier that re-derives
     #    the state from the screen with no memory at all passes it.
     #
-    #    The silence first is 6x the 400ms working window.
+    #    The silence first is 5x the 600ms working window.
     c.drain(0.5)
     quiet = lists(c.drain(2.5))
     check(
