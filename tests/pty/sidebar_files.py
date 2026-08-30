@@ -208,7 +208,7 @@ def setup_dirs():
         os.makedirs(f"{FIX}/{d}", exist_ok=True)
     with open(f"{FIX}/alpha/inside.txt", "w") as f:
         f.write("x\n")
-    for f_ in ("notes.txt", ".hidden"):
+    for f_ in ("notes.txt", "other.txt", ".hidden"):
         with open(f"{FIX}/{f_}", "w") as f:
             f.write("x\n")
     os.chmod(f"{FIX}/locked", 0o000)
@@ -388,7 +388,8 @@ def scenario():
     rows = entry_rows(screen)
     log("panel:", rows)
     check("1 directories are listed and marked, files are not",
-          rows[:4] == ["alpha/", "beta/", "locked/", "notes.txt"], rows)
+          rows[:5] == ["alpha/", "beta/", "locked/", "notes.txt", "other.txt"],
+          rows)
     check("1 hidden entries are hidden by default",
           all(".hidden" not in r for r in rows), rows)
 
@@ -399,7 +400,8 @@ def scenario():
     keys(child, pump, ".")
     shown = entry_rows(screen)
     check("2 `.` reveals the hidden entries",
-          shown == ["alpha/", "beta/", "locked/", ".hidden", "notes.txt"], shown)
+          shown == ["alpha/", "beta/", "locked/", ".hidden", "notes.txt",
+                    "other.txt"], shown)
     keys(child, pump, ".")
     check("2 and `.` again hides them",
           all(".hidden" not in r for r in entry_rows(screen)), entry_rows(screen))
@@ -444,9 +446,9 @@ def scenario():
 
     # -- 6: THE ONE THAT MATTERS --------------------------------------------
     before = wire.pane_count()
-    keys(child, pump, "G")
-    check("6 the last visible row is the file", entry_rows(screen)[-1] == "notes.txt",
-          entry_rows(screen))
+    keys(child, pump, "G", "k")
+    check("6 the selected row is notes.txt",
+          entry_rows(screen)[-2] == "notes.txt", entry_rows(screen))
     keys(child, pump, "\r", settle=0.5)
     ok = wait_until(pump, lambda: "EDITING" in content(screen))
     after = wire.pane_count()
@@ -475,6 +477,12 @@ def stale_config_scenario():
 
     A fresh CLIENT against the same server -- the sidebar is client-side, so the
     config is re-read on startup with nothing to restart.
+
+    Case 9 therefore opens a DIFFERENT file from case 6, and asserts on the
+    marker that NAMES it. Case 6's editor split is still on screen, and with the
+    fix reverted a plain "EDITING appeared" answered case 9 out of that pane --
+    one of the two assertions went red instead of both. A run less red than
+    expected is the same signal as a probe that prints OK.
     """
     write_config(CFG_STALE)
     wire = Wire(SOCK)
@@ -499,17 +507,19 @@ def stale_config_scenario():
     before = wire.pane_count()
     child.send(b"\x1b2")  # Alt-2: focus the panel
     pump(0.5)
+    # `other.txt`, NOT the `notes.txt` case 6 opened: the marker names the file,
+    # so a pane left over from an earlier case cannot supply this one's evidence.
     keys(child, pump, "G")
     check("9 the last visible row is the file",
-          entry_rows(screen)[-1] == "notes.txt", entry_rows(screen))
+          entry_rows(screen)[-1] == "other.txt", entry_rows(screen))
     keys(child, pump, "\r", settle=0.5)
-    ok = wait_until(pump, lambda: "EDITING" in content(screen))
+    ok = wait_until(pump, lambda: "F=other.txt" in content(screen))
     after = wire.pane_count()
     body = content(screen)
     log(body)
     check("9 the split exists", after == before + 1, (before, after))
     check("9 a stale `command` does NOT become the editor: Enter opened "
-          "$EDITOR on the file", ok and "F=notes.txt" in body, repr(body[-600:]))
+          "$EDITOR on the file", ok and "EDITING" in body, repr(body[-600:]))
     check("9 and the program named by `command` never ran",
           "WRONGEDITOR" not in body, repr(body[-600:]))
 
