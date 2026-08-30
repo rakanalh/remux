@@ -2366,7 +2366,26 @@ async fn run_client_loop(
             "the agent list",
         )
         .await;
+        // How long until some VISIBLE panel wants ticking, computed fresh each
+        // pass. `None` -- no sidebar, none visible, or no panel that polls --
+        // disables the timer branch below entirely, so a client with no such
+        // panel never wakes on a schedule at all.
+        //
+        // Recomputing per pass is only safe because a panel answers from a
+        // stored anchor rather than with a fresh interval: this loop wakes on
+        // every keystroke and every server frame, and a re-armed interval would
+        // be pushed past its deadline for ever by a busy pane. See
+        // `SidebarPlugin::poll_after`.
+        let panel_poll = {
+            let (tc, tr) = renderer.size();
+            chrome.next_poll(tc, tr)
+        };
         tokio::select! {
+            // A sidebar panel's timer. Nothing to do here: the work is
+            // `chrome.pump` at the top of the loop, which this wake-up exists to
+            // reach. Requests it produces are dispatched there, and their
+            // answers repaint through the ordinary server-message arms.
+            _ = tokio::time::sleep(panel_poll.unwrap_or_default()), if panel_poll.is_some() => {}
             // Keyboard events
             event = event_stream.next() => {
                 match event {

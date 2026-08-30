@@ -46,6 +46,8 @@
 //! extraction was made for; the identity here is the entry NAME, which is what
 //! makes a selection survive a file appearing above it.
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
 use super::nav::{self, NavKey, NavList, HEADER_ROWS};
@@ -58,6 +60,48 @@ use crate::protocol::{CellColor, DirEntry, RenderCell};
 
 /// The key that toggles hidden entries.
 const HIDDEN_KEY: char = '.';
+
+/// The key that re-lists the current directory NOW.
+///
+/// It exists even though the panel re-lists on its own, and that is the point:
+/// an automatic refresh that has silently stopped -- a reply lost, a request
+/// that went out during a connection change -- is worse than no automatic
+/// refresh at all, because the panel looks live and is not. A key that always
+/// works is the floor under the timer.
+const REFRESH_KEY: char = 'r';
+
+/// How often a VISIBLE panel re-lists the directory it is showing.
+///
+/// Polling rather than a filesystem watcher (`notify` is already a dependency,
+/// so the watcher was available). Three reasons, in order of weight:
+///
+/// * **The directory is on the SERVER, and routinely on a remote.** The listing
+///   already goes over the wire, so a poll is one more message on a path that
+///   works everywhere; a watcher would have to be a server-side subscription
+///   with its own protocol messages, its own lifetime, and its own teardown on
+///   disconnect.
+/// * **A watcher's lifetime follows the user's navigation.** `h`/`l` change the
+///   watched directory on every keystroke, and every one of those is a watch to
+///   register and an old one to drop -- on a remote, asynchronously. A leaked
+///   watch is a file descriptor and an inotify slot per directory ever visited.
+/// * **Polling stops when the panel does.** `poll_after` is asked only of placed
+///   panels, so a hidden sidebar costs exactly nothing, with no state to unwind.
+///
+/// What polling costs, honestly: up to one `read_dir` every two seconds per
+/// visible panel, and a change can take that long to appear. For a sidebar
+/// watching a directory a build writes into, two seconds is not noticeable; for
+/// a directory with a hundred thousand entries it is a real cost, which is what
+/// the server's entry cap bounds.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a request may be outstanding before the panel gives up on it and
+/// asks again.
+///
+/// Without this the panel polls only when nothing is in flight -- which is
+/// right, or a 200ms-RTT remote would stack requests -- and then one lost reply
+/// stops the refresh FOR EVER, leaving a panel that looks live and is frozen.
+/// Long enough that a slow remote is never mistaken for a lost reply.
+const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct FilesPlugin {
     /// The editor override from `[[sidebar.panel]]`'s `editor`, or `None` to let
@@ -102,6 +146,14 @@ pub struct FilesPlugin {
     /// pre-seeded row because a row would be PAINTED -- a fabricated entry sitting
     /// in a directory whose real contents have not arrived yet.
     pending_select: Option<String>,
+    /// When the most recent `ListDirectory` went out, which is what the refresh
+    /// deadline is measured from.
+    ///
+    /// An ANCHOR, not an interval: `poll_after` is asked on every pass of the
+    /// client's event loop -- so on every keystroke and every frame -- and a
+    /// panel that answered "two seconds from now" each time would have its
+    /// deadline pushed back for ever by a busy pane.
+    last_request: Option<Instant>,
     nav: NavList,
     requests: Vec<PluginRequest>,
 }
@@ -120,6 +172,7 @@ impl FilesPlugin {
             show_hidden: false,
             pending: None,
             pending_select: None,
+            last_request: None,
             nav: NavList::new(),
             requests: Vec::new(),
         }
@@ -168,8 +221,55 @@ impl FilesPlugin {
         // resolve the destination itself, from `foreground()`, which moves
         // before `FocusedCwd` does.
         self.pending = Some((conn.clone(), path.clone()));
+        self.last_request = Some(Instant::now());
         self.requests
             .push(PluginRequest::ListDirectory { conn, path });
+    }
+
+    /// Ask for the CURRENT directory again, keeping everything on screen.
+    ///
+    /// Deliberately not `open_dir(self.cwd)`: that one drops the entries, the
+    /// selection and the scroll position, which is right when the user asked to
+    /// go somewhere else and catastrophic on a two-second timer -- the panel
+    /// would blink empty and lose the cursor twice a minute. The old rows stay
+    /// up until the new ones arrive, and `rebuild` re-points the selection by
+    /// entry NAME, so a file appearing above the cursor does not move it.
+    ///
+    /// Safe to call with a request already in flight: `pending` is overwritten
+    /// with the same `(conn, path)` it already held, so the reply is still
+    /// claimed. The timer avoids doing so anyway (see [`Self::refresh_due`]);
+    /// the manual key does not, because "refresh now" must mean now.
+    fn refresh(&mut self) {
+        let (Some(conn), Some(path)) = (self.conn.clone(), self.cwd.clone()) else {
+            return;
+        };
+        self.pending = Some((conn.clone(), path.clone()));
+        self.last_request = Some(Instant::now());
+        self.requests
+            .push(PluginRequest::ListDirectory { conn, path });
+    }
+
+    /// How long until the automatic re-list is due, `Some(ZERO)` if it is due
+    /// now, or `None` if this panel does not want one.
+    ///
+    /// `None` before the panel has a directory: there is nothing to re-list, and
+    /// a panel waiting for its first `FocusedCwd` must not arm the client's
+    /// timer to discover that twice a second.
+    ///
+    /// While a request is in flight the deadline is [`PENDING_TIMEOUT`] rather
+    /// than [`REFRESH_INTERVAL`] -- so a slow remote is waited for instead of
+    /// being piled on, but a reply that never comes cannot freeze the panel for
+    /// the rest of the session.
+    fn refresh_due(&self) -> Option<Duration> {
+        self.cwd.as_ref()?;
+        self.conn.as_ref()?;
+        let sent = self.last_request?;
+        let deadline = if self.pending.is_some() {
+            PENDING_TIMEOUT
+        } else {
+            REFRESH_INTERVAL
+        };
+        Some(deadline.saturating_sub(sent.elapsed()))
     }
 
     /// The absolute path of `name` inside the current directory.
@@ -411,6 +511,10 @@ impl SidebarPlugin for FilesPlugin {
                     PluginAction::None
                 };
             }
+            KeyCode::Char(REFRESH_KEY) => {
+                self.refresh();
+                return PluginAction::Redraw;
+            }
             KeyCode::Char(HIDDEN_KEY) => {
                 self.show_hidden = !self.show_hidden;
                 // Through `rebuild`, so the selection stays on the entry it was
@@ -500,12 +604,25 @@ impl SidebarPlugin for FilesPlugin {
                     self.error = None;
                     self.truncated = false;
                     self.pending = None;
+                    self.last_request = None;
                     self.nav.set_selected(0);
                 }
             }
             // The session tree is the sessions panel's and the agent list the
             // agents panel's.
             PluginEvent::SessionTree { .. } | PluginEvent::Agents { .. } => {}
+        }
+    }
+
+    fn poll_after(&self) -> Option<Duration> {
+        self.refresh_due()
+    }
+
+    fn tick(&mut self) {
+        // Every placed panel is ticked whenever ANY panel's timer fires, so
+        // check our own deadline rather than assume it is ours.
+        if self.refresh_due().is_some_and(|d| d.is_zero()) {
+            self.refresh();
         }
     }
 
@@ -603,6 +720,133 @@ mod tests {
             editor: editor.map(str::to_string),
             command: command.map(str::to_string),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // the automatic refresh
+    // -----------------------------------------------------------------
+
+    /// A panel with nothing to list must not arm the client's timer.
+    #[test]
+    fn a_panel_with_no_directory_asks_for_no_tick() {
+        let p = FilesPlugin::new(None);
+        assert_eq!(p.poll_after(), None);
+    }
+
+    #[test]
+    fn a_panel_showing_a_directory_asks_to_be_ticked() {
+        let mut p = at("/w", vec![entry("a", false)]);
+        let d = p.poll_after().expect("a panel with a listing must poll");
+        assert!(
+            d <= REFRESH_INTERVAL && !d.is_zero(),
+            "the deadline must count DOWN from the last request, not restart: {d:?}"
+        );
+        // Asked again immediately, the answer must be no larger -- an anchor,
+        // not a fresh interval. A panel that re-armed here would be pushed past
+        // its deadline for ever by a busy pane.
+        let again = p.poll_after().expect("still polling");
+        assert!(
+            again <= d,
+            "the deadline moved forwards: {d:?} then {again:?}"
+        );
+        // Not yet due, so a tick must ask for nothing.
+        p.tick();
+        assert_eq!(p.take_requests(), vec![], "the panel re-listed early");
+    }
+
+    /// The refresh keeps the rows and the cursor. Losing either twice a minute
+    /// is worse than not refreshing at all.
+    #[test]
+    fn a_refresh_keeps_the_rows_and_the_selection_until_the_answer_arrives() {
+        let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
+        p.on_key(key(KeyCode::Char('j')));
+        assert_eq!(painted(&p, 20, 5)[2], "b");
+
+        p.on_key(key(KeyCode::Char(REFRESH_KEY)));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/w".to_string()
+            }]
+        );
+        let rows = painted(&p, 20, 5);
+        assert_eq!(
+            (rows[1].as_str(), rows[2].as_str()),
+            ("a", "b"),
+            "the panel blanked while waiting for the refresh: {rows:?}"
+        );
+
+        // A file appears ABOVE the selection: the cursor stays on `b`.
+        p.on_event(&listing(
+            ConnId::Local,
+            "/w",
+            vec![entry("a", false), entry("aa", false), entry("b", false)],
+        ));
+        let rows = painted(&p, 20, 6);
+        assert_eq!(rows[1..4], ["a", "aa", "b"], "{rows:?}");
+        p.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
+                path: "/w/b".to_string(),
+                command: None,
+                vertical: true,
+            }],
+            "the refresh moved the selection off the entry the user was on"
+        );
+    }
+
+    /// The manual key works with a request already outstanding -- "refresh now"
+    /// has to mean now, and it is the floor under a timer that has stopped.
+    #[test]
+    fn the_refresh_key_works_even_with_a_request_in_flight() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests(); // the initial listing, still unanswered
+        p.on_key(key(KeyCode::Char(REFRESH_KEY)));
+        assert_eq!(
+            p.take_requests(),
+            vec![PluginRequest::ListDirectory {
+                conn: ConnId::Local,
+                path: "/w".to_string()
+            }]
+        );
+    }
+
+    /// While a request is outstanding the deadline is the LOST-REPLY timeout,
+    /// not the refresh interval: a slow remote is waited for rather than piled
+    /// on, and a reply that never comes still cannot freeze the panel.
+    #[test]
+    fn an_outstanding_request_is_waited_for_but_not_for_ever() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/w"));
+        p.take_requests();
+        let d = p
+            .poll_after()
+            .expect("a panel awaiting a listing still polls");
+        assert!(
+            d > REFRESH_INTERVAL,
+            "a request in flight must not be re-sent on the refresh interval: {d:?}"
+        );
+        assert!(d <= PENDING_TIMEOUT, "{d:?}");
+    }
+
+    /// A connection going away takes the anchor with it, so a panel that has
+    /// nothing to list stops arming the timer.
+    #[test]
+    fn a_lost_connection_stops_the_polling() {
+        let mut p = at("/w", vec![entry("a", false)]);
+        assert!(p.poll_after().is_some());
+        p.on_event(&PluginEvent::ConnectionLost {
+            conn: ConnId::Local,
+        });
+        assert_eq!(
+            p.poll_after(),
+            None,
+            "the panel kept polling for a machine it is no longer talking to"
+        );
     }
 
     #[test]

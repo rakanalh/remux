@@ -26,6 +26,11 @@ What it covers:
      pass on a split running a plain shell
   7  and the keyboard has left the sidebar -- typing reaches the editor, which
      an Enter that opened a pane nobody could type into would fail
+ 10  a file created BEHIND the panel's back appears without any keystroke, and
+     one removed disappears -- the automatic refresh
+ 11  `r` re-lists on demand, which is the floor under a timer that has stopped
+ 12  neither of them moves the cursor: a file appearing above the selection
+     leaves Enter opening the same file it would have before
   8  a config still saying `plugin = "browser"` LOADS this panel, rather than
      falling through the unknown-plugin rule and silently vanishing
   9  the reported bug: a config still carrying `command = <a file manager>` does
@@ -61,6 +66,9 @@ SOCK = f"{RUN}/run/remux.sock"
 VERBOSE = "-v" in sys.argv
 
 COLS, ROWS = 100, 30
+# Long enough for the panel's 2s poll plus a round trip, short enough that a
+# panel which never re-lists fails rather than hangs.
+REFRESH_WINDOW = 8.0
 SIDEBAR_W = 30
 FRAME = 1  # the sidebar's border is drawn INSIDE the bar
 
@@ -463,6 +471,60 @@ def scenario():
     ok = wait_until(pump, lambda: "GOT[zz]" in content(screen))
     check("7 the keyboard left the sidebar: typing reaches the editor",
           ok, repr(content(screen)[-600:]))
+
+    # -- 10/11/12: the refresh ----------------------------------------------
+    #
+    # Back into the panel. The file is created by THIS PROCESS, not through
+    # anything Remux can see -- which is the point: nothing tells the panel, so
+    # only a re-list can put it on screen.
+    child.send(b"\x1b2")
+    pump(0.5)
+    # Case 6 opened a FILE, so the panel never left the fixture directory.
+    # Asserted rather than assumed: an `h` "to be safe" here walked up to the
+    # run directory, and the "a removed file disappears" check below then passed
+    # on a file that had never been listed at all. A pass that costs nothing to
+    # obtain is not a pass.
+    check("10 the panel is still in the fixture directory",
+          wait_until(pump, lambda: header(screen).endswith("fixture")),
+          header(screen))
+    keys(child, pump, "g")          # cursor on the first entry, `alpha/`
+
+    with open(f"{FIX}/zzz-appeared.txt", "w") as f:
+        f.write("x\n")
+    ok = wait_until(pump, lambda: "zzz-appeared.txt" in entry_rows(screen),
+                    timeout=REFRESH_WINDOW)
+    check("10 a file created behind the panel's back appears with no keystroke",
+          ok, entry_rows(screen))
+
+    # And the cursor did not move with it. `alpha/` sorts first, so the new file
+    # landed BELOW -- but `g` put the cursor on a row that a re-list rebuilds,
+    # and an index-based reselect would have been enough to break case 12 the
+    # other way. Enter is what proves where the cursor actually is.
+    keys(child, pump, "\r")
+    ok = wait_until(pump, lambda: header(screen).endswith("/alpha"))
+    check("12 the refresh left the cursor on the entry it was on",
+          ok, (header(screen), entry_rows(screen)))
+    keys(child, pump, "h")
+    wait_until(pump, lambda: header(screen).endswith("fixture"))
+
+    os.remove(f"{FIX}/zzz-appeared.txt")
+    ok = wait_until(pump, lambda: "zzz-appeared.txt" not in entry_rows(screen),
+                    timeout=REFRESH_WINDOW)
+    check("10 and a file removed behind its back disappears",
+          ok, entry_rows(screen))
+
+    # 11: the manual key. Proved by making the automatic one useless -- a file
+    # created and then looked for INSIDE one keystroke, faster than the timer
+    # could have produced it on its own.
+    with open(f"{FIX}/zzz-manual.txt", "w") as f:
+        f.write("x\n")
+    keys(child, pump, "r", settle=0.0)
+    ok = wait_until(pump, lambda: "zzz-manual.txt" in entry_rows(screen),
+                    timeout=1.5)
+    check("11 `r` re-lists on demand", ok, entry_rows(screen))
+    os.remove(f"{FIX}/zzz-manual.txt")
+    wait_until(pump, lambda: "zzz-manual.txt" not in entry_rows(screen),
+               timeout=REFRESH_WINDOW)
 
     check("client still alive", child.isalive())
     try:

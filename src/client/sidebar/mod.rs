@@ -5,6 +5,8 @@
 //! written INTO the renderer's front buffer rather than painted over it. See
 //! the design doc, section 6.
 
+use std::time::Duration;
+
 use crossterm::event::{KeyEvent, MouseEventKind};
 use unicode_width::UnicodeWidthChar;
 
@@ -200,6 +202,35 @@ pub trait SidebarPlugin: Send {
     /// never been laid out never starts anything -- and a hidden sidebar stops
     /// the calls, which is what makes a hidden panel free.
     fn on_size(&mut self, _cols: u16, _rows: u16) {}
+
+    /// How long until this panel wants [`SidebarPlugin::tick`] called, or
+    /// `None` if it never does. The default is `None`: a panel is event-driven
+    /// unless it says otherwise.
+    ///
+    /// The client arms ONE timer, for the soonest answer across the panels the
+    /// chrome actually PLACED -- so a panel in a hidden sidebar is not asked,
+    /// and a client whose panels all answer `None` arms no timer at all. That is
+    /// what makes "it costs nothing when the sidebar is closed" true rather than
+    /// merely cheap.
+    ///
+    /// It must be computed from an ANCHOR the panel stores (a `last_*: Instant`)
+    /// rather than returned as a fresh interval each call. The client recomputes
+    /// this on every pass through its event loop, and a pass happens on every
+    /// keystroke and every frame from the server; a panel answering "two seconds
+    /// from now" each time would have its deadline pushed back by a busy pane
+    /// and never fire.
+    fn poll_after(&self) -> Option<Duration> {
+        None
+    }
+
+    /// The deadline from [`SidebarPlugin::poll_after`] has passed.
+    ///
+    /// Called on the same pass as [`SidebarPlugin::on_size`], for the same
+    /// panels -- the ones the chrome placed -- and before
+    /// [`SidebarPlugin::take_requests`] drains whatever it produced. A panel is
+    /// called whenever ANY panel's timer fires, not only its own, so it must
+    /// check its own deadline rather than assume it is due.
+    fn tick(&mut self) {}
 
     /// Hand over anything the plugin needs the client to do. Drained once per
     /// pass; a plugin that wants nothing returns an empty vec (the default).

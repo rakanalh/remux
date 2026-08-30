@@ -7,6 +7,8 @@
 pub mod frame;
 pub mod geometry;
 
+use std::time::Duration;
+
 use anyhow::Result;
 
 // `MIN_CONTENT_COLS`/`MIN_CONTENT_ROWS` are deliberately NOT re-exported: this
@@ -505,9 +507,13 @@ impl Chrome {
     /// a request a panel was holding when a resize hid it is not stranded.
     pub fn pump(&mut self, term_cols: u16, term_rows: u16) -> Vec<(usize, usize, PluginRequest)> {
         for (si, pi, r) in self.panel_rects(term_cols, term_rows) {
-            self.sidebars[si].panels[pi]
-                .plugin
-                .on_size(r.width, r.height);
+            let plugin = &mut self.sidebars[si].panels[pi].plugin;
+            plugin.on_size(r.width, r.height);
+            // Only PLACED panels are ticked, which is the same rule `on_size`
+            // follows and the reason a hidden sidebar costs nothing. A panel is
+            // ticked whenever any panel's timer fires, so it checks its own
+            // deadline; see `SidebarPlugin::tick`.
+            plugin.tick();
         }
         let mut out = Vec::new();
         for (si, s) in self.sidebars.iter_mut().enumerate() {
@@ -531,6 +537,21 @@ impl Chrome {
                 p.plugin.on_event(ev);
             }
         }
+    }
+
+    /// How long until some PLACED panel wants ticking, or `None` if none does.
+    ///
+    /// The soonest across the panels this size actually places, so the client
+    /// arms one timer for all of them -- and none at all when every panel is
+    /// hidden or event-driven. Deliberately NOT the `wants_*` treatment, which
+    /// ignores visibility: a standing subscription costs nothing between pushes,
+    /// whereas a timer wakes the event loop on a schedule whether or not anyone
+    /// can see the result.
+    pub fn next_poll(&self, term_cols: u16, term_rows: u16) -> Option<Duration> {
+        self.panel_rects(term_cols, term_rows)
+            .into_iter()
+            .filter_map(|(si, pi, _)| self.sidebars[si].panels[pi].plugin.poll_after())
+            .min()
     }
 
     /// Whether any configured panel wants the session-tree push.
@@ -1117,6 +1138,57 @@ mod focus_tests {
                 weight: 1,
             }],
         }])
+    }
+
+    /// A `files` panel that already has a directory, so it wants ticking.
+    /// `placeholder` never does, which is what makes it useless here.
+    fn chrome_with_a_polling_panel() -> Chrome {
+        let mut c = Chrome::from_config(&[SidebarConfig {
+            edge: SidebarEdge::Left,
+            size: 30,
+            visible: true,
+            panel: vec![PanelConfig {
+                editor: None,
+                command: None,
+                plugin: "files".into(),
+                weight: 1,
+            }],
+        }]);
+        c.broadcast(&PluginEvent::FocusedCwd {
+            conn: crate::client::registry::ConnId::Local,
+            cwd: Some("/w".into()),
+        });
+        c
+    }
+
+    #[test]
+    fn a_polling_panel_arms_the_timer_and_a_hidden_one_does_not() {
+        let mut c = chrome_with_a_polling_panel();
+        assert!(
+            c.next_poll(100, 30).is_some(),
+            "a visible panel that polls must arm the client's timer"
+        );
+        c.sidebars[0].visible = false;
+        assert_eq!(
+            c.next_poll(100, 30),
+            None,
+            "a hidden sidebar still woke the client's event loop on a timer"
+        );
+    }
+
+    /// The same rule as `on_size`: a terminal too small to place the panel
+    /// places nothing, so there is nothing to tick.
+    #[test]
+    fn a_terminal_too_small_to_place_the_panel_arms_no_timer() {
+        let c = chrome_with_a_polling_panel();
+        assert_eq!(c.next_poll(10, 3), None);
+    }
+
+    /// A panel with no plugin that polls must not arm it either.
+    #[test]
+    fn a_sidebar_of_event_driven_panels_arms_no_timer() {
+        let c = chrome_with(SidebarEdge::Left, 30);
+        assert_eq!(c.next_poll(100, 30), None);
     }
 
     fn chrome_with_panels(edge: SidebarEdge, size: u16, n: usize) -> Chrome {

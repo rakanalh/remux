@@ -605,9 +605,18 @@
 #
 #                 `j`/`k` (or the arrows) move, `g`/`G` jump to the ends, `l` or
 #                 Right descends into the selected directory, `h` or Left goes
-#                 up a level, and `.` toggles hidden entries. `h` then `l` is a
-#                 round trip: going up lands the selection on the directory you
-#                 just left.
+#                 up a level, `.` toggles hidden entries, and `r` re-lists now.
+#                 `h` then `l` is a round trip: going up lands the selection on
+#                 the directory you just left.
+#
+#                 IT RE-LISTS BY ITSELF, about every two seconds, so files
+#                 created or deleted by something else appear and disappear
+#                 without a keystroke. Only while the panel is on screen — a
+#                 hidden or closed sidebar polls nothing at all. The cursor
+#                 stays on the entry it was on, by NAME, so a file appearing
+#                 above it does not slide your selection onto something else.
+#                 `r` is there because an automatic refresh that has quietly
+#                 stopped is worse than none: it always works.
 #
 #                 ENTER ON A FILE OPENS IT IN A SPLIT, running an editor, and
 #                 the keyboard leaves the sidebar with it — you asked for the
