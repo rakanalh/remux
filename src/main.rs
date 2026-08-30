@@ -2170,9 +2170,6 @@ async fn run_client_loop(
     // so the head of this queue for the answering connection is the requester.
     let mut aux_pending: std::collections::VecDeque<(ConnId, (usize, usize))> =
         std::collections::VecDeque::new();
-    // The last directory broadcast as `FocusedCwd`, so an unchanged tree push
-    // does not re-announce it.
-    let mut focused_cwd: Option<String> = None;
 
     loop {
         // Lay the panels out and act on what they ask for, before anything can
@@ -5531,17 +5528,23 @@ async fn run_client_loop(
                             // The focused pane's directory, resolved HERE rather
                             // than in a panel: it takes knowing which connection
                             // is in the foreground, which is the client's
-                            // knowledge. Only re-announced when it changes, so a
-                            // panel following it does not restart its program on
-                            // every unrelated tree push.
+                            // knowledge.
+                            //
+                            // Announced on every foreground tree, unchanged or
+                            // not. Filtering here as well would put the "has the
+                            // directory changed?" decision in two places, and the
+                            // panel's is the one that counts -- it compares
+                            // against what it actually SPAWNED, which is not
+                            // always the last thing announced. A dedup here also
+                            // silently defeated the end-to-end test of the
+                            // panel's own: no event, no respawn, whatever the
+                            // panel decided.
                             if mgr.is_foreground(&src) {
-                                let cwd = focused_pane_cwd(&folders, &unfiled);
-                                if cwd != focused_cwd {
-                                    focused_cwd = cwd.clone();
-                                    chrome.broadcast(
-                                        &crate::client::sidebar::PluginEvent::FocusedCwd { cwd },
-                                    );
-                                }
+                                chrome.broadcast(
+                                    &crate::client::sidebar::PluginEvent::FocusedCwd {
+                                        cwd: focused_pane_cwd(&folders, &unfiled),
+                                    },
+                                );
                             }
                             // Repaint the panels. Over a live view `paint_view`
                             // ends with `chrome.paint`, so it is the one that
