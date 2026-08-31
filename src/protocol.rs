@@ -659,11 +659,13 @@ pub enum ServerMessage {
         agents: Vec<AgentEntry>,
         /// Whether this server can detect agents AT ALL.
         ///
-        /// Detection reads the PTY's foreground process group out of `/proc`,
-        /// so a non-Linux server can never list anything. Without this the
-        /// panel would render an empty list there -- indistinguishable from
-        /// "you have no agents running", and exactly the sort of thing that
-        /// gets reported as a bug. The panel says so instead.
+        /// Detection reads the PTY's foreground process group and then asks the
+        /// OS to name that process -- `/proc/<pid>/comm` on Linux, `sysinfo` on
+        /// macOS. Both work; a server on anything else falls back to `"shell"`
+        /// for every pid and so can never match a configured agent command.
+        /// Without this the panel would render an empty list there --
+        /// indistinguishable from "you have no agents running", and exactly the
+        /// sort of thing that gets reported as a bug. The panel says so instead.
         ///
         /// It belongs on the wire rather than being a `cfg!` in the client:
         /// a macOS client attached to a Linux server detects fine, and it is
