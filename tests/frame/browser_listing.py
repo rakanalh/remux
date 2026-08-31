@@ -25,6 +25,9 @@ What it covers:
   8  with neither, it falls back to `vi` -- checked by the argv the server logs,
      since `vi` may not be installed and its behaviour is not ours to depend on
   9  `OpenInSplit` from a client with no attached session is ignored, not fatal
+ 10  every listing carries the SERVER's own `$HOME`, which is what lets the panel
+     header render `~/Work` rather than the full path -- and it is the server's,
+     not the harness's, so a client-side substitution could not fake it
 
 Run from the repo root:
     python3 tests/frame/browser_listing.py [-v]
@@ -39,6 +42,12 @@ from harness import BIN, Client, Server, name_of, only  # noqa: E402
 RUN = "/tmp/rmxbrowse"
 FIX = f"{RUN}/fixture"
 BIGDIR = f"{RUN}/big"
+# The listing server's `$HOME`, which it reports on every listing so the panel
+# can render `~`. Deliberately NOT this process's home: the assertion has to be
+# about the server's answer, and one that could be satisfied by the harness's own
+# environment would pass on a client-side substitution -- the exact mistake the
+# field exists to prevent.
+FAKE_HOME = f"{RUN}/home"
 VERBOSE = "-v" in sys.argv
 FAILURES = []
 
@@ -71,7 +80,7 @@ def check(name, cond, detail=""):
 def build_fixture():
     """A tree with the orderings and the special cases the assertions need."""
     for d in ("bin", "fixture", "fixture/zeta", "fixture/Alpha", "fixture/real",
-              "outside"):
+              "outside", "home"):
         os.makedirs(f"{RUN}/{d}", exist_ok=True)
     for f in ("Beta.txt", "apple.txt", ".hidden"):
         with open(f"{FIX}/{f}", "w") as fh:
@@ -215,6 +224,23 @@ def listing_cases(srv):
     check("5 a directory over the cap is truncated AND says so",
           capped["truncated"] is True and len(capped["entries"]) == 5000,
           {"truncated": capped["truncated"], "n": len(capped["entries"])})
+
+    # 10: `home` is what lets the panel header say `~/fixture`. It rides on the
+    # listing because the directory is on the SERVER -- routinely a remote with a
+    # different username, and on macOS a different layout entirely. `.get`, not
+    # `[...]`, so a server that never sends the field FAILS this check instead of
+    # raising and taking the rest of the run with it.
+    check("10 the listing carries the SERVER's own home directory",
+          got.get("home") == FAKE_HOME, {"home": got.get("home"),
+                                         "expected": FAKE_HOME})
+    check("10 and it is not this process's home, so a client-side $HOME "
+          "could not have produced it",
+          got.get("home") != os.environ.get("HOME"),
+          {"home": got.get("home"), "harness HOME": os.environ.get("HOME")})
+    # Every listing carries it, including one that failed: the panel keeps its
+    # header up while it reports the error.
+    check("10 a failed listing carries it too",
+          gone.get("home") == FAKE_HOME, gone.get("home"))
     c.close()
 
 
@@ -277,8 +303,18 @@ def fallback_and_no_session_case(srv):
 def scenario():
     build_fixture()
 
+    # The server gets the fixture home; this process keeps its own. The variable
+    # is restored the instant the server is up -- it was already spawned with the
+    # value, so from here on the two sides genuinely disagree and case 10 can
+    # tell which one answered.
+    real_home = os.environ.get("HOME")
+    os.environ["HOME"] = FAKE_HOME
     srv = Server(f"{RUN}/srv")
     srv.start()
+    if real_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = real_home
     try:
         listing_cases(srv)
         configured_editor_case(srv)

@@ -5742,7 +5742,7 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::DirectoryListing { path, entries, error, truncated }) => {
+                    Some(ServerMessage::DirectoryListing { path, entries, error, truncated, home }) => {
                         log::debug!(
                             "srv: DirectoryListing src={:?} path={:?} entries={} error={:?} truncated={}",
                             src, path, entries.len(), error, truncated
@@ -5758,6 +5758,7 @@ async fn run_client_loop(
                             entries,
                             error,
                             truncated,
+                            home,
                         });
                         // Repainted exactly as the agent-list and session-tree
                         // arms do: over a live view `paint_view` ends with

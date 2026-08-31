@@ -108,6 +108,11 @@ pub enum PluginEvent {
         error: Option<String>,
         /// Whether the server hit its entry cap, so this listing is incomplete.
         truncated: bool,
+        /// `conn`'s OWN home directory, or `None` from a server too old to send
+        /// one. Carried on the listing rather than kept per-connection so that a
+        /// panel can never pair one machine's home with another machine's path
+        /// -- see [`crate::protocol::ServerMessage::DirectoryListing`].
+        home: Option<String>,
     },
 }
 
@@ -417,6 +422,48 @@ pub fn draw_text(
 ///
 /// Used by the `files` panel's header, and kept general for anything else whose
 /// header is a directory.
+/// Replace a leading home directory with `~`.
+///
+/// Applied BEFORE [`shorten_path`], which is the whole point: `~` buys back
+/// enough columns that the part of the path identifying where you are survives
+/// a narrow panel instead of being truncated away.
+///
+/// `home` is the home of the machine `path` is ON, which for this panel means
+/// the one that arrived with the listing. A client-side `$HOME` would be a
+/// different machine's answer on every remote.
+///
+/// The match is on a whole path COMPONENT, never a text prefix: with a home of
+/// `/home/rakan`, the path `/home/rakanalh` is a different user's directory and
+/// must come back untouched. A bare `strip_prefix` renders it `~alh`, which
+/// names nothing.
+pub fn tilde_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    // A trailing slash is a legal spelling of the same directory (`HOME=/home/me/`),
+    // and keeping it would make the separator check below look for `//`.
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        // `HOME=/`. Everything is under it, so `~` would replace the leading
+        // slash of every path on the machine -- a shortening that hides which
+        // directory is meant. Left alone.
+        return path.to_string();
+    }
+    // The path's own trailing slash is dropped for the comparison only, so
+    // `/home/me/` is recognised as the home itself rather than as something one
+    // level below it.
+    let trimmed = path.trim_end_matches('/');
+    if trimmed == home {
+        return "~".to_string();
+    }
+    match trimmed.strip_prefix(home) {
+        // The separator is REQUIRED: this is what makes `/home/rakanalh` a
+        // non-match rather than `~alh`.
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 pub fn shorten_path(path: &str, width: usize) -> String {
     let chars: Vec<char> = path.chars().collect();
     if chars.len() <= width || width == 0 {
@@ -427,4 +474,61 @@ pub fn shorten_path(path: &str, width: usize) -> String {
     }
     let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
     format!("\u{2026}{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The substitution the `files` panel header asks for, and the one shape it
+    /// must refuse.
+    #[test]
+    fn tilde_path_replaces_a_whole_home_and_nothing_less() {
+        assert_eq!(tilde_path("/home/rakan", Some("/home/rakan")), "~");
+        assert_eq!(
+            tilde_path("/home/rakan/Work/x", Some("/home/rakan")),
+            "~/Work/x"
+        );
+        // The bug a bare `strip_prefix` ships: a DIFFERENT user whose name
+        // starts with this one's. `~alh` is not a path anybody has.
+        assert_eq!(
+            tilde_path("/home/rakanalh", Some("/home/rakan")),
+            "/home/rakanalh"
+        );
+        assert_eq!(
+            tilde_path("/home/rakanalh/x", Some("/home/rakan")),
+            "/home/rakanalh/x"
+        );
+        // Nothing to do with home at all.
+        assert_eq!(tilde_path("/srv/app", Some("/home/rakan")), "/srv/app");
+        // A server too old to send one, or one that could not resolve it: the
+        // full path, which is what the panel showed before `~` existed.
+        assert_eq!(tilde_path("/home/rakan/x", None), "/home/rakan/x");
+        // Spellings of the same directory.
+        assert_eq!(tilde_path("/home/rakan/", Some("/home/rakan")), "~");
+        assert_eq!(tilde_path("/home/rakan", Some("/home/rakan/")), "~");
+        assert_eq!(tilde_path("/home/rakan/x", Some("/home/rakan/")), "~/x");
+        // `HOME=/` is left alone: `~` for every path on the machine shortens
+        // nothing and hides which directory is meant.
+        assert_eq!(tilde_path("/srv/app", Some("/")), "/srv/app");
+        assert_eq!(tilde_path("/", Some("/")), "/");
+        // A macOS server, whose layout the client may not share at all.
+        assert_eq!(tilde_path("/Users/me/src", Some("/Users/me")), "~/src");
+    }
+
+    /// Substituting FIRST is the entire user-visible point: the same panel width
+    /// that could only show the tail of the absolute path shows the whole
+    /// shortened one.
+    #[test]
+    fn the_tilde_is_what_makes_the_path_fit() {
+        let path = "/home/rakan/Work/Personal/Remux";
+        let width = 22;
+        let absolute = shorten_path(path, width);
+        assert!(
+            absolute.starts_with('\u{2026}'),
+            "the absolute path does not fit this panel: {absolute}"
+        );
+        let short = shorten_path(&tilde_path(path, Some("/home/rakan")), width);
+        assert_eq!(short, "~/Work/Personal/Remux");
+    }
 }

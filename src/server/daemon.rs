@@ -1533,6 +1533,12 @@ entries={} error={:?} truncated={}",
                     entries: listing.entries,
                     error: listing.error,
                     truncated: listing.truncated,
+                    // THIS machine's home, sent with the path it might shorten.
+                    // A getenv, so it stays out of the `spawn_blocking` above --
+                    // and it is re-read per listing on purpose: a server whose
+                    // `$HOME` changed under it should not keep answering with
+                    // the old one for the life of the daemon.
+                    home: browse::home_dir(),
                 });
             }
             Ok(())

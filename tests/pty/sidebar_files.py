@@ -14,6 +14,10 @@ the listing and the editor resolution.)
 What it covers:
 
   0  the panel headers itself with the directory the FOCUSED PANE is in
+ 13  and it shortens that directory to `~/fixture` when it is under the home the
+     SERVER reported, `~` when it IS that home -- and leaves a sibling whose
+     path merely STARTS with the home's text alone (`/home/rakanalh`, the bug a
+     `strip_prefix` ships)
   1  entries render, directories are marked, hidden ones are absent
   2  `.` reveals the hidden entry and hides it again
   3  `j` moves the selection -- proved by where Enter LANDS, not by reading a
@@ -61,7 +65,16 @@ import pyte
 
 BIN = os.path.abspath("target/debug/remux")
 RUN = "/tmp/rmx-sbb"
-FIX = f"{RUN}/fixture"
+# The SERVER's `$HOME` for this run, and the fixture sits inside it -- which is
+# what lets the header be `~/fixture` and not the absolute path. Not the real
+# home: the substitution must be the server's answer, and a fixture under the
+# user's own home would pass equally on a client-side `$HOME`.
+HOME = f"{RUN}/home"
+# The trap. Its path starts with HOME as TEXT and is a different directory --
+# the `/home/rakanalh` shape. A `strip_prefix` with no separator check renders it
+# `~work`, which names nothing.
+NOT_HOME = f"{RUN}/homework"
+FIX = f"{HOME}/fixture"
 SOCK = f"{RUN}/run/remux.sock"
 VERBOSE = "-v" in sys.argv
 
@@ -164,6 +177,11 @@ def base_env():
         "TERM": "xterm-256color",
         "PS1": "$ ",
         "REMUX_ALLOW_NESTED": "1",
+        # The server reports this on every listing; the panel renders `~` from
+        # it. Set for both sides because the XDG dirs above are explicit, so
+        # nothing else here reads it -- and pinning it keeps the run independent
+        # of whose machine it is on.
+        "HOME": HOME,
     }
 
 
@@ -203,7 +221,7 @@ def setup_dirs():
     except Exception:
         pass
     shutil.rmtree(RUN, ignore_errors=True)
-    for s in ("run", "state", "data", "bin", "cfg"):
+    for s in ("run", "state", "data", "bin", "cfg", "home", "homework"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     os.makedirs(f"{RUN}/cfg/remux", exist_ok=True)
     write_config(CFG)
@@ -382,6 +400,25 @@ def keys(child, pump, *seq, settle=0.35):
         pump(settle)
 
 
+def descend(child, pump, screen, name):
+    """Select the entry called `name` and press Enter.
+
+    By reading where the row IS rather than by counting `j`s from a listing
+    assumed in advance: the directories this walks through are the harness's own
+    XDG dirs, and a hard-coded index would silently descend into the wrong one
+    the day another is added. Returns False if the row is not on screen, so the
+    caller's check fails rather than the run hanging somewhere else.
+    """
+    rows = [r.rstrip("/") for r in entry_rows(screen)]
+    if name not in rows:
+        return False
+    keys(child, pump, "g")
+    for _ in range(rows.index(name)):
+        keys(child, pump, "j")
+    keys(child, pump, "\r")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # the scenario
 # ---------------------------------------------------------------------------
@@ -530,6 +567,38 @@ def scenario():
     os.remove(f"{FIX}/zzz-manual.txt")
     wait_until(pump, lambda: "zzz-manual.txt" not in entry_rows(screen),
                timeout=REFRESH_WINDOW)
+
+    # -- 13: `~` ------------------------------------------------------------
+    #
+    # EQUALITY, not `endswith`: `~/fixture` and `/tmp/rmx-sbb/home/fixture` both
+    # end in "fixture", so the assertion every other case uses would pass here
+    # whether or not a single character was substituted.
+    check("13 the header shortens the server's home to `~`",
+          header(screen) == "~/fixture", (header(screen), HOME))
+
+    keys(child, pump, "h")
+    ok = wait_until(pump, lambda: header(screen) == "~")
+    check("13 the home directory itself is exactly `~`", ok, header(screen))
+
+    # ...and the trap, one level up: a DIFFERENT directory whose path starts
+    # with the home's text.
+    keys(child, pump, "h")
+    ok = wait_until(pump, lambda: header(screen) == RUN)
+    check("13 the directory above home is not shortened at all", ok,
+          header(screen))
+    found = descend(child, pump, screen, "homework")
+    ok = wait_until(pump, lambda: header(screen) == NOT_HOME)
+    check("13 a sibling whose path merely STARTS with the home's is left "
+          "alone, rather than becoming `~work`",
+          found and ok, (found, header(screen), entry_rows(screen)))
+
+    # Back where the other cases left it.
+    keys(child, pump, "h")
+    wait_until(pump, lambda: header(screen) == RUN)
+    descend(child, pump, screen, "home")
+    wait_until(pump, lambda: header(screen) == "~")
+    descend(child, pump, screen, "fixture")
+    wait_until(pump, lambda: header(screen) == "~/fixture")
 
     check("client still alive", child.isalive())
     try:

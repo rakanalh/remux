@@ -52,7 +52,8 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
 use super::nav::{self, NavKey, NavList, HEADER_ROWS};
 use super::{
-    blank_grid, draw_text, shorten_path, PluginAction, PluginEvent, PluginRequest, SidebarPlugin,
+    blank_grid, draw_text, shorten_path, tilde_path, PluginAction, PluginEvent, PluginRequest,
+    SidebarPlugin,
 };
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
@@ -134,6 +135,18 @@ pub struct FilesPlugin {
     error: Option<String>,
     /// Whether the server capped this listing.
     truncated: bool,
+    /// The home directory of the machine [`FilesPlugin::conn`] names, as the
+    /// last claimed listing reported it -- what turns `/home/you/Work` into
+    /// `~/Work` in the header.
+    ///
+    /// Kept across navigation on the same connection so the header does not
+    /// flash the absolute path for the round trip of every `l`, and cleared the
+    /// moment the connection changes: a remote's home is a different string and
+    /// possibly a different LAYOUT (`/Users/x`), and pairing one machine's home
+    /// with another's path is the mistake this field exists to avoid rather than
+    /// to make. `None` until the first listing arrives, and from a server too
+    /// old to send one -- the header then shows the full path.
+    home: Option<String>,
     show_hidden: bool,
     /// The `(conn, path)` of the listing request in flight, if any. A
     /// `DirectoryListing` that does not match it belongs to another panel.
@@ -169,6 +182,7 @@ impl FilesPlugin {
             rows: Vec::new(),
             error: None,
             truncated: false,
+            home: None,
             show_hidden: false,
             pending: None,
             pending_select: None,
@@ -401,7 +415,10 @@ impl SidebarPlugin for FilesPlugin {
             return grid;
         }
         let header = match self.cwd.as_deref() {
-            Some(cwd) => shorten_path(cwd, cols as usize),
+            // Substituted BEFORE truncating: `~` is worth ten or more columns
+            // here, and they go to the end of the path -- the part that says
+            // which directory this is.
+            Some(cwd) => shorten_path(&tilde_path(cwd, self.home.as_deref()), cols as usize),
             None => self.title().to_string(),
         };
         nav::draw_header(&mut grid, &header, focused, theme, &bg);
@@ -568,6 +585,10 @@ impl SidebarPlugin for FilesPlugin {
                 // "keeping their place", it is showing them the wrong computer.
                 if conn_changed {
                     self.conn = Some(conn.clone());
+                    // The old machine's home says nothing about the new one's
+                    // paths. Dropped here rather than left to be overwritten by
+                    // the next listing: the header renders in between.
+                    self.home = None;
                 } else if !anchored || self.cwd.as_deref() == Some(dir) {
                     return;
                 }
@@ -579,6 +600,7 @@ impl SidebarPlugin for FilesPlugin {
                 entries,
                 error,
                 truncated,
+                home,
             } => {
                 // Claim only the answer to the request THIS panel has out. The
                 // event is broadcast, so every other files panel's listing
@@ -590,6 +612,9 @@ impl SidebarPlugin for FilesPlugin {
                 self.entries = entries.clone();
                 self.error = error.clone();
                 self.truncated = *truncated;
+                // Taken from the message that carried the path it applies to,
+                // which is what makes the pairing safe.
+                self.home = home.clone();
                 self.rebuild();
             }
             PluginEvent::ConnectionLost { conn } => {
@@ -603,6 +628,7 @@ impl SidebarPlugin for FilesPlugin {
                     self.rows.clear();
                     self.error = None;
                     self.truncated = false;
+                    self.home = None;
                     self.pending = None;
                     self.last_request = None;
                     self.nav.set_selected(0);
@@ -680,12 +706,24 @@ mod tests {
     }
 
     fn listing(conn: ConnId, path: &str, entries: Vec<DirEntry>) -> PluginEvent {
+        listing_from(conn, path, entries, None)
+    }
+
+    /// A listing that also reports the answering server's home -- what the
+    /// header needs to say `~`.
+    fn listing_from(
+        conn: ConnId,
+        path: &str,
+        entries: Vec<DirEntry>,
+        home: Option<&str>,
+    ) -> PluginEvent {
         PluginEvent::DirectoryListing {
             conn,
             path: path.to_string(),
             entries,
             error: None,
             truncated: false,
+            home: home.map(str::to_string),
         }
     }
 
@@ -1106,6 +1144,105 @@ mod tests {
         assert_eq!(parent_of("/a/b/").as_deref(), Some("/a"));
     }
 
+    /// The header says `~/Work`, and it says it because the SERVER said where
+    /// its home is.
+    #[test]
+    fn the_header_shortens_the_servers_home_to_a_tilde() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/home/me/Work"));
+        p.take_requests();
+        p.on_event(&listing_from(
+            ConnId::Local,
+            "/home/me/Work",
+            vec![entry("a.txt", false)],
+            Some("/home/me"),
+        ));
+        assert_eq!(painted(&p, 30, 4)[0], "~/Work");
+
+        // The home itself, not a directory below it.
+        p.on_event(&cwd(ConnId::Local, "/home/me"));
+        p.take_requests();
+        p.on_event(&listing_from(
+            ConnId::Local,
+            "/home/me",
+            Vec::new(),
+            Some("/home/me"),
+        ));
+        assert_eq!(painted(&p, 30, 4)[0], "~");
+    }
+
+    /// A server that sends no home -- one built before the field existed -- gets
+    /// the header the panel has always had, rather than a `~` guessed from the
+    /// CLIENT's own home.
+    #[test]
+    fn without_a_home_from_the_server_the_header_is_the_full_path() {
+        let p = at("/home/me/Work", vec![entry("a.txt", false)]);
+        assert_eq!(painted(&p, 30, 4)[0], "/home/me/Work");
+    }
+
+    /// The header shortens where the panel IS, so the substitution has to be
+    /// worth something on a panel too narrow for the absolute path -- which is
+    /// the width the request was actually about.
+    #[test]
+    fn the_tilde_survives_the_width_the_absolute_path_would_not() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/home/me/Work/Personal/Remux"));
+        p.take_requests();
+        p.on_event(&listing_from(
+            ConnId::Local,
+            "/home/me/Work/Personal/Remux",
+            Vec::new(),
+            Some("/home/me"),
+        ));
+        assert_eq!(painted(&p, 22, 4)[0], "~/Work/Personal/Remux");
+    }
+
+    /// The failure mode the field is per-message to prevent: the foreground
+    /// moves to another machine, and until that machine's first listing lands
+    /// the panel holds a path from one computer and a home from another. It must
+    /// not put them together -- a remote whose home is `/Users/them` renders
+    /// nothing shortened, and one that merely shares a prefix would render a `~`
+    /// for a directory that is nobody's home there.
+    #[test]
+    fn a_home_never_outlives_the_connection_it_came_from() {
+        let mut p = FilesPlugin::new(None);
+        p.on_event(&cwd(ConnId::Local, "/home/me/Work"));
+        p.take_requests();
+        p.on_event(&listing_from(
+            ConnId::Local,
+            "/home/me/Work",
+            Vec::new(),
+            Some("/home/me"),
+        ));
+        assert_eq!(painted(&p, 30, 4)[0], "~/Work");
+
+        // The foreground moves to a remote that happens to use the same paths.
+        p.on_event(&cwd(ConnId::Remote("box".to_string()), "/home/me/Other"));
+        assert_eq!(
+            painted(&p, 30, 4)[0],
+            "/home/me/Other",
+            "the local server's home must not be applied to the remote's path"
+        );
+        p.take_requests();
+        p.on_event(&listing_from(
+            ConnId::Remote("box".to_string()),
+            "/home/me/Other",
+            Vec::new(),
+            Some("/home/me"),
+        ));
+        assert_eq!(
+            painted(&p, 30, 4)[0],
+            "~/Other",
+            "and once the remote says so itself, it shortens"
+        );
+
+        // A dropped connection takes the home with the rest of that machine.
+        p.on_event(&PluginEvent::ConnectionLost {
+            conn: ConnId::Remote("box".to_string()),
+        });
+        assert!(p.home.is_none());
+    }
+
     #[test]
     fn a_listing_error_is_shown_rather_than_looking_like_an_empty_directory() {
         let mut p = at("/w", vec![entry("secret", true)]);
@@ -1117,6 +1254,7 @@ mod tests {
             entries: Vec::new(),
             error: Some("permission denied".to_string()),
             truncated: false,
+            home: None,
         });
         let rows = painted(&p, 24, 5);
         assert_eq!(rows[1], "permission denied");
@@ -1146,6 +1284,7 @@ mod tests {
             entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
             error: None,
             truncated: true,
+            home: None,
         });
         // Header + 2 rows + the note: the list alone would fill this and more.
         let rows = painted(&p, 24, 4);
@@ -1175,6 +1314,7 @@ mod tests {
             entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
             error: None,
             truncated: true,
+            home: None,
         });
         // Header + exactly one content line.
         let rows = painted(&p, 24, 2);
@@ -1197,6 +1337,7 @@ mod tests {
             entries: (0..20).map(|i| entry(&format!("f{i}"), false)).collect(),
             error: None,
             truncated: true,
+            home: None,
         });
         let _ = painted(&p, 24, 4);
         let down = MouseEventKind::Down(MouseButton::Left);

@@ -74,6 +74,17 @@ pub enum ConnDescriptor {
 /// addition in the direction that matters here: an old client sending
 /// `SpawnAuxPane` to a new server gets a message the server cannot parse, so the
 /// bump is what turns that into a refused handshake instead.
+///
+/// Added AT 11 without a bump: [`ServerMessage::DirectoryListing`]'s `home`, the
+/// server's own home directory, which is what lets the `files` panel header say
+/// `~/Work` instead of `/home/you/Work`. It is a `#[serde(default)]` field on an
+/// existing message, so both directions still decode -- a new client reading an
+/// old server's listing gets `None` and shows the full path, and an old client
+/// reading a new server's listing ignores a key it does not know (nothing here
+/// sets `deny_unknown_fields`). Neither peer can misparse the other, which is
+/// the only thing this number is for. Pinned by
+/// `directory_listing_home_round_trips_and_defaults`. The entry exists so that a
+/// field with no ladder line does not read as an oversight.
 pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -647,6 +658,28 @@ pub enum ServerMessage {
         /// panel says so on its own line.
         #[serde(default)]
         truncated: bool,
+        /// **This server's** home directory, so the panel can render
+        /// `~/Work/Remux` where the path is under it.
+        ///
+        /// It rides on the listing rather than being a client-side
+        /// `$HOME` for the same reason the listing itself is not a client-side
+        /// `read_dir`: the directory is on the SERVER, routinely a remote with a
+        /// different username and, on macOS, a different layout entirely
+        /// (`/Users/x`, not `/home/x`). Substituting the CLIENT's home would be
+        /// the same failure one level down -- plausible, wrong on every remote,
+        /// and worst where the two machines share a prefix, which renders `~`
+        /// for a directory that is nobody's home there.
+        ///
+        /// Per-message rather than per-connection because that is what makes it
+        /// impossible to pair with the wrong path: the panel substitutes only
+        /// when the path it is holding is under the home that arrived WITH it.
+        ///
+        /// `None` from a server that predates the field, or one whose home
+        /// cannot be resolved at all; the panel then shows the full path, which
+        /// is the behaviour it had before this existed. That graceful `None` is
+        /// what keeps the addition off [`PROTOCOL_VERSION`].
+        #[serde(default)]
+        home: Option<String>,
     },
     /// The panes running an AI coding agent, pushed to every client subscribed
     /// with [`ClientMessage::SubscribeAgents`].
@@ -1681,6 +1714,52 @@ mod tests {
         let legacy = br#"{"ScrollPane":{"pane_id":3,"up":false,"lines":3}}"#;
         match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
             ClientMessage::ScrollPane { x, y, .. } => assert_eq!((x, y), (0, 0)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The `files` panel's `~` needs the SERVER's home, and it rides on the
+    /// listing. Both directions of the compatibility claim that keeps it off
+    /// `PROTOCOL_VERSION` are checked here, because only one of them is about
+    /// the new field at all:
+    ///
+    /// - a NEW client reading an OLD server's listing: no `home` key, decodes to
+    ///   `None`, and the panel shows the full path exactly as before;
+    /// - an OLD client reading a NEW server's listing: modelled by decoding a
+    ///   payload carrying a key this build has never heard of, since that is
+    ///   precisely what `home` is to a peer built before it. Decoding `home`
+    ///   with a deserializer that knows `home` would prove nothing.
+    #[test]
+    fn directory_listing_home_round_trips_and_defaults() {
+        let msg = ServerMessage::DirectoryListing {
+            path: "/home/me/w".to_string(),
+            entries: Vec::new(),
+            error: None,
+            truncated: false,
+            home: Some("/home/me".to_string()),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        match serde_json::from_slice::<ServerMessage>(&encoded[4..4 + len]).unwrap() {
+            ServerMessage::DirectoryListing { home, .. } => {
+                assert_eq!(home.as_deref(), Some("/home/me"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy =
+            br#"{"DirectoryListing":{"path":"/w","entries":[],"error":null,"truncated":false}}"#;
+        match serde_json::from_slice::<ServerMessage>(legacy).unwrap() {
+            ServerMessage::DirectoryListing { home, path, .. } => {
+                assert_eq!(home, None, "an older server's listing must still decode");
+                assert_eq!(path, "/w");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let from_the_future = br#"{"DirectoryListing":{"path":"/w","entries":[],"error":null,"truncated":false,"home":"/home/me","some_field_added_later":7}}"#;
+        match serde_json::from_slice::<ServerMessage>(from_the_future).unwrap() {
+            ServerMessage::DirectoryListing { path, .. } => assert_eq!(path, "/w"),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

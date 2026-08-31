@@ -52,6 +52,23 @@ impl Listing {
     }
 }
 
+/// This server's home directory, as an absolute path string.
+///
+/// Sent with every listing so the `files` panel can render `~`. It is resolved
+/// HERE rather than on the client for the same reason the listing is: the
+/// directory being shown belongs to this machine, and the client's own `$HOME`
+/// describes a different one whenever the server is a remote.
+///
+/// `None` when it cannot be resolved (no `$HOME` and no passwd entry), which the
+/// panel reads as "show the full path" -- the behaviour it had before `~`.
+///
+/// A non-UTF-8 home is also `None`: the wire is JSON, and a lossy conversion
+/// would be a path that does not exist. The panel loses the shortening, not
+/// correctness.
+pub fn home_dir() -> Option<String> {
+    dirs::home_dir().and_then(|h| h.to_str().map(str::to_string))
+}
+
 /// List `path`, sorted directories-first then by name.
 ///
 /// Errors are RETURNED, not logged and swallowed. "Permission denied" is an
