@@ -25,6 +25,15 @@ Covers `SubscribeAgents` / `UnsubscribeAgents` / `AgentList`:
      wake it -- otherwise the entry sits on `Working` for ever, because
      `Working -> Idle` is caused by the ABSENCE of output and nothing else is
      coming.
+ 12. **a pane whose process NAME is not the agent's name is STILL listed**, on
+     the strength of its `argv[0]`. This is the macOS bug, reproduced on Linux:
+     Claude Code's installer execs a VERSIONED path (`.../versions/2.1.251`)
+     with `argv[0] = "claude"`, and macOS names a process after its executable
+     path while Linux reports the title the binary sets -- so the Mac saw
+     `2.1.251`, matched nothing, and showed an empty panel. Running a binary
+     literally called `2.1.251` under `argv[0] = "claude"` puts a Linux pane in
+     exactly that shape, which is what makes the fix testable at all on a
+     machine nobody can run macOS on.
 
 Uses a stand-in `claude` script on `PATH`, so nothing here needs a real agent
 installed.
@@ -67,6 +76,21 @@ done
 # Same program under a name the config does not list.
 NOT_AGENT = AGENT
 
+# Case 12's stand-in, and it CANNOT be a `#!` script like the two above.
+#
+# For a shebang script the kernel DISCARDS the caller's `argv[0]` and rebuilds
+# the vector as [interpreter, script, ...], so a script can never be given the
+# custom `argv[0]` this case is entirely about -- it would silently test nothing.
+# A copied ELF keeps what `execv` is handed: `comm` becomes the FILE's basename
+# (`2.1.251`) and `argv[0]` stays `claude`, which is the macOS shape exactly.
+VERSIONED = "2.1.251"
+
+# Typed into the pane's shell. `exec -a` is not POSIX and `/bin/sh` is the
+# harness shell, so `python3` sets the argv vector instead.
+VERSIONED_LAUNCH = (
+    "python3 -c 'import os; os.execv(\"{path}\", [\"claude\", \"600\"])'\n"
+)
+
 CONFIG = """
 [agents]
 commands = ["claude"]
@@ -96,6 +120,10 @@ def write_bins():
         with open(p, "w") as f:
             f.write(body)
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    real = shutil.which("sleep")
+    if real is None:
+        raise SystemExit("case 12 needs a real ELF to copy, and `sleep` is not on PATH")
+    shutil.copy(real, f"{BINDIR}/{VERSIONED}")
     os.environ["PATH"] = BINDIR + ":" + os.environ["PATH"]
 
 
@@ -359,6 +387,57 @@ def run(srv):
     check(
         state_of(decayed, agent_pane) == "Idle",
         "11 and THAT pane decays to Idle rather than sitting on Working for ever",
+    )
+
+    # -- 12: the macOS bug, in a shape Linux can reproduce --------------------
+    #
+    # A binary literally named `2.1.251` running as `argv[0] = "claude"`. Before
+    # the argv[0] candidate existed this pane was invisible -- which is the whole
+    # user report, and is why the check below is keyed on the pane APPEARING.
+    # Re-subscribed rather than read from the stream: by now every agent is
+    # Idle, so the pusher has parked and `latest` collects NOTHING. That is not
+    # hypothetical -- the guard below caught exactly that on the first run, with
+    # an empty baseline making the "a NEW pane appeared" check answerable by a
+    # pane that had been listed since case 9. A subscribe is answered at once
+    # (case 1), which is what makes it a reliable snapshot.
+    c.send("UnsubscribeAgents")
+    c.drain(0.5)
+    c.send("SubscribeAgents")
+    before = {a["pane_id"] for a in first_list(c) or []}
+    # Without this the case is a false green waiting to happen: if the list
+    # arrived empty, "some pane_id is not in `before`" would be satisfied by one
+    # of the two `claude` panes that have been listed since case 9.
+    check(len(before) == 2, f"12 the two existing agents are the baseline ({before})")
+    c.send({"Command": "TabNew"})
+    time.sleep(0.5)
+    c.drain(0.3)
+    launch = VERSIONED_LAUNCH.format(path=f"{BINDIR}/{VERSIONED}")
+    c.send({"Input": {"data": list(launch.encode())}})
+    # Polled by RE-SUBSCRIBING rather than by waiting on the stream, because
+    # this stand-in never writes a byte after `execv`. No output means nothing
+    # dirties the pane, and with every other agent Idle the pusher has parked --
+    # so a `wait_for` here waits for a push that is never coming and reports the
+    # pane missing whether the fix works or not. A subscribe is answered with a
+    # fresh sample (case 1), which is the only thing that re-reads this pane.
+    fresh, got = None, []
+    end = time.time() + 8.0
+    while time.time() < end and fresh is None:
+        time.sleep(0.5)
+        c.send("UnsubscribeAgents")
+        c.drain(0.3)
+        c.send("SubscribeAgents")
+        got = first_list(c) or []
+        fresh = next((a for a in got if a["pane_id"] not in before), None)
+    check(
+        fresh is not None,
+        f"12 a pane whose process NAME is {VERSIONED!r} is listed on its argv[0] ({got})",
+    )
+    # `AgentEntry.command` promises a CONFIGURED command, and `classify` scopes
+    # its patterns against that string -- so reporting the raw candidate would
+    # both break the promise and silently unscope every pattern for this pane.
+    check(
+        fresh is not None and fresh["command"] == "claude",
+        f"12 and it is reported under the configured spelling, not {VERSIONED!r} ({fresh})",
     )
 
     c.close()
