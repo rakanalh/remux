@@ -84,12 +84,17 @@ impl Pty {
         cwd: Option<&std::path::Path>,
         identity: Option<PaneIdentity<'_>>,
     ) -> Result<Pty> {
+        // `args` is COUNTED, never printed. `server.log` is plaintext and never
+        // pruned, and the only user-supplied args that reach here come from
+        // `remux split -- <command line>`, which is exactly where a connection
+        // string or an API key lives. See `handle_client_message`'s summary
+        // match for the rule this follows.
         log::debug!(
-            "pty: spawn cols={}, rows={}, command={:?}, args={:?}, cwd={:?}, identity={:?}",
+            "pty: spawn cols={}, rows={}, command={:?}, {} arg(s), cwd={:?}, identity={:?}",
             cols,
             rows,
             command,
-            args,
+            args.len(),
             cwd,
             identity
         );

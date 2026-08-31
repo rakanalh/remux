@@ -194,8 +194,17 @@ async fn run_cli_spawn(
         std::process::exit(1);
     };
     let session = session.to_string_lossy().into_owned();
+    // The PROGRAM and a count, never the arguments. `client.log` is the same
+    // kind of file as `server.log` -- plaintext, unrotated, always at `Debug` --
+    // and this is the very command line the user typed, so
+    // `remux split -- psql postgresql://user:pass@host/db` would put the
+    // password on disk. The server side redacts identically; see
+    // `handle_client_message`'s summary match.
     log::debug!(
-        "cmd: cli-spawn session={session:?} placement={placement:?} argv={argv:?} cwd={cwd:?}"
+        "cmd: cli-spawn session={session:?} placement={placement:?} program={:?} \
+         ({} more arg(s)) cwd={cwd:?}",
+        argv.first(),
+        argv.len().saturating_sub(1)
     );
 
     // Deliberately no `ensure_server_running()`: a set $REMUX_SESSION means a

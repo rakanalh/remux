@@ -1019,11 +1019,58 @@ async fn handle_client_message(
     dormant: &DormantStore,
 ) -> Result<()> {
     // Log a summary of every incoming client message.
+    //
+    // **Anything the user TYPED is summarised, never printed.** `server.log` is
+    // plaintext, unrotated and never pruned -- one user's reached 586 MB in
+    // about a day -- and `main.rs` pins the logger at `Debug` with no
+    // `RUST_LOG`, so nothing a user can set turns any of this off. Whatever
+    // lands here stays on disk indefinitely.
+    //
+    // The three arms below carry content; the catch-all `{other:?}` Debug-prints
+    // whole structs, so a variant carrying typed bytes MUST have an arm here or
+    // it leaks verbatim. `Input` always had one. `InputToPane` and `CliSpawn`
+    // arrived later and did not, and both leaked in full: `InputToPane` prints
+    // its `Vec<u8>` as `[99, 111, 114, ...]` (full fidelity, trivially decoded)
+    // and it is how every keystroke reaches a VIEW cell, so a passphrase typed
+    // into a view was on disk; `CliSpawn` printed `argv` as plain strings, and
+    // `remux split -- psql postgresql://user:pass@host/db` is an ordinary thing
+    // to run.
+    //
+    // The line drawn is CONTENT, not "is it noisy" and not "did the user name
+    // it". NAMES stay -- session, folder, tab, view -- because they are labels
+    // the user chose to see in a UI, they are already logged verbatim by their
+    // own handlers, and redacting only the copy in this match would be theatre.
+    // PATHS stay for the same reason plus one more: a path IS the diagnostic
+    // for the panel messages that carry one. A credential is not a name and is
+    // not a path.
     match &msg {
         ClientMessage::Input { data } => {
             log::debug!(
                 "server: client_id={client_id} msg=Input({} bytes)",
                 data.len()
+            );
+        }
+        ClientMessage::InputToPane { pane_id, data } => {
+            log::debug!(
+                "server: client_id={client_id} msg=InputToPane(pane_id={pane_id}, {} bytes)",
+                data.len()
+            );
+        }
+        ClientMessage::CliSpawn {
+            session,
+            placement,
+            argv,
+            cwd,
+        } => {
+            // The PROGRAM, then a count. Which binary was asked for is the
+            // whole diagnostic value of this line ("it tried to run `psql`");
+            // its arguments are where a connection string or an API key lives.
+            log::debug!(
+                "server: client_id={client_id} msg=CliSpawn(session={session:?}, \
+                 placement={placement:?}, program={:?}, {} more arg(s), cwd={})",
+                argv.first(),
+                argv.len().saturating_sub(1),
+                if cwd.is_some() { "set" } else { "none" }
             );
         }
         ClientMessage::ScrollDelta { delta } => {
@@ -5703,9 +5750,13 @@ async fn create_tab_in_session(
                 .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
         }
     };
+    // `args` COUNTED, not printed: `remux new-tab -- <command line>` reaches
+    // here, and its arguments are where a credential lives. See
+    // `handle_client_message`'s summary match for the rule.
     log::debug!(
         "server: create_tab_in_session session={session_name:?} new pane_id={pane_id} \
-command={command:?} args={args:?}"
+command={command:?} ({} arg(s))",
+        args.len()
     );
     spawn_pane(
         pane_id,
@@ -5970,9 +6021,16 @@ async fn handle_cli_spawn(
         None => (None, &[][..]),
     };
     let cwd_path = cwd.map(std::path::Path::new);
+    // Redacted the same way as the summary line in `handle_client_message`, and
+    // for the same reason: `argv` is a command line the user typed, so its
+    // ARGUMENTS are where a connection string or an API key lives. The program
+    // is what anyone reading this line needs. `cwd` is a path, not a
+    // credential, and is the other half of "why did it fail to start".
     log::info!(
         "server: CliSpawn client_id={client_id} session={session:?} placement={placement:?} \
-argv={argv:?} cwd={cwd:?}"
+program={:?} ({} more arg(s)) cwd={cwd:?}",
+        argv.first(),
+        argv.len().saturating_sub(1)
     );
 
     let spawned = match placement {
@@ -6073,8 +6131,15 @@ async fn spawn_pane(
     config: &Arc<Config>,
 ) -> Result<()> {
     let cmd = command.or(config.general.default_shell.as_deref());
+    // `args` is COUNTED, never printed -- the same redaction as the `CliSpawn`
+    // lines this is downstream of, and required for the same reason: the only
+    // way user-supplied args reach here is `remux split -- <command line>`, and
+    // that is where a connection string or an API key lives. The COMMAND is
+    // printed, because "what did it try to run" is the whole diagnostic.
     log::debug!(
-        "server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} args={args:?} cwd={cwd:?} identity={identity:?}"
+        "server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} \
+         ({} arg(s)) cwd={cwd:?} identity={identity:?}",
+        args.len()
     );
     let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd, identity)?;
     // The reader gets its OWN descriptor (a dup), so the fd number cannot be
