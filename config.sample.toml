@@ -600,10 +600,11 @@
 #                 the server's tree changes; Enter jumps to whatever is selected.
 #
 #                 `j`/`k` (or the arrows) move, `g`/`G` jump to the ends, and
-#                 `l`/`h` EXPAND and COLLAPSE a node rather than toggling it, so
-#                 holding a direction cannot flap one open and shut. Space
-#                 toggles. Note that Space MARKS panes for a view in the session
-#                 manager OVERLAY; in this panel it only opens and closes nodes.
+#                 `l`/`h` (or Right/Left) EXPAND and COLLAPSE a node rather than
+#                 toggling it, so holding a direction cannot flap one open and
+#                 shut. Space toggles. Note that Space MARKS panes for a view in
+#                 the session manager OVERLAY; in this panel it only opens and
+#                 closes nodes.
 #   files       — a built-in file browser. No REQUIRED configuration: nothing to
 #                 set beyond the optional `editor` above, no opener hook,
 #                 nothing to install.
