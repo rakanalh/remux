@@ -38,6 +38,22 @@ Covers `SubscribeAgents` / `UnsubscribeAgents` / `AgentList`:
 Uses a stand-in `claude` script on `PATH`, so nothing here needs a real agent
 installed.
 
+A SECOND server then runs with the SHIPPED patterns (its `[agents]` table
+declares no `[[agents.pattern]]`, so the defaults survive), covering:
+
+ 13. **Claude Code's QUESTION menu reads as `NeedsInput`.** Its `AskUserQuestion`
+     UI asks a free-form question rather than for permission, so it matches none
+     of the approval wordings -- a user's blocked pane showed grey. The shipped
+     pattern keys on the selector's FOOTER, and the stand-in prints that footer
+     with the real glyphs (`.`, arrows) so the regex is proved against a line
+     Claude Code actually renders rather than an ASCII paraphrase of one.
+ 14. **and the ANSWERED form reads as `Idle` again.** This is the staleness
+     objection that keeps the menu-ROW pattern unshipped, asked of the footer:
+     once the question is answered Claude Code collapses the whole block to
+     `User answered Claude's questions: ...` and the footer is nowhere on
+     screen, so the footer cannot hold the panel red for ever the way a
+     left-behind menu row could.
+
 Run: python3 tests/frame/agents_panel.py
 """
 import os
@@ -50,6 +66,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, Server, name_of  # noqa: E402
 
 RUNDIR = "/tmp/rmx-agents"
+# The second server, run with the SHIPPED patterns (see cases 13-14).
+RUNDIR2 = "/tmp/rmx-agents-shipped"
 # OUTSIDE the rundir on purpose: `Server.start` wipes the rundir, so a stand-in
 # written inside it would be deleted before the server ever looked for it -- and
 # the pane would silently fall back to whatever real `claude` the developer
@@ -67,6 +85,8 @@ printf 'agent ready\\n'
 while read line; do
   case "$line" in
     block) printf 'Do you want to proceed?\\n> 1. Yes\\n  2. No\\n' ;;
+    menu) printf 'Which color do you like?\\n\\n❯ 1. Blue\\n  2. Red\\n  3. Yellow\\n  4. Type something.\\n  5. Chat about this\\n\\nEnter to select · ↑/↓ to navigate · Esc to cancel\\n' ;;
+    answered) printf '\\033[2J\\033[H'; printf "⏺ User answered Claude's questions:\\n  ⎿  · Which color do you like? → Blue\\n" ;;
     clear) printf '\\033[2J\\033[H'; printf 'back to work\\n' ;;
     *) printf 'ok\\n' ;;
   esac
@@ -101,6 +121,15 @@ scan_rows = 12
   name = "test-approval"
   command = "claude"
   regex = "Do you want to proceed"
+"""
+
+# The second server's config declares NO `[[agents.pattern]]`, so the SHIPPED
+# defaults survive -- which is the whole point of cases 13-14. Spelling a copy
+# of the shipped pattern in here would test the copy, not the thing that ships.
+SHIPPED_CONFIG = """
+[agents]
+commands = ["claude"]
+working_ms = 1000
 """
 
 
@@ -192,7 +221,18 @@ def main():
         log = srv.log()
         srv.kill()
 
+    srv2 = Server(RUNDIR2).start(config=SHIPPED_CONFIG)
+    try:
+        try:
+            run_shipped(srv2)
+        except Exception as e:  # noqa: BLE001 -- as above
+            check(False, f"the shipped-pattern run completed without an exception ({e!r})")
+    finally:
+        log2 = srv2.log()
+        srv2.kill()
+
     check("panicked at" not in log, "no panic in the server log")
+    check("panicked at" not in log2, "no panic in the shipped-pattern server log")
 
     # The user-facing diagnostic for "the panel is empty but the agent is right
     # there". On a Mac it is the ONLY thing that can say what the platform
@@ -453,6 +493,141 @@ def run(srv):
         f"12 and it is reported under the configured spelling, not {VERSIONED!r} ({fresh})",
     )
 
+    c.close()
+
+
+class Grid:
+    """The composited frame, rebuilt from `FullRender` + `RenderDiff`.
+
+    Only enough of it to answer "is this string on the screen right now", which
+    cases 13-14 need so that "the pattern stopped matching" cannot be satisfied
+    by a screen that went blank.
+    """
+
+    def __init__(self):
+        self.rows = []
+
+    def feed(self, msgs):
+        for m in msgs:
+            n = name_of(m)
+            if n == "FullRender":
+                self.rows = [
+                    "".join(c["c"] for c in row) for row in m["FullRender"]["cells"]
+                ]
+            elif n == "RenderDiff" and self.rows:
+                for ch in m["RenderDiff"]["changes"]:
+                    y, x = ch["y"], ch["x"]
+                    if y < len(self.rows) and x < len(self.rows[y]):
+                        row = self.rows[y]
+                        self.rows[y] = row[:x] + ch["cell"]["c"] + row[x + 1 :]
+
+    def has(self, text):
+        # `finditer`-equivalent: a row scan must not stop at the first match
+        # when two panes share a screen row. `any` over every row does that.
+        return any(text in r for r in self.rows)
+
+    def pump(self, c, t=0.15):
+        """Drain `c` into the grid, and hand back the `AgentList`s that came with it.
+
+        The shared `wait_for`/`latest` cannot be used once a grid is in play:
+        they drain the socket and keep only the `AgentList`s, so every
+        `FullRender`/`RenderDiff` in the same batch is DISCARDED and the grid
+        stays at whatever it last saw. That is not hypothetical -- it is how the
+        first version of case 14 failed, reporting an empty screen while the
+        text was plainly there.
+        """
+        msgs = c.drain(t)
+        self.feed(msgs)
+        return lists(msgs)
+
+    def wait(self, c, predicate, timeout=4.0):
+        last = None
+        end = time.time() + timeout
+        while time.time() < end:
+            for got in self.pump(c):
+                last = got
+                if predicate(got):
+                    return got
+        return last
+
+    def idle(self, c, t):
+        end = time.time() + t
+        while time.time() < end:
+            self.pump(c)
+
+
+def run_shipped(srv):
+    """13 + 14: Claude Code's QUESTION menu, against the SHIPPED patterns."""
+    c = Client(srv.sock)
+    c.hello()
+    c.send({"CreateSession": {"name": "main", "folder": None}})
+    c.send({"Attach": {"session_name": "main"}})
+    c.send({"Resize": {"cols": 100, "rows": 30}})
+    grid = Grid()
+    grid.idle(c, 0.5)
+    c.send("SubscribeAgents")
+    grid.idle(c, 0.4)
+
+    c.send({"Input": {"data": list(b"claude\n")}})
+    got = grid.wait(c, lambda ags: any(a["command"] == "claude" for a in ags), timeout=4.0)
+    entry = next((a for a in got or [] if a["command"] == "claude"), None)
+    check(entry is not None, "13 the stand-in agent is listed under the shipped config")
+    if entry is None:
+        return
+    pane = entry["pane_id"]
+
+    def state_of(ags):
+        return next((a["state"] for a in ags or [] if a["pane_id"] == pane), None)
+
+    # 13. The question menu. `menu` is typed; `Enter to select` is ASSEMBLED by
+    #     the stand-in, so the typed and matched strings never coincide and the
+    #     shell's own echo cannot answer this check.
+    c.send({"Input": {"data": list(b"menu\n")}})
+    got = grid.wait(c, lambda ags: state_of(ags) == "NeedsInput", timeout=4.0)
+    check(
+        state_of(got) == "NeedsInput",
+        f"13 Claude Code's question-menu footer reads as NeedsInput ({got})",
+    )
+    grid.idle(c, 0.4)
+    check(
+        grid.has("Enter to select"),
+        "13 and the footer really is on the pane's screen",
+    )
+
+    # ...and it does not decay while it is there. 2.5x the working window.
+    grid.idle(c, 2.5)
+    b = Client(srv.sock)
+    b.hello()
+    b.send("SubscribeAgents")
+    fresh = latest(b, 1.5)
+    check(
+        next((a["state"] for a in fresh or [] if a["pane_id"] == pane), None) == "NeedsInput",
+        f"13 and it survives silence past the working window ({fresh})",
+    )
+    b.close()
+
+    # 14. THE ONE THAT MATTERS. Answering collapses the block: Claude Code
+    #     redraws with `User answered Claude's questions: ...` and the footer is
+    #     nowhere on screen. This is the staleness objection that keeps the
+    #     menu-ROW pattern unshipped, asked of the footer -- and the answer is
+    #     that a live keybinding hint is not transcript content.
+    c.send({"Input": {"data": list(b"answered\n")}})
+    got = grid.wait(c, lambda ags: state_of(ags) == "Idle", timeout=6.0)
+    grid.idle(c, 0.5)
+    check(
+        state_of(got) == "Idle",
+        f"14 the ANSWERED form releases NeedsInput and reads Idle again ({got})",
+    )
+    # Without this the check above is answerable by a screen that simply went
+    # blank, which would prove nothing about the pattern.
+    check(
+        grid.has("User answered Claude"),
+        f"14 with the collapsed answered block actually on the screen ({grid.rows[:3]})",
+    )
+    check(
+        not grid.has("Enter to select"),
+        "14 and the footer gone from it -- which is what makes the pattern safe to ship",
+    )
     c.close()
 
 

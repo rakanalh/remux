@@ -104,10 +104,11 @@ impl Default for AgentsConfig {
 
 /// The shipped patterns: enough for `claude` and `codex` to work unconfigured.
 ///
-/// **Deliberately no menu-shaped pattern.** An earlier default matched the
-/// selected row of a numbered menu, as a second chance for a question that had
-/// scrolled out of the window. It is not shipped, for two reasons pointing the
-/// same way:
+/// **Deliberately no menu-ROW pattern -- and that is not in tension with the
+/// question-menu FOOTER pattern that IS shipped.** An earlier default matched
+/// the selected row of a numbered menu (`^\s*>\s*\d+\.`), as a second chance
+/// for a question that had scrolled out of the window. It is not shipped, for
+/// two reasons pointing the same way:
 ///
 /// * **It is unverifiable in the way that matters.** If an agent leaves an
 ///   ANSWERED menu on screen with its chosen row still marked, no pattern
@@ -126,8 +127,18 @@ impl Default for AgentsConfig {
 /// question out of the `scan_rows` window within a screenful. A menu row is the
 /// LAST thing on screen, so it would survive longest.
 ///
-/// A user who wants the second chance adds it back in one config entry; the
-/// sample config shows it with this caveat attached.
+/// **`claude-select` is exempt from the first reason, and the exemption is
+/// EVIDENCE rather than an argument.** It matches the selector's footer, and
+/// the same pane was dumped before and after the question was answered: the
+/// footer is present while the selector is live and gone once the block
+/// collapses to `User answered Claude's questions: ...`. It is a keybinding
+/// hint bound to an active overlay, not content that lands in the transcript,
+/// so the "an answered menu is indistinguishable from a waiting one" objection
+/// simply does not arise for it. Whoever is tempted to delete this pattern on
+/// staleness grounds is re-deriving an objection that was already tested.
+///
+/// A user who wants the menu row back adds it in one config entry; the sample
+/// config shows it with this caveat attached.
 fn default_patterns() -> Vec<AgentPattern> {
     let p = |name: &str, command: &str, regex: &str| AgentPattern {
         name: name.to_string(),
@@ -151,6 +162,40 @@ fn default_patterns() -> Vec<AgentPattern> {
             "claude-proceed",
             "claude",
             r"(?i)do you want to (proceed|continue|allow|use this api key)",
+        ),
+        // Claude Code's QUESTION menu -- its `AskUserQuestion` selector, which
+        // asks something rather than asking permission and so matches none of
+        // the wordings above. A user's pane sat blocked on "Which color do you
+        // like?" and the panel showed grey.
+        //
+        // Keyed on the selector's FOOTER (`Enter to select . arrows to
+        // navigate . Esc to cancel`), NOT on the `> 1.` menu row -- and the
+        // difference is the entire staleness argument this module's other
+        // comment makes. A left-behind menu row is indistinguishable in a
+        // snapshot from a waiting one; the footer is a live keybinding hint
+        // tied to an ACTIVE selector. Verified rather than assumed: the same
+        // pane was dumped again after the question was answered, and the whole
+        // block had collapsed to
+        //
+        //     User answered Claude's questions:
+        //       . Which color do you like? -> Blue
+        //
+        // with no footer anywhere on screen. So this cannot hold the panel red
+        // for ever the way the menu row could.
+        //
+        // Two phrases, not the whole line: it carries a middot, two arrow
+        // glyphs and spacing nobody should be hand-transcribing, and `.*`
+        // spans all of that. Requiring BOTH ends is what keeps the specificity
+        // -- the same crying-wolf argument that stops `claude-proceed` from
+        // matching the bare "Do you want to " prefix.
+        //
+        // It generalises on purpose: any Claude Code overlay drawing this
+        // footer is by definition waiting on the user, so matching another
+        // selector is the right answer and not a false positive.
+        p(
+            "claude-select",
+            "claude",
+            r"(?i)enter to select.*esc to cancel",
         ),
         // Codex's command-approval prompt.
         p(

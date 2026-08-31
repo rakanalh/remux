@@ -745,6 +745,81 @@ mod tests {
         }
     }
 
+    /// The real question menu, glyph for glyph, from a pane the user reported
+    /// as showing grey while it was blocked.
+    ///
+    /// The footer is the last line, and it is what the shipped pattern matches;
+    /// the `\u{276f} 1.` rows deliberately do NOT match anything (see
+    /// `a_bare_menu_row_is_not_a_shipped_blocked_signal`), so a green result
+    /// here can only have come from the footer.
+    const CLAUDE_QUESTION_MENU: [&str; 8] = [
+        "Which color do you like?",
+        "",
+        "\u{276f} 1. Blue",
+        "  2. Red",
+        "  3. Yellow",
+        "  4. Type something.",
+        "  5. Chat about this",
+        "Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} Esc to cancel",
+    ];
+
+    /// What the SAME pane showed once the question had been answered: the whole
+    /// block collapsed, and no footer anywhere.
+    const CLAUDE_ANSWERED: [&str; 2] = [
+        "\u{23fa} User answered Claude's questions:",
+        "  \u{23bf}  \u{b7} Which color do you like? \u{2192} Blue",
+    ];
+
+    /// Claude Code's QUESTION menu is a blocked agent, with zero configuration.
+    ///
+    /// It is its `AskUserQuestion` UI, which asks something rather than asking
+    /// permission, so it matches none of the approval wordings above -- and a
+    /// user's blocked pane read `Idle` for exactly that reason.
+    #[test]
+    fn the_question_menu_is_a_shipped_blocked_signal() {
+        let r = shipped();
+        let screen: Vec<String> = CLAUDE_QUESTION_MENU.iter().map(|s| s.to_string()).collect();
+        let v = r.classify("claude", &screen, Duration::from_secs(30));
+        assert_eq!(v.state, AgentState::NeedsInput, "{v:?}");
+    }
+
+    /// **The staleness objection, tested rather than argued.**
+    ///
+    /// The reason no menu-ROW pattern ships is that an answered menu left on
+    /// screen cannot be told from a waiting one, so the panel would stay red for
+    /// ever. The footer does not have that problem, and this is the evidence:
+    /// once the question is answered the block collapses to two lines with the
+    /// footer nowhere in them, so nothing keeps matching.
+    ///
+    /// If a future change makes this fail, the shipped `claude-select` pattern
+    /// has become exactly the thing its own doc comment says it is not.
+    #[test]
+    fn the_answered_question_menu_is_not_a_blocked_signal() {
+        let r = shipped();
+        let screen: Vec<String> = CLAUDE_ANSWERED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            r.classify("claude", &screen, Duration::from_secs(30)).state,
+            AgentState::Idle
+        );
+    }
+
+    /// Half the footer is not the footer. Both ends are required, which is what
+    /// keeps the pattern from firing on ordinary agent prose -- the same
+    /// crying-wolf argument that stops `claude-proceed` matching the bare
+    /// "Do you want to " prefix.
+    #[test]
+    fn half_the_selector_footer_does_not_match() {
+        let r = shipped();
+        for half in ["press Enter to select a file", "Esc to cancel"] {
+            assert_eq!(
+                r.classify("claude", &[half.to_string()], Duration::from_secs(30))
+                    .state,
+                AgentState::Idle,
+                "{half:?}"
+            );
+        }
+    }
+
     /// A menu row on its own is NOT a shipped blocked signal. See
     /// `config::agents::default_patterns`: an answered menu left on screen is
     /// indistinguishable from a waiting one, and a panel stuck red for ever is

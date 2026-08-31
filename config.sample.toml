@@ -792,12 +792,26 @@
 #
 # Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
 # is no merge, so you own the whole list and cannot be surprised by a built-in
-# pattern you cannot see. The shipped Claude one is taken from the wordings
-# actually present in the Claude Code binary ("Do you want to proceed?",
-# "...continue?", "...allow this connection?", "...use this API key?"). The Codex
-# ones are a best-effort guess at its approval prompt and have NOT been checked
-# against a real Codex — if you run it and they are wrong, this is the section to
-# correct.
+# pattern you cannot see. TWO ship for Claude Code:
+#
+#   claude-proceed — its permission prompts, taken from the wordings actually
+#                    present in the binary ("Do you want to proceed?",
+#                    "...continue?", "...allow this connection?", "...use this
+#                    API key?").
+#   claude-select  — its QUESTION menu, which asks you something rather than
+#                    asking permission ("Which color do you like?" over a list
+#                    of options) and so matches none of the wordings above. That
+#                    gap is a real bug report: a pane sat blocked on a question
+#                    and the panel showed grey.
+#
+# The Codex ones are a best-effort guess at its approval prompt and have NOT been
+# checked against a real Codex — if you run it and they are wrong, this is the
+# section to correct.
+#
+# `claude-select` matches the selector's FOOTER — the "Enter to select · ↑/↓ to
+# navigate · Esc to cancel" hint line — and NOT the "❯ 1. Blue" menu row above
+# it. That distinction is the whole reason it is safe to ship, so it is worth
+# reading next to the one pattern that is deliberately left out:
 #
 # NOT shipped, on purpose: a pattern matching the selected row of a numbered
 # menu, e.g.
@@ -812,6 +826,24 @@
 # slow one: it teaches you to ignore the colour. The question patterns are much
 # less exposed to this — a resumed agent's output pushes the question out of the
 # window within a screenful, while a menu row is the last thing on the screen.
+#
+# The FOOTER is exempt from that trade, and this was checked rather than assumed.
+# The same pane was read twice: while the question was waiting the footer was on
+# screen, and after it was answered the whole block had collapsed to
+#
+#   ⏺ User answered Claude's questions:
+#     ⎿  · Which color do you like? → Blue
+#
+# with no footer anywhere. It is a live keybinding hint tied to an ACTIVE
+# selector, not something that stays behind in the transcript — so it cannot hold
+# the panel red the way a left-behind menu row could. (If you are here about to
+# delete `claude-select` on staleness grounds: that is the objection, and this
+# paragraph is the answer to it.) It generalises deliberately — any Claude Code
+# overlay drawing that footer is by definition waiting on you.
+#
+# It keys on two stable phrases with `.*` between them rather than reproducing
+# the line: it contains a middot, two arrow glyphs and spacing that is very easy
+# to hand-transcribe wrongly. Requiring BOTH ends is what keeps it specific.
 #
 # Soft-wrapped lines are rejoined before matching, so a pattern does not have to
 # survive being cut in half by a narrow pane.
@@ -832,6 +864,11 @@
 #   name = "claude-proceed"
 #   command = "claude"
 #   regex = "(?i)do you want to (proceed|continue|allow|use this api key)"
+#
+#   [[agents.pattern]]
+#   name = "claude-select"
+#   command = "claude"
+#   regex = "(?i)enter to select.*esc to cancel"
 
 # -----------------------------------------------------------------------------
 # REMOTES
