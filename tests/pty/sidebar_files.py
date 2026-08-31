@@ -198,6 +198,10 @@ def setup_dirs():
         os.chmod(f"{FIX}/locked", 0o755)
     except Exception:
         pass
+    try:
+        os.rmdir(f"{FIX}/aaa-new")
+    except Exception:
+        pass
     shutil.rmtree(RUN, ignore_errors=True)
     for s in ("run", "state", "data", "bin", "cfg"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
@@ -487,31 +491,32 @@ def scenario():
     check("10 the panel is still in the fixture directory",
           wait_until(pump, lambda: header(screen).endswith("fixture")),
           header(screen))
-    keys(child, pump, "g")          # cursor on the first entry, `alpha/`
+    keys(child, pump, "g", "j")     # cursor on the SECOND entry, `beta/`
 
-    with open(f"{FIX}/zzz-appeared.txt", "w") as f:
-        f.write("x\n")
-    ok = wait_until(pump, lambda: "zzz-appeared.txt" in entry_rows(screen),
+    # A DIRECTORY that sorts before `beta/`, so the row under the cursor SHIFTS
+    # DOWN by one when it appears. That is what makes case 12 discriminating: a
+    # panel that reselected by index would leave the cursor on `alpha/`, and one
+    # that simply reset it to 0 would land on `aaa-new/` -- both wrong, both
+    # distinguishable from `beta/`. A new file at the END of the list would have
+    # let every one of those pass.
+    os.makedirs(f"{FIX}/aaa-new", exist_ok=True)
+    ok = wait_until(pump, lambda: "aaa-new/" in entry_rows(screen),
                     timeout=REFRESH_WINDOW)
-    check("10 a file created behind the panel's back appears with no keystroke",
-          ok, entry_rows(screen))
+    check("10 a directory created behind the panel's back appears with no "
+          "keystroke", ok, entry_rows(screen))
 
-    # And the cursor did not move with it. `alpha/` sorts first, so the new file
-    # landed BELOW -- but `g` put the cursor on a row that a re-list rebuilds,
-    # and an index-based reselect would have been enough to break case 12 the
-    # other way. Enter is what proves where the cursor actually is.
+    # Enter, not a highlight: where the cursor IS, not where it is painted.
     keys(child, pump, "\r")
-    ok = wait_until(pump, lambda: header(screen).endswith("/alpha"))
-    check("12 the refresh left the cursor on the entry it was on",
-          ok, (header(screen), entry_rows(screen)))
+    ok = wait_until(pump, lambda: header(screen).endswith("/beta"))
+    check("12 the refresh kept the cursor on the entry it was on, though a row "
+          "appeared above it", ok, (header(screen), entry_rows(screen)))
     keys(child, pump, "h")
     wait_until(pump, lambda: header(screen).endswith("fixture"))
 
-    os.remove(f"{FIX}/zzz-appeared.txt")
-    ok = wait_until(pump, lambda: "zzz-appeared.txt" not in entry_rows(screen),
+    os.rmdir(f"{FIX}/aaa-new")
+    ok = wait_until(pump, lambda: "aaa-new/" not in entry_rows(screen),
                     timeout=REFRESH_WINDOW)
-    check("10 and a file removed behind its back disappears",
-          ok, entry_rows(screen))
+    check("10 and one removed behind its back disappears", ok, entry_rows(screen))
 
     # 11: the manual key. Proved by making the automatic one useless -- a file
     # created and then looked for INSIDE one keystroke, faster than the timer
