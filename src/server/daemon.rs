@@ -5288,22 +5288,31 @@ async fn handle_pane_mouse_drag(
     // Current per-(client, pane) offset and the state of any gesture already
     // running on this pane. A drag on a pane this client does not subscribe to
     // is ignored, mirroring `ScrollPane`.
-    let (scroll_offset, gesture, copy_mode) = {
+    //
+    // The lookup yields an Option and the "ignored" branch is handled AFTER the
+    // block, so the `clients` guard is dropped before `disarm_pane_autoscroll`
+    // takes it again: a match arm owns the scrutinee, so `cls` would still be
+    // live inside it, and `tokio::sync::Mutex` is not reentrant. Calling disarm
+    // from inside the match parked this task forever *holding* `clients`, which
+    // wedged every other task that needed the map -- the whole daemon, not just
+    // this client. Do not re-inline it.
+    let subscribed = {
         let cls = clients.lock().await;
         match cls.get(&client_id) {
-            Some(c) if c.subscribed_panes.contains_key(&pane_id) => (
+            Some(c) if c.subscribed_panes.contains_key(&pane_id) => Some((
                 c.pane_scroll.get(&pane_id).copied().unwrap_or(0),
                 c.pane_drag
                     .as_ref()
                     .filter(|d| d.pane_id == pane_id)
                     .map(|d| (d.anchor_col, d.anchor_abs)),
                 c.mode == COPY_MODE,
-            ),
-            _ => {
-                disarm_pane_autoscroll(clients, client_id).await;
-                return Ok(());
-            }
+            )),
+            _ => None,
         }
+    };
+    let Some((scroll_offset, gesture, copy_mode)) = subscribed else {
+        disarm_pane_autoscroll(clients, client_id).await;
+        return Ok(());
     };
     let new_gesture = gesture.is_none();
 
