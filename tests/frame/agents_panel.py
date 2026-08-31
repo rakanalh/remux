@@ -54,9 +54,18 @@ declares no `[[agents.pattern]]`, so the defaults survive), covering:
      screen, so the footer cannot hold the panel red for ever the way a
      left-behind menu row could.
 
+And BOTH logs are checked for:
+
+ 15. **the classification line is logged on TRANSITIONS, not on samples.** It
+     fires per agent pane per sample, up to ten times a second, for ever; a
+     user's `server.log` reached 586 MB in about a day. It had a dedup already,
+     but keyed on the explain STRING, which embeds the elapsed milliseconds and
+     therefore differs on every single sample.
+
 Run: python3 tests/frame/agents_panel.py
 """
 import os
+import re
 import shutil
 import stat
 import sys
@@ -205,6 +214,54 @@ def states(agents):
     return {(a["command"], a["state"]) for a in agents}
 
 
+# `agents: pane_id=<id> <command> -> <State> (<why>)`, the classification line.
+CLASSIFY = re.compile(r"agents: pane_id=(\d+) (\S+) -> (\w+) \((.*)\)\s*$")
+
+
+def classifications(log):
+    """Every classification line in `log`, in order, as (pane_id, state, why)."""
+    out = []
+    for line in log.splitlines():
+        m = CLASSIFY.search(line)
+        if m:
+            out.append((int(m.group(1)), m.group(3), m.group(4)))
+    return out
+
+
+def check_transition_logging(log, label, want_states):
+    """15. The classification line fires on TRANSITIONS, not on samples.
+
+    Two halves, and the second is the one that can go false-green on its own: a
+    "there are no repeats" count is satisfied perfectly by a server that logged
+    NOTHING. So the states this run is known to have passed through are asserted
+    PRESENT first, and only then is the repeat count asserted zero.
+
+    The repeat check is per PANE and looks only at the previous line for THAT
+    pane, because the panes are sampled together: two panes alternating in the
+    log is not a repeat, and a flat "no two identical lines anywhere" check
+    would both miss that and forbid a pane legitimately returning to a state.
+    """
+    seen = classifications(log)
+    got_states = {st for _, st, _ in seen}
+    for want in want_states:
+        check(
+            want in got_states,
+            f"15 {label}: the classification line still reports {want} ({len(seen)} lines)",
+        )
+    last = {}
+    repeats = []
+    for pane, state, why in seen:
+        if last.get(pane) == state:
+            repeats.append((pane, state, why))
+        last[pane] = state
+    check(
+        not repeats,
+        f"15 {label}: no pane logs the same state twice running "
+        f"({len(repeats)} of {len(seen)} lines, e.g. {repeats[:2]})",
+    )
+    return seen
+
+
 def main():
     write_bins()
     srv = Server(RUNDIR).start(config=CONFIG)
@@ -246,6 +303,21 @@ def main():
     # per pane per sample. Once per distinct answer, not once per sample.
     rescues = log.count("matched on argv[0]")
     check(rescues == 1, f"12 and said so ONCE, not once per sample (got {rescues})")
+
+    # 15. The classification line, on both servers.
+    #
+    # Run 1 passes through all three states; run 2 never reaches `Working` as a
+    # LOGGED state on every pane, so only the two it is actually about are
+    # required of it.
+    seen = check_transition_logging(log, "run 1", ("Working", "Idle", "NeedsInput"))
+    seen2 = check_transition_logging(log2, "run 2", ("NeedsInput", "Idle"))
+    # A gross bound as well, because "no ADJACENT repeat" would still pass a
+    # pane oscillating between two states ten times a second. Both runs are well
+    # under a minute and drive a couple of dozen real transitions between them;
+    # the unfixed server emitted a line per pane per sample, at up to ten
+    # samples a second, which lands in the hundreds.
+    total = len(seen) + len(seen2)
+    check(total < 120, f"15 and the two runs together logged {total} classification lines, not hundreds")
 
     print()
     if FAILURES:

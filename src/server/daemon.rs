@@ -364,12 +364,22 @@ struct PaneData {
     /// exactly the tab an agents panel most needs to be right about, so it
     /// cannot be the source for this.
     last_output: std::time::Instant,
-    /// The last agent verdict reported for this pane, as its explain string.
+    /// The last agent verdict LOGGED for this pane: its state and its
+    /// sample-independent reason.
     ///
     /// Kept only so the classification is logged when it CHANGES rather than
     /// ten times a second. `None` for a pane that has never been classified --
     /// which is most of them, since a pane running no agent is never sampled.
-    agent_why: Option<String>,
+    ///
+    /// **Not the explain STRING, which is what this used to be and is why the
+    /// dedup did nothing.** `Verdict::why` embeds the elapsed milliseconds, so
+    /// two consecutive samples of a pane that had not moved compared UNEQUAL and
+    /// both logged -- per agent pane, at up to ten samples a second, into a log
+    /// that is never rotated and (`main.rs` pins the logger at `Debug`) can
+    /// never be turned down. A user reported 586 MB in about a day.
+    /// [`crate::server::agents::Reason`] is the same reason with that number
+    /// taken out.
+    agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
 }
 
 impl Drop for PaneData {
@@ -3697,14 +3707,16 @@ async fn collect_agents(
                 &bottom,
                 now.saturating_duration_since(pd.last_output),
             );
-            // The explain path: say WHY, but only when the answer changes.
-            if pd.agent_why.as_deref() != Some(verdict.why.as_str()) {
+            // The explain path: say WHY, but only on a TRANSITION -- keyed on
+            // the state and the sample-independent reason, never on `why`.
+            let key = (verdict.state, verdict.reason.clone());
+            if pd.agent_verdict.as_ref() != Some(&key) {
                 log::debug!(
                     "agents: pane_id={pane_id} {command} -> {:?} ({})",
                     verdict.state,
                     verdict.why
                 );
-                pd.agent_why = Some(verdict.why.clone());
+                pd.agent_verdict = Some(key);
             }
             entries.push(AgentEntry {
                 pane_id,
@@ -6086,7 +6098,7 @@ async fn spawn_pane(
             forwarding_started: false,
             streamed_session_visible: false,
             last_output: std::time::Instant::now(),
-            agent_why: None,
+            agent_verdict: None,
         },
     );
     Ok(())

@@ -213,7 +213,38 @@ struct CompiledPattern {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     pub state: AgentState,
+    /// The one-line explanation, for the log. Carries SAMPLE-SPECIFIC detail --
+    /// the elapsed milliseconds -- so it is not what a caller may dedupe on.
     pub why: String,
+    /// The same reason with that detail removed, so two consecutive samples of
+    /// an unchanged pane compare EQUAL. See [`Reason`].
+    pub reason: Reason,
+}
+
+/// Why a pane is in the state it is in, stripped of anything that changes from
+/// one sample to the next.
+///
+/// This exists because [`Verdict::why`] cannot serve as a dedup key and quietly
+/// failed to for a whole phase. The caller logged the classification only when
+/// `why` changed -- which reads like a transition check and is not one, because
+/// `why` embeds the elapsed milliseconds. Every sample produced a new string, so
+/// every sample logged, at up to ten lines a second per agent pane, for ever:
+/// one user's `server.log` reached **586 MB in about a day**. Both the `Working`
+/// and the `Idle` wordings carry that number, so it was not one state
+/// misbehaving.
+///
+/// The pattern NAME is part of the key on purpose. Two different patterns both
+/// mean `NeedsInput`, and a pane moving from one to the other is a change of
+/// REASON worth a line even though the state did not move -- which is exactly
+/// what the log is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reason {
+    /// A configured pattern matched; carries its `name`.
+    Pattern(String),
+    /// Output arrived inside the working window.
+    RecentOutput,
+    /// Neither: nothing matched and nothing arrived.
+    Silent,
 }
 
 /// The agent commands and blocked-prompt patterns, ready to match.
@@ -307,6 +338,7 @@ impl AgentRules {
                 return Verdict {
                     state: AgentState::NeedsInput,
                     why: format!("matched pattern {:?}", p.name),
+                    reason: Reason::Pattern(p.name.clone()),
                 };
             }
         }
@@ -314,6 +346,7 @@ impl AgentRules {
             return Verdict {
                 state: AgentState::Working,
                 why: format!("output {}ms ago", since_output.as_millis()),
+                reason: Reason::RecentOutput,
             };
         }
         Verdict {
@@ -322,6 +355,7 @@ impl AgentRules {
                 "no pattern matched; silent for {}ms",
                 since_output.as_millis()
             ),
+            reason: Reason::Silent,
         }
     }
 
@@ -781,6 +815,7 @@ mod tests {
         let screen: Vec<String> = CLAUDE_QUESTION_MENU.iter().map(|s| s.to_string()).collect();
         let v = r.classify("claude", &screen, Duration::from_secs(30));
         assert_eq!(v.state, AgentState::NeedsInput, "{v:?}");
+        assert_eq!(v.reason, Reason::Pattern("claude-select".to_string()));
     }
 
     /// **The staleness objection, tested rather than argued.**
