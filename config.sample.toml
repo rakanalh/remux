@@ -590,15 +590,23 @@
 #   editor  — the editor the `files` panel opens a file with, OVERRIDING the
 #             server's own $EDITOR. Optional and usually absent; the server
 #             already knows $EDITOR. Ignored by every other plugin.
-#   command — REMOVED. See "Migrating from `browser` / the old `files`" below.
+#   command — parsed and then IGNORED, with a warning naming `editor`. See
+#             "Migrating from `browser` / the old `files`" below.
 #
 # Available plugins:
 #
 #   sessions    — a live tree of every session, tab and pane across the local
 #                 server and every connected remote. It refreshes by itself when
 #                 the server's tree changes; Enter jumps to whatever is selected.
-#   files       — a built-in file browser. NO configuration: nothing to set,
-#                 no opener hook, nothing to install.
+#
+#                 `j`/`k` (or the arrows) move, `g`/`G` jump to the ends, and
+#                 `l`/`h` EXPAND and COLLAPSE a node rather than toggling it, so
+#                 holding a direction cannot flap one open and shut. Space
+#                 toggles. Note that Space MARKS panes for a view in the session
+#                 manager OVERLAY; in this panel it only opens and closes nodes.
+#   files       — a built-in file browser. No REQUIRED configuration: nothing to
+#                 set beyond the optional `editor` above, no opener hook,
+#                 nothing to install.
 #
 #                   [[sidebar.panel]]
 #                   plugin = "files"

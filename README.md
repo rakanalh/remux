@@ -74,11 +74,12 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 ### Sidebars & plugins
 
 - **Sidebars** — client-side panels docked to the **left**, **right**, and/or **bottom** edge; one sidebar per edge, up to three at once, each stacking one or more plugin **panels**. They are chrome, not panes: the server never sees them, they take their slice of the terminal and hand the panes what is left. There are none by default — declare `[[sidebar]]` / `[[sidebar.panel]]` to opt in.
-- **`sessions` panel** — the session-manager tree, live in a sidebar instead of an overlay: every session, tab, and pane across the local server and every connected remote, refreshed by the server as things change. `Enter` jumps to whatever is selected.
-- **`files` panel** — a built-in file browser with **nothing to configure**, following the focused pane's directory. `j`/`k` move, `l`/`h` (or the arrows) descend and go up, `.` toggles hidden entries, `r` re-lists now, and **`Enter` on a file opens it in a split running an editor** — taking the keyboard with it, so you land in the editor rather than in the sidebar. The listing and the editor both come from the **server**, so pointing it at a pane on a remote browses and edits *that* machine. It **re-lists itself** every couple of seconds while it is on screen, so files created or removed by anything else appear and disappear with no keystroke — and the cursor stays on the entry it was on, by name. A hidden or closed sidebar polls nothing. (It was called `browser` until the two file panels merged; the old name still loads, with a warning. See [Migrating](#migrating-from-browser--the-old-files).)
-- **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
-- **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` cycles focus between them. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
-- **They follow the focused pane** — the file panels show the directory of the pane you are focused **on**, and it updates when **focus** moves, not when you `cd`. Focus a pane on a remote and they list that machine.
+- **`sessions` panel** — the session-manager tree, live in a sidebar instead of an overlay: every session, tab, and pane across the local server and every connected remote, refreshed by the server as things change. `j`/`k` (or the arrows) move and `g`/`G` jump to the ends, `l`/`h` expand and collapse a node, `Space` toggles one, and `Enter` jumps to whatever is selected. (`Space` *marks* panes for a view in the session-manager overlay; in the panel it only opens and closes nodes.)
+- **`files` panel** — a built-in file browser with **nothing you must configure**, following the focused pane's directory. `j`/`k` move and `g`/`G` jump to the ends, `l`/`h` (or the arrows) descend and go up, `.` toggles hidden entries, `r` re-lists now, and **`Enter` on a file opens it in a split running an editor** — taking the keyboard with it, so you land in the editor rather than in the sidebar. The listing and the editor both come from the **server**, so pointing it at a pane on a remote browses and edits *that* machine. It **re-lists itself** every couple of seconds while it is on screen, so files created or removed by anything else appear and disappear with no keystroke — and the cursor stays on the entry it was on, by name. A hidden or closed sidebar polls nothing. (It was called `browser` until the two file panels merged; the old name still loads, with a warning. See [Migrating](#migrating-from-browser--the-old-files).)
+- **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
+- **`placeholder` panel** — a test fixture that paints its own name and size. It exists for checking sidebar geometry; there is nothing to configure and no reason to dock one day to day.
+- **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` walks focus through every visible panel and then back to the panes. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
+- **The `files` panel follows the focused pane** — it shows the directory of the pane you are focused **on**, and it moves when **focus** moves, *not* when you `cd`. That is the one thing that looks broken by hand: typing `cd ~/project` in a pane does not move the panel. Navigate the panel yourself with `h`/`l` and it stays where you put it, resuming its following once it is back on the pane's own directory. It follows the pane's **machine** too — focus a pane on a remote and it lists that remote's filesystem.
 - **Config edits apply live**, with one visible cost: reloading rebuilds the panels, so a `sessions` tree loses its expansion and selection. The alternative was a `[[sidebar]]` block that needed a client restart to appear.
 
 ### Mouse
@@ -312,7 +313,7 @@ Views are virtual tabs whose cells alias existing panes (see [Views](#views-cros
 | `h` | Toggle the **left** sidebar |
 | `l` | Toggle the **right** sidebar |
 | `j` | Toggle the **bottom** sidebar |
-| `b` | Cycle focus between the visible sidebars |
+| `b` | Cycle focus through every visible panel, then back to the panes |
 
 There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h/j/k/l` already move into and out of one exactly as they move between panes. The `SidebarFocusLeft` / `SidebarFocusRight` / `SidebarFocusBottom` commands exist and can be bound if you want them.
 
@@ -320,7 +321,7 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 
 | Shortcut | Action |
 |----------|--------|
-| `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right |
+| `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right — and into or out of a sidebar on that edge |
 | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
 | `Alt-,` / `Alt-.` | Previous / next tab |
 | `Alt-1` … `Alt-9` | Jump to tab 1–9 |
@@ -439,10 +440,10 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `SidebarToggleLeft` | — | Show/hide the left sidebar. |
 | `SidebarToggleRight` | — | Show/hide the right sidebar. |
 | `SidebarToggleBottom` | — | Show/hide the bottom sidebar. |
-| `SidebarCycle` | — | Cycle keyboard focus between the visible sidebars. |
-| `SidebarFocusLeft` | — | Focus the left sidebar (unbound by default). |
-| `SidebarFocusRight` | — | Focus the right sidebar (unbound by default). |
-| `SidebarFocusBottom` | — | Focus the bottom sidebar (unbound by default). |
+| `SidebarCycle` | — | Cycle keyboard focus through every visible panel, then back to the panes. |
+| `SidebarFocusLeft` | — | Focus the left sidebar, opening it if hidden (unbound by default). |
+| `SidebarFocusRight` | — | Focus the right sidebar, opening it if hidden (unbound by default). |
+| `SidebarFocusBottom` | — | Focus the bottom sidebar, opening it if hidden (unbound by default). |
 | `EnterNormal` | — | Return to Normal mode (keys pass to the app). |
 | `EnterCommandMode` | — | Enter Command mode (navigate the leader tree). |
 | `EnterVisualMode` | — | Enter Visual/copy mode. |
@@ -506,7 +507,7 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `[appearance.theme]` — per-role colors (named / hex / `{ ansi = N }` / `{ rgb = [r,g,b] }`); defaults are Catppuccin Mocha.
 - **`[modes.command]`**
   - `timeout_ms` — delay before the which-key popup appears (default 500).
-- **`[[sidebar]]` / `[[sidebar.panel]]`** — dock panels to an edge. One sidebar per edge; `edge` and `size` are required, `visible` defaults to true. Each panel names a `plugin` (`sessions`, `files`, `agents`) and optionally a `weight` (its share of the sidebar) and, for `files`, an `editor`. Nothing is docked by default:
+- **`[[sidebar]]` / `[[sidebar.panel]]`** — dock panels to an edge. One sidebar per edge; `edge` and `size` are required, `visible` defaults to true. Each panel names a `plugin` (`sessions`, `files`, `agents`, `placeholder`) and optionally a `weight` (its share of the sidebar) and, for `files`, an `editor`. Nothing is docked by default:
 
 ```toml
 [[sidebar]]
