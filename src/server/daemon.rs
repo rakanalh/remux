@@ -74,6 +74,26 @@ pub(crate) fn get_process_name(pid: i32) -> String {
         .unwrap_or_else(|_| "shell".to_string())
 }
 
+/// The one `sysinfo::System` this module owns, built on first use.
+///
+/// Hoisted out of [`get_process_name`] so [`get_process_names`] can share it
+/// rather than construct a second: on macOS `System::new()` calls
+/// `mach_host_self()`, reads the host clock info, enumerates CPUs and allocates
+/// a 200-slot process map before the refresh that does the work, and both
+/// callers run per candidate pane at up to 10 Hz. Refresh kinds are per-CALL,
+/// so sharing the `System` costs the two callers nothing in what they read.
+///
+/// Still a different one from [`crate::server::persistence::get_pane_cwd`]'s:
+/// that one is private to its function, refreshes a different field (`cwd`) and
+/// is driven by a different push. Sharing across modules would couple two
+/// cadences for no gain.
+#[cfg(target_os = "macos")]
+fn proc_system() -> &'static std::sync::Mutex<sysinfo::System> {
+    use std::sync::{Mutex, OnceLock};
+    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+    SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()))
+}
+
 /// See the Linux variant for documentation. macOS reads the name through
 /// `sysinfo` because there is no `/proc` filesystem.
 ///
@@ -85,11 +105,11 @@ pub(crate) fn get_process_name(pid: i32) -> String {
 /// the agents pusher's cadence -- up to 10 Hz while an agent is `Working` --
 /// so a per-call construction would put all of that on a timer.
 ///
-/// A SECOND `System` rather than sharing `get_pane_cwd`'s: that one is private
-/// to its function, the two refresh different fields (`cwd` there, nothing but
-/// the base info here), and they are driven by different pushes. The cost is one
-/// more retained `Process` entry per pid ever queried, bounded by the panes this
-/// server has looked at and dropped as soon as a refresh finds the process dead.
+/// The `System` is [`proc_system`]'s, shared with [`get_process_names`] and
+/// deliberately NOT `get_pane_cwd`'s -- see `proc_system`'s own docs for why the
+/// line is drawn there. The cost is one more retained `Process` entry per pid
+/// ever queried, bounded by the panes this server has looked at and dropped as
+/// soon as a refresh finds the process dead.
 ///
 /// `ProcessRefreshKind::nothing()` is deliberate and sufficient: the process
 /// NAME is base information populated when `sysinfo` first sees the process, not
@@ -100,17 +120,13 @@ pub(crate) fn get_process_name(pid: i32) -> String {
 /// panicking caller must not cost every later pane its name.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_process_name(pid: i32) -> String {
-    use std::sync::{Mutex, OnceLock};
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
-    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
 
     if pid <= 0 {
         return "shell".to_string();
     }
     let spid = Pid::from_u32(pid as u32);
-    let mut system = SYSTEM
-        .get_or_init(|| Mutex::new(System::new()))
+    let mut system = proc_system()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     system.refresh_processes_specifics(
@@ -131,6 +147,125 @@ pub(crate) fn get_process_name(pid: i32) -> String {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn get_process_name(_pid: i32) -> String {
     "shell".to_string()
+}
+
+/// Every name by which this OS will admit to knowing `pid`.
+///
+/// [`get_process_name`] alone is not enough to RECOGNISE a program, because the
+/// two platforms answer a different question and for some programs the two
+/// answers disagree:
+///
+/// * Linux `/proc/<pid>/comm` is a process TITLE. It starts as the executable's
+///   basename, and a process may then set it to whatever it likes
+///   (`prctl(PR_SET_NAME)`, which is what `process.title =` compiles down to in
+///   every Node/Bun-shaped runtime).
+/// * macOS `sysinfo` reports `exe.file_name()` -- the EXECUTABLE PATH's
+///   basename, from `KERN_PROCARGS2`'s `exec_path` or `proc_pidpath`
+///   (`sysinfo-0.35.2/src/unix/apple/macos/process.rs:574` and `:439`). It never
+///   reads `p_comm`, and no title a process sets for itself can move it.
+///
+/// Claude Code is exactly the program that falls in the gap. Its installer
+/// execs a VERSIONED path with `argv[0] = "claude"`:
+///
+/// ```text
+/// comm=claude exe=/home/rakan/.local/share/claude/versions/2.1.251
+///     argv: claude --dangerously-skip-permissions --resume
+/// ```
+///
+/// so Linux says `claude` (the title the binary sets) while macOS says
+/// `2.1.251` (the executable's real basename) -- and `2.1.251` matches nothing
+/// in `[agents] commands`, which is the whole of the "the agents panel is empty
+/// on my Mac" report. `argv[0]` is the name both platforms agree on, so it is
+/// carried alongside as the second candidate.
+///
+/// **This is deliberately NOT [`get_process_name`].** Pane names keep reading
+/// `comm` alone: that runs per live pane from the session-tree push while three
+/// locks are held, and it has no naming problem to fix.
+pub(crate) struct ProcessNames {
+    /// Whatever [`get_process_name`] reports. Never empty -- `"shell"` when the
+    /// process cannot be read at all.
+    pub name: String,
+    /// The process's `argv[0]`, VERBATIM: a bare word (`claude`), a path
+    /// (`/usr/local/bin/claude`), or a login shell's leading-dash convention
+    /// (`-zsh`). Reducing it to a name is the caller's job and is a pure
+    /// function, which is why it is not done here. `None` when the OS will not
+    /// say.
+    pub argv0: Option<String>,
+}
+
+/// The Linux arm: `comm`, plus the first NUL-separated field of
+/// `/proc/<pid>/cmdline`.
+///
+/// The `cmdline` read is UNCONDITIONAL rather than taken only when `comm` fails
+/// to match, and that is a deliberate trade. Making it lazy would save one small
+/// procfs read per non-agent pane per sample (single-digit microseconds, against
+/// a `tcgetpgrp` syscall and a `comm` read already paid on the same pass) and
+/// would cost the macOS arm a SECOND `KERN_PROCARGS2` round trip, because
+/// `sysinfo` re-runs it on every `refresh_processes_specifics` regardless of the
+/// refresh kind. Cheap where it is paid, avoided where it is dear.
+#[cfg(target_os = "linux")]
+pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
+    ProcessNames {
+        name: get_process_name(pid),
+        argv0: std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .and_then(|raw| {
+                let first = raw.split(|b| *b == 0).next()?;
+                (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
+            }),
+    }
+}
+
+/// See the Linux variant for documentation. macOS reads both through `sysinfo`,
+/// in ONE refresh.
+///
+/// One refresh and not two: `update_process` re-runs the `KERN_PROCARGS2`
+/// sysctl pair on every refresh whatever the `ProcessRefreshKind`
+/// (`sysinfo-0.35.2/src/unix/apple/macos/process.rs:700`), so asking for the
+/// name and then the args separately would fetch the whole args-and-environment
+/// buffer twice per pane per sample. Folding them into one call makes the extra
+/// data free: the buffer is already in hand and `with_cmd` only parses it.
+///
+/// `UpdateKind::OnlyIfNotSet` rather than `Always` because `argv[0]` does not
+/// change over a process's life, so the parse is paid once per pid.
+#[cfg(target_os = "macos")]
+pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+
+    let unknown = || ProcessNames {
+        name: "shell".to_string(),
+        argv0: None,
+    };
+    if pid <= 0 {
+        return unknown();
+    }
+    let spid = Pid::from_u32(pid as u32);
+    let mut system = proc_system()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    match system.process(spid) {
+        Some(p) => ProcessNames {
+            name: p.name().to_string_lossy().to_string(),
+            argv0: p.cmd().first().map(|a| a.to_string_lossy().to_string()),
+        },
+        None => unknown(),
+    }
+}
+
+/// Fallback for platforms with no known way to name a foreign process. The name
+/// is `"shell"` and there is no `argv[0]`, so nothing can ever match -- which is
+/// what [`crate::server::agents::DETECTION_SUPPORTED`] reports as `false`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
+    ProcessNames {
+        name: get_process_name(pid),
+        argv0: None,
+    }
 }
 
 /// Return the runtime directory used for the socket and pid files.
@@ -3517,8 +3652,9 @@ async fn collect_agents(
     let matched: Vec<(PaneId, String)> = masters
         .iter()
         .filter_map(|(id, fd)| {
-            let comm = crate::server::agents::foreground_command(std::os::fd::AsFd::as_fd(fd))?;
-            rules.is_agent(&comm).then_some((*id, comm))
+            let comm =
+                crate::server::agents::foreground_command(std::os::fd::AsFd::as_fd(fd), rules)?;
+            Some((*id, comm))
         })
         .collect();
     drop(masters);

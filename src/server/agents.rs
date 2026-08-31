@@ -3,11 +3,15 @@
 //! Two jobs, both pure enough to test on their own:
 //!
 //! * **Detection** ([`foreground_command`]) reads the PTY's foreground process
-//!   group and asks `/proc` what it is. `Pty::child_pid` is the login SHELL, so
+//!   group and asks the OS what it is. `Pty::child_pid` is the login SHELL, so
 //!   the pane's own name is `zsh` however long `claude` has been running in it;
-//!   `tcgetpgrp` is what sees past that. Deliberately scoped to agent detection
-//!   -- pane NAMES are untouched, because fixing them the same way would rename
-//!   every pane border in the product and that needs its own decision.
+//!   `tcgetpgrp` is what sees past that. It then matches on TWO names -- the
+//!   process name and its `argv[0]` -- because the platforms answer differently
+//!   and Claude Code falls in the gap; see
+//!   [`crate::server::daemon::ProcessNames`]. Deliberately scoped to agent
+//!   detection -- pane NAMES are untouched, because fixing them the same way
+//!   would rename every pane border in the product and that needs its own
+//!   decision.
 //! * **Classification** ([`AgentRules::classify`]) is a pure function of the
 //!   visible screen and how long ago output arrived.
 //!
@@ -54,10 +58,35 @@ use crate::screen::Screen;
 /// (`ServerMessage::AgentList`) so the panel can say why it is empty rather than
 /// looking broken.
 ///
-/// `tcgetpgrp` is POSIX and needs no split; the platform question is only ever
-/// "can this build NAME a pid". So this mirrors `get_process_name`'s cfg arms
-/// exactly rather than inventing a second platform split -- if the two ever
-/// disagree, the panel is lying in one direction or the other.
+/// `tcgetpgrp` needs no split, so the platform question is only ever "can this
+/// build NAME a pid" -- and this mirrors `get_process_name`'s cfg arms exactly
+/// rather than inventing a second platform split, because if the two ever
+/// disagree the panel is lying in one direction or the other.
+///
+/// **The reason `tcgetpgrp` needs no split is NOT that it is POSIX**, which is
+/// what this comment used to say and is what sent a later reader hunting a
+/// non-existent macOS bug here. POSIX says nothing about calling it on a PTY
+/// MASTER, which is not a controlling terminal -- so portability is a matter of
+/// what each kernel chose. Both of ours chose to answer. XNU special-cases it in
+/// `ptyioctl` on the controller side, precisely to avoid the controlling-
+/// terminal requirement (`bsd/kern/tty_dev.c`, and `tty_ptmx.c` wires the ptmx
+/// master's `d_open` to the `ptcopen` this branch tests for):
+///
+/// ```c
+/// } else if (cdevsw[major(dev)].d_open == ptcopen) {
+///     switch (cmd) {
+///     case TIOCGPGRP:
+///         /*
+///          * We aviod calling ttioctl on the controller since,
+///          * in that case, tp must be the controlling terminal.
+///          */
+///         *(int *)data = tp->t_pgrp ? tp->t_pgrp->pg_id : 0;
+/// ```
+///
+/// Linux's `ptmx` implements `TIOCGPGRP` on the master directly; FreeBSD reaches
+/// the same place by redirecting unhandled master ioctls to the slave tty. Note
+/// the `: 0` above: a master with no session attached reports pgid **0**, not an
+/// error, and pid 0 names nothing -- so that reads as "no agent", not a panic.
 ///
 /// COMPILE-TIME, so it reports what this BUILD could do, never what a given
 /// sample actually did: a Linux server with no `/proc` mounted, or one whose
@@ -65,17 +94,63 @@ use crate::screen::Screen;
 /// `ServerMessage::AgentList`'s field docs.
 pub const DETECTION_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
-/// The command running in the foreground of this PTY, e.g. `"claude"`.
+/// The CONFIGURED agent command running in the foreground of this PTY, e.g.
+/// `"claude"`, or `None` if this pane is not running one.
 ///
-/// `None` when the PTY has no foreground group to report -- a child that is
+/// `None` also when the PTY has no foreground group to report -- a child that is
 /// exiting, or already gone. NEVER a panic: this runs on a timer against panes
 /// that close underneath it, which is the exact boundary at which Phase C found
 /// two latent PTY bugs.
-pub fn foreground_command(fd: BorrowedFd<'_>) -> Option<String> {
+///
+/// The `rules` are taken here rather than the raw name being returned for the
+/// caller to test, because the OS offers SEVERAL names for a process and which
+/// one matched is not the caller's business -- see [`crate::server::daemon::ProcessNames`] for why
+/// there is more than one, and [`AgentRules::match_command`] for the order they
+/// are tried in. What comes back is always a string from `[agents] commands`,
+/// which is what `AgentEntry::command` promises and what `classify`'s
+/// per-command patterns are scoped against.
+///
+/// The two log lines are the only diagnostic anyone gets for "the panel is empty
+/// but the agent is right there", so they say which name was read, not just that
+/// nothing matched. The rescue is `debug` because it is rare and worth seeing;
+/// the plain miss is `trace` because it would otherwise fire for every ordinary
+/// shell pane on every sample, up to ten times a second.
+pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<String> {
     let pgid = nix::unistd::tcgetpgrp(fd).ok()?;
-    // The same `/proc/<pid>/comm` reader the session tree uses for pane names,
-    // handed the process GROUP leader instead of the shell. One reader.
-    Some(crate::server::daemon::get_process_name(pgid.as_raw()))
+    let pid = pgid.as_raw();
+    let names = crate::server::daemon::get_process_names(pid);
+    match rules.match_command(&names.name, names.argv0.as_deref()) {
+        Some(command) => {
+            if command != names.name {
+                log::debug!(
+                    "agents: pid={pid} is {command:?}, matched on argv[0] {:?} -- \
+                     this platform names the process {:?}",
+                    names.argv0,
+                    names.name
+                );
+            }
+            Some(command.to_string())
+        }
+        None => {
+            log::trace!(
+                "agents: pid={pid} is not a configured agent: name={:?} argv0={:?}",
+                names.name,
+                names.argv0
+            );
+            None
+        }
+    }
+}
+
+/// The name part of an `argv[0]`.
+///
+/// Verbatim apart from the path: a login shell's `-zsh` stays `-zsh` and does
+/// NOT match a configured `zsh`, because the dash is how the OS distinguishes
+/// the two and inventing an equivalence here would be a new false positive in
+/// the name of fixing a false negative.
+fn argv0_name(argv0: &str) -> Option<&str> {
+    let name = argv0.rsplit('/').next().unwrap_or(argv0);
+    (!name.is_empty()).then_some(name)
 }
 
 /// A configured pattern, compiled.
@@ -141,9 +216,31 @@ impl AgentRules {
         }
     }
 
-    /// Whether a pane whose foreground command is `comm` belongs in the list.
-    pub fn is_agent(&self, comm: &str) -> bool {
-        self.commands.iter().any(|c| c == comm)
+    /// The configured command this process is running, if any.
+    ///
+    /// `name` is what the OS calls the process and `argv0` is its `argv[0]`, and
+    /// the two disagree for real programs --
+    /// [`crate::server::daemon::ProcessNames`] has the case that
+    /// prompted this. Both are candidates; the first that IS a configured
+    /// command wins.
+    ///
+    /// **`name` is tried first, and the order is load-bearing rather than
+    /// arbitrary.** It is the answer Linux has always given and every existing
+    /// harness pins, so trying it first leaves that path's outcome untouched and
+    /// makes `argv0` purely additive -- a rescue for the panes the old rule
+    /// missed, never a re-decision of one it already got right.
+    ///
+    /// The return is borrowed from `commands`, so a caller cannot accidentally
+    /// report the raw candidate: what comes back is the CONFIGURED spelling.
+    pub fn match_command(&self, name: &str, argv0: Option<&str>) -> Option<&str> {
+        if let Some(c) = self.commands.iter().find(|c| c.as_str() == name) {
+            return Some(c.as_str());
+        }
+        let base = argv0.and_then(argv0_name)?;
+        self.commands
+            .iter()
+            .find(|c| c.as_str() == base)
+            .map(|c| c.as_str())
     }
 
     /// Whether anything is configured at all. With no commands there is nothing
@@ -334,12 +431,106 @@ mod tests {
     #[test]
     fn only_configured_commands_are_agents() {
         let r = shipped();
-        assert!(r.is_agent("claude"));
-        assert!(r.is_agent("codex"));
-        assert!(!r.is_agent("zsh"));
-        assert!(!r.is_agent("vim"));
+        assert_eq!(r.match_command("claude", None), Some("claude"));
+        assert_eq!(r.match_command("codex", None), Some("codex"));
+        assert_eq!(r.match_command("zsh", None), None);
+        assert_eq!(r.match_command("vim", None), None);
         // `get_process_name`'s unreadable-process fallback must not be an agent.
-        assert!(!r.is_agent("shell"));
+        assert_eq!(r.match_command("shell", None), None);
+    }
+
+    /// THE macOS BUG, as a unit test.
+    ///
+    /// Claude Code's installer execs `~/.local/share/claude/versions/<version>`
+    /// with `argv[0] = "claude"`. Linux `comm` reports the title the binary sets
+    /// (`claude`); macOS `sysinfo` reports the executable's basename
+    /// (`2.1.251`), which matches nothing in `commands` -- an agents panel that
+    /// is empty on a Mac while detection is running perfectly.
+    #[test]
+    fn a_process_named_after_its_version_is_still_matched_by_argv0() {
+        let r = shipped();
+        assert_eq!(r.match_command("2.1.251", Some("claude")), Some("claude"));
+    }
+
+    /// `argv[0]` is often a path, and only its last component is a name.
+    #[test]
+    fn an_argv0_that_is_a_path_matches_on_its_basename() {
+        let r = shipped();
+        assert_eq!(
+            r.match_command("node", Some("/Users/rakan/.local/bin/claude")),
+            Some("claude")
+        );
+        // ...and a path with nothing after the last slash names nothing.
+        assert_eq!(r.match_command("node", Some("/usr/local/bin/")), None);
+        assert_eq!(r.match_command("node", Some("")), None);
+    }
+
+    /// Each candidate must be able to match ON ITS OWN.
+    ///
+    /// Pinned separately because the fallback can MASK the primary: if `name`
+    /// matching broke, every real agent would still be found through `argv[0]`
+    /// and the end-to-end harnesses would stay green over a dead code path.
+    #[test]
+    fn each_candidate_matches_without_help_from_the_other() {
+        let r = shipped();
+        // Name alone, with argv[0] absent and then actively wrong.
+        assert_eq!(r.match_command("claude", None), Some("claude"));
+        assert_eq!(r.match_command("claude", Some("/bin/zsh")), Some("claude"));
+        // argv[0] alone, with the name actively wrong.
+        assert_eq!(r.match_command("bun", Some("codex")), Some("codex"));
+    }
+
+    /// The NAME is tried first. A pane whose name already matches is decided by
+    /// the rule that has always decided it, whatever its `argv[0]` says.
+    #[test]
+    fn the_process_name_outranks_argv0() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["claude".to_string(), "codex".to_string()],
+            working_ms: 500,
+            scan_rows: 12,
+            pattern: Vec::new(),
+        });
+        assert_eq!(r.match_command("claude", Some("codex")), Some("claude"));
+    }
+
+    #[test]
+    fn a_pane_matching_on_neither_name_is_not_an_agent() {
+        let r = shipped();
+        assert_eq!(r.match_command("2.1.251", Some("/usr/bin/vim")), None);
+        assert_eq!(r.match_command("zsh", Some("-zsh")), None);
+    }
+
+    /// A login shell's leading dash is part of its `argv[0]`, and is left there.
+    /// Stripping it would make `-zsh` match a configured `zsh` -- a new false
+    /// positive introduced while fixing a false negative.
+    #[test]
+    fn a_login_shells_leading_dash_is_not_stripped() {
+        let r = AgentRules::from_config(&AgentsConfig {
+            commands: vec!["zsh".to_string()],
+            working_ms: 500,
+            scan_rows: 12,
+            pattern: Vec::new(),
+        });
+        assert_eq!(r.match_command("bash", Some("-zsh")), None);
+        assert_eq!(r.match_command("bash", Some("/bin/zsh")), Some("zsh"));
+    }
+
+    /// What comes back is the CONFIGURED spelling, which is what
+    /// `AgentEntry::command` promises and what `classify` scopes patterns
+    /// against -- so a pattern with `command = "claude"` still fires for a pane
+    /// that was only recognisable through its `argv[0]`.
+    #[test]
+    fn a_pane_matched_by_argv0_is_still_scoped_to_its_configured_patterns() {
+        let r = rules(vec![pattern("approval", Some("claude"), r"proceed\?")], 500);
+        let command = r
+            .match_command("2.1.251", Some("/opt/claude"))
+            .expect("argv[0] names a configured command");
+        assert_eq!(command, "claude");
+        assert_eq!(
+            r.classify(command, &["proceed?".to_string()], Duration::from_secs(60))
+                .state,
+            AgentState::NeedsInput
+        );
     }
 
     #[test]
