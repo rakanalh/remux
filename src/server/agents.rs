@@ -110,35 +110,78 @@ pub const DETECTION_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = 
 /// which is what `AgentEntry::command` promises and what `classify`'s
 /// per-command patterns are scoped against.
 ///
-/// The two log lines are the only diagnostic anyone gets for "the panel is empty
-/// but the agent is right there", so they say which name was read, not just that
-/// nothing matched. The rescue is `debug` because it is rare and worth seeing;
-/// the plain miss is `trace` because it would otherwise fire for every ordinary
-/// shell pane on every sample, up to ten times a second.
+/// The log line is the only diagnostic anyone gets for "the panel is empty but
+/// the agent is right there", so it says which names were read rather than just
+/// that nothing matched. See [`log_detection`] for why it is deduplicated
+/// instead of levelled down.
 pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<String> {
     let pgid = nix::unistd::tcgetpgrp(fd).ok()?;
     let pid = pgid.as_raw();
     let names = crate::server::daemon::get_process_names(pid);
-    match rules.match_command(&names.name, names.argv0.as_deref()) {
-        Some(command) => {
-            if command != names.name {
-                log::debug!(
-                    "agents: pid={pid} is {command:?}, matched on argv[0] {:?} -- \
-                     this platform names the process {:?}",
-                    names.argv0,
-                    names.name
-                );
-            }
-            Some(command.to_string())
-        }
-        None => {
-            log::trace!(
-                "agents: pid={pid} is not a configured agent: name={:?} argv0={:?}",
-                names.name,
-                names.argv0
-            );
-            None
-        }
+    let matched = rules.match_command(&names.name, names.argv0.as_deref());
+    log_detection(pid, &names, matched);
+    matched.map(|c| c.to_string())
+}
+
+/// Say what this pane's process was called and what it was taken for -- ONCE
+/// per distinct answer.
+///
+/// **The dedupe is what makes this loggable at all.** There is no level quiet
+/// enough to hide behind: `main.rs` pins the logger at `Debug` and never reads
+/// `RUST_LOG`, so `trace!` would be invisible to a user and `debug!` would fire
+/// for every non-agent pane on every sample -- tens of lines a second into a log
+/// that is not rotated. One line per newly-seen foreground process is what
+/// somebody debugging "the panel is empty" actually wants, and it is the only
+/// thing that can answer "so what DID this platform call it".
+///
+/// A pane matched on its own name is the ordinary case and says nothing.
+///
+/// The cache is CLEARED rather than evicted when it fills. It exists to suppress
+/// repeats, not to remember, so the worst a clear costs is one repeated line --
+/// against an eviction policy whose bound would have to be argued for.
+fn log_detection(pid: i32, names: &crate::server::daemon::ProcessNames, matched: Option<&str>) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    /// One logged answer: the pid, both names it went by, and whether it was
+    /// taken for an agent.
+    type Answer = (i32, String, Option<String>, bool);
+    /// Distinct foreground processes remembered before starting over.
+    const CAP: usize = 256;
+    static SEEN: OnceLock<Mutex<HashSet<Answer>>> = OnceLock::new();
+
+    if matched == Some(names.name.as_str()) {
+        return;
+    }
+    let key = (
+        pid,
+        names.name.clone(),
+        names.argv0.clone(),
+        matched.is_some(),
+    );
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= CAP {
+        seen.clear();
+    }
+    if !seen.insert(key) {
+        return;
+    }
+    drop(seen);
+    match matched {
+        Some(command) => log::debug!(
+            "agents: pid={pid} is {command:?}, matched on argv[0] {:?} -- \
+             this platform names the process {:?}",
+            names.argv0,
+            names.name
+        ),
+        None => log::debug!(
+            "agents: pid={pid} is not a configured agent: name={:?} argv0={:?}",
+            names.name,
+            names.argv0
+        ),
     }
 }
 

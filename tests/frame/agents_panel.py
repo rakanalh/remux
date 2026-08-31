@@ -194,6 +194,19 @@ def main():
 
     check("panicked at" not in log, "no panic in the server log")
 
+    # The user-facing diagnostic for "the panel is empty but the agent is right
+    # there". On a Mac it is the ONLY thing that can say what the platform
+    # called the process, so it is pinned rather than left to rot -- and pinned
+    # on the RESCUE line specifically, which no run without case 12 would emit.
+    check(
+        'matched on argv[0]' in log and '"2.1.251"' in log,
+        "12 the server logged WHICH name it matched on, and what it called the process",
+    )
+    # It is deduplicated, because the logger is pinned at Debug and this fires
+    # per pane per sample. Once per distinct answer, not once per sample.
+    rescues = log.count("matched on argv[0]")
+    check(rescues == 1, f"12 and said so ONCE, not once per sample (got {rescues})")
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + "; ".join(FAILURES))
