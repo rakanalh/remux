@@ -8,6 +8,7 @@ mod protocol;
 mod screen;
 mod server;
 
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -618,13 +619,61 @@ async fn ensure_server_running() -> Result<()> {
         "ensure_server_running: spawning server from {}",
         exe.display()
     );
-    std::process::Command::new(exe)
-        .arg("server")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("server")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawning server process")?;
+        .stderr(std::process::Stdio::null());
+
+    // Detach the server from the terminal that is spawning it. Null stdio LOOKS
+    // like daemonizing and is not: without this the child inherits our process
+    // GROUP, our SESSION and our controlling terminal, and sits in the
+    // foreground group -- so closing the terminal SIGHUPs the whole group and
+    // takes the server down with the client. The next client then finds no
+    // server and starts a fresh one, which the user sees as "my sessions were
+    // not resumed". `setsid` makes the child a session leader with no
+    // controlling terminal, so a terminal closing has nothing to signal it
+    // through. It is the standard daemon step and what tmux does.
+    //
+    // The server stays terminal-free afterwards, and that is worth stating
+    // because `setsid` alone does not guarantee it: a session leader is
+    // precisely the kind of process that CAN acquire a controlling terminal,
+    // by opening a tty without `O_NOCTTY`. The only ttys this process opens
+    // are pane PTYs. Traced rather than assumed (glibc 2.43): the master is
+    // `openat("/dev/ptmx", O_RDWR)` -- no `O_NOCTTY`, but a pty MASTER is not
+    // a controlling-terminal candidate -- and the slave never reaches this
+    // process as an `open` at all, since `openpty(3)` obtains it with
+    // `ioctl(master, TIOCGPTPEER, O_RDWR|O_NOCTTY)`. The `setsid`/`TIOCSCTTY`
+    // pair in `Pty::spawn` runs in the forked CHILD, not here.
+    //
+    // The mechanism is glibc's to change, so the PROPERTY is what is pinned:
+    // `tests/pty/server_daemonized.py` asserts the server's `tty_nr` is still
+    // 0 once a pane exists. Note that check is only meaningful on a session
+    // LEADER -- a non-leader cannot acquire a ctty whatever it opens, so the
+    // same assertion against a hand-started server passes without testing
+    // anything.
+    //
+    // SAFETY: the closure runs in the child between fork and exec, where only
+    // async-signal-safe functions may be called -- the allocator lock can be
+    // held by a thread that does not exist on this side of the fork. This is
+    // the same constraint `Pty::spawn`'s fork path documents. `setsid` is a
+    // bare syscall wrapper, and `Error::from_raw_os_error` does not allocate;
+    // nothing here logs, locks or allocates.
+    //
+    // A `setsid` failure ABORTS the spawn rather than proceeding undetached.
+    // `EPERM` -- already a process-group leader -- is unreachable for a
+    // `Command` child, which is never one; and proceeding undetached would
+    // silently recreate the exact bug this prevents, whereas an error surfaces
+    // through `spawn()` into the context below and is loud.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
+    }
+
+    cmd.spawn().context("spawning server process")?;
 
     // Wait for the socket to appear
     for i in 0..50 {
