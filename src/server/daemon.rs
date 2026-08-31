@@ -1007,6 +1007,51 @@ impl RemuxServer {
 // Message handling
 // ---------------------------------------------------------------------------
 
+/// Say which directory a panel asked for -- ONCE per distinct path, per client.
+///
+/// The `files` panel re-lists itself **every 2 seconds while it is placed, for
+/// ever** (see `sidebar/files.rs`), so through the catch-all this was a
+/// timer-driven line writing roughly 43k entries a day per placed panel into a
+/// log that is never rotated and that `main.rs` pins at `Debug` with no
+/// `RUST_LOG` to turn down. That is the same unbounded shape as the agents
+/// classification line and the compositor's per-frame lines, and it is fixed
+/// the same way: on CHANGE, not on sample.
+///
+/// The PATH is kept rather than counted. It is the whole diagnostic -- "the
+/// panel is empty" is answered by what it asked for -- and a path is not a
+/// credential; see the summary match's own comment for where that line is
+/// drawn. Nothing here is gated behind a level, because there is no level to
+/// gate it behind.
+///
+/// Keyed per CLIENT, since two clients can browse different directories and a
+/// single global "last path" would make them log each other's polls for ever.
+/// The cache is CLEARED rather than evicted when it fills, exactly as
+/// [`crate::server::agents`]'s detection cache is and for the same reason: it
+/// exists to suppress repeats, not to remember, so the worst a clear costs is
+/// one repeated line.
+fn log_list_directory(client_id: u64, path: &str) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Clients remembered before starting over.
+    const CAP: usize = 64;
+    static LAST: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.len() >= CAP {
+        last.clear();
+    }
+    if last.get(&client_id).map(String::as_str) == Some(path) {
+        return;
+    }
+    last.insert(client_id, path.to_string());
+    drop(last);
+    log::debug!("server: client_id={client_id} msg=ListDirectory(path={path:?})");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     client_id: u64,
@@ -1072,6 +1117,9 @@ async fn handle_client_message(
                 argv.len().saturating_sub(1),
                 if cwd.is_some() { "set" } else { "none" }
             );
+        }
+        ClientMessage::ListDirectory { path } => {
+            log_list_directory(client_id, path);
         }
         ClientMessage::ScrollDelta { delta } => {
             log::debug!("server: client_id={client_id} msg=ScrollDelta(delta={delta})");
