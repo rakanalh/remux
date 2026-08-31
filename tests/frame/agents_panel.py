@@ -240,6 +240,14 @@ def check_transition_logging(log, label, want_states):
     pane, because the panes are sampled together: two panes alternating in the
     log is not a repeat, and a flat "no two identical lines anywhere" check
     would both miss that and forbid a pane legitimately returning to a state.
+
+    It keys on the STATE alone, which is looser than the server's own key --
+    that is `(state, agents::Reason)`, so a pane moving from one NeedsInput
+    pattern to a DIFFERENT one logs a line on purpose. Nothing here drives that
+    (each run reaches NeedsInput through one pattern only), but a future case
+    that typed `block` and then `menu` at the same pane would be logged
+    correctly by the server and counted as a repeat by this check. Widen the key
+    to include the pattern name rather than chasing it as a regression.
     """
     seen = classifications(log)
     got_states = {st for _, st, _ in seen}
