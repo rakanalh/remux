@@ -56,6 +56,11 @@
 # [appearance]
 
 # Where the status bar is placed: "top" | "bottom" (default: "bottom").
+#
+# KNOWN GAP: `status_bar_position` never moves the bar. The server composites it
+# onto the frame's last row unconditionally and no compositor code reads this
+# option, so setting "top" has no effect. Wire the server up before specifying
+# against it.
 # status_bar_position = "bottom"
 
 # Pane border rendering style: "zellij_style" (borders with pane names) |
@@ -348,6 +353,28 @@
 # q = "ViewClose"
 # d = "ViewDelete"
 
+# --- Sidebar (b) ---
+# Sidebars are client-side chrome docked to a terminal edge; see the SIDEBARS
+# section near the bottom of this file for how to declare them. `b` was the
+# old Buffer group, freed by the search-mode refactor.
+#
+# NOTE ON `b b`: cycling lives on `b`, not on Tab. The command-mode tree is
+# keyed by single characters and only plain character keys reach it, so Tab
+# (and any other named key) cannot be bound inside a group.
+# [keybindings.command.b]
+# _label = "Sidebar"
+# h = "SidebarToggleLeft"
+# l = "SidebarToggleRight"
+# j = "SidebarToggleBottom"
+# b = "SidebarCycle"
+#
+# There are no default FOCUS bindings: Alt+h/j/k/l enter and leave a sidebar
+# exactly as they move between panes. The SidebarFocus* actions are still in
+# the registry, so add them here if you want a second way in:
+# H = "SidebarFocusLeft"
+# L = "SidebarFocusRight"
+# J = "SidebarFocusBottom"
+
 # --- Direct bindings (root level) ---
 # These are top-level keys pressed right after the leader, not inside a group.
 # They live directly under [keybindings.command] as single-character keys.
@@ -459,6 +486,15 @@
 #   ViewClose                       — Leave the active view (it keeps existing)
 #   ViewDelete                      — Delete the active view for everyone
 #
+# Sidebar commands (client-side chrome; sidebars are declared with [[sidebar]]):
+#   SidebarToggleLeft               — Show/hide the left sidebar
+#   SidebarToggleRight              — Show/hide the right sidebar
+#   SidebarToggleBottom             — Show/hide the bottom sidebar
+#   SidebarFocusLeft                — Focus the left sidebar, opening it if hidden
+#   SidebarFocusRight               — Focus the right sidebar, opening it if hidden
+#   SidebarFocusBottom              — Focus the bottom sidebar, opening it if hidden
+#   SidebarCycle                    — Cycle focus through every panel, then the content
+#
 # Session commands:
 #   SessionNew <name> [folder]      — Create a new session
 #   SessionQuickSwitch              — Open the quick session switcher
@@ -501,6 +537,347 @@
 # Remote commands:
 #   RemoteConnect <dest|alias>      — Connect to a remote server (SSH destination
 #                                     or a `[remotes.<name>]` alias)
+
+# -----------------------------------------------------------------------------
+# SIDEBARS
+# -----------------------------------------------------------------------------
+# A sidebar is client-side chrome docked to an edge of the terminal. It is NOT
+# a pane: the server never sees it, it is not part of any session, and it is not
+# persisted with your sessions. The panes get whatever rectangle is left over
+# once every visible sidebar has taken its slice.
+#
+# Declare one `[[sidebar]]` table per edge. All three edges may be used at once;
+# a left and a right sidebar bracket the panes, and a bottom one spans only the
+# columns between them.
+#
+# ONE SIDEBAR PER EDGE. A second entry on an edge already taken is dropped with
+# a warning. Stacking two on one edge would lay out, but nothing could reach the
+# inner one — the toggle/focus commands and `Alt+h/j/k/l` all resolve an edge to
+# a single sidebar — so it is refused rather than left unreachable. To show two
+# things on one edge, give that sidebar two `[[sidebar.panel]]` entries.
+#
+# Sizes are clamped, not honoured blindly: a sidebar is shrunk so the panes keep
+# a minimum of 20 columns and 5 rows, and one that cannot fit even shrunk is
+# hidden for as long as the terminal is that small. Verticals are resolved
+# before the bottom sidebar, so they own the corners.
+#
+# Per-sidebar fields:
+#   edge    — "left" | "right" | "bottom". Required. There is no "top": that row
+#             belongs to the tab bar. An unknown edge is a hard parse error,
+#             because a typo there has no sensible forward-compatible reading.
+#   size    — how thick the sidebar is: COLUMNS for "left"/"right", ROWS for
+#             "bottom". Required. It is a starting size, not a fixed one — a
+#             sidebar is resizable at runtime and its live size is remembered.
+#             The FRAME IS DRAWN INSIDE IT (see below), so a 30-column sidebar
+#             still occupies 30 columns and gives its panels 28 of them under
+#             the default border style.
+#   visible — whether it starts open (default: true). Toggling it at runtime
+#             also persists, so this is only the very first run's state.
+#
+# Runtime state (each sidebar's visibility and size, and each panel's weight)
+# is saved to `$XDG_STATE_HOME/remux/sidebar.json` and restored on the next
+# start, so what you left on screen is what you come back to. Edit the config
+# and the declared `size`/`visible` become the defaults for a sidebar that has
+# no saved state yet.
+#
+# Each `[[sidebar.panel]]` stacks one plugin inside its sidebar, in the order
+# written. Panel fields:
+#   plugin  — registry name of the plugin. Required. See the list below.
+#   weight  — this panel's share of the sidebar's length relative to its
+#             siblings (default: 1). Two panels at weights 2 and 1 split the
+#             sidebar two-thirds / one-third. A single panel takes it all, so
+#             the weight is irrelevant until there are two.
+#   editor  — the editor the `files` panel opens a file with, OVERRIDING the
+#             server's own $EDITOR. Optional and usually absent; the server
+#             already knows $EDITOR. Ignored by every other plugin.
+#   command — parsed and then IGNORED, with a warning naming `editor`. See
+#             "Migrating from `browser` / the old `files`" below.
+#
+# Available plugins:
+#
+#   sessions    — a live tree of every session, tab and pane across the local
+#                 server and every connected remote. It refreshes by itself when
+#                 the server's tree changes; Enter jumps to whatever is selected.
+#
+#                 `j`/`k` (or the arrows) move, `g`/`G` jump to the ends, and
+#                 `l`/`h` (or Right/Left) EXPAND and COLLAPSE a node rather than
+#                 toggling it, so holding a direction cannot flap one open and
+#                 shut. Space toggles. Note that Space MARKS panes for a view in
+#                 the session manager OVERLAY; in this panel it only opens and
+#                 closes nodes.
+#   files       — a built-in file browser. No REQUIRED configuration: nothing to
+#                 set beyond the optional `editor` above, no opener hook,
+#                 nothing to install.
+#
+#                   [[sidebar.panel]]
+#                   plugin = "files"
+#
+#                 `j`/`k` (or the arrows) move, `g`/`G` jump to the ends, `l` or
+#                 Right descends into the selected directory, `h` or Left goes
+#                 up a level, `.` toggles hidden entries, and `r` re-lists now.
+#                 `h` then `l` is a round trip: going up lands the selection on
+#                 the directory you just left.
+#
+#                 IT RE-LISTS BY ITSELF, about every two seconds, so files
+#                 created or deleted by something else appear and disappear
+#                 without a keystroke. Only while the panel is on screen — a
+#                 hidden or closed sidebar polls nothing at all. The cursor
+#                 stays on the entry it was on, by NAME, so a file appearing
+#                 above it does not slide your selection onto something else.
+#                 `r` is there because an automatic refresh that has quietly
+#                 stopped is worse than none: it always works.
+#
+#                 ENTER ON A FILE OPENS IT IN A SPLIT, running an editor, and
+#                 the keyboard leaves the sidebar with it — you asked for the
+#                 file to be open, and an editor your keystrokes cannot reach is
+#                 the same as not having opened it. `l` deliberately does NOT
+#                 open a file; only Enter does. A key that sometimes launches an
+#                 editor is a key nobody presses confidently.
+#
+#                 The editor is resolved ON THE SERVER: `editor` here if you
+#                 set one, else the server's own $EDITOR, else `vi`. That is not
+#                 a detail — the file is on the server, so the editor has to be
+#                 too, and your own $EDITOR may name a binary the remote has
+#                 never had installed.
+#
+#                 Long directories are capped (5000 entries) and the panel says
+#                 so rather than quietly showing you part of one. A directory it
+#                 cannot read shows the reason — "permission denied" is an
+#                 answer, and an empty panel that might mean "empty" and might
+#                 mean "denied" is not.
+#   agents      — the panes running an AI coding agent (`claude`, `codex`, ...),
+#                 on the local server and every connected remote, each with a
+#                 colour-coded state: RED needs your input, YELLOW is working,
+#                 dim is idle. `j`/`k`/`g`/`G` move and Enter jumps to that
+#                 pane, wherever it is. Configure WHICH commands count as an
+#                 agent, and what a blocked one looks like, under `[agents]`
+#                 below — the defaults cover `claude` and `codex` with no setup.
+#   placeholder — a fixed test fixture that paints its own name and size. Useful
+#                 for checking geometry; there is no reason to configure it.
+#
+# Migrating from `browser` / the old `files`
+# ------------------------------------------
+# There used to be TWO file panels: `browser` (this one, built in) and `files`
+# (which ran yazi/nnn/ranger in the panel). They have merged — the built-in one
+# took the `files` name, and the hosted-file-manager plugin is gone. Two lines
+# in an older config point at the old world, and they are treated differently on
+# purpose:
+#
+#   plugin = "browser"   still works, with a warning. Rename it to "files".
+#   command = "..."      is IGNORED, with a warning. Delete it.
+#
+# `command` is ignored rather than renamed because it meant two opposite things:
+# the FILE MANAGER to run to the old `files`, and the EDITOR to open a file with
+# to `browser`. That is exactly how a `command = "nnn"` copied from one to the
+# other ended up opening every file in nnn. With it ignored, Enter falls back to
+# the server's $EDITOR, which is what you wanted either way. If you did mean to
+# override the editor, say `editor = "hx"`.
+#
+# What you lose by the merge is a file manager's own key bindings and previews.
+# What you keep is a panel that works with nothing installed, over a remote, and
+# with no opener hook (NNN_OPENER, yazi's [opener], rifle.conf) wired up to
+# `remux split`.
+#
+# THE DIRECTORY THE FILE PANEL FOLLOWS IS THE FOCUSED PANE'S, and it updates
+# when FOCUS moves — not when you `cd`. This is the first thing that looks
+# broken: you type `cd ~/project` in a pane, the panel does not move, and it
+# reads as a bug. It is not. Remux learns a pane's directory by asking the
+# operating system where that pane's process is, and it asks when the tree
+# changes — a pane gaining or losing focus, being created, or exiting. To point
+# a panel somewhere, move the focus there (or just navigate: `h`/`l` go wherever
+# you like, and the panel stops following focus for as long as you are somewhere
+# you chose yourself).
+#
+# It also follows the pane's MACHINE. Focus a pane on a remote and the panel
+# lists that remote's filesystem, because that is where the pane is; the same
+# path on two machines is two different directories, and switching machines
+# always re-targets even if the path is identical.
+#
+# An UNKNOWN plugin name is skipped with a warning rather than rejected, so a
+# config written for a plugin a later version adds still loads on this build —
+# you lose that panel, not the whole config. A sidebar left with no usable
+# panels (none declared, or every name unknown) is dropped entirely, also with
+# a warning: an empty strip of chrome would just be stolen space.
+#
+# FRAMES. A sidebar is framed in the same border style as the panes beside it
+# (`appearance.border_style`), so it reads as part of the same screen: one frame
+# per SIDEBAR — not one per panel — with a rule between stacked panels. Under
+# "zellij_style" that is a rounded box around the whole sidebar; under
+# "tmux_style", which has no per-pane box, it is a single divider on the side
+# facing the panes plus a divider between panels. `ToggleStyle` (`Prefix g`)
+# reframes the sidebars in the same keystroke it reframes the panes, and the
+# frame takes the active border colour while any of that sidebar's panels holds
+# the keyboard (zellij style only — tmux-style dividers do not track focus for
+# panes either).
+#
+# The frame is drawn INSIDE the sidebar's `size`, exactly as a pane's border is
+# drawn inside the pane: the panes' rectangle is unchanged by it. A sidebar too
+# small to carry a frame and still leave an interior is drawn unframed rather
+# than with a broken box.
+#
+# Keys: the `b` group under [keybindings.command] toggles, focuses and cycles
+# the sidebars, and `Alt+h/j/k/l` move focus into and out of one exactly as they
+# move between panes. While a panel has focus, the `Resize*` commands re-target:
+# the axis perpendicular to the edge resizes the SIDEBAR, and the parallel axis
+# adjusts the focused PANEL's weight.
+#
+# There are NO sidebars by default — omit this section entirely and Remux looks
+# exactly as it did before the feature existed.
+#
+# A sidebar with the session tree on top and the built-in file browser under
+# it. This is a good starting point: nothing in it needs anything installed.
+#
+# [[sidebar]]
+# edge = "left"
+# size = 30
+# visible = true
+#
+#   [[sidebar.panel]]
+#   plugin = "sessions"
+#   weight = 1
+#
+#   [[sidebar.panel]]
+#   plugin = "files"
+#   weight = 1
+#
+# Add an `agents` panel on another edge to watch what your AI agents are doing:
+#
+# [[sidebar]]
+# edge = "right"
+# size = 34
+#
+#   [[sidebar.panel]]
+#   plugin = "agents"
+
+# -----------------------------------------------------------------------------
+# AGENTS
+# -----------------------------------------------------------------------------
+# What the `agents` sidebar panel counts as an agent, and how it decides what
+# one is doing. Read by the SERVER (it owns the PTYs and the screens), so an
+# edit here needs `remux restart`, not just a config reload.
+#
+# Everything below has a default that works, so this whole section is optional.
+#
+#   commands   — the foreground commands that count as an agent. A pane running
+#                anything else is not listed at all.
+#                (default: ["claude", "codex", "aider", "gemini"])
+#   working_ms — how recently output must have reached a pane for it to read as
+#                "working" (default: 500).
+#   scan_rows  — how many LOGICAL LINES up from the bottom of the pane's LIVE
+#                screen the patterns below are matched against (default: 24).
+#                The live screen, never the scrollback: a prompt you have
+#                scrolled past is not what the agent is showing now. Soft-wrapped
+#                rows are joined first, so on a narrow pane this is more rows
+#                than it is lines. The default is generous on purpose — a real
+#                agent's blocked prompt sits a dozen or so rows above the bottom
+#                of the screen, under its options, its input box and a hint
+#                line — and it is also the cost bound, since every pattern runs
+#                against every line in the window on every sample.
+#
+# STATES. Three, in this precedence:
+#
+#   needs input — a pattern below matches the bottom of the pane's screen. This
+#                 state NEVER decays on silence, and does not need to: a blocked
+#                 agent's prompt is still on screen, so it keeps matching. It
+#                 also outranks "working" — a spinner underneath an approval
+#                 prompt is still blocked.
+#   working     — output reached the pane within `working_ms`.
+#   idle        — neither.
+#
+# PATTERNS. Each `[[agents.pattern]]` is a Rust regex matched line by line
+# against the bottom of the screen; a match means the agent is blocked on you.
+# They are configuration rather than code precisely because they rot: when an
+# agent changes the wording of its approval prompt, the fix should be an edit
+# here, not a new build.
+#
+#   name    — a short label, reported in the log when this pattern decides a
+#             pane's state. The server log ($XDG_STATE_HOME/remux/server.log)
+#             already says WHY a pane was classified as it was — debug logging
+#             is always on and RUST_LOG is not read, so there is nothing to
+#             set. A classifier that cannot tell you that cannot be tuned.
+#   command — the agent this applies to. Omit it to apply to every agent.
+#   regex   — the pattern. An invalid one is warned about and skipped; it never
+#             takes the server down, and the other patterns still work.
+#
+# Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
+# is no merge, so you own the whole list and cannot be surprised by a built-in
+# pattern you cannot see. TWO ship for Claude Code:
+#
+#   claude-proceed — its permission prompts, taken from the wordings actually
+#                    present in the binary ("Do you want to proceed?",
+#                    "...continue?", "...allow this connection?", "...use this
+#                    API key?").
+#   claude-select  — its QUESTION menu, which asks you something rather than
+#                    asking permission ("Which color do you like?" over a list
+#                    of options) and so matches none of the wordings above. That
+#                    gap is a real bug report: a pane sat blocked on a question
+#                    and the panel showed grey.
+#
+# The Codex ones are a best-effort guess at its approval prompt and have NOT been
+# checked against a real Codex — if you run it and they are wrong, this is the
+# section to correct.
+#
+# `claude-select` matches the selector's FOOTER — the "Enter to select · ↑/↓ to
+# navigate · Esc to cancel" hint line — and NOT the "❯ 1. Blue" menu row above
+# it. That distinction is the whole reason it is safe to ship, so it is worth
+# reading next to the one pattern that is deliberately left out:
+#
+# NOT shipped, on purpose: a pattern matching the selected row of a numbered
+# menu, e.g.
+#
+#   regex = "❯\\s*\\d+\\."
+#
+# It would be a useful second chance when the question itself has scrolled out of
+# the window, and you can add it in one entry — but understand the trade first.
+# If an agent leaves an ANSWERED menu on screen with its choice still marked,
+# nothing in a screen snapshot can tell it apart from one that is still waiting,
+# and the panel stays red indefinitely. A permanently red panel is worse than a
+# slow one: it teaches you to ignore the colour. The question patterns are much
+# less exposed to this — a resumed agent's output pushes the question out of the
+# window within a screenful, while a menu row is the last thing on the screen.
+#
+# The FOOTER is exempt from that trade, and this was checked rather than assumed.
+# The same pane was read twice: while the question was waiting the footer was on
+# screen, and after it was answered the whole block had collapsed to
+#
+#   ⏺ User answered Claude's questions:
+#     ⎿  · Which color do you like? → Blue
+#
+# with no footer anywhere. It is a live keybinding hint tied to an ACTIVE
+# selector, not something that stays behind in the transcript — so it cannot hold
+# the panel red the way a left-behind menu row could. (If you are here about to
+# delete `claude-select` on staleness grounds: that is the objection, and this
+# paragraph is the answer to it.) It generalises deliberately — any Claude Code
+# overlay drawing that footer is by definition waiting on you.
+#
+# It keys on two stable phrases with `.*` between them rather than reproducing
+# the line: it contains a middot, two arrow glyphs and spacing that is very easy
+# to hand-transcribe wrongly. Requiring BOTH ends is what keeps it specific.
+#
+# Soft-wrapped lines are rejoined before matching, so a pattern does not have to
+# survive being cut in half by a narrow pane.
+#
+# Detection reads the pane's foreground process group and then asks the OS to
+# name that process — `/proc/<pid>/comm` on Linux, `sysinfo` on macOS. Both work;
+# every other platform cannot, and says so rather than pretending: the panel
+# shows "<server>: no detection" instead of an empty list that would read
+# as "you have no agents running". It is the SERVER's platform that decides, so
+# a macOS client attached to a Linux server (or the reverse) detects fine.
+#
+# [agents]
+# commands = ["claude", "codex", "aider", "gemini"]
+# working_ms = 500
+# scan_rows = 24
+#
+#   [[agents.pattern]]
+#   name = "claude-proceed"
+#   command = "claude"
+#   regex = "(?i)do you want to (proceed|continue|allow|use this api key)"
+#
+#   [[agents.pattern]]
+#   name = "claude-select"
+#   command = "claude"
+#   regex = "(?i)enter to select.*esc to cancel"
 
 # -----------------------------------------------------------------------------
 # REMOTES

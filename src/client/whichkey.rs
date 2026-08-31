@@ -7,6 +7,10 @@ use crossterm::style::Color;
 
 use crate::config::theme::Theme;
 use crate::config::WhichKeyPosition;
+use crate::server::compositor::{
+    box_bottom_line, box_top_line, sharp_box_bottom_line, sharp_box_top_line, BOX_HORIZONTAL,
+    BOX_VERTICAL,
+};
 
 /// Fixed cell width for a single entry in the full-width layout:
 /// `" <key> \u{2192} <label>"`.
@@ -164,7 +168,7 @@ impl WhichKeyPopup {
         let key_fg = theme.whichkey_key_fg;
 
         // Top border.
-        let top_border = format!("\u{256D}{}\u{256E}", "\u{2500}".repeat(inner_width));
+        let top_border = box_top_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
@@ -179,10 +183,10 @@ impl WhichKeyPopup {
             let right_entry = self.entries.get(row * 2 + 1);
             let y = start_y + 1 + row as u16;
 
-            let mut row_text = String::from("\u{2502}");
+            let mut row_text = BOX_VERTICAL.to_string();
             row_text.push_str(&entry_cell(left_entry, col_width));
             row_text.push_str(&entry_cell(right_entry, col_width));
-            row_text.push('\u{2502}');
+            row_text.push(BOX_VERTICAL);
             commands.push(DrawCommand {
                 x: start_x,
                 y,
@@ -232,7 +236,7 @@ impl WhichKeyPopup {
                         x: start_x,
                         y,
                         text: format!(
-                            "\u{2502}{:^width$}\u{2502}",
+                            "{BOX_VERTICAL}{:^width$}{BOX_VERTICAL}",
                             "\u{2026}",
                             width = inner_width
                         ),
@@ -245,10 +249,10 @@ impl WhichKeyPopup {
                 let left = self.shortcuts.get(row * 2);
                 let right = self.shortcuts.get(row * 2 + 1);
 
-                let mut row_text = String::from("\u{2502}");
+                let mut row_text = BOX_VERTICAL.to_string();
                 row_text.push_str(&shortcut_cell(left, col_width));
                 row_text.push_str(&shortcut_cell(right, col_width));
-                row_text.push('\u{2502}');
+                row_text.push(BOX_VERTICAL);
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
@@ -284,7 +288,7 @@ impl WhichKeyPopup {
         }
 
         // Bottom border.
-        let bottom_border = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_border = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y + 1 + inner as u16,
@@ -379,7 +383,7 @@ impl WhichKeyPopup {
         commands.push(DrawCommand {
             x: 0,
             y: start_y,
-            text: format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_cols as usize)),
+            text: sharp_box_top_line(inner_cols as usize),
             fg,
             bg,
         });
@@ -390,7 +394,10 @@ impl WhichKeyPopup {
             commands.push(DrawCommand {
                 x: 0,
                 y: content_y0 + row,
-                text: format!("\u{2502}{}\u{2502}", " ".repeat(inner_cols as usize)),
+                text: format!(
+                    "{BOX_VERTICAL}{}{BOX_VERTICAL}",
+                    " ".repeat(inner_cols as usize)
+                ),
                 fg,
                 bg,
             });
@@ -400,7 +407,7 @@ impl WhichKeyPopup {
         commands.push(DrawCommand {
             x: 0,
             y: content_y0 + content_rows,
-            text: format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_cols as usize)),
+            text: sharp_box_bottom_line(inner_cols as usize),
             fg,
             bg,
         });
@@ -560,11 +567,11 @@ fn separator_line(title: &str, inner_width: usize) -> String {
     let dashes = inner_width.saturating_sub(title_len);
     let left = dashes / 2;
     let right = dashes - left;
+    let dash = BOX_HORIZONTAL.to_string();
     format!(
-        "\u{2502}{}{}{}\u{2502}",
-        "\u{2500}".repeat(left),
-        title,
-        "\u{2500}".repeat(right)
+        "{BOX_VERTICAL}{}{title}{}{BOX_VERTICAL}",
+        dash.repeat(left),
+        dash.repeat(right)
     )
 }
 

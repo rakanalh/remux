@@ -553,8 +553,14 @@ impl ConnectionManager {
     ///
     /// Only `Connected` servers are considered — a `NotConnected`/`Failed`
     /// remote (or one whose version was never captured) reports `None`. The
-    /// local server is always treated as connected. Comparison is on the full
-    /// string, so a differing git hash counts as a mismatch.
+    /// local server is always treated as connected.
+    ///
+    /// Comparison is [`crate::protocol::stamps_match`], NOT string equality: the
+    /// `-dirty` suffix is build-environment noise (`cargo install --git` touches
+    /// `Cargo.lock` in its own checkout and stamps every install `-dirty`) and
+    /// comparing it made a correctly-installed remote report skew for ever. The
+    /// string returned for display is still the server's RAW stamp — the
+    /// normalisation decides whether to warn, and never launders what is shown.
     pub fn version_mismatch(&self, id: &ConnId) -> Option<String> {
         let ours = crate::protocol::build_version();
         let reported = match id {
@@ -566,7 +572,9 @@ impl ConnectionManager {
                 _ => None,
             },
         };
-        reported.filter(|v| **v != ours).cloned()
+        reported
+            .filter(|v| !crate::protocol::stamps_match(v, &ours))
+            .cloned()
     }
 
     /// Ordered roster of servers for the session-manager tree: Local first
@@ -862,6 +870,31 @@ mod tests {
 
         // Unknown remote -> no mismatch.
         assert_eq!(mgr.version_mismatch(&ConnId::Remote("ghost".into())), None);
+    }
+
+    /// The 10.0.0.2 report, at the level the user actually sees it: a remote
+    /// installed with `cargo install --git` at THIS commit stamps `-dirty`
+    /// (cargo touches `Cargo.lock` in its own checkout) and must not be flagged.
+    ///
+    /// `build_version()` is the right input here, unlike in `stamps_match`'s own
+    /// tests: the point is that the manager compares against this binary's real
+    /// stamp. Both arms are derived from it, so the assertion holds whether the
+    /// tree the test runs in is clean or dirty.
+    #[test]
+    fn a_dirty_install_of_this_commit_is_not_flagged() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        let ours = crate::protocol::build_version();
+        let clean = ours.strip_suffix("-dirty").unwrap_or(&ours).to_string();
+
+        mgr.local_server_version = Some(format!("{clean}-dirty"));
+        assert_eq!(
+            mgr.version_mismatch(&ConnId::Local),
+            None,
+            "a `cargo install --git` build of this very commit was reported as skew"
+        );
+
+        mgr.local_server_version = Some(clean);
+        assert_eq!(mgr.version_mismatch(&ConnId::Local), None);
     }
 
     #[test]

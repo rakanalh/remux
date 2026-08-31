@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use nix::pty::{openpty, OpenptyResult, Winsize};
@@ -10,19 +10,6 @@ use tokio::io::Interest;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// A thin wrapper around a raw file descriptor that implements `AsRawFd`.
-///
-/// This is used to register a borrowed raw fd with tokio's `AsyncFd`
-/// without transferring ownership. The caller is responsible for ensuring
-/// the underlying fd outlives this wrapper.
-struct RawFdWrapper(RawFd);
-
-impl AsRawFd for RawFdWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
 /// Represents an allocated PTY with a running child process.
 pub struct Pty {
     /// The master side of the PTY pair.
@@ -31,13 +18,57 @@ pub struct Pty {
     pub child_pid: Pid,
 }
 
+/// Who the pane about to be spawned IS, as the child is told it.
+///
+/// Exported into the child's environment as `REMUX_SESSION` and `REMUX_PANE`,
+/// the pair that makes `remux split` possible from inside a pane -- the
+/// `TMUX`/`TMUX_PANE` equivalent. Without them a process in a pane knows only
+/// that it is in *some* remux (`REMUX=1`), which is not enough to ask the server
+/// for anything.
+///
+/// Borrowed rather than owned because it is consumed entirely before the fork
+/// and never outlives the call.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneIdentity<'a> {
+    /// The session the pane belongs to, by name -- the same name `remux attach`
+    /// takes, which is what makes it a usable CLI argument.
+    pub session: &'a str,
+    /// The pane id the child should report as its own, normally the pane's own.
+    ///
+    /// A PARAMETER rather than the pane's id because it has not always been the
+    /// same thing: an **aux pane** -- a PTY in no layout tree, which is what the
+    /// old file-manager `files` plugin ran -- named the pane it was spawned FOR,
+    /// since "split me" is meaningless for a pane that is in no layout. Aux
+    /// panes are gone, but the parameter stays honest about being the CALLER's
+    /// answer rather than a derived one.
+    pub pane: u64,
+}
+
 impl Pty {
-    /// Spawn a new PTY with the given dimensions, optional command, and
-    /// optional working directory.
+    /// Spawn a new PTY with the given dimensions, optional command and
+    /// arguments, and optional working directory.
     ///
     /// If `command` is `None`, the shell from `$SHELL` is used, falling back
     /// to `/bin/sh`. If `cwd` is `Some`, the child process starts in that
     /// directory; otherwise it inherits the parent's working directory.
+    ///
+    /// `args` is the argument vector AFTER argv[0] -- `["-R", "/tmp/f"]` for
+    /// `nvim -R /tmp/f`. It also decides how argv[0] itself is presented, and
+    /// the two cases are genuinely different programs:
+    ///
+    /// * **Empty** (every pane shell): argv[0] is `-<basename>`, the
+    ///   leading-dash LOGIN convention, exactly as before this parameter
+    ///   existed.
+    /// * **Non-empty** (the `files` plugin's editor): argv[0] is the plain
+    ///   basename. A leading dash tells a SHELL to source its login files; to
+    ///   `vim` it is an unrecognised program name, and there is no reason to
+    ///   hand one to a program that was invoked to edit a file.
+    ///
+    /// `identity` names the pane to the child via `REMUX_SESSION`/`REMUX_PANE`.
+    /// `None` leaves both UNSET, which is a real answer and not a missing one:
+    /// a pane the server cannot attribute to a session has no session to name,
+    /// and `remux split` refuses politely on an unset `$REMUX_SESSION` rather
+    /// than guessing one.
     ///
     /// # Safety
     ///
@@ -49,15 +80,41 @@ impl Pty {
         cols: u16,
         rows: u16,
         command: Option<&str>,
+        args: &[String],
         cwd: Option<&std::path::Path>,
+        identity: Option<PaneIdentity<'_>>,
     ) -> Result<Pty> {
+        // `args` is COUNTED, never printed. `server.log` is plaintext and never
+        // pruned, and the only user-supplied args that reach here come from
+        // `remux split -- <command line>`, which is exactly where a connection
+        // string or an API key lives. See `handle_client_message`'s summary
+        // match for the rule this follows.
         log::debug!(
-            "pty: spawn cols={}, rows={}, command={:?}, cwd={:?}",
+            "pty: spawn cols={}, rows={}, command={:?}, {} arg(s), cwd={:?}, identity={:?}",
             cols,
             rows,
             command,
-            cwd
+            args.len(),
+            cwd,
+            identity
         );
+
+        // Built BEFORE the fork. `CString::new` allocates, and the child of a
+        // fork in a multi-threaded process may only call async-signal-safe
+        // functions -- the allocator lock can be held by a thread that does not
+        // exist on this side of the fork. Everything below the fork just reads
+        // these.
+        let c_args: Vec<std::ffi::CString> = args
+            .iter()
+            .map(|a| std::ffi::CString::new(a.as_str()))
+            .collect::<std::result::Result<_, _>>()
+            .context("an argument for the pane's command contains a NUL byte")?;
+
+        // Formatted BEFORE the fork, for the same reason `c_args` is: `format!`
+        // allocates, and the child of a fork in a multi-threaded process may only
+        // call async-signal-safe functions. The child below just hands these two
+        // strings to `set_var`.
+        let identity_env = identity.map(|id| (id.session.to_string(), id.pane.to_string()));
 
         let winsize = Winsize {
             ws_row: rows,
@@ -119,6 +176,21 @@ impl Pty {
                 // is inherited by the pane's shell and its descendants.
                 std::env::set_var("REMUX", "1");
 
+                // Name the pane to whatever runs in it, mirroring tmux's
+                // $TMUX/$TMUX_PANE. `REMUX=1` only says "you are inside SOME
+                // remux"; these two say which, and that is the difference
+                // between a script knowing it is nested and a script being able
+                // to ask the server for a split.
+                //
+                // Left UNSET when there is no identity, rather than set to an
+                // empty string: `remux split` distinguishes "not in a pane" from
+                // "in a pane" by PRESENCE, and an empty value would read as a
+                // session whose name is "".
+                if let Some((session, pane)) = &identity_env {
+                    std::env::set_var("REMUX_SESSION", session);
+                    std::env::set_var("REMUX_PANE", pane);
+                }
+
                 // Determine which shell/command to execute.
                 let shell = match command {
                     Some(cmd) => cmd.to_string(),
@@ -134,24 +206,56 @@ impl Pty {
                 // ~/.zprofile, ~/.zlogin and ~/.bash_profile are sourced.
                 // We still exec the real binary at `c_shell`, but present its
                 // argv[0] as "-<basename>".
+                //
+                // Only when there are no ARGUMENTS, though, and the two halves
+                // of that fail in opposite and equally quiet ways -- which is
+                // why this comment is here and must not be tidied away as
+                // restating the code:
+                //
+                // * a dash-prefixed `vim` is a program name `vim` does not
+                //   recognise, so the pane dies with an error nobody expects;
+                // * a shell WITHOUT the dash starts perfectly and silently
+                //   stops sourcing `~/.zprofile`, `~/.zlogin` and
+                //   `~/.bash_profile`. Nothing fails. The user's PATH is just
+                //   quietly different in remux than everywhere else, months
+                //   after anyone would connect that to this line.
                 let shell_basename = std::path::Path::new(&shell)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or(shell.as_str());
-                let login_argv0 = format!("-{shell_basename}");
-                let c_argv0 =
-                    std::ffi::CString::new(login_argv0.as_str()).expect("CString::new failed");
+                let argv0 = if c_args.is_empty() {
+                    format!("-{shell_basename}")
+                } else {
+                    shell_basename.to_string()
+                };
+                let c_argv0 = std::ffi::CString::new(argv0.as_str()).expect("CString::new failed");
 
-                // exec the shell. On success this does not return.
-                // On failure, expect() panics (which is appropriate for a
-                // post-fork child process).
-                #[allow(unreachable_code)]
-                {
-                    unistd::execvp(&c_shell, &[&c_argv0]).expect("execvp failed");
-                    // SAFETY: execvp either succeeds (never returns) or expect()
-                    // panics. This line is unreachable but satisfies the type
-                    // checker.
-                    unsafe { libc::_exit(1) }
+                // exec the shell. On success this does not return; on failure
+                // say so on the terminal and leave immediately.
+                //
+                // Deliberately NOT a panic. This is a forked child, so unwinding
+                // runs the parent's hooks and atexit handlers in a process that
+                // shares its memory image -- and the panic message goes to the
+                // pane, where the user reads a Rust backtrace instead of the
+                // name of the program that could not be started. Reachable by
+                // ordinary config since the `files` sidebar plugin takes a
+                // user-supplied `command`: one typo in `command = "yazi"` used
+                // to paint a panic into the panel.
+                let mut argv: Vec<&std::ffi::CStr> = Vec::with_capacity(1 + c_args.len());
+                argv.push(&c_argv0);
+                argv.extend(c_args.iter().map(|a| a.as_c_str()));
+                let _ = unistd::execvp(&c_shell, &argv);
+                let err = std::io::Error::last_os_error();
+                let msg = format!("remux: cannot run {shell:?}: {err}\r\n");
+                // SAFETY: a plain `write` to fd 2, which is the PTY slave here.
+                // Async-signal-safe, which `println!` and unwinding are not.
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        msg.as_ptr() as *const libc::c_void,
+                        msg.len(),
+                    );
+                    libc::_exit(127) // 127 = "command not found", as a shell reports it
                 }
             }
             ForkResult::Parent { child } => {
@@ -182,8 +286,18 @@ impl Pty {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        let wrapper = RawFdWrapper(fd);
-        let async_fd = AsyncFd::with_interest(wrapper, Interest::READABLE)
+        // A `BorrowedFd` rather than a bare `RawFd` in a wrapper: this genuinely
+        // IS a borrow -- `&self` outlives the await -- and saying so in the type
+        // is what makes it safe. The wrapper it replaced carried no lifetime, so
+        // the compiler could not tell this legitimate borrow from the one in
+        // `start_reader` that outlived its descriptor and cost a pane every byte
+        // of its output. Dropping a `BorrowedFd` closes nothing, so the
+        // `into_inner()` dance that used to guard each exit is gone too.
+        //
+        // SAFETY: `fd` comes from `self.master_fd`, which `&self` keeps alive
+        // for the whole of this function.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let async_fd = AsyncFd::with_interest(borrowed, Interest::READABLE)
             .context("AsyncFd creation failed")?;
 
         let mut buf = vec![0u8; 4096];
@@ -211,16 +325,12 @@ impl Pty {
                 }
             }) {
                 Ok(Ok(0)) => {
-                    // Prevent AsyncFd from closing the fd (we don't own it).
-                    let _ = async_fd.into_inner();
                     return Ok(Vec::new());
                 }
                 Ok(Ok(n)) => {
-                    let _ = async_fd.into_inner();
                     return Ok(buf[..n].to_vec());
                 }
                 Ok(Err(e)) => {
-                    let _ = async_fd.into_inner();
                     return Err(e).context("read from PTY master failed");
                 }
                 Err(_would_block) => {
@@ -292,8 +402,111 @@ impl Drop for Pty {
     fn drop(&mut self) {
         // Best-effort kill of the child process.
         let _ = signal::kill(self.child_pid, Signal::SIGHUP);
-        let _ = waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG));
+        // ...and then get out of the way. The signalled child needs a moment to
+        // die before its status can be collected, and this `Drop` is reached
+        // from `reap_panes` with the daemon's `panes` lock held: waiting here
+        // blocks a runtime thread while that lock is held. The file-manager
+        // sidebar panel closes a pane and opens another on every directory
+        // change, so that would put a stall under a lock on a routine user
+        // action -- harder to attribute later than the zombies it fixes.
+        //
+        // Nothing is shared with the spawned closure but the pid. That pid is
+        // not necessarily ours to collect, and it is not a race we need to win:
+        // see `reap_child`, which explains why another waiter getting there
+        // first is the expected case rather than a problem.
+        //
+        // Two properties of `spawn_blocking` worth knowing, both read out of
+        // tokio 1.50.0 rather than assumed:
+        //
+        // - On a runtime that has begun shutting down, the closure is NEVER
+        //   RUN. `blocking::pool::spawn_task` shuts the task down and returns
+        //   `SpawnError::ShuttingDown`, and the caller deliberately hands back a
+        //   `JoinHandle` that never resolves ("Compat: do not panic here"). So
+        //   the reap is LOST, not deferred -- and the `Err(_)` arm below does
+        //   not cover it, because `Handle::try_current()` still succeeds while a
+        //   runtime is shutting down. Harmless only because the process is on
+        //   its way out and init reparents and reaps every zombie it leaves.
+        // - `spawn_blocking` PANICS on `SpawnError::NoThreads`, i.e. when the OS
+        //   refuses a new thread and none is free. Remote, but a panic inside a
+        //   `Drop` that is itself running during an unwind aborts the process.
+        let pid = self.child_pid;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || reap_child(pid));
+            }
+            // No runtime at all: nothing left to stall, so wait inline. Blocking
+            // briefly is fine here; leaking is not.
+            Err(_) => reap_child(pid),
+        }
     }
+}
+
+/// How long [`reap_child`] waits for a signalled child before escalating, and
+/// again before giving up.
+///
+/// 20ms is the WORST case, not the usual one: the loop polls at 1ms and returns
+/// the instant the child is collected, so a shell exiting on SIGHUP costs 1-3ms.
+/// Only a child that survives both SIGHUP and SIGKILL -- uninterruptible sleep --
+/// pays the full bound.
+///
+/// It is bounded at all because of where this can run. On the normal path that
+/// is a blocking-pool thread, which must not be parked for ever on a child that
+/// will not die; on the no-runtime fallback it is `Drop` itself, which the
+/// daemon reaches holding the `panes` lock, and a `Drop` that can hang is worth
+/// nothing at all.
+const REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Wait for an already-signalled child so it does not linger as a zombie.
+///
+/// A single `waitpid(WNOHANG)` right after the signal is not enough, and that is
+/// what this replaced: the child has not exited yet at that instant, so the wait
+/// reports `StillAlive`, the child dies a moment later, and nothing ever collects
+/// its status. Every pane closed while its shell was still running left a
+/// `<defunct>` entry behind for the life of the server -- which the file-manager
+/// sidebar panel turns from a curiosity into a real leak, since it kills and
+/// respawns its pane every time the focused pane's directory changes.
+///
+/// Always the SPECIFIC pid, never `waitpid(-1, ..)`: a wildcard reaper would
+/// steal children that other code is waiting for.
+///
+/// **This is not the only waiter, and usually not the winning one.**
+/// [`reap_panes`] calls [`Pty::try_wait`] on the same pid immediately before
+/// dropping the `Pty`, to read the exit code -- and on the commonest path of all
+/// (the PTY channel disconnected *because* the child died) that call collects it
+/// and frees the pid before this ever runs. `ECHILD` is therefore SUCCESS, and it
+/// is matched explicitly rather than swept up with every other errno, so that a
+/// genuine failure is logged instead of silently reading as "reaped".
+///
+/// [`reap_panes`]: crate::server::daemon
+fn reap_child(pid: Pid) {
+    for stage in 0..2 {
+        let deadline = std::time::Instant::now() + REAP_WAIT;
+        loop {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                // Still running: keep polling until this stage's deadline.
+                Ok(WaitStatus::StillAlive) => {}
+                // Collected here.
+                Ok(_) => return,
+                // Already collected elsewhere -- see the note above.
+                Err(nix::errno::Errno::ECHILD) => return,
+                Err(e) => {
+                    log::warn!("pty: waitpid({pid}) failed: {e}");
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(REAP_POLL);
+        }
+        // SIGHUP was declined (or arrived while the child was blocked on a
+        // signal-ignoring path); escalate once.
+        if stage == 0 {
+            let _ = signal::kill(pid, Signal::SIGKILL);
+        }
+    }
+    log::warn!("pty: child {pid} did not exit after SIGKILL; leaving it unreaped");
 }
 
 /// Spawn a background tokio task that continuously reads from the PTY master
@@ -301,18 +514,21 @@ impl Drop for Pty {
 ///
 /// Returns the task handle and the receiving end of the channel.
 ///
-/// # Safety
-///
-/// The caller must ensure that `master_fd` remains valid for the lifetime of
-/// the returned task. The task does not own the fd and will not close it.
-pub fn start_reader(master_fd: RawFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
-    log::debug!("pty: start_reader watching fd={}", master_fd);
+/// Takes an **owned** descriptor -- give it a `dup` of the master, not the
+/// master itself -- and closes it when the task ends. There is no safety
+/// contract left for the caller to honour, and that is the point: this used to
+/// ask the caller to keep a borrowed fd alive for the task's lifetime, nobody
+/// could, and the fd number was reissued to the next PTY while this task's epoll
+/// registration still held it. See the comment on `AsyncFd` below.
+pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
+    let raw = master_fd.as_raw_fd();
+    log::debug!("pty: start_reader watching fd={raw}");
 
     // Set the fd to non-blocking mode, which is required by AsyncFd.
-    // SAFETY: The fd is valid (caller guarantees).
+    // SAFETY: `master_fd` owns a valid descriptor for the whole call.
     unsafe {
-        let flags = libc::fcntl(master_fd, libc::F_GETFL);
-        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -320,8 +536,23 @@ pub fn start_reader(master_fd: RawFd) -> (JoinHandle<()>, mpsc::UnboundedReceive
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
 
-        let wrapper = RawFdWrapper(master_fd);
-        let async_fd = match AsyncFd::with_interest(wrapper, Interest::READABLE) {
+        // The task OWNS its descriptor -- a `dup` of the master the caller made
+        // for it -- and this is load-bearing, not tidiness.
+        //
+        // It used to borrow the raw fd. The task then outlived the descriptor:
+        // when the pane's `Pty` was dropped the fd was closed, the kernel
+        // silently dropped it from the epoll set, and `readable()` parked here
+        // forever instead of erroring. The next PTY opened got the SAME fd
+        // NUMBER back (descriptors are handed out lowest-free-first), and its
+        // reader's registration collided with the parked one's: readiness for
+        // the new pane went nowhere and the pane never produced a single byte.
+        // Reproduced exactly: fd 13, reused twice, and a file-manager panel
+        // that painted blank forever after its second re-target.
+        //
+        // Owning it closes the hole at the root: `AsyncFd` deregisters before it
+        // drops the inner descriptor, so the fd NUMBER cannot be reissued while
+        // any registration for it still exists.
+        let async_fd = match AsyncFd::with_interest(master_fd, Interest::READABLE) {
             Ok(fd) => fd,
             Err(e) => {
                 log::error!("start_reader: failed to create AsyncFd: {e}");
@@ -370,8 +601,10 @@ pub fn start_reader(master_fd: RawFd) -> (JoinHandle<()>, mpsc::UnboundedReceive
             }
         }
 
-        // Prevent the AsyncFd from closing the borrowed fd on drop.
-        let _ = async_fd.into_inner();
+        // `async_fd` drops here: it deregisters from the reactor FIRST and only
+        // then closes the descriptor it owns, which is the ordering that makes
+        // the fd number safe to reissue. Nothing to do by hand -- the previous
+        // `into_inner()` here existed to stop it closing a fd it did not own.
     });
 
     (handle, rx)
@@ -384,7 +617,8 @@ mod tests {
     #[test]
     fn spawn_and_exit() {
         // Spawn a shell that immediately exits.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.write_input(b"exit\n").expect("write_input failed");
 
         // Wait for the child to exit.
@@ -395,7 +629,8 @@ mod tests {
 
     #[test]
     fn resize_does_not_error() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.resize(120, 40).expect("resize should not fail");
         pty.write_input(b"exit\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -403,7 +638,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_output_returns_data() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.write_input(b"echo hello\n").expect("write failed");
 
         // Give the shell a moment to produce output.
@@ -418,10 +654,10 @@ mod tests {
 
     #[tokio::test]
     async fn start_reader_receives_output() {
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
-        let raw_fd = pty.master_fd.as_raw_fd();
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
 
-        let (_handle, mut rx) = start_reader(raw_fd);
+        let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
         pty.write_input(b"echo test_marker\n")
             .expect("write failed");
@@ -466,10 +702,10 @@ mod tests {
         // The sentinel is split across a shell string concatenation
         // ("AR""GV0=") so the assembled token "ARGV0=" appears only in the
         // shell's actual output, never in the (terminal-echoed) command line.
-        let pty = Pty::spawn(80, 24, Some("/bin/sh"), None).expect("failed to spawn PTY");
-        let raw_fd = pty.master_fd.as_raw_fd();
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
 
-        let (_handle, mut rx) = start_reader(raw_fd);
+        let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
 
         pty.write_input(b"echo \"AR\"\"GV0=$0\"\n")
             .expect("write failed");
@@ -513,6 +749,92 @@ mod tests {
         assert!(
             argv0.starts_with('-'),
             "expected a login shell (argv[0] beginning with '-'), got $0={argv0:?}"
+        );
+    }
+
+    /// Read the value of a `KEY=value` sentinel line out of a PTY.
+    ///
+    /// Deliberately NOT used by `spawns_login_shell` above. That test is the
+    /// regression witness for the behaviour that existed before `args` did, and
+    /// a witness rewritten in the same change that could have broken it is not
+    /// a witness. It keeps its own loop; everything new goes through here.
+    async fn sentinel(pty: &Pty, input: Option<&[u8]>, key: &str) -> Option<String> {
+        let (_handle, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
+        if let Some(bytes) = input {
+            pty.write_input(bytes).expect("write failed");
+        }
+        let mut collected = Vec::new();
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(3));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                data = rx.recv() => match data {
+                    Some(d) => {
+                        collected.extend_from_slice(&d);
+                        let output = String::from_utf8_lossy(&collected);
+                        if let Some(start) = output.find(key) {
+                            let rest = &output[start + key.len()..];
+                            if let Some(end) = rest.find(['\r', '\n']) {
+                                return Some(rest[..end].to_string());
+                            }
+                        }
+                    }
+                    None => return None,
+                },
+                _ = &mut timeout => return None,
+            }
+        }
+    }
+
+    /// The `args` parameter must be invisible to every caller that does not use
+    /// it, and this is the exact shape of "invisible": an empty `args` still
+    /// produces the leading-dash login argv[0].
+    ///
+    /// Pinned to the FULL string rather than `starts_with('-')`, so a change
+    /// that produced `-/bin/sh` -- a plausible near-miss, and one no shell
+    /// treats as a login shell -- is caught too. Every pane in the program goes
+    /// through this path.
+    #[tokio::test]
+    async fn empty_args_still_spawn_a_dash_prefixed_login_shell() {
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
+        // The sentinel is split across a shell concatenation so the assembled
+        // token appears only in the shell's OUTPUT, never in the command line
+        // the terminal echoes back.
+        let argv0 = sentinel(&pty, Some(b"echo \"AR\"\"GV0=$0\"\n"), "ARGV0=")
+            .await
+            .expect("did not observe $0 output");
+        pty.write_input(b"exit\n").unwrap();
+        assert_eq!(
+            argv0.trim(),
+            "-sh",
+            "an empty `args` must reproduce the pre-`args` login argv[0] exactly"
+        );
+    }
+
+    /// The complement, and the case the `files` panel needs: a command given
+    /// arguments RECEIVES them, and loses the login dash.
+    ///
+    /// One line proves both. `sh -c <script>` reaches the shell only through
+    /// `args`, so an argv that dropped them would leave an interactive shell
+    /// printing nothing at all and the sentinel would never appear; and `$0`
+    /// inside `-c` is the argv[0] this function chose, so the value that comes
+    /// back is what says whether the dash was applied.
+    #[tokio::test]
+    async fn an_argv_d_command_receives_its_arguments_and_loses_the_login_dash() {
+        // Nothing is written to this PTY, so nothing is echoed and the sentinel
+        // needs no concatenation trick: it can only reach the output by being
+        // printed.
+        let args = vec!["-c".to_string(), "echo ARGV0=$0".to_string()];
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &args, None, None).expect("failed to spawn PTY");
+        let argv0 = sentinel(&pty, None, "ARGV0=")
+            .await
+            .expect("the script never ran, so its arguments never reached exec");
+        assert_eq!(
+            argv0.trim(),
+            "sh",
+            "a program invoked with arguments is not a login shell"
         );
     }
 }

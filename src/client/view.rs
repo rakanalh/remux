@@ -474,11 +474,10 @@ pub fn cell_rects(view: &ClientView, area: Rect) -> Vec<Option<Rect>> {
 /// view's borders indistinguishable from a normal tab's (the previous hardcoded
 /// `Indexed(10)`/`Indexed(8)` pair did not match any theme).
 fn cell_border_fg(theme: &CompositorTheme, focused: bool) -> CellColor {
-    if focused {
-        theme.frame_active_fg.clone()
-    } else {
-        theme.frame_fg.clone()
-    }
+    // Delegates rather than restates: the active/inactive choice is one rule,
+    // shared with the panes and the sidebar frame. Kept as a named wrapper
+    // because "focused" reads better than "active" at the call site here.
+    crate::server::compositor::border_fg(theme, focused)
 }
 
 /// The interior (content) region of a cell whose outer rect is `rw` x `rh` at
@@ -889,6 +888,41 @@ pub fn focused_cell_visual_scope(
     }
 }
 
+/// Paint a pane snapshot into the `iw` x `ih` rectangle at `(ix, iy)` of `buf`.
+///
+/// This is THE way a streamed [`PaneSnapshot`] becomes cells. A View cell is one
+/// caller ([`draw_cell`]); the `files` sidebar panel is the other, because a
+/// file-manager panel is a pane snapshot painted into a rect and nothing else --
+/// the same problem, and so deliberately not a second blitter.
+///
+/// Bottom-anchored: when the snapshot is taller than the rectangle its LAST `ih`
+/// rows are shown, so a shell's newest output is what stays visible; when it is
+/// shorter, it is top-aligned and the rows below are left as they were.
+pub(crate) fn blit_snapshot(
+    buf: &mut [Vec<RenderCell>],
+    ix: usize,
+    iy: usize,
+    iw: usize,
+    ih: usize,
+    snap: &PaneSnapshot,
+) {
+    let sr = snap.cells.len();
+    let start = sr.saturating_sub(ih);
+    for r in 0..ih {
+        let src = start + r;
+        if src >= sr {
+            break;
+        }
+        let row = &snap.cells[src];
+        for c in 0..iw {
+            match row.get(c) {
+                Some(rc) => put(buf, iy + r, ix + c, rc.clone()),
+                None => break,
+            }
+        }
+    }
+}
+
 /// Write a single cell into the buffer if the coordinates are in range.
 fn put(buf: &mut [Vec<RenderCell>], y: usize, x: usize, cell: RenderCell) {
     if let Some(row) = buf.get_mut(y) {
@@ -995,25 +1029,7 @@ fn draw_cell(
             let label = format!("● Active in {}", cell_title(cell));
             draw_centered(buf, ix, iy, iw, ih, &label);
         }
-        Some(snap) => {
-            // Bottom-anchor: when the snapshot is taller than the interior show
-            // its LAST `ih` rows; when shorter, top-align from row 0.
-            let sr = snap.cells.len();
-            let start = sr.saturating_sub(ih);
-            for r in 0..ih {
-                let src = start + r;
-                if src >= sr {
-                    break;
-                }
-                let row = &snap.cells[src];
-                for c in 0..iw {
-                    match row.get(c) {
-                        Some(rc) => put(buf, iy + r, ix + c, rc.clone()),
-                        None => break,
-                    }
-                }
-            }
-        }
+        Some(snap) => blit_snapshot(buf, ix, iy, iw, ih, snap),
         None => {
             // No snapshot yet: centered `waiting for <title>…` placeholder.
             let label = format!("waiting for {}…", cell_title(cell));
@@ -1102,7 +1118,9 @@ fn draw_monocle_strip(
         );
         return;
     }
-    let border_fg = theme.frame_active_fg.clone();
+    // Always the focused colour: the strip belongs to the focused cell. Said
+    // through the shared rule rather than by naming the theme role.
+    let border_fg = crate::server::compositor::border_fg(theme, true);
     let cells = build_top_border_content(
         &stack_info,
         view.focused_id(),
@@ -1122,7 +1140,7 @@ fn draw_monocle_strip(
 /// Draw `text` centered (horizontally and vertically) inside the interior
 /// rect `(ix, iy, iw, ih)`, clipped to the interior width. Used for the
 /// waiting / disconnected / empty-view placeholders.
-fn draw_centered(
+pub(crate) fn draw_centered(
     buf: &mut [Vec<RenderCell>],
     ix: usize,
     iy: usize,

@@ -196,12 +196,14 @@ pub fn composite(
     scroll_offsets: &HashMap<PaneId, usize>,
     theme: &CompositorTheme,
 ) -> (Vec<Vec<RenderCell>>, HitRegions) {
-    log::debug!(
-        "compositor: composite area={}x{} at ({},{}), total={}x{}, gap={}, focused_pane={}, border={:?}",
-        area.width, area.height, area.x, area.y,
-        total_cols, total_rows, gap_size, focused_pane, border_style
-    );
-
+    // NOTHING is logged per frame here, and that is deliberate. This ran once
+    // per composited frame and `draw_zellij_panes` once per PANE per frame, at
+    // `debug!` -- and `main.rs` pins the logger at `Debug` with no `RUST_LOG` to
+    // turn it down, into a log that is never rotated. Frames are driven by pane
+    // output, so a single pane scrolling a build log wrote lines for as long as
+    // the build ran. Everything both lines reported is pure derived geometry
+    // recomputed from the arguments, so it told a reader nothing the inputs did
+    // not already say.
     let mut buffer = vec![vec![RenderCell::default(); total_cols as usize]; total_rows as usize];
     let mut hit_regions = HitRegions::default();
 
@@ -421,59 +423,264 @@ pub fn draw_zellij_border(
     let x = rect.x as usize;
     let y = rect.y as usize;
     let w = rect.width as usize;
-    let h = rect.height as usize;
-    if w == 0 || h == 0 {
+    if w == 0 || rect.height == 0 {
         return;
     }
 
-    let border_bg = theme.border_bg();
-    let border_cell = |c: char| RenderCell {
+    // The box itself is shared: the sidebar chrome draws the same one.
+    draw_zellij_box(buffer, rect, border_fg, theme);
+
+    // Then the pane-specific part, and the ONLY pane-specific part: the name /
+    // tab labels, overlaid on the top edge the box already filled with ─.
+    let available_width = w.saturating_sub(2); // inside the two corner chars
+    let top_content =
+        build_top_border_content(stack_info, pane_id, border_fg, mode, available_width, theme);
+    // The range stops at the right corner, so overlong content is clipped
+    // exactly as it was when this loop carried its own counter.
+    for (col, cell) in ((x + 1)..(x + w - 1)).zip(top_content.iter()) {
+        set_cell(buffer, y, col, cell.clone());
+    }
+}
+
+/// The glyphs the **rounded** box family is drawn from.
+///
+/// Border chrome is drawn by two different mechanisms here: the compositor
+/// paints `RenderCell` grids (panes, popups, the client's sidebar frame), while
+/// the client's overlays -- which-key, the command palette, the session
+/// manager, the pickers -- emit `DrawCommand` text lines painted over the
+/// finished frame. The MECHANISMS genuinely differ and cannot share a drawing
+/// routine, but the glyphs must not: a corner changed for the panes and missed
+/// for the overlays is the drift that had `\u{2570}` spelled out in seven
+/// separate `format!`s.
+///
+/// **There are TWO families, deliberately.** This rounded one is worn by
+/// everything that frames content -- panes, popups, the sidebar, and every
+/// overlay's own box. The `BOX_SHARP_*` set below is a second, lighter family
+/// used by exactly one thing: which-key's full-width band, which is a strip
+/// across the bottom of the screen rather than a box around content, and reads
+/// better square. Both families live here so neither can be changed in one
+/// place and missed in another -- but they are not interchangeable, and code
+/// picking between them is making a real choice.
+pub const BOX_TOP_LEFT: char = '\u{256D}'; // the corner glyphs
+pub const BOX_TOP_RIGHT: char = '\u{256E}';
+pub const BOX_BOTTOM_LEFT: char = '\u{2570}';
+pub const BOX_BOTTOM_RIGHT: char = '\u{256F}';
+pub const BOX_HORIZONTAL: char = '\u{2500}';
+pub const BOX_VERTICAL: char = '\u{2502}';
+/// Tee junctions, where a rule meets an edge. Used by the sidebar frame, the
+/// only border here that divides itself.
+pub const BOX_TEE_LEFT: char = '\u{251C}';
+pub const BOX_TEE_RIGHT: char = '\u{2524}';
+pub const BOX_TEE_DOWN: char = '\u{252C}';
+pub const BOX_TEE_UP: char = '\u{2534}';
+
+/// A box's top edge as a string: `\u{256D}\u{2500}\u{2500}\u{256E}`, with
+/// `inner_width` rule glyphs between the corners.
+///
+/// For the `DrawCommand` overlays; the grid drawing uses [`draw_zellij_box`].
+/// Both take their glyphs from the constants above.
+pub fn box_top_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_TOP_LEFT}{}{BOX_TOP_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// A box's top edge with a title set into it.
+///
+/// The caller computes the two fills: how a title is centred differs per
+/// overlay, the corners and the rule between them do not.
+pub fn box_top_line_titled(left_fill: usize, title: &str, right_fill: usize) -> String {
+    let dash = BOX_HORIZONTAL.to_string();
+    format!(
+        "{BOX_TOP_LEFT}{}{title}{}{BOX_TOP_RIGHT}",
+        dash.repeat(left_fill),
+        dash.repeat(right_fill)
+    )
+}
+
+/// A box's bottom edge as a string.
+pub fn box_bottom_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_BOTTOM_LEFT}{}{BOX_BOTTOM_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// A horizontal rule ACROSS a box, tee'd into both side edges.
+///
+/// The overlays' section dividers. It was four verbatim copies of the same
+/// `format!` (the command palette, the session manager twice, the pickers).
+pub fn box_rule_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_TEE_LEFT}{}{BOX_TEE_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// The **sharp** box family: which-key's full-width band, and nothing else.
+///
+/// See the note on [`BOX_TOP_LEFT`] -- this is the second family, kept here for
+/// the same reason and NOT interchangeable with the rounded one.
+pub const BOX_SHARP_TOP_LEFT: char = '\u{250C}';
+pub const BOX_SHARP_TOP_RIGHT: char = '\u{2510}';
+pub const BOX_SHARP_BOTTOM_LEFT: char = '\u{2514}';
+pub const BOX_SHARP_BOTTOM_RIGHT: char = '\u{2518}';
+
+/// The sharp family's top edge.
+pub fn sharp_box_top_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_SHARP_TOP_LEFT}{}{BOX_SHARP_TOP_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// The sharp family's bottom edge.
+pub fn sharp_box_bottom_line(inner_width: usize) -> String {
+    format!(
+        "{BOX_SHARP_BOTTOM_LEFT}{}{BOX_SHARP_BOTTOM_RIGHT}",
+        BOX_HORIZONTAL.to_string().repeat(inner_width)
+    )
+}
+
+/// The foreground a border wears, given whether the thing it frames holds
+/// focus. **The one statement of the active/inactive rule.**
+///
+/// The glyphs are shared by [`draw_zellij_box`] and the string builders above;
+/// this is the same argument one level up. It was written out three times --
+/// `draw_zellij_panes`, `view::cell_border_fg` and the sidebar frame -- and
+/// `draw_zellij_box` cannot own the choice, because it takes the colour as a
+/// parameter. So the choice lives here instead.
+///
+/// Callers that are always focused (a popup owns input whenever it is visible)
+/// pass `true` rather than reaching for `frame_active_fg` themselves.
+pub fn border_fg(theme: &CompositorTheme, active: bool) -> CellColor {
+    if active {
+        theme.frame_active_fg.clone()
+    } else {
+        theme.frame_fg.clone()
+    }
+}
+
+/// One cell of a border, in `border_fg` on the theme's border background.
+///
+/// **The one construction of a border cell.** Every frame drawn anywhere -- the
+/// zellij box, the tmux dividers, a View cell's border, the client's sidebar
+/// chrome -- goes through here, so a change to how a border cell is styled
+/// cannot reach one of them and miss another.
+///
+/// `draw_tmux_tab_bar` deliberately does NOT use this: a tab bar is
+/// status-bar-styled, not border-styled, and folding it in would be false
+/// sharing.
+pub fn border_cell(c: char, border_fg: &CellColor, theme: &CompositorTheme) -> RenderCell {
+    RenderCell {
         c,
         fg: border_fg.clone(),
-        bg: border_bg.clone(),
+        bg: theme.border_bg(),
         bold: false,
         italic: false,
         underline: false,
         hyperlink: None,
         width: 1,
         combining: Vec::new(),
-    };
+    }
+}
+
+/// Draw a zellij-style box: rounded corners and `─`/`│` edges, nothing inside.
+///
+/// **The one implementation of the box.** [`draw_zellij_border`] calls this and
+/// then overlays the pane's title run on the top edge; the client's sidebar
+/// chrome calls it and overlays nothing. Two callers, one set of glyphs.
+///
+/// `rect` is in BUFFER coordinates, and is NOT required to satisfy
+/// [`fits_zellij_border`] -- every write is bounds-checked, so a smaller rect
+/// draws safely and simply leaves no interior. Deciding whether a box is
+/// wanted at all is the caller's job (`draw_zellij_panes` and
+/// `chrome::geometry::sidebar_frame` both gate on `fits_zellij_border`).
+pub fn draw_zellij_box(
+    buffer: &mut [Vec<RenderCell>],
+    rect: Rect,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    let x = rect.x as usize;
+    let y = rect.y as usize;
+    let w = rect.width as usize;
+    let h = rect.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let cell = |c: char| border_cell(c, border_fg, theme);
 
     // Corners.
-    set_cell(buffer, y, x, border_cell('\u{256D}')); // ╭
-    set_cell(buffer, y, x + w - 1, border_cell('\u{256E}')); // ╮
-    set_cell(buffer, y + h - 1, x, border_cell('\u{2570}')); // ╰
-    set_cell(buffer, y + h - 1, x + w - 1, border_cell('\u{256F}')); // ╯
+    set_cell(buffer, y, x, cell(BOX_TOP_LEFT));
+    set_cell(buffer, y, x + w - 1, cell(BOX_TOP_RIGHT));
+    set_cell(buffer, y + h - 1, x, cell(BOX_BOTTOM_LEFT));
+    set_cell(buffer, y + h - 1, x + w - 1, cell(BOX_BOTTOM_RIGHT));
 
-    // Top border: the pane name / tab labels, then ─ fill to the right corner.
-    let available_width = w.saturating_sub(2); // inside the two corner chars
-    let top_content =
-        build_top_border_content(stack_info, pane_id, border_fg, mode, available_width, theme);
-    let top_start = x + 1;
-    let top_end = x + w - 1;
-    let mut col = top_start;
-    for cell in &top_content {
-        if col >= top_end {
-            break;
-        }
-        set_cell(buffer, y, col, cell.clone());
-        col += 1;
-    }
-    while col < top_end {
-        set_cell(buffer, y, col, border_cell('\u{2500}')); // ─
-        col += 1;
+    // Top and bottom edges, between the corners.
+    for col in (x + 1)..(x + w - 1) {
+        set_cell(buffer, y, col, cell(BOX_HORIZONTAL));
+        set_cell(buffer, y + h - 1, col, cell(BOX_HORIZONTAL));
     }
 
-    // Bottom border (fill between corners).
-    for col in top_start..top_end {
-        set_cell(buffer, y + h - 1, col, border_cell('\u{2500}')); // ─
-    }
-
-    // Left and right edges (between corners).
+    // Left and right edges, between the corners.
     for row in (y + 1)..(y + h - 1) {
-        set_cell(buffer, row, x, border_cell('\u{2502}')); // │
-        set_cell(buffer, row, x + w - 1, border_cell('\u{2502}')); // │
+        set_cell(buffer, row, x, cell(BOX_VERTICAL));
+        set_cell(buffer, row, x + w - 1, cell(BOX_VERTICAL));
     }
+}
+
+/// Draw a vertical divider run: `│` down `col`, rows `y0..y1`.
+///
+/// Shared by the tmux pane dividers and the client's sidebar seam so the glyph
+/// and the styling have one definition. Bounds-checked; an empty range draws
+/// nothing.
+pub fn draw_divider_column(
+    buffer: &mut [Vec<RenderCell>],
+    col: usize,
+    y0: usize,
+    y1: usize,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    for row in y0..y1 {
+        set_cell(
+            buffer,
+            row,
+            col,
+            border_cell(BOX_VERTICAL, border_fg, theme),
+        );
+    }
+}
+
+/// Draw a horizontal divider run: `─` along `row`, columns `x0..x1`.
+///
+/// The counterpart to [`draw_divider_column`], and shared the same way.
+pub fn draw_divider_row(
+    buffer: &mut [Vec<RenderCell>],
+    row: usize,
+    x0: usize,
+    x1: usize,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    for col in x0..x1 {
+        set_cell(
+            buffer,
+            row,
+            col,
+            border_cell(BOX_HORIZONTAL, border_fg, theme),
+        );
+    }
+}
+
+/// Write one already-built cell into `buffer`, bounds-checked.
+///
+/// Public so a client-side frame can overlay a junction glyph (`├┤┬┴`) onto a
+/// run drawn by the shared primitives above without restating the bounds check.
+pub fn put_cell(buffer: &mut [Vec<RenderCell>], row: usize, col: usize, cell: RenderCell) {
+    set_cell(buffer, row, col, cell);
 }
 
 /// Draw panes with full box-drawing borders using rounded corners.
@@ -504,11 +711,7 @@ fn draw_zellij_panes(
         };
 
         let is_active = pane_id == focused_pane;
-        let border_fg = if is_active {
-            theme.frame_active_fg.clone()
-        } else {
-            theme.frame_fg.clone()
-        };
+        let border_fg = border_fg(theme, is_active);
 
         let offset = scroll_offsets.get(&pane_id).copied().unwrap_or(0);
 
@@ -520,18 +723,6 @@ fn draw_zellij_panes(
             continue;
         }
 
-        log::debug!(
-            "draw_zellij_panes: pane_id={}, rect={}x{} at ({},{}), inner={}x{} at ({},{})",
-            pane_id,
-            rect.width,
-            rect.height,
-            rect.x,
-            rect.y,
-            inner.width,
-            inner.height,
-            inner.x,
-            inner.y
-        );
         blit_screen(buffer, screen, inner, offset);
 
         // Draw the full box border with rounded corners (shared with the
@@ -969,49 +1160,38 @@ pub fn draw_tmux_dividers(
     pane_rects: &[(PaneId, Rect)],
     theme: &CompositorTheme,
 ) {
-    // A divider IS the frame in tmux style, so it wears the frame's background.
-    let divider_cell = |c: char| RenderCell {
-        c,
-        fg: theme.frame_fg.clone(),
-        bg: theme.border_bg(),
-        bold: false,
-        italic: false,
-        underline: false,
-        hyperlink: None,
-        width: 1,
-        combining: Vec::new(),
-    };
+    // A divider IS the frame in tmux style, so it wears the frame's colors --
+    // built by the shared `border_cell` and drawn by the shared runs, the same
+    // ones the client's sidebar seam uses.
+    // tmux dividers never track focus (this function is not even told which
+    // pane is focused), so the rule is asked with `false`.
+    let fg = border_fg(theme, false);
 
     for i in 0..pane_rects.len() {
         for j in (i + 1)..pane_rects.len() {
             let (_, r1) = pane_rects[i];
             let (_, r2) = pane_rects[j];
 
-            // Vertical divider: r1 is left of r2.
+            // Vertical divider: r1 is left of r2. It lands in r1's LAST column,
+            // overwriting content -- a pane may paint over its neighbour, which
+            // is the one thing the client's sidebar cannot do (the rect on the
+            // far side of its seam belongs to the server).
             if r1.x + r1.width == r2.x {
                 let top = r1.y.max(r2.y) as usize;
                 let bottom = (r1.y + r1.height).min(r2.y + r2.height) as usize;
                 let col = r2.x as usize;
                 if col > 0 {
-                    for row in top..bottom {
-                        if row < buffer.len() && (col - 1) < buffer[row].len() {
-                            buffer[row][col - 1] = divider_cell('\u{2502}'); // │
-                        }
-                    }
+                    draw_divider_column(buffer, col - 1, top, bottom, &fg, theme);
                 }
             }
 
-            // Horizontal divider: r1 is above r2.
+            // Horizontal divider: r1 is above r2, landing in r1's last row.
             if r1.y + r1.height == r2.y {
                 let left = r1.x.max(r2.x) as usize;
                 let right = (r1.x + r1.width).min(r2.x + r2.width) as usize;
                 let row = r2.y as usize;
                 if row > 0 {
-                    for c in left..right {
-                        if (row - 1) < buffer.len() && c < buffer[row - 1].len() {
-                            buffer[row - 1][c] = divider_cell('\u{2500}'); // ─
-                        }
-                    }
+                    draw_divider_row(buffer, row - 1, left, right, &fg, theme);
                 }
             }
         }
@@ -1099,8 +1279,9 @@ pub fn draw_popup(
     }
 
     // The popup owns input whenever it is visible, so it always wears the
-    // active-frame color.
-    let border_fg = theme.frame_active_fg.clone();
+    // active-frame color -- said through the shared rule rather than by
+    // reaching for the theme role directly.
+    let border_fg = border_fg(theme, true);
     let blank = RenderCell::default();
 
     // Clear the popup's footprint so the layout underneath cannot show through.
@@ -1117,70 +1298,17 @@ pub fn draw_popup(
         return rect;
     }
 
-    let interior = Rect {
-        x: rect.x + 1,
-        y: rect.y + 1,
-        width: rect.width - 2,
-        height: rect.height - 2,
-    };
+    // The interior comes from the one definition of a style's content rect,
+    // not from a local `+1 / -2`.
+    let interior = pane_content_rect(&BorderStyle::ZellijStyle, rect, false);
     blit_screen(buffer, screen, interior, scroll_offset);
 
-    let x = rect.x as usize;
-    let y = rect.y as usize;
-    let w = rect.width as usize;
-    let h = rect.height as usize;
-
-    let border_cell = |c: char| RenderCell {
-        c,
-        fg: border_fg.clone(),
-        bg: theme.border_bg(),
-        bold: false,
-        italic: false,
-        underline: false,
-        hyperlink: None,
-        width: 1,
-        combining: Vec::new(),
-    };
-
-    // Rounded corners, matching a ZellijStyle pane frame.
-    set_cell(buffer, y, x, border_cell('\u{256D}')); // ╭
-    set_cell(buffer, y, x + w - 1, border_cell('\u{256E}')); // ╮
-    set_cell(buffer, y + h - 1, x, border_cell('\u{2570}')); // ╰
-    set_cell(buffer, y + h - 1, x + w - 1, border_cell('\u{256F}')); // ╯
-
-    // Title in the top border, styled exactly like a single-pane top border.
+    // The frame is a zellij pane's frame -- the same box, the same title
+    // treatment -- because a popup floats OVER those panes and any difference
+    // reads as a bug. `draw_zellij_border` is box + title overlay, which is
+    // exactly what this used to spell out for itself.
     let stack_info = Some((vec![title.to_string()], vec![pane_id], 0usize));
-    let top_content = build_top_border_content(
-        &stack_info,
-        pane_id,
-        &border_fg,
-        mode,
-        w.saturating_sub(2),
-        theme,
-    );
-    let top_end = x + w - 1;
-    let mut col = x + 1;
-    for cell in &top_content {
-        if col >= top_end {
-            break;
-        }
-        set_cell(buffer, y, col, cell.clone());
-        col += 1;
-    }
-    while col < top_end {
-        set_cell(buffer, y, col, border_cell('\u{2500}')); // ─
-        col += 1;
-    }
-
-    // Bottom border.
-    for col in (x + 1)..(x + w - 1) {
-        set_cell(buffer, y + h - 1, col, border_cell('\u{2500}')); // ─
-    }
-    // Side edges.
-    for row in (y + 1)..(y + h - 1) {
-        set_cell(buffer, row, x, border_cell('\u{2502}')); // │
-        set_cell(buffer, row, x + w - 1, border_cell('\u{2502}')); // │
-    }
+    draw_zellij_border(buffer, rect, &border_fg, &stack_info, pane_id, mode, theme);
 
     // A drag-selection inside the popup highlights against the popup's own rect
     // (the layout pass can't: the popup pane is in no layout tree).
@@ -1886,6 +2014,198 @@ mod tests {
                 .any(|cell| cell.c == '\u{2500}' || cell.c == '\u{2570}' || cell.c == '\u{256F}')
         });
         assert!(has_horizontal, "expected horizontal border characters");
+    }
+
+    /// A popup's frame IS a zellij pane's frame -- same box, same title
+    /// treatment, same colors.
+    ///
+    /// `draw_popup` used to spell the whole box out for itself: its own
+    /// `border_cell` closure, its own corners and edges, its own title loop and
+    /// its own `+1 / -2` interior. Three copies of the box existed (pane,
+    /// popup, sidebar chrome). This pins the popup to the shared one, so a
+    /// change to a corner glyph or a border color cannot reach the panes and
+    /// miss the thing floating over them.
+    #[test]
+    fn a_popups_frame_is_a_zellij_panes_frame() {
+        let theme = CompositorTheme::default();
+        let screen = Screen::new(10, 4, 100);
+        let rect = Rect {
+            x: 1,
+            y: 1,
+            width: 12,
+            height: 6,
+        };
+        let mut popup = vec![vec![RenderCell::default(); 16]; 10];
+        draw_popup(
+            &mut popup, rect, 7, &screen, "term", "NORMAL", 0, None, &theme,
+        );
+
+        let mut pane = vec![vec![RenderCell::default(); 16]; 10];
+        let stack = Some((vec!["term".to_string()], vec![7], 0usize));
+        draw_zellij_border(
+            &mut pane,
+            rect,
+            &theme.frame_active_fg,
+            &stack,
+            7,
+            "NORMAL",
+            &theme,
+        );
+
+        // The perimeter only: the popup also blits its screen into the interior.
+        let (x0, y0) = (rect.x as usize, rect.y as usize);
+        let (x1, y1) = (x0 + rect.width as usize - 1, y0 + rect.height as usize - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if y != y0 && y != y1 && x != x0 && x != x1 {
+                    continue;
+                }
+                assert_eq!(
+                    popup[y][x], pane[y][x],
+                    "popup and pane frames differ at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// The popup's interior is `pane_content_rect`, not a local `+1 / -2`.
+    #[test]
+    fn a_popups_interior_is_the_shared_content_rect() {
+        let theme = CompositorTheme::default();
+        let screen = Screen::new(10, 4, 100);
+        let rect = Rect {
+            x: 1,
+            y: 1,
+            width: 12,
+            height: 6,
+        };
+        let mut buf = vec![vec![RenderCell::default(); 16]; 10];
+        let interior = draw_popup(
+            &mut buf, rect, 7, &screen, "term", "NORMAL", 0, None, &theme,
+        );
+        // LITERAL numbers, not `pane_content_rect(...)`. Comparing against the
+        // very function `draw_popup` calls is a tautology: re-inline the old
+        // `+1 / -2` and it would still pass. These numbers fail against a
+        // drifted local copy AND against a change to `pane_content_rect`.
+        assert_eq!(
+            interior,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 10,
+                height: 4
+            }
+        );
+        // ... and they are what the shared function says, which is the claim.
+        assert_eq!(
+            interior,
+            pane_content_rect(&BorderStyle::ZellijStyle, rect, false)
+        );
+    }
+
+    /// Every border in the program resolves its focus colour through one rule.
+    ///
+    /// The glyphs are shared; this is the same argument one level up, and it
+    /// was written out three times before (`draw_zellij_panes`,
+    /// `view::cell_border_fg`, the sidebar frame).
+    #[test]
+    fn one_rule_decides_every_borders_focus_colour() {
+        let theme = CompositorTheme::default();
+        assert_eq!(border_fg(&theme, true), theme.frame_active_fg);
+        assert_eq!(border_fg(&theme, false), theme.frame_fg);
+        assert_ne!(
+            theme.frame_fg, theme.frame_active_fg,
+            "the default theme must distinguish them or this test proves nothing"
+        );
+
+        // A focused pane's border really is what the rule returns.
+        let layout = LayoutNode::new_stack(1);
+        let screen = Screen::new(18, 8, 100);
+        let mut panes = HashMap::new();
+        panes.insert(1, &screen);
+        let status = StatusInfo {
+            mode: "NORMAL".to_string(),
+            session_name: "t".to_string(),
+            tabs: vec![("Tab 1".to_string(), true, TabActivity::None)],
+            layout_mode: "bsp".to_string(),
+            search_info: None,
+        };
+        let (buf, _) = composite(
+            &layout,
+            &panes,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            },
+            &BorderStyle::ZellijStyle,
+            &status,
+            20,
+            11,
+            0,
+            1,
+            None,
+            &HashMap::new(),
+            &theme,
+        );
+        assert_eq!(buf[0][0].fg, border_fg(&theme, true));
+    }
+
+    /// Every string builder, pinned to LITERAL glyphs.
+    ///
+    /// Deliberately literal rather than written in terms of the constants: a
+    /// golden that moves when the constant moves pins nothing. This is what
+    /// makes a typo in `BOX_TEE_LEFT`, or in the sharp family, fail here --
+    /// probing found that a drifted `box_rule_line` reached the
+    /// command-palette PTY harness without a single assertion noticing.
+    #[test]
+    fn the_string_builders_are_pinned_to_literal_glyphs() {
+        assert_eq!(box_top_line(3), "\u{256D}\u{2500}\u{2500}\u{2500}\u{256E}");
+        assert_eq!(
+            box_bottom_line(3),
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{256F}"
+        );
+        assert_eq!(box_rule_line(3), "\u{251C}\u{2500}\u{2500}\u{2500}\u{2524}");
+        assert_eq!(
+            box_top_line_titled(1, "x", 1),
+            "\u{256D}\u{2500}x\u{2500}\u{256E}"
+        );
+        // The second family. Sharp corners, and they must stay sharp.
+        assert_eq!(
+            sharp_box_top_line(3),
+            "\u{250C}\u{2500}\u{2500}\u{2500}\u{2510}"
+        );
+        assert_eq!(
+            sharp_box_bottom_line(3),
+            "\u{2514}\u{2500}\u{2500}\u{2500}\u{2518}"
+        );
+    }
+
+    /// The string builders and the grid drawing use the SAME glyphs.
+    ///
+    /// The overlays cannot share a drawing routine with the compositor -- they
+    /// emit `DrawCommand` text, not cells -- so this is what keeps the two
+    /// mechanisms showing the same box.
+    #[test]
+    fn the_string_builders_and_the_grid_agree_on_every_glyph() {
+        let theme = CompositorTheme::default();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 3,
+        };
+        let mut grid = vec![vec![RenderCell::default(); 6]; 3];
+        draw_zellij_box(&mut grid, rect, &theme.frame_fg, &theme);
+        let top: String = grid[0].iter().map(|c| c.c).collect();
+        let bottom: String = grid[2].iter().map(|c| c.c).collect();
+        assert_eq!(top, box_top_line(4));
+        assert_eq!(bottom, box_bottom_line(4));
+        assert_eq!(
+            box_top_line_titled(1, "ab", 1),
+            format!("{BOX_TOP_LEFT}\u{2500}ab\u{2500}{BOX_TOP_RIGHT}")
+        );
     }
 
     #[test]

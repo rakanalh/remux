@@ -18,14 +18,18 @@ use futures::StreamExt;
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
     FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget, SessionSwitchOverlay,
+    SidebarIntent,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
 use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
+use crate::client::tree_model::JumpTarget;
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::{Config, RemoteConfig};
-use crate::protocol::{ClientMessage, ConnDescriptor, RemuxCommand, ServerMessage, ViewId};
+use crate::protocol::{
+    CliPlacement, ClientMessage, ConnDescriptor, RemuxCommand, ServerMessage, ViewId,
+};
 use crate::server::daemon::{self, socket_path, RemuxServer};
 
 /// Data captured while computing search matches, used to transition from
@@ -90,6 +94,64 @@ enum Commands {
         remux_path: String,
     },
 
+    /// Split the focused pane of the session named by $REMUX_SESSION
+    //
+    // No short flags for the direction, and `-h` is left to clap as the help
+    // flag. `-h`/`-v` are ambiguous in EVERY multiplexer -- "horizontal" names
+    // the divider in remux and the arrangement in tmux, so the same letter means
+    // opposite geometry in the two tools. Inheriting that spelling would have
+    // cost this subcommand its help flag in order to buy an ambiguity, which is
+    // a bad trade in both directions. `--right`/`--below` name where the pane
+    // LANDS and cannot be misread; splitting is not frequent enough in a script
+    // for four saved characters to be worth any of it.
+    #[command(
+        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session to split.\n\
+                      With no COMMAND the new pane runs the login shell.\n\n\
+                      Examples:\n  \
+                        remux split\n  \
+                        remux split --right -- nvim /tmp/notes.md"
+    )]
+    Split {
+        /// Put the new pane to the RIGHT of the focused one
+        #[arg(long)]
+        right: bool,
+
+        /// Put the new pane BELOW the focused one (the default)
+        #[arg(long, conflicts_with = "right")]
+        below: bool,
+
+        /// Working directory for the new pane (default: the target pane's)
+        #[arg(short = 'c', long, value_name = "DIR")]
+        cwd: Option<String>,
+
+        /// Command to run, after `--`; empty runs the login shell
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        argv: Vec<String>,
+    },
+
+    /// Create a new tab in the session named by $REMUX_SESSION
+    #[command(
+        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session.\n\
+                            With no COMMAND the new pane runs the login shell."
+    )]
+    NewTab {
+        /// Working directory for the new tab's pane (default: the focused pane's)
+        #[arg(short = 'c', long, value_name = "DIR")]
+        cwd: Option<String>,
+
+        /// Command to run, after `--`; empty runs the login shell
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        argv: Vec<String>,
+    },
+
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
     Server,
@@ -97,6 +159,124 @@ enum Commands {
     /// Internal: relay stdio to the local server socket (used over SSH)
     #[command(hide = true)]
     Relay,
+}
+
+/// Ask the running server to create a pane, on behalf of `remux split` /
+/// `remux new-tab`.
+///
+/// The whole point of the subcommand is that it is run from INSIDE a pane, by a
+/// script or a file manager's opener hook, so the session comes from the
+/// `$REMUX_SESSION` that `Pty::spawn` exported into that pane -- the
+/// `TMUX`/`TMUX_PANE` arrangement.
+///
+/// **An unset `$REMUX_SESSION` is refused, never guessed.** There is usually a
+/// plausible guess available ("the only session", "the most recent one"), and
+/// taking it is how a script splits a window the user was not looking at. The
+/// message says which variable is missing so the fix is obvious.
+///
+/// Note what this deliberately does NOT read: `$REMUX_PANE`. The server splits
+/// the session's active tab's FOCUSED pane, because the variable is fixed at
+/// spawn time, which may be long past, whereas focus is where the user is now.
+/// `$REMUX_PANE` is
+/// exported for callers that want that precision by other means.
+///
+/// Exits the process non-zero on every failure, since the caller is a script.
+async fn run_cli_spawn(
+    placement: CliPlacement,
+    cwd: Option<String>,
+    argv: Vec<String>,
+) -> Result<()> {
+    let Some(session) = std::env::var_os("REMUX_SESSION") else {
+        eprintln!(
+            "remux: not inside a remux pane ($REMUX_SESSION is unset).\n\
+             Run this from a shell running in a remux pane."
+        );
+        std::process::exit(1);
+    };
+    let session = session.to_string_lossy().into_owned();
+    // The PROGRAM and a count, never the arguments. `client.log` is the same
+    // kind of file as `server.log` -- plaintext, unrotated, always at `Debug` --
+    // and this is the very command line the user typed, so
+    // `remux split -- psql postgresql://user:pass@host/db` would put the
+    // password on disk. The server side redacts identically; see
+    // `handle_client_message`'s summary match.
+    log::debug!(
+        "cmd: cli-spawn session={session:?} placement={placement:?} program={:?} \
+         ({} more arg(s)) cwd={cwd:?}",
+        argv.first(),
+        argv.len().saturating_sub(1)
+    );
+
+    // Deliberately no `ensure_server_running()`: a set $REMUX_SESSION means a
+    // pane exists, which means a server does. Starting one here would create an
+    // EMPTY server that could not possibly hold the named session, and then
+    // report that the session does not exist -- a confusing answer to a
+    // situation that is really "the server this pane belongs to has gone away".
+    if !socket_path().exists() {
+        eprintln!("remux: no server running on this machine.");
+        std::process::exit(1);
+    }
+    let mut client = RemuxClient::connect().await?;
+    client
+        .send(ClientMessage::CliSpawn {
+            session: session.clone(),
+            placement,
+            argv,
+            cwd,
+        })
+        .await?;
+
+    match client.recv_skip_views().await? {
+        Some(ServerMessage::CliSpawned { pane_id }) => {
+            log::debug!("cmd: cli-spawn created pane_id={pane_id}");
+        }
+        Some(ServerMessage::Error { message }) => {
+            eprintln!("remux: {message}");
+            std::process::exit(1);
+        }
+        other => {
+            log::warn!("cmd: cli-spawn unexpected reply: {other:?}");
+            eprintln!("remux: unexpected response from server.");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Route panics into the role's log file, in addition to stderr.
+///
+/// `env_logger` only ever sees what goes through the `log` crate, and every
+/// harness runs the server with its stderr on `/dev/null` -- so before this
+/// hook existed a panic left NO trace in `server.log`. 53 of the 62 harnesses
+/// grep that file for "panic" (66 sites); every one was searching a file the
+/// evidence could never reach, and passed on an empty search.
+///
+/// The message deliberately opens with the literal `panicked at`, because the
+/// harnesses split between grepping a case-sensitive `"panicked"` and a
+/// lowercased `"panic"`; that prefix satisfies both.
+///
+/// The previous hook is chained rather than replaced, so an interactive run
+/// still prints the standard panic message (and any backtrace) to stderr.
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `payload_as_str` is not stable yet, so downcast the two types the
+        // standard `panic!` paths actually produce.
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic payload>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>").to_string();
+        log::error!("panicked at {location} (thread '{thread}'): {payload}");
+        previous(info);
+    }));
 }
 
 #[tokio::main]
@@ -125,6 +305,8 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
+
+    install_panic_logger();
 
     let role = match cli.command {
         Some(Commands::Server) => "server",
@@ -363,6 +545,33 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Split {
+            right,
+            below: _,
+            cwd,
+            argv,
+        }) => {
+            // BELOW is the default, stated in `--help` and pinned by a harness
+            // rather than left to whatever the code happens to do: an unpinned
+            // default is exactly the thing that flips during a refactor and gets
+            // noticed months later by a script opening panes in the wrong place.
+            // `--below` is therefore accepted and then ignored -- it exists so a
+            // caller who wants to be explicit can be, and `conflicts_with` makes
+            // naming both an error rather than a silent winner.
+            //
+            // Below rather than right because a terminal is wider than it is
+            // tall, so stacking leaves both panes more usable line length. It is
+            // also what a bare `tmux split-window` does.
+            let placement = if right {
+                CliPlacement::SplitRight
+            } else {
+                CliPlacement::SplitBelow
+            };
+            run_cli_spawn(placement, cwd, argv).await?;
+        }
+        Some(Commands::NewTab { cwd, argv }) => {
+            run_cli_spawn(CliPlacement::NewTab, cwd, argv).await?;
+        }
         Some(Commands::Stop) => {
             log::debug!("cmd: stop server");
             stop_server().await?;
@@ -556,7 +765,8 @@ async fn client_event_loop(
 
 /// Hand the foreground over to `target`: connect it if it is a not-yet-connected
 /// remote, detach the current foreground so it stops streaming, make `target`
-/// the foreground, and resize it to the current terminal.
+/// the foreground, and resize it to the current CONTENT rect (the terminal
+/// minus the visible sidebars), never to the raw terminal size.
 ///
 /// No-op (and crucially no `Detach`) when `target` is already the foreground, so
 /// same-server switches behave exactly as before. The detach-before-attach step
@@ -565,8 +775,7 @@ async fn client_event_loop(
 async fn switch_to_server(
     mgr: &mut ConnectionManager,
     target: &ConnId,
-    cols: u16,
-    rows: u16,
+    content: crate::server::layout::Rect,
 ) -> Result<()> {
     if mgr.is_foreground(target) {
         return Ok(());
@@ -580,8 +789,14 @@ async fn switch_to_server(
     }
     let _ = mgr.send_foreground(ClientMessage::Detach).await;
     mgr.set_foreground(target.clone());
-    mgr.send(target, ClientMessage::Resize { cols, rows })
-        .await?;
+    mgr.send(
+        target,
+        ClientMessage::Resize {
+            cols: content.width,
+            rows: content.height,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -603,6 +818,428 @@ fn record_switch(
     }
     *previous = current.take();
     *current = Some(new_attached);
+}
+
+/// The rect the server composites into: the terminal minus the visible
+/// sidebars.
+///
+/// EVERY "content" `terminal::size()` call site goes through this. See section
+/// 7 of the design doc for the content-vs-chrome classification -- the modal
+/// overlays (rename, palette, search prompt, switcher, pickers, session
+/// manager, which-key) deliberately keep using the raw terminal size, because
+/// they centre on the whole terminal.
+///
+/// A live View is no exception: `paint_view` composites into a CONTENT-sized
+/// buffer and blits it with `render_full`, so the renderer's origin places it
+/// between the sidebars exactly as it does a server frame. Every view-geometry
+/// computation (compositing, cell subscriptions, hit tests, the visual scope)
+/// therefore runs against the SAME rect this returns -- they are one invariant,
+/// and splitting them is what makes a view's borders land right while the
+/// content inside them is sized wrong.
+fn content_rect_now(chrome: &crate::client::chrome::Chrome) -> Result<crate::server::layout::Rect> {
+    let (c, r) = crossterm::terminal::size()?;
+    Ok(chrome.content_rect(c, r))
+}
+
+/// Which panel, if any, a screen coordinate falls inside.
+///
+/// `term_cols`/`term_rows` must come from [`Renderer::size`], not from a fresh
+/// `terminal::size()`: panels are laid out against the front buffer, and
+/// between a SIGWINCH and the `Resize` event the two disagree -- a hit test run
+/// against the new size would resolve against rects that are not on screen yet.
+fn panel_at(
+    chrome: &crate::client::chrome::Chrome,
+    term_cols: u16,
+    term_rows: u16,
+    x: u16,
+    y: u16,
+) -> Option<(usize, usize)> {
+    chrome
+        .panel_rects(term_cols, term_rows)
+        .into_iter()
+        .find(|(_, _, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+        .map(|(si, pi, _)| (si, pi))
+}
+
+/// Which region a mouse gesture belongs to.
+///
+/// A press claims a region and every event up to the matching release stays
+/// with it: a drag that began in the content and wandered over a sidebar is
+/// clamped into the content rect rather than stealing the panel, and a drag
+/// that began in a panel keeps feeding that panel after the pointer leaves it.
+/// Without this the two halves of one gesture would land on different
+/// consumers -- the server would see a press with no release, or a panel a
+/// release it never got a press for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseGrab {
+    Content,
+    Panel { sidebar: usize, panel: usize },
+}
+
+/// The focus direction a `PaneFocus*` command asks for, if it is one.
+///
+/// The chrome intercepts these before they reach the server; every other
+/// command is `None` and falls straight through.
+fn focus_direction_of(cmd: &RemuxCommand) -> Option<crate::server::layout::FocusDirection> {
+    use crate::server::layout::FocusDirection;
+    match cmd {
+        RemuxCommand::PaneFocusLeft => Some(FocusDirection::Left),
+        RemuxCommand::PaneFocusRight => Some(FocusDirection::Right),
+        RemuxCommand::PaneFocusUp => Some(FocusDirection::Up),
+        RemuxCommand::PaneFocusDown => Some(FocusDirection::Down),
+        _ => None,
+    }
+}
+
+/// The direction and amount a `Resize*` command asks for, if it is one.
+///
+/// A focused sidebar re-targets these at itself; every other command is `None`
+/// and falls straight through to the server.
+fn resize_of(cmd: &RemuxCommand) -> Option<(crate::server::layout::FocusDirection, u16)> {
+    use crate::server::layout::FocusDirection;
+    match cmd {
+        RemuxCommand::ResizeLeft(n) => Some((FocusDirection::Left, *n)),
+        RemuxCommand::ResizeRight(n) => Some((FocusDirection::Right, *n)),
+        RemuxCommand::ResizeUp(n) => Some((FocusDirection::Up, *n)),
+        RemuxCommand::ResizeDown(n) => Some((FocusDirection::Down, *n)),
+        _ => None,
+    }
+}
+
+/// Re-target a `Resize*` at the focused sidebar. Returns `true` when the chrome
+/// consumed the command and it must NOT be forwarded to the server.
+///
+/// Perpendicular to the sidebar's edge this moves its `size`, so the CONTENT
+/// RECT moves with it: the origin and the `Resize` travel together (see
+/// `sync_content_rect`), exactly as they do for a toggle. Parallel to the edge
+/// it reweights the focused panel, which leaves the content rect alone and only
+/// needs a repaint.
+///
+/// There is deliberately no live-view branch. A view cannot coexist with panel
+/// focus -- `SidebarIntent::Focus` is refused while one is up and `enter_view`
+/// drops panel focus -- and this runs AFTER `handle_view_command`, which
+/// consumes `Resize*` for the view's cells. So a resize while a view is live
+/// never reaches here, and one that did would find focus on the content and
+/// fall through.
+async fn handle_chrome_resize(
+    cmd: &RemuxCommand,
+    chrome: &mut crate::client::chrome::Chrome,
+    active_view: Option<usize>,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    compositor_theme: &crate::config::theme::CompositorTheme,
+) -> Result<bool> {
+    // The unasserted invariant this function's safety rests on. It neither
+    // re-subscribes view cells nor consults the view's geometry, so if a panel
+    // could hold focus while a view is live, a sidebar resize would move the
+    // content rect out from under that view without re-subscribing its cells.
+    // Three call sites depend on this and none of them check it, so assert it
+    // where the damage would happen -- a future view-entry path that forgets
+    // `chrome.leave_sidebar()` should trip here in debug, not corrupt a view.
+    debug_assert!(
+        !(matches!(
+            chrome.focus,
+            crate::client::chrome::ChromeFocus::Sidebar { .. }
+        ) && active_view.is_some()),
+        "panel focus while a view is live: a sidebar resize would move the \
+         content rect under the view without re-subscribing its cells"
+    );
+    let Some((dir, amount)) = resize_of(cmd) else {
+        return Ok(false);
+    };
+    let (tc, tr) = renderer.size();
+    let before = chrome.content_rect(tc, tr);
+    let persisted_before = crate::client::sidebar_state::SidebarState::from_chrome(chrome);
+    if !crate::client::chrome::intercept_resize(chrome, dir, amount, tc, tr) {
+        return Ok(false);
+    }
+    if crate::client::sidebar_state::SidebarState::from_chrome(chrome) != persisted_before {
+        crate::client::sidebar_state::save(chrome);
+    }
+    let content = chrome.content_rect(tc, tr);
+    if content != before {
+        sync_content_rect(renderer, &content);
+        mgr.send_foreground(ClientMessage::Resize {
+            cols: content.width,
+            rows: content.height,
+        })
+        .await?;
+    }
+    chrome.paint(renderer, tc, tr, compositor_theme, focused_pane_rect)?;
+    renderer.flush()?;
+    Ok(true)
+}
+
+/// Go to a session, a tab, or a pane, anywhere: leave any live view, re-point
+/// the renderer at the content rect, hand the screen to the target's server,
+/// attach and switch.
+///
+/// The ONE implementation of "go to that node". The session manager's three
+/// switch arms and the sidebar's `PluginAction::JumpTo` both route through it,
+/// so the two surfaces cannot drift -- which matters most above pane level,
+/// where "that node's current focus" is resolved by the server (`Attach` lands
+/// on a session's current tab and pane; `SessionSwitchTab` on a tab's focused
+/// pane) and a second client-side answer could only disagree with it.
+///
+/// The session-manager teardown (closing the overlay, clearing it) stays at
+/// those call sites: it is about the overlay, not about the jump.
+#[allow(clippy::too_many_arguments)]
+async fn switch_to_target(
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    chrome: &mut crate::client::chrome::Chrome,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    mouse_grab: &mut Option<MouseGrab>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+    target: JumpTarget,
+) -> Result<()> {
+    let server = target.conn().clone();
+    let session = target.session().to_string();
+    // A live view masks the switched-to session: tear it down before handing
+    // off the screen.
+    leave_active_view(mgr, views, active_view, active_view_id, chrome, mouse_grab).await?;
+    // Leaving the view hands the screen back to the content rect: re-point the
+    // renderer at it before the target server is told what size to composite.
+    let content = content_rect_now(chrome)?;
+    sync_content_rect(renderer, &content);
+    switch_to_server(mgr, &server, content).await?;
+    // The server's handle_command ignores commands from a client with no
+    // attached session, so a remote switch must attach first (a harmless
+    // re-attach for local). Attaching alone is what a session-level jump is.
+    mgr.send(
+        &server,
+        ClientMessage::Attach {
+            session_name: session.clone(),
+        },
+    )
+    .await?;
+    let narrow = match &target {
+        JumpTarget::Session { .. } => None,
+        JumpTarget::Tab { tab_index, .. } => Some(RemuxCommand::SessionSwitchTab {
+            session: session.clone(),
+            tab_index: *tab_index,
+        }),
+        JumpTarget::Pane {
+            tab_index, pane_id, ..
+        } => Some(RemuxCommand::SessionSwitchPane {
+            session: session.clone(),
+            tab_index: *tab_index,
+            pane_id: *pane_id,
+        }),
+    };
+    if let Some(cmd) = narrow {
+        mgr.send(&server, ClientMessage::Command(cmd)).await?;
+    }
+    mgr.send(
+        &server,
+        ClientMessage::ModeChanged {
+            mode: "NORMAL".to_string(),
+        },
+    )
+    .await?;
+    if server == ConnId::Local {
+        *last_local_session = Some(session.clone());
+    }
+    record_switch(current_attached, previous_attached, server, session);
+    Ok(())
+}
+
+/// Act on what a sidebar plugin asked for after an input event.
+///
+/// Both focus-leaving arms go through `Chrome::leave_sidebar` so the panel the
+/// user was on is remembered: `focus_edge` comes back to it rather than
+/// resetting to the first panel.
+/// Carry out one [`PluginRequest`] on behalf of the panel at `(si, pi)`.
+///
+/// This is where a panel's "list me this directory" becomes a message to a
+/// specific server. The mapping lives here, not in the plugin, for the reason
+/// [`PluginRequest`] gives.
+async fn dispatch_plugin_request(
+    si: usize,
+    pi: usize,
+    req: crate::client::sidebar::PluginRequest,
+    mgr: &mut ConnectionManager,
+) {
+    use crate::client::sidebar::PluginRequest;
+    let key = (si, pi);
+    match req {
+        // Both of these are routed by the PANEL, not by `foreground()`.
+        //
+        // They used to use `mgr.foreground()`, under a comment arguing the two
+        // were equal by construction because `PluginEvent::FocusedCwd` is
+        // broadcast for the foreground connection alone. They are equal in the
+        // steady state, and the construction has a window: `foreground()` moves
+        // on the switch, while the panel only learns of it from the new
+        // connection's first tree push. Press Enter in between and `OpenInSplit`
+        // carried the OLD machine's path to the NEW machine, where the editor
+        // silently created an empty file with a plausible name. `ListDirectory`
+        // merely stuck on "loading…", because the reply's conn no longer matched
+        // what the panel was correlating on -- which is the same disagreement,
+        // showing its harmless face.
+        PluginRequest::ListDirectory { conn, path } => {
+            if let Err(e) = mgr.send(&conn, ClientMessage::ListDirectory { path }).await {
+                log::warn!("sidebar: ListDirectory for panel {key:?} failed: {e:#}");
+            }
+        }
+        PluginRequest::OpenInSplit {
+            conn,
+            path,
+            command,
+            vertical,
+        } => {
+            if let Err(e) = mgr
+                .send(
+                    &conn,
+                    ClientMessage::OpenInSplit {
+                        path,
+                        command,
+                        vertical,
+                    },
+                )
+                .await
+            {
+                log::warn!("sidebar: OpenInSplit for panel {key:?} failed: {e:#}");
+            }
+        }
+    }
+}
+
+/// The working directory of the pane the user is focused on, read out of a
+/// session tree: the current session's active tab's focused pane.
+///
+/// All three qualifiers matter. `is_focused` is per-tab, so every tab names one
+/// and `is_active` is what picks between them; `is_current` is per-recipient, so
+/// it names the session THIS client is attached to on that server.
+fn focused_pane_cwd(
+    folders: &[crate::protocol::FolderTreeEntry],
+    unfiled: &[crate::protocol::SessionTreeEntry],
+) -> Option<String> {
+    folders
+        .iter()
+        .flat_map(|f| f.sessions.iter())
+        .chain(unfiled.iter())
+        .find(|s| s.is_current)
+        .and_then(|s| s.tabs.iter().find(|t| t.is_active))
+        .and_then(|t| t.panes.iter().find(|p| p.is_focused))
+        .and_then(|p| p.cwd.clone())
+}
+
+/// Make sure every live connection carries this push subscription, and forget
+/// the ones that went away.
+///
+/// Reconciled once per loop pass rather than at each connect site: remotes are
+/// dialled from five different places (startup auto-connect, the session
+/// manager, a lazy view-cell connect, a background dial completing, a foreground
+/// handoff), and a subscription missed at any one of them is a panel that
+/// silently stops updating for that server.
+///
+/// One function for both pushes. They differ only in the message and the label,
+/// and the part that is easy to get wrong -- forgetting a dropped connection, so
+/// that reconnecting re-subscribes -- should exist once.
+async fn reconcile_push_subscription(
+    wanted: bool,
+    subscribed: &mut std::collections::HashSet<ConnId>,
+    mgr: &mut ConnectionManager,
+    subscribe: ClientMessage,
+    what: &str,
+) {
+    if !wanted {
+        return;
+    }
+    let live = mgr.connected_ids();
+    for id in &live {
+        if subscribed.insert(id.clone()) {
+            log::debug!("sidebar: subscribing to {what} on {id:?}");
+            if let Err(e) = mgr.send(id, subscribe.clone()).await {
+                log::warn!("sidebar: subscribing to {what} on {id:?} failed: {e:#}");
+                subscribed.remove(id);
+            }
+        }
+    }
+    // A dropped connection must be forgotten, or reconnecting it would never
+    // re-subscribe (the server forgets the subscription along with the client
+    // that held it).
+    subscribed.retain(|id| live.contains(id));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_plugin_action(
+    action: crate::client::sidebar::PluginAction,
+    chrome: &mut crate::client::chrome::Chrome,
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    theme: &crate::config::theme::CompositorTheme,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    mouse_grab: &mut Option<MouseGrab>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+) -> Result<()> {
+    use crate::client::sidebar::PluginAction;
+    let (c, r) = renderer.size();
+    match action {
+        PluginAction::None => {}
+        PluginAction::Redraw => {
+            chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
+            renderer.flush()?;
+        }
+        PluginAction::LeaveTo(dir) => {
+            log::debug!("sidebar: plugin asked to leave towards {dir:?}");
+            chrome.leave_sidebar();
+            chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
+            renderer.flush()?;
+        }
+        PluginAction::Leave => {
+            // No direction, and none invented. The panel is leaving because it
+            // did something (`files` opening a file in a split), and the pane
+            // it wants the user in is the one the server is about to create --
+            // which is where the server's own focus already goes.
+            log::debug!("sidebar: plugin asked to leave");
+            chrome.leave_sidebar();
+            chrome.paint(renderer, c, r, theme, focused_pane_rect)?;
+            renderer.flush()?;
+        }
+        PluginAction::JumpTo(target) => {
+            log::debug!("sidebar: plugin jump to {target:?}");
+            chrome.leave_sidebar();
+            switch_to_target(
+                mgr,
+                renderer,
+                chrome,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+                target,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Point the renderer at `content`.
+///
+/// The origin and the content size are ONE piece of state and must always be
+/// set together. `Renderer::resize` resets the content size to the full
+/// terminal but deliberately leaves the origin alone, so setting only one
+/// leaves a stale origin paired with a full-terminal content rect -- in which
+/// the end-of-row clear runs to the terminal's right edge and blanks a right
+/// sidebar.
+fn sync_content_rect(renderer: &mut Renderer, content: &crate::server::layout::Rect) {
+    renderer.set_origin(content.x, content.y);
+    renderer.set_content_size(content.width, content.height);
 }
 
 /// Re-render whichever transient overlay is currently active on top of the
@@ -729,6 +1366,7 @@ fn toggled_border_style(style: &crate::config::BorderStyle) -> crate::config::Bo
 #[allow(clippy::too_many_arguments)]
 fn paint_view(
     renderer: &mut Renderer,
+    chrome: &crate::client::chrome::Chrome,
     view: &crate::client::view::ClientView,
     input: &InputHandler,
     whichkey: &WhichKeyPopup,
@@ -739,12 +1377,22 @@ fn paint_view(
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
 ) -> Result<()> {
-    let (c, r) = crossterm::terminal::size()?;
+    // `Renderer::size`, not `terminal::size()`: the panels beside the view have
+    // to be laid out against the front buffer (its own doc says so), and inside
+    // the SIGWINCH-to-`Resize` window the two disagree. The view's hit tests
+    // read the same source, so what is composited and what a click resolves
+    // against can never be laid out for different terminal sizes.
+    let (c, r) = renderer.size();
+    let content = chrome.content_rect(c, r);
+    // The view composites in content-relative coordinates; the renderer's
+    // origin places it on screen, exactly as it does for server frames. Keep
+    // this the SAME rect `subscribe_view_cells`, the hit tests and the visual
+    // scope use -- see [`content_rect_now`].
     let area = crate::server::layout::Rect {
         x: 0,
         y: 0,
-        width: c,
-        height: r,
+        width: content.width,
+        height: content.height,
     };
     // Draw the client-side status bar on the reserved bottom row, mirroring the
     // normal (server) bar's left/right layout with the same theme colors.
@@ -787,6 +1435,15 @@ fn paint_view(
             None => (0, 0, false),
         };
     renderer.render_full(&composed, cur_x, cur_y, cur_vis, 0)?;
+    // The view only ever wrote inside the content rect, so the panels still
+    // hold whatever the front buffer had -- but a repaint of the whole screen
+    // (a resize, an overlay teardown) can drop them. Re-paint them with the
+    // frame, as the server-frame arms do.
+    // `None`: the content rect is showing the VIEW's own composite, not the
+    // server frame `focused_pane_rect` describes, so there is no pane border
+    // there to re-colour -- and the view frames its own cells through
+    // `view::cell_border_fg`, which already tracks the focused cell.
+    chrome.paint(renderer, c, r, compositor_theme, None)?;
     relay_overlays(
         renderer,
         input,
@@ -839,15 +1496,25 @@ fn paint_view(
 /// the dial lands. Without this the cell sat on `waiting…` forever.
 async fn subscribe_view_cells(
     mgr: &mut ConnectionManager,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
     view: &mut crate::client::view::ClientView,
     border_style: &crate::config::BorderStyle,
 ) -> Result<()> {
-    let (c, r) = crossterm::terminal::size()?;
+    // `Renderer::size` for the same reason `paint_view` uses it: the cells are
+    // demanded at the size they are DRAWN at, and inside the SIGWINCH window
+    // the front buffer is what is on screen.
+    let (c, r) = renderer.size();
+    // The cells are laid out in the SAME rect `paint_view` composites into.
+    // Subscribing at the full terminal instead would reflow every source pane
+    // to an interior wider than the cell it is drawn in -- borders in the right
+    // place, content inside them cropped.
+    let content = chrome.content_rect(c, r);
     let area = crate::server::layout::Rect {
         x: 0,
         y: 0,
-        width: c,
-        height: r,
+        width: content.width,
+        height: content.height,
     };
     let inner = crate::client::view::cells_area(area);
     let rects = crate::client::view::cell_rects(view, area);
@@ -1011,6 +1678,8 @@ async fn enter_view(
     views: &mut [crate::client::view::ClientView],
     active_view: &mut Option<usize>,
     active_view_id: &mut Option<ViewId>,
+    chrome: &mut crate::client::chrome::Chrome,
+    mouse_grab: &mut Option<MouseGrab>,
     target_idx: usize,
     current_attached: &Option<(ConnId, String)>,
     renderer: &mut Renderer,
@@ -1034,6 +1703,16 @@ async fn enter_view(
     }
     *active_view = Some(target_idx);
     *active_view_id = Some(views[target_idx].id);
+    // A view takes the keyboard for its cells: the sidebar key-routing gate is
+    // `active_view.is_none()`, so focus left in a panel here would be focus
+    // nothing can reach. Reachable via a prefix chord (the gate also requires
+    // `Mode::Normal`, which a chord leaves). `leave_sidebar` mirrors
+    // `focused_panel` first, so leaving the view returns to the same panel.
+    chrome.leave_sidebar();
+    // The view branch of the mouse loop `continue`s above the grab bookkeeping,
+    // so a grab set before entering would never see its release. Drop it here
+    // rather than leaving a stale claim on a panel across the whole view.
+    *mouse_grab = None;
     // bug4: detach the foreground session so a cell aliasing one of its
     // active-tab panes streams content instead of showing the "Active in
     // session" placeholder. Guarded on a known session so the leave-to-session
@@ -1043,9 +1722,17 @@ async fn enter_view(
     }
     let (c, r) = crossterm::terminal::size()?;
     renderer.resize(c, r);
-    subscribe_view_cells(mgr, &mut views[target_idx], border_style).await?;
+    // A View composites into the CONTENT rect and blits it with `render_full`,
+    // so the renderer keeps pointing at the content rect exactly as it does for
+    // server frames. `resize` reset the content size to the whole terminal but
+    // deliberately left the origin alone; both are re-pointed together here
+    // (see `sync_content_rect`).
+    let content = chrome.content_rect(c, r);
+    sync_content_rect(renderer, &content);
+    subscribe_view_cells(mgr, chrome, renderer, &mut views[target_idx], border_style).await?;
     paint_view(
         renderer,
+        chrome,
         &views[target_idx],
         input,
         whichkey,
@@ -1143,6 +1830,7 @@ async fn handle_view_command(
     views: &mut [crate::client::view::ClientView],
     av: usize,
     renderer: &mut Renderer,
+    chrome: &crate::client::chrome::Chrome,
     input: &InputHandler,
     whichkey: &mut WhichKeyPopup,
     theme: &crate::config::theme::Theme,
@@ -1171,6 +1859,7 @@ async fn handle_view_command(
         () => {
             paint_view(
                 renderer,
+                chrome,
                 &views[av],
                 input,
                 whichkey,
@@ -1198,11 +1887,15 @@ async fn handle_view_command(
         // Resolve the neighbor cell with THIS terminal's geometry (a clone probe
         // so the cache isn't mutated), then intent the shared focus change. The
         // repaint arrives via the resulting `ViewList`.
+        // Resolved against the rect the view is PAINTED into, not the raw
+        // terminal: with a sidebar open the two differ, and a neighbour
+        // computed from the wrong width is the wrong cell.
+        let content = chrome.content_rect(cols, rows);
         let cells = crate::client::view::cells_area(crate::server::layout::Rect {
             x: 0,
             y: 0,
-            width: cols,
-            height: rows,
+            width: content.width,
+            height: content.height,
         });
         let mut probe = views[av].clone();
         if probe.move_focus(dir, cells) {
@@ -1329,7 +2022,7 @@ async fn handle_view_command(
             hide_whichkey!();
             // The interior a cell paints changed size (a border was gained or
             // lost on every edge), so re-demand the new content size.
-            subscribe_view_cells(mgr, &mut views[av], border_style).await?;
+            subscribe_view_cells(mgr, chrome, renderer, &mut views[av], border_style).await?;
             repaint!();
             Ok(true)
         }
@@ -1393,11 +2086,19 @@ async fn leave_active_view(
     views: &[crate::client::view::ClientView],
     active_view: &mut Option<usize>,
     active_view_id: &mut Option<ViewId>,
+    chrome: &mut crate::client::chrome::Chrome,
+    mouse_grab: &mut Option<MouseGrab>,
 ) -> Result<()> {
     if let Some(av) = *active_view {
         unsubscribe_view_cells(mgr, &views[av]).await?;
         *active_view = None;
         *active_view_id = None;
+        // Symmetric with `enter_view`: the screen goes back to the content, so
+        // focus does too (a panel focused before the view was entered has not
+        // been reachable since), and a grab claimed while the view swallowed
+        // the mouse must not survive into the next gesture.
+        chrome.leave_sidebar();
+        *mouse_grab = None;
     }
     Ok(())
 }
@@ -1432,6 +2133,30 @@ async fn run_client_loop(
     // `CompositorTheme` (CellColor) mirror of the client `Theme`, used to draw
     // the client-side view status bar with the same colors as the normal bar.
     let mut compositor_theme = config.compositor_theme();
+    // Client-side sidebars. The server never learns they exist: the client
+    // hands it a reduced content rect and paints the panels around the frames
+    // it gets back. Rebuilt from scratch by the config hot-reload arm below --
+    // that discards plugin state (the session tree's expansion and selection),
+    // which is the accepted price of a `[[sidebar]]` block appearing without a
+    // restart: the panel set can change shape entirely, so there is nothing to
+    // carry across.
+    let mut chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
+    // The config supplies the defaults; anything the user changed at runtime
+    // last time -- which sidebars are open, how wide, how the panels are
+    // weighted -- is layered on top. Applied here, BEFORE the first
+    // `content_rect`/`Resize` below, so the opening frame is already sized for
+    // the sidebars the user will actually see. Never fails: a missing,
+    // unreadable, or corrupt state file degrades to the config defaults.
+    crate::client::sidebar_state::apply(&mut chrome, &crate::client::sidebar_state::load());
+    // Every `[[sidebar]]` edge this session has seen, at its last-seen values.
+    // The hot-reload arm diffs the incoming config against it field by field
+    // (see `sidebar_state::apply_on_reload`), so it MUST advance on every
+    // reload -- left at the startup value, the second edit of a field would
+    // diff against a value two reloads old and the precedence rule would
+    // invert. It advances by UPSERT (`merge_seen_config`), not replacement, so
+    // an edge whose block is commented out is still remembered when it comes
+    // back.
+    let mut prev_sidebar_cfg = config.sidebar.clone();
     let mut which_key_position = config.appearance.which_key_position.clone();
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
@@ -1447,6 +2172,12 @@ async fn run_client_loop(
     // surface the user pressed it on, the next view they open shows the style
     // they last chose.
     let mut view_border_style = config.appearance.border_style.clone();
+    // The sidebars are framed in the SAME style, so a sidebar sits beside the
+    // panes looking like one of them. Seeded here rather than in
+    // `Chrome::from_config` so there is exactly one expression of "the style
+    // the client is currently drawing with", and re-applied at every site that
+    // flips it below.
+    chrome.set_border_style(view_border_style.clone());
 
     // Spawn the config-file watcher for live hot-reload. This is best-effort:
     // if it fails to start we log and continue without hot-reload rather than
@@ -1567,31 +2298,190 @@ async fn run_client_loop(
     let mut pending_panes: Vec<(ConnId, crate::protocol::PaneId)> = Vec::new();
 
     // Mouse drag state for coalescing drag events (~60fps throttle).
+    // `drag_start` is in CONTENT coordinates -- everything the foreground
+    // session is told about the mouse is.
     let mut drag_start: Option<(u16, u16)> = None;
+    // Which region the in-flight button gesture was pressed in. `None` between
+    // gestures; see [`MouseGrab`].
+    let mut mouse_grab: Option<MouseGrab> = None;
     // An in-progress drag-selection inside a VIEW cell: the cell's connection,
     // its source pane, and the press point in that pane's own content
-    // coordinates. Kept separate from `drag_start` (screen coordinates in the
-    // foreground session) because a client displaying a view is detached: the
-    // gesture is routed by pane identity, and it stays bound to the cell it
-    // started in even as the pointer leaves that cell.
+    // coordinates. Kept separate from `drag_start` because a client displaying
+    // a view is detached: the gesture is routed by pane identity, and it stays
+    // bound to the cell it started in even as the pointer leaves that cell.
     let mut view_drag: Option<(ConnId, protocol::PaneId, u16, u16)> = None;
     let mut last_drag_send: Instant = Instant::now();
     /// Minimum interval between drag event sends (~16ms = ~60fps).
     const DRAG_THROTTLE: Duration = Duration::from_millis(16);
 
-    // Tell server our terminal size
-    log::debug!("run_client_loop: sending initial resize {}x{}", cols, rows);
-    mgr.send_foreground(ClientMessage::Resize { cols, rows })
-        .await?;
+    // Tell the server the size of the area it composites: the terminal minus
+    // any visible sidebars, not the terminal itself.
+    let content = content_rect_now(&chrome)?;
+    sync_content_rect(&mut renderer, &content);
+    log::debug!(
+        "run_client_loop: sending initial resize {}x{} at ({},{})",
+        content.width,
+        content.height,
+        content.x,
+        content.y
+    );
+    mgr.send_foreground(ClientMessage::Resize {
+        cols: content.width,
+        rows: content.height,
+    })
+    .await?;
+
+    // Whether a configured panel needs the server's session-tree push.
+    // Recomputed by the config hot-reload arm, which can add or remove the
+    // panel that wants it.
+    let mut wants_session_tree = chrome.wants_session_tree();
+    // Connections already told to push their tree. Reconciled against
+    // `connected_ids` at the top of every loop pass rather than at each connect
+    // site: remotes are dialled from five different places (startup
+    // auto-connect, the session manager, a lazy view-cell connect, a background
+    // dial completing, a foreground handoff), and a subscription missed at any
+    // one of them is a panel that silently stops updating for that server.
+    let mut tree_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+    // The same, for the agents panel's push. A second set rather than a second
+    // meaning for the first: the two subscriptions are independent on the wire,
+    // and a client may configure either panel without the other.
+    let mut wants_agents = chrome.wants_agents();
+    let mut agents_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
 
     loop {
+        // Lay the panels out and act on what they ask for, before anything can
+        // block in the `select!` below. This is the pass on which a `files`
+        // panel that has just been given a rect asks for its first listing.
+        {
+            let (tc, tr) = renderer.size();
+            let requests = chrome.pump(tc, tr);
+            for (si, pi, req) in requests {
+                dispatch_plugin_request(si, pi, req, mgr).await;
+            }
+        }
+        reconcile_push_subscription(
+            wants_session_tree,
+            &mut tree_subscribed,
+            mgr,
+            ClientMessage::SubscribeSessionTree,
+            "the session tree",
+        )
+        .await;
+        reconcile_push_subscription(
+            wants_agents,
+            &mut agents_subscribed,
+            mgr,
+            ClientMessage::SubscribeAgents,
+            "the agent list",
+        )
+        .await;
+        // How long until some VISIBLE panel wants ticking, computed fresh each
+        // pass. `None` -- no sidebar, none visible, or no panel that polls --
+        // disables the timer branch below entirely, so a client with no such
+        // panel never wakes on a schedule at all.
+        //
+        // Recomputing per pass is only safe because a panel answers from a
+        // stored anchor rather than with a fresh interval: this loop wakes on
+        // every keystroke and every server frame, and a re-armed interval would
+        // be pushed past its deadline for ever by a busy pane. See
+        // `SidebarPlugin::poll_after`.
+        let panel_poll = {
+            let (tc, tr) = renderer.size();
+            chrome.next_poll(tc, tr)
+        };
         tokio::select! {
+            // A sidebar panel's timer. Nothing to do here: the work is
+            // `chrome.pump` at the top of the loop, which this wake-up exists to
+            // reach. Requests it produces are dispatched there, and their
+            // answers repaint through the ordinary server-message arms.
+            _ = tokio::time::sleep(panel_poll.unwrap_or_default()), if panel_poll.is_some() => {}
             // Keyboard events
             event = event_stream.next() => {
                 match event {
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
+                        // A focused sidebar owns the keyboard, except for the
+                        // prefix (which keeps command mode reachable), directional
+                        // focus (handled by `intercept_focus` on the way out), the
+                        // sidebar commands themselves (a swallowed `SidebarCycle`
+                        // would be unreachable from the one place it is most
+                        // useful) and Escape (which returns to the content area).
+                        // This sits BEFORE `handle_key` because it inspects the
+                        // raw key.
+                        //
+                        // The guard is deliberately narrow. An open overlay or a
+                        // half-typed prefix chord owns the keyboard FIRST -- the
+                        // prefix is let through, so without the mode check the
+                        // NEXT key of `Prefix x m` would be eaten by the plugin
+                        // and command mode would be unreachable from a panel. A
+                        // live view owns the keyboard for its cells -- the
+                        // panels are still PAINTED beside it, but nothing routes
+                        // keys to them -- so the chrome claims nothing while one
+                        // is up. `enter_view` drops panel focus for that reason.
+                        //
+                        // Panels are laid out against the front buffer, so the
+                        // sizes come from `Renderer::size` -- see `panel_at` for
+                        // the SIGWINCH window a fresh `terminal::size()` reopens.
+                        // The other half of the `handle_chrome_resize`
+                        // invariant: panel focus and a live view must never
+                        // coexist. Asserted on the gate itself, so a new
+                        // view-entry path that forgets `leave_sidebar()` trips
+                        // here in debug rather than silently stranding the
+                        // keyboard in a panel no key can reach.
+                        debug_assert!(
+                            !(matches!(
+                                chrome.focus,
+                                crate::client::chrome::ChromeFocus::Sidebar { .. }
+                            ) && active_view.is_some()),
+                            "panel focus survived into a live view: the sidebar key gate \
+                             requires `active_view.is_none()`, so the panel would hold \
+                             focus that no keystroke can reach"
+                        );
+                        if active_view.is_none() && input.mode == Mode::Normal && !input.has_overlay() {
+                            let (tc, tr) = renderer.size();
+                            match chrome.focused_panel(tc, tr) {
+                                Some((sidebar, panel)) => {
+                                    if key.code == crossterm::event::KeyCode::Esc {
+                                        chrome.leave_sidebar();
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                        renderer.flush()?;
+                                        continue;
+                                    }
+                                    let passes_through = input.is_prefix_key(&key)
+                                        || input.resolves_to_pane_focus(&key)
+                                        || input.resolves_to_resize(&key)
+                                        || input.resolves_to_sidebar_action(&key);
+                                    if !passes_through {
+                                        let plugin_action = chrome.sidebars[sidebar].panels[panel]
+                                            .plugin
+                                            .on_key(key);
+                                        handle_plugin_action(
+                                            plugin_action,
+                                            &mut chrome,
+                                            mgr,
+                                            &mut renderer,
+                                            &compositor_theme,
+                                            focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut mouse_grab,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                }
+                                // Focus is plain indices, so a resize that
+                                // force-hid the sidebar can strand it on a panel
+                                // that is no longer laid out. Release it rather
+                                // than swallowing keys into something invisible.
+                                None => chrome.leave_sidebar(),
+                            }
+                        }
                         let was_renaming = input.rename_overlay.is_some();
                         let was_in_palette = input.command_palette.is_some();
                         // Inside a view, arrow/nav keys must be encoded with the
@@ -1647,6 +2537,7 @@ async fn run_client_loop(
                                     {
                                         paint_view(
                                             &mut renderer,
+                                            &chrome,
                                             &views[av],
                                             &input,
                                             &whichkey,
@@ -1679,6 +2570,10 @@ async fn run_client_loop(
                                 // drifting apart.
                                 if matches!(cmd, RemuxCommand::ToggleStyle) {
                                     view_border_style = toggled_border_style(&view_border_style);
+                                    // The sidebars are framed in the same style
+                                    // as the panes, so one keystroke reframes
+                                    // both. The repaint below then draws it.
+                                    chrome.set_border_style(view_border_style.clone());
                                 }
                                 // (The palette overlay was already torn down
                                 // above, before this arm and so before the view
@@ -1699,6 +2594,7 @@ async fn run_client_loop(
                                         &mut views,
                                         av,
                                         &mut renderer,
+                                        &chrome,
                                         &input,
                                         &mut whichkey,
                                         &theme,
@@ -1723,6 +2619,44 @@ async fn run_client_loop(
                                 renderer.flush()?;
                                 if matches!(cmd, RemuxCommand::SessionDetach) {
                                     return Ok(());
+                                }
+                                // Directional focus: a sidebar on that edge takes
+                                // it instead of the server. `intercept_focus`
+                                // returns false whenever there is nothing to enter,
+                                // so with no sidebar configured this is a no-op and
+                                // the command forwards exactly as before.
+                                if let Some(dir) = focus_direction_of(&cmd) {
+                                    let (tc, tr) = renderer.size();
+                                    if crate::client::chrome::intercept_focus(
+                                        &mut chrome,
+                                        dir,
+                                        focused_pane_rect.as_ref(),
+                                        tc,
+                                        tr,
+                                        &config.appearance.status_bar_position,
+                                    ) {
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                        renderer.flush()?;
+                                        continue;
+                                    }
+                                }
+                                // A focused sidebar re-targets `Resize*` at
+                                // itself: its own size across the edge, its
+                                // focused panel's weight along it. With focus on
+                                // the content this is a no-op and the command
+                                // reaches the server exactly as before.
+                                if handle_chrome_resize(
+                                    &cmd,
+                                    &mut chrome,
+                                    active_view,
+                                    focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                                    mgr,
+                                    &mut renderer,
+                                    &compositor_theme,
+                                )
+                                .await?
+                                {
+                                    continue;
                                 }
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
@@ -1773,6 +2707,7 @@ async fn run_client_loop(
                                     if matches!(cmd, RemuxCommand::ToggleStyle) {
                                         view_border_style =
                                             toggled_border_style(&view_border_style);
+                                        chrome.set_border_style(view_border_style.clone());
                                     }
                                     // While a view is active, intercept structural
                                     // commands client-side (focus / layout / eject
@@ -1786,6 +2721,7 @@ async fn run_client_loop(
                                             &mut views,
                                             av,
                                             &mut renderer,
+                                            &chrome,
                                             &input,
                                             &mut whichkey,
                                             &theme,
@@ -1801,6 +2737,43 @@ async fn run_client_loop(
                                         {
                                             continue;
                                         }
+                                    }
+                                    // Directional focus is intercepted here too:
+                                    // the default `Prefix h` is a CHAIN
+                                    // (`PaneFocusLeft; EnterNormal`), not a single
+                                    // `Execute`. `continue` skips only this command,
+                                    // so `EnterNormal` still runs.
+                                    if let Some(dir) = focus_direction_of(&cmd) {
+                                        let (tc, tr) = renderer.size();
+                                        if crate::client::chrome::intercept_focus(
+                                            &mut chrome,
+                                            dir,
+                                            focused_pane_rect.as_ref(),
+                                            tc,
+                                            tr,
+                                            &config.appearance.status_bar_position,
+                                        ) {
+                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                            renderer.flush()?;
+                                            continue;
+                                        }
+                                    }
+                                    // Re-targeted at the sidebar exactly as in
+                                    // the single-command arm; `continue` skips
+                                    // only this command, so the rest of the
+                                    // chain still runs.
+                                    if handle_chrome_resize(
+                                        &cmd,
+                                        &mut chrome,
+                                        active_view,
+                                        focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                                        mgr,
+                                        &mut renderer,
+                                        &compositor_theme,
+                                    )
+                                    .await?
+                                    {
+                                        continue;
                                     }
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
@@ -1833,6 +2806,32 @@ async fn run_client_loop(
                             }
                             InputAction::ModeChanged(mode) => {
                                 log::debug!("input: ModeChanged to {:?}", mode);
+                                // A panel keeps the keyboard only in Normal
+                                // mode: the sidebar key gate is
+                                // `active_view.is_none() && mode == Normal`.
+                                // Leaving Normal (a chord into Visual/Search,
+                                // the palette, the session manager) therefore
+                                // routes every key to the server while
+                                // `chrome.focus` still names a panel -- which
+                                // kept painting a focused header for a panel
+                                // that no longer had the keyboard. Drop the
+                                // focus so the invariant holds in every mode,
+                                // not just the one it was written for.
+                                // `leave_sidebar` mirrors `focused_panel`
+                                // first, so returning re-enters the same panel.
+                                if mode != Mode::Normal
+                                    && matches!(
+                                        chrome.focus,
+                                        crate::client::chrome::ChromeFocus::Sidebar { .. }
+                                    )
+                                {
+                                    log::debug!(
+                                        "sidebar: releasing panel focus on mode change to {mode:?}"
+                                    );
+                                    chrome.leave_sidebar();
+                                    let (tc, tr) = renderer.size();
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                }
                                 let mode_str = match mode {
                                     Mode::Normal => "NORMAL",
                                     Mode::Command => "COMMAND",
@@ -1875,14 +2874,21 @@ async fn run_client_loop(
                                     // on screen, which is what put the cursor in
                                     // the wrong cell at a nonsensical offset.
                                     let view_scope = active_view.and_then(|av| {
+                                        // The scope is content-relative, which is
+                                        // exactly what the renderer expects: it
+                                        // adds its own origin to `pane_offset_*`.
+                                        // Measuring against the raw terminal would
+                                        // offset the visual cursor by the sidebar
+                                        // width on top of that.
                                         let (c, r) = crossterm::terminal::size().ok()?;
+                                        let content = chrome.content_rect(c, r);
                                         crate::client::view::focused_cell_visual_scope(
                                             &views[av],
                                             crate::server::layout::Rect {
                                                 x: 0,
                                                 y: 0,
-                                                width: c,
-                                                height: r,
+                                                width: content.width,
+                                                height: content.height,
                                             },
                                             &view_border_style,
                                         )
@@ -1926,10 +2932,15 @@ async fn run_client_loop(
                                                 vs.cursor_col = vs.visible_cols.saturating_sub(1);
                                             }
                                         } else {
-                                            // Fallback: use full terminal dims.
-                                            let (tc, tr) = crossterm::terminal::size()?;
-                                            vs.visible_rows = tr as usize;
-                                            vs.visible_cols = tc as usize;
+                                            // Fallback: the server reported no
+                                            // focused pane, so scope the visual
+                                            // state to the CONTENT rect. Using
+                                            // the raw terminal here would let
+                                            // the selection-highlight loop walk
+                                            // into a sidebar's columns.
+                                            let content = content_rect_now(&chrome)?;
+                                            vs.visible_rows = content.height as usize;
+                                            vs.visible_cols = content.width as usize;
                                             vs.cursor_row = vs.visible_rows.saturating_sub(1);
                                         }
                                         // total_lines is at least visible_rows
@@ -1989,6 +3000,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -2059,6 +3071,7 @@ async fn run_client_loop(
                                 // border style in step with the server's.
                                 if matches!(command, RemuxCommand::ToggleStyle) {
                                     view_border_style = toggled_border_style(&view_border_style);
+                                    chrome.set_border_style(view_border_style.clone());
                                 }
                                 let mut consumed = false;
                                 if let Some(av) = active_view {
@@ -2068,6 +3081,7 @@ async fn run_client_loop(
                                         &mut views,
                                         av,
                                         &mut renderer,
+                                        &chrome,
                                         &input,
                                         &mut whichkey,
                                         &theme,
@@ -2078,6 +3092,56 @@ async fn run_client_loop(
                                         focused_pane_rect.as_ref(),
                                         cols,
                                         rows,
+                                    )
+                                    .await?;
+                                }
+                                if !consumed {
+                                    // Task 7's invariant is unqualified:
+                                    // nothing inside a focused sidebar reaches
+                                    // the server. Sticky-group leaves arrive
+                                    // here and NOT at `Execute`, and a config
+                                    // can put a `PaneFocus*` in a sticky group
+                                    // -- a built-in group stays sticky when a
+                                    // user adds leaves to it (see `merge_maps`)
+                                    // -- so without this the invariant has a
+                                    // config-shaped hole in it.
+                                    if let Some(dir) = focus_direction_of(&command) {
+                                        let (tc, tr) = renderer.size();
+                                        if crate::client::chrome::intercept_focus(
+                                            &mut chrome,
+                                            dir,
+                                            focused_pane_rect.as_ref(),
+                                            tc,
+                                            tr,
+                                            &config.appearance.status_bar_position,
+                                        ) {
+                                            chrome.paint(
+                                                &mut renderer,
+                                                tc,
+                                                tr,
+                                                &compositor_theme,
+                                                focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                                            )?;
+                                            consumed = true;
+                                        }
+                                    }
+                                }
+                                if !consumed {
+                                    // A focused sidebar re-targets `Resize*` at
+                                    // itself. This arm is where the DEFAULT
+                                    // resize keys land -- `p R h/j/k/l` is a
+                                    // sticky group, so its leaves never reach
+                                    // `Execute` -- which makes it the primary
+                                    // path for the sidebar resize, not an
+                                    // afterthought of it.
+                                    consumed = handle_chrome_resize(
+                                        &command,
+                                        &mut chrome,
+                                        active_view,
+                                        focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                                        mgr,
+                                        &mut renderer,
+                                        &compositor_theme,
                                     )
                                     .await?;
                                 }
@@ -2589,16 +3653,21 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        // A live view masks the switched-to session:
-                                        // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        switch_to_server(mgr, &server, c, r).await?;
-                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        if server == ConnId::Local {
-                                            last_local_session = Some(session.clone());
-                                        }
-                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
+                                        // Same jump path as the sidebar panel; see
+                                        // `switch_to_target`.
+                                        switch_to_target(
+                                            mgr,
+                                            &mut renderer,
+                                            &mut chrome,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut mouse_grab,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                            JumpTarget::Session { conn: server, session },
+                                        ).await?;
                                     }
                                     SessionManagerAction::SwitchTab { server, session, tab_index } => {
                                         input.session_manager = None;
@@ -2606,23 +3675,21 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        // A live view masks the switched-to session:
-                                        // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        switch_to_server(mgr, &server, c, r).await?;
-                                        // The server's handle_command ignores commands from a
-                                        // client with no attached session, so a remote tab switch
-                                        // must attach first (harmless re-attach for local).
-                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchTab {
-                                            session: session.clone(),
-                                            tab_index,
-                                        })).await?;
-                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        if server == ConnId::Local {
-                                            last_local_session = Some(session.clone());
-                                        }
-                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
+                                        // Same jump path as the sidebar panel; see
+                                        // `switch_to_target`.
+                                        switch_to_target(
+                                            mgr,
+                                            &mut renderer,
+                                            &mut chrome,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut mouse_grab,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                            JumpTarget::Tab { conn: server, session, tab_index },
+                                        ).await?;
                                     }
                                     SessionManagerAction::SwitchPane { server, session, tab_index, pane_id } => {
                                         input.session_manager = None;
@@ -2630,24 +3697,21 @@ async fn run_client_loop(
                                         let (c, r) = crossterm::terminal::size()?;
                                         renderer.clear_overlay(c, r)?;
                                         renderer.flush()?;
-                                        // A live view masks the switched-to session:
-                                        // tear it down before handing off the screen.
-                                        leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                        switch_to_server(mgr, &server, c, r).await?;
-                                        // The server's handle_command ignores commands from a
-                                        // client with no attached session, so a remote pane switch
-                                        // must attach first (harmless re-attach for local).
-                                        mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        mgr.send(&server, ClientMessage::Command(RemuxCommand::SessionSwitchPane {
-                                            session: session.clone(),
-                                            tab_index,
-                                            pane_id,
-                                        })).await?;
-                                        mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                        if server == ConnId::Local {
-                                            last_local_session = Some(session.clone());
-                                        }
-                                        record_switch(&mut current_attached, &mut previous_attached, server, session);
+                                        // The jump itself is shared with the sidebar's
+                                        // `PluginAction::JumpTo`; see `switch_to_target`.
+                                        switch_to_target(
+                                            mgr,
+                                            &mut renderer,
+                                            &mut chrome,
+                                            &views,
+                                            &mut active_view,
+                                            &mut active_view_id,
+                                            &mut mouse_grab,
+                                            &mut last_local_session,
+                                            &mut current_attached,
+                                            &mut previous_attached,
+                                            JumpTarget::Pane { conn: server, session, tab_index, pane_id },
+                                        ).await?;
                                     }
                                     // Structural edits target the server carried by the
                                     // action (the selected node's connection), so the
@@ -2773,7 +3837,7 @@ async fn run_client_loop(
                                     }
                                     SessionManagerAction::Close => {
                                         let has_sessions = input.session_manager.as_ref()
-                                            .map(|sm| sm.rows.iter().any(|r| matches!(r.node_type, NodeType::Session { .. })))
+                                            .map(|sm| sm.model.rows.iter().any(|r| matches!(r.node_type, NodeType::Session { .. })))
                                             .unwrap_or(false);
                                         input.session_manager = None;
                                         input.mode = Mode::Normal;
@@ -2858,6 +3922,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -2883,6 +3948,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -2914,8 +3980,20 @@ async fn run_client_loop(
                                 // session-manager SwitchSession path.
                                 // A live view masks the switched-to session: tear it
                                 // down first so the switch actually shows.
-                                leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                switch_to_server(mgr, &server, c, r).await?;
+                                leave_active_view(
+                                    mgr,
+                                    &views,
+                                    &mut active_view,
+                                    &mut active_view_id,
+                                    &mut chrome,
+                                    &mut mouse_grab,
+                                ).await?;
+                                // Leaving the view hands the screen back to the content rect:
+                                // re-point the renderer at it before the target server is told
+                                // what size to composite.
+                                let content = content_rect_now(&chrome)?;
+                                sync_content_rect(&mut renderer, &content);
+                                switch_to_server(mgr, &server, content).await?;
                                 mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                 mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 if server == ConnId::Local {
@@ -2941,8 +4019,20 @@ async fn run_client_loop(
                                     // Mirror the SessionSwitchConfirm path.
                                     // A live view masks the switched-to session: tear
                                     // it down before handing off the screen.
-                                    leave_active_view(mgr, &views, &mut active_view, &mut active_view_id).await?;
-                                    switch_to_server(mgr, &server, c, r).await?;
+                                    leave_active_view(
+                                    mgr,
+                                    &views,
+                                    &mut active_view,
+                                    &mut active_view_id,
+                                    &mut chrome,
+                                    &mut mouse_grab,
+                                ).await?;
+                                    // Leaving the view hands the screen back to the content rect:
+                                    // re-point the renderer at it before the target server is told
+                                    // what size to composite.
+                                    let content = content_rect_now(&chrome)?;
+                                    sync_content_rect(&mut renderer, &content);
+                                    switch_to_server(mgr, &server, content).await?;
                                     mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                     mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                     if server == ConnId::Local {
@@ -3020,6 +4110,8 @@ async fn run_client_loop(
                                         &mut views,
                                         &mut active_view,
                                         &mut active_view_id,
+                                        &mut chrome,
+                                        &mut mouse_grab,
                                         index,
                                         &current_attached,
                                         &mut renderer,
@@ -3080,6 +4172,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -3107,6 +4200,7 @@ async fn run_client_loop(
                                     if let Some(av) = active_view {
                                         paint_view(
                                             &mut renderer,
+                                            &chrome,
                                             &views[av],
                                             &input,
                                             &whichkey,
@@ -3162,6 +4256,7 @@ async fn run_client_loop(
                                             if let Some(av) = active_view {
                                                 paint_view(
                                                     &mut renderer,
+                                                    &chrome,
                                                     &views[av],
                                                     &input,
                                                     &whichkey,
@@ -3206,6 +4301,7 @@ async fn run_client_loop(
                                         &mut views,
                                         av,
                                         &mut renderer,
+                                        &chrome,
                                         &input,
                                         &mut whichkey,
                                         &theme,
@@ -3235,6 +4331,7 @@ async fn run_client_loop(
                                     // popup leaves no artifacts; the resync follows.
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -3260,8 +4357,19 @@ async fn run_client_loop(
                                     unsubscribe_view_cells(mgr, &views[av]).await?;
                                     active_view = None;
                                     active_view_id = None;
+                                    // The screen goes back to the content, so
+                                    // focus and any mouse grab do too -- same
+                                    // reset `leave_active_view` performs, which
+                                    // this path deliberately does not go through
+                                    // (it re-attaches and repaints itself).
+                                    chrome.leave_sidebar();
+                                    mouse_grab = None;
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.resize(c, r);
+                                    // Back to the content rect: the view no longer
+                                    // owns the terminal, so the sidebars do again.
+                                    let content = chrome.content_rect(c, r);
+                                    sync_content_rect(&mut renderer, &content);
                                     // Entering the view detached the foreground session
                                     // (bug4 fix); re-attach it now so the server resumes
                                     // rendering it. `handle_resize` is a no-op for an
@@ -3272,7 +4380,9 @@ async fn run_client_loop(
                                             session_name: session,
                                         }).await?;
                                     }
-                                    mgr.send_foreground(ClientMessage::Resize { cols: c, rows: r }).await?;
+                                    mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
+                                    chrome.paint(&mut renderer, c, r, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                    renderer.flush()?;
                                 }
                             }
                             InputAction::ViewDelete => {
@@ -3291,6 +4401,160 @@ async fn run_client_loop(
                                         .await?;
                                 }
                             }
+                            InputAction::Sidebar(intent) => {
+                                log::debug!("input: Sidebar {intent:?}");
+                                let (tc, tr) = renderer.size();
+                                // Tear the which-key popup down HERE -- before
+                                // the refusal gate below can `continue`, and
+                                // unconditionally, the way every other
+                                // client-action arm does it.
+                                //
+                                // This arm used to have no `whichkey` teardown
+                                // at all and lean on a side effect: a toggle
+                                // that moves the content rect sends a `Resize`,
+                                // the server answers with a `FullRender`, and
+                                // the full repaint incidentally erased the
+                                // popup. Every intent that changes NOTHING --
+                                // a toggle for an edge with no sidebar
+                                // configured, a cycle with no sidebars, a focus
+                                // refused because a view owns the keyboard --
+                                // repainted nothing (`Chrome::paint` over zero
+                                // panel rects emits zero bytes) and stranded
+                                // the popup on screen forever, while the mode
+                                // reset underneath it fed the next keystroke
+                                // straight to the shell.
+                                let tore_down_popup = whichkey.visible;
+                                if tore_down_popup {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(tc, tr)?;
+                                }
+                                // FOCUS intents are refused while a view is live.
+                                // The sidebar key gate is `active_view.is_none()`,
+                                // so a focused panel could not receive a keystroke
+                                // -- focusing one would silently swallow the
+                                // keyboard. TOGGLE is honoured: the view is
+                                // composited into the content rect now, and the
+                                // panels it would show or hide are on screen next
+                                // to it, so a toggle that did nothing would read as
+                                // a dropped keypress. Logged either way, because a
+                                // no-op that leaves no trace reads as one too.
+                                if active_view.is_some()
+                                    && !matches!(intent, SidebarIntent::Toggle(_))
+                                {
+                                    log::debug!(
+                                        "sidebar: ignoring {intent:?} -- a view owns the keyboard"
+                                    );
+                                    // Nothing else runs, so the popup teardown
+                                    // above needs its own repaint: `paint_view`
+                                    // is what puts the view's cells and its
+                                    // cursor back after `clear_overlay`.
+                                    if tore_down_popup {
+                                        if let Some(av) = active_view {
+                                            paint_view(
+                                                &mut renderer,
+                                                &chrome,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &compositor_theme,
+                                                &view_border_style,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let before = chrome.content_rect(tc, tr);
+                                // Snapshot of everything that OUTLIVES this
+                                // client, so the save below fires on a real
+                                // change and only on a real change. Comparing
+                                // state rather than naming the intents keeps
+                                // this correct for `Focus` (which opens a hidden
+                                // sidebar) and for the resize/weight commands a
+                                // later phase adds, and keeps a no-op toggle --
+                                // including every toggle with no sidebar
+                                // configured -- from writing a file at all.
+                                let persisted_before =
+                                    crate::client::sidebar_state::SidebarState::from_chrome(&chrome);
+                                match intent {
+                                    SidebarIntent::Toggle(edge) => {
+                                        chrome.toggle_edge(edge);
+                                    }
+                                    SidebarIntent::Focus(edge) => {
+                                        chrome.focus_edge(edge, tc, tr);
+                                    }
+                                    SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
+                                }
+                                if crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
+                                    != persisted_before
+                                {
+                                    crate::client::sidebar_state::save(&chrome);
+                                }
+                                // Showing or hiding a sidebar moves the content
+                                // rect, which is the server's whole world: the
+                                // origin and the `Resize` must travel together
+                                // (see `sync_content_rect`). Focus/cycle leave
+                                // the geometry alone, so nothing is sent.
+                                let content = chrome.content_rect(tc, tr);
+                                if content != before {
+                                    sync_content_rect(&mut renderer, &content);
+                                    mgr.send_foreground(ClientMessage::Resize {
+                                        cols: content.width,
+                                        rows: content.height,
+                                    })
+                                    .await?;
+                                }
+                                match active_view {
+                                    // A live view owns the screen: its cells just
+                                    // changed size with the content rect, so
+                                    // re-demand their panes and recomposite -- the
+                                    // same pair the SIGWINCH path runs, for the
+                                    // same reason. `paint_view` paints the panels.
+                                    Some(av) => {
+                                        subscribe_view_cells(
+                                            mgr,
+                                            &chrome,
+                                            &renderer,
+                                            &mut views[av],
+                                            &view_border_style,
+                                        )
+                                        .await?;
+                                        paint_view(
+                                            &mut renderer,
+                                            &chrome,
+                                            &views[av],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &compositor_theme,
+                                            &view_border_style,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
+                                    }
+                                    None => {
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                        // `clear_overlay` replays the front
+                                        // buffer with the cursor hidden, and
+                                        // only `paint_panel` puts it back --
+                                        // so with no panel on screen (which is
+                                        // exactly the no-op case above) the
+                                        // shell would be left with no cursor.
+                                        if tore_down_popup {
+                                            renderer.restore_cursor(
+                                                last_cursor_x,
+                                                last_cursor_y,
+                                                last_cursor_visible,
+                                            )?;
+                                        }
+                                        renderer.flush()?;
+                                    }
+                                }
+                            }
                             InputAction::None => {}
                         }
                     }
@@ -3304,19 +4568,58 @@ async fn run_client_loop(
                         // session. Entering a view detaches, so those would find
                         // no session and silently do nothing.
                         if let Some(av) = active_view {
+                            // The view is composited into the CONTENT rect, so
+                            // every hit test below runs in content coordinates
+                            // and against a content-sized area -- the same rect
+                            // `paint_view` drew. Sizes come from
+                            // `Renderer::size`, not a fresh `terminal::size()`:
+                            // between a SIGWINCH and the `Resize` event the two
+                            // disagree, and the cells actually on screen are the
+                            // ones laid out against the front buffer.
+                            let (tc, tr) = renderer.size();
+                            let content = chrome.content_rect(tc, tr);
+                            let area = crate::server::layout::Rect {
+                                x: 0,
+                                y: 0,
+                                width: content.width,
+                                height: content.height,
+                            };
+                            let inside = mouse.column >= content.x
+                                && mouse.column < content.x + content.width
+                                && mouse.row >= content.y
+                                && mouse.row < content.y + content.height;
+                            // Clamped translation, mirroring the content path
+                            // below: a gesture that strayed over a sidebar stays
+                            // on the content edge (which is what the server turns
+                            // into an edge auto-scroll step) instead of
+                            // underflowing to the far side of the view.
+                            let mx = mouse
+                                .column
+                                .saturating_sub(content.x)
+                                .min(content.width.saturating_sub(1));
+                            let my = mouse
+                                .row
+                                .saturating_sub(content.y)
+                                .min(content.height.saturating_sub(1));
                             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                                let (c, r) = crossterm::terminal::size()?;
-                                let area = crate::server::layout::Rect {
-                                    x: 0,
-                                    y: 0,
-                                    width: c,
-                                    height: r,
-                                };
+                                // Cleared BEFORE the out-of-content bail below:
+                                // a press on a panel must not leave the previous
+                                // anchor armed for the next drag to extend.
+                                view_drag = None;
+                                if !inside {
+                                    // A press on a sidebar is not a view gesture.
+                                    // It is not routed to the panel either: the
+                                    // view owns the keyboard, and focusing a panel
+                                    // here would strand keys nothing can deliver
+                                    // (the sidebar key gate is `active_view
+                                    // .is_none()`).
+                                    continue;
+                                }
                                 if let Some(idx) = crate::client::view::cell_at(
                                     &views[av],
                                     area,
-                                    mouse.column,
-                                    mouse.row,
+                                    mx,
+                                    my,
                                     &view_border_style,
                                 ) {
                                     // Clicking a cell focuses it for EVERY terminal:
@@ -3341,13 +4644,12 @@ async fn run_client_loop(
                                 // selection on that pane, so a plain click
                                 // dismisses a highlight exactly like it does in a
                                 // normal pane.
-                                view_drag = None;
                                 if let Some((idx, cx, cy)) =
                                     crate::client::view::cell_content_at(
                                         &views[av],
                                         area,
-                                        mouse.column,
-                                        mouse.row,
+                                        mx,
+                                        my,
                                         &view_border_style,
                                     )
                                 {
@@ -3372,13 +4674,6 @@ async fn run_client_loop(
                                 // `mouse_auto_yank`, replying with
                                 // `CopyToClipboard` just as it does for a pane.
                                 if let Some((conn, pane_id, sx, sy)) = view_drag.take() {
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    let area = crate::server::layout::Rect {
-                                        x: 0,
-                                        y: 0,
-                                        width: c,
-                                        height: r,
-                                    };
                                     let idx = views[av]
                                         .cells
                                         .iter()
@@ -3388,8 +4683,8 @@ async fn run_client_loop(
                                             &views[av],
                                             area,
                                             i,
-                                            mouse.column,
-                                            mouse.row,
+                                            mx,
+                                            my,
                                             &view_border_style,
                                         )
                                     }) {
@@ -3440,21 +4735,24 @@ async fn run_client_loop(
                                 // masked foreground session. The server keeps a
                                 // per-(client, pane) offset and streams a fresh
                                 // `PaneContent` rendered at it.
-                                let (c, r) = crossterm::terminal::size()?;
-                                let area = crate::server::layout::Rect {
-                                    x: 0,
-                                    y: 0,
-                                    width: c,
-                                    height: r,
+                                //
+                                // A wheel over a sidebar is NOT clamped into the
+                                // view: it takes the same focused-cell fallback a
+                                // pointer that is off every cell already takes,
+                                // rather than resolving to whichever cell happens
+                                // to touch the seam.
+                                let target = if inside {
+                                    crate::client::view::cell_at(
+                                        &views[av],
+                                        area,
+                                        mx,
+                                        my,
+                                        &view_border_style,
+                                    )
+                                    .unwrap_or(views[av].focused)
+                                } else {
+                                    views[av].focused
                                 };
-                                let target = crate::client::view::cell_at(
-                                    &views[av],
-                                    area,
-                                    mouse.column,
-                                    mouse.row,
-                                    &view_border_style,
-                                )
-                                .unwrap_or(views[av].focused);
                                 if let Some(cell) = views[av].cells.get(target) {
                                     let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                                     // The wheel position in the cell's content
@@ -3464,15 +4762,19 @@ async fn run_client_loop(
                                     // (the focused-cell fallback above) has no
                                     // position of its own, so it reports the
                                     // top-left content cell.
-                                    let (wx, wy) = crate::client::view::cell_content_pos(
-                                        &views[av],
-                                        area,
-                                        target,
-                                        mouse.column,
-                                        mouse.row,
-                                        &view_border_style,
-                                    )
-                                    .unwrap_or((0, 0));
+                                    let (wx, wy) = if inside {
+                                        crate::client::view::cell_content_pos(
+                                            &views[av],
+                                            area,
+                                            target,
+                                            mx,
+                                            my,
+                                            &view_border_style,
+                                        )
+                                        .unwrap_or((0, 0))
+                                    } else {
+                                        (0, 0)
+                                    };
                                     mgr.send(
                                         &cell.conn,
                                         ClientMessage::ScrollPane {
@@ -3498,13 +4800,6 @@ async fn run_client_loop(
                                 if let Some((conn, pane_id, sx, sy)) = view_drag.clone() {
                                     let now = Instant::now();
                                     if now.duration_since(last_drag_send) >= DRAG_THROTTLE {
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        let area = crate::server::layout::Rect {
-                                            x: 0,
-                                            y: 0,
-                                            width: c,
-                                            height: r,
-                                        };
                                         let idx = views[av]
                                             .cells
                                             .iter()
@@ -3514,8 +4809,8 @@ async fn run_client_loop(
                                                 &views[av],
                                                 area,
                                                 i,
-                                                mouse.column,
-                                                mouse.row,
+                                                mx,
+                                                my,
                                                 &view_border_style,
                                             )
                                         }) {
@@ -3538,15 +4833,170 @@ async fn run_client_loop(
                             }
                             continue;
                         }
+
+                        // Sidebar routing, ahead of every arm below. An event
+                        // that lands in a panel belongs to that panel and NEVER
+                        // reaches the server; everything else is translated out
+                        // of screen coordinates into the content rect the
+                        // server composites for. Both are no-ops with no
+                        // sidebar configured: `panel_rects` is empty and the
+                        // content origin is (0, 0), so the translation is the
+                        // identity.
+                        //
+                        // Panels are laid out against the front buffer, so the
+                        // hit test, the rect lookup and the content rect all
+                        // come from ONE size -- mixing `Renderer::size` with a
+                        // fresh `terminal::size()` within a single event would
+                        // reopen the SIGWINCH-to-`Resize` window the buffer size
+                        // exists to close.
+                        let (tc, tr) = renderer.size();
+                        let at_pointer = match panel_at(&chrome, tc, tr, mouse.column, mouse.row) {
+                            Some((sidebar, panel)) => MouseGrab::Panel { sidebar, panel },
+                            None => MouseGrab::Content,
+                        };
+                        // The sidebar's FRAME is inside the sidebar and inside
+                        // no panel: `panel_rects` returns interiors. An event
+                        // there is swallowed, never translated into the content
+                        // rect -- clamping a click on a border into the content
+                        // would land it on a pane the user did not click, one
+                        // cell away from where they pressed.
+                        //
+                        // Only routes derived from POSITION consult this. A
+                        // gesture already grabbed by the content keeps its grab
+                        // when the pointer crosses the frame, exactly as it does
+                        // when it crosses a panel.
+                        let over_frame = matches!(at_pointer, MouseGrab::Content)
+                            && chrome.sidebar_at(tc, tr, mouse.column, mouse.row).is_some();
+                        let route = match mouse.kind {
+                            // A press claims the region for the whole gesture.
+                            MouseEventKind::Down(_) => {
+                                if over_frame {
+                                    mouse_grab = None;
+                                    continue;
+                                }
+                                mouse_grab = Some(at_pointer);
+                                at_pointer
+                            }
+                            // Motion and release follow the press, wherever the
+                            // pointer has since wandered. A stray one with no
+                            // press behind it falls back to position.
+                            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                                match mouse_grab {
+                                    Some(g) => g,
+                                    None if over_frame => continue,
+                                    None => at_pointer,
+                                }
+                            }
+                            // The wheel is not part of a button gesture: it acts
+                            // on whatever is under the pointer.
+                            _ if over_frame => continue,
+                            _ => at_pointer,
+                        };
+                        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                            mouse_grab = None;
+                        }
+                        if let MouseGrab::Panel { sidebar, panel } = route {
+                            let rect = chrome
+                                .panel_rects(tc, tr)
+                                .into_iter()
+                                .find(|(a, b, _)| *a == sidebar && *b == panel)
+                                .map(|(_, _, r)| r);
+                            let Some(rect) = rect else {
+                                // The panel stopped being laid out (a resize
+                                // shrank it away) mid-gesture. Drop the event
+                                // rather than re-routing it at the content,
+                                // which would hand the server the tail of a
+                                // drag it never saw the head of.
+                                mouse_grab = None;
+                                continue;
+                            };
+                            // Clamp into the rect before subtracting: a drag
+                            // anchored here may have left the panel, and the
+                            // plugin takes unsigned panel-local coordinates.
+                            let px = mouse
+                                .column
+                                .clamp(rect.x, rect.x + rect.width.saturating_sub(1))
+                                - rect.x;
+                            let py = mouse
+                                .row
+                                .clamp(rect.y, rect.y + rect.height.saturating_sub(1))
+                                - rect.y;
+                            let focus_before = chrome.focus;
+                            // Only a press moves focus: the wheel and a drag
+                            // that merely crosses a panel must not steal it.
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                chrome.focus =
+                                    crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel };
+                            }
+                            let action = chrome.sidebars[sidebar].panels[panel]
+                                .plugin
+                                .on_mouse(px, py, mouse.kind);
+                            // A focus change repaints even when the plugin asks
+                            // for nothing -- the panel renders its header
+                            // differently focused.
+                            let repaint_for_focus = chrome.focus != focus_before
+                                && !matches!(action, crate::client::sidebar::PluginAction::Redraw);
+                            handle_plugin_action(
+                                action,
+                                &mut chrome,
+                                mgr,
+                                &mut renderer,
+                                &compositor_theme,
+                                focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                                &views,
+                                &mut active_view,
+                                &mut active_view_id,
+                                &mut mouse_grab,
+                                &mut last_local_session,
+                                &mut current_attached,
+                                &mut previous_attached,
+                            )
+                            .await?;
+                            if repaint_for_focus {
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                renderer.flush()?;
+                            }
+                            continue;
+                        }
+                        // A press in the content area returns focus there.
+                        // Without this, the panel-press focus above is a one-way
+                        // door: keys stay in the panel after clicking the terminal.
+                        // Mirroring `focused_panel` before leaving is what lets a
+                        // later `focus_edge` return to the panel the user was last
+                        // on rather than resetting to the first.
+                        if matches!(mouse.kind, MouseEventKind::Down(_))
+                            && !matches!(chrome.focus, crate::client::chrome::ChromeFocus::Content)
+                        {
+                            if let crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel } =
+                                chrome.focus
+                            {
+                                chrome.sidebars[sidebar].focused_panel = panel;
+                            }
+                            chrome.focus = crate::client::chrome::ChromeFocus::Content;
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                            renderer.flush()?;
+                        }
+                        // Content-bound: screen -> content coordinates, clamped
+                        // into the rect so a gesture that strayed over a sidebar
+                        // stays on the content edge instead of underflowing.
+                        let content = chrome.content_rect(tc, tr);
+                        let cx = mouse
+                            .column
+                            .saturating_sub(content.x)
+                            .min(content.width.saturating_sub(1));
+                        let cy = mouse
+                            .row
+                            .saturating_sub(content.y)
+                            .min(content.height.saturating_sub(1));
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
-                                log::debug!("mouse: click at ({}, {})", mouse.column, mouse.row);
-                                drag_start = Some((mouse.column, mouse.row));
+                                log::debug!("mouse: click at ({}, {})", cx, cy);
+                                drag_start = Some((cx, cy));
                                 // Send click immediately.
                                 mgr
                                     .send_foreground(ClientMessage::MouseClick {
-                                        x: mouse.column,
-                                        y: mouse.row,
+                                        x: cx,
+                                        y: cy,
                                         pane_id: None,
                                         release: false,
                                     })
@@ -3561,8 +5011,8 @@ async fn run_client_loop(
                                             .send_foreground(ClientMessage::MouseDrag {
                                                 start_x: sx,
                                                 start_y: sy,
-                                                end_x: mouse.column,
-                                                end_y: mouse.row,
+                                                end_x: cx,
+                                                end_y: cy,
                                                 is_final: false,
                                                 pane_id: None,
                                             })
@@ -3574,13 +5024,13 @@ async fn run_client_loop(
                             MouseEventKind::Up(MouseButton::Left) => {
                                 // Send final drag on release.
                                 if let Some((sx, sy)) = drag_start.take() {
-                                    if sx != mouse.column || sy != mouse.row {
+                                    if sx != cx || sy != cy {
                                         mgr
                                             .send_foreground(ClientMessage::MouseDrag {
                                                 start_x: sx,
                                                 start_y: sy,
-                                                end_x: mouse.column,
-                                                end_y: mouse.row,
+                                                end_x: cx,
+                                                end_y: cy,
                                                 is_final: true,
                                                 pane_id: None,
                                             })
@@ -3594,8 +5044,8 @@ async fn run_client_loop(
                                         // the view path's release-click.)
                                         mgr
                                             .send_foreground(ClientMessage::MouseClick {
-                                                x: mouse.column,
-                                                y: mouse.row,
+                                                x: cx,
+                                                y: cy,
                                                 pane_id: None,
                                                 release: true,
                                             })
@@ -3621,8 +5071,8 @@ async fn run_client_loop(
                                     // or scroll remux scrollback. It replies with a render
                                     // that re-syncs scroll_offset/is_scrolled.
                                     mgr.send_foreground(ClientMessage::MouseScroll {
-                                        x: mouse.column,
-                                        y: mouse.row,
+                                        x: cx,
+                                        y: cy,
                                         up: true,
                                     })
                                     .await?;
@@ -3646,8 +5096,8 @@ async fn run_client_loop(
                                     // or scroll remux scrollback. It replies with a render
                                     // that re-syncs scroll_offset/is_scrolled.
                                     mgr.send_foreground(ClientMessage::MouseScroll {
-                                        x: mouse.column,
-                                        y: mouse.row,
+                                        x: cx,
+                                        y: cy,
                                         up: false,
                                     })
                                     .await?;
@@ -3659,7 +5109,22 @@ async fn run_client_loop(
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
                         log::debug!("resize: {}x{}", new_cols, new_rows);
                         renderer.resize(new_cols, new_rows);
-                        mgr.send_foreground(ClientMessage::Resize { cols: new_cols, rows: new_rows }).await?;
+                        // `resize` reallocated the front buffer and reset the
+                        // content size to the whole terminal, but deliberately
+                        // left the origin alone: re-point BOTH at the new
+                        // content rect before anything paints.
+                        let content = chrome.content_rect(new_cols, new_rows);
+                        sync_content_rect(&mut renderer, &content);
+                        mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
+                        // The panels have to be re-laid for the new terminal;
+                        // the server frame that answers the Resize repaints only
+                        // the content columns. A live view repaints them itself
+                        // (`paint_view` ends with `chrome.paint`), so painting
+                        // here would just be the same work twice.
+                        if active_view.is_none() {
+                            chrome.paint(&mut renderer, new_cols, new_rows, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                            renderer.flush()?;
+                        }
                         // A live view owns the screen; recomposite it at the new
                         // size so it doesn't stay blank until the next snapshot.
                         // Every cell's rect changed with the terminal, so re-demand
@@ -3667,9 +5132,10 @@ async fn run_client_loop(
                         // (the other geometry changes -- layout/resize/move/zoom --
                         // arrive as `ViewList` and re-subscribe there).
                         if let Some(av) = active_view {
-                            subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
+                            subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                             paint_view(
                                 &mut renderer,
+                                &chrome,
                                 &views[av],
                                 &input,
                                 &whichkey,
@@ -3683,6 +5149,20 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Paste(text))) => {
+                        // Bracketed paste is a SEPARATE crossterm event, so it never
+                        // passes the key routing above: without this guard a focused
+                        // sidebar would have Ctrl-Shift-V typed into the shell behind
+                        // it, which is the one path by which input reaches the server
+                        // while a panel owns the keyboard. Dropped rather than routed
+                        // -- a plugin paste hook belongs to the plugin tasks.
+                        let (tc, tr) = renderer.size();
+                        if chrome.focused_panel(tc, tr).is_some() {
+                            log::debug!(
+                                "sidebar: dropping a {}-byte paste -- a panel has focus",
+                                text.len()
+                            );
+                            continue;
+                        }
                         // Wrap pasted text in bracketed paste sequences.
                         let mut data = Vec::new();
                         data.extend_from_slice(b"\x1b[200~");
@@ -3698,6 +5178,7 @@ async fn run_client_loop(
                             {
                                 paint_view(
                                     &mut renderer,
+                                    &chrome,
                                     &views[av],
                                     &input,
                                     &whichkey,
@@ -3742,9 +5223,10 @@ async fn run_client_loop(
                         let connected = mgr.finish_remote_dial(&name, result);
                         log::debug!("srv: RemoteDialed '{name}' connected={connected}");
                         if let Some(av) = active_view {
-                            subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
+                            subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                             paint_view(
                                 &mut renderer,
+                                &chrome,
                                 &views[av],
                                 &input,
                                 &whichkey,
@@ -3760,6 +5242,22 @@ async fn run_client_loop(
                     }
                     Incoming::Closed(src) => {
                         log::debug!("srv: connection closed src={:?}", src);
+                        // Panels scope their state by connection: tell them
+                        // before anything else here can `continue` or return.
+                        if wants_session_tree || wants_agents {
+                            chrome.broadcast(&crate::client::sidebar::PluginEvent::ConnectionLost {
+                                conn: src.clone(),
+                            });
+                            // Repaint so the dropped server's rows go away.
+                            // Skipped over a live view: the cells below are
+                            // about to be marked disconnected, and painting
+                            // twice would show the stale half first.
+                            if active_view.is_none() {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                renderer.flush()?;
+                            }
+                        }
                         // Mark every view cell (across ALL views) that aliases a
                         // pane on the dropped connection as disconnected. Done at
                         // the very top of the arm, before the several early
@@ -3780,6 +5278,7 @@ async fn run_client_loop(
                             if let Some(av) = active_view {
                                 paint_view(
                                     &mut renderer,
+                                    &chrome,
                                     &views[av],
                                     &input,
                                     &whichkey,
@@ -3808,8 +5307,8 @@ async fn run_client_loop(
                                         return Ok(());
                                     }
                                     mgr.set_foreground(ConnId::Local);
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    mgr.send(&ConnId::Local, ClientMessage::Resize { cols: c, rows: r }).await?;
+                                    let content = content_rect_now(&chrome)?;
+                                    mgr.send(&ConnId::Local, ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
                                     if let Some(session) = last_local_session.clone() {
                                         // Reattach; the server responds with a fresh FullRender.
                                         mgr.send(&ConnId::Local, ClientMessage::Attach { session_name: session.clone() }).await?;
@@ -3890,6 +5389,16 @@ async fn run_client_loop(
                         // closes) but skip painting the server's frame.
                         if active_view.is_none() {
                             renderer.render_full(&cells, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            // Panels write INTO the front buffer, so this
+                            // is idempotent and cheap next to a frame. It is
+                            // needed because a server frame repaints only the
+                            // content columns, while a `resize` reallocates
+                            // the whole buffer. Laid out against the size the
+                            // front buffer was allocated for -- a fresh
+                            // `terminal::size()` disagrees with it between a
+                            // SIGWINCH and the `Resize` event.
+                            let (tc, tr) = renderer.size();
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -3919,6 +5428,16 @@ async fn run_client_loop(
                         // See the FullRender arm: a View suppresses the paint.
                         if active_view.is_none() {
                             renderer.render_diff(&changes, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            // Panels write INTO the front buffer, so this
+                            // is idempotent and cheap next to a frame. It is
+                            // needed because a server frame repaints only the
+                            // content columns, while a `resize` reallocates
+                            // the whole buffer. Laid out against the size the
+                            // front buffer was allocated for -- a fresh
+                            // `terminal::size()` disagrees with it between a
+                            // SIGWINCH and the `Resize` event.
+                            let (tc, tr) = renderer.size();
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -3948,6 +5467,16 @@ async fn run_client_loop(
                         // See the FullRender arm: a View suppresses the paint.
                         if active_view.is_none() {
                             renderer.render_scroll(pane_x, pane_y, pane_width, pane_height, delta, &new_rows, cursor_x, cursor_y, cursor_visible, cursor_style)?;
+                            // Panels write INTO the front buffer, so this
+                            // is idempotent and cheap next to a frame. It is
+                            // needed because a server frame repaints only the
+                            // content columns, while a `resize` reallocates
+                            // the whole buffer. Laid out against the size the
+                            // front buffer was allocated for -- a fresh
+                            // `terminal::size()` disagrees with it between a
+                            // SIGWINCH and the `Resize` event.
+                            let (tc, tr) = renderer.size();
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
                             relay_overlays(
                                 &mut renderer,
                                 &input,
@@ -3987,7 +5516,8 @@ async fn run_client_loop(
                             let (c, r) = crossterm::terminal::size()?;
                             renderer.clear_overlay(c, r)?;
                             renderer.flush()?;
-                            switch_to_server(mgr, &ConnId::Local, c, r).await?;
+                            let content = content_rect_now(&chrome)?;
+                            switch_to_server(mgr, &ConnId::Local, content).await?;
                             mgr.send(&ConnId::Local, ClientMessage::Attach {
                                 session_name: target.clone(),
                             }).await?;
@@ -4023,7 +5553,21 @@ async fn run_client_loop(
                             // Re-send resize in case terminal changed
                             let (cols, rows) = crossterm::terminal::size()?;
                             renderer.resize(cols, rows);
-                            mgr.send_foreground(ClientMessage::Resize { cols, rows }).await?;
+                            // See the resize arm: origin and content size move
+                            // together, and `resize` only moves one of them.
+                            // A live view goes through the content rect like
+                            // everything else -- see `content_rect_now`. This is
+                            // not reachable with a view up today (`enter_view`
+                            // detaches, and the server answers `RequestScrollback`
+                            // only for an attached client), but the rect must not
+                            // be the one place that still disagrees.
+                            let content = chrome.content_rect(cols, rows);
+                            sync_content_rect(&mut renderer, &content);
+                            mgr.send_foreground(ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
+                            if active_view.is_none() {
+                                chrome.paint(&mut renderer, cols, rows, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                renderer.flush()?;
+                            }
                         } else if let Some(ref mut ss) = input.search_state {
                             if let Some(ref query) = ss.confirmed_query {
                                 let pane_height = focused_pane_rect
@@ -4152,8 +5696,173 @@ async fn run_client_loop(
                             .await?;
                         }
                     }
+                    Some(ServerMessage::AgentList { agents, detection_supported }) => {
+                        log::debug!(
+                            "srv: AgentList src={:?} agents={} supported={}",
+                            src, agents.len(), detection_supported
+                        );
+                        if wants_agents {
+                            chrome.broadcast(&crate::client::sidebar::PluginEvent::Agents {
+                                conn: src.clone(),
+                                agents,
+                                supported: detection_supported,
+                            });
+                            // Repaint exactly as the session tree's arm does:
+                            // over a live view `paint_view` ends with
+                            // `chrome.paint`, so it is the one that has to run.
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &chrome,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &compositor_theme,
+                                    &view_border_style,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            } else {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                relay_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    tc,
+                                    tr,
+                                )?;
+                            }
+                            renderer.flush()?;
+                        }
+                    }
+                    Some(ServerMessage::DirectoryListing { path, entries, error, truncated }) => {
+                        log::debug!(
+                            "srv: DirectoryListing src={:?} path={:?} entries={} error={:?} truncated={}",
+                            src, path, entries.len(), error, truncated
+                        );
+                        // Unguarded by any `wants_*` flag: a listing arrives
+                        // only in answer to a request, and only a `files` panel
+                        // makes one. Broadcast rather than addressed -- the
+                        // panel claims it by `(conn, path)`; see
+                        // `PluginEvent::DirectoryListing`.
+                        chrome.broadcast(&crate::client::sidebar::PluginEvent::DirectoryListing {
+                            conn: src.clone(),
+                            path,
+                            entries,
+                            error,
+                            truncated,
+                        });
+                        // Repainted exactly as the agent-list and session-tree
+                        // arms do: over a live view `paint_view` ends with
+                        // `chrome.paint`, so it is the one that has to run.
+                        if let Some(av) = active_view {
+                            paint_view(
+                                &mut renderer,
+                                &chrome,
+                                &views[av],
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &compositor_theme,
+                                &view_border_style,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                            )?;
+                        } else {
+                            let (tc, tr) = renderer.size();
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                            relay_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                                tc,
+                                tr,
+                            )?;
+                        }
+                        renderer.flush()?;
+                    }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
+                        // Hand every panel the tree BEFORE the overlay branches
+                        // below move it. Unconditional: a tree arrives whether
+                        // it was asked for (`ListSessionTree`) or pushed
+                        // (`SubscribeSessionTree`), and the panel wants both.
+                        if wants_session_tree {
+                            chrome.broadcast(&crate::client::sidebar::PluginEvent::SessionTree {
+                                conn: src.clone(),
+                                folders: folders.clone(),
+                                unfiled: unfiled.clone(),
+                                dormant: dormant.clone(),
+                            });
+                            // The focused pane's directory, resolved HERE rather
+                            // than in a panel: it takes knowing which connection
+                            // is in the foreground, which is the client's
+                            // knowledge.
+                            //
+                            // Announced on every foreground tree, unchanged or
+                            // not. Filtering here as well would put the "has the
+                            // directory changed?" decision in two places, and the
+                            // panel's is the one that counts -- it compares
+                            // against what it actually SPAWNED, which is not
+                            // always the last thing announced. A dedup here also
+                            // silently defeated the end-to-end test of the
+                            // panel's own: no event, no respawn, whatever the
+                            // panel decided.
+                            if mgr.is_foreground(&src) {
+                                chrome.broadcast(
+                                    &crate::client::sidebar::PluginEvent::FocusedCwd {
+                                        conn: src.clone(),
+                                        cwd: focused_pane_cwd(&folders, &unfiled),
+                                    },
+                                );
+                            }
+                            // Repaint the panels. Over a live view `paint_view`
+                            // ends with `chrome.paint`, so it is the one that
+                            // has to run; otherwise panels are painted straight
+                            // into the front buffer and the overlays re-laid on
+                            // top, exactly as a server frame does it.
+                            if let Some(av) = active_view {
+                                paint_view(
+                                    &mut renderer,
+                                    &chrome,
+                                    &views[av],
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &compositor_theme,
+                                    &view_border_style,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                )?;
+                            } else {
+                                let (tc, tr) = renderer.size();
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                relay_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    tc,
+                                    tr,
+                                )?;
+                            }
+                        }
                         // Resolve a pending "add focused pane to a view" request
                         // BEFORE `folders`/`unfiled` are moved into the session
                         // manager below. `is_focused` is per-tab (every tab reports
@@ -4220,6 +5929,7 @@ async fn run_client_loop(
                             if let Some(av) = active_view {
                                 paint_view(
                                     &mut renderer,
+                                    &chrome,
                                     &views[av],
                                     &input,
                                     &whichkey,
@@ -4342,6 +6052,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -4411,6 +6122,36 @@ async fn run_client_loop(
                                 break;
                             }
                         }
+                    }
+                    Some(ServerMessage::SessionBorderStyle { style }) => {
+                        // The style the server draws the session we just
+                        // attached to. Only the FOREGROUND connection's answer
+                        // applies: a background server attaching a session of
+                        // its own must not reframe what this terminal is
+                        // showing.
+                        if mgr.is_foreground(&src) && style != view_border_style {
+                            log::debug!("srv: SessionBorderStyle {style:?} (was {view_border_style:?})");
+                            view_border_style = style;
+                            chrome.set_border_style(view_border_style.clone());
+                            // The frame is repainted by the attach's own
+                            // FullRender, which follows this; painting here as
+                            // well keeps the sidebar right even if the frame is
+                            // a no-op diff.
+                            let (tc, tr) = renderer.size();
+                            if active_view.is_none() {
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                renderer.flush()?;
+                            }
+                        }
+                    }
+                    Some(ServerMessage::CliSpawned { pane_id }) => {
+                        // The interactive client never sends `CliSpawn`; only
+                        // the unattached `remux split`/`remux new-tab` path
+                        // does, and that one reads its own answer without ever
+                        // reaching this loop. Logged rather than ignored so that
+                        // if it ever DOES arrive here, the log says so instead of
+                        // the message vanishing into a catch-all.
+                        log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);
@@ -4507,13 +6248,14 @@ async fn run_client_loop(
                                 // Re-subscribe the whole active view so the flipped
                                 // cell's size_demand is recomputed (see
                                 // `subscribe_view_cells`).
-                                subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
+                                subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                             }
                         }
                         if active_touched {
                             if let Some(av) = active_view {
                                 paint_view(
                                     &mut renderer,
+                                    &chrome,
                                     &views[av],
                                     &input,
                                     &whichkey,
@@ -4595,6 +6337,8 @@ async fn run_client_loop(
                                                 &mut views,
                                                 &mut active_view,
                                                 &mut active_view_id,
+                                                &mut chrome,
+                                                &mut mouse_grab,
                                                 idx,
                                                 &current_attached,
                                                 &mut renderer,
@@ -4634,8 +6378,19 @@ async fn run_client_loop(
                                     }
                                     active_view = None;
                                     active_view_id = None;
+                                    // The screen goes back to the content, so
+                                    // focus and any mouse grab do too -- same
+                                    // reset `leave_active_view` performs, which
+                                    // this path deliberately does not go through
+                                    // (it re-attaches and repaints itself).
+                                    chrome.leave_sidebar();
+                                    mouse_grab = None;
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.resize(c, r);
+                                    // The view no longer owns the terminal: hand
+                                    // the edges back to the sidebars.
+                                    let content = chrome.content_rect(c, r);
+                                    sync_content_rect(&mut renderer, &content);
                                     if let Some((_, session)) = current_attached.clone() {
                                         mgr.send_foreground(ClientMessage::Attach {
                                             session_name: session,
@@ -4643,10 +6398,12 @@ async fn run_client_loop(
                                         .await?;
                                     }
                                     mgr.send_foreground(ClientMessage::Resize {
-                                        cols: c,
-                                        rows: r,
+                                        cols: content.width,
+                                        rows: content.height,
                                     })
                                     .await?;
+                                    chrome.paint(&mut renderer, c, r, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                    renderer.flush()?;
                                 } else if let Some(av) = active_view {
                                     // Diff the pane set: unsubscribe panes fully gone,
                                     // (re)subscribe the current set (adds the new ones,
@@ -4671,9 +6428,10 @@ async fn run_client_loop(
                                                 .await;
                                         }
                                     }
-                                    subscribe_view_cells(mgr, &mut views[av], &view_border_style).await?;
+                                    subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -4697,6 +6455,7 @@ async fn run_client_loop(
                                 if let Some(av) = active_view {
                                     paint_view(
                                         &mut renderer,
+                                        &chrome,
                                         &views[av],
                                         &input,
                                         &whichkey,
@@ -4728,7 +6487,29 @@ async fn run_client_loop(
             // require a restart. The channel is kept open by `_cfg_keepalive`,
             // so `None` only appears on a genuine full teardown.
             maybe_cfg = cfg_rx.recv() => {
-                if let Some(new_config) = maybe_cfg {
+                if let Some(mut new_config) = maybe_cfg {
+                    // Coalesce the burst. One editor save typically produces
+                    // several Create/Modify events (write, rename, chmod), and
+                    // the watcher sends a `Config` for each -- so without this
+                    // the whole arm below (chrome rebuild, subscription
+                    // give-back and re-subscribe of every connection, plugin
+                    // state wiped, repaint) ran two to five times per save,
+                    // with a visible flash each time.
+                    //
+                    // Trailing edge, so the LAST config written wins: sleep out
+                    // the burst, then drain everything that queued behind it.
+                    // The event loop is parked for the sleep, but only ever
+                    // right after a config save, where 150ms is imperceptible.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let mut coalesced = 0usize;
+                    while let Ok(later) = cfg_rx.try_recv() {
+                        new_config = later;
+                        coalesced += 1;
+                    }
+                    if coalesced > 0 {
+                        log::debug!("client: coalesced {coalesced} extra config events");
+                    }
+
                     // Revalidate cross-references (logs on bad refs, like startup).
                     new_config.validate();
 
@@ -4751,6 +6532,160 @@ async fn run_client_loop(
                     // Reconcile the remotes roster (update in place / add new /
                     // drop idle config-removed remotes).
                     mgr.update_remotes(&new_config.remotes);
+
+                    // Rebuild the client-side chrome. Plugins are rebuilt with
+                    // it, so a sessions panel loses its expansion and selection
+                    // on any config edit -- accepted, because the alternative
+                    // is a `[[sidebar]]` block that needs a client restart to
+                    // appear, and there is no meaningful way to carry state
+                    // across a panel set that may have changed shape entirely.
+                    let (tc, tr) = renderer.size();
+                    let chrome_before = chrome.content_rect(tc, tr);
+                    // Where the keyboard is, by EDGE rather than by index --
+                    // the rebuild renumbers the sidebars, and an unrelated
+                    // config edit yanking the keyboard out of a panel the user
+                    // is working in reads as a dropped keypress.
+                    let focused_edge = match chrome.focus {
+                        crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel } => {
+                            Some((chrome.sidebars[sidebar].edge, panel))
+                        }
+                        crate::client::chrome::ChromeFocus::Content => None,
+                    };
+                    chrome = crate::client::chrome::Chrome::from_config(&new_config.sidebar);
+                    // The rebuild starts from the config default; the frame has
+                    // to go back to the style the client is actually drawing
+                    // with, which a runtime `ToggleStyle` may have flipped away
+                    // from what any config says.
+                    chrome.set_border_style(view_border_style.clone());
+                    // Runtime state is layered back on -- but NOT the way
+                    // startup does it. `sidebar.json` holds a size for every
+                    // edge from the first toggle or resize onward, so a
+                    // startup-style overlay would silently revert every
+                    // `size = ...` the user then typed, which is the very
+                    // complaint hot-reload exists to answer. `apply_on_reload`
+                    // diffs old config against new, field by field: what the
+                    // user just typed wins, what they did not type keeps what
+                    // they dragged.
+                    let sidebar_state = crate::client::sidebar_state::load();
+                    crate::client::sidebar_state::apply_on_reload(
+                        &mut chrome,
+                        &sidebar_state,
+                        &prev_sidebar_cfg,
+                        &new_config.sidebar,
+                    );
+                    prev_sidebar_cfg = crate::client::sidebar_state::merge_seen_config(
+                        &prev_sidebar_cfg,
+                        &new_config.sidebar,
+                    );
+                    // Where the config won, the persisted state now describes
+                    // something the user has overridden; write the truth back
+                    // so the next reload diffs against it. Skipped when nothing
+                    // has ever been persisted, so a config-only session still
+                    // creates no state file.
+                    if !sidebar_state.bars.is_empty()
+                        && crate::client::sidebar_state::merged(&chrome, &sidebar_state)
+                            != sidebar_state
+                    {
+                        crate::client::sidebar_state::save(&chrome);
+                    }
+                    // Put the keyboard back where it was. `refocus_edge`
+                    // resolves the target against `panel_rects`, so a stack
+                    // that changed shape cannot leave focus on a panel that is
+                    // never painted -- `split_panels` drops one whose weighted
+                    // share falls below its `min_size`, and the panel COUNT
+                    // says nothing about that.
+                    if let Some((edge, panel)) = focused_edge {
+                        if !chrome.refocus_edge(edge, panel, tc, tr) {
+                            log::debug!(
+                                "sidebar: no panel on the focused {edge:?} edge survived the \
+                                 reload; focus returns to the content"
+                            );
+                        }
+                    }
+
+                    // The panel that wants the session tree may have just
+                    // appeared or gone. Recompute, and forget the existing
+                    // subscriptions so the reconcile at the top of the loop
+                    // re-subscribes every live connection: the server answers a
+                    // subscribe with the tree at once, which is what fills a
+                    // freshly built panel that has never seen a push.
+                    let wanted_session_tree_before = wants_session_tree;
+                    wants_session_tree = chrome.wants_session_tree();
+                    // Removing the last panel that wanted it has to be said out
+                    // loud. The reconcile only ever ADDS subscriptions, so
+                    // without this every connection -- remotes over SSH
+                    // included -- keeps pushing a full tree on every structural
+                    // change for the rest of the client's life, to nobody.
+                    if wanted_session_tree_before && !wants_session_tree {
+                        for id in &tree_subscribed {
+                            log::debug!("sidebar: unsubscribing from the session tree on {id:?}");
+                            if let Err(e) =
+                                mgr.send(id, ClientMessage::UnsubscribeSessionTree).await
+                            {
+                                log::warn!(
+                                    "sidebar: UnsubscribeSessionTree to {id:?} failed: {e:#}"
+                                );
+                            }
+                        }
+                    }
+                    tree_subscribed.clear();
+
+                    // The same for the agents push, for the same reasons.
+                    let wanted_agents_before = wants_agents;
+                    wants_agents = chrome.wants_agents();
+                    if wanted_agents_before && !wants_agents {
+                        for id in &agents_subscribed {
+                            log::debug!("sidebar: unsubscribing from the agent list on {id:?}");
+                            if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
+                                log::warn!("sidebar: UnsubscribeAgents to {id:?} failed: {e:#}");
+                            }
+                        }
+                    }
+                    agents_subscribed.clear();
+                    // Origin and `Resize` travel together (see
+                    // `sync_content_rect`): `Renderer::resize` resets the
+                    // content size but keeps the origin.
+                    let chrome_content = chrome.content_rect(tc, tr);
+                    if chrome_content != chrome_before {
+                        sync_content_rect(&mut renderer, &chrome_content);
+                        mgr.send_foreground(ClientMessage::Resize {
+                            cols: chrome_content.width,
+                            rows: chrome_content.height,
+                        })
+                        .await?;
+                    }
+                    // Repaint so the new chrome is on screen now rather than at
+                    // the next frame -- the same pair the sidebar-intent arm
+                    // runs, for the same reason.
+                    match active_view {
+                        Some(av) => {
+                            subscribe_view_cells(
+                                mgr,
+                                &chrome,
+                                &renderer,
+                                &mut views[av],
+                                &view_border_style,
+                            )
+                            .await?;
+                            paint_view(
+                                &mut renderer,
+                                &chrome,
+                                &views[av],
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &compositor_theme,
+                                &view_border_style,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                            )?;
+                        }
+                        None => {
+                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                            renderer.flush()?;
+                        }
+                    }
 
                     // If the session-manager overlay is open, repaint it so the
                     // new theme takes effect immediately.

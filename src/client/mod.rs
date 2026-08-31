@@ -1,9 +1,13 @@
+pub mod chrome;
 pub mod command_palette;
 pub mod editor;
 pub mod input;
 pub mod registry;
 pub mod renderer;
 pub mod session_manager;
+pub mod sidebar;
+pub mod sidebar_state;
 pub mod terminal;
+pub mod tree_model;
 pub mod view;
 pub mod whichkey;

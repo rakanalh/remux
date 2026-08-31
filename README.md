@@ -6,7 +6,7 @@
 
 A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, a tree-view session manager, first-class SSH remote sessions, and **Views** — a single screen composed of live panes borrowed from any session on any machine.
 
-Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Config changes hot-reload live — no restart needed.
+Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Keybindings, theme, and remotes hot-reload on save; the server-side `[agents]` section is read at startup and needs `remux restart`.
 
 ---
 
@@ -71,6 +71,17 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Real layouts** — views use the same layout engine as normal tabs (Grid by default; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
 - **Re-entry via the switcher** — the quick switcher (`Alt-s`) lists views alongside sessions; selecting one enters it.
 
+### Sidebars & plugins
+
+- **Sidebars** — client-side panels docked to the **left**, **right**, and/or **bottom** edge; one sidebar per edge, up to three at once, each stacking one or more plugin **panels**. They are chrome, not panes: the server never sees them, they take their slice of the terminal and hand the panes what is left. There are none by default — declare `[[sidebar]]` / `[[sidebar.panel]]` to opt in.
+- **`sessions` panel** — the session-manager tree, live in a sidebar instead of an overlay: every session, tab, and pane across the local server and every connected remote, refreshed by the server as things change. `j`/`k` (or the arrows) move and `g`/`G` jump to the ends, `l`/`h` (or Right/Left) expand and collapse a node, `Space` toggles one, and `Enter` jumps to whatever is selected. (`Space` *marks* panes for a view in the session-manager overlay; in the panel it only opens and closes nodes.)
+- **`files` panel** — a built-in file browser with **nothing you must configure**, following the focused pane's directory. `j`/`k` move and `g`/`G` jump to the ends, `l`/`h` (or the arrows) descend and go up, `.` toggles hidden entries, `r` re-lists now, and **`Enter` on a file opens it in a split running an editor** — taking the keyboard with it, so you land in the editor rather than in the sidebar. The listing and the editor both come from the **server**, so pointing it at a pane on a remote browses and edits *that* machine. It **re-lists itself** every couple of seconds while it is on screen, so files created or removed by anything else appear and disappear with no keystroke — and the cursor stays on the entry it was on, by name. A hidden or closed sidebar polls nothing. (It was called `browser` until the two file panels merged; the old name still loads, with a warning. See [Migrating](#migrating-from-browser--the-old-files).)
+- **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
+- **`placeholder` panel** — a test fixture that paints its own name and size. It exists for checking sidebar geometry; there is nothing to configure and no reason to dock one day to day.
+- **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` walks focus through every visible panel and then back to the panes. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
+- **The `files` panel follows the focused pane** — it shows the directory of the pane you are focused **on**, and it moves when **focus** moves, *not* when you `cd`. That is the one thing that looks broken by hand: typing `cd ~/project` in a pane does not move the panel. Navigate the panel yourself with `h`/`l` and it stays where you put it, resuming its following once it is back on the pane's own directory. It follows the pane's **machine** too — focus a pane on a remote and it lists that remote's filesystem.
+- **Config edits apply live**, with one visible cost: reloading rebuilds the panels, so a `sessions` tree loses its expansion and selection. The alternative was a `[[sidebar]]` block that needed a client restart to appear.
+
 ### Mouse
 
 - **Text selection** — click-drag to select; on release the selection auto-copies to the clipboard and clears (`mouse_auto_yank`, on by default). Disable it to keep the selection for keyboard adjustment in Visual mode.
@@ -81,7 +92,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 ### Theming & configuration
 
 - **Configurable theming** — named colors, CSS hex, ANSI 256 indices, and RGB tuples. Per-mode status bar colors, frame colors, tab colors, which-key colors, search-highlight colors, and more (defaults are Catppuccin Mocha).
-- **Hot-reload** — a file watcher reloads `~/.config/remux/config.toml` on save and the client applies new **keybindings, theme, and remotes** live.
+- **Hot-reload** — a file watcher reloads `~/.config/remux/config.toml` on save and the client applies new **keybindings, theme, and remotes** live. Server-side settings — `[agents]`, and the general/persistence options the daemon reads at startup — need `remux restart`.
 - **Fully configurable keybindings** — override or unbind any leader-tree key or Alt shortcut, remap the leader, and chain commands. See [Keybindings](#keybindings) and [Chaining commands](#chaining-commands).
 
 ## Which-key
@@ -156,7 +167,32 @@ remux new --session <name> [--folder <dir>]    # Create a session
 remux attach <name>                            # Attach to a session
 remux ls                                       # List sessions
 remux kill <name>                              # Kill a session
+remux stop                                     # Stop the server, saving sessions first
+remux restart                                  # Stop and start it again
 ```
+
+### Talking to Remux from inside a pane
+
+Every pane's environment carries **`REMUX_SESSION`** (the session it belongs to) and **`REMUX_PANE`** (its pane id) — the equivalent of tmux's `TMUX` / `TMUX_PANE`. Two subcommands read them, so anything running in a pane can ask Remux for another one:
+
+```
+remux split [--right|--below] [-c DIR] [-- COMMAND [ARGS...]]
+remux new-tab                 [-c DIR] [-- COMMAND [ARGS...]]
+```
+
+```bash
+remux split                                    # another shell, below
+remux split --right -- nvim /tmp/notes.md      # nvim, in a pane beside this one
+remux new-tab -c ~/project                     # a new tab, starting in ~/project
+```
+
+`--below` is the default: a terminal is wider than it is tall, so stacking leaves both panes more usable line length. With no command the new pane runs your login shell, exactly as an interactive split does, and `-c` defaults to the target pane's directory.
+
+**The split lands on whatever pane has focus right now**, in the active tab of `$REMUX_SESSION` — not necessarily the pane the command was typed in. That is deliberate, and it is what tmux does: the environment variable was fixed when the pane started, while focus is where you are looking.
+
+Run outside a pane, both refuse and say so rather than guessing a session — guessing is how a script splits a window you were not looking at.
+
+This is what makes an external file manager's opener hook work: point `NNN_OPENER`, yazi's `[opener]`, or ranger's `rifle.conf` at `remux split -- $EDITOR "$1"` and files open beside your work — run your file manager in an ordinary pane and it behaves as it always did. The built-in [`files` panel](#sidebars--plugins) needs none of this: it is part of the client and talks to the server directly.
 
 ### Configuration file
 
@@ -167,7 +203,7 @@ mkdir -p ~/.config/remux
 cp config.sample.toml ~/.config/remux/config.toml
 ```
 
-Edits are picked up automatically by the file watcher — no restart needed.
+Client-side edits — keybindings, theme, remotes, sidebars — are picked up automatically by the file watcher. Settings the **server** reads, `[agents]` in particular, need `remux restart`.
 
 ## Keybindings
 
@@ -192,6 +228,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `x` | Open the **Session** group |
 | `s` | Open the **Search** group |
 | `w` | Open the **View** group |
+| `b` | Open the **Sidebar** group |
 | `v` | Enter Visual mode |
 | `g` | Toggle border style (Zellij ⇄ Tmux) *(→ Normal)* |
 | `Space` | Cycle layout (BSP → Master → Monocle → Grid) *(→ Normal)* |
@@ -269,11 +306,22 @@ Views are virtual tabs whose cells alias existing panes (see [Views](#views-cros
 | `q` | Leave the view (it stays available to every terminal) |
 | `d` | Delete the view (for everyone) |
 
+#### Sidebar (`b`)
+
+| Key | Action |
+|-----|--------|
+| `h` | Toggle the **left** sidebar |
+| `l` | Toggle the **right** sidebar |
+| `j` | Toggle the **bottom** sidebar |
+| `b` | Cycle focus through every visible panel, then back to the panes |
+
+There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h/j/k/l` already move into and out of one exactly as they move between panes. The `SidebarFocusLeft` / `SidebarFocusRight` / `SidebarFocusBottom` commands exist and can be bound if you want them.
+
 ### Alt shortcuts (default, instant in Normal mode)
 
 | Shortcut | Action |
 |----------|--------|
-| `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right |
+| `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` | Focus pane left / down / up / right — and into or out of a sidebar on that edge |
 | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` | Move (swap) pane left / down / up / right |
 | `Alt-,` / `Alt-.` | Previous / next tab |
 | `Alt-1` … `Alt-9` | Jump to tab 1–9 |
@@ -389,6 +437,13 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `ViewLayoutNext` | — | Cycle the current view's layout. |
 | `ViewClose` | — | Leave the current view; it stays available to every terminal. |
 | `ViewDelete` | — | Delete the current view for everyone. |
+| `SidebarToggleLeft` | — | Show/hide the left sidebar. |
+| `SidebarToggleRight` | — | Show/hide the right sidebar. |
+| `SidebarToggleBottom` | — | Show/hide the bottom sidebar. |
+| `SidebarCycle` | — | Cycle keyboard focus through every visible panel, then back to the panes. |
+| `SidebarFocusLeft` | — | Focus the left sidebar, opening it if hidden (unbound by default). |
+| `SidebarFocusRight` | — | Focus the right sidebar, opening it if hidden (unbound by default). |
+| `SidebarFocusBottom` | — | Focus the bottom sidebar, opening it if hidden (unbound by default). |
 | `EnterNormal` | — | Return to Normal mode (keys pass to the app). |
 | `EnterCommandMode` | — | Enter Command mode (navigate the leader tree). |
 | `EnterVisualMode` | — | Enter Visual/copy mode. |
@@ -444,7 +499,7 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `mouse_auto_yank` — auto-copy mouse selections on release (default `true`).
   - `allow_app_clipboard` — let applications in a pane copy to your system clipboard with OSC 52 (default `true`). Read by the server owning the pane, so a remote session obeys the remote machine's setting. Clipboard *reads* are never served either way.
 - **`[appearance]`**
-  - `status_bar_position` — `"top"` or `"bottom"`.
+  - `status_bar_position` — `"bottom"`. **`"top"` currently has no effect**: the server always composites the status bar onto the last row. Documented rather than removed because the option is still read; treat `"bottom"` as the only working value.
   - `border_style` — `"zellij_style"` or `"tmux_style"`.
   - `default_layout` — `"bsp"`, `"master"`, `"monocle"`, or `"custom"`.
   - `which_key_position` — `"anchored"`, `"centered"`, or `"full_width"`.
@@ -452,6 +507,35 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `[appearance.theme]` — per-role colors (named / hex / `{ ansi = N }` / `{ rgb = [r,g,b] }`); defaults are Catppuccin Mocha.
 - **`[modes.command]`**
   - `timeout_ms` — delay before the which-key popup appears (default 500).
+- **`[[sidebar]]` / `[[sidebar.panel]]`** — dock panels to an edge. One sidebar per edge; `edge` and `size` are required, `visible` defaults to true. Each panel names a `plugin` (`sessions`, `files`, `agents`, `placeholder`) and optionally a `weight` (its share of the sidebar) and, for `files`, an `editor`. Nothing is docked by default:
+
+```toml
+[[sidebar]]
+edge = "left"
+size = 30
+
+  [[sidebar.panel]]
+  plugin = "sessions"
+
+  [[sidebar.panel]]
+  plugin = "files"          # zero-config; `editor = "hx"` would override $EDITOR
+```
+
+  An unknown plugin name is skipped with a warning rather than rejected, so a config written for a newer Remux still loads.
+
+#### Migrating from `browser` / the old `files`
+
+  There used to be two file panels: `browser` (built in) and `files` (which ran `yazi`/`nnn`/`ranger` inside the panel). They have merged — the built-in one took the `files` name and the hosted-file-manager plugin is gone. Two lines in an older config point at the old world:
+
+  | Old | Now |
+  |---|---|
+  | `plugin = "browser"` | still loads, with a warning — rename it to `"files"` |
+  | `command = "…"` | **ignored**, with a warning — delete it (use `editor` if you meant an editor override) |
+
+  `command` is ignored rather than renamed because it meant opposite things to the two panels: the *file manager to run* to old-`files`, the *editor to open a file with* to `browser`. That is precisely how a `command = "nnn"` copied between them ended up opening every file in `nnn`. Ignored, `Enter` falls back to the server's `$EDITOR` — which is what you wanted in either case. To keep a file manager, run it in an ordinary pane and point its opener hook at [`remux split`](#talking-to-remux-from-inside-a-pane).
+- **`[agents]` / `[[agents.pattern]]`** — what the `agents` panel counts as an agent and how it decides one is blocked on you. `commands` lists the programs (default `claude`, `codex`, `aider`, `gemini`); each `[[agents.pattern]]` is a regex matched against the bottom of the pane's screen, and a match means *needs input*. Defaults ship for `claude` and `codex`, so this is optional. Two things worth knowing:
+  - **The `codex` patterns are an unverified guess.** The `claude` ones are taken from wordings actually present in the Claude Code binary; Codex was not installed to check against. If you run Codex and the panel never turns red, this is the section to correct.
+  - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings, theme, and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.
 - **`[remotes.<name>]`** — declare SSH-reachable remote servers:
 
 ```toml

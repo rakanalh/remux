@@ -57,12 +57,36 @@ pub fn get_pane_cwd(pid: nix::unistd::Pid) -> Option<String> {
 
 /// See the Linux variant for documentation. macOS reads the cwd through
 /// `sysinfo` because there is no `/proc` filesystem.
+///
+/// The `System` is built ONCE and reused. On macOS `System::new()` is not the
+/// empty struct its name suggests: it calls `mach_host_self()`, reads the host
+/// clock info, enumerates CPUs and allocates a 200-slot process map, all before
+/// the refresh that actually does the work. This function is called from the
+/// session-tree push -- once per session, under the `state`, `clients` AND
+/// `panes` guards, at up to 10 Hz while a sidebar is subscribed -- so paying all
+/// of that per call put real setup work inside the daemon's hottest lock scope.
+/// On Linux the same function is one `readlink` and needs nothing.
+///
+/// The cost of reusing it is a retained `Process` entry per pid ever queried.
+/// That is bounded by the panes this server has focused, entries are dropped as
+/// soon as a refresh finds their process dead, and each is far cheaper than the
+/// per-call construction it replaces.
+///
+/// A poisoned lock is recovered from rather than propagated: a panicking caller
+/// leaves the `System` merely stale, and refusing to read a cwd for the rest of
+/// the process's life would be the worse failure.
 #[cfg(target_os = "macos")]
 pub fn get_pane_cwd(pid: nix::unistd::Pid) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
     let spid = Pid::from_u32(pid.as_raw() as u32);
-    let mut system = System::new();
+    let mut system = SYSTEM
+        .get_or_init(|| Mutex::new(System::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[spid]),
         true,

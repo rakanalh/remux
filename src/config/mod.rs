@@ -1,4 +1,6 @@
+pub mod agents;
 pub mod keybindings;
+pub mod sidebar;
 pub mod theme;
 pub mod watcher;
 
@@ -19,6 +21,14 @@ pub struct Config {
     /// Named remote servers reachable over SSH, keyed by a short label used in
     /// the session manager tree. Configured via `[remotes.<name>]` tables.
     pub remotes: std::collections::HashMap<String, RemoteConfig>,
+    /// Sidebar definitions, in declaration order. Empty means no chrome.
+    #[serde(default)]
+    pub sidebar: Vec<sidebar::SidebarConfig>,
+    /// Which commands the agents panel counts as an agent, and what a blocked
+    /// one looks like. Read by the SERVER (it owns the PTYs and the screens);
+    /// the client only paints what it is told.
+    #[serde(default)]
+    pub agents: agents::AgentsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +303,8 @@ impl Default for Config {
             modes: ModesConfig::default(),
             keybindings: KeybindingsConfig::default(),
             remotes: std::collections::HashMap::new(),
+            sidebar: Vec::new(),
+            agents: agents::AgentsConfig::default(),
         }
     }
 }

@@ -4,88 +4,21 @@
 //! panes. The user can navigate, expand/collapse nodes, switch sessions/tabs,
 //! create/delete folders and sessions, and move sessions between folders.
 
-use std::collections::{HashMap, HashSet};
-
 use unicode_width::UnicodeWidthStr;
 
 use crate::client::registry::{ConnId, RemoteState};
+use crate::client::tree_model::TreeModel;
 use crate::client::whichkey::DrawCommand;
 use crate::config::keybindings::{SessionManagerBinding, SessionManagerBindings};
 use crate::config::theme::Theme;
 use crate::protocol::{FolderTreeEntry, SessionTreeEntry};
+use crate::server::compositor::{
+    box_bottom_line, box_rule_line, box_top_line_titled, BOX_TEE_LEFT, BOX_TEE_RIGHT, BOX_VERTICAL,
+};
 
-// ---------------------------------------------------------------------------
-// NodeType / TreeRow
-// ---------------------------------------------------------------------------
-
-/// The type of a node in the flattened tree view.
-///
-/// The tree is now two-level at the top: a `Server` node per connection, whose
-/// folders/sessions/tabs/panes nest beneath it. Every non-server node carries
-/// the `ConnId` of the server it belongs to so actions can be routed and
-/// remote-only guards applied.
-#[derive(Debug, Clone, PartialEq)]
-pub enum NodeType {
-    Server {
-        id: ConnId,
-        state: RemoteState,
-    },
-    Folder {
-        server: ConnId,
-        name: String,
-    },
-    Session {
-        server: ConnId,
-        name: String,
-    },
-    Tab {
-        server: ConnId,
-        session: String,
-        tab_index: usize,
-    },
-    Pane {
-        server: ConnId,
-        session: String,
-        tab_index: usize,
-        pane_id: u64,
-    },
-    /// Header row for the "Saved (resurrect)" group of dormant sessions. Local
-    /// server only for now.
-    SavedGroup {
-        server: ConnId,
-    },
-    /// A dormant (saved-but-not-live) session that can be resurrected. Pressing
-    /// Enter on it materializes the session on the server.
-    DormantSession {
-        server: ConnId,
-        name: String,
-    },
-}
-
-impl NodeType {
-    /// The connection this node belongs to.
-    pub fn server(&self) -> ConnId {
-        match self {
-            NodeType::Server { id, .. } => id.clone(),
-            NodeType::Folder { server, .. }
-            | NodeType::Session { server, .. }
-            | NodeType::Tab { server, .. }
-            | NodeType::Pane { server, .. }
-            | NodeType::SavedGroup { server }
-            | NodeType::DormantSession { server, .. } => server.clone(),
-        }
-    }
-}
-
-/// A single row in the flattened session manager tree.
-#[derive(Debug, Clone)]
-pub struct TreeRow {
-    pub indent: usize,
-    pub node_type: NodeType,
-    pub display_name: String,
-    pub is_expanded: bool,
-    pub is_current: bool,
-}
+/// The tree node type lives in [`crate::client::tree_model`] now; re-exported
+/// here so the overlay's long-standing import path keeps working.
+pub use crate::client::tree_model::NodeType;
 
 // ---------------------------------------------------------------------------
 // SubMode / CreatePhase
@@ -107,8 +40,19 @@ pub enum RenameKind {
 pub enum SubMode {
     /// Normal navigation.
     Navigate,
-    /// Waiting for delete confirmation. String describes the item.
-    ConfirmDelete(String),
+    /// Waiting for delete confirmation.
+    ///
+    /// Carries the TARGET NODE, not just its description. The tree rebuilds on
+    /// every server push, so between `d` and `y` the row under the selection
+    /// index can become a different node -- and when the selected key is gone
+    /// `rebuild_rows` deliberately leaves the index where it was, so the
+    /// selection silently slides onto a neighbour. Re-reading the selection at
+    /// confirm time would then delete something the prompt never named.
+    ConfirmDelete {
+        target: NodeType,
+        /// What the prompt says, captured with the target so the two agree.
+        description: String,
+    },
     /// Creating a new folder -- text buffer for the name.
     CreateFolder(String),
     /// Creating a new session.
@@ -249,13 +193,10 @@ pub enum SessionManagerAction {
 /// State for the session manager overlay.
 #[derive(Debug, Clone)]
 pub struct SessionManagerState {
-    /// Flattened tree rows currently displayed.
-    pub rows: Vec<TreeRow>,
-    /// Index of the selected row.
-    pub selected: usize,
-    /// Set of expanded node keys (namespaced by server, e.g.
-    /// "server:local", "folder:local:work", "session:remote:pi:proj").
-    pub expanded: HashSet<String>,
+    /// The tree itself: rows, expansion state, selection, the search query,
+    /// the roster and the per-server data behind them. Shared with the
+    /// sidebar's session-tree panel (see [`crate::client::tree_model`]).
+    pub model: TreeModel,
     /// Current sub-mode.
     pub sub_mode: SubMode,
     /// The server a structural sub-mode (create/delete/move) targets. Set from
@@ -264,40 +205,16 @@ pub struct SessionManagerState {
     sub_mode_server: ConnId,
     /// The name of the session the client is currently attached to.
     pub current_session: Option<String>,
-    /// The foreground connection — a session row is "current" only when it is
-    /// the attached session of the foreground server.
-    foreground: ConnId,
-    /// Ordered roster of servers: `(id, label, state)`.
-    /// Ordered server roster: `(id, label, state, version_mismatch)`. The last
-    /// element is `Some(server_version)` when the server is outdated relative to
-    /// this client (drives the "outdated" suffix), else `None`.
-    roster: Vec<(ConnId, String, RemoteState, Option<String>)>,
-    /// Per-server raw tree data: `(folders, unfiled)`.
-    trees: HashMap<ConnId, (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>)>,
-    /// Names of the Local server's dormant (saved-but-not-live) sessions,
-    /// rendered as a "Saved (resurrect)" group. Dormant sessions are a
-    /// Local-server concept for now.
-    dormant: Vec<String>,
     /// Configured chord bindings for the overlay (defaults unless injected from
     /// config via `set_bindings`).
     bindings: SessionManagerBindings,
     /// The first char of an in-progress 2-char chord, awaiting completion.
     pending_chord: Option<char>,
     /// Panes marked (via Space) for a multi-select "add to view" action, keyed
-    /// by `(server, pane_id)` so a mark survives `rebuild_rows` (row indices are
+    /// by `(server, pane_id)` so a mark survives a rebuild (row indices are
     /// not stable across tree refreshes). Insertion order is preserved so the
     /// resulting view cell order is deterministic; inserts dedupe.
     marked: Vec<(ConnId, u64)>,
-    /// The search bar's text. Filters the tree to matching nodes plus their
-    /// ancestor chain (see [`SessionManagerState::compute_filter`]). Empty means
-    /// "no filtering" -- the tree renders exactly as it did before the search
-    /// bar existed.
-    ///
-    /// Deliberately a plain field rather than a [`SubMode`] variant: `sub_mode`
-    /// holds a single value, and the query must survive while a
-    /// delete/create/move/rename sub-mode is active (otherwise deleting a
-    /// filtered session would wipe the query out from under the user).
-    pub query: String,
     /// Whether keystrokes are typed into the search bar rather than routed to
     /// the tree.
     ///
@@ -305,41 +222,6 @@ pub struct SessionManagerState {
     /// The sub-modes are only ever entered by a binding or a hardcoded key, and
     /// neither can fire while focus is on the search bar.
     pub search_focused: bool,
-    /// Direct hits from the most recent [`SessionManagerState::rebuild_rows`]
-    /// (see [`Filter::hits`]); empty when no query is active. Refreshed on every
-    /// rebuild and read only by [`SessionManagerState::on_query_changed`] to
-    /// place the selection -- it is derived state, never user-visible, and must
-    /// not leak into `expanded`.
-    filter_hits: HashSet<String>,
-}
-
-/// A per-rebuild view of what the current query allows to render.
-///
-/// Computed fresh on every [`SessionManagerState::rebuild_rows`] and thrown
-/// away afterwards. `force_expand` deliberately does NOT touch
-/// `SessionManagerState::expanded`: auto-expanding a match path must not
-/// permanently rewrite the user's expansion state, or clearing the query would
-/// leave the tree splayed open.
-#[derive(Debug, Default)]
-struct Filter {
-    /// Keys of the nodes the query permits to render.
-    visible: HashSet<String>,
-    /// Keys of the nodes that must be treated as expanded so matches nested
-    /// beneath them are reachable. Only ever the *ancestors* of a match -- a
-    /// matching node's own subtree stays governed by `expanded`.
-    force_expand: HashSet<String>,
-    /// Keys of the nodes whose OWN name matched the query -- the *direct hits*,
-    /// as opposed to the rows that only render because an ancestor or a
-    /// descendant matched. This is what the selection must land on: the first
-    /// visible row is typically an ancestor (a server, then a folder), and
-    /// activating an ancestor is not what the user typed.
-    hits: HashSet<String>,
-}
-
-/// Whether `filter` permits the node with `key` to render. No filter (an empty
-/// query) permits everything.
-fn filter_allows(filter: Option<&Filter>, key: &str) -> bool {
-    filter.is_none_or(|f| f.visible.contains(key))
 }
 
 /// Pad or truncate a string to exactly `target_width` display columns,
@@ -410,6 +292,10 @@ fn chord_group_rank(chord: &str) -> u8 {
 
 /// Separator between footer cells (matches the box-drawing style used across
 /// the popups).
+/// Separates footer ITEMS -- text punctuation, not a box edge, which is why it
+/// keeps its own literal rather than going through `BOX_VERTICAL`. Same
+/// reasoning that excludes the status-bar separators in the compositor and the
+/// View: those are `separator_fg` furniture, not border chrome.
 const FOOTER_SEP: &str = " \u{2502} ";
 
 /// Pack `(key, label)` cells into up to `max_lines` footer lines that each fit
@@ -448,133 +334,92 @@ fn pack_footer_lines(
     lines
 }
 
-/// Expansion key for a server node.
-fn server_key(id: &ConnId) -> String {
-    format!("server:{}", id.key())
-}
-
-/// Expansion key for a folder node (namespaced by server).
-fn folder_key(server: &ConnId, name: &str) -> String {
-    format!("folder:{}:{}", server.key(), name)
-}
-
-/// Expansion key for a session node (namespaced by server).
-fn session_key(server: &ConnId, name: &str) -> String {
-    format!("session:{}:{}", server.key(), name)
-}
-
-/// Expansion key for a tab node (namespaced by server).
-fn tab_key(server: &ConnId, session: &str, tab_index: usize) -> String {
-    format!("tab:{}:{}:{}", server.key(), session, tab_index)
-}
-
-/// Expansion key for the "Saved (resurrect)" group node (namespaced by server).
-fn saved_key(server: &ConnId) -> String {
-    format!("saved:{}", server.key())
-}
-
-/// Filter key for a pane node. Panes never expand, so this key only ever
-/// appears in [`Filter::visible`].
-fn pane_key(server: &ConnId, session: &str, pane_id: u64) -> String {
-    format!("pane:{}:{}:{}", server.key(), session, pane_id)
-}
-
-/// Filter key for a dormant (saved) session row. Dormant sessions never expand,
-/// so this key only ever appears in [`Filter::visible`].
-fn dormant_key(server: &ConnId, name: &str) -> String {
-    format!("dormant:{}:{}", server.key(), name)
-}
-
 impl SessionManagerState {
     /// Create a new session manager state (initially just a local server node,
     /// expanded so local sessions show immediately as before).
     pub fn new(current_session: Option<String>) -> Self {
-        let mut expanded = HashSet::new();
-        expanded.insert(server_key(&ConnId::Local));
-        // Expand the Saved group by default so dormant sessions are discoverable.
-        expanded.insert(saved_key(&ConnId::Local));
         Self {
-            rows: Vec::new(),
-            selected: 0,
-            expanded,
+            model: TreeModel::new(),
             sub_mode: SubMode::Navigate,
             sub_mode_server: ConnId::Local,
             current_session,
-            foreground: ConnId::Local,
-            roster: vec![(
-                ConnId::Local,
-                "local".to_string(),
-                RemoteState::Connected,
-                None,
-            )],
-            trees: HashMap::new(),
-            dormant: Vec::new(),
             bindings: SessionManagerBindings::default(),
             pending_chord: None,
             marked: Vec::new(),
-            query: String::new(),
             // The overlay opens with the search bar focused so the user can
             // just start typing; Tab/Down/Enter hands focus to the tree.
             search_focused: true,
-            filter_hits: HashSet::new(),
         }
     }
 
     // -----------------------------------------------------------------------
-    // Search
+    // Tree model delegation
+    //
+    // The tree lives in `TreeModel`; these keep the overlay's own API (and its
+    // callers in `input.rs` / `main.rs`) exactly as it was.
     // -----------------------------------------------------------------------
 
     /// Append a char to the search query and refilter.
     pub fn push_query_char(&mut self, c: char) {
-        self.query.push(c);
-        self.on_query_changed();
+        self.model.push_query_char(c);
     }
 
     /// Remove the last char of the search query and refilter.
     pub fn pop_query_char(&mut self) {
-        self.query.pop();
-        self.on_query_changed();
+        self.model.pop_query_char();
     }
 
     /// Clear the search query and refilter (Ctrl-U).
     pub fn clear_query(&mut self) {
-        if self.query.is_empty() {
-            return;
-        }
-        self.query.clear();
-        self.on_query_changed();
+        self.model.clear_query();
     }
 
-    /// Re-filter after the query changed. The previous selection index is
-    /// meaningless against a new result set, so it is re-placed against the
-    /// rows the filter just produced.
-    ///
-    /// The filtered tree shows a match's whole ancestor chain, so the topmost
-    /// rows are ancestors: always a `Server` row (servers render regardless of
-    /// the query), then usually the enclosing folder. Activating an ancestor
-    /// only toggles its expansion -- not what the user typed. The selection
-    /// therefore lands on the first *direct hit* (a row whose own name matched,
-    /// per [`Filter::hits`]).
-    ///
-    /// Two fallbacks, for rows that are visible without being hits: the first
-    /// non-server row, then the top. An empty query means no filtering at all,
-    /// so it keeps the plain "back to the top" behaviour.
-    fn on_query_changed(&mut self) {
-        self.rebuild_rows();
-        let next = if self.query.is_empty() {
-            0
-        } else {
-            self.rows
-                .iter()
-                .position(|r| self.filter_hits.contains(&self.row_key(r)))
-                .or_else(|| {
-                    self.rows
-                        .iter()
-                        .position(|r| !matches!(r.node_type, NodeType::Server { .. }))
-                })
-                .unwrap_or(0)
-        };
-        self.selected = next;
+    /// Set the foreground connection (drives which server's sessions render as
+    /// "current"). Does not rebuild rows on its own; callers pair this with
+    /// `set_roster`/`update_tree`.
+    pub fn set_foreground(&mut self, foreground: ConnId) {
+        self.model.set_foreground(foreground);
+    }
+
+    /// Replace the server roster (order + labels + states) and rebuild rows.
+    pub fn set_roster(&mut self, roster: Vec<(ConnId, String, RemoteState, Option<String>)>) {
+        self.model.set_roster(roster);
+    }
+
+    /// Update a single server's slice of the tree and rebuild rows.
+    pub fn update_tree(
+        &mut self,
+        server: ConnId,
+        folders: Vec<FolderTreeEntry>,
+        unfiled: Vec<SessionTreeEntry>,
+        dormant: Vec<String>,
+    ) {
+        self.model.update_tree(server, folders, unfiled, dormant);
+    }
+
+    /// Move selection down, wrapping to the top.
+    pub fn select_next(&mut self) {
+        self.model.select_next();
+    }
+
+    /// Move selection up, wrapping to the bottom.
+    pub fn select_prev(&mut self) {
+        self.model.select_prev();
+    }
+
+    /// Toggle the expand/collapse state of the selected node.
+    pub fn toggle_expand(&mut self) {
+        self.model.toggle_expand();
+    }
+
+    /// Expand the selected node.
+    pub fn expand_selected(&mut self) {
+        self.model.expand_selected();
+    }
+
+    /// Collapse the selected node.
+    pub fn collapse_selected(&mut self) {
+        self.model.collapse_selected();
     }
 
     /// Move focus to the search bar. Any half-typed chord prefix is dropped so
@@ -593,7 +438,12 @@ impl SessionManagerState {
     /// `(server, pane_id)` so they survive tree rebuilds. Returns true when a
     /// pane row was toggled (marked or unmarked), false for non-pane rows.
     pub fn toggle_mark(&mut self) -> bool {
-        let key = match self.rows.get(self.selected).map(|r| &r.node_type) {
+        let key = match self
+            .model
+            .rows
+            .get(self.model.selected)
+            .map(|r| &r.node_type)
+        {
             Some(NodeType::Pane {
                 server, pane_id, ..
             }) => (server.clone(), *pane_id),
@@ -619,7 +469,12 @@ impl SessionManagerState {
         if !self.marked.is_empty() {
             return std::mem::take(&mut self.marked);
         }
-        match self.rows.get(self.selected).map(|r| &r.node_type) {
+        match self
+            .model
+            .rows
+            .get(self.model.selected)
+            .map(|r| &r.node_type)
+        {
             Some(NodeType::Pane {
                 server, pane_id, ..
             }) => vec![(server.clone(), *pane_id)],
@@ -633,511 +488,9 @@ impl SessionManagerState {
         self.bindings = bindings;
     }
 
-    /// Set the foreground connection (drives which server's sessions render as
-    /// "current"). Does not rebuild rows on its own; callers pair this with
-    /// `set_roster`/`update_tree`.
-    pub fn set_foreground(&mut self, foreground: ConnId) {
-        self.foreground = foreground;
-    }
-
-    /// Replace the server roster (order + labels + states) and rebuild rows.
-    pub fn set_roster(&mut self, roster: Vec<(ConnId, String, RemoteState, Option<String>)>) {
-        // Ensure Local is always expanded by default the first time we see it.
-        for (id, _, _, _) in &roster {
-            if matches!(id, ConnId::Local) {
-                self.expanded.insert(server_key(id));
-            }
-            self.trees.entry(id.clone()).or_default();
-        }
-        self.roster = roster;
-        self.rebuild_rows();
-    }
-
-    /// Update a single server's slice of the tree and rebuild rows.
-    pub fn update_tree(
-        &mut self,
-        server: ConnId,
-        folders: Vec<FolderTreeEntry>,
-        unfiled: Vec<SessionTreeEntry>,
-        dormant: Vec<String>,
-    ) {
-        log::debug!(
-            "session_manager: update_tree server={:?} folders={} unfiled={} dormant={}",
-            server,
-            folders.len(),
-            unfiled.len(),
-            dormant.len()
-        );
-        // Dormant sessions are a Local-server concept for now.
-        if server == ConnId::Local {
-            self.dormant = dormant;
-        }
-        // Determine whether this is the first data we've seen for this server.
-        let is_first_load = self
-            .trees
-            .get(&server)
-            .map(|(f, u)| f.is_empty() && u.is_empty())
-            .unwrap_or(true);
-
-        // Collect previously known keys so we auto-expand only new entries.
-        let mut known_keys: HashSet<String> = HashSet::new();
-        if let Some((pf, pu)) = self.trees.get(&server) {
-            for f in pf {
-                known_keys.insert(folder_key(&server, &f.name));
-                for s in &f.sessions {
-                    known_keys.insert(session_key(&server, &s.name));
-                }
-            }
-            for s in pu {
-                known_keys.insert(session_key(&server, &s.name));
-            }
-        }
-
-        for f in &folders {
-            let key = folder_key(&server, &f.name);
-            if is_first_load || !known_keys.contains(&key) {
-                self.expanded.insert(key);
-            }
-            for s in &f.sessions {
-                let key = session_key(&server, &s.name);
-                if is_first_load || !known_keys.contains(&key) {
-                    self.expanded.insert(key);
-                }
-            }
-        }
-        for s in &unfiled {
-            let key = session_key(&server, &s.name);
-            if is_first_load || !known_keys.contains(&key) {
-                self.expanded.insert(key);
-            }
-        }
-
-        self.trees.insert(server, (folders, unfiled));
-        self.rebuild_rows();
-    }
-
-    /// Compute the visibility / auto-expansion sets implied by the current
-    /// query, or `None` when the query is empty (no filtering at all).
-    ///
-    /// A node is visible when it matches, when any descendant matches, or when
-    /// any ancestor matches -- so a hit on a tab name drags its session and
-    /// folder into view, and a hit on a session name keeps that session's tabs
-    /// and panes browsable. Matching is a case-insensitive substring test
-    /// against the *entity* name, not the decorated `display_name` (which
-    /// carries client-count suffixes, the dormant `💤` prefix and the focused
-    /// pane's `*`).
-    ///
-    /// Server rows are always visible: the roster is tiny, and hiding an
-    /// offline remote would remove the only affordance to connect it.
-    fn compute_filter(&self) -> Option<Filter> {
-        if self.query.is_empty() {
-            return None;
-        }
-        let needle = self.query.to_lowercase();
-        let hit = |name: &str| name.to_lowercase().contains(&needle);
-
-        let mut f = Filter::default();
-        for (id, _, _, _) in &self.roster {
-            let skey = server_key(id);
-            f.visible.insert(skey.clone());
-
-            if let Some((folders, unfiled)) = self.trees.get(id) {
-                // Unfiled sessions hang directly off the server node.
-                for session in unfiled {
-                    if self.filter_session(&mut f, id, session, false, &hit) {
-                        f.force_expand.insert(skey.clone());
-                    }
-                }
-                for folder in folders {
-                    let fkey = folder_key(id, &folder.name);
-                    let folder_hit = hit(&folder.name);
-                    let mut child_hit = false;
-                    for session in &folder.sessions {
-                        if self.filter_session(&mut f, id, session, folder_hit, &hit) {
-                            child_hit = true;
-                        }
-                    }
-                    if folder_hit {
-                        f.hits.insert(fkey.clone());
-                    }
-                    if folder_hit || child_hit {
-                        f.visible.insert(fkey.clone());
-                        f.force_expand.insert(skey.clone());
-                    }
-                    if child_hit {
-                        f.force_expand.insert(fkey);
-                    }
-                }
-            }
-
-            // The "Saved (resurrect)" group is Local-only; it shows when any
-            // dormant session name matches.
-            if *id == ConnId::Local {
-                let mut any_dormant = false;
-                for name in &self.dormant {
-                    if hit(name) {
-                        let dkey = dormant_key(id, name);
-                        f.visible.insert(dkey.clone());
-                        f.hits.insert(dkey);
-                        any_dormant = true;
-                    }
-                }
-                if any_dormant {
-                    f.visible.insert(saved_key(id));
-                    f.force_expand.insert(saved_key(id));
-                    f.force_expand.insert(skey);
-                }
-            }
-        }
-        Some(f)
-    }
-
-    /// Filter one session subtree into `f`. `ancestor_hit` is true when an
-    /// enclosing folder already matched (which makes the whole subtree visible).
-    /// Returns whether this session or anything beneath it matched -- the caller
-    /// uses that to decide whether to force-expand the session's parent.
-    fn filter_session(
-        &self,
-        f: &mut Filter,
-        server: &ConnId,
-        session: &SessionTreeEntry,
-        ancestor_hit: bool,
-        hit: &impl Fn(&str) -> bool,
-    ) -> bool {
-        let skey = session_key(server, &session.name);
-        let session_hit = hit(&session.name);
-        let mut child_hit = false;
-
-        for (tab_idx, tab) in session.tabs.iter().enumerate() {
-            let tkey = tab_key(server, &session.name, tab_idx);
-            let tab_hit = hit(&tab.name);
-            let mut pane_hit = false;
-            for pane in &tab.panes {
-                let this_pane_hit = hit(&pane.name);
-                pane_hit |= this_pane_hit;
-                // A pane renders when it matches or when anything above it did.
-                if this_pane_hit || tab_hit || session_hit || ancestor_hit {
-                    let pkey = pane_key(server, &session.name, pane.id);
-                    if this_pane_hit {
-                        f.hits.insert(pkey.clone());
-                    }
-                    f.visible.insert(pkey);
-                }
-            }
-            if tab_hit {
-                f.hits.insert(tkey.clone());
-            }
-            if tab_hit || pane_hit || session_hit || ancestor_hit {
-                f.visible.insert(tkey.clone());
-            }
-            if pane_hit {
-                // Only a match *below* the tab forces it open; a tab that
-                // merely matched keeps its own panes under `expanded`.
-                f.force_expand.insert(tkey);
-                child_hit = true;
-            }
-            if tab_hit {
-                child_hit = true;
-            }
-        }
-
-        if session_hit {
-            f.hits.insert(skey.clone());
-        }
-        if session_hit || child_hit || ancestor_hit {
-            f.visible.insert(skey.clone());
-        }
-        if child_hit {
-            f.force_expand.insert(skey);
-        }
-        session_hit || child_hit
-    }
-
-    /// Whether `key` renders as expanded: either the user expanded it, or the
-    /// active filter is holding it open so a match beneath it is reachable.
-    fn is_expanded(&self, key: &str, filter: Option<&Filter>) -> bool {
-        self.expanded.contains(key) || filter.is_some_and(|f| f.force_expand.contains(key))
-    }
-
-    /// Rebuild the flat row list from the roster + per-server tree data.
-    fn rebuild_rows(&mut self) {
-        let mut rows = Vec::new();
-        let filter = self.compute_filter();
-        let filter = filter.as_ref();
-
-        for (id, label, state, mismatch) in &self.roster {
-            let skey = server_key(id);
-            let server_expanded = self.is_expanded(&skey, filter);
-            let connected = matches!(state, RemoteState::Connected);
-            let mut suffix = match state {
-                RemoteState::Connected => String::new(),
-                RemoteState::NotConnected => " (offline)".to_string(),
-                RemoteState::Connecting => " (connecting…)".to_string(),
-                RemoteState::Failed(msg) => format!(" (failed: {msg})"),
-            };
-            // A connected-but-outdated server (e.g. the local daemon still
-            // running an older binary after a rebuild) is flagged so the user
-            // knows to restart it rather than silently hitting version skew.
-            if mismatch.is_some() {
-                suffix.push_str(" (outdated: restart remux server)");
-            }
-            rows.push(TreeRow {
-                indent: 0,
-                node_type: NodeType::Server {
-                    id: id.clone(),
-                    state: state.clone(),
-                },
-                display_name: format!("{label}{suffix}"),
-                is_expanded: server_expanded,
-                is_current: false,
-            });
-
-            if server_expanded && connected {
-                if let Some((folders, unfiled)) = self.trees.get(id) {
-                    for folder in folders {
-                        let fkey = folder_key(id, &folder.name);
-                        if !filter_allows(filter, &fkey) {
-                            continue;
-                        }
-                        let folder_expanded = self.is_expanded(&fkey, filter);
-                        rows.push(TreeRow {
-                            indent: 1,
-                            node_type: NodeType::Folder {
-                                server: id.clone(),
-                                name: folder.name.clone(),
-                            },
-                            display_name: folder.name.clone(),
-                            is_expanded: folder_expanded,
-                            is_current: false,
-                        });
-
-                        if folder_expanded {
-                            for session in &folder.sessions {
-                                self.add_session_rows(&mut rows, id, session, 2, filter);
-                            }
-                        }
-                    }
-
-                    for session in unfiled {
-                        self.add_session_rows(&mut rows, id, session, 1, filter);
-                    }
-                }
-
-                // Render the "Saved (resurrect)" group at the bottom of the
-                // Local server's children. Dormant sessions are Local-only.
-                let gkey = saved_key(id);
-                if *id == ConnId::Local && !self.dormant.is_empty() && filter_allows(filter, &gkey)
-                {
-                    let group_expanded = self.is_expanded(&gkey, filter);
-                    rows.push(TreeRow {
-                        indent: 1,
-                        node_type: NodeType::SavedGroup { server: id.clone() },
-                        display_name: "Saved (resurrect)".to_string(),
-                        is_expanded: group_expanded,
-                        is_current: false,
-                    });
-                    if group_expanded {
-                        for name in &self.dormant {
-                            if !filter_allows(filter, &dormant_key(id, name)) {
-                                continue;
-                            }
-                            rows.push(TreeRow {
-                                indent: 2,
-                                node_type: NodeType::DormantSession {
-                                    server: id.clone(),
-                                    name: name.clone(),
-                                },
-                                display_name: format!("\u{1F4A4} {}", name),
-                                is_expanded: false,
-                                is_current: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        self.rows = rows;
-        // Unconditionally refreshed: `rebuild_rows` also runs for expand /
-        // collapse / tree updates, and leaving a previous query's hits behind
-        // would let a stale set outlive the query that produced it.
-        self.filter_hits = filter.map(|f| f.hits.clone()).unwrap_or_default();
-        // Clamp selection.
-        if !self.rows.is_empty() && self.selected >= self.rows.len() {
-            self.selected = self.rows.len() - 1;
-        }
-    }
-
-    fn add_session_rows(
-        &self,
-        rows: &mut Vec<TreeRow>,
-        server: &ConnId,
-        session: &SessionTreeEntry,
-        indent: usize,
-        filter: Option<&Filter>,
-    ) {
-        let skey = session_key(server, &session.name);
-        if !filter_allows(filter, &skey) {
-            return;
-        }
-        let session_expanded = self.is_expanded(&skey, filter);
-        let client_suffix = if session.client_count > 0 {
-            format!(" ({})", session.client_count)
-        } else {
-            String::new()
-        };
-        // "Current" only for the foreground server's attached session.
-        let is_current = server == &self.foreground && session.is_current;
-        rows.push(TreeRow {
-            indent,
-            node_type: NodeType::Session {
-                server: server.clone(),
-                name: session.name.clone(),
-            },
-            display_name: format!("{}{}", session.name, client_suffix),
-            is_expanded: session_expanded,
-            is_current,
-        });
-
-        if session_expanded {
-            for (tab_idx, tab) in session.tabs.iter().enumerate() {
-                let tkey = tab_key(server, &session.name, tab_idx);
-                if !filter_allows(filter, &tkey) {
-                    continue;
-                }
-                let tab_expanded = self.is_expanded(&tkey, filter);
-                rows.push(TreeRow {
-                    indent: indent + 1,
-                    node_type: NodeType::Tab {
-                        server: server.clone(),
-                        session: session.name.clone(),
-                        tab_index: tab_idx,
-                    },
-                    display_name: tab.name.clone(),
-                    is_expanded: tab_expanded,
-                    is_current: false,
-                });
-
-                if tab_expanded {
-                    for pane in &tab.panes {
-                        if !filter_allows(filter, &pane_key(server, &session.name, pane.id)) {
-                            continue;
-                        }
-                        let focus_marker = if pane.is_focused { "*" } else { "" };
-                        rows.push(TreeRow {
-                            indent: indent + 2,
-                            node_type: NodeType::Pane {
-                                server: server.clone(),
-                                session: session.name.clone(),
-                                tab_index: tab_idx,
-                                pane_id: pane.id,
-                            },
-                            display_name: format!("{}{}", pane.name, focus_marker),
-                            is_expanded: false,
-                            is_current: false,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Navigation
     // -----------------------------------------------------------------------
-
-    /// Move selection down, wrapping to the top.
-    pub fn select_next(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        self.selected = (self.selected + 1) % self.rows.len();
-        log::debug!("session_manager: select_next selected={}", self.selected);
-    }
-
-    /// Move selection up, wrapping to the bottom.
-    pub fn select_prev(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        if self.selected == 0 {
-            self.selected = self.rows.len() - 1;
-        } else {
-            self.selected -= 1;
-        }
-        log::debug!("session_manager: select_prev selected={}", self.selected);
-    }
-
-    /// Toggle the expand/collapse state of the selected node.
-    pub fn toggle_expand(&mut self) {
-        if let Some(row) = self.rows.get(self.selected) {
-            let key = self.node_key(&row.node_type);
-            if self.expanded.contains(&key) {
-                self.expanded.remove(&key);
-            } else {
-                self.expanded.insert(key);
-            }
-            self.rebuild_rows();
-        }
-    }
-
-    /// Expand the selected node.
-    pub fn expand_selected(&mut self) {
-        if let Some(row) = self.rows.get(self.selected) {
-            let key = self.node_key(&row.node_type);
-            if !self.expanded.contains(&key) {
-                self.expanded.insert(key);
-                self.rebuild_rows();
-            }
-        }
-    }
-
-    /// Collapse the selected node.
-    pub fn collapse_selected(&mut self) {
-        if let Some(row) = self.rows.get(self.selected) {
-            let key = self.node_key(&row.node_type);
-            if self.expanded.contains(&key) {
-                self.expanded.remove(&key);
-                self.rebuild_rows();
-            }
-        }
-    }
-
-    fn node_key(&self, node_type: &NodeType) -> String {
-        match node_type {
-            NodeType::Server { id, .. } => server_key(id),
-            NodeType::Folder { server, name } => folder_key(server, name),
-            NodeType::Session { server, name } => session_key(server, name),
-            NodeType::Tab {
-                server,
-                session,
-                tab_index,
-            } => tab_key(server, session, *tab_index),
-            NodeType::SavedGroup { server } => saved_key(server),
-            // Panes and dormant sessions don't expand.
-            NodeType::Pane { .. } | NodeType::DormantSession { .. } => String::new(),
-        }
-    }
-
-    /// The filter key of a row, for hit-testing against [`Filter::hits`].
-    ///
-    /// Distinct from [`SessionManagerState::node_key`], which deliberately
-    /// returns an empty string for panes and dormant sessions because they have
-    /// no expansion state. Search matching has no such exemption -- either can
-    /// be the thing the user typed -- so those two get their real filter keys
-    /// here and everything else defers to `node_key`.
-    fn row_key(&self, row: &TreeRow) -> String {
-        match &row.node_type {
-            NodeType::Pane {
-                server,
-                session,
-                pane_id,
-                ..
-            } => pane_key(server, session, *pane_id),
-            NodeType::DormantSession { server, name } => dormant_key(server, name),
-            other => self.node_key(other),
-        }
-    }
 
     // -----------------------------------------------------------------------
     // Actions
@@ -1145,7 +498,7 @@ impl SessionManagerState {
 
     /// Handle Enter key on the selected row.
     pub fn handle_enter(&mut self) -> SessionManagerAction {
-        let row = match self.rows.get(self.selected) {
+        let row = match self.model.rows.get(self.model.selected) {
             Some(r) => r.clone(),
             None => return SessionManagerAction::None,
         };
@@ -1165,8 +518,7 @@ impl SessionManagerState {
                     RemoteState::NotConnected | RemoteState::Failed(_) => {
                         // Force-expand so children appear once the tree arrives,
                         // and kick off the lazy connect.
-                        self.expanded.insert(server_key(id));
-                        self.rebuild_rows();
+                        self.model.force_expand_server(id);
                         SessionManagerAction::ConnectRemote(name.clone())
                     }
                 },
@@ -1218,7 +570,7 @@ impl SessionManagerState {
     /// Server it force-expands and returns [`SessionManagerAction::ConnectRemote`]
     /// so the connection is established lazily (mirroring `handle_enter`).
     pub fn handle_expand(&mut self) -> SessionManagerAction {
-        let row = match self.rows.get(self.selected) {
+        let row = match self.model.rows.get(self.model.selected) {
             Some(r) => r.clone(),
             None => return SessionManagerAction::None,
         };
@@ -1228,8 +580,7 @@ impl SessionManagerState {
                 ConnId::Remote(name) if *state != RemoteState::Connected => {
                     // Force-expand so children appear once the tree arrives,
                     // and kick off the lazy connect.
-                    self.expanded.insert(server_key(id));
-                    self.rebuild_rows();
+                    self.model.force_expand_server(id);
                     SessionManagerAction::ConnectRemote(name.clone())
                 }
                 _ => {
@@ -1252,7 +603,7 @@ impl SessionManagerState {
     /// Works on any connected server (Local or a connected remote). Panes,
     /// server nodes, the saved group, and dormant sessions are never deletable.
     pub fn handle_delete_key(&mut self) -> SessionManagerAction {
-        let row = match self.rows.get(self.selected) {
+        let row = match self.model.rows.get(self.model.selected) {
             Some(r) => r.clone(),
             None => return SessionManagerAction::None,
         };
@@ -1277,7 +628,10 @@ impl SessionManagerState {
             return SessionManagerAction::None;
         }
         self.sub_mode_server = server;
-        self.sub_mode = SubMode::ConfirmDelete(description);
+        self.sub_mode = SubMode::ConfirmDelete {
+            target: row.node_type.clone(),
+            description,
+        };
         SessionManagerAction::None
     }
 
@@ -1288,18 +642,42 @@ impl SessionManagerState {
             return SessionManagerAction::None;
         }
 
-        let row = match self.rows.get(self.selected) {
-            Some(r) => r.clone(),
-            None => {
+        // Act on the node captured when `d` was pressed, NEVER on whatever the
+        // selection index points at now. A `SubscribeSessionTree` push can
+        // rebuild the tree between the two keystrokes, and a rebuild that loses
+        // the selected key leaves the index parked on a neighbour -- so
+        // re-reading the selection here would delete a session the prompt did
+        // not name, with no second confirmation.
+        let target = match &self.sub_mode {
+            SubMode::ConfirmDelete { target, .. } => target.clone(),
+            // Not in the prompt: nothing was confirmed.
+            _ => {
                 self.sub_mode = SubMode::Navigate;
                 return SessionManagerAction::None;
             }
         };
         self.sub_mode = SubMode::Navigate;
 
+        // The captured node may itself have disappeared while the prompt was
+        // up. Deleting by name regardless would resurrect a race the capture
+        // exists to close, so abort instead.
+        let key = self.model.node_key(&target);
+        if !self
+            .model
+            .rows
+            .iter()
+            .any(|r| self.model.node_key(&r.node_type) == key)
+        {
+            log::warn!(
+                "session_manager: delete aborted -- {key:?} disappeared while the \
+                 confirmation prompt was open"
+            );
+            return SessionManagerAction::None;
+        }
+
         // Route the delete to the server captured when the sub-mode was entered.
         let server = self.sub_mode_server.clone();
-        match &row.node_type {
+        match &target {
             NodeType::Folder { name, .. } => SessionManagerAction::DeleteFolder {
                 server,
                 name: name.clone(),
@@ -1352,7 +730,7 @@ impl SessionManagerState {
     /// Handle 'm' key -- enter move-session sub-mode. Works on a session on any
     /// connected server; the folder list is drawn from that server's tree.
     pub fn handle_move_key(&mut self) -> SessionManagerAction {
-        let row = match self.rows.get(self.selected) {
+        let row = match self.model.rows.get(self.model.selected) {
             Some(r) => r.clone(),
             None => return SessionManagerAction::None,
         };
@@ -1376,16 +754,14 @@ impl SessionManagerState {
 
     /// Whether `server` is present in the roster and currently connected.
     fn is_connected(&self, server: &ConnId) -> bool {
-        self.roster
-            .iter()
-            .any(|(id, _, state, _)| id == server && matches!(state, RemoteState::Connected))
+        self.model.is_connected(server)
     }
 
     /// The server a structural edit (create folder/session) should target:
     /// the selected node's server, but only if it is connected. Returns `None`
     /// for the saved group, dormant sessions, and not-connected servers.
     fn structural_target_server(&self) -> Option<ConnId> {
-        let row = self.rows.get(self.selected)?;
+        let row = self.model.rows.get(self.model.selected)?;
         match &row.node_type {
             NodeType::SavedGroup { .. } | NodeType::DormantSession { .. } => None,
             _ => {
@@ -1414,10 +790,7 @@ impl SessionManagerState {
 
     /// A given server's folder names.
     fn folder_names_for(&self, server: &ConnId) -> Vec<String> {
-        self.trees
-            .get(server)
-            .map(|(folders, _)| folders.iter().map(|f| f.name.clone()).collect())
-            .unwrap_or_default()
+        self.model.folder_names_for(server)
     }
 
     // -----------------------------------------------------------------------
@@ -1468,7 +841,7 @@ impl SessionManagerState {
     /// bindings enter a text-input sub-mode and return [`SessionManagerAction::None`].
     pub fn apply_binding(&mut self, binding: SessionManagerBinding) -> SessionManagerAction {
         use SessionManagerBinding::*;
-        let node = match self.rows.get(self.selected) {
+        let node = match self.model.rows.get(self.model.selected) {
             Some(r) => r.node_type.clone(),
             None => return SessionManagerAction::None,
         };
@@ -1757,12 +1130,7 @@ impl SessionManagerState {
         let border_len = inner_width.saturating_sub(title.len());
         let left_border = border_len / 2;
         let right_border = border_len - left_border;
-        let top_line = format!(
-            "\u{256D}{}{}{}\u{256E}",
-            "\u{2500}".repeat(left_border),
-            title,
-            "\u{2500}".repeat(right_border),
-        );
+        let top_line = box_top_line_titled(left_border, &title, right_border);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
@@ -1776,17 +1144,17 @@ impl SessionManagerState {
         // keystrokes are going.
         let search_y = start_y + 1;
         let search_text = if self.search_focused {
-            format!(" / {}\u{2588}", self.query)
-        } else if self.query.is_empty() {
+            format!(" / {}\u{2588}", self.model.query)
+        } else if self.model.query.is_empty() {
             " / (search)".to_string()
         } else {
-            format!(" / {}", self.query)
+            format!(" / {}", self.model.query)
         };
         let search_fg = if self.search_focused { current_fg } else { fg };
         commands.push(DrawCommand {
             x: start_x,
             y: search_y,
-            text: "\u{2502}".to_string(),
+            text: BOX_VERTICAL.to_string(),
             fg: border_fg,
             bg,
         });
@@ -1800,7 +1168,7 @@ impl SessionManagerState {
         commands.push(DrawCommand {
             x: start_x + 1 + inner_width as u16,
             y: search_y,
-            text: "\u{2502}".to_string(),
+            text: BOX_VERTICAL.to_string(),
             fg: border_fg,
             bg,
         });
@@ -1808,7 +1176,7 @@ impl SessionManagerState {
         commands.push(DrawCommand {
             x: start_x,
             y: search_y + 1,
-            text: format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width)),
+            text: box_rule_line(inner_width),
             fg: border_fg,
             bg,
         });
@@ -1827,8 +1195,8 @@ impl SessionManagerState {
         // search row (1), its separator (1), the prompt/separator line (1), the
         // footer lines, and the bottom border (1).
         let content_height = (popup_height as usize).saturating_sub(5 + footer_n);
-        let scroll_offset = if self.selected >= content_height {
-            self.selected - content_height + 1
+        let scroll_offset = if self.model.selected >= content_height {
+            self.model.selected - content_height + 1
         } else {
             0
         };
@@ -1838,8 +1206,8 @@ impl SessionManagerState {
             // +3: top border, search row, search separator.
             let y = start_y + 3 + row_idx as u16;
 
-            if let Some(row) = self.rows.get(tree_idx) {
-                let is_selected = tree_idx == self.selected;
+            if let Some(row) = self.model.rows.get(tree_idx) {
+                let is_selected = tree_idx == self.model.selected;
                 let indent = "  ".repeat(row.indent);
 
                 // Is this a pane marked for "add to view"? Keyed by identity so
@@ -1886,7 +1254,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1902,7 +1270,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1911,7 +1279,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1927,7 +1295,7 @@ impl SessionManagerState {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1950,8 +1318,8 @@ impl SessionManagerState {
                 };
                 format!(" Rename {label}: {buffer}_ ")
             }
-            SubMode::ConfirmDelete(desc) => {
-                format!(" Delete {}? (y/n) ", desc)
+            SubMode::ConfirmDelete { description, .. } => {
+                format!(" Delete {}? (y/n) ", description)
             }
             SubMode::CreateFolder(buf) => {
                 format!(" Folder name: {}_ ", buf)
@@ -1980,7 +1348,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x,
                 y: sep_y,
-                text: "\u{251C}".to_string(),
+                text: BOX_TEE_LEFT.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1994,7 +1362,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y: sep_y,
-                text: "\u{2524}".to_string(),
+                text: BOX_TEE_RIGHT.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -2002,7 +1370,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x,
                 y: sep_y,
-                text: format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width)),
+                text: box_rule_line(inner_width),
                 fg: border_fg,
                 bg,
             });
@@ -2019,7 +1387,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -2073,7 +1441,7 @@ impl SessionManagerState {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -2081,7 +1449,7 @@ impl SessionManagerState {
 
         // Bottom border.
         let bottom_y = footer_y0 + footer_n as u16;
-        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_line = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: bottom_y,
@@ -2109,9 +1477,11 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "project-a".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
+                        cwd: None,
                         id: 10,
                         name: "zsh".to_string(),
                         is_focused: true,
@@ -2124,6 +1494,7 @@ mod tests {
         let unfiled = vec![SessionTreeEntry {
             name: "scratch".to_string(),
             tabs: vec![TabTreeEntry {
+                is_active: true,
                 id: 2,
                 name: "Tab 1".to_string(),
                 panes: vec![],
@@ -2142,17 +1513,19 @@ mod tests {
     /// Expand a server node by selecting its row and expanding it.
     fn expand_server(state: &mut SessionManagerState, server: &ConnId) {
         let idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Server { id, .. } if id == server))
             .unwrap();
-        state.selected = idx;
+        state.model.selected = idx;
         state.expand_selected();
     }
 
     /// Index of the first row matching the named local session.
     fn session_row(state: &SessionManagerState, name: &str) -> usize {
         state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Session { name: n, .. } if n == name))
@@ -2163,8 +1536,8 @@ mod tests {
     fn test_new_state_is_empty() {
         let state = SessionManagerState::new(None);
         // No tree data yet, so no rows built.
-        assert!(state.rows.is_empty());
-        assert_eq!(state.selected, 0);
+        assert!(state.model.rows.is_empty());
+        assert_eq!(state.model.selected, 0);
     }
 
     #[test]
@@ -2174,13 +1547,14 @@ mod tests {
 
         // Row 0 is the local server node; the folder nests beneath it.
         assert!(matches!(
-            state.rows[0].node_type,
+            state.model.rows[0].node_type,
             NodeType::Server {
                 id: ConnId::Local,
                 ..
             }
         ));
         assert!(state
+            .model
             .rows
             .iter()
             .any(|r| matches!(&r.node_type, NodeType::Folder { name, .. } if name == "work")));
@@ -2191,13 +1565,13 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
 
-        let total = state.rows.len();
-        state.selected = total - 1;
+        let total = state.model.rows.len();
+        state.model.selected = total - 1;
         state.select_next();
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.model.selected, 0);
 
         state.select_prev();
-        assert_eq!(state.selected, total - 1);
+        assert_eq!(state.model.selected, total - 1);
     }
 
     #[test]
@@ -2207,18 +1581,19 @@ mod tests {
 
         // Find the folder row and collapse it.
         let folder_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Folder { name, .. } if name == "work"))
             .unwrap();
-        let initial_count = state.rows.len();
-        state.selected = folder_idx;
+        let initial_count = state.model.rows.len();
+        state.model.selected = folder_idx;
         state.collapse_selected();
-        assert!(state.rows.len() < initial_count);
+        assert!(state.model.rows.len() < initial_count);
 
         // Expand it back.
         state.expand_selected();
-        assert_eq!(state.rows.len(), initial_count);
+        assert_eq!(state.model.rows.len(), initial_count);
     }
 
     #[test]
@@ -2226,7 +1601,7 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
 
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
         let action = state.handle_enter();
         assert!(matches!(
             action,
@@ -2239,13 +1614,117 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
 
-        state.selected = 0; // local server node
-        let initial_count = state.rows.len();
+        state.model.selected = 0; // local server node
+        let initial_count = state.model.rows.len();
         let action = state.handle_enter();
         assert!(matches!(action, SessionManagerAction::None));
         // Server was expanded, now collapsed -> only the server row remains.
-        assert!(state.rows.len() < initial_count);
-        assert_eq!(state.rows.len(), 1);
+        assert!(state.model.rows.len() < initial_count);
+        assert_eq!(state.model.rows.len(), 1);
+    }
+
+    /// A confirmed delete must act on the node the PROMPT named, even if the
+    /// tree was rebuilt underneath the prompt.
+    ///
+    /// The window is two keystrokes wide (`d` then `y`) and a sidebar holding a
+    /// standing `SubscribeSessionTree` rebuilds the tree on ANY structural
+    /// change on ANY connected server. When the selected key disappears,
+    /// `rebuild_rows` deliberately leaves the index where it was -- so the
+    /// selection slides onto the next row, and a confirm that re-read the
+    /// selection would delete a session the user never saw named, with no
+    /// second confirmation.
+    #[test]
+    fn a_delete_never_retargets_when_the_tree_rebuilds_under_the_prompt() {
+        let unfiled = |names: &[&str]| -> Vec<SessionTreeEntry> {
+            names
+                .iter()
+                .map(|n| SessionTreeEntry {
+                    name: (*n).to_string(),
+                    tabs: vec![],
+                    client_count: 0,
+                    is_current: false,
+                })
+                .collect()
+        };
+
+        let mut state = SessionManagerState::new(None);
+        state.update_tree(
+            ConnId::Local,
+            Vec::new(),
+            unfiled(&["beta", "gamma"]),
+            Vec::new(),
+        );
+
+        let beta_idx = session_row(&state, "beta");
+        state.model.selected = beta_idx;
+
+        // Arm the prompt on `beta`.
+        state.handle_delete_key();
+        assert!(
+            matches!(&state.sub_mode, SubMode::ConfirmDelete { description, .. }
+                     if description == "session 'beta'"),
+            "the prompt must name beta, got {:?}",
+            state.sub_mode
+        );
+
+        // Another client kills `beta`; the push rebuilds the tree. `gamma` now
+        // occupies the index the selection is parked on.
+        state.update_tree(ConnId::Local, Vec::new(), unfiled(&["gamma"]), Vec::new());
+        assert_eq!(
+            state.model.selected, beta_idx,
+            "precondition: the stale index is what makes this dangerous"
+        );
+        assert!(
+            matches!(&state.model.rows[beta_idx].node_type,
+                     NodeType::Session { name, .. } if name == "gamma"),
+            "precondition: the selection must now sit on gamma"
+        );
+
+        // Confirming must delete NOTHING -- beta is gone, and gamma was never
+        // named by the prompt.
+        let action = state.handle_confirm_delete(true);
+        assert!(
+            matches!(action, SessionManagerAction::None),
+            "a vanished target must abort, not retarget -- got {action:?}"
+        );
+        assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    /// The companion case: the target still exists but the rows moved around it.
+    ///
+    /// This one is a GUARD, not a bug-catcher -- it passes against the old
+    /// re-read-the-selection code too, because identity-preserving
+    /// `rebuild_rows` already moved the index onto `beta`. It is here so the
+    /// capture cannot regress the ordinary path while fixing the dangerous
+    /// one.
+    #[test]
+    fn a_delete_follows_its_target_when_rows_shift_under_the_prompt() {
+        let entry = |n: &str| SessionTreeEntry {
+            name: n.to_string(),
+            tabs: vec![],
+            client_count: 0,
+            is_current: false,
+        };
+
+        let mut state = SessionManagerState::new(None);
+        state.update_tree(
+            ConnId::Local,
+            Vec::new(),
+            vec![entry("alpha"), entry("beta")],
+            Vec::new(),
+        );
+        state.model.selected = session_row(&state, "beta");
+        state.handle_delete_key();
+
+        // `alpha` disappears: every row below it shifts up, so the index that
+        // named `beta` now names something else -- but `beta` is still there.
+        state.update_tree(ConnId::Local, Vec::new(), vec![entry("beta")], Vec::new());
+
+        let action = state.handle_confirm_delete(true);
+        assert!(
+            matches!(&action, SessionManagerAction::DeleteSession { name, .. } if name == "beta"),
+            "the delete must follow beta, not the index -- got {action:?}"
+        );
     }
 
     #[test]
@@ -2253,12 +1732,12 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
 
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
 
         // Press 'd'.
         let action = state.handle_delete_key();
         assert!(matches!(action, SessionManagerAction::None));
-        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
 
         // Confirm with 'y'.
         let action = state.handle_confirm_delete(true);
@@ -2289,13 +1768,13 @@ mod tests {
 
         // Find the remote server row.
         let remote_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| {
                 matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
             })
             .unwrap();
-        state.selected = remote_idx;
+        state.model.selected = remote_idx;
         let action = state.handle_enter();
         assert!(matches!(action, SessionManagerAction::ConnectRemote(ref n) if n == "pi"));
     }
@@ -2321,13 +1800,13 @@ mod tests {
         // Select the not-connected remote server node and try to create a
         // folder -> no-op, no sub-mode (structural edits require a connection).
         let remote_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| {
                 matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
             })
             .unwrap();
-        state.selected = remote_idx;
+        state.model.selected = remote_idx;
         let action = state.handle_create_folder_key();
         assert!(matches!(action, SessionManagerAction::None));
         assert!(matches!(state.sub_mode, SubMode::Navigate));
@@ -2364,13 +1843,13 @@ mod tests {
         // sub_mode_server value is exactly what the input layer reads to route
         // the completed CreateSession action.
         let remote_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| {
                 matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
             })
             .unwrap();
-        state.selected = remote_idx;
+        state.model.selected = remote_idx;
         let action = state.handle_create_session_key();
         assert!(matches!(action, SessionManagerAction::None));
         assert!(matches!(
@@ -2412,14 +1891,14 @@ mod tests {
         // Select the remote's session and delete it -> enters confirm, then the
         // confirmed action carries the remote ConnId.
         let remote_session_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Session { server: ConnId::Remote(s), name } if s == "pi" && name == "project-a"))
             .unwrap();
-        state.selected = remote_session_idx;
+        state.model.selected = remote_session_idx;
         let action = state.handle_delete_key();
         assert!(matches!(action, SessionManagerAction::None));
-        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
 
         let action = state.handle_confirm_delete(true);
         assert!(matches!(
@@ -2459,7 +1938,7 @@ mod tests {
         expand_server(&mut state, &ConnId::Remote("pi".to_string()));
 
         let remote_session = state
-            .rows
+            .model.rows
             .iter()
             .find(|r| matches!(&r.node_type, NodeType::Session { server: ConnId::Remote(s), .. } if s == "pi"))
             .unwrap();
@@ -2474,25 +1953,29 @@ mod tests {
         // Reveal the tab: expand server -> folder -> session.
         expand_server(&mut state, &ConnId::Local);
         let folder_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Folder { name, .. } if name == "work"))
             .unwrap();
-        state.selected = folder_idx;
+        state.model.selected = folder_idx;
         state.expand_selected();
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
         state.expand_selected();
 
         // Select the tab row.
         let tab_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
             .unwrap();
-        let tab_key = state.node_key(&state.rows[tab_idx].node_type.clone());
+        let tab_key = state
+            .model
+            .node_key(&state.model.rows[tab_idx].node_type.clone());
 
         // handle_enter on the tab still SWITCHES (returns SwitchTab).
-        state.selected = tab_idx;
+        state.model.selected = tab_idx;
         let enter_action = state.handle_enter();
         assert!(matches!(
             enter_action,
@@ -2502,16 +1985,18 @@ mod tests {
         // handle_expand on the tab EXPANDS: inserts the tab key, no switch.
         // Re-find the tab row (rebuilds may have shifted indices).
         let tab_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
             .unwrap();
-        state.selected = tab_idx;
+        state.model.selected = tab_idx;
         let expand_action = state.handle_expand();
         assert!(matches!(expand_action, SessionManagerAction::None));
-        assert!(state.expanded.contains(&tab_key));
+        assert!(state.model.expanded.contains(&tab_key));
         // The tab's pane is now visible.
         assert!(state
+            .model
             .rows
             .iter()
             .any(|r| matches!(&r.node_type, NodeType::Pane { .. })));
@@ -2536,13 +2021,13 @@ mod tests {
         ]);
 
         let remote_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| {
                 matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
             })
             .unwrap();
-        state.selected = remote_idx;
+        state.model.selected = remote_idx;
         let action = state.handle_expand();
         assert!(matches!(action, SessionManagerAction::ConnectRemote(ref n) if n == "pi"));
     }
@@ -2569,7 +2054,7 @@ mod tests {
         );
 
         // A SavedGroup header row exists under the Local server.
-        assert!(state.rows.iter().any(|r| matches!(
+        assert!(state.model.rows.iter().any(|r| matches!(
             &r.node_type,
             NodeType::SavedGroup {
                 server: ConnId::Local
@@ -2578,6 +2063,7 @@ mod tests {
         // Both dormant sessions are shown as DormantSession rows (expanded by
         // default).
         let dormant_names: Vec<&str> = state
+            .model
             .rows
             .iter()
             .filter_map(|r| match &r.node_type {
@@ -2593,6 +2079,7 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state); // dormant is empty
         assert!(!state
+            .model
             .rows
             .iter()
             .any(|r| matches!(&r.node_type, NodeType::SavedGroup { .. })));
@@ -2605,11 +2092,11 @@ mod tests {
         state.update_tree(ConnId::Local, folders, unfiled, vec!["saved-a".to_string()]);
 
         let idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::DormantSession { name, .. } if name == "saved-a"))
             .unwrap();
-        state.selected = idx;
+        state.model.selected = idx;
         let action = state.handle_enter();
         assert!(matches!(
             action,
@@ -2624,15 +2111,17 @@ mod tests {
         state.update_tree(ConnId::Local, folders, unfiled, vec!["saved-a".to_string()]);
 
         let group_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::SavedGroup { .. }))
             .unwrap();
-        state.selected = group_idx;
+        state.model.selected = group_idx;
         // Group starts expanded (dormant row visible); Enter collapses it.
         let action = state.handle_enter();
         assert!(matches!(action, SessionManagerAction::None));
         assert!(!state
+            .model
             .rows
             .iter()
             .any(|r| matches!(&r.node_type, NodeType::DormantSession { .. })));
@@ -2664,6 +2153,7 @@ mod tests {
             vec!["remote-saved".to_string()],
         );
         assert!(!state
+            .model
             .rows
             .iter()
             .any(|r| matches!(&r.node_type, NodeType::SavedGroup { .. })));
@@ -2676,6 +2166,7 @@ mod tests {
     /// Index of the first Tab row for the named local session.
     fn tab_row(state: &SessionManagerState, session: &str) -> usize {
         state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { session: s, .. } if s == session))
@@ -2714,7 +2205,7 @@ mod tests {
     fn test_feed_chord_pending_then_complete() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = tab_row(&state, "project-a");
+        state.model.selected = tab_row(&state, "project-a");
 
         // 't' begins the default 2-char chords -> pending.
         assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
@@ -2772,7 +2263,7 @@ mod tests {
     fn test_tab_new_on_session_node() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::TabNew);
         assert!(matches!(
             action,
@@ -2785,7 +2276,7 @@ mod tests {
     fn test_tab_close_is_immediate_no_confirm() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = tab_row(&state, "project-a");
+        state.model.selected = tab_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::TabClose);
         assert!(matches!(
             action,
@@ -2803,7 +2294,7 @@ mod tests {
     fn test_tab_move_left_and_right() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = tab_row(&state, "project-a");
+        state.model.selected = tab_row(&state, "project-a");
         let right = state.apply_binding(SessionManagerBinding::TabMoveRight);
         assert!(matches!(
             right,
@@ -2828,7 +2319,7 @@ mod tests {
     fn test_pane_new_on_tab_node() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = tab_row(&state, "project-a");
+        state.model.selected = tab_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::PaneNew);
         assert!(matches!(
             action,
@@ -2845,7 +2336,7 @@ mod tests {
         // TabNew on a Tab node targets that tab's session.
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = tab_row(&state, "project-a");
+        state.model.selected = tab_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::TabNew);
         assert!(matches!(
             action,
@@ -2860,14 +2351,15 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
         // Expand the tab to reveal its pane, then select the pane.
-        state.selected = tab_row(&state, "project-a");
+        state.model.selected = tab_row(&state, "project-a");
         state.expand_selected();
         let pane_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Pane { .. }))
             .unwrap();
-        state.selected = pane_idx;
+        state.model.selected = pane_idx;
         let action = state.apply_binding(SessionManagerBinding::PaneNew);
         assert!(matches!(
             action,
@@ -2884,7 +2376,7 @@ mod tests {
         // A direct action on the wrong node type is a no-op.
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::PaneClose);
         assert!(matches!(action, SessionManagerAction::None));
     }
@@ -2893,10 +2385,10 @@ mod tests {
     fn test_session_close_on_session_enters_confirm() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::SessionClose);
         assert!(matches!(action, SessionManagerAction::None));
-        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete(_)));
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
     }
 
     #[test]
@@ -2904,11 +2396,12 @@ mod tests {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
         let folder_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Folder { .. }))
             .unwrap();
-        state.selected = folder_idx;
+        state.model.selected = folder_idx;
         let action = state.apply_binding(SessionManagerBinding::SessionClose);
         assert!(matches!(action, SessionManagerAction::None));
         // No confirm sub-mode was entered — the folder is untouched.
@@ -2919,7 +2412,7 @@ mod tests {
     fn test_folder_delete_on_session_is_noop() {
         let mut state = SessionManagerState::new(None);
         local_tree(&mut state);
-        state.selected = session_row(&state, "project-a");
+        state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::FolderDelete);
         assert!(matches!(action, SessionManagerAction::None));
         assert!(matches!(state.sub_mode, SubMode::Navigate));
@@ -2929,11 +2422,11 @@ mod tests {
     fn test_tab_rename_on_remote_tab_carries_remote() {
         let mut state = remote_state_with_tree();
         let idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { server: ConnId::Remote(s), session, .. } if s == "pi" && session == "project-a"))
             .unwrap();
-        state.selected = idx;
+        state.model.selected = idx;
 
         // Chord: t, r.
         assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
@@ -2965,19 +2458,19 @@ mod tests {
         let mut state = remote_state_with_tree();
         // Reveal the pane by expanding its (remote) tab.
         let tab_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { server: ConnId::Remote(s), .. } if s == "pi"))
             .unwrap();
-        state.selected = tab_idx;
+        state.model.selected = tab_idx;
         state.expand_selected();
 
         let pane_idx = state
-            .rows
+            .model.rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Pane { server: ConnId::Remote(s), .. } if s == "pi"))
             .unwrap();
-        state.selected = pane_idx;
+        state.model.selected = pane_idx;
 
         // Chord: p, x.
         assert_eq!(state.feed_chord('p'), ChordOutcome::Pending);
@@ -3083,15 +2576,18 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "multi".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![
                         PaneTreeEntry {
+                            cwd: None,
                             id: 10,
                             name: "p10".to_string(),
                             is_focused: true,
                         },
                         PaneTreeEntry {
+                            cwd: None,
                             id: 11,
                             name: "p11".to_string(),
                             is_focused: false,
@@ -3104,17 +2600,19 @@ mod tests {
         }];
         state.update_tree(ConnId::Local, folders, Vec::new(), Vec::new());
         let tab_idx = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
             .unwrap();
-        state.selected = tab_idx;
+        state.model.selected = tab_idx;
         state.expand_selected();
         state
     }
 
     fn pane_row_by_id(state: &SessionManagerState, id: u64) -> usize {
         state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Pane { pane_id, .. } if *pane_id == id))
@@ -3129,7 +2627,7 @@ mod tests {
         assert_eq!(state.marked_count(), 0);
 
         // On a pane row, toggle marks it; toggling again unmarks.
-        state.selected = pane_row_by_id(&state, 10);
+        state.model.selected = pane_row_by_id(&state, 10);
         assert!(state.toggle_mark());
         assert_eq!(state.marked_count(), 1);
         assert!(state.toggle_mark());
@@ -3139,9 +2637,9 @@ mod tests {
     #[test]
     fn test_take_marked_returns_drained_set() {
         let mut state = two_pane_state();
-        state.selected = pane_row_by_id(&state, 10);
+        state.model.selected = pane_row_by_id(&state, 10);
         state.toggle_mark();
-        state.selected = pane_row_by_id(&state, 11);
+        state.model.selected = pane_row_by_id(&state, 11);
         state.toggle_mark();
         assert_eq!(state.marked_count(), 2);
 
@@ -3154,7 +2652,7 @@ mod tests {
     #[test]
     fn test_take_falls_back_to_highlighted_pane() {
         let mut state = two_pane_state();
-        state.selected = pane_row_by_id(&state, 11);
+        state.model.selected = pane_row_by_id(&state, 11);
         // No marks: the single highlighted pane is returned.
         let panes = state.take_marked_or_highlighted_panes();
         assert_eq!(panes, vec![(ConnId::Local, 11u64)]);
@@ -3164,7 +2662,8 @@ mod tests {
     fn test_take_empty_on_non_pane_with_no_marks() {
         let mut state = two_pane_state();
         // Highlight the tab (not a pane), no marks -> empty.
-        state.selected = state
+        state.model.selected = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
@@ -3175,7 +2674,7 @@ mod tests {
     #[test]
     fn test_mark_survives_rebuild_rows() {
         let mut state = two_pane_state();
-        state.selected = pane_row_by_id(&state, 10);
+        state.model.selected = pane_row_by_id(&state, 10);
         state.toggle_mark();
         assert_eq!(state.marked_count(), 1);
 
@@ -3186,9 +2685,11 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "multi".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
+                        cwd: None,
                         id: 10,
                         name: "p10".to_string(),
                         is_focused: true,
@@ -3205,9 +2706,9 @@ mod tests {
     #[test]
     fn test_add_to_view_binding_emits_marked_panes() {
         let mut state = two_pane_state();
-        state.selected = pane_row_by_id(&state, 10);
+        state.model.selected = pane_row_by_id(&state, 10);
         state.toggle_mark();
-        state.selected = pane_row_by_id(&state, 11);
+        state.model.selected = pane_row_by_id(&state, 11);
         state.toggle_mark();
 
         let action = state.apply_binding(SessionManagerBinding::AddToView);
@@ -3224,7 +2725,8 @@ mod tests {
     #[test]
     fn test_add_to_view_binding_noop_on_non_pane_without_marks() {
         let mut state = two_pane_state();
-        state.selected = state
+        state.model.selected = state
+            .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Session { .. }))
@@ -3241,6 +2743,7 @@ mod tests {
     /// so a query can be aimed at exactly one depth.
     fn search_tree() -> (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>) {
         let pane = |id: u64, name: &str| PaneTreeEntry {
+            cwd: None,
             id,
             name: name.to_string(),
             is_focused: false,
@@ -3252,11 +2755,13 @@ mod tests {
                     name: "alpha".to_string(),
                     tabs: vec![
                         TabTreeEntry {
+                            is_active: true,
                             id: 1,
                             name: "editor".to_string(),
                             panes: vec![pane(10, "vim"), pane(11, "logtail")],
                         },
                         TabTreeEntry {
+                            is_active: true,
                             id: 2,
                             name: "shell".to_string(),
                             panes: vec![pane(12, "bash")],
@@ -3271,6 +2776,7 @@ mod tests {
                 sessions: vec![SessionTreeEntry {
                     name: "beta".to_string(),
                     tabs: vec![TabTreeEntry {
+                        is_active: true,
                         id: 3,
                         name: "notes".to_string(),
                         panes: vec![pane(13, "nvim")],
@@ -3283,6 +2789,7 @@ mod tests {
         let unfiled = vec![SessionTreeEntry {
             name: "gamma".to_string(),
             tabs: vec![TabTreeEntry {
+                is_active: true,
                 id: 4,
                 name: "build".to_string(),
                 panes: vec![pane(14, "cargo")],
@@ -3303,6 +2810,7 @@ mod tests {
     /// Compact `kind:name` label per visible row, for exact assertions.
     fn row_labels(state: &SessionManagerState) -> Vec<String> {
         state
+            .model
             .rows
             .iter()
             .map(|r| match &r.node_type {
@@ -3341,7 +2849,7 @@ mod tests {
         assert_ne!(row_labels(&state), before);
         state.pop_query_char();
         state.pop_query_char();
-        assert!(state.query.is_empty());
+        assert!(state.model.query.is_empty());
         assert_eq!(row_labels(&state), before);
     }
 
@@ -3426,7 +2934,10 @@ mod tests {
         );
         // The "Saved (resurrect)" header is an ancestor, not the match: the
         // selection belongs on the dormant session itself.
-        assert_eq!(row_labels(&state)[state.selected], "dormant:saved-one");
+        assert_eq!(
+            row_labels(&state)[state.model.selected],
+            "dormant:saved-one"
+        );
     }
 
     #[test]
@@ -3434,10 +2945,10 @@ mod tests {
         let mut state = search_state(Vec::new());
         // Collapse a folder FIRST, so "restored" is a state the auto-expansion
         // in `update_tree` did not already produce.
-        state.selected = label_row(&state, "folder:personal");
+        state.model.selected = label_row(&state, "folder:personal");
         state.collapse_selected();
         let rows_before = row_labels(&state);
-        let expanded_before = state.expanded.clone();
+        let expanded_before = state.model.expanded.clone();
         assert!(!rows_before.contains(&"session:beta".to_string()));
 
         // A query that only matches inside the collapsed folder must reveal it.
@@ -3454,20 +2965,23 @@ mod tests {
 
         // Clearing the query restores the user's expansion state exactly.
         state.clear_query();
-        assert_eq!(state.expanded, expanded_before, "expanded set was mutated");
+        assert_eq!(
+            state.model.expanded, expanded_before,
+            "expanded set was mutated"
+        );
         assert_eq!(row_labels(&state), rows_before);
     }
 
     #[test]
     fn search_query_change_replaces_a_stale_selection() {
         let mut state = search_state(Vec::new());
-        state.selected = 3;
+        state.model.selected = 3;
         type_query(&mut state, "a");
         // The stale index is gone, and the selection is NOT parked on the server
         // row at 0 -- nor on `folder:clients`, which only renders because a
         // session beneath it matched. `alpha` is the topmost direct hit.
-        assert_ne!(state.selected, 3);
-        assert_eq!(row_labels(&state)[state.selected], "session:alpha");
+        assert_ne!(state.model.selected, 3);
+        assert_eq!(row_labels(&state)[state.model.selected], "session:alpha");
     }
 
     #[test]
@@ -3480,7 +2994,7 @@ mod tests {
         let labels = row_labels(&state);
         assert_eq!(labels[1], "folder:clients", "the ancestor folder must show");
         assert_eq!(
-            labels[state.selected], "session:alpha",
+            labels[state.model.selected], "session:alpha",
             "the selection landed on an ancestor instead of the direct hit"
         );
         assert!(matches!(
@@ -3506,7 +3020,7 @@ mod tests {
             ],
             "the ancestors must still be visible above the match"
         );
-        assert_eq!(labels[state.selected], "tab:editor");
+        assert_eq!(labels[state.model.selected], "tab:editor");
     }
 
     #[test]
@@ -3515,7 +3029,7 @@ mod tests {
         // A folder is a legitimate direct hit: nothing beneath `personal`
         // matches, so the folder row itself is what the user searched for.
         type_query(&mut state, "personal");
-        assert_eq!(row_labels(&state)[state.selected], "folder:personal");
+        assert_eq!(row_labels(&state)[state.model.selected], "folder:personal");
     }
 
     #[test]
@@ -3526,12 +3040,12 @@ mod tests {
         type_query(&mut state, "gamma");
         assert!(
             !matches!(
-                state.rows[state.selected].node_type,
+                state.model.rows[state.model.selected].node_type,
                 NodeType::Server { .. }
             ),
             "the selection sat on a server row after a query"
         );
-        assert_eq!(row_labels(&state)[state.selected], "session:gamma");
+        assert_eq!(row_labels(&state)[state.model.selected], "session:gamma");
         // ...so Enter activates the match instead of toggling the server open.
         assert!(matches!(
             state.handle_enter(),
@@ -3544,11 +3058,11 @@ mod tests {
         state.clear_query();
         type_query(&mut state, "zzzznope");
         assert_eq!(row_labels(&state), vec!["server:local".to_string()]);
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.model.selected, 0);
 
         // Clearing the query restores the plain "top of the tree" selection.
         state.clear_query();
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.model.selected, 0);
     }
 
     #[test]
@@ -3628,7 +3142,7 @@ mod tests {
     #[test]
     fn test_marked_count_shows_in_title() {
         let mut state = two_pane_state();
-        state.selected = pane_row_by_id(&state, 10);
+        state.model.selected = pane_row_by_id(&state, 10);
         state.toggle_mark();
         let theme = Theme::default();
         let cmds = state.render(100, 30, &theme);

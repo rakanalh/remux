@@ -292,6 +292,141 @@ where
 fn client_message_summary(msg: &ClientMessage) -> String {
     match msg {
         ClientMessage::Input { data } => format!("Input({} bytes)", data.len()),
+        // Every keystroke into a VIEW cell goes out as `InputToPane`, so
+        // without this arm a passphrase typed into a view was written to
+        // `client.log` -- as `[99, 111, 114, ...]`, which is full fidelity and
+        // trivially decoded. `Input` had the arm from the start; the newer
+        // variant never got the same treatment.
+        ClientMessage::InputToPane { pane_id, data } => {
+            format!("InputToPane(pane_id={pane_id}, {} bytes)", data.len())
+        }
+        // `remux split -- psql postgresql://user:pass@host/db`: the PROGRAM is
+        // the diagnostic, the ARGUMENTS are where the credential is.
+        ClientMessage::CliSpawn {
+            session,
+            placement,
+            argv,
+            cwd,
+        } => format!(
+            "CliSpawn(session={session:?}, placement={placement:?}, program={:?}, \
+             {} more arg(s), cwd={})",
+            argv.first(),
+            argv.len().saturating_sub(1),
+            if cwd.is_some() { "set" } else { "none" }
+        ),
         other => format!("{:?}", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **`client.log` must not contain what the user typed.** It is plaintext,
+    /// unrotated and never pruned, and `main.rs` pins the logger at `Debug`
+    /// with no `RUST_LOG`, so nothing a user can set turns it off.
+    ///
+    /// Tested here rather than in a harness because `InputToPane` is only ever
+    /// sent from a VIEW cell, which no frame-level harness can drive -- and a
+    /// summary function is a pure function, so this is the layer that can
+    /// assert on it directly.
+    #[test]
+    fn a_keystroke_is_summarised_by_length_and_never_printed() {
+        let secret = b"correct-horse-battery-staple".to_vec();
+        for msg in [
+            ClientMessage::Input {
+                data: secret.clone(),
+            },
+            ClientMessage::InputToPane {
+                pane_id: 7,
+                data: secret.clone(),
+            },
+        ] {
+            let s = client_message_summary(&msg);
+            assert!(
+                !s.contains("correct-horse"),
+                "the text itself must not appear: {s}"
+            );
+            // The form the leak actually took: `{:?}` prints a `Vec<u8>` as
+            // decimal bytes, so a check for the STRING alone passes against a
+            // leaking build.
+            assert!(!s.contains("99, 111, 114"), "nor the byte list: {s}");
+            assert!(
+                s.contains(&format!("{} bytes", secret.len())),
+                "but the length must, or the line is useless: {s}"
+            );
+        }
+    }
+
+    /// The same, for the command line `remux split` forwards.
+    #[test]
+    fn cli_spawn_names_the_program_but_not_its_arguments() {
+        let s = client_message_summary(&ClientMessage::CliSpawn {
+            session: "main".to_string(),
+            placement: crate::protocol::CliPlacement::SplitBelow,
+            argv: vec![
+                "psql".to_string(),
+                "postgresql://sam:hunter2@db/prod".to_string(),
+            ],
+            cwd: None,
+        });
+        assert!(
+            !s.contains("hunter2"),
+            "the credential must not appear: {s}"
+        );
+        assert!(s.contains("psql"), "but the program must: {s}");
+        assert!(s.contains("1 more arg"), "and how many were dropped: {s}");
+    }
+
+    /// Drive [`handshake`] against a scripted peer that answers with `welcome`.
+    /// The client's Hello is read (and returned) so the test can also assert
+    /// what this binary announces.
+    async fn handshake_against(welcome: Welcome) -> (Hello, Result<String>) {
+        let (mut client_side, mut peer) = tokio::io::duplex(4096);
+        let peer_task = tokio::spawn(async move {
+            let hello: Hello = read_message(&mut peer)
+                .await
+                .unwrap()
+                .expect("client sent no Hello");
+            write_message(&mut peer, &welcome).await.unwrap();
+            hello
+        });
+        let (mut r, mut w) = tokio::io::split(&mut client_side);
+        let result = handshake(&mut r, &mut w).await;
+        (peer_task.await.unwrap(), result)
+    }
+
+    /// The client announces the current protocol version and accepts a peer
+    /// that speaks it, returning the peer's build stamp for skew display.
+    #[tokio::test]
+    async fn handshake_accepts_a_matching_protocol_version() {
+        let (hello, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            remux_version: "0.1.0+peer".to_string(),
+        })
+        .await;
+        assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(result.unwrap(), "0.1.0+peer");
+    }
+
+    /// Version skew is HARD-rejected here, on the client. The server is
+    /// deliberately lenient (it logs the mismatch and answers anyway), so this
+    /// bail is the whole enforcement -- a `PROTOCOL_VERSION` bump only keeps
+    /// old peers out because of it. The frozen `Hello`/`Welcome` shape is what
+    /// lets the rejection be a clean error rather than a decode failure.
+    #[tokio::test]
+    async fn handshake_rejects_an_older_protocol_version() {
+        let (_, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION - 1,
+            remux_version: "0.1.0+old".to_string(),
+        })
+        .await;
+        let err = result
+            .expect_err("a skewed peer must be rejected")
+            .to_string();
+        assert!(
+            err.contains("incompatible remux") && err.contains("0.1.0+old"),
+            "the rejection must name the peer it refused: {err}"
+        );
     }
 }

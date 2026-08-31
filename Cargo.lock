@@ -917,6 +917,7 @@ dependencies = [
  "log",
  "nix",
  "notify",
+ "regex",
  "serde",
  "serde_json",
  "signal-hook",

@@ -7,6 +7,9 @@
 use crate::client::whichkey::DrawCommand;
 use crate::config::theme::Theme;
 use crate::protocol::command_names;
+use crate::server::compositor::{
+    box_bottom_line, box_rule_line, box_top_line_titled, BOX_VERTICAL,
+};
 
 /// State for the command palette overlay.
 #[derive(Debug, Clone)]
@@ -289,12 +292,7 @@ impl CommandPaletteState {
         let fill = inner_width.saturating_sub(title_len);
         let left_fill = fill / 2;
         let right_fill = fill - left_fill;
-        let top = format!(
-            "\u{256D}{}{}{}\u{256E}",
-            "\u{2500}".repeat(left_fill),
-            title,
-            "\u{2500}".repeat(right_fill),
-        );
+        let top = box_top_line_titled(left_fill, title, right_fill);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
@@ -311,7 +309,7 @@ impl CommandPaletteState {
             format!("> {}", self.input)
         };
         let padded_input = format!(
-            "\u{2502}{:<width$}\u{2502}",
+            "{BOX_VERTICAL}{:<width$}{BOX_VERTICAL}",
             input_display,
             width = inner_width
         );
@@ -324,7 +322,7 @@ impl CommandPaletteState {
         });
 
         // Separator.
-        let sep = format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width));
+        let sep = box_rule_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: start_y + 2,
@@ -358,7 +356,11 @@ impl CommandPaletteState {
 
             // Truncate to inner width.
             let truncated: String = full_entry.chars().take(inner_width).collect();
-            let padded = format!("\u{2502}{:<width$}\u{2502}", truncated, width = inner_width);
+            let padded = format!(
+                "{BOX_VERTICAL}{:<width$}{BOX_VERTICAL}",
+                truncated,
+                width = inner_width
+            );
 
             let row_fg = if is_selected { key_fg } else { fg };
             commands.push(DrawCommand {
@@ -373,7 +375,11 @@ impl CommandPaletteState {
         // If no entries, show "No matches".
         if visible_count == 0 {
             let msg = "  No matches";
-            let padded = format!("\u{2502}{:<width$}\u{2502}", msg, width = inner_width);
+            let padded = format!(
+                "{BOX_VERTICAL}{:<width$}{BOX_VERTICAL}",
+                msg,
+                width = inner_width
+            );
             commands.push(DrawCommand {
                 x: start_x,
                 y: start_y + 3,
@@ -389,7 +395,7 @@ impl CommandPaletteState {
         } else {
             start_y + 3 + visible_count as u16
         };
-        let bottom = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: bottom_y,

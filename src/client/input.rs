@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::client::chrome::SidebarEdge;
 use crate::client::command_palette::CommandPaletteState;
 use crate::client::registry::ConnId;
 use crate::config::keybindings::{
@@ -9,6 +10,9 @@ use crate::config::keybindings::{
     ShortcutBindings,
 };
 use crate::protocol::{Action, ClientAction, RemuxCommand};
+use crate::server::compositor::{
+    box_bottom_line, box_rule_line, box_top_line_titled, BOX_HORIZONTAL, BOX_VERTICAL,
+};
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -458,8 +462,24 @@ pub enum InputAction {
     ViewPickerConfirm { view: Option<usize> },
     /// The view picker was cancelled.
     ViewPickerClose,
+    /// A sidebar action the main loop applies to the `Chrome`.
+    Sidebar(SidebarIntent),
     /// No action to take.
     None,
+}
+
+/// What a sidebar `ClientAction` asks the main loop to do.
+///
+/// The chrome lives in the main loop, not in the `InputHandler`, so these are
+/// intents rather than mutations -- the same shape the view actions use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarIntent {
+    /// Show or hide the sidebar on this edge.
+    Toggle(crate::client::chrome::SidebarEdge),
+    /// Focus the sidebar on this edge, opening it if hidden.
+    Focus(crate::client::chrome::SidebarEdge),
+    /// Move focus to the next visible panel, then back to the content area.
+    Cycle,
 }
 
 // ---------------------------------------------------------------------------
@@ -634,12 +654,7 @@ impl FolderSelectOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
-            text: format!(
-                "\u{256D}{}{}{}\u{256E}",
-                "\u{2500}".repeat(left_b),
-                title,
-                "\u{2500}".repeat(right_b)
-            ),
+            text: box_top_line_titled(left_b, title, right_b),
             fg: border_fg,
             bg,
         });
@@ -667,7 +682,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -681,7 +696,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -697,7 +712,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -711,7 +726,7 @@ impl FolderSelectOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -719,7 +734,7 @@ impl FolderSelectOverlay {
 
         // Separator line
         let help_y = start_y + popup_height - 2;
-        let sep_line = format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_width));
+        let sep_line = box_rule_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_y,
@@ -730,7 +745,7 @@ impl FolderSelectOverlay {
 
         // Bottom border
         let help_line_y = start_y + popup_height - 1;
-        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_line = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_line_y,
@@ -829,12 +844,7 @@ impl ViewPickerOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
-            text: format!(
-                "\u{256D}{}{}{}\u{256E}",
-                "\u{2500}".repeat(left_b),
-                title,
-                "\u{2500}".repeat(right_b)
-            ),
+            text: box_top_line_titled(left_b, title, right_b),
             fg: border_fg,
             bg,
         });
@@ -861,7 +871,7 @@ impl ViewPickerOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -875,7 +885,7 @@ impl ViewPickerOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -886,7 +896,7 @@ impl ViewPickerOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: bottom_y,
-            text: format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width)),
+            text: box_bottom_line(inner_width),
             fg: border_fg,
             bg,
         });
@@ -993,7 +1003,32 @@ impl SessionSwitchOverlay {
                 }
             }
         }
+        // Keep the highlight on the entry the user had chosen, by IDENTITY
+        // (`(server, name)`), not by index.
+        //
+        // `rebuild` runs on every `SessionTree`, which is now also an
+        // unsolicited push on any structural change (the sidebar's session-tree
+        // panel subscribes to it). Local is prepended ahead of the remotes, so a
+        // merge for one server shifts every entry below it -- an index-preserved
+        // highlight silently retargets. A view row's index is stable here,
+        // because `rebuild` never touches `views`.
+        let previously_selected = self
+            .selected
+            .checked_sub(self.views.len())
+            .and_then(|i| self.entries.get(i))
+            .map(|e| (e.server.clone(), e.name.clone()));
+
         self.entries = entries;
+
+        if let Some((server, name)) = previously_selected {
+            if let Some(idx) = self
+                .entries
+                .iter()
+                .position(|e| e.server == server && e.name == name)
+            {
+                self.selected = self.views.len() + idx;
+            }
+        }
         // On the first merge that carries the current session, snap the
         // highlight to it so the popup opens showing which session is current.
         // If no current entry has arrived yet, leave `selection_initialized`
@@ -1109,12 +1144,7 @@ impl SessionSwitchOverlay {
         commands.push(DrawCommand {
             x: start_x,
             y: start_y,
-            text: format!(
-                "\u{256D}{}{}{}\u{256E}",
-                "\u{2500}".repeat(left_b),
-                title,
-                "\u{2500}".repeat(right_b)
-            ),
+            text: box_top_line_titled(left_b, title, right_b),
             fg: border_fg,
             bg,
         });
@@ -1129,18 +1159,21 @@ impl SessionSwitchOverlay {
         // session groups, under a labeled "Views" header. Selection indices
         // `0..views.len()` map to these rows.
         if !self.views.is_empty() && row_offset < popup_height - 1 {
-            let label = "\u{2500} Views ".to_string();
+            let label = format!("{BOX_HORIZONTAL} Views ");
             let label_chars = label.chars().count();
             let sep_text = if label_chars >= inner_width {
                 label.chars().take(inner_width).collect::<String>()
             } else {
-                format!("{label}{}", "\u{2500}".repeat(inner_width - label_chars))
+                format!(
+                    "{label}{}",
+                    BOX_HORIZONTAL.to_string().repeat(inner_width - label_chars)
+                )
             };
             let sep_y = start_y + row_offset;
             commands.push(DrawCommand {
                 x: start_x,
                 y: sep_y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1154,7 +1187,7 @@ impl SessionSwitchOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y: sep_y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1180,7 +1213,7 @@ impl SessionSwitchOverlay {
                 commands.push(DrawCommand {
                     x: start_x,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1194,7 +1227,7 @@ impl SessionSwitchOverlay {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1213,18 +1246,21 @@ impl SessionSwitchOverlay {
                 if row_offset >= popup_height - 1 {
                     break;
                 }
-                let label = format!("\u{2500} {} ", Self::server_display(&entry.server));
+                let label = format!("{BOX_HORIZONTAL} {} ", Self::server_display(&entry.server));
                 let label_chars = label.chars().count();
                 let sep_text = if label_chars >= inner_width {
                     label.chars().take(inner_width).collect::<String>()
                 } else {
-                    format!("{label}{}", "\u{2500}".repeat(inner_width - label_chars))
+                    format!(
+                        "{label}{}",
+                        BOX_HORIZONTAL.to_string().repeat(inner_width - label_chars)
+                    )
                 };
                 let sep_y = start_y + row_offset;
                 commands.push(DrawCommand {
                     x: start_x,
                     y: sep_y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1238,7 +1274,7 @@ impl SessionSwitchOverlay {
                 commands.push(DrawCommand {
                     x: start_x + 1 + inner_width as u16,
                     y: sep_y,
-                    text: "\u{2502}".to_string(),
+                    text: BOX_VERTICAL.to_string(),
                     fg: border_fg,
                     bg,
                 });
@@ -1273,7 +1309,7 @@ impl SessionSwitchOverlay {
             commands.push(DrawCommand {
                 x: start_x,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1287,7 +1323,7 @@ impl SessionSwitchOverlay {
             commands.push(DrawCommand {
                 x: start_x + 1 + inner_width as u16,
                 y,
-                text: "\u{2502}".to_string(),
+                text: BOX_VERTICAL.to_string(),
                 fg: border_fg,
                 bg,
             });
@@ -1296,7 +1332,7 @@ impl SessionSwitchOverlay {
 
         // Bottom border
         let help_line_y = start_y + popup_height - 1;
-        let bottom_line = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let bottom_line = box_bottom_line(inner_width);
         commands.push(DrawCommand {
             x: start_x,
             y: help_line_y,
@@ -1540,6 +1576,135 @@ impl InputHandler {
         key.code == self.leader_key.code && key.modifiers == self.leader_key.modifiers
     }
 
+    /// Whether any overlay is currently capturing keystrokes.
+    ///
+    /// These sit ON TOP of the mode (a rename prompt or the switcher runs with
+    /// `mode == Normal`), so a mode check alone does not see them. The sidebar
+    /// key routing asks this before claiming a key: an open overlay owns the
+    /// keyboard first.
+    pub fn has_overlay(&self) -> bool {
+        self.rename_overlay.is_some()
+            || self.command_palette.is_some()
+            || self.search_state.is_some()
+            || self.session_manager.is_some()
+            || self.folder_select.is_some()
+            || self.session_switch.is_some()
+            || self.view_picker.is_some()
+    }
+
+    /// Whether this key is a way into command mode: the configured leader, or a
+    /// shortcut bound to a group prefix (`"Alt-p" = "@p"`).
+    ///
+    /// A focused sidebar owns the keyboard, but never these: swallowing one
+    /// would make command mode unreachable from inside a panel. A group prefix
+    /// is a second entrance to the same place, so it earns the same exemption.
+    pub fn is_prefix_key(&self, key: &KeyEvent) -> bool {
+        if self.is_leader_key(key) {
+            return true;
+        }
+        self.mode == Mode::Normal
+            && matches!(
+                self.shortcut_bindings.lookup(key),
+                Some(InterceptAction::GroupPrefix(_))
+            )
+    }
+
+    /// Whether this key resolves to one of the sidebar `ClientAction`s.
+    ///
+    /// The same exemption `resolves_to_pane_focus` earns, for the same reason:
+    /// a focused sidebar that swallowed `SidebarCycle` would make the sidebar
+    /// commands unreachable from precisely the place they are most useful.
+    pub fn resolves_to_sidebar_action(&self, key: &KeyEvent) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
+            return false;
+        };
+        actions.iter().any(|a| {
+            matches!(
+                resolve_action(a),
+                Some(Action::Client(
+                    ClientAction::SidebarToggleLeft
+                        | ClientAction::SidebarToggleRight
+                        | ClientAction::SidebarToggleBottom
+                        | ClientAction::SidebarFocusLeft
+                        | ClientAction::SidebarFocusRight
+                        | ClientAction::SidebarFocusBottom
+                        | ClientAction::SidebarCycle
+                ))
+            )
+        })
+    }
+
+    /// Whether this key resolves to a `Resize*` command in the current mode.
+    ///
+    /// A focused sidebar RE-TARGETS these rather than swallowing them: the
+    /// resize adjusts the sidebar's own size or its focused panel's weight
+    /// (`chrome::intercept_resize`), which is the only way to adjust either.
+    /// Swallowing them would make a sidebar's own size unadjustable from the
+    /// one place the user is looking at it.
+    ///
+    /// Nothing leaks: `intercept_resize` consumes every `Resize*` while a
+    /// sidebar has focus, including one clamped to a no-op.
+    ///
+    /// EVERY action in the chain must be a `Resize*`, for the same reason
+    /// `resolves_to_pane_focus` demands it: the exemption passes the whole key
+    /// through, so a mixed chain would forward its other half to the server
+    /// while a panel has the keyboard.
+    pub fn resolves_to_resize(&self, key: &KeyEvent) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
+            return false;
+        };
+        !actions.is_empty()
+            && actions.iter().all(|a| {
+                matches!(
+                    resolve_action(a),
+                    Some(Action::Server(
+                        RemuxCommand::ResizeLeft(_)
+                            | RemuxCommand::ResizeRight(_)
+                            | RemuxCommand::ResizeUp(_)
+                            | RemuxCommand::ResizeDown(_)
+                    ))
+                )
+            })
+    }
+
+    /// Whether this key resolves to a `PaneFocus*` command in the current mode.
+    ///
+    /// Directional keys are the one command a focused sidebar does not take:
+    /// they are how the user gets back out, and `intercept_focus` decides what
+    /// they mean. Non-mutating, so it can be asked before `handle_key`.
+    ///
+    /// EVERY action in the chain must be a `PaneFocus*`, not just one of them:
+    /// the exemption passes the whole key through to `ExecuteChain`, so a mixed
+    /// chain like `"PaneFocusLeft; PaneKill"` would forward `PaneKill` to the
+    /// server while a panel has the keyboard. A mixed chain goes to the plugin
+    /// instead, like any other key.
+    pub fn resolves_to_pane_focus(&self, key: &KeyEvent) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        let Some(InterceptAction::Command(actions)) = self.shortcut_bindings.lookup(key) else {
+            return false;
+        };
+        !actions.is_empty()
+            && actions.iter().all(|a| {
+                matches!(
+                    resolve_action(a),
+                    Some(Action::Server(
+                        RemuxCommand::PaneFocusLeft
+                            | RemuxCommand::PaneFocusRight
+                            | RemuxCommand::PaneFocusUp
+                            | RemuxCommand::PaneFocusDown
+                    ))
+                )
+            })
+    }
+
     // -----------------------------------------------------------------------
     // Command mode
     // -----------------------------------------------------------------------
@@ -1660,7 +1825,7 @@ impl InputHandler {
     /// `InputAction` the main loop acts on.
     ///
     /// Every path that can name an action -- a keybinding leaf, an Alt
-    /// shortcut, the command palette -- funnels through here, so the nine
+    /// shortcut, the command palette -- funnels through here, so all sixteen
     /// client actions behave identically however they are reached.
     fn begin_client_action(&mut self, action: ClientAction) -> InputAction {
         match action {
@@ -1717,6 +1882,43 @@ impl InputHandler {
             ClientAction::ViewDelete => {
                 self.mode = Mode::Normal;
                 InputAction::ViewDelete
+            }
+            // Every sidebar action drops back to Normal first, exactly as the
+            // `View*` actions above do. Until the `b` which-key group existed
+            // these were only ever reached from a Normal-mode Alt shortcut, so
+            // the mode reset was invisible; reached from the command tree
+            // without it, the client would toggle the sidebar and then sit in
+            // Command mode swallowing the next keystroke. `EnterNormal` cannot
+            // patch this from the binding side -- `execute_action_chain`
+            // returns at the first client action, so a trailing `EnterNormal`
+            // in the chain never runs.
+            ClientAction::SidebarToggleLeft => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Left))
+            }
+            ClientAction::SidebarToggleRight => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Right))
+            }
+            ClientAction::SidebarToggleBottom => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Toggle(SidebarEdge::Bottom))
+            }
+            ClientAction::SidebarFocusLeft => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Left))
+            }
+            ClientAction::SidebarFocusRight => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Right))
+            }
+            ClientAction::SidebarFocusBottom => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Focus(SidebarEdge::Bottom))
+            }
+            ClientAction::SidebarCycle => {
+                self.mode = Mode::Normal;
+                InputAction::Sidebar(SidebarIntent::Cycle)
             }
         }
     }
@@ -2157,7 +2359,7 @@ impl InputHandler {
 
         // Handle sub-modes first.
         match &sm.sub_mode {
-            SubMode::ConfirmDelete(_) => {
+            SubMode::ConfirmDelete { .. } => {
                 return match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         let action = sm.handle_confirm_delete(true);
@@ -2627,9 +2829,22 @@ impl InputHandler {
         if current_folder.is_none() {
             folders.retain(|f| f != "(none)");
         }
+        // Keep the highlight on the folder the user had chosen, by NAME.
+        //
+        // This runs on every `SessionTree` the client receives, and since the
+        // sidebar's session-tree panel subscribes to the server's push, that is
+        // now every structural change anywhere -- not just the reply this
+        // overlay asked for. Rebuilding at index 0 would yank the selection back
+        // to the top whenever somebody else created a session.
+        let selected = self
+            .folder_select
+            .as_ref()
+            .and_then(|prev| prev.folders.get(prev.selected))
+            .and_then(|name| folders.iter().position(|f| f == name))
+            .unwrap_or(0);
         self.folder_select = Some(FolderSelectOverlay {
             folders,
-            selected: 0,
+            selected,
             session_name,
         });
     }
@@ -2886,7 +3101,7 @@ impl InputHandler {
 
 /// Convert a crossterm `KeyEvent` to the byte sequence that should be sent to
 /// a PTY. Returns `None` for key events that have no PTY representation.
-fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<Vec<u8>> {
+pub(crate) fn key_event_to_bytes(key: &KeyEvent, application_cursor_keys: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     // xterm's modifier parameter -- the encoding readline, vim, tmux and every
@@ -4096,6 +4311,44 @@ mod tests {
         assert_eq!(handler.mode, Mode::Normal);
     }
 
+    // -- Sidebar which-key tests --------------------------------------------
+
+    /// The `b` group's leaves must both fire the intent AND leave Command mode.
+    /// A sidebar action that returned its intent without resetting the mode
+    /// would toggle the sidebar and then eat the user's next keystroke as a
+    /// which-key key -- and no `EnterNormal` in the binding could fix it,
+    /// because `execute_action_chain` returns at the first client action.
+    #[test]
+    fn sidebar_group_leaves_fire_and_return_to_normal() {
+        let expected = [
+            ('h', SidebarIntent::Toggle(SidebarEdge::Left)),
+            ('l', SidebarIntent::Toggle(SidebarEdge::Right)),
+            ('j', SidebarIntent::Toggle(SidebarEdge::Bottom)),
+            // The `SidebarFocus*` leaves have no default binding -- see
+            // `sidebar_focus_actions_are_unbound_by_default_but_still_bindable`
+            // in `config::keybindings`. Bound from config they still produce
+            // `SidebarIntent::Focus`; the PTY harnesses bind them to `Alt-2`.
+            ('b', SidebarIntent::Cycle),
+        ];
+        for (key, intent) in expected {
+            let mut handler = InputHandler::with_defaults();
+            handler.mode = Mode::Command;
+            assert!(
+                matches!(
+                    handler.handle_key(char_key('b')),
+                    InputAction::ShowWhichKey { ref label, .. } if label == "Sidebar"
+                ),
+                "'b' should open the Sidebar which-key menu"
+            );
+            assert_eq!(
+                handler.handle_key(char_key(key)),
+                InputAction::Sidebar(intent),
+                "'b {key}'"
+            );
+            assert_eq!(handler.mode, Mode::Normal, "'b {key}' left Command mode on");
+        }
+    }
+
     // -- Rename overlay tests -----------------------------------------------
 
     #[test]
@@ -4806,13 +5059,14 @@ mod tests {
         ]);
         // Select the connected remote server node.
         let idx = sm
+            .model
             .rows
             .iter()
             .position(
                 |r| matches!(&r.node_type, NodeType::Server { id, .. } if *id == remote("mini")),
             )
             .unwrap();
-        sm.selected = idx;
+        sm.model.selected = idx;
         // The overlay opens with the search bar focused; this test drives the
         // tree, so hand focus over first (as Tab/Down/Enter would).
         sm.focus_tree();
@@ -4865,9 +5119,11 @@ mod tests {
             sessions: vec![SessionTreeEntry {
                 name: "proj".to_string(),
                 tabs: vec![TabTreeEntry {
+                    is_active: true,
                     id: 1,
                     name: "Tab 1".to_string(),
                     panes: vec![PaneTreeEntry {
+                        cwd: None,
                         id: 10,
                         name: "zsh".to_string(),
                         is_focused: true,
@@ -4880,23 +5136,25 @@ mod tests {
         sm.update_tree(remote("pi"), folders, Vec::new(), Vec::new());
         // Expand the remote server node so its session/tab rows appear.
         let sidx = sm
+            .model
             .rows
             .iter()
             .position(
                 |r| matches!(&r.node_type, NodeType::Server { id, .. } if *id == remote("pi")),
             )
             .unwrap();
-        sm.selected = sidx;
+        sm.model.selected = sidx;
         sm.expand_selected();
         // Select the remote tab row.
         let tidx = sm
+            .model
             .rows
             .iter()
             .position(
                 |r| matches!(&r.node_type, NodeType::Tab { server, .. } if *server == remote("pi")),
             )
             .unwrap();
-        sm.selected = tidx;
+        sm.model.selected = tidx;
         sm.focus_tree();
         handler.session_manager = Some(sm);
 
@@ -4945,9 +5203,11 @@ mod tests {
                 sessions: vec![SessionTreeEntry {
                     name: "alpha".to_string(),
                     tabs: vec![TabTreeEntry {
+                        is_active: true,
                         id: 1,
                         name: "editor".to_string(),
                         panes: vec![PaneTreeEntry {
+                            cwd: None,
                             id: 10,
                             name: "zsh".to_string(),
                             is_focused: true,
@@ -4974,7 +5234,7 @@ mod tests {
             assert!(matches!(a, InputAction::SessionManagerUpdate));
         }
         let sm = handler.session_manager.as_ref().unwrap();
-        assert_eq!(sm.query, "qd");
+        assert_eq!(sm.model.query, "qd");
         assert!(matches!(
             sm.sub_mode,
             crate::client::session_manager::SubMode::Navigate
@@ -4982,12 +5242,12 @@ mod tests {
 
         // Ctrl-U clears; Backspace pops.
         let _ = handler.handle_session_manager_key(ctrl_key('u'));
-        assert_eq!(handler.session_manager.as_ref().unwrap().query, "");
+        assert_eq!(handler.session_manager.as_ref().unwrap().model.query, "");
         let _ = handler.handle_session_manager_key(char_key('a'));
         let _ = handler.handle_session_manager_key(char_key('b'));
         let _ =
             handler.handle_session_manager_key(make_key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(handler.session_manager.as_ref().unwrap().query, "a");
+        assert_eq!(handler.session_manager.as_ref().unwrap().model.query, "a");
     }
 
     #[test]
@@ -4997,13 +5257,13 @@ mod tests {
         let sm = handler.session_manager.as_ref().unwrap();
         assert!(!sm.search_focused);
         // Focus moved without also moving the selection.
-        assert_eq!(sm.selected, 0);
+        assert_eq!(sm.model.selected, 0);
 
         // `j` now navigates instead of typing.
         let _ = handler.handle_session_manager_key(char_key('j'));
         let sm = handler.session_manager.as_ref().unwrap();
-        assert_eq!(sm.selected, 1);
-        assert!(sm.query.is_empty());
+        assert_eq!(sm.model.selected, 1);
+        assert!(sm.model.query.is_empty());
     }
 
     #[test]
@@ -5025,11 +5285,14 @@ mod tests {
         // Named exactly: `contains("alpha")` also passes for "tab 0 in 'alpha'",
         // which is what the old two-`j` navigation was actually landing on.
         assert!(
-            matches!(&sm.sub_mode, SubMode::ConfirmDelete(d) if d == "session 'alpha'"),
+            matches!(&sm.sub_mode, SubMode::ConfirmDelete { description: d, .. } if d == "session 'alpha'"),
             "expected the delete confirm for the filtered session, got {:?}",
             sm.sub_mode
         );
-        assert_eq!(sm.query, "alpha", "the query must survive the sub-mode");
+        assert_eq!(
+            sm.model.query, "alpha",
+            "the query must survive the sub-mode"
+        );
     }
 
     #[test]
@@ -5049,7 +5312,7 @@ mod tests {
         assert!(sm.search_focused);
         assert_eq!(sm.pending_chord(), None);
         assert!(
-            sm.query.is_empty(),
+            sm.model.query.is_empty(),
             "`/` must not type itself into the query"
         );
     }
@@ -5159,6 +5422,84 @@ mod tests {
         // highlight back to the current entry.
         handler.merge_session_switch(remote("mini"), vec![("x".to_string(), true, None)]);
         assert_eq!(handler.session_switch.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn session_switch_selection_follows_its_entry_when_the_list_shifts() {
+        // `rebuild` runs on every `SessionTree` -- which is now also an
+        // unsolicited push, because the sidebar's session-tree panel subscribes
+        // to it. Local is prepended ahead of the remotes, so a later Local merge
+        // shifts every remote entry down; an index-preserved highlight would
+        // silently retarget.
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        let mut overlay = SessionSwitchOverlay::new();
+        overlay.merge_server(
+            remote("mini"),
+            vec![
+                ("x".to_string(), false, None),
+                ("y".to_string(), false, None),
+            ],
+        );
+        handler.session_switch = Some(overlay);
+
+        // The user lands on the remote's second entry (moving also locks the
+        // preselect, so the snap cannot explain the result).
+        let _ = handler.handle_session_switch_key(char_key('j'));
+        let ss = handler.session_switch.as_ref().unwrap();
+        assert_eq!(ss.entries[ss.selected].name, "y");
+        assert!(ss.selection_initialized);
+
+        // A push for LOCAL arrives and prepends two entries.
+        handler.merge_session_switch(
+            ConnId::Local,
+            vec![
+                ("a".to_string(), false, None),
+                ("b".to_string(), false, None),
+            ],
+        );
+        let ss = handler.session_switch.as_ref().unwrap();
+        assert_eq!(ss.selected, 3, "the list must actually have shifted");
+        assert_eq!(ss.entries[ss.selected].name, "y");
+        assert_eq!(ss.entries[ss.selected].server, remote("mini"));
+    }
+
+    #[test]
+    fn folder_select_keeps_its_highlight_across_a_refresh() {
+        // Same reason: this rebuilds on every `SessionTree`, so a structural
+        // change made by anyone would otherwise yank the highlight to the top.
+        let mut handler = InputHandler::with_defaults();
+        handler.update_folder_list(
+            vec!["work".to_string(), "play".to_string()],
+            None,
+            "sess".to_string(),
+        );
+        let fs = handler.folder_select.as_mut().unwrap();
+        fs.selected = 1;
+        let want = fs.folders[1].clone();
+
+        handler.update_folder_list(
+            vec!["work".to_string(), "play".to_string()],
+            None,
+            "sess".to_string(),
+        );
+        let fs = handler.folder_select.as_ref().unwrap();
+        assert_eq!(fs.folders[fs.selected], want);
+    }
+
+    #[test]
+    fn folder_select_falls_back_to_the_top_when_its_folder_is_gone() {
+        let mut handler = InputHandler::with_defaults();
+        handler.update_folder_list(
+            vec!["work".to_string(), "play".to_string()],
+            None,
+            "sess".to_string(),
+        );
+        handler.folder_select.as_mut().unwrap().selected = 1;
+        handler.update_folder_list(vec!["work".to_string()], None, "sess".to_string());
+        let fs = handler.folder_select.as_ref().unwrap();
+        assert_eq!(fs.selected, 0);
+        assert!(fs.selected < fs.folders.len());
     }
 
     #[test]

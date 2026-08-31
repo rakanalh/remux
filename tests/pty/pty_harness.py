@@ -10,6 +10,29 @@ BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
 
 
+def _protocol_version():
+    """Read `PROTOCOL_VERSION` out of the source rather than restating it here.
+
+    The frame harness learned this the expensive way and the PTY side inherits
+    the lesson: a hard-coded copy goes stale SILENTLY, because the server is
+    deliberately lenient about skew (it logs the mismatch and proceeds, see
+    CLAUDE.md). A harness announcing v6 against a v10 server therefore keeps
+    passing while claiming to speak a protocol that no longer exists -- it is
+    not testing the wire it says it is. Reading the number is what makes it
+    true.
+    """
+    src = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "src", "protocol.rs")
+    for line in open(src):
+        if "pub const PROTOCOL_VERSION" in line:
+            return int(line.split("=")[1].strip().rstrip(";"))
+    raise SystemExit("could not read PROTOCOL_VERSION from src/protocol.rs")
+
+
+PROTOCOL_VERSION = _protocol_version()
+
+
 class Tui:
     def __init__(self, rundir, cols=120, rows=40, config=None):
         self.rundir = rundir

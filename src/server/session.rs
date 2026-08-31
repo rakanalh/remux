@@ -1359,17 +1359,25 @@ impl ServerState {
     /// `current_session` marks which session the requesting client is attached
     /// to. `client_counts` maps session name to the number of clients attached.
     /// `pane_names` maps pane IDs to display names (e.g. process name).
+    /// `pane_cwds` maps pane IDs to working directories; only the panes that end
+    /// up carrying a [`PaneTreeEntry::cwd`] are looked up in it, so the caller
+    /// need only resolve those (see [`send_session_tree_to`]).
+    ///
+    /// [`send_session_tree_to`]: crate::server::daemon
     pub fn build_session_tree(
         &self,
         current_session: Option<&str>,
         client_counts: &HashMap<String, usize>,
         pane_names: &HashMap<PaneId, String>,
+        pane_cwds: &HashMap<PaneId, String>,
     ) -> (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>) {
         let build_entry = |session: &Session| -> SessionTreeEntry {
             let tabs = session
                 .tabs
                 .iter()
-                .map(|tab| {
+                .enumerate()
+                .map(|(ti, tab)| {
+                    let is_active = ti == session.active_tab;
                     let panes = layout::all_pane_ids(&tab.layout)
                         .into_iter()
                         .map(|pid| PaneTreeEntry {
@@ -1379,12 +1387,22 @@ impl ServerState {
                                 .cloned()
                                 .unwrap_or_else(|| format!("pane-{}", pid)),
                             is_focused: pid == tab.focused_pane,
+                            // Only THE focused pane -- the active tab's -- gets a
+                            // cwd. Every tab marks its own `focused_pane`, so
+                            // filling them all would hand a consumer several
+                            // equally-focused directories and no way to choose.
+                            cwd: if is_active && pid == tab.focused_pane {
+                                pane_cwds.get(&pid).cloned()
+                            } else {
+                                None
+                            },
                         })
                         .collect();
                     TabTreeEntry {
                         id: tab.id,
                         name: tab.name.clone(),
                         panes,
+                        is_active,
                     }
                 })
                 .collect();
@@ -2448,7 +2466,8 @@ mod tests {
         let state = ServerState::new();
         let counts = HashMap::new();
         let pane_names = HashMap::new();
-        let (folders, unfiled) = state.build_session_tree(None, &counts, &pane_names);
+        let (folders, unfiled) =
+            state.build_session_tree(None, &counts, &pane_names, &HashMap::new());
         assert!(folders.is_empty());
         assert!(unfiled.is_empty());
     }
@@ -2479,7 +2498,8 @@ mod tests {
         counts.insert("proj".to_string(), 2);
         let pane_names = HashMap::new();
 
-        let (folders, unfiled) = state.build_session_tree(Some("proj"), &counts, &pane_names);
+        let (folders, unfiled) =
+            state.build_session_tree(Some("proj"), &counts, &pane_names, &HashMap::new());
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0].name, "work");
         assert_eq!(folders[0].sessions.len(), 1);
@@ -2514,7 +2534,7 @@ mod tests {
         pane_names.insert(1, "zsh".to_string());
         pane_names.insert(2, "vim".to_string());
 
-        let (_, unfiled) = state.build_session_tree(None, &counts, &pane_names);
+        let (_, unfiled) = state.build_session_tree(None, &counts, &pane_names, &HashMap::new());
         assert_eq!(unfiled.len(), 1);
         assert_eq!(unfiled[0].tabs.len(), 2);
         // First tab should have pane with name "zsh"
@@ -2562,7 +2582,7 @@ mod tests {
             }
         }
 
-        let (_, unfiled) = state.build_session_tree(None, &counts, &pane_names);
+        let (_, unfiled) = state.build_session_tree(None, &counts, &pane_names, &HashMap::new());
         assert_eq!(unfiled.len(), 1);
         // The custom name must win over the auto-detected process name.
         assert_eq!(unfiled[0].tabs[0].panes[0].name, "XYZZY");

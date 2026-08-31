@@ -6,7 +6,25 @@ server with isolated XDG dirs and a short socket path.
 import json, os, shutil, socket, struct, subprocess, time
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
-PROTOCOL_VERSION = 4
+
+
+def _protocol_version():
+    """Read `PROTOCOL_VERSION` out of the source rather than restating it here.
+
+    A hard-coded copy went stale silently: the server is deliberately LENIENT
+    about skew (it logs and proceeds, see CLAUDE.md), so a harness announcing an
+    old version kept passing while claiming to speak a protocol that no longer
+    existed. Reading it is what makes the number true.
+    """
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "src", "protocol.rs")
+    for line in open(src):
+        if "pub const PROTOCOL_VERSION" in line:
+            return int(line.split("=")[1].strip().rstrip(";"))
+    raise SystemExit("could not read PROTOCOL_VERSION from src/protocol.rs")
+
+
+PROTOCOL_VERSION = _protocol_version()
 
 
 class Server:
@@ -68,29 +86,44 @@ class Client:
         b = json.dumps(obj).encode()
         self.s.sendall(struct.pack(">I", len(b)) + b)
 
+    def _fill(self):
+        """Read one chunk; EOF raises rather than spinning forever (the server
+        drops the connection on an undecodable message, and a bare `recv` would
+        then return b"" in a tight loop instead of surfacing the close)."""
+        chunk = self.s.recv(65536)
+        if not chunk:
+            raise ConnectionError("server closed the connection")
+        self.buf += chunk
+
     def recv(self):
         while len(self.buf) < 4:
-            self.buf += self.s.recv(65536)
+            self._fill()
         n = struct.unpack(">I", self.buf[:4])[0]
         while len(self.buf) < 4 + n:
-            self.buf += self.s.recv(65536)
+            self._fill()
         body, self.buf = self.buf[4:4 + n], self.buf[4 + n:]
         return json.loads(body)
 
     def drain(self, t=0.6):
-        """Collect all messages arriving within t seconds."""
+        """Collect all messages arriving within t seconds.
+
+        A closed connection is RAISED, not swallowed. Returning `[]` for it
+        would make every "no messages arrived" assertion pass unconditionally
+        once the server dropped the peer -- a zero-count check that cannot tell
+        "nothing was sent" from "there is nobody to send to" is not a check.
+        """
         out = []
         end = time.time() + t
         old = self.s.gettimeout()
-        while time.time() < end:
-            self.s.settimeout(0.1)
-            try:
-                out.append(self.recv())
-            except socket.timeout:
-                pass
-            except Exception:
-                break
-        self.s.settimeout(old)
+        try:
+            while time.time() < end:
+                self.s.settimeout(0.1)
+                try:
+                    out.append(self.recv())
+                except socket.timeout:
+                    pass
+        finally:
+            self.s.settimeout(old)
         return out
 
     def hello(self):

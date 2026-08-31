@@ -4,7 +4,6 @@
 //! helpers, and the main server event loop.
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use crate::config::{BorderStyle, Config};
 use crate::protocol;
 use crate::protocol::*;
 use crate::screen::Screen;
+use crate::server::browse;
 use crate::server::compositor::{
     composite, fits_zellij_border, hit_test, is_multi_stack, pane_content_rect, ClickTarget,
     HitRegions, MouseSelection, StatusInfo,
@@ -29,7 +29,7 @@ use crate::server::layout::{
     self, BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::server::persistence::{self, PersistedState};
-use crate::server::pty::{self, Pty};
+use crate::server::pty::{self, PaneIdentity, Pty};
 use crate::server::session::{self, Folder, ServerState, Session};
 
 /// In-memory store of dormant (saved-but-not-live) sessions.
@@ -51,13 +51,221 @@ pub type DormantStore = Arc<Mutex<PersistedState>>;
 /// mixes differently-sized frames.
 pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
 
-/// Read the process name from `/proc/<pid>/comm`.
+/// The name of the process with this pid, e.g. `"zsh"` or `"claude"`.
 ///
-/// Falls back to `"shell"` if the file is unreadable.
-fn get_process_name(pid: i32) -> String {
+/// Falls back to `"shell"` when it cannot be determined, which is what a pane
+/// with no readable process is labelled in the session tree.
+///
+/// Shared with [`crate::server::agents`], which hands it a foreground process
+/// GROUP id rather than a pane's child pid. One reader, two callers -- and the
+/// reason this is platform-split rather than Linux-only: agent detection reads
+/// `/proc/<pgid>/comm` THROUGH here, so a macOS server that always answered
+/// `"shell"` could never match a configured agent command, and
+/// [`crate::server::agents::DETECTION_SUPPORTED`] had to report `false` to stop
+/// the panel from looking merely empty. Teaching this function macOS is what
+/// lets that constant say `true` there. It fixes macOS pane NAMES at the same
+/// time, which had the identical fallback.
+///
+/// The Linux arm: `/proc/<pid>/comm`.
+#[cfg(target_os = "linux")]
+pub(crate) fn get_process_name(pid: i32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "shell".to_string())
+}
+
+/// The one `sysinfo::System` this module owns, built on first use.
+///
+/// Hoisted out of [`get_process_name`] so [`get_process_names`] can share it
+/// rather than construct a second: on macOS `System::new()` calls
+/// `mach_host_self()`, reads the host clock info, enumerates CPUs and allocates
+/// a 200-slot process map before the refresh that does the work, and both
+/// callers run per candidate pane at up to 10 Hz. Refresh kinds are per-CALL,
+/// so sharing the `System` costs the two callers nothing in what they read.
+///
+/// Still a different one from [`crate::server::persistence::get_pane_cwd`]'s:
+/// that one is private to its function, refreshes a different field (`cwd`) and
+/// is driven by a different push. Sharing across modules would couple two
+/// cadences for no gain.
+#[cfg(target_os = "macos")]
+fn proc_system() -> &'static std::sync::Mutex<sysinfo::System> {
+    use std::sync::{Mutex, OnceLock};
+    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+    SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()))
+}
+
+/// See the Linux variant for documentation. macOS reads the name through
+/// `sysinfo` because there is no `/proc` filesystem.
+///
+/// The `System` is built ONCE and reused, for the reason
+/// [`crate::server::persistence::get_pane_cwd`]'s macOS arm gives at length:
+/// `System::new()` on macOS calls `mach_host_self()`, reads the host clock
+/// info, enumerates CPUs and allocates a 200-slot process map before the
+/// refresh that does the work. This one is called once per candidate pane on
+/// the agents pusher's cadence -- up to 10 Hz while an agent is `Working` --
+/// so a per-call construction would put all of that on a timer.
+///
+/// The `System` is [`proc_system`]'s, shared with [`get_process_names`] and
+/// deliberately NOT `get_pane_cwd`'s -- see `proc_system`'s own docs for why the
+/// line is drawn there. The cost is one more retained `Process` entry per pid
+/// ever queried, bounded by the panes this server has looked at and dropped as
+/// soon as a refresh finds the process dead.
+///
+/// `ProcessRefreshKind::nothing()` is deliberate and sufficient: the process
+/// NAME is base information populated when `sysinfo` first sees the process, not
+/// one of the opt-in fields (`cwd`, `cmd`, `exe`, `environ`, `user`) that need a
+/// `with_*`. Asking for more would refresh data nothing here reads.
+///
+/// A poisoned lock is recovered from rather than propagated, as there: a
+/// panicking caller must not cost every later pane its name.
+#[cfg(target_os = "macos")]
+pub(crate) fn get_process_name(pid: i32) -> String {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+
+    if pid <= 0 {
+        return "shell".to_string();
+    }
+    let spid = Pid::from_u32(pid as u32);
+    let mut system = proc_system()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(spid)
+        .map(|p| p.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| "shell".to_string())
+}
+
+/// Fallback for platforms with no known way to name a foreign process. Always
+/// `"shell"` -- and [`crate::server::agents::DETECTION_SUPPORTED`] is `false`
+/// there, so the agents panel says it cannot know rather than showing an empty
+/// list that reads as "no agents".
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn get_process_name(_pid: i32) -> String {
+    "shell".to_string()
+}
+
+/// Every name by which this OS will admit to knowing `pid`.
+///
+/// [`get_process_name`] alone is not enough to RECOGNISE a program, because the
+/// two platforms answer a different question and for some programs the two
+/// answers disagree:
+///
+/// * Linux `/proc/<pid>/comm` is a process TITLE. It starts as the executable's
+///   basename, and a process may then set it to whatever it likes
+///   (`prctl(PR_SET_NAME)`, which is what `process.title =` compiles down to in
+///   every Node/Bun-shaped runtime).
+/// * macOS `sysinfo` reports `exe.file_name()` -- the EXECUTABLE PATH's
+///   basename, from `KERN_PROCARGS2`'s `exec_path` or `proc_pidpath`
+///   (`sysinfo-0.35.2/src/unix/apple/macos/process.rs:574` and `:439`). It never
+///   reads `p_comm`, and no title a process sets for itself can move it.
+///
+/// Claude Code is exactly the program that falls in the gap. Its installer
+/// execs a VERSIONED path with `argv[0] = "claude"`:
+///
+/// ```text
+/// comm=claude exe=/home/rakan/.local/share/claude/versions/2.1.251
+///     argv: claude --dangerously-skip-permissions --resume
+/// ```
+///
+/// so Linux says `claude` (the title the binary sets) while macOS says
+/// `2.1.251` (the executable's real basename) -- and `2.1.251` matches nothing
+/// in `[agents] commands`, which is the whole of the "the agents panel is empty
+/// on my Mac" report. `argv[0]` is the name both platforms agree on, so it is
+/// carried alongside as the second candidate.
+///
+/// **This is deliberately NOT [`get_process_name`].** Pane names keep reading
+/// `comm` alone: that runs per live pane from the session-tree push while three
+/// locks are held, and it has no naming problem to fix.
+pub(crate) struct ProcessNames {
+    /// Whatever [`get_process_name`] reports. Never empty -- `"shell"` when the
+    /// process cannot be read at all.
+    pub name: String,
+    /// The process's `argv[0]`, VERBATIM: a bare word (`claude`), a path
+    /// (`/usr/local/bin/claude`), or a login shell's leading-dash convention
+    /// (`-zsh`). Reducing it to a name is the caller's job and is a pure
+    /// function, which is why it is not done here. `None` when the OS will not
+    /// say.
+    pub argv0: Option<String>,
+}
+
+/// The Linux arm: `comm`, plus the first NUL-separated field of
+/// `/proc/<pid>/cmdline`.
+///
+/// The `cmdline` read is UNCONDITIONAL rather than taken only when `comm` fails
+/// to match, and that is a deliberate trade. Making it lazy would save one small
+/// procfs read per non-agent pane per sample (single-digit microseconds, against
+/// a `tcgetpgrp` syscall and a `comm` read already paid on the same pass) and
+/// would cost the macOS arm a SECOND `KERN_PROCARGS2` round trip, because
+/// `sysinfo` re-runs it on every `refresh_processes_specifics` regardless of the
+/// refresh kind. Cheap where it is paid, avoided where it is dear.
+#[cfg(target_os = "linux")]
+pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
+    ProcessNames {
+        name: get_process_name(pid),
+        argv0: std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .and_then(|raw| {
+                let first = raw.split(|b| *b == 0).next()?;
+                (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
+            }),
+    }
+}
+
+/// See the Linux variant for documentation. macOS reads both through `sysinfo`,
+/// in ONE refresh.
+///
+/// One refresh and not two: `update_process` re-runs the `KERN_PROCARGS2`
+/// sysctl pair on every refresh whatever the `ProcessRefreshKind`
+/// (`sysinfo-0.35.2/src/unix/apple/macos/process.rs:700`), so asking for the
+/// name and then the args separately would fetch the whole args-and-environment
+/// buffer twice per pane per sample. Folding them into one call makes the extra
+/// data free: the buffer is already in hand and `with_cmd` only parses it.
+///
+/// `UpdateKind::OnlyIfNotSet` rather than `Always` because `argv[0]` does not
+/// change over a process's life, so the parse is paid once per pid.
+#[cfg(target_os = "macos")]
+pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+
+    let unknown = || ProcessNames {
+        name: "shell".to_string(),
+        argv0: None,
+    };
+    if pid <= 0 {
+        return unknown();
+    }
+    let spid = Pid::from_u32(pid as u32);
+    let mut system = proc_system()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    match system.process(spid) {
+        Some(p) => ProcessNames {
+            name: p.name().to_string_lossy().to_string(),
+            argv0: p.cmd().first().map(|a| a.to_string_lossy().to_string()),
+        },
+        None => unknown(),
+    }
+}
+
+/// Fallback for platforms with no known way to name a foreign process. The name
+/// is `"shell"` and there is no `argv[0]`, so nothing can ever match -- which is
+/// what [`crate::server::agents::DETECTION_SUPPORTED`] reports as `false`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
+    ProcessNames {
+        name: get_process_name(pid),
+        argv0: None,
+    }
 }
 
 /// Return the runtime directory used for the socket and pid files.
@@ -131,6 +339,13 @@ struct PaneData {
     screen: Screen,
     /// Receiving end for PTY output from the background reader task.
     pty_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// The background reader task feeding `pty_rx`.
+    ///
+    /// Held so it can be aborted when the pane goes away. Dropping a
+    /// `JoinHandle` detaches the task rather than stopping it, and a reader left
+    /// running holds an epoll registration on a descriptor number that the next
+    /// PTY will be handed -- see `pty::start_reader` for what that cost.
+    reader: tokio::task::JoinHandle<()>,
     /// True once a PTY-forwarding task has been spawned for this pane.
     /// start_pty_forwarding is called from many sites (attach, session/tab
     /// switches); without this guard each call would spawn a competing task
@@ -142,6 +357,39 @@ struct PaneData {
     /// (so cells flip live between the "Active in session" placeholder and the
     /// streamed content), while steady state stays quiet.
     streamed_session_visible: bool,
+    /// When bytes last reached this pane's [`Screen`].
+    ///
+    /// Per PANE, not per tab. `Tab::activity` deliberately ignores the
+    /// foreground tab (`record_pane_activity` returns early for it), which is
+    /// exactly the tab an agents panel most needs to be right about, so it
+    /// cannot be the source for this.
+    last_output: std::time::Instant,
+    /// The last agent verdict LOGGED for this pane: its state and its
+    /// sample-independent reason.
+    ///
+    /// Kept only so the classification is logged when it CHANGES rather than
+    /// ten times a second. `None` for a pane that has never been classified --
+    /// which is most of them, since a pane running no agent is never sampled.
+    ///
+    /// **Not the explain STRING, which is what this used to be and is why the
+    /// dedup did nothing.** `Verdict::why` embeds the elapsed milliseconds, so
+    /// two consecutive samples of a pane that had not moved compared UNEQUAL and
+    /// both logged -- per agent pane, at up to ten samples a second, into a log
+    /// that is never rotated and (`main.rs` pins the logger at `Debug`) can
+    /// never be turned down. A user reported 586 MB in about a day.
+    /// [`crate::server::agents::Reason`] is the same reason with that number
+    /// taken out.
+    agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
+}
+
+impl Drop for PaneData {
+    fn drop(&mut self) {
+        // Stop the reader with the pane. Its descriptor is its own, so the abort
+        // is about not leaking a task (and the dup with it) for a pane whose
+        // child left a grandchild holding the slave open -- the read would never
+        // reach EOF and the task would park forever.
+        self.reader.abort();
+    }
 }
 
 // MouseSelection is imported from compositor.
@@ -231,6 +479,23 @@ struct ClientConnection {
     /// start_y, end_x, end_y)` in the pane's content coordinates, replayed by
     /// the ticker task while a cell drag rests on a scrollable content edge.
     pane_autoscroll_repeat: Option<(PaneId, u16, u16, u16, u16)>,
+    /// Set by `SubscribeSessionTree`: this client receives an unsolicited
+    /// [`ServerMessage::SessionTree`] whenever the structure changes, instead
+    /// of polling with `ListSessionTree`.
+    ///
+    /// Per-connection and independent of attachment, exactly like
+    /// [`ClientConnection::subscribed_panes`]. Living here rather than in a
+    /// side table is what makes disconnect cleanup automatic: dropping the
+    /// `ClientConnection` in [`handle_client_disconnect`] drops the
+    /// subscription with it, so there is no second registry to leak.
+    session_tree_subscribed: bool,
+    /// Set by [`ClientMessage::SubscribeAgents`]: this client receives an
+    /// unsolicited [`ServerMessage::AgentList`] whenever agent state changes.
+    ///
+    /// A second flag rather than a mode of `session_tree_subscribed`, because
+    /// the two payloads are dirtied by different things -- structure versus
+    /// pane output -- and a client wanting one must not pay for the other.
+    agents_subscribed: bool,
 }
 
 /// The Remux server.
@@ -339,6 +604,56 @@ impl RemuxServer {
             .context("registering SIGTERM handler")?;
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("registering SIGINT handler")?;
+
+        // Session-tree push task. Sleeping a full interval after each broadcast
+        // is the coalescing: every change arriving during that sleep collapses
+        // into the single permit `Notify` holds, so a burst of structural
+        // commands costs subscribers one extra push rather than one per
+        // command. The first change after a quiet period goes out immediately
+        // (the task is parked on `notified()`, which consumes the permit at
+        // once), so the common case is not delayed. Idle costs nothing.
+        {
+            let state = Arc::clone(&server.state);
+            let panes = Arc::clone(&server.panes);
+            let clients = Arc::clone(&server.clients);
+            let dormant = Arc::clone(&server.dormant);
+            tokio::spawn(async move {
+                loop {
+                    SESSION_TREE_DIRTY.notified().await;
+                    broadcast_session_tree(&state, &panes, &clients, &dormant).await;
+                    tokio::time::sleep(SESSION_TREE_PUSH_INTERVAL).await;
+                }
+            });
+        }
+
+        // Agent push task: the same coalescing shape as the session tree above,
+        // on its own signal (see `AGENTS_DIRTY`), plus one addition. Output
+        // drives every transition except `Working` -> `Idle`, which is caused by
+        // the ABSENCE of output and so can wake nobody. The tick covers exactly
+        // that, and is armed only while something is actually `Working`, so an
+        // idle server -- or one with no agents panel attached -- parks on the
+        // `Notify` and costs nothing.
+        {
+            let state = Arc::clone(&server.state);
+            let panes = Arc::clone(&server.panes);
+            let clients = Arc::clone(&server.clients);
+            let config = Arc::clone(&server.config);
+            tokio::spawn(async move {
+                let mut ticking = false;
+                loop {
+                    if ticking {
+                        tokio::select! {
+                            _ = AGENTS_DIRTY.notified() => {}
+                            _ = tokio::time::sleep(AGENTS_DECAY_TICK) => {}
+                        }
+                    } else {
+                        AGENTS_DIRTY.notified().await;
+                    }
+                    ticking = broadcast_agents(&state, &panes, &clients, &config).await;
+                    tokio::time::sleep(AGENTS_PUSH_INTERVAL).await;
+                }
+            });
+        }
 
         // Periodic tick that promotes quiet background `Activity` tabs to
         // `Silent` ("finished"). Runs in the real server binary, so
@@ -514,6 +829,8 @@ impl RemuxServer {
                     pane_selection: std::collections::HashMap::new(),
                     pane_drag: None,
                     pane_autoscroll_repeat: None,
+                    session_tree_subscribed: false,
+                    agents_subscribed: false,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -690,6 +1007,51 @@ impl RemuxServer {
 // Message handling
 // ---------------------------------------------------------------------------
 
+/// Say which directory a panel asked for -- ONCE per distinct path, per client.
+///
+/// The `files` panel re-lists itself **every 2 seconds while it is placed, for
+/// ever** (see `sidebar/files.rs`), so through the catch-all this was a
+/// timer-driven line writing roughly 43k entries a day per placed panel into a
+/// log that is never rotated and that `main.rs` pins at `Debug` with no
+/// `RUST_LOG` to turn down. That is the same unbounded shape as the agents
+/// classification line and the compositor's per-frame lines, and it is fixed
+/// the same way: on CHANGE, not on sample.
+///
+/// The PATH is kept rather than counted. It is the whole diagnostic -- "the
+/// panel is empty" is answered by what it asked for -- and a path is not a
+/// credential; see the summary match's own comment for where that line is
+/// drawn. Nothing here is gated behind a level, because there is no level to
+/// gate it behind.
+///
+/// Keyed per CLIENT, since two clients can browse different directories and a
+/// single global "last path" would make them log each other's polls for ever.
+/// The cache is CLEARED rather than evicted when it fills, exactly as
+/// [`crate::server::agents`]'s detection cache is and for the same reason: it
+/// exists to suppress repeats, not to remember, so the worst a clear costs is
+/// one repeated line.
+fn log_list_directory(client_id: u64, path: &str) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Clients remembered before starting over.
+    const CAP: usize = 64;
+    static LAST: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.len() >= CAP {
+        last.clear();
+    }
+    if last.get(&client_id).map(String::as_str) == Some(path) {
+        return;
+    }
+    last.insert(client_id, path.to_string());
+    drop(last);
+    log::debug!("server: client_id={client_id} msg=ListDirectory(path={path:?})");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     client_id: u64,
@@ -702,12 +1064,62 @@ async fn handle_client_message(
     dormant: &DormantStore,
 ) -> Result<()> {
     // Log a summary of every incoming client message.
+    //
+    // **Anything the user TYPED is summarised, never printed.** `server.log` is
+    // plaintext, unrotated and never pruned -- one user's reached 586 MB in
+    // about a day -- and `main.rs` pins the logger at `Debug` with no
+    // `RUST_LOG`, so nothing a user can set turns any of this off. Whatever
+    // lands here stays on disk indefinitely.
+    //
+    // The three arms below carry content; the catch-all `{other:?}` Debug-prints
+    // whole structs, so a variant carrying typed bytes MUST have an arm here or
+    // it leaks verbatim. `Input` always had one. `InputToPane` and `CliSpawn`
+    // arrived later and did not, and both leaked in full: `InputToPane` prints
+    // its `Vec<u8>` as `[99, 111, 114, ...]` (full fidelity, trivially decoded)
+    // and it is how every keystroke reaches a VIEW cell, so a passphrase typed
+    // into a view was on disk; `CliSpawn` printed `argv` as plain strings, and
+    // `remux split -- psql postgresql://user:pass@host/db` is an ordinary thing
+    // to run.
+    //
+    // The line drawn is CONTENT, not "is it noisy" and not "did the user name
+    // it". NAMES stay -- session, folder, tab, view -- because they are labels
+    // the user chose to see in a UI, they are already logged verbatim by their
+    // own handlers, and redacting only the copy in this match would be theatre.
+    // PATHS stay for the same reason plus one more: a path IS the diagnostic
+    // for the panel messages that carry one. A credential is not a name and is
+    // not a path.
     match &msg {
         ClientMessage::Input { data } => {
             log::debug!(
                 "server: client_id={client_id} msg=Input({} bytes)",
                 data.len()
             );
+        }
+        ClientMessage::InputToPane { pane_id, data } => {
+            log::debug!(
+                "server: client_id={client_id} msg=InputToPane(pane_id={pane_id}, {} bytes)",
+                data.len()
+            );
+        }
+        ClientMessage::CliSpawn {
+            session,
+            placement,
+            argv,
+            cwd,
+        } => {
+            // The PROGRAM, then a count. Which binary was asked for is the
+            // whole diagnostic value of this line ("it tried to run `psql`");
+            // its arguments are where a connection string or an API key lives.
+            log::debug!(
+                "server: client_id={client_id} msg=CliSpawn(session={session:?}, \
+                 placement={placement:?}, program={:?}, {} more arg(s), cwd={})",
+                argv.first(),
+                argv.len().saturating_sub(1),
+                if cwd.is_some() { "set" } else { "none" }
+            );
+        }
+        ClientMessage::ListDirectory { path } => {
+            log_list_directory(client_id, path);
         }
         ClientMessage::ScrollDelta { delta } => {
             log::debug!("server: client_id={client_id} msg=ScrollDelta(delta={delta})");
@@ -731,7 +1143,7 @@ async fn handle_client_message(
 
     match msg {
         ClientMessage::Attach { session_name } => {
-            handle_attach(
+            let result = handle_attach(
                 client_id,
                 &session_name,
                 state,
@@ -741,10 +1153,16 @@ async fn handle_client_message(
                 prev_frames,
                 dormant,
             )
-            .await
+            .await;
+            // The tree's `client_count` and `is_current` are derived from the
+            // client map, so attaching changes what every subscriber renders --
+            // not only what this client renders.
+            mark_session_tree_dirty();
+            result
         }
         ClientMessage::Detach => {
             handle_detach(client_id, clients).await;
+            mark_session_tree_dirty();
             // Detaching may make this client's active-tab panes no longer
             // session-visible; re-evaluate subscribed panes so any View cell on
             // them flips from the "Active in session" placeholder to live content.
@@ -798,16 +1216,73 @@ async fn handle_client_message(
             )
             .await;
             save_if_enabled(state, panes, config, dormant).await;
+            mark_session_tree_dirty();
             result
         }
         ClientMessage::ListSessions => handle_list_sessions(client_id, state, clients).await,
         ClientMessage::KillSession { name } => {
             let result = handle_kill_session(&name, state, panes, clients).await;
             save_if_enabled(state, panes, config, dormant).await;
+            mark_session_tree_dirty();
             result
         }
         ClientMessage::ListSessionTree => {
             handle_list_session_tree(client_id, state, panes, clients, dormant).await
+        }
+        ClientMessage::SubscribeSessionTree => {
+            {
+                let mut cls = clients.lock().await;
+                if let Some(conn) = cls.get_mut(&client_id) {
+                    conn.session_tree_subscribed = true;
+                }
+            }
+            // Answer at once, so a subscriber's panel is populated immediately
+            // rather than staying blank until the next structural change.
+            send_session_tree_to(&[client_id], state, panes, clients, dormant).await;
+            Ok(())
+        }
+        ClientMessage::UnsubscribeSessionTree => {
+            let mut cls = clients.lock().await;
+            if let Some(conn) = cls.get_mut(&client_id) {
+                conn.session_tree_subscribed = false;
+            }
+            Ok(())
+        }
+        ClientMessage::SubscribeAgents => {
+            {
+                let mut cls = clients.lock().await;
+                if let Some(conn) = cls.get_mut(&client_id) {
+                    conn.agents_subscribed = true;
+                }
+            }
+            // Answer at once, so a subscriber's panel is populated immediately
+            // rather than staying blank until the next agent output.
+            let any_working = send_agents_to(&[client_id], state, panes, clients, config).await;
+            // And WAKE THE PUSHER, whatever that answer was.
+            //
+            // The pusher's decay tick is armed only by what `broadcast_agents`
+            // returns. If it last ran with nobody subscribed it parked
+            // unarmed -- and `Working` -> `Idle` is caused by the ABSENCE of
+            // output, so nothing else was ever going to wake it. A client
+            // subscribing inside the working window would be told `Working` and
+            // then sit on it for ever, self-healing only if some pane happened
+            // to produce output. Narrow at the 500ms default and proportionally
+            // wider for anyone who raises `working_ms` to stop flapping.
+            //
+            // Unconditional rather than `if any_working`: this reply went to ONE
+            // client, and the pusher's own next pass is what re-reads the whole
+            // subscriber set. `any_working` is logged rather than acted on here
+            // because acting on it would be reasoning about the wrong set.
+            log::debug!("server: SubscribeAgents client_id={client_id} any_working={any_working}");
+            mark_agents_dirty();
+            Ok(())
+        }
+        ClientMessage::UnsubscribeAgents => {
+            let mut cls = clients.lock().await;
+            if let Some(conn) = cls.get_mut(&client_id) {
+                conn.agents_subscribed = false;
+            }
+            Ok(())
         }
         ClientMessage::ResurrectSession { name } => {
             let result = handle_resurrect_session(
@@ -821,6 +1296,7 @@ async fn handle_client_message(
             )
             .await;
             save_if_enabled(state, panes, config, dormant).await;
+            mark_session_tree_dirty();
             result
         }
         ClientMessage::RequestScrollback => {
@@ -938,19 +1414,25 @@ async fn handle_client_message(
             Ok(())
         }
         ClientMessage::RequestScrollbackInfo => {
-            let (session_name, focused_pane_id) = {
+            // Take `clients` and RELEASE it before touching `state`. Holding it
+            // across the `state` lock would be a `clients -> state` order, and
+            // every other path here -- `handle_list_sessions`, `handle_attach`,
+            // `send_session_tree_to` -- takes `state -> clients`. Two tasks on
+            // the two orders deadlock the whole daemon, and the session-tree
+            // pusher now runs `state -> clients` on a background task whenever
+            // anyone is subscribed, which a sidebar does permanently.
+            let session_name = {
                 let cls = clients.lock().await;
-                let session_name = cls.get(&client_id).and_then(|c| c.session_name.clone());
-                if let Some(ref sn) = session_name {
+                cls.get(&client_id).and_then(|c| c.session_name.clone())
+            };
+            let focused_pane_id = match session_name {
+                Some(ref sn) => {
                     let st = state.lock().await;
-                    let fp = st
-                        .sessions
+                    st.sessions
                         .get(sn)
-                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane));
-                    (session_name, fp)
-                } else {
-                    (None, None)
+                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
                 }
+                None => None,
             };
             if let (Some(_sn), Some(fp)) = (session_name, focused_pane_id) {
                 let total_lines = {
@@ -1017,6 +1499,83 @@ async fn handle_client_message(
             // size; recompute and re-stream if it changed.
             recompute_pane_size(pane_id, state, panes, clients, config).await;
             Ok(())
+        }
+        ClientMessage::ListDirectory { path } => {
+            // Blocking filesystem work off the executor. A `read_dir` over a
+            // cold NFS mount or a directory with a hundred thousand entries can
+            // take hundreds of milliseconds, and this task also drives every
+            // pane's output: blocking it would stall the whole server, not just
+            // this listing.
+            let requested = path.clone();
+            let listing = tokio::task::spawn_blocking(move || {
+                browse::list_directory(std::path::Path::new(&path))
+            })
+            .await
+            .unwrap_or_else(|e| browse::Listing {
+                entries: Vec::new(),
+                error: Some(format!("listing failed: {e}")),
+                truncated: false,
+            });
+            log::debug!(
+                "server: ListDirectory client_id={client_id} path={requested:?} \
+entries={} error={:?} truncated={}",
+                listing.entries.len(),
+                listing.error,
+                listing.truncated
+            );
+            let cls = clients.lock().await;
+            if let Some(conn) = cls.get(&client_id) {
+                let _ = conn.tx.send(ServerMessage::DirectoryListing {
+                    // The REQUESTED path, verbatim. The panel matches its
+                    // pending request against it; answering about a path we
+                    // resolved differently would leave that match unfindable.
+                    path: requested,
+                    entries: listing.entries,
+                    error: listing.error,
+                    truncated: listing.truncated,
+                });
+            }
+            Ok(())
+        }
+        ClientMessage::OpenInSplit {
+            path,
+            command,
+            vertical,
+        } => {
+            handle_open_in_split(
+                client_id,
+                &path,
+                command.as_deref(),
+                vertical,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await
+        }
+        ClientMessage::CliSpawn {
+            session,
+            placement,
+            argv,
+            cwd,
+        } => {
+            handle_cli_spawn(
+                client_id,
+                &session,
+                placement,
+                &argv,
+                cwd.as_deref(),
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await
         }
         ClientMessage::UnsubscribePane { pane_id } => {
             {
@@ -1308,6 +1867,25 @@ async fn handle_attach(
     {
         let mut st = state.lock().await;
         st.clear_active_tab_activity(session_name);
+    }
+
+    // Tell the client which border style this session is composited in, BEFORE
+    // its first frame. The client seeds its own style from config once and
+    // never re-learns it, so without this an attach to a session whose style was
+    // toggled leaves the sidebar frame and the pane borders disagreeing.
+    {
+        let style = {
+            let st = state.lock().await;
+            st.sessions
+                .get(session_name)
+                .map(|s| s.border_style.clone())
+        };
+        if let Some(style) = style {
+            let cls = clients.lock().await;
+            if let Some(client) = cls.get(&client_id) {
+                let _ = client.tx.send(ServerMessage::SessionBorderStyle { style });
+            }
+        }
     }
 
     // Resize panes to match the attaching client's terminal dimensions.
@@ -1730,7 +2308,12 @@ async fn handle_command(
                     rect.width.saturating_sub(2).max(1),
                     rect.height.saturating_sub(2).max(1),
                     None,
+                    &[],
                     focused_cwd.as_deref().map(std::path::Path::new),
+                    Some(PaneIdentity {
+                        session: &session_name,
+                        pane: new_id,
+                    }),
                     panes,
                     config,
                 )
@@ -1784,7 +2367,12 @@ async fn handle_command(
                 cols,
                 rows,
                 None,
+                &[],
                 focused_cwd.as_deref().map(std::path::Path::new),
+                Some(PaneIdentity {
+                    session: &session_name,
+                    pane: pane_id,
+                }),
                 panes,
                 config,
             )
@@ -1911,6 +2499,9 @@ async fn handle_command(
                 placement,
                 cols,
                 rows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2053,6 +2644,9 @@ async fn handle_command(
                 PanePlacement::Stack,
                 cols,
                 rows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2218,6 +2812,9 @@ async fn handle_command(
                 PanePlacement::Auto,
                 cols,
                 rows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2597,58 +3194,11 @@ async fn handle_command(
             }
         }
         RemuxCommand::TabNewInSession { session } => {
-            // Mirror TabNew but on the named target session, using that
-            // session's own render dimensions (the requester may be attached
-            // elsewhere or nowhere).
-            let (tcols, trows) = session_render_size(&session, clients).await;
-            // Capture the target session's source pane (its active tab's focused
-            // pane) BEFORE create_tab flips active_tab to the new empty tab.
-            let (pane_id, source_pane_id) = {
-                let mut st = state.lock().await;
-                let source_pane_id = st
-                    .sessions
-                    .get(&session)
-                    .and_then(|s| s.tabs.get(s.active_tab))
-                    .map(|t| t.focused_pane);
-                let tab_count = match st.sessions.get(&session) {
-                    Some(s) => s.tabs.len(),
-                    None => {
-                        log::info!("TabNewInSession: session '{session}' not found");
-                        return Ok(());
-                    }
-                };
-                let tab_name = format!("Tab {}", tab_count + 1);
-                match st.create_tab(&session, &tab_name, LayoutMode::default()) {
-                    Ok(pid) => (pid, source_pane_id),
-                    Err(e) => {
-                        log::info!("TabNewInSession: {e}");
-                        return Ok(());
-                    }
-                }
-            };
-            let focused_cwd = {
-                let panes_lock = panes.lock().await;
-                source_pane_id
-                    .and_then(|id| panes_lock.get(&id))
-                    .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
-            };
-            log::debug!("server: TabNewInSession session={session:?} new pane_id={pane_id}");
-            spawn_pane(
-                pane_id,
-                tcols,
-                trows,
-                None,
-                focused_cwd.as_deref().map(std::path::Path::new),
-                panes,
-                config,
-            )
-            .await?;
-            // create_tab makes the new tab active, so forwarding starts for its
-            // pane here. (For a mutation on a non-active tab, forwarding would
-            // instead begin on the next SessionSwitchTab; the guard makes the
-            // repeat call safe.)
-            start_pty_forwarding(
+            create_tab_in_session(
                 &session,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2656,8 +3206,7 @@ async fn handle_command(
                 prev_frames,
                 dormant,
             )
-            .await;
-            refresh_target_session(&session, state, panes, clients, config, prev_frames).await?;
+            .await?;
         }
         RemuxCommand::TabRenameByIndex {
             session,
@@ -2688,6 +3237,9 @@ async fn handle_command(
                 PanePlacement::Auto,
                 tcols,
                 trows,
+                None,
+                &[],
+                None,
                 state,
                 panes,
                 clients,
@@ -2843,8 +3395,14 @@ async fn handle_command(
         }
     }
 
-    // Persist state after every command that may have changed structure.
+    // Persist state after every command that may have changed structure. The
+    // same hook feeds the session-tree push: a command that may have changed
+    // structure is exactly a command that may have changed what a subscriber's
+    // tree shows. Deliberately here rather than inside `save_if_enabled`, whose
+    // body is skipped entirely when `save_sessions = false` -- pushes must not
+    // depend on the persistence toggle.
     save_if_enabled(state, panes, config, dormant).await;
+    mark_session_tree_dirty();
 
     Ok(())
 }
@@ -2877,7 +3435,21 @@ async fn handle_create_session(
         st.create_session(name, folder, border_style, layout_mode, popup_size)?
     };
     log::debug!("server: CreateSession name={name:?} folder={folder:?} pane_id={pane_id}");
-    spawn_pane(pane_id, cols, rows, None, None, panes, config).await?;
+    spawn_pane(
+        pane_id,
+        cols,
+        rows,
+        None,
+        &[],
+        None,
+        Some(PaneIdentity {
+            session: name,
+            pane: pane_id,
+        }),
+        panes,
+        config,
+    )
+    .await?;
 
     // Announce to EVERY client, not just the creator. A session manager open in
     // another terminal has no timer -- every tree refresh is event-driven -- so
@@ -2926,23 +3498,71 @@ async fn handle_list_sessions(
     Ok(())
 }
 
-async fn handle_list_session_tree(
-    client_id: u64,
+// ---------------------------------------------------------------------------
+// Session-tree push
+// ---------------------------------------------------------------------------
+
+/// Minimum spacing between two `SessionTree` broadcasts, so a burst of
+/// structural commands costs subscribers one extra push rather than one push
+/// per command.
+const SESSION_TREE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wakes the session-tree push task when something a subscriber's tree
+/// *displays* has changed.
+///
+/// A process-global signal rather than a handle threaded through the call
+/// graph, for two reasons:
+///
+/// 1. One of the change points is [`update_auto_pane_names`], reached from
+///    `broadcast_full_render` and `send_full_render_to_client` -- some fifty
+///    call sites that would each have to carry a handle they have no other use
+///    for.
+/// 2. More importantly it keeps [`mark_session_tree_dirty`] *synchronous*. The
+///    change points run while the `state`/`panes` guards are held; an async
+///    broadcast there would relock them on the same task and deadlock, whereas
+///    a bare `notify_one` cannot.
+///
+/// The coalescing falls out of `Notify`'s semantics: it stores at most one
+/// permit, so any number of changes arriving while the pusher is asleep wake it
+/// exactly once. The server is a singleton process, which is the scope a global
+/// is correct at here.
+static SESSION_TREE_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Record that the session tree has changed. Cheap and non-blocking; safe to
+/// call while holding any server lock. With no subscribers the pusher wakes,
+/// finds none, and parks again.
+fn mark_session_tree_dirty() {
+    SESSION_TREE_DIRTY.notify_one();
+}
+
+/// Build and send [`ServerMessage::SessionTree`] to each client in `targets`,
+/// skipping ids that are no longer connected.
+///
+/// The expensive inputs -- the dormant name list, per-session client counts and
+/// one `get_process_name` per live pane -- are snapshotted once and shared;
+/// only `build_session_tree` runs per recipient, because `is_current` is
+/// recipient-relative. Backpressure is a non-issue and deliberately so: `tx` is
+/// an unbounded channel, so the send cannot block the daemon on a slow client,
+/// and a send to a dead connection returns `Err`, which is discarded exactly as
+/// [`broadcast_view_list`] does.
+///
+/// Locks in the codebase's `dormant` -> `state` -> `clients` -> `panes` order.
+async fn send_session_tree_to(
+    targets: &[u64],
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     dormant: &DormantStore,
-) -> Result<()> {
+) {
+    if targets.is_empty() {
+        return;
+    }
+
     let dormant_names: Vec<String> = {
         let d = dormant.lock().await;
         let mut names: Vec<String> = d.state.sessions.keys().cloned().collect();
         names.sort();
         names
-    };
-
-    let current_session = {
-        let cls = clients.lock().await;
-        cls.get(&client_id).and_then(|c| c.session_name.clone())
     };
 
     let st = state.lock().await;
@@ -2976,16 +3596,296 @@ async fn handle_list_session_tree(
         }
     }
 
-    let (folders, unfiled) =
-        st.build_session_tree(current_session.as_deref(), &client_counts, &pane_names);
+    // Working directories, for the `files` sidebar plugin to follow. Resolved
+    // ONLY for the pane `build_session_tree` will actually attach one to -- the
+    // focused pane of each session's ACTIVE tab -- because `get_pane_cwd` is a
+    // `/proc` readlink (or a `sysinfo` process refresh on macOS) per call and a
+    // whole-map sweep would pay it for every pane on every push.
+    let mut pane_cwds: HashMap<PaneId, String> = HashMap::new();
+    for sess in st.sessions.values() {
+        let Some(tab) = sess.tabs.get(sess.active_tab) else {
+            continue;
+        };
+        if let Some(pane) = ps.get(&tab.focused_pane) {
+            if let Some(cwd) = crate::server::persistence::get_pane_cwd(pane.pty.child_pid) {
+                pane_cwds.insert(tab.focused_pane, cwd);
+            }
+        }
+    }
 
-    if let Some(client) = cls.get(&client_id) {
+    for &target in targets {
+        let Some(client) = cls.get(&target) else {
+            continue;
+        };
+        // `is_current` is per-recipient, so the tree is built per target from
+        // the one shared snapshot above.
+        let (folders, unfiled) = st.build_session_tree(
+            client.session_name.as_deref(),
+            &client_counts,
+            &pane_names,
+            &pane_cwds,
+        );
         let _ = client.tx.send(ServerMessage::SessionTree {
             folders,
             unfiled,
-            dormant: dormant_names,
+            dormant: dormant_names.clone(),
         });
     }
+}
+
+/// Push the current tree to every `SubscribeSessionTree` subscriber.
+///
+/// Subscribers are read here, at fire time, rather than captured when the
+/// change was recorded, so a client that unsubscribed during the coalescing
+/// window is simply not in the list. That narrows the race but does not close
+/// it: an `UnsubscribeSessionTree` landing between this collect and the send
+/// inside [`send_session_tree_to`] still gets one last `SessionTree`. Harmless
+/// -- a stale tree is the same payload the client asked for a moment ago -- but
+/// a client must tolerate one trailing push rather than treat it as a protocol
+/// violation.
+async fn broadcast_session_tree(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    dormant: &DormantStore,
+) {
+    let targets: Vec<u64> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| c.session_tree_subscribed)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    send_session_tree_to(&targets, state, panes, clients, dormant).await;
+}
+
+// ---------------------------------------------------------------------------
+// Agent push
+// ---------------------------------------------------------------------------
+
+/// Minimum spacing between two `AgentList` broadcasts, the same coalescing
+/// bound the session tree uses.
+const AGENTS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How often the pusher re-samples while something is `Working`, so the
+/// `Working` -> `Idle` decay is actually delivered.
+///
+/// Needed for that ONE transition and no other: every other change is caused by
+/// output, and output calls [`mark_agents_dirty`]. So the tick is armed only
+/// while the last list contained a `Working` entry -- an agent sitting on
+/// `NeedsInput` overnight, the case this whole panel exists for, costs zero
+/// wakeups.
+///
+/// A server with NO subscriber costs nearly nothing, which is not the same as
+/// nothing and should not be claimed as such: `mark_agents_dirty` is called from
+/// the PTY forwarding loops unconditionally, so any pane producing output still
+/// wakes this task at up to ten times a second. Each of those wakeups finds an
+/// empty subscriber set under one `clients` lock and parks again -- deliberately
+/// cheap, deliberately not free. Gating the mark on "is anyone subscribed?"
+/// would mean taking that lock in the output path instead, which is the more
+/// expensive half of the trade.
+const AGENTS_DECAY_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Wakes the agent push task. See [`SESSION_TREE_DIRTY`] for why this shape.
+///
+/// A SEPARATE signal from the session tree's, deliberately. The mechanism is
+/// shared; the signal must not be. Agent state is dirtied by pane OUTPUT, and
+/// folding that into `SESSION_TREE_DIRTY` would drive `send_session_tree_to`'s
+/// per-pane `/proc` sweep -- taken under `state` + `clients` + `panes` -- from
+/// every keystroke echo in every pane.
+static AGENTS_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Record that agent state may have changed. Cheap, non-blocking, and safe to
+/// call while holding any server lock.
+fn mark_agents_dirty() {
+    AGENTS_DIRTY.notify_one();
+}
+
+/// The compiled agent rules, built once from the config the server started with.
+///
+/// A `OnceLock` rather than a field threaded through the call graph: the server
+/// reads its config at startup and the rules are immutable for its life, so the
+/// alternative is an `Arc` clone at fifty call sites that have no other use for
+/// it. An edit to `[agents]` therefore needs `remux restart`, exactly like every
+/// other server-side setting.
+static AGENT_RULES: std::sync::OnceLock<crate::server::agents::AgentRules> =
+    std::sync::OnceLock::new();
+
+fn agent_rules(config: &Config) -> &'static crate::server::agents::AgentRules {
+    AGENT_RULES.get_or_init(|| crate::server::agents::AgentRules::from_config(&config.agents))
+}
+
+/// Every pane running a configured agent command, with its state.
+///
+/// Sampled in three phases so no `/proc` read or `tcgetpgrp` syscall ever
+/// happens under the locks -- `send_session_tree_to` already pays that cost per
+/// live pane while holding three of them, and this runs up to ten times a
+/// second:
+///
+/// 1. Under `panes` alone, DUP each PTY master (`try_clone`). Snapshotting raw
+///    fd NUMBERS instead would be the Phase C fd-recycling bug in a new place:
+///    a pane closing between the snapshot and the read hands its number to the
+///    next PTY, and the sample would name the wrong pane's process. Owning the
+///    dup is what makes the number meaningful for as long as we hold it.
+/// 2. With no locks held, ask each dup for its foreground process group and
+///    that group's `comm`. A dead or exiting PTY errors, which reads as "no
+///    agent" -- never an unwrap.
+/// 3. Only for the panes that matched, take `state` then `panes` (the
+///    codebase's order) to resolve session/tab and classify the screen.
+async fn collect_agents(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) -> Vec<AgentEntry> {
+    let rules = agent_rules(config);
+    if rules.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 1: dup the masters, briefly.
+    let masters: Vec<(PaneId, std::os::fd::OwnedFd)> = {
+        let ps = panes.lock().await;
+        ps.iter()
+            .filter_map(|(&id, pd)| pd.pty.master_fd.try_clone().ok().map(|fd| (id, fd)))
+            .collect()
+    };
+
+    // Phase 2: no locks held.
+    let matched: Vec<(PaneId, String)> = masters
+        .iter()
+        .filter_map(|(id, fd)| {
+            let comm =
+                crate::server::agents::foreground_command(std::os::fd::AsFd::as_fd(fd), rules)?;
+            Some((*id, comm))
+        })
+        .collect();
+    drop(masters);
+    if matched.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 3: place each matched pane in the tree, then classify it.
+    let mut located: HashMap<PaneId, (String, usize)> = HashMap::new();
+    {
+        let st = state.lock().await;
+        for (name, sess) in &st.sessions {
+            for (tab_index, tab) in sess.tabs.iter().enumerate() {
+                for pane_id in layout::all_pane_ids(&tab.layout) {
+                    if matched.iter().any(|(id, _)| *id == pane_id) {
+                        located.insert(pane_id, (name.clone(), tab_index));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<AgentEntry> = Vec::new();
+    {
+        let now = std::time::Instant::now();
+        let mut ps = panes.lock().await;
+        for (pane_id, command) in matched {
+            // A pane in no layout tree is an AUX pane -- a sidebar's own file
+            // manager. It belongs to a panel, not to the session tree, and has
+            // no session or tab to jump to, so it is not listed.
+            let Some((session, tab_index)) = located.get(&pane_id).cloned() else {
+                continue;
+            };
+            let Some(pd) = ps.get_mut(&pane_id) else {
+                continue;
+            };
+            let bottom = rules.visible_bottom(&pd.screen);
+            let verdict = rules.classify(
+                &command,
+                &bottom,
+                now.saturating_duration_since(pd.last_output),
+            );
+            // The explain path: say WHY, but only on a TRANSITION -- keyed on
+            // the state and the sample-independent reason, never on `why`.
+            let key = (verdict.state, verdict.reason.clone());
+            if pd.agent_verdict.as_ref() != Some(&key) {
+                log::debug!(
+                    "agents: pane_id={pane_id} {command} -> {:?} ({})",
+                    verdict.state,
+                    verdict.why
+                );
+                pd.agent_verdict = Some(key);
+            }
+            entries.push(AgentEntry {
+                pane_id,
+                session,
+                tab_index,
+                command,
+                state: verdict.state,
+            });
+        }
+    }
+    // A stable order, so a refresh never reshuffles the panel under the user's
+    // selection. The panel preserves the selection by identity regardless, but
+    // a list that jumped around between pushes would be unreadable.
+    entries.sort_by(|a, b| {
+        (&a.session, a.tab_index, a.pane_id).cmp(&(&b.session, b.tab_index, b.pane_id))
+    });
+    entries
+}
+
+/// Send the agent list to each client in `targets`. Returns whether any listed
+/// agent is `Working` -- what the pusher uses to decide whether to arm its
+/// decay tick.
+async fn send_agents_to(
+    targets: &[u64],
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    let agents = collect_agents(state, panes, config).await;
+    let any_working = agents
+        .iter()
+        .any(|a| a.state == crate::protocol::AgentState::Working);
+    let cls = clients.lock().await;
+    for &target in targets {
+        let Some(client) = cls.get(&target) else {
+            continue;
+        };
+        let _ = client.tx.send(ServerMessage::AgentList {
+            agents: agents.clone(),
+            detection_supported: crate::server::agents::DETECTION_SUPPORTED,
+        });
+    }
+    any_working
+}
+
+/// Push the agent list to every `SubscribeAgents` subscriber.
+async fn broadcast_agents(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+) -> bool {
+    let targets: Vec<u64> = {
+        let cls = clients.lock().await;
+        cls.iter()
+            .filter(|(_, c)| c.agents_subscribed)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    send_agents_to(&targets, state, panes, clients, config).await
+}
+
+async fn handle_list_session_tree(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    dormant: &DormantStore,
+) -> Result<()> {
+    send_session_tree_to(&[client_id], state, panes, clients, dormant).await;
     Ok(())
 }
 
@@ -3018,6 +3918,14 @@ async fn handle_kill_session(
     Ok(())
 }
 
+/// Forget a departed client: its connection, and its diff baseline.
+///
+/// It used to reap the client's **aux panes** here too -- PTYs in no layout
+/// tree, reachable from nothing but this connection, so a disconnect that left
+/// them behind leaked processes. That was the whole reason this function took
+/// `panes`. The old `files` plugin was the only thing that ever asked for one,
+/// and it is gone: every pane is now in a session's layout, where a disconnect
+/// is not supposed to kill anything.
 async fn handle_client_disconnect(
     client_id: u64,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -3034,6 +3942,10 @@ async fn handle_client_disconnect(
         let mut pf = prev_frames.lock().await;
         pf.remove(&client_id);
     }
+    // Removing the `ClientConnection` above dropped any session-tree
+    // subscription with it -- but it also changed the `client_count` every
+    // *remaining* subscriber displays, so the survivors need a push.
+    mark_session_tree_dirty();
 }
 
 async fn handle_request_scrollback(
@@ -3928,6 +4840,9 @@ async fn handle_mouse_click(
             if tab.focused_pane != pane_id {
                 tab.focus_pane(pane_id);
                 drop(st);
+                // `PaneTreeEntry::is_focused` is in the pushed payload, so
+                // click-to-focus is a tree change exactly as keyboard focus is.
+                mark_session_tree_dirty();
                 broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
                     .await;
             }
@@ -3937,6 +4852,12 @@ async fn handle_mouse_click(
                 let mut st = state.lock().await;
                 let _ = st.goto_tab(&session_name, tab_index);
             }
+            // `TabTreeEntry::is_active` is in the pushed payload, so a tab-bar
+            // click is a tree change exactly as the keyboard routes are -- and
+            // this arm has to say so itself. `handle_mouse_click` is reached
+            // from `ClientMessage::MouseClick`, never from `handle_command`,
+            // whose tail is what marks the tree dirty for every command.
+            mark_session_tree_dirty();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         ClickTarget::StackLabel(pane_id) => {
@@ -3954,6 +4875,9 @@ async fn handle_mouse_click(
             activate_pane_in_stack(&mut tab.layout, pane_id);
             tab.focus_pane(pane_id);
             drop(st);
+            // Changes both the stack's active pane and `is_focused`; both are
+            // in the pushed payload.
+            mark_session_tree_dirty();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         ClickTarget::None => {}
@@ -4795,6 +5719,126 @@ impl PanePlacement {
 /// resolved. The caller owns the refresh tail (`resize_session_panes` +
 /// `broadcast_full_render`, or `refresh_target_session` for another session's
 /// tab), since which clients to repaint is a caller-side decision.
+///
+/// `command`/`args`/`cwd` are the OPTIONAL overrides. Every `RemuxCommand` that
+/// creates a pane passes `(None, &[], None)` and gets what it always got: the
+/// configured shell, in the previously focused pane's directory. The one caller
+/// that passes them is `OpenInSplit`, which needs a specific editor, on a
+/// specific file, in that file's directory -- and it comes through HERE rather
+/// than down a second pane-creation path, because a split that skipped this
+/// function would eject neither the tab to `Custom` nor the zoom.
+/// Create a new tab in `session_name`, and spawn its first pane.
+///
+/// The counterpart to [`create_pane_in_tab`] for the one case that function
+/// cannot serve: a tab's FIRST pane is created by `ServerState::create_tab`,
+/// which mints the pane id as part of building the tab, so there is no existing
+/// pane in that tab to split. This is therefore not a second pane-creation path
+/// in the sense ruling 4 forbids -- `TabNew`/`TabNewInSession` have always
+/// worked this way -- it is that path, extracted so `remux new-tab` can hand it
+/// a command instead of copying it.
+///
+/// `command`/`args`/`cwd` mean exactly what they mean in `create_pane_in_tab`:
+/// `None`/empty gives the login shell, and a `None` cwd inherits the session's
+/// previously-focused pane, so a new tab opens where the old one was.
+///
+/// Returns the new pane's id, or `None` when the session does not exist or the
+/// tab could not be created -- both logged, neither an error to the caller,
+/// matching how every other session-targeted command treats a name that has
+/// gone away.
+#[allow(clippy::too_many_arguments)]
+async fn create_tab_in_session(
+    session_name: &str,
+    command: Option<&str>,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<Option<PaneId>> {
+    // Use the TARGET session's own render dimensions: the requester may be
+    // attached elsewhere, or -- for a CLI invocation -- nowhere at all.
+    let (tcols, trows) = session_render_size(session_name, clients).await;
+    // Capture the source pane (the active tab's focused pane) BEFORE create_tab
+    // flips active_tab to the new empty tab.
+    let (pane_id, source_pane_id) = {
+        let mut st = state.lock().await;
+        let source_pane_id = st
+            .sessions
+            .get(session_name)
+            .and_then(|s| s.tabs.get(s.active_tab))
+            .map(|t| t.focused_pane);
+        let tab_count = match st.sessions.get(session_name) {
+            Some(s) => s.tabs.len(),
+            None => {
+                log::info!("create_tab_in_session: session '{session_name}' not found");
+                return Ok(None);
+            }
+        };
+        let tab_name = format!("Tab {}", tab_count + 1);
+        match st.create_tab(session_name, &tab_name, LayoutMode::default()) {
+            Ok(pid) => (pid, source_pane_id),
+            Err(e) => {
+                log::info!("create_tab_in_session: {e}");
+                return Ok(None);
+            }
+        }
+    };
+    // An explicit `cwd` wins over inheritance and the inheritance is not even
+    // computed then -- the same rule `create_pane_in_tab` follows, for the same
+    // reason.
+    let focused_cwd = match cwd {
+        Some(_) => None,
+        None => {
+            let panes_lock = panes.lock().await;
+            source_pane_id
+                .and_then(|id| panes_lock.get(&id))
+                .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+        }
+    };
+    // `args` COUNTED, not printed: `remux new-tab -- <command line>` reaches
+    // here, and its arguments are where a credential lives. See
+    // `handle_client_message`'s summary match for the rule.
+    log::debug!(
+        "server: create_tab_in_session session={session_name:?} new pane_id={pane_id} \
+command={command:?} ({} arg(s))",
+        args.len()
+    );
+    spawn_pane(
+        pane_id,
+        tcols,
+        trows,
+        command,
+        args,
+        cwd.or(focused_cwd.as_deref().map(std::path::Path::new)),
+        Some(PaneIdentity {
+            session: session_name,
+            pane: pane_id,
+        }),
+        panes,
+        config,
+    )
+    .await?;
+    // create_tab makes the new tab active, so forwarding starts for its
+    // pane here. (For a mutation on a non-active tab, forwarding would
+    // instead begin on the next SessionSwitchTab; the guard makes the
+    // repeat call safe.)
+    start_pty_forwarding(
+        session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await;
+    refresh_target_session(session_name, state, panes, clients, config, prev_frames).await?;
+    Ok(Some(pane_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_pane_in_tab(
     session_name: &str,
@@ -4802,6 +5846,9 @@ async fn create_pane_in_tab(
     placement: PanePlacement,
     cols: u16,
     rows: u16,
+    command: Option<&str>,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -4863,19 +5910,32 @@ async fn create_pane_in_tab(
         (new_pane_id, focused)
     };
 
-    let source_cwd = {
-        let panes_lock = panes.lock().await;
-        panes_lock
-            .get(&source_pane_id)
-            .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+    // An explicit `cwd` wins over inheritance, and the inheritance is not even
+    // computed then. Inheriting the focused pane's directory is right for "give
+    // me another shell here" and wrong for "open THIS file": the editor gets an
+    // absolute path either way, but a relative `:e` inside it should resolve
+    // beside the file, not beside whatever pane happened to have focus.
+    let source_cwd = match cwd {
+        Some(_) => None,
+        None => {
+            let panes_lock = panes.lock().await;
+            panes_lock
+                .get(&source_pane_id)
+                .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
+        }
     };
     let (spawn_cols, spawn_rows) = placement.spawn_size(cols, rows);
     spawn_pane(
         new_pane_id,
         spawn_cols,
         spawn_rows,
-        None,
-        source_cwd.as_deref().map(std::path::Path::new),
+        command,
+        args,
+        cwd.or(source_cwd.as_deref().map(std::path::Path::new)),
+        Some(PaneIdentity {
+            session: session_name,
+            pane: new_pane_id,
+        }),
         panes,
         config,
     )
@@ -4893,20 +5953,251 @@ async fn create_pane_in_tab(
     Ok(Some(new_pane_id))
 }
 
+/// Open `path` in a new split of `client_id`'s attached session, running an
+/// editor resolved ON THIS SERVER.
+///
+/// Server-side resolution is the point rather than an implementation detail:
+/// the file is on this machine, so the editor that opens it has to be too. A
+/// client-side `$EDITOR` would name whatever the user has installed on the
+/// machine they are sitting at, which for a remote session is not where the
+/// file is.
+///
+/// The split itself goes through [`create_pane_in_tab`], the one pane-creation
+/// path, so it ejects the tab to `Custom` and clears the zoom exactly as a
+/// hand-typed `PaneSplitVertical` does. The refresh tail is this function's,
+/// matching the `PaneSplit*` command arm it mirrors.
+///
+/// A client with no attached session is ignored, as every other pane-creating
+/// path ignores it: there is no tab to split.
+#[allow(clippy::too_many_arguments)]
+async fn handle_open_in_split(
+    client_id: u64,
+    path: &str,
+    command: Option<&str>,
+    vertical: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<()> {
+    let (session_name, cols, rows) = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => (c.session_name.clone(), c.cols, c.rows),
+            None => return Ok(()),
+        }
+    };
+    let Some(session_name) = session_name else {
+        log::debug!("server: OpenInSplit from client_id={client_id} with no attached session");
+        return Ok(());
+    };
+    let mut argv = browse::editor_argv(command, path);
+    // `editor_argv` always yields at least the program and the file.
+    let program = argv.remove(0);
+    // The file's own directory, so a relative `:e` inside the editor resolves
+    // beside the file rather than beside whatever pane had focus.
+    let parent = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+    let placement = if vertical {
+        PanePlacement::SplitVertical
+    } else {
+        PanePlacement::SplitHorizontal
+    };
+    log::info!(
+        "server: OpenInSplit client_id={client_id} session={session_name:?} path={path:?} \
+program={program:?} args={argv:?} vertical={vertical}"
+    );
+    create_pane_in_tab(
+        &session_name,
+        None,
+        placement,
+        cols,
+        rows,
+        Some(&program),
+        &argv,
+        parent.as_deref(),
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        dormant,
+    )
+    .await?;
+    resize_session_panes(&session_name, state, panes, clients, config).await?;
+    broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+    Ok(())
+}
+
+/// Create a pane in `session` on behalf of a command line -- `remux split`,
+/// `remux new-tab`.
+///
+/// The only pane-creating handler that takes its session as an ARGUMENT rather
+/// than reading it off the connection, because its sender is a CLI invocation
+/// that never attaches: it connects, asks, reads the answer and exits. The name
+/// reaches it as the `REMUX_SESSION` the pane's own `Pty::spawn` exported.
+///
+/// The target within the session is the **active tab's focused pane**, which is
+/// what `create_pane_in_tab` already splits when handed no `tab_index`. That is
+/// deliberate and is not the caller's `REMUX_PANE`: an environment variable is
+/// fixed at spawn time and may be hours stale, whereas focus is where the user
+/// is looking now. tmux resolves `split-window` the same way.
+///
+/// A `Some(pane_id)` answer becomes [`ServerMessage::CliSpawned`]; every failure
+/// becomes a [`ServerMessage::Error`] that NAMES the session, since the failure
+/// this will actually hit is a `REMUX_SESSION` left over from a renamed or
+/// closed session, and "session not found" without the name explains nothing.
+#[allow(clippy::too_many_arguments)]
+async fn handle_cli_spawn(
+    client_id: u64,
+    session: &str,
+    placement: CliPlacement,
+    argv: &[String],
+    cwd: Option<&str>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) -> Result<()> {
+    // An empty argv means the login shell, exactly as an interactive split gets
+    // it: `spawn_pane` falls back to the configured default shell, then $SHELL.
+    let (command, args) = match argv.split_first() {
+        Some((program, rest)) => (Some(program.as_str()), rest),
+        None => (None, &[][..]),
+    };
+    let cwd_path = cwd.map(std::path::Path::new);
+    // Redacted the same way as the summary line in `handle_client_message`, and
+    // for the same reason: `argv` is a command line the user typed, so its
+    // ARGUMENTS are where a connection string or an API key lives. The program
+    // is what anyone reading this line needs. `cwd` is a path, not a
+    // credential, and is the other half of "why did it fail to start".
+    log::info!(
+        "server: CliSpawn client_id={client_id} session={session:?} placement={placement:?} \
+program={:?} ({} more arg(s)) cwd={cwd:?}",
+        argv.first(),
+        argv.len().saturating_sub(1)
+    );
+
+    let spawned = match placement {
+        CliPlacement::NewTab => {
+            create_tab_in_session(
+                session,
+                command,
+                args,
+                cwd_path,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await?
+        }
+        CliPlacement::SplitRight | CliPlacement::SplitBelow => {
+            // The session's own render size, not the caller's: this connection is
+            // attached to nothing, so it has no dimensions worth the name. The
+            // `resize_session_panes` tail corrects whatever this was anyway.
+            let (cols, rows) = session_render_size(session, clients).await;
+            // The ONE place the CLI's vocabulary meets the layout engine's, and
+            // the mapping looks backwards until you know why: `PanePlacement`
+            // names the DIVIDER, `CliPlacement` names where the pane LANDS. A
+            // vertical divider puts the new pane to the RIGHT; a horizontal one
+            // puts it BELOW. Written out so nobody has to re-derive it, and so
+            // nobody "fixes" the apparent mismatch by pairing the like-sounding
+            // names.
+            let placement = match placement {
+                CliPlacement::SplitRight => PanePlacement::SplitVertical,
+                _ => PanePlacement::SplitHorizontal,
+            };
+            let created = create_pane_in_tab(
+                session,
+                None,
+                placement,
+                cols,
+                rows,
+                command,
+                args,
+                cwd_path,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            )
+            .await?;
+            if created.is_some() {
+                // The refresh tail the `PaneSplit*` arm runs. Without it the pane
+                // exists and no attached client repaints -- the split would appear
+                // only on the next unrelated redraw.
+                resize_session_panes(session, state, panes, clients, config).await?;
+                broadcast_full_render(session, state, panes, clients, config, prev_frames).await;
+            }
+            created
+        }
+    };
+
+    let cls = clients.lock().await;
+    if let Some(conn) = cls.get(&client_id) {
+        let msg = match spawned {
+            Some(pane_id) => ServerMessage::CliSpawned { pane_id },
+            None => ServerMessage::Error {
+                message: format!("no session named '{session}' on this server"),
+            },
+        };
+        let _ = conn.tx.send(msg);
+    }
+    Ok(())
+}
+
+/// Spawn the PTY for `pane_id` and register it.
+///
+/// `args` is the command's argument vector after argv[0], and is empty for
+/// every pane whose command is a shell or a self-contained TUI. It is non-empty
+/// for exactly one caller -- the `files` panel's "open this file in an editor"
+/// -- and it exists because `Pty::spawn` execs a single-element argv: without
+/// it, a `command` of `"vim /tmp/x"` would look for a BINARY of that name rather
+/// than running `vim` on the file.
+///
+/// `identity` is what the child is told it is, as `REMUX_SESSION`/`REMUX_PANE`.
+/// A PARAMETER rather than derived from `pane_id` here because only the caller
+/// knows what the pane should call itself -- see [`PaneIdentity`].
+#[allow(clippy::too_many_arguments)]
 async fn spawn_pane(
     pane_id: PaneId,
     cols: u16,
     rows: u16,
     command: Option<&str>,
+    args: &[String],
     cwd: Option<&std::path::Path>,
+    identity: Option<PaneIdentity<'_>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
 ) -> Result<()> {
     let cmd = command.or(config.general.default_shell.as_deref());
-    log::debug!("server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} cwd={cwd:?}");
-    let pty_instance = Pty::spawn(cols, rows, cmd, cwd)?;
-    let raw_fd = pty_instance.master_fd.as_raw_fd();
-    let (_reader_handle, pty_rx) = pty::start_reader(raw_fd);
+    // `args` is COUNTED, never printed -- the same redaction as the `CliSpawn`
+    // lines this is downstream of, and required for the same reason: the only
+    // way user-supplied args reach here is `remux split -- <command line>`, and
+    // that is where a connection string or an API key lives. The COMMAND is
+    // printed, because "what did it try to run" is the whole diagnostic.
+    log::debug!(
+        "server: spawn_pane pane_id={pane_id} dims={cols}x{rows} cmd={cmd:?} \
+         ({} arg(s)) cwd={cwd:?} identity={identity:?}",
+        args.len()
+    );
+    let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd, identity)?;
+    // The reader gets its OWN descriptor (a dup), so the fd number cannot be
+    // reissued to a later PTY while the reader's epoll registration still
+    // exists. See `start_reader`.
+    let reader_fd = pty_instance
+        .master_fd
+        .try_clone()
+        .context("failed to duplicate the PTY master for the reader")?;
+    let (reader_handle, pty_rx) = pty::start_reader(reader_fd);
     let screen = Screen::new(cols, rows, config.general.scrollback_lines);
 
     let mut ps = panes.lock().await;
@@ -4916,8 +6207,11 @@ async fn spawn_pane(
             pty: pty_instance,
             screen,
             pty_rx,
+            reader: reader_handle,
             forwarding_started: false,
             streamed_session_visible: false,
+            last_output: std::time::Instant::now(),
+            agent_verdict: None,
         },
     );
     Ok(())
@@ -5998,6 +7292,14 @@ async fn broadcast_full_render(
 
 /// Update display names for panes that don't have a custom name by
 /// reading the process name from `/proc/<pid>/comm`.
+/// Refresh the auto-detected (process-derived) name of every pane in the
+/// session's active tab.
+///
+/// Also marks the session tree dirty, but ONLY when a name actually changed.
+/// This runs on every render and every mouse event, so notifying
+/// unconditionally would be a push storm that the coalescing would merely hide;
+/// a process name changing (a shell becoming `vim`) is a real change to the
+/// pane labels a subscriber's tree displays, and is rare.
 async fn update_auto_pane_names(
     session_name: &str,
     state: &Arc<Mutex<ServerState>>,
@@ -6020,6 +7322,7 @@ async fn update_auto_pane_names(
     // Skip the pane being actively renamed -- its name is managed by the rename flow.
     let renaming_pane = sess.rename_state.as_ref().map(|(pid, _)| *pid);
 
+    let mut changed = false;
     for pane_id in pane_ids {
         if renaming_pane == Some(pane_id) {
             continue;
@@ -6030,9 +7333,18 @@ async fn update_auto_pane_names(
             // No custom name -- auto-detect from process.
             if let Some(pane_data) = ps.get(&pane_id) {
                 let name = get_process_name(pane_data.pty.child_pid.as_raw());
+                if layout::get_pane_name(&tab.layout, pane_id).as_deref() != Some(name.as_str()) {
+                    changed = true;
+                }
                 layout::set_pane_name(&mut tab.layout, pane_id, &name);
             }
         }
+    }
+
+    // Synchronous, so calling it under the `state`/`panes` guards still held
+    // here is safe -- an async broadcast would relock them and deadlock.
+    if changed {
+        mark_session_tree_dirty();
     }
 }
 
@@ -6526,6 +7838,10 @@ async fn reap_panes(
     // Taken under `clients` alone (the panes lock above is released) to keep the
     // locks unnested.
     notify_panes_exited(&exits, clients).await;
+    // Every path that destroys a pane funnels through here, so this is the one
+    // place an agent that has GONE has to be noticed. Nothing else would: the
+    // pusher is woken by output, and a dead pane produces none.
+    mark_agents_dirty();
 }
 
 /// Run the NOTIFICATION half of pane death for a pane whose PTY exited but that
@@ -6700,34 +8016,72 @@ async fn start_pty_forwarding(
 
     log::debug!("server: start_pty_forwarding session={session_name:?} pane_ids={pane_ids:?}");
 
-    let session_name = session_name.to_string();
-
     for pane_id in pane_ids {
-        // Enforce exactly one forwarding task per pane. Check-and-set the
-        // guard under the panes lock before spawning: if a task already
-        // exists, skip this pane so we don't spawn a competing task that
-        // could process PTY chunks out of order.
-        {
-            let mut ps = panes.lock().await;
-            match ps.get_mut(&pane_id) {
-                Some(pane_data) => {
-                    if pane_data.forwarding_started {
-                        continue; // already has its forwarding task
-                    }
-                    pane_data.forwarding_started = true;
+        start_forwarding_for_pane(
+            pane_id,
+            session_name.to_string(),
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            dormant,
+        )
+        .await;
+    }
+}
+
+/// Start the one forwarding task for `pane_id`: pump its PTY into its `Screen`,
+/// stream the result to subscribers, and handle the pane's death.
+///
+/// `session_name` is the session whose layout the pane belongs to: each batch
+/// re-composites that session's frame, and the pane's death runs the full
+/// `close_pane` path (layout repair, persistence, the tree push).
+///
+/// It used to be an `Option`, `None` meaning an **auxiliary** pane -- one in no
+/// layout and on no frame, whose death was `reap_panes` alone. Aux panes existed
+/// only to host the old `files` plugin's file manager and went with it; every
+/// pane now belongs to a session, so the parameter no longer asks a question.
+///
+/// Split out of [`start_pty_forwarding`] rather than inlined: the loop body is
+/// the emulator's whole ingest path (batching, DSR replies, OSC 52, activity
+/// marking, subscriber streaming), and it is spawned once per pane id.
+#[allow(clippy::too_many_arguments)]
+async fn start_forwarding_for_pane(
+    pane_id: PaneId,
+    session_name: String,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+    dormant: &DormantStore,
+) {
+    // Enforce exactly one forwarding task per pane. Check-and-set the
+    // guard under the panes lock before spawning: if a task already
+    // exists, skip this pane so we don't spawn a competing task that
+    // could process PTY chunks out of order.
+    {
+        let mut ps = panes.lock().await;
+        match ps.get_mut(&pane_id) {
+            Some(pane_data) => {
+                if pane_data.forwarding_started {
+                    return; // already has its forwarding task
                 }
-                None => continue,
+                pane_data.forwarding_started = true;
             }
+            None => return,
         }
+    }
 
-        let state = Arc::clone(state);
-        let panes = Arc::clone(panes);
-        let clients = Arc::clone(clients);
-        let config = Arc::clone(config);
-        let prev_frames = Arc::clone(prev_frames);
-        let dormant = Arc::clone(dormant);
-        let session_name = session_name.clone();
+    let state = Arc::clone(state);
+    let panes = Arc::clone(panes);
+    let clients = Arc::clone(clients);
+    let config = Arc::clone(config);
+    let prev_frames = Arc::clone(prev_frames);
+    let dormant = Arc::clone(dormant);
 
+    {
         tokio::spawn(async move {
             loop {
                 let recv_result = {
@@ -6765,6 +8119,12 @@ async fn start_pty_forwarding(
                                 for chunk in &chunks {
                                     pane_data.screen.process_output(chunk);
                                 }
+                                pane_data.last_output = std::time::Instant::now();
+                                // Output is what makes an agent `Working`, and
+                                // what clears a `NeedsInput` prompt off the
+                                // screen. Safe under the lock for the same
+                                // reason `mark_session_tree_dirty` is.
+                                mark_agents_dirty();
                                 log::debug!(
                                     "pty_forwarding: pane_id={}, cursor=({},{}), screen.rows={}, scroll_bottom={}",
                                     pane_id,
@@ -6824,7 +8184,7 @@ async fn start_pty_forwarding(
                     Some(Err(())) => {
                         // Channel disconnected - process has exited.
                         log::debug!(
-                            "server: PTY channel disconnected for pane_id={pane_id} session={session_name:?}"
+                            "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
                         // Close the pane automatically.
                         close_pane(
@@ -6839,6 +8199,9 @@ async fn start_pty_forwarding(
                         .await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
+                        // A pane dying on its own removes a row from every
+                        // subscriber's tree, and no command ran to say so.
+                        mark_session_tree_dirty();
                         break;
                     }
                     None => {
@@ -6997,7 +8360,12 @@ async fn materialize_session(
             default_cols,
             default_rows,
             None,
+            &[],
             cwd_path,
+            Some(PaneIdentity {
+                session: session_name,
+                pane: *pane_id,
+            }),
             panes,
             config,
         )
@@ -7054,6 +8422,12 @@ async fn materialize_session(
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
                                 pane_data.screen.process_output(&data);
+                                pane_data.last_output = std::time::Instant::now();
+                                // Output is what makes an agent `Working`, and
+                                // what clears a `NeedsInput` prompt off the
+                                // screen. Safe under the lock for the same
+                                // reason `mark_session_tree_dirty` is.
+                                mark_agents_dirty();
                                 let bell = pane_data.screen.take_bell();
                                 let clipboard = pane_data.screen.take_clipboard();
                                 (pane_data.screen.take_responses(), bell, clipboard)
@@ -7107,6 +8481,9 @@ async fn materialize_session(
                         .await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
+                        // A pane dying on its own removes a row from every
+                        // subscriber's tree, and no command ran to say so.
+                        mark_session_tree_dirty();
                         break;
                     }
                     None => {

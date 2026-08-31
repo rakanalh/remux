@@ -36,13 +36,84 @@ pub enum ConnDescriptor {
 
 /// The wire protocol version. Bump when a breaking change is made to the
 /// framed message shapes exchanged between client and server.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// Went 4 -> 6, skipping 5, deliberately. Two lines of work each bumped 4 -> 5
+/// independently and with DIFFERENT message sets -- `ViewSetMaster` on master,
+/// `SubscribeSessionTree`/`UnsubscribeSessionTree` on the sidebar branch. Two
+/// peers both claiming 5 while speaking different wires would complete the
+/// `Hello`/`Welcome` handshake and only then disagree, which is precisely what
+/// this number exists to prevent. Merging the two therefore resolves to 6 so
+/// that no build of either lineage can be mistaken for the merged protocol.
+///
+/// 6 -> 7: the file-manager sidebar plugin. Added `SpawnAuxPane`/`KillAuxPane`
+/// and `AuxPaneSpawned` (all three removed again at 11), the `cwd`/`is_active`
+/// session-tree fields those needed to follow the focused pane, and
+/// [`ServerMessage::SessionBorderStyle`]. The session-tree fields stayed: the
+/// `files` panel still follows the focused pane's directory, it just lists it
+/// over the wire now instead of running a file manager in a PTY.
+///
+/// 7 -> 8: the agents sidebar plugin. Adds
+/// [`ClientMessage::SubscribeAgents`]/[`ClientMessage::UnsubscribeAgents`] and
+/// [`ServerMessage::AgentList`].
+///
+/// 8 -> 9: the built-in file-browser sidebar plugin, then called `browser` and
+/// since renamed `files`. Adds
+/// [`ClientMessage::ListDirectory`]/[`ServerMessage::DirectoryListing`] and
+/// [`ClientMessage::OpenInSplit`]. (Recorded after the fact, so the list has no
+/// gap where the next entry begins.)
+///
+/// 9 -> 10: the CLI subcommands. Adds [`ClientMessage::CliSpawn`] and
+/// [`ServerMessage::CliSpawned`], the pair that lets a process INSIDE a pane ask
+/// the server for a new one -- `remux split`, `remux new-tab`.
+///
+/// 10 -> 11: the two file panels merged into one. REMOVES
+/// `ClientMessage::SpawnAuxPane`, `ClientMessage::KillAuxPane` and
+/// `ServerMessage::AuxPaneSpawned` -- the aux-pane machinery existed solely to
+/// host the old `files` plugin's `nnn`/`yazi`/`ranger`, and that plugin is gone;
+/// the built-in browser took its name. A removal is exactly as breaking as an
+/// addition in the direction that matters here: an old client sending
+/// `SpawnAuxPane` to a new server gets a message the server cannot parse, so the
+/// bump is what turns that into a refused handshake instead.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
 /// "<version>+unknown" when git metadata is unavailable (e.g. crates.io build).
 pub fn build_version() -> String {
     format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("REMUX_GIT_HASH"))
+}
+
+/// Whether two [`build_version`] stamps describe the SAME source tree.
+///
+/// The `-dirty` suffix is stripped from both sides first, because it does not
+/// describe the source: `build.rs` appends it whenever `git status --porcelain`
+/// is non-empty in the tree being built, and **`cargo install --git` touches
+/// `Cargo.lock` in its own checkout**. So a machine installed with
+/// `cargo install --force --git <url> --branch <b>` stamps `<hash>-dirty` while
+/// a `--path` build of the very same commit stamps `<hash>`, and a whole-string
+/// comparison called them different builds. That false positive is worse than a
+/// missed skew: the warning it fires ("restart the server") cannot possibly fix
+/// it, so the user restarts, sees it again, and learns to ignore the one message
+/// that matters when the skew is real.
+///
+/// This is NOT the same as basing the check on [`PROTOCOL_VERSION`], which was
+/// the standing candidate fix. That would make the check DEAD: the client
+/// `bail!`s on a protocol mismatch during the handshake (both the local and the
+/// remote dial path go through the same `handshake()`), so every server that is
+/// connected at all necessarily agrees on the protocol. Same-protocol,
+/// different-build skew -- a server rebuilt but not restarted -- is exactly what
+/// is left to detect, and only the stamp can see it.
+///
+/// The residual blind spot is deliberate: two builds of the same commit, one
+/// with real uncommitted edits, now compare equal. Detecting that would need the
+/// stamp to carry a content hash of the working tree, and a false "you are out
+/// of date" on every clean install costs more than a missed warning on a tree
+/// the user is actively editing.
+pub fn stamps_match(a: &str, b: &str) -> bool {
+    fn clean(s: &str) -> &str {
+        s.strip_suffix("-dirty").unwrap_or(s)
+    }
+    clean(a) == clean(b)
 }
 
 /// First frame sent by a connecting client, announcing its protocol/build.
@@ -72,6 +143,35 @@ pub struct Welcome {
 // ---------------------------------------------------------------------------
 // Client -> Server
 // ---------------------------------------------------------------------------
+
+/// Where a [`ClientMessage::CliSpawn`] puts the pane it asks for.
+///
+/// A separate enum from the server's internal `PanePlacement` on purpose: this
+/// one is the CLI's vocabulary and only ever grows a variant when a *subcommand*
+/// grows one, whereas `PanePlacement` also carries `Stack` and `Auto`, which no
+/// command line names. Keeping them apart means adding a layout placement server
+/// side is not automatically a wire change.
+///
+/// The split variants are named for the **OUTCOME**, not for the divider:
+/// `SplitRight` puts the new pane to the right, `SplitBelow` puts it underneath.
+/// This deliberately does NOT mirror
+/// [`RemuxCommand::PaneSplitHorizontal`]/[`RemuxCommand::PaneSplitVertical`],
+/// and the reason is worth keeping: "horizontal" names the DIVIDER in remux and
+/// the ARRANGEMENT in tmux, so the same word means opposite geometry in the two
+/// tools -- `split-window -h` gives a pane beside, `PaneSplitHorizontal` gives
+/// one below. There is no side of that to be on. A name that says where the pane
+/// LANDS cannot be read two ways at all, so the ambiguity is not resolved here,
+/// it is absent. The mapping onto `PanePlacement` is one `match`, in
+/// `handle_cli_spawn`, and it is the only place the two vocabularies meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CliPlacement {
+    /// The new pane goes to the RIGHT of the focused one.
+    SplitRight,
+    /// The new pane goes BELOW the focused one.
+    SplitBelow,
+    /// Create a new tab in the session, rather than splitting anything.
+    NewTab,
+}
 
 /// Messages sent from a Remux client to the server over the Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +253,37 @@ pub enum ClientMessage {
     SearchInfo { current: usize, total: usize },
     /// Request the full session tree (folders, sessions, tabs, panes).
     ListSessionTree,
+    /// Subscribe to unsolicited [`ServerMessage::SessionTree`] pushes whenever
+    /// the structure changes, instead of polling with `ListSessionTree`.
+    ///
+    /// Per-connection and independent of attachment, exactly like
+    /// [`ClientMessage::SubscribePane`]: a client that has no session in the
+    /// foreground still receives them. One `SessionTree` is sent immediately in
+    /// answer, so a subscriber's panel is populated at once rather than staying
+    /// blank until the next change. Dropped automatically when the connection
+    /// goes away.
+    SubscribeSessionTree,
+    /// Stop receiving [`ServerMessage::SessionTree`] pushes. A no-op for a
+    /// client that never subscribed.
+    UnsubscribeSessionTree,
+    /// Subscribe to unsolicited [`ServerMessage::AgentList`] pushes: the panes
+    /// on this server that are running an AI coding agent, and what each one is
+    /// doing.
+    ///
+    /// A SECOND subscription rather than a field on the session tree, because
+    /// the two are dirtied by different things. The tree changes structurally --
+    /// a few times a second at worst -- while agent state changes with pane
+    /// OUTPUT. Folding them together would drive the tree's per-pane `/proc`
+    /// sweep from every keystroke echo.
+    ///
+    /// Per-connection and independent of attachment, exactly like
+    /// [`ClientMessage::SubscribeSessionTree`]. One `AgentList` is sent
+    /// immediately in answer, so a subscriber's panel is populated at once.
+    /// Dropped automatically when the connection goes away.
+    SubscribeAgents,
+    /// Stop receiving [`ServerMessage::AgentList`] pushes. A no-op for a client
+    /// that never subscribed.
+    UnsubscribeAgents,
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the
     /// server was started with `save_sessions = true` and
@@ -196,6 +327,93 @@ pub enum ClientMessage {
     /// explicitly -- this is what a focused View cell uses to type into the
     /// real pane it aliases, wherever that pane actually lives.
     InputToPane { pane_id: PaneId, data: Vec<u8> },
+    /// List the contents of `path` **on this server's filesystem**.
+    ///
+    /// The `files` sidebar panel's one question. It goes over the wire rather
+    /// than being a client-side `read_dir` because the panel follows the FOCUSED
+    /// pane's directory, and that pane is routinely on a remote: a client-side
+    /// listing would show the client's own `/home/you` and look entirely
+    /// plausible while describing the wrong machine.
+    ///
+    /// `path` must be absolute, and the server ENFORCES it rather than trusting
+    /// this sentence: a relative path would resolve against the server PROCESS's
+    /// working directory -- whatever directory the daemon was started in -- and
+    /// come back as a real, plausible listing of somewhere the client never
+    /// asked about. It is refused as an ordinary `error` instead.
+    ///
+    /// It is echoed back VERBATIM in the answer, so a panel with a request in
+    /// flight can tell its own reply from another panel's. Normalising it
+    /// (resolving `..`) is the client's job for that reason -- a server that
+    /// answered about a different path than it was asked about would break the
+    /// match.
+    ///
+    /// Answered with [`ServerMessage::DirectoryListing`], including on failure:
+    /// a listing that cannot be produced reports WHY rather than an empty list.
+    ListDirectory { path: String },
+    /// Open `path` in a new split of this client's attached session, running an
+    /// editor.
+    ///
+    /// **The editor is resolved on the SERVER** (`command`, else the server's
+    /// `$EDITOR`, else `vi`), because the editor has to exist where the FILE is.
+    /// A client-side `$EDITOR` would name a binary installed on the client and
+    /// absent from the remote holding the file.
+    ///
+    /// `command` is the panel's configured override; `None` means "whatever this
+    /// server would use". `vertical` picks the split orientation, matching
+    /// [`RemuxCommand::PaneSplitVertical`]/[`RemuxCommand::PaneSplitHorizontal`].
+    ///
+    /// This executes a program named partly by a client-supplied string, and
+    /// that is deliberately not "hardened": a connected client can already
+    /// [`Input`](ClientMessage::Input) arbitrary bytes into any pane's shell, so
+    /// it can run anything it likes on this server already. This grants it
+    /// nothing new. The reasoning is written down so nobody later either
+    /// narrows it into uselessness or widens the trust boundary without
+    /// noticing that it moved.
+    OpenInSplit {
+        path: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        vertical: bool,
+    },
+    /// Create a pane in `session` on behalf of a command line -- `remux split`,
+    /// `remux new-tab` -- run from INSIDE a pane.
+    ///
+    /// The one message whose sender is not an attached client. Every other
+    /// pane-creating message resolves its session from the CONNECTION, and a CLI
+    /// invocation has none: it connects, sends this, reads the answer and exits
+    /// without ever attaching. Hence the explicit `session`, which the caller
+    /// gets from the `REMUX_SESSION` that [`Pty::spawn`](crate::server::pty::Pty)
+    /// exported into its pane.
+    ///
+    /// **The target is the session's ACTIVE TAB's FOCUSED pane, not the pane the
+    /// caller is sitting in.** `REMUX_SESSION` picks the machine and the session;
+    /// live focus picks the spot. This is tmux's behaviour, and it is the
+    /// behaviour that survives the user moving focus after the calling process
+    /// started -- an environment variable is fixed at spawn time and may be
+    /// hours stale.
+    ///
+    /// `argv` is the program and its arguments; **empty means the login shell**,
+    /// exactly as an interactive split gets. `cwd` of `None` inherits the target
+    /// pane's directory, as a split does.
+    ///
+    /// Like [`OpenInSplit`](ClientMessage::OpenInSplit), this runs a program
+    /// named by the client, and for the same reason that is not a new grant: a
+    /// connected client can already [`Input`](ClientMessage::Input) arbitrary
+    /// bytes into any pane's shell. The trust boundary is the SOCKET, and it has
+    /// not moved. Written down so nobody later narrows it into uselessness or
+    /// widens it without noticing.
+    ///
+    /// Answered with [`ServerMessage::CliSpawned`] on success and
+    /// [`ServerMessage::Error`] on failure, so the command can exit non-zero.
+    CliSpawn {
+        session: String,
+        placement: CliPlacement,
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Scroll a subscribed pane's own scroll view by `lines` (per-subscriber,
     /// by pane identity), independent of this client's foreground scroll. Used
     /// by a View cell's mouse wheel: the server adjusts a per-(client, pane)
@@ -372,6 +590,99 @@ pub enum ServerMessage {
     ScrollbackContent { lines: Vec<String> },
     /// Response to a `RequestScrollbackInfo` request with the total line count.
     ScrollbackInfo { total_lines: usize },
+    /// The border style the server composites the client's newly attached
+    /// session with.
+    ///
+    /// Sent on every successful `Attach`, BEFORE that attach's first frame.
+    /// `Session::border_style` is per-session SERVER state that the server's own
+    /// `ToggleStyle` handler flips, while the client's copy -- the one that
+    /// frames the sidebars -- is seeded once from `appearance.border_style` and
+    /// was never re-learned. Two reachable consequences, both on default
+    /// keybindings: toggle, detach, reattach, and the panes come back in tmux
+    /// style while the sidebar is still framed in zellij; or toggle in one
+    /// session and switch to another, and they disagree the other way round.
+    /// This is the message that lets an attach resync them.
+    SessionBorderStyle { style: crate::config::BorderStyle },
+    /// Answer to a successful [`ClientMessage::CliSpawn`]: the id of the pane
+    /// that was created.
+    ///
+    /// Failure is reported as [`ServerMessage::Error`] instead, carrying a
+    /// human sentence that NAMES the session it could not find -- a
+    /// `REMUX_SESSION` left over from a renamed session is the failure this
+    /// message exists to explain, and "not found" without the name explains
+    /// nothing.
+    ///
+    /// The id is not currently used by any caller; `remux split` prints nothing
+    /// on success. It is here because the alternative -- a bare ack -- makes
+    /// "which pane did I just get?" a wire change rather than a client change,
+    /// and a script that wants to send the new pane input needs the answer.
+    CliSpawned { pane_id: PaneId },
+    /// The answer to a [`ClientMessage::ListDirectory`].
+    ///
+    /// `path` is the requested path echoed back unchanged -- the panel matches
+    /// on it to claim its own reply.
+    ///
+    /// `entries` and `error` are not exclusive in principle, but in practice a
+    /// failed `read_dir` yields no entries. `error` is a HUMAN string shown in
+    /// the panel rather than swallowed: "permission denied" is an ordinary
+    /// answer for a directory, and an empty panel that might mean "empty" and
+    /// might mean "denied" is the same ambiguity
+    /// [`AgentList::detection_supported`](ServerMessage::AgentList) exists to
+    /// remove.
+    ///
+    /// Entries arrive **unsorted-by-policy** in the server's chosen order
+    /// (directories first, then by name) and **unfiltered**: hidden files are
+    /// included, and the client hides them. That is what makes the `.` toggle
+    /// instant instead of a round trip.
+    DirectoryListing {
+        path: String,
+        #[serde(default)]
+        entries: Vec<DirEntry>,
+        #[serde(default)]
+        error: Option<String>,
+        /// Whether the listing hit the entry cap and is therefore INCOMPLETE.
+        ///
+        /// A directory with a hundred thousand files is real, and silently
+        /// showing the first slice of one is a lie the user cannot detect. The
+        /// panel says so on its own line.
+        #[serde(default)]
+        truncated: bool,
+    },
+    /// The panes running an AI coding agent, pushed to every client subscribed
+    /// with [`ClientMessage::SubscribeAgents`].
+    ///
+    /// A full list each time, not a diff: it is a handful of entries at most,
+    /// and a diff would need the client to hold a baseline that a dropped push
+    /// could desynchronize.
+    AgentList {
+        #[serde(default)]
+        agents: Vec<AgentEntry>,
+        /// Whether this server can detect agents AT ALL.
+        ///
+        /// Detection reads the PTY's foreground process group and then asks the
+        /// OS to name that process -- `/proc/<pid>/comm` on Linux, `sysinfo` on
+        /// macOS. Both work; a server on anything else falls back to `"shell"`
+        /// for every pid and so can never match a configured agent command.
+        /// Without this the panel would render an empty list there --
+        /// indistinguishable from "you have no agents running", and exactly the
+        /// sort of thing that gets reported as a bug. The panel says so instead.
+        ///
+        /// It belongs on the wire rather than being a `cfg!` in the client:
+        /// a macOS client attached to a Linux server detects fine, and it is
+        /// the SERVER's platform that decides. Defaults to `true`, so a peer
+        /// that omits it is assumed capable.
+        ///
+        /// **It is COMPILE-TIME, and so answers "could this build ever
+        /// detect?", not "did detection work?"** A Linux server with no `/proc`
+        /// mounted, or one configured `commands = []` (which makes the sampler
+        /// return early before it looks at a single pane), both report `true`
+        /// beside an empty list -- the exact ambiguity this field exists to
+        /// remove, surviving in the cases it cannot see. Narrowing it would mean
+        /// reporting a REASON rather than a capability; worth doing if either
+        /// case turns out to bite, and deliberately not guessed at now.
+        #[serde(default = "default_true")]
+        detection_supported: bool,
+    },
     /// Response to a `ListSessionTree` request with the full hierarchy.
     SessionTree {
         folders: Vec<FolderTreeEntry>,
@@ -477,6 +788,66 @@ pub struct ViewInfo {
     /// Whether the focused cell is zoomed to fill the view.
     #[serde(default)]
     pub zoomed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+/// What an agent pane is doing, as the server classifies it.
+///
+/// Three states, deliberately, and honestly: `Background`, `Error` and progress
+/// reporting need lifecycle hooks the agents do not give us yet, and five states
+/// that misreport are worse than three that do not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentState {
+    /// The agent is showing a visible approval, question or permission prompt
+    /// and is blocked on the user.
+    ///
+    /// **Outranks [`AgentState::Working`]**, and never decays on silence -- a
+    /// blocked agent produces no output PRECISELY BECAUSE it is waiting, so a
+    /// state that decayed would vanish at the moment the user most needs it.
+    NeedsInput,
+    /// Output reached this pane within the working window.
+    Working,
+    /// Neither of the above.
+    Idle,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One pane running an AI coding agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEntry {
+    pub pane_id: PaneId,
+    /// The session the pane lives in, for the panel's label and its jump.
+    pub session: String,
+    /// The index of the tab within that session.
+    pub tab_index: usize,
+    /// The detected foreground command, e.g. `"claude"`. One of the configured
+    /// agent commands by construction: a pane running anything else is not an
+    /// entry at all.
+    pub command: String,
+    pub state: AgentState,
+}
+
+/// One entry in a [`ServerMessage::DirectoryListing`].
+///
+/// A name, not a path: the directory it belongs to is the listing's `path`, and
+/// repeating it on every row would put the same string on the wire a thousand
+/// times.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    /// Whether this entry can be DESCENDED INTO, following symlinks -- so a
+    /// symlink pointing at a directory is `is_dir` AND `is_symlink`, and
+    /// `Enter` on it descends, which is what a shell's `cd` does. A broken
+    /// symlink is neither.
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +962,15 @@ pub struct TabTreeEntry {
     pub id: u64,
     pub name: String,
     pub panes: Vec<PaneTreeEntry>,
+    /// Whether this is its session's ACTIVE tab.
+    ///
+    /// Needed because [`PaneTreeEntry::is_focused`] is per-tab -- every tab
+    /// marks its own focused pane -- so without this a consumer cannot tell
+    /// which of them is *the* focused pane of the session. `#[serde(default)]`
+    /// decodes an older peer's tree as "no active tab", which reads as "unknown"
+    /// rather than lying about one.
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 /// A pane entry in the session tree.
@@ -599,6 +979,15 @@ pub struct PaneTreeEntry {
     pub id: u64,
     pub name: String,
     pub is_focused: bool,
+    /// The pane's current working directory, for the `files` sidebar plugin to
+    /// follow.
+    ///
+    /// Filled ONLY for the focused pane of an active tab: resolving it is a
+    /// `/proc` readlink per pane (`persistence::get_pane_cwd`), and no consumer
+    /// wants the other panes' directories. `None` everywhere else, and for a
+    /// pane whose cwd could not be read.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +1200,20 @@ pub enum ClientAction {
     ViewClose,
     /// Delete the active view for everyone.
     ViewDelete,
+    /// Toggle the left sidebar's visibility.
+    SidebarToggleLeft,
+    /// Toggle the right sidebar's visibility.
+    SidebarToggleRight,
+    /// Toggle the bottom sidebar's visibility.
+    SidebarToggleBottom,
+    /// Focus the left sidebar, opening it if hidden.
+    SidebarFocusLeft,
+    /// Focus the right sidebar, opening it if hidden.
+    SidebarFocusRight,
+    /// Focus the bottom sidebar, opening it if hidden.
+    SidebarFocusBottom,
+    /// Cycle focus through every visible panel, then back to the content area.
+    SidebarCycle,
 }
 
 /// What an action string resolves to: either a command the server executes or
@@ -970,6 +1373,20 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::client("ViewLayoutNext", ClientAction::ViewLayoutNext).label("layout next"),
             ActionSpec::client("ViewClose", ClientAction::ViewClose).label("close view"),
             ActionSpec::client("ViewDelete", ClientAction::ViewDelete).label("delete view"),
+            ActionSpec::client("SidebarToggleLeft", ClientAction::SidebarToggleLeft)
+                .label("toggle left sidebar"),
+            ActionSpec::client("SidebarToggleRight", ClientAction::SidebarToggleRight)
+                .label("toggle right sidebar"),
+            ActionSpec::client("SidebarToggleBottom", ClientAction::SidebarToggleBottom)
+                .label("toggle bottom sidebar"),
+            ActionSpec::client("SidebarFocusLeft", ClientAction::SidebarFocusLeft)
+                .label("focus left sidebar"),
+            ActionSpec::client("SidebarFocusRight", ClientAction::SidebarFocusRight)
+                .label("focus right sidebar"),
+            ActionSpec::client("SidebarFocusBottom", ClientAction::SidebarFocusBottom)
+                .label("focus bottom sidebar"),
+            ActionSpec::client("SidebarCycle", ClientAction::SidebarCycle)
+                .label("cycle sidebar focus"),
         ]
     })
 }
@@ -1344,6 +1761,37 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_subscribe_session_tree() {
+        for msg in [
+            ClientMessage::SubscribeSessionTree,
+            ClientMessage::UnsubscribeSessionTree,
+        ] {
+            let encoded = encode_message(&msg).unwrap();
+            let len = decode_message_length(encoded[..4].try_into().unwrap());
+            let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+            match (&msg, &decoded) {
+                (ClientMessage::SubscribeSessionTree, ClientMessage::SubscribeSessionTree) => {}
+                (ClientMessage::UnsubscribeSessionTree, ClientMessage::UnsubscribeSessionTree) => {}
+                _ => panic!("round trip changed the variant: {decoded:?}"),
+            }
+        }
+    }
+
+    /// Both new variants are unit variants, so they ride the wire as bare
+    /// JSON strings -- the shape the frame harness sends.
+    #[test]
+    fn subscribe_session_tree_is_a_bare_string_on_the_wire() {
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::SubscribeSessionTree).unwrap(),
+            "\"SubscribeSessionTree\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientMessage::UnsubscribeSessionTree).unwrap(),
+            "\"UnsubscribeSessionTree\""
+        );
+    }
+
+    #[test]
     fn round_trip_session_tree() {
         let msg = ServerMessage::SessionTree {
             folders: vec![FolderTreeEntry {
@@ -1351,9 +1799,11 @@ mod tests {
                 sessions: vec![SessionTreeEntry {
                     name: "proj".to_string(),
                     tabs: vec![TabTreeEntry {
+                        is_active: true,
                         id: 1,
                         name: "Tab 1".to_string(),
                         panes: vec![PaneTreeEntry {
+                            cwd: None,
                             id: 10,
                             name: "zsh".to_string(),
                             is_focused: true,
@@ -1444,6 +1894,36 @@ mod tests {
             !suffix.is_empty(),
             "build id after '+' must be non-empty: {v}"
         );
+    }
+
+    /// The exact scenario reported from 10.0.0.2: `cargo install --force --git
+    /// … --branch feat/sidebar-plugins` at the same commit as this tree, whose
+    /// checkout cargo dirties by touching `Cargo.lock`. These two stamps MUST
+    /// compare equal or the session manager cries skew for ever.
+    ///
+    /// Fixed strings, never `build_version()`: that function's dirtiness depends
+    /// on the state of the working tree the test happens to run in, which would
+    /// make this pass or fail for reasons that have nothing to do with the code.
+    #[test]
+    fn a_dirty_install_of_the_same_commit_is_not_a_mismatch() {
+        assert!(stamps_match("0.1.0+0f954b2", "0.1.0+0f954b2-dirty"));
+        assert!(stamps_match("0.1.0+0f954b2-dirty", "0.1.0+0f954b2"));
+        assert!(stamps_match("0.1.0+0f954b2-dirty", "0.1.0+0f954b2-dirty"));
+        assert!(stamps_match("0.1.0+0f954b2", "0.1.0+0f954b2"));
+    }
+
+    /// The check must still DO something: a real skew is a different hash, and
+    /// stripping `-dirty` must not turn that into a match.
+    #[test]
+    fn a_different_commit_is_still_a_mismatch() {
+        assert!(!stamps_match("0.1.0+0f954b2", "0.1.0+e47397d"));
+        assert!(!stamps_match("0.1.0+0f954b2-dirty", "0.1.0+e47397d-dirty"));
+        assert!(!stamps_match("0.1.0+0f954b2", "0.1.0+e47397d-dirty"));
+        // A different crate version at the same hash is a mismatch too.
+        assert!(!stamps_match("0.1.0+0f954b2", "0.2.0+0f954b2"));
+        // "-dirty" is stripped as a SUFFIX, not searched for: a hash that
+        // merely contains the word is left alone.
+        assert!(!stamps_match("0.1.0+0f954b2", "0.1.0+0f954b2-dirtyx"));
     }
 
     #[test]
