@@ -782,9 +782,10 @@
 # here, not a new build.
 #
 #   name    — a short label, reported in the log when this pattern decides a
-#             pane's state. Run with RUST_LOG=debug to see WHY a pane was
-#             classified as it was; a classifier that cannot tell you that
-#             cannot be tuned.
+#             pane's state. The server log ($XDG_STATE_HOME/remux/server.log)
+#             already says WHY a pane was classified as it was — debug logging
+#             is always on and RUST_LOG is not read, so there is nothing to
+#             set. A classifier that cannot tell you that cannot be tuned.
 #   command — the agent this applies to. Omit it to apply to every agent.
 #   regex   — the pattern. An invalid one is warned about and skipped; it never
 #             takes the server down, and the other patterns still work.
