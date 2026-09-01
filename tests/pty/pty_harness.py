@@ -213,7 +213,7 @@ class SmRow:
         """How deep this row sits in the tree, in screen columns.
 
         Leading blanks alone would be wrong: a marked pane spends its two
-        indent blanks on the `[MARK] ` glyph, so it would read two columns
+        indent blanks on the `MARK_GLYPH` above, so it would read two columns
         SHALLOWER than its unmarked siblings and stop looking like a child of
         its tab. Adding those two back makes the number strictly increase with
         tree depth for every row shape -- server, session, tab, pane, marked
