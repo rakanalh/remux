@@ -38,9 +38,9 @@ def main():
     try:
         # --- A: open the session manager and hold it open ---------------------
         t.prefix(b"xm", 1.2)
-        # The manager opens with its search bar focused; Tab hands focus to the tree.
-        t.send(b"\t", 0.3)
-        t.pump(0.6)
+        # The manager opens on the tree (`/` is the way into the search bar), and
+        # this test sends no keystrokes at all past this point on purpose.
+        t.pump(0.9)
         if not t.has("Session Manager"):
             print("ABORT: the session manager never opened")
             t.dump("no session manager")

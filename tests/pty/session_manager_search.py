@@ -14,8 +14,11 @@ harness never has to drive the manager's own create flows to get the names it
 filters on.
 
 Asserted here:
-  1. Opening the manager shows the search row, focused (the block cursor).
-  2. Typing a TAB name filters the tree; the tab's session AND folder stay.
+  1. Opening the manager shows the search row UNfocused (no block cursor), with
+     the highlight already on the session the client is attached to -- and `j`
+     then MOVES that highlight instead of typing a `j` into the query.
+  2. `/` focuses the search bar; typing a TAB name filters the tree; the tab's
+     session AND folder stay.
   3. Tab unfocuses -- the cursor block goes, and `j` then MOVES the selection
      instead of typing a `j`.
   4. With tree focus and a non-empty query, `d` still opens the delete confirm
@@ -28,7 +31,9 @@ Asserted here:
   8. A query matching a session INSIDE A FOLDER selects the session, not the
      folder that is only visible as its ancestor -- Enter switches rather than
      toggling the folder open.
-  9. The client is still alive and the log has no panic.
+  9. Reopening the manager after switching sessions highlights the session
+     switched TO -- the snap follows the client, it is not a fixed row.
+ 10. The client is still alive and the log has no panic.
 
 Run from the repo root:  python3 tests/pty/session_manager_search.py
 """
@@ -40,6 +45,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from pty_harness import Tui  # noqa: E402
 from harness import Client  # noqa: E402
 
+# The session the client auto-creates and attaches to on startup (`main.rs`).
+# It is the "current session" the overlay must open highlighting.
+CURRENT = "main"
 FOLDER = "warehouse"
 SESSION = "alphasession"
 OTHER = "omegasession"
@@ -101,7 +109,7 @@ def main():
                                                  "name": TAB}}})
         b.drain(0.8)
 
-        # --- 1. the manager opens with a focused search row -------------------
+        # --- 1. the manager opens on the TREE, highlighting the current session -
         t.prefix(b"xm", 1.2)
         t.pump(0.8)
         if not t.has("Session Manager"):
@@ -114,15 +122,44 @@ def main():
         search_row = t.rows_text()[search_y]
         if "/" not in search_row:
             fail(f"no search row under the title (row {search_y}: {search_row!r})", "1: no search row")
-        if CURSOR not in search_row:
-            fail(f"search row is not focused on open (row {search_y}: {search_row!r})",
-                 "1: search not focused")
+        if CURSOR in search_row:
+            fail(f"the overlay opened focused on the search bar (row {search_y}: "
+                 f"{search_row!r})", "1: search focused on open")
         if not t.has(TAB) or not t.has(FOLDER) or not t.has(OTHER):
             fail("the unfiltered tree is missing rows it should show", "1: tree incomplete")
-        else:
-            print("1. OK: manager open, search row focused, full tree shown")
+        # The highlight must be on the CURRENT session, not on row 0 (the always
+        # -present `local` server row, which is where the selection used to sit).
+        sel_y = sel_row(t, search_y)
+        if sel_y == -1:
+            fail("no row is highlighted at all", "1: no selection")
+        elif CURRENT not in t.rows_text()[sel_y]:
+            fail(f"the highlight is not on the current session {CURRENT!r} "
+                 f"(row {sel_y}: {t.rows_text()[sel_y].rstrip()!r})",
+                 "1: not on the current session")
+        if not fails:
+            print(f"1. OK: manager open on the tree, highlighting {CURRENT!r}")
 
-        # --- 2. typing a TAB name filters, keeping its session + folder -------
+        # --- 1b. `j` navigates; it is not typed into the query ----------------
+        before = len(fails)
+        sel_before = sel_row(t, search_y)
+        t.send(b"j", 0.8)
+        sel_after = sel_row(t, search_y)
+        if sel_before == -1 or sel_after == -1:
+            fail(f"could not locate the highlighted row (before={sel_before} "
+                 f"after={sel_after})", "1b: no selection")
+        elif sel_after == sel_before:
+            fail(f"`j` did not move the highlight (stayed at row {sel_before}) "
+                 "-- it was typed into the search bar", "1b: j did not move")
+        if "(search)" not in t.rows_text()[search_y]:
+            fail(f"`j` landed in the query: {t.rows_text()[search_y]!r}",
+                 "1b: j typed into the query")
+        if len(fails) == before:
+            print("1b. OK: `j` moves the highlight and does not reach the query")
+
+        # --- 2. `/` focuses the search bar; a TAB name filters ----------------
+        t.send(b"/", 0.8)
+        if CURSOR not in t.rows_text()[search_y]:
+            fail("`/` did not focus the search bar", "2: no focus")
         t.send(TAB.encode(), 1.0)
         if not t.has(TAB):
             fail(f"the matching tab {TAB!r} is not shown", "2: tab missing")
@@ -135,7 +172,8 @@ def main():
         if not t.has("local"):
             fail("the server row was filtered out (it must always show)", "2: server row gone")
         if not fails:
-            print(f"2. OK: query {TAB!r} filtered the tree to the match + its ancestors")
+            print(f"2. OK: `/` focused the search bar and {TAB!r} filtered the "
+                  "tree to the match + its ancestors")
 
         # --- 3. Tab hands focus to the tree; `j` then navigates ---------------
         before = len(fails)
@@ -256,6 +294,22 @@ def main():
             fail("the manager did not reopen for the foldered-match check",
                  "8: manager did not reopen")
         else:
+            # 9. The manager reopened AFTER check 7 switched to OTHER: the
+            # highlight must be on OTHER now, not on the session the client
+            # started in. A snap that is really a fixed row would still be
+            # sitting on `main`, and one that never fires on `local`.
+            reopened_sel = sel_row(t, search_y)
+            if reopened_sel == -1:
+                fail("no row is highlighted in the reopened manager", "9: no selection")
+            elif OTHER not in t.rows_text()[reopened_sel]:
+                fail(f"the reopened manager does not highlight the session the "
+                     f"client switched to ({OTHER!r}); row {reopened_sel} is "
+                     f"{t.rows_text()[reopened_sel].rstrip()!r}",
+                     "9: highlight did not follow the switch")
+            else:
+                print(f"9. OK: reopening highlights {OTHER!r}, the session "
+                      "switched to")
+            t.send(b"/", 0.8)          # into the search bar
             t.send(b"\x15", 0.8)       # a reopened manager starts empty; be sure
             status_before = t.rows_text()[-1]
             if SESSION in status_before:
@@ -283,7 +337,7 @@ def main():
             print(f"8. OK: a query matching foldered {SESSION!r} selects the "
                   f"session, not {FOLDER!r}; Enter switches to it")
 
-        # --- 9. still alive, no panic ----------------------------------------
+        # --- 10. still alive, no panic ---------------------------------------
         if not t.alive():
             fails.append("the client is not alive at the end")
         logs = (t.log("client") + t.log("server")).lower()
