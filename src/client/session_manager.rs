@@ -2947,10 +2947,12 @@ mod tests {
     }
 
     #[test]
-    fn a_current_session_that_is_not_in_the_tree_leaves_the_selection_at_the_top() {
-        // The fallback: a session deleted elsewhere, or a foreground whose tree
-        // never arrives. Row 0 -- the `local` server row -- is where a fresh
-        // overlay already sat.
+    fn no_current_session_in_the_push_leaves_the_selection_at_the_top() {
+        // The fallback, and it is ONE case, not several: the snap is driven by
+        // the `is_current` flags on the pushed tree, so a detached client, a
+        // session deleted elsewhere and a foreground whose tree has not arrived
+        // are all just "no session in this push is current". Row 0 -- the
+        // `local` server row -- is where a fresh overlay already sat.
         let mut state = SessionManagerState::new(None);
         let (folders, unfiled) = search_tree();
         state.update_tree(ConnId::Local, folders, unfiled, Vec::new());

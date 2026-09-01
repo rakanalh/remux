@@ -31,9 +31,11 @@ Asserted here:
   8. A query matching a session INSIDE A FOLDER selects the session, not the
      folder that is only visible as its ancestor -- Enter switches rather than
      toggling the folder open.
-  9. Reopening the manager after switching sessions highlights the session
-     switched TO -- the snap follows the client, it is not a fixed row.
- 10. The client is still alive and the log has no panic.
+ 8a. Reopening the manager after switching sessions highlights the session
+     switched TO -- the snap follows the client, it is not a fixed row. It runs
+     inside check 8, which is where the manager is reopened; hence the printed
+     order 7, 8a, 8.
+  9. The client is still alive and the log has no panic.
 
 Run from the repo root:  python3 tests/pty/session_manager_search.py
 """
@@ -294,20 +296,20 @@ def main():
             fail("the manager did not reopen for the foldered-match check",
                  "8: manager did not reopen")
         else:
-            # 9. The manager reopened AFTER check 7 switched to OTHER: the
+            # 8a. The manager reopened AFTER check 7 switched to OTHER: the
             # highlight must be on OTHER now, not on the session the client
             # started in. A snap that is really a fixed row would still be
             # sitting on `main`, and one that never fires on `local`.
             reopened_sel = sel_row(t, search_y)
             if reopened_sel == -1:
-                fail("no row is highlighted in the reopened manager", "9: no selection")
+                fail("no row is highlighted in the reopened manager", "8a: no selection")
             elif OTHER not in t.rows_text()[reopened_sel]:
                 fail(f"the reopened manager does not highlight the session the "
                      f"client switched to ({OTHER!r}); row {reopened_sel} is "
                      f"{t.rows_text()[reopened_sel].rstrip()!r}",
-                     "9: highlight did not follow the switch")
+                     "8a: highlight did not follow the switch")
             else:
-                print(f"9. OK: reopening highlights {OTHER!r}, the session "
+                print(f"8a. OK: reopening highlights {OTHER!r}, the session "
                       "switched to")
             t.send(b"/", 0.8)          # into the search bar
             t.send(b"\x15", 0.8)       # a reopened manager starts empty; be sure
@@ -337,7 +339,7 @@ def main():
             print(f"8. OK: a query matching foldered {SESSION!r} selects the "
                   f"session, not {FOLDER!r}; Enter switches to it")
 
-        # --- 10. still alive, no panic ---------------------------------------
+        # --- 9. still alive, no panic ----------------------------------------
         if not t.alive():
             fails.append("the client is not alive at the end")
         logs = (t.log("client") + t.log("server")).lower()
