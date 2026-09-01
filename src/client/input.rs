@@ -2320,6 +2320,13 @@ impl InputHandler {
             }
         };
 
+        // Any keystroke at all means the user is driving the overlay, so the
+        // selection must stop tracking the current session. One site rather
+        // than one per navigation key: a missed site is a cursor that gets
+        // yanked back by the next server push, and there is no cost to
+        // freezing on a key that turns out not to move anything.
+        sm.freeze_selection();
+
         // The search bar owns every keystroke while it is focused -- before the
         // sub-modes and before the chord engine, so `q`/`j`/`d`/... are plain
         // text and nothing is a command. (The invariant that focus can only be
@@ -5224,11 +5231,123 @@ mod tests {
         handler
     }
 
+    /// `search_handler()` with the search bar focused -- reached the way a user
+    /// reaches it, by pressing `/` on the tree the overlay now opens on.
+    fn search_focused_handler() -> InputHandler {
+        let mut handler = search_handler();
+        assert!(
+            !handler.session_manager.as_ref().unwrap().search_focused,
+            "the overlay must open on the tree"
+        );
+        let _ = handler.handle_session_manager_key(char_key('/'));
+        assert!(
+            handler.session_manager.as_ref().unwrap().search_focused,
+            "`/` must focus the search bar"
+        );
+        handler
+    }
+
+    #[test]
+    fn a_keystroke_freezes_the_selection_against_a_later_tree_push() {
+        use crate::client::registry::RemoteState;
+        use crate::protocol::{FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+
+        // The fixture's tree carries no current session, so the one snap is
+        // still unspent when the user starts navigating. Pressing `j` must
+        // spend it: a current session arriving afterwards (the tree is
+        // re-pushed on any structural change anywhere) must not move a cursor
+        // the user is driving.
+        let mut handler = search_handler();
+        let _ = handler.handle_session_manager_key(char_key('j'));
+        let moved = handler.session_manager.as_ref().unwrap().model.selected;
+        // Named, not just non-zero: the `work` folder row is a different NODE
+        // from the current session pushed below, so an index that survives by
+        // coincidence cannot pass this.
+        let node_under_cursor = |h: &InputHandler| {
+            h.session_manager
+                .as_ref()
+                .unwrap()
+                .model
+                .rows
+                .get(moved)
+                .map(|r| r.display_name.clone())
+        };
+        assert_eq!(node_under_cursor(&handler).as_deref(), Some("work"));
+
+        let sm = handler.session_manager.as_mut().unwrap();
+        sm.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            None,
+        )]);
+        sm.update_tree(
+            ConnId::Local,
+            vec![FolderTreeEntry {
+                name: "work".to_string(),
+                sessions: Vec::new(),
+            }],
+            vec![SessionTreeEntry {
+                name: "later".to_string(),
+                tabs: vec![TabTreeEntry {
+                    is_active: true,
+                    id: 1,
+                    name: "editor".to_string(),
+                    panes: vec![PaneTreeEntry {
+                        cwd: None,
+                        id: 10,
+                        name: "zsh".to_string(),
+                        is_focused: true,
+                    }],
+                }],
+                client_count: 0,
+                is_current: true,
+            }],
+            Vec::new(),
+        );
+        let sm = handler.session_manager.as_ref().unwrap();
+        assert_eq!(
+            sm.model.selected, moved,
+            "a later push yanked the cursor back to the current session"
+        );
+        assert_eq!(
+            sm.model
+                .rows
+                .get(sm.model.selected)
+                .map(|r| &r.display_name),
+            Some(&"work".to_string()),
+            "the cursor is no longer on the node the user left it on"
+        );
+    }
+
+    #[test]
+    fn session_manager_opens_on_the_tree_so_command_keys_are_commands() {
+        // The other half of `session_manager_search_bar_swallows_command_keys`:
+        // with focus on the tree, the same keys are the commands they name.
+        let mut handler = search_handler();
+        // Down onto the folder row, then `d`: the delete confirm, not a query.
+        let _ = handler.handle_session_manager_key(make_key(KeyCode::Down, KeyModifiers::NONE));
+        let _ = handler.handle_session_manager_key(char_key('d'));
+        let sm = handler.session_manager.as_ref().unwrap();
+        assert!(
+            matches!(
+                &sm.sub_mode,
+                crate::client::session_manager::SubMode::ConfirmDelete { .. }
+            ),
+            "expected the delete confirm, got {:?}",
+            sm.sub_mode
+        );
+        assert!(
+            sm.model.query.is_empty(),
+            "`d` was typed into the query instead of firing the command"
+        );
+    }
+
     #[test]
     fn session_manager_search_bar_swallows_command_keys() {
-        let mut handler = search_handler();
-        // The overlay opens focused on the search bar, so `q` is text -- not the
-        // close key -- and `d` does not open the delete prompt.
+        let mut handler = search_focused_handler();
+        // With the search bar focused, `q` is text -- not the close key -- and
+        // `d` does not open the delete prompt.
         for c in "qd".chars() {
             let a = handler.handle_session_manager_key(char_key(c));
             assert!(matches!(a, InputAction::SessionManagerUpdate));
@@ -5252,7 +5371,7 @@ mod tests {
 
     #[test]
     fn session_manager_tab_hands_focus_to_the_tree() {
-        let mut handler = search_handler();
+        let mut handler = search_focused_handler();
         let _ = handler.handle_session_manager_key(make_key(KeyCode::Tab, KeyModifiers::NONE));
         let sm = handler.session_manager.as_ref().unwrap();
         assert!(!sm.search_focused);
@@ -5270,7 +5389,7 @@ mod tests {
     fn session_manager_query_survives_the_delete_sub_mode() {
         use crate::client::session_manager::SubMode;
 
-        let mut handler = search_handler();
+        let mut handler = search_focused_handler();
         // Filter to the session, then take tree focus and delete it: the query
         // must still be there while the confirm prompt is up (this is what
         // modelling search as a SubMode would have broken).
@@ -5297,8 +5416,8 @@ mod tests {
 
     #[test]
     fn session_manager_slash_refocuses_the_search_bar() {
+        // The overlay opens on the tree, so this starts where a user starts.
         let mut handler = search_handler();
-        let _ = handler.handle_session_manager_key(make_key(KeyCode::Tab, KeyModifiers::NONE));
         // Half-type a chord, then `/`: focus moves and the prefix is dropped so
         // it cannot complete later.
         let _ = handler.handle_session_manager_key(char_key('t'));
@@ -5319,7 +5438,7 @@ mod tests {
 
     #[test]
     fn session_manager_esc_from_the_search_bar_closes() {
-        let mut handler = search_handler();
+        let mut handler = search_focused_handler();
         let _ = handler.handle_session_manager_key(char_key('a'));
         let a = handler.handle_session_manager_key(esc_key());
         assert!(matches!(a, InputAction::SessionManagerClose));

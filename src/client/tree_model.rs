@@ -360,6 +360,68 @@ impl TreeModel {
         }
     }
 
+    /// Put the selection on the foreground server's *current* session, opening
+    /// whatever ancestors it takes to make that row exist. Returns whether a
+    /// current session was found and selected.
+    ///
+    /// Looks in the raw per-server data rather than scanning `rows`, because the
+    /// row may not be there yet to scan: a remote foreground's server node is
+    /// collapsed until the user opens it, and a session row inside a collapsed
+    /// folder is absent too. Ancestors are expanded (server, then the folder the
+    /// session lives in) and the rows rebuilt, so the answer is the same
+    /// wherever the session sits in the tree.
+    ///
+    /// The session itself is deliberately NOT expanded: the request is to
+    /// highlight the current session, and forcing its tabs open would be a
+    /// second, unasked-for change to what the tree shows.
+    pub fn select_current_session(&mut self) -> bool {
+        let server = self.foreground.clone();
+        let Some((folders, unfiled)) = self.trees.get(&server) else {
+            return false;
+        };
+        // The folder the current session lives in, or `None` when it is unfiled.
+        // `find_map` over folders first, then the unfiled list -- the same order
+        // `rebuild_rows` walks, so a duplicate name resolves identically.
+        let found = folders
+            .iter()
+            .find_map(|f| {
+                f.sessions
+                    .iter()
+                    .find(|s| s.is_current)
+                    .map(|s| (s.name.clone(), Some(f.name.clone())))
+            })
+            .or_else(|| {
+                unfiled
+                    .iter()
+                    .find(|s| s.is_current)
+                    .map(|s| (s.name.clone(), None))
+            });
+        let Some((session, folder)) = found else {
+            return false;
+        };
+
+        self.expanded.insert(server_key(&server));
+        if let Some(folder) = &folder {
+            self.expanded.insert(folder_key(&server, folder));
+        }
+        self.rebuild_rows();
+
+        // Positioned AFTER the rebuild: `rebuild_rows` re-resolves the selection
+        // by identity from the row that was selected going in, so setting the
+        // index first would just be overwritten.
+        let key = session_key(&server, &session);
+        match self.rows.iter().position(|r| self.row_key(r) == key) {
+            Some(idx) => {
+                self.selected = idx;
+                true
+            }
+            // A filter can still hide the row (the query is the user's own, and
+            // it outranks this): report "not selected" so a later attempt can
+            // still land it.
+            None => false,
+        }
+    }
+
     /// Force a server node open (used when a lazy connect is kicked off, so its
     /// children appear as soon as the tree arrives).
     pub fn force_expand_server(&mut self, id: &ConnId) {
@@ -1070,6 +1132,90 @@ mod tests {
     fn expand(model: &mut TreeModel, name: &str) {
         model.selected = row_of(model, name);
         model.expand_selected();
+    }
+
+    /// Flag the session named `name` as the current one, wherever it lives.
+    fn mark_current(per_conn: &mut [(ConnId, ConnTrees)], name: &str) {
+        for (_, trees) in per_conn.iter_mut() {
+            for s in trees
+                .folders
+                .iter_mut()
+                .flat_map(|f| f.sessions.iter_mut())
+                .chain(trees.unfiled.iter_mut())
+            {
+                s.is_current = s.name == name;
+            }
+        }
+    }
+
+    #[test]
+    fn select_current_session_lands_on_the_foreground_servers_current_session() {
+        let (mut model, mut per_conn) = two_conn_fixture();
+        mark_current(&mut per_conn, "alpha");
+        model.rebuild(&per_conn);
+
+        // Move the selection off it first, so landing on it cannot be the
+        // default index passing by accident.
+        model.selected = 0;
+        assert!(model.select_current_session());
+        assert_eq!(model.selected_row().unwrap().display_name, "alpha");
+    }
+
+    #[test]
+    fn select_current_session_opens_the_folder_the_session_is_collapsed_inside() {
+        let (mut model, mut per_conn) = two_conn_fixture();
+        mark_current(&mut per_conn, "alpha");
+        model.rebuild(&per_conn);
+        // Collapse `work`: `alpha` now has no row at all to scan for.
+        model.selected = row_of(&model, "work");
+        model.collapse_selected();
+        assert!(
+            !model.rows.iter().any(|r| r.display_name == "alpha"),
+            "precondition: the current session must be hidden"
+        );
+
+        assert!(model.select_current_session());
+        assert_eq!(model.selected_row().unwrap().display_name, "alpha");
+    }
+
+    #[test]
+    fn select_current_session_opens_a_collapsed_remote_foreground() {
+        let (mut model, mut per_conn) = two_conn_fixture();
+        mark_current(&mut per_conn, "beta");
+        model.set_foreground(remote("pi"));
+        model.rebuild(&per_conn);
+        // Collapse the remote server node the way it opens for a fresh overlay.
+        model.selected = row_of(&model, "pi");
+        model.collapse_selected();
+        assert!(
+            !model.rows.iter().any(|r| r.display_name == "beta"),
+            "precondition: the remote's sessions must be hidden"
+        );
+
+        assert!(model.select_current_session());
+        assert_eq!(model.selected_row().unwrap().display_name, "beta");
+    }
+
+    #[test]
+    fn select_current_session_ignores_a_current_session_on_another_server() {
+        // `beta` is current on `pi`, but the foreground is Local: the manager
+        // must not jump to a session the client is not in. (`is_current` is
+        // per-server on the wire -- two servers can each report one.)
+        let (mut model, mut per_conn) = two_conn_fixture();
+        mark_current(&mut per_conn, "beta");
+        model.rebuild(&per_conn);
+
+        assert!(!model.select_current_session());
+    }
+
+    #[test]
+    fn select_current_session_is_false_when_nothing_is_current() {
+        let (mut model, per_conn) = two_conn_fixture();
+        model.rebuild(&per_conn);
+        let before = model.selected;
+
+        assert!(!model.select_current_session());
+        assert_eq!(model.selected, before, "the selection must not move");
     }
 
     #[test]

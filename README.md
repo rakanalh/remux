@@ -109,7 +109,7 @@ After pressing the leader key, a popup shows the available keybindings at each t
 
 ## Session manager
 
-Tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — local and remote.
+Tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — local and remote. It opens with the current session highlighted; `/` searches.
 
 ![Session manager](docs/screenshots/session-manager.png)
 
@@ -363,9 +363,12 @@ Entered with `/` in Visual mode (or the Search leader binding).
 
 Opened with `Ctrl-a x m` (or `Alt-s` for the quick switcher).
 
+It opens on the **tree**, with the highlight already on the session you are attached to (like the quick switcher). `/` moves focus to the search bar; every other key is a navigation key or a command.
+
 | Key | Action |
 |-----|--------|
 | `Up` / `Down` | Navigate the tree |
+| `/` | Focus the search bar (filter the tree); `Tab` / `Down` / `Enter` hands focus back |
 | `Enter` | Switch to node (or expand it) |
 | `l` / `Right` / `+` | Expand (including connecting a remote) |
 | `h` / `Left` / `-` | Collapse |

@@ -222,6 +222,17 @@ pub struct SessionManagerState {
     /// The sub-modes are only ever entered by a binding or a hardcoded key, and
     /// neither can fire while focus is on the search bar.
     pub search_focused: bool,
+    /// Whether the selection has been placed deliberately -- snapped to the
+    /// current session, or moved by the user -- and must therefore be left
+    /// alone by later tree pushes.
+    ///
+    /// The overlay opens before it has a tree (rows arrive from a server push),
+    /// so the snap cannot happen in `new`; it happens on the first push that
+    /// carries a current session. Without this flag it would happen on EVERY
+    /// push, and the tree is re-pushed on any structural change anywhere --
+    /// which would yank the cursor back mid-navigation. Same rule as the
+    /// quick switcher's `selection_initialized`.
+    selection_initialized: bool,
 }
 
 /// Pad or truncate a string to exactly `target_width` display columns,
@@ -346,9 +357,13 @@ impl SessionManagerState {
             bindings: SessionManagerBindings::default(),
             pending_chord: None,
             marked: Vec::new(),
-            // The overlay opens with the search bar focused so the user can
-            // just start typing; Tab/Down/Enter hands focus to the tree.
-            search_focused: true,
+            // The overlay opens focused on the TREE, so it behaves like the
+            // quick switcher: the highlight starts on the session you are in
+            // and the navigation keys work straight away. `/` is the one and
+            // only way into the search bar (input.rs intercepts it ahead of the
+            // chord engine).
+            search_focused: false,
+            selection_initialized: false,
         }
     }
 
@@ -384,6 +399,7 @@ impl SessionManagerState {
     /// Replace the server roster (order + labels + states) and rebuild rows.
     pub fn set_roster(&mut self, roster: Vec<(ConnId, String, RemoteState, Option<String>)>) {
         self.model.set_roster(roster);
+        self.snap_to_current_session();
     }
 
     /// Update a single server's slice of the tree and rebuild rows.
@@ -395,6 +411,38 @@ impl SessionManagerState {
         dormant: Vec<String>,
     ) {
         self.model.update_tree(server, folders, unfiled, dormant);
+        self.snap_to_current_session();
+    }
+
+    /// Put the selection on the current session, ONCE.
+    ///
+    /// Called after every rebuild the overlay drives, and a no-op after the
+    /// first one that lands: `selection_initialized` is what makes it "once".
+    /// A push that carries no current session (a detached client, a foreground
+    /// whose tree has not arrived yet) leaves the selection where it is -- the
+    /// top of the tree on a fresh overlay -- and leaves the flag clear so a
+    /// later push carrying it can still snap. That is exactly the quick
+    /// switcher's rule.
+    fn snap_to_current_session(&mut self) {
+        if self.selection_initialized {
+            return;
+        }
+        if self.model.select_current_session() {
+            self.selection_initialized = true;
+        }
+    }
+
+    /// Record that the user is now driving the selection, so no later tree push
+    /// can move it.
+    ///
+    /// Called for every keystroke the overlay handles. Over-freezing costs
+    /// nothing (a user who has touched the overlay does not want the cursor
+    /// jumping), whereas any keystroke that reaches the tree without freezing
+    /// is the cursor-yank bug: `j` `j` `j` and then an unrelated session
+    /// elsewhere is created, the tree is re-pushed, and the highlight snaps
+    /// back to where it started.
+    pub fn freeze_selection(&mut self) {
+        self.selection_initialized = true;
     }
 
     /// Move selection down, wrapping to the top.
@@ -2800,6 +2848,117 @@ mod tests {
         (folders, unfiled)
     }
 
+    /// `search_tree()` with `name` flagged as the current session (and every
+    /// other session flagged as not current).
+    fn tree_with_current(name: &str) -> (Vec<FolderTreeEntry>, Vec<SessionTreeEntry>) {
+        let (mut folders, mut unfiled) = search_tree();
+        for s in folders
+            .iter_mut()
+            .flat_map(|f| f.sessions.iter_mut())
+            .chain(unfiled.iter_mut())
+        {
+            s.is_current = s.name == name;
+        }
+        (folders, unfiled)
+    }
+
+    /// The `kind:name` label of the selected row.
+    fn selected_label(state: &SessionManagerState) -> String {
+        row_labels(state)
+            .get(state.model.selected)
+            .cloned()
+            .unwrap_or_else(|| "<none>".to_string())
+    }
+
+    #[test]
+    fn the_overlay_opens_focused_on_the_tree() {
+        // Not the search bar: `/` is the only way in there now, so every
+        // navigation key works on the keystroke after the overlay appears.
+        let state = SessionManagerState::new(None);
+        assert!(!state.search_focused);
+    }
+
+    #[test]
+    fn the_selection_snaps_to_the_current_session_when_the_tree_arrives() {
+        // Nothing to select at construction -- the rows come from a server
+        // push -- so the snap has to happen on the push, not in `new`.
+        let mut state = SessionManagerState::new(None);
+        assert!(state.model.rows.is_empty());
+        assert_eq!(state.model.selected, 0);
+
+        let (folders, unfiled) = tree_with_current("beta");
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+
+        assert_eq!(selected_label(&state), "session:beta");
+    }
+
+    #[test]
+    fn a_later_push_does_not_move_the_selection_off_where_it_landed() {
+        // The tree is re-pushed on any structural change anywhere; re-snapping
+        // per push would yank the cursor back mid-navigation.
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = tree_with_current("beta");
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+        assert_eq!(selected_label(&state), "session:beta");
+
+        state.select_next();
+        let moved = selected_label(&state);
+        assert_ne!(moved, "session:beta", "precondition: the cursor moved");
+
+        let (folders, unfiled) = tree_with_current("beta");
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+        assert_eq!(selected_label(&state), moved);
+    }
+
+    #[test]
+    fn a_later_push_still_snaps_when_the_first_carried_no_current_session() {
+        // A remote's tree can arrive before the foreground server's, and a
+        // client that is not attached yet has no current session at all: the
+        // first push having none must not spend the one snap.
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = search_tree(); // nothing is current
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+        assert_eq!(
+            selected_label(&state),
+            "server:local",
+            "with no current session the selection stays at the top of the tree"
+        );
+
+        let (folders, unfiled) = tree_with_current("alpha");
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+        assert_eq!(selected_label(&state), "session:alpha");
+    }
+
+    #[test]
+    fn a_frozen_selection_is_not_snapped_by_a_later_push() {
+        // `freeze_selection` is what the key handler calls on every keystroke:
+        // once the user has driven the overlay, a current session arriving late
+        // must not move the cursor.
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = search_tree();
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+        state.select_next();
+        let moved = selected_label(&state);
+        state.freeze_selection();
+
+        let (folders, unfiled) = tree_with_current("alpha");
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+        assert_eq!(selected_label(&state), moved);
+    }
+
+    #[test]
+    fn a_current_session_that_is_not_in_the_tree_leaves_the_selection_at_the_top() {
+        // The fallback: a session deleted elsewhere, or a foreground whose tree
+        // never arrives. Row 0 -- the `local` server row -- is where a fresh
+        // overlay already sat.
+        let mut state = SessionManagerState::new(None);
+        let (folders, unfiled) = search_tree();
+        state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
+
+        assert_eq!(state.model.selected, 0);
+        assert_eq!(selected_label(&state), "server:local");
+    }
+
     fn search_state(dormant: Vec<String>) -> SessionManagerState {
         let mut state = SessionManagerState::new(None);
         let (folders, unfiled) = search_tree();
@@ -3086,13 +3245,21 @@ mod tests {
                 .expect("search row content command")
         };
 
-        // Opens focused: the block cursor, painted in the accent color.
-        assert!(state.search_focused);
+        // Opens UNfocused (the overlay opens on the tree): the placeholder, no
+        // cursor, normal fg.
+        assert!(!state.search_focused);
+        let row = search_row(&state);
+        assert_eq!(row.text.trim(), "/ (search)");
+        assert_eq!(row.fg, theme.whichkey_fg);
+
+        // Focused with an empty query: the block cursor, painted in the accent
+        // color.
+        state.focus_search();
         let row = search_row(&state);
         assert_eq!(row.text.trim(), "/ \u{2588}");
         assert_eq!(row.fg, theme.whichkey_key_fg);
 
-        // Unfocused with an empty query: the placeholder, no cursor, normal fg.
+        // Back on the tree with an empty query: the placeholder again.
         state.focus_tree();
         let row = search_row(&state);
         assert_eq!(row.text.trim(), "/ (search)");
