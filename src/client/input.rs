@@ -1416,9 +1416,8 @@ impl InputHandler {
     /// chord overrides consistently apply.
     pub(crate) fn new_session_manager(
         &self,
-        current_session: Option<String>,
     ) -> crate::client::session_manager::SessionManagerState {
-        let mut sm = crate::client::session_manager::SessionManagerState::new(current_session);
+        let mut sm = crate::client::session_manager::SessionManagerState::new();
         sm.set_bindings(self.session_manager_bindings.clone());
         sm
     }
@@ -1544,7 +1543,7 @@ impl InputHandler {
         // Intercept mode-changing shortcuts before parsing to RemuxCommand.
         if actions.len() == 1 && actions[0] == "OpenSessionManager" {
             self.mode = Mode::SessionManager;
-            self.session_manager = Some(self.new_session_manager(None));
+            self.session_manager = Some(self.new_session_manager());
             return InputAction::SessionManagerOpen;
         }
 
@@ -1961,14 +1960,14 @@ impl InputHandler {
                         }
                         RemuxCommand::OpenSessionManager => {
                             self.mode = Mode::SessionManager;
-                            self.session_manager = Some(self.new_session_manager(None));
+                            self.session_manager = Some(self.new_session_manager());
                             return InputAction::SessionManagerOpen;
                         }
                         RemuxCommand::RemoteConnect(dest) => {
                             // Open the session manager (same as OpenSessionManager),
                             // then request the connect via a dedicated action.
                             self.mode = Mode::SessionManager;
-                            self.session_manager = Some(self.new_session_manager(None));
+                            self.session_manager = Some(self.new_session_manager());
                             return InputAction::RemoteConnect(dest.clone());
                         }
                         RemuxCommand::SessionMoveToFolder => {
@@ -5049,7 +5048,7 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::SessionManager;
 
-        let mut sm = SessionManagerState::new(None);
+        let mut sm = SessionManagerState::new();
         sm.set_roster(vec![
             (
                 ConnId::Local,
@@ -5111,7 +5110,7 @@ mod tests {
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::SessionManager;
 
-        let mut sm = SessionManagerState::new(None);
+        let mut sm = SessionManagerState::new();
         sm.set_roster(vec![
             (
                 ConnId::Local,
@@ -5196,7 +5195,7 @@ mod tests {
 
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::SessionManager;
-        let mut sm = SessionManagerState::new(None);
+        let mut sm = SessionManagerState::new();
         sm.set_roster(vec![(
             ConnId::Local,
             "local".to_string(),
@@ -5453,7 +5452,7 @@ mod tests {
 
         let mut handler = InputHandler::with_defaults();
         handler.mode = Mode::SessionManager;
-        let mut sm = SessionManagerState::new(None);
+        let mut sm = SessionManagerState::new();
         sm.set_roster(vec![(
             ConnId::Local,
             "local".to_string(),

@@ -5365,7 +5365,7 @@ async fn run_client_loop(
                                     } else {
                                         // Nothing to fall back to: open the session manager.
                                         input.mode = Mode::SessionManager;
-                                        input.session_manager = Some(input.new_session_manager(None));
+                                        input.session_manager = Some(input.new_session_manager());
                                         if let Some(sm) = input.session_manager.as_mut() {
                                             sm.set_foreground(mgr.foreground().clone());
                                             sm.set_roster(mgr.server_roster());

@@ -203,8 +203,6 @@ pub struct SessionManagerState {
     /// the selected node's server when entering the sub-mode, and read when the
     /// completed action is emitted so it is routed to the right connection.
     sub_mode_server: ConnId,
-    /// The name of the session the client is currently attached to.
-    pub current_session: Option<String>,
     /// Configured chord bindings for the overlay (defaults unless injected from
     /// config via `set_bindings`).
     bindings: SessionManagerBindings,
@@ -348,12 +346,11 @@ fn pack_footer_lines(
 impl SessionManagerState {
     /// Create a new session manager state (initially just a local server node,
     /// expanded so local sessions show immediately as before).
-    pub fn new(current_session: Option<String>) -> Self {
+    pub fn new() -> Self {
         Self {
             model: TreeModel::new(),
             sub_mode: SubMode::Navigate,
             sub_mode_server: ConnId::Local,
-            current_session,
             bindings: SessionManagerBindings::default(),
             pending_chord: None,
             marked: Vec::new(),
@@ -1582,7 +1579,7 @@ mod tests {
 
     #[test]
     fn test_new_state_is_empty() {
-        let state = SessionManagerState::new(None);
+        let state = SessionManagerState::new();
         // No tree data yet, so no rows built.
         assert!(state.model.rows.is_empty());
         assert_eq!(state.model.selected, 0);
@@ -1590,7 +1587,7 @@ mod tests {
 
     #[test]
     fn test_update_tree_builds_rows() {
-        let mut state = SessionManagerState::new(Some("project-a".to_string()));
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         // Row 0 is the local server node; the folder nests beneath it.
@@ -1610,7 +1607,7 @@ mod tests {
 
     #[test]
     fn test_navigation_wraps() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         let total = state.model.rows.len();
@@ -1624,7 +1621,7 @@ mod tests {
 
     #[test]
     fn test_toggle_expand_collapse() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         // Find the folder row and collapse it.
@@ -1646,7 +1643,7 @@ mod tests {
 
     #[test]
     fn test_enter_on_session_returns_switch() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         state.model.selected = session_row(&state, "project-a");
@@ -1659,7 +1656,7 @@ mod tests {
 
     #[test]
     fn test_enter_on_server_toggles_expand() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         state.model.selected = 0; // local server node
@@ -1695,7 +1692,7 @@ mod tests {
                 .collect()
         };
 
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.update_tree(
             ConnId::Local,
             Vec::new(),
@@ -1754,7 +1751,7 @@ mod tests {
             is_current: false,
         };
 
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.update_tree(
             ConnId::Local,
             Vec::new(),
@@ -1777,7 +1774,7 @@ mod tests {
 
     #[test]
     fn test_delete_confirmation_flow() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         state.model.selected = session_row(&state, "project-a");
@@ -1798,7 +1795,7 @@ mod tests {
 
     #[test]
     fn test_remote_server_node_lazy_connect() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -1829,7 +1826,7 @@ mod tests {
 
     #[test]
     fn test_structural_edit_guarded_on_disconnected_remote() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -1862,7 +1859,7 @@ mod tests {
 
     #[test]
     fn test_create_session_key_on_connected_remote_targets_remote() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -1912,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_delete_on_connected_remote_session_targets_remote() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -1959,7 +1956,7 @@ mod tests {
 
     #[test]
     fn test_remote_session_not_current_when_local_foreground() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_foreground(ConnId::Local);
         state.set_roster(vec![
             (
@@ -1995,7 +1992,7 @@ mod tests {
 
     #[test]
     fn test_handle_expand_reveals_tab_panes_without_switching() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         // Reveal the tab: expand server -> folder -> session.
@@ -2052,7 +2049,7 @@ mod tests {
 
     #[test]
     fn test_handle_expand_remote_server_triggers_lazy_connect() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -2082,7 +2079,7 @@ mod tests {
 
     #[test]
     fn test_render_returns_commands() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         let theme = Theme::default();
@@ -2092,7 +2089,7 @@ mod tests {
 
     #[test]
     fn test_saved_group_built_from_dormant_sessions() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = sample_tree();
         state.update_tree(
             ConnId::Local,
@@ -2124,7 +2121,7 @@ mod tests {
 
     #[test]
     fn test_no_saved_group_when_no_dormant_sessions() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state); // dormant is empty
         assert!(!state
             .model
@@ -2135,7 +2132,7 @@ mod tests {
 
     #[test]
     fn test_enter_on_dormant_session_returns_resurrect() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = sample_tree();
         state.update_tree(ConnId::Local, folders, unfiled, vec!["saved-a".to_string()]);
 
@@ -2154,7 +2151,7 @@ mod tests {
 
     #[test]
     fn test_enter_on_saved_group_toggles_expand() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = sample_tree();
         state.update_tree(ConnId::Local, folders, unfiled, vec!["saved-a".to_string()]);
 
@@ -2177,7 +2174,7 @@ mod tests {
 
     #[test]
     fn test_dormant_only_for_local_server() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -2223,7 +2220,7 @@ mod tests {
 
     /// A connected-remote ("pi") state with the sample tree loaded + expanded.
     fn remote_state_with_tree() -> SessionManagerState {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         state.set_roster(vec![
             (
                 ConnId::Local,
@@ -2251,7 +2248,7 @@ mod tests {
 
     #[test]
     fn test_feed_chord_pending_then_complete() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = tab_row(&state, "project-a");
 
@@ -2280,7 +2277,7 @@ mod tests {
 
     #[test]
     fn test_feed_chord_unmatched_second_key_clears() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         assert_eq!(state.feed_chord('t'), ChordOutcome::Pending);
         // 'z' completes no 't' chord -> Cleared, pending reset.
@@ -2290,7 +2287,7 @@ mod tests {
 
     #[test]
     fn test_feed_chord_nomatch_falls_through() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         // 'j' is neither a prefix nor a binding -> NoMatch (legacy nav survives).
         assert_eq!(state.feed_chord('j'), ChordOutcome::NoMatch);
@@ -2299,7 +2296,7 @@ mod tests {
 
     #[test]
     fn test_clear_pending_chord() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.feed_chord('t');
         assert_eq!(state.pending_chord(), Some('t'));
@@ -2309,7 +2306,7 @@ mod tests {
 
     #[test]
     fn test_tab_new_on_session_node() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::TabNew);
@@ -2322,7 +2319,7 @@ mod tests {
 
     #[test]
     fn test_tab_close_is_immediate_no_confirm() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = tab_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::TabClose);
@@ -2340,7 +2337,7 @@ mod tests {
 
     #[test]
     fn test_tab_move_left_and_right() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = tab_row(&state, "project-a");
         let right = state.apply_binding(SessionManagerBinding::TabMoveRight);
@@ -2365,7 +2362,7 @@ mod tests {
 
     #[test]
     fn test_pane_new_on_tab_node() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = tab_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::PaneNew);
@@ -2382,7 +2379,7 @@ mod tests {
     #[test]
     fn test_tab_new_on_tab_node_uses_its_session() {
         // TabNew on a Tab node targets that tab's session.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = tab_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::TabNew);
@@ -2396,7 +2393,7 @@ mod tests {
     #[test]
     fn test_pane_new_on_pane_node_uses_its_tab() {
         // PaneNew on a Pane node targets that pane's containing tab.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         // Expand the tab to reveal its pane, then select the pane.
         state.model.selected = tab_row(&state, "project-a");
@@ -2422,7 +2419,7 @@ mod tests {
     #[test]
     fn test_pane_close_on_session_node_is_noop() {
         // A direct action on the wrong node type is a no-op.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::PaneClose);
@@ -2431,7 +2428,7 @@ mod tests {
 
     #[test]
     fn test_session_close_on_session_enters_confirm() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::SessionClose);
@@ -2441,7 +2438,7 @@ mod tests {
 
     #[test]
     fn test_session_close_on_folder_is_noop() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         let folder_idx = state
             .model
@@ -2458,7 +2455,7 @@ mod tests {
 
     #[test]
     fn test_folder_delete_on_session_is_noop() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.model.selected = session_row(&state, "project-a");
         let action = state.apply_binding(SessionManagerBinding::FolderDelete);
@@ -2539,7 +2536,7 @@ mod tests {
 
     #[test]
     fn test_rename_pending_chord_shown_in_render() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         // A pending prefix should surface a subtle hint in the rendered popup.
         state.feed_chord('t');
@@ -2555,7 +2552,7 @@ mod tests {
     /// (a) The footer lists a configured chord alongside its short label.
     #[test]
     fn test_footer_lists_configured_chord_and_label() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         let cells = state.footer_cells();
         // Default binding tn -> TabNew, labelled "tab new".
@@ -2569,7 +2566,7 @@ mod tests {
     /// even at the default 80x24 popup width.
     #[test]
     fn test_footer_chord_rendered() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         let theme = Theme::default();
         let cmds = state.render(80, 24, &theme);
@@ -2583,7 +2580,7 @@ mod tests {
     /// replaced default) appears for the action.
     #[test]
     fn test_footer_reflects_user_override() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
 
         // Rebind TabNew to "zt" and unbind the default "tn".
@@ -2602,7 +2599,7 @@ mod tests {
     /// chords beginning with that prefix (e.g. "tab new", never "pane new").
     #[test]
     fn test_footer_pending_prefix_filters() {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         local_tree(&mut state);
         state.feed_chord('t');
 
@@ -2618,7 +2615,7 @@ mod tests {
     /// A single-session, two-pane local state with the tab expanded so both
     /// pane rows are present. Pane ids are 10 and 11.
     fn two_pane_state() -> SessionManagerState {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let folders = vec![FolderTreeEntry {
             name: "work".to_string(),
             sessions: vec![SessionTreeEntry {
@@ -2874,7 +2871,7 @@ mod tests {
     fn the_overlay_opens_focused_on_the_tree() {
         // Not the search bar: `/` is the only way in there now, so every
         // navigation key works on the keystroke after the overlay appears.
-        let state = SessionManagerState::new(None);
+        let state = SessionManagerState::new();
         assert!(!state.search_focused);
     }
 
@@ -2882,7 +2879,7 @@ mod tests {
     fn the_selection_snaps_to_the_current_session_when_the_tree_arrives() {
         // Nothing to select at construction -- the rows come from a server
         // push -- so the snap has to happen on the push, not in `new`.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         assert!(state.model.rows.is_empty());
         assert_eq!(state.model.selected, 0);
 
@@ -2896,7 +2893,7 @@ mod tests {
     fn a_later_push_does_not_move_the_selection_off_where_it_landed() {
         // The tree is re-pushed on any structural change anywhere; re-snapping
         // per push would yank the cursor back mid-navigation.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = tree_with_current("beta");
         state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
         assert_eq!(selected_label(&state), "session:beta");
@@ -2915,7 +2912,7 @@ mod tests {
         // A remote's tree can arrive before the foreground server's, and a
         // client that is not attached yet has no current session at all: the
         // first push having none must not spend the one snap.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = search_tree(); // nothing is current
         state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
         assert_eq!(
@@ -2934,7 +2931,7 @@ mod tests {
         // `freeze_selection` is what the key handler calls on every keystroke:
         // once the user has driven the overlay, a current session arriving late
         // must not move the cursor.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = search_tree();
         state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
         state.select_next();
@@ -2953,7 +2950,7 @@ mod tests {
         // session deleted elsewhere and a foreground whose tree has not arrived
         // are all just "no session in this push is current". Row 0 -- the
         // `local` server row -- is where a fresh overlay already sat.
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = search_tree();
         state.update_tree(ConnId::Local, folders, unfiled, Vec::new());
 
@@ -2962,7 +2959,7 @@ mod tests {
     }
 
     fn search_state(dormant: Vec<String>) -> SessionManagerState {
-        let mut state = SessionManagerState::new(None);
+        let mut state = SessionManagerState::new();
         let (folders, unfiled) = search_tree();
         state.update_tree(ConnId::Local, folders, unfiled, dormant);
         state
