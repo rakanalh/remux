@@ -9,7 +9,7 @@ and that the client stays alive with no panic.
 Run from repo root:  PYTHONPATH=tests/pty python3 tests/pty/shared_views_single_lifecycle.py [-v]
 """
 import sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 VERBOSE = "-v" in sys.argv
 A = "AAAA_alpha"
@@ -81,14 +81,7 @@ def main():
     t.prefix(b"pv", 0.7)               # split -> pane 2
     t.send(f"printf '{B}\\n'\r", 0.5)
     t.send(b"\x1bt", 0.7)             # Alt+t: background panes 1 & 2
-    t.prefix(b"xm", 0.8)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.3)
-    t.send("j", 0.2); t.send(" ", 0.3)   # mark pane 1
-    t.send("j", 0.2); t.send(" ", 0.3)   # mark pane 2
-    t.send("v", 0.2); t.send("a", 0.5)   # AddToView
-    t.send("\r", 1.0)                     # create + enter view with 2 cells
+    sm_compose_view(t, panes=(0, 1), settle=1.0)   # -> a view with 2 cells
     t.pump(0.6)
     if VERBOSE:
         t.dump("2-cell view")

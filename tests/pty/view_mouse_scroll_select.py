@@ -23,7 +23,7 @@ Run from the repo root:  PYTHONPATH=tests/pty python3 tests/pty/view_mouse_scrol
 import re
 import sys
 
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 RUNDIR = "/tmp/rmxvms"
 COLS, ROWS = 120, 40
@@ -117,14 +117,7 @@ def build_view(t):
     # or select, and every assertion below would pass or fail for the wrong
     # reason.
     t.send(b"\x1bt", 0.8)
-    t.prefix(b"xm", 0.9)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)   # expand Tab 1
-    t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 1
-    t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 2
-    t.send("v", 0.3); t.send("a", 0.8)                     # AddToView picker
-    t.send("\r", 1.6)                                      # "New view" -> enter
+    sm_compose_view(t, panes=(0, 1), settle=1.6)           # both panes -> new view
     t.pump(1.0)
 
 

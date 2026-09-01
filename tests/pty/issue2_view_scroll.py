@@ -5,7 +5,7 @@ Build a 1-cell view over a pane holding >1 screen of numbered history. Wheel up
 => the cell shows earlier line numbers; wheel down => returns to the live tail.
 """
 import re, sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 RUNDIR = "/tmp/rmxfix/i2"
 
@@ -39,13 +39,7 @@ def main():
     t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
 
     # Build a 1-cell view over this pane.
-    t.prefix(b"xm", 0.7)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1
-    t.send("j", 0.2); t.send(" ", 0.3)                    # mark the pane
-    t.send("v", 0.2); t.send("a", 0.5)                    # AddToView
-    t.send("\r", 0.9)                                     # create + enter view
+    sm_compose_view(t, panes=(0,), settle=0.9)   # mark the one pane -> new view
 
     if not t.has("View 1"):
         print("FAIL: not in view"); t.dump("state"); t.kill(); sys.exit(1)

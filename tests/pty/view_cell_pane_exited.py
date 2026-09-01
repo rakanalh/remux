@@ -27,7 +27,7 @@ asserts:
 Run from the repo root:  python3 tests/pty/view_cell_pane_exited.py
 """
 import sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 MARK_A = "AAAA_survivor_marker"
 MARK_B = "BBBB_doomed_marker"
@@ -54,14 +54,7 @@ def make_two_panes(t):
 
 def compose_view(t):
     """Mark both panes in the session manager and alias them into a new view."""
-    t.prefix(b"xm", 0.8)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)   # expand Tab 1
-    t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 1
-    t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 2
-    t.send("v", 0.3); t.send("a", 0.7)                     # AddToView picker
-    t.send("\r", 1.5)                                      # "New view" -> enter
+    sm_compose_view(t, panes=(0, 1), settle=1.5)           # both panes -> new view
     t.pump(0.8)                                            # let PaneContent land
 
 

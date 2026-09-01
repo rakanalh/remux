@@ -20,7 +20,7 @@ Run from the repo root:
 import re
 import sys
 
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 RUNDIR = "/tmp/rmx_mta"
 COLS, ROWS = 120, 40
@@ -74,15 +74,7 @@ def build_view(t):
     # session's active tab renders the "Active in session" placeholder instead
     # of content, and every assertion below would pass for the wrong reason.
     t.send(b"\x1bt", 0.8)
-    t.prefix(b"xm", 0.9)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    for k in (b"j", b"j", b"l"):
-        t.send(k, 0.3)
-    t.send(b"j", 0.2); t.send(b" ", 0.3)
-    t.send(b"j", 0.2); t.send(b" ", 0.3)
-    t.send(b"v", 0.3); t.send(b"a", 0.8)
-    t.send(b"\r", 1.6)
+    sm_compose_view(t, panes=(0, 1), settle=1.6)
     t.pump(1.0)
 
 

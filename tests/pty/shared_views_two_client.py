@@ -10,6 +10,9 @@ Run from repo root:  PYTHONPATH=tests/pty python3 tests/pty/shared_views_two_cli
 import os, shutil, subprocess, sys, time
 import pexpect, pyte
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pty_harness import sm_compose_view  # noqa: E402
+
 BIN = os.path.abspath("target/debug/remux")
 RUN = "/tmp/rmx2c"
 SOCK = f"{RUN}/run/remux.sock"
@@ -123,27 +126,9 @@ def log_has_panic():
 def sm_compose_mark_first(a):
     """Open the session manager, expand the session's Tab 1, mark ONLY the
     first pane, and create+enter a new view over it."""
-    a.prefix(b"xm", 0.8)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    a.send(b"\t", 0.3)
+    sm_compose_view(a, panes=(0,), settle=0.9)
     if VERBOSE:
-        a.dump("SM opened")
-    # Expand down to the panes. Mirrors issue1_view_blank: j to session, j to
-    # Tab 1, l to expand, j onto the first pane, space to mark.
-    a.send("j", 0.2)   # Local -> session (or session if already there)
-    a.send("j", 0.2)
-    a.send("l", 0.3)
-    a.send("j", 0.2)
-    if VERBOSE:
-        a.dump("SM before mark")
-    a.send(" ", 0.3)   # mark first pane
-    if VERBOSE:
-        a.dump("SM marked first pane")
-    a.send("v", 0.2)
-    a.send("a", 0.5)   # AddToView -> picker
-    if VERBOSE:
-        a.dump("picker (new view)")
-    a.send("\r", 0.9)  # confirm -> new view (create + enter)
+        a.dump("A in the new view")
 
 
 def main():
@@ -197,20 +182,10 @@ def main():
                 fail("(b) B did not see the cell content after entering")
 
             # (c) A adds a SECOND pane to the view; B repaints WITHOUT input.
-            a.prefix(b"xm", 0.8)
-            # The manager opens with its search bar focused; Tab hands focus to the tree.
-            a.send(b"\t", 0.3)
-            a.send("j", 0.2); a.send("j", 0.2); a.send("l", 0.3)
-            a.send("j", 0.2); a.send("j", 0.2)   # move to the SECOND pane
+            # Mark the SECOND pane only, and add it to the EXISTING view.
+            sm_compose_view(a, panes=(1,), existing=True, settle=1.0)
             if VERBOSE:
-                a.dump("A SM second pane")
-            a.send(" ", 0.3)                       # mark it
-            a.send("v", 0.2); a.send("a", 0.5)     # AddToView
-            if VERBOSE:
-                a.dump("A picker for existing view")
-            # Pick the EXISTING view (not "new"): navigate to it then Enter.
-            a.send("k", 0.3)
-            a.send("\r", 1.0)
+                a.dump("A added the second pane")
             # Give B time to receive the ViewList broadcast + PaneContent.
             b.pump(1.2)
             if VERBOSE:

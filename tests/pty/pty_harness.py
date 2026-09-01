@@ -156,3 +156,254 @@ class Tui:
             except Exception:
                 pass
         return out
+
+
+# ---------------------------------------------------------------------------
+# Session-manager navigation
+# ---------------------------------------------------------------------------
+#
+# Sixteen View harnesses used to compose their View by firing a fixed keystroke
+# sequence at the manager from an ASSUMED cursor position -- `Tab` out of the
+# search bar, then a counted run of `j` from row 0. Both assumptions were
+# properties of the overlay, not of the tree: the manager now opens ON the tree
+# (so `Tab` is a no-op) with the highlight snapped to the current session (so
+# the counts are off), and all sixteen silently marked the WRONG panes and
+# built a View out of them. A count is the wrong primitive -- re-deriving it
+# against today's snap position would break the same sixteen on the next
+# selection change, and far from the cause.
+#
+# So: never assume where the cursor is, READ it. These helpers locate the popup
+# on the rendered screen, identify the highlighted row by its inverted
+# background (theme-independent -- it is the row whose background differs from
+# its siblings'), and step `j` until the selection is on the row they were asked
+# for, asserting what they landed on before acting on it. A future selection
+# change makes them re-navigate rather than mis-mark; a genuine break names the
+# row it is on.
+#
+# They take the client as their first argument rather than living on `Tui`
+# because `shared_views_two_client.py` drives two clients through its own
+# `Client` class. Everything here needs only `rows_text()`, `screen`, `rows`,
+# `send()`, `pump()` and `prefix()`, which both provide.
+
+BOX_TL = "╭"          # popup top-left corner
+BOX_TR = "╮"          # popup top-right corner
+BOX_V = "│"           # popup side border
+MARK_GLYPH = "●"      # the filled circle a marked pane row carries
+EXPANDED = "▼"        # an expanded node's triangle
+
+
+class SmRow:
+    """One rendered row of the session-manager tree."""
+
+    def __init__(self, y, text, selected):
+        self.y = y
+        self.text = text
+        self.selected = selected
+
+    @property
+    def blank(self):
+        return not self.text.strip()
+
+    @property
+    def marked(self):
+        return self.text.strip().startswith(MARK_GLYPH)
+
+    @property
+    def depth(self):
+        """How deep this row sits in the tree, in screen columns.
+
+        Leading blanks alone would be wrong: a marked pane spends its two
+        indent blanks on the `[MARK] ` glyph, so it would read two columns
+        SHALLOWER than its unmarked siblings and stop looking like a child of
+        its tab. Adding those two back makes the number strictly increase with
+        tree depth for every row shape -- server, session, tab, pane, marked
+        pane alike -- which is all any caller here asks of it.
+        """
+        lead = len(self.text) - len(self.text.lstrip(" "))
+        return lead + 2 if self.text.lstrip(" ").startswith(MARK_GLYPH + " ") else lead
+
+    def __repr__(self):
+        flag = "*" if self.selected else " "
+        return f"<{flag}{self.y:2} {self.text.rstrip()!r}>"
+
+
+def sm_title(t):
+    """The manager's top border line, which carries the marked count."""
+    for r in t.rows_text():
+        if "Session Manager" in r:
+            return r
+    raise AssertionError("session manager is not on screen")
+
+
+def sm_tree(t):
+    """Every tree row the manager is currently painting, top to bottom.
+
+    The popup is found by its title line, its columns by that line's corners --
+    so this is immune to the popup moving or resizing with the terminal.
+    """
+    rows = t.rows_text()
+    title_y = None
+    for i, r in enumerate(rows):
+        if "Session Manager" in r and BOX_TL in r:
+            title_y = i
+            break
+    if title_y is None:
+        raise AssertionError("session manager popup is not on screen")
+    line = rows[title_y]
+    x0 = line.index(BOX_TL)
+    x1 = line.rindex(BOX_TR)
+    out = []
+    # +3: the top border, the search row and the search separator.
+    y = title_y + 3
+    while y < len(rows) and rows[y][x0] == BOX_V:
+        out.append([y, rows[y][x0 + 1:x1], t.screen.buffer[y][x0 + 1].bg])
+        y += 1
+    if not out:
+        raise AssertionError("session manager popup has no tree rows")
+    # The highlighted row is the one whose background differs from the others'.
+    # Reading it rather than hard-coding the selection color keeps this working
+    # under the custom themes some harnesses configure.
+    bgs = [bg for _, _, bg in out]
+    normal = max(set(bgs), key=bgs.count)
+    return [SmRow(y, text, bg != normal) for y, text, bg in out]
+
+
+def sm_selected(t):
+    """The highlighted tree row. Raises unless exactly one row is highlighted."""
+    tree = sm_tree(t)
+    hits = [r for r in tree if r.selected]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"expected exactly one highlighted row, found {len(hits)}: {tree}"
+        )
+    return hits[0]
+
+
+def sm_open(t, timeout=6.0):
+    """Open the manager (Prefix+x m) and wait for a tree with a live selection.
+
+    The wait is not politeness. The overlay opens before it has any rows (they
+    arrive on a server push) and the snap to the current session happens on the
+    first push that carries one -- but ANY keystroke the overlay handles freezes
+    the selection where it is. Typing into a not-yet-populated manager therefore
+    pins the cursor at row 0, and the opening position becomes a race. Waiting
+    for a painted tree is what makes it deterministic.
+    """
+    t.prefix(b"xm", 0.5)
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            tree = sm_tree(t)
+            sm_selected(t)
+        except AssertionError as e:
+            last = e
+        else:
+            if any(not r.blank for r in tree):
+                return tree
+        t.pump(0.2)
+    raise AssertionError(f"session manager never painted a tree ({last})")
+
+
+def sm_goto(t, pred, what):
+    """Press `j` until the highlighted row satisfies `pred`, and return it.
+
+    One key at a time, re-reading the screen between presses, so a wrapped or
+    scrolled tree is handled by construction and a miss reports the row it
+    actually stopped on instead of marking it.
+    """
+    tree = sm_tree(t)
+    for _ in range(len(tree) + 1):
+        row = sm_selected(t)
+        if pred(row):
+            return row
+        t.send("j", 0.15)
+    raise AssertionError(
+        f"never reached {what}; stopped on {sm_selected(t)!r}, tree was {sm_tree(t)}"
+    )
+
+
+def sm_goto_text(t, needle):
+    """Move the highlight onto the first row whose text contains `needle`."""
+    return sm_goto(t, lambda r: needle in r.text, f"a row containing {needle!r}")
+
+
+def sm_children(t, parent):
+    """The rows nested under `parent`: everything below it that is deeper."""
+    tree = sm_tree(t)
+    idx = next(i for i, r in enumerate(tree) if r.y == parent.y)
+    kids = []
+    for row in tree[idx + 1:]:
+        if row.blank or row.depth <= parent.depth:
+            break
+        kids.append(row)
+    return kids
+
+
+def sm_expand(t, needle):
+    """Put the highlight on `needle`, expand it, and return its child rows."""
+    row = sm_goto_text(t, needle)
+    if EXPANDED not in row.text:
+        t.send("l", 0.4)
+    row = sm_selected(t)
+    assert EXPANDED in row.text, f"{needle!r} did not expand: {row!r}"
+    kids = sm_children(t, row)
+    assert kids, f"{needle!r} expanded to no children: {sm_tree(t)}"
+    return kids
+
+
+def sm_mark(t, row, expect_total):
+    """Move onto `row`, check it is still that row, mark it, check the mark took.
+
+    `expect_total` is the number of marks there should be afterwards -- the
+    manager puts it in its own title, so the assertion reads the renderer's own
+    account of what is marked rather than trusting the keystroke.
+    """
+    landed = sm_goto(t, lambda r: r.y == row.y, f"row {row.y} ({row.text.strip()!r})")
+    assert landed.text == row.text, (
+        f"row {row.y} was {row.text.strip()!r} and is now {landed.text.strip()!r} "
+        "-- the tree moved under the cursor"
+    )
+    t.send(" ", 0.3)
+    assert sm_selected(t).marked, f"space did not mark {landed!r}"
+    want = f"({expect_total} marked)"
+    assert want in sm_title(t), f"title is {sm_title(t).strip()!r}, wanted {want!r}"
+
+
+def sm_mark_panes(t, tab="Tab 1", panes=(0, 1)):
+    """Open the manager, expand `tab`, and mark the panes at those indices.
+
+    Returns the marked rows, in the order they were marked.
+    """
+    sm_open(t)
+    kids = sm_expand(t, tab)
+    assert max(panes) < len(kids), (
+        f"{tab!r} has {len(kids)} panes, cannot mark {panes}: {kids}"
+    )
+    marked = []
+    for want in panes:
+        sm_mark(t, kids[want], len(marked) + 1)
+        marked.append(kids[want])
+    return marked
+
+
+def sm_add_to_view(t, existing=False, settle=1.0):
+    """`v a` -> the view picker; Enter creates a new view, or joins the last one.
+
+    The picker opens on its "New view" sentinel, so one `k` wraps to the last
+    existing view -- which is what "add these panes to the view I already have"
+    means here.
+    """
+    t.send("v", 0.2)
+    t.send("a", 0.6)
+    assert t.has("Add Pane to View"), "the view picker never opened"
+    if existing:
+        t.send("k", 0.3)
+    t.send("\r", settle)
+
+
+def sm_compose_view(t, tab="Tab 1", panes=(0, 1), existing=False, settle=1.0):
+    """Compose a View out of the given panes of `tab` and enter it."""
+    marked = sm_mark_panes(t, tab=tab, panes=panes)
+    sm_add_to_view(t, existing=existing, settle=settle)
+    return marked

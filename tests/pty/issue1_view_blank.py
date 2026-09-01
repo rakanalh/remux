@@ -3,7 +3,7 @@ Focus cell A, then B, then back to A. At EVERY step BOTH cells must keep showing
 their content (no blank), and the client must stay alive.
 """
 import sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
@@ -19,14 +19,7 @@ def make_view(t):
     # renders the "● Active in session" placeholder in its cell instead of live
     # content; this harness asserts live content, so the panes must be backgrounded.
     t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
-    t.prefix(b"xm", 0.7)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)  # expand Tab 1
-    t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 1
-    t.send("j", 0.2); t.send(" ", 0.3)                    # mark pane 2
-    t.send("v", 0.2); t.send("a", 0.5)                    # AddToView
-    t.send("\r", 0.9)                                     # create + enter view
+    sm_compose_view(t, panes=(0, 1), settle=0.9)   # mark both panes -> new view
 
 
 def both_visible(t):

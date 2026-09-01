@@ -5,7 +5,7 @@ Build a 2-cell view, make a custom arrangement (move a cell), zoom (Prefix f) ->
 only the focused cell shows; unzoom (Prefix f) -> BOTH cells show again.
 """
 import sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
@@ -20,14 +20,7 @@ def make_view(t):
     # Background tab so A/B are NOT "session-visible" (else the cells show the
     # "● Active in session" placeholder instead of the live A/B content).
     t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
-    t.prefix(b"xm", 0.7)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)
-    t.send("j", 0.2); t.send(" ", 0.3)
-    t.send("j", 0.2); t.send(" ", 0.3)
-    t.send("v", 0.2); t.send("a", 0.5)
-    t.send("\r", 0.9)
+    sm_compose_view(t, panes=(0, 1), settle=0.9)
 
 
 def both_visible(t):

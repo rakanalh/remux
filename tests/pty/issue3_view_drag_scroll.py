@@ -7,7 +7,7 @@ Build a 1-cell view over a pane with >1 screen of numbered lines, press-drag to
 the top edge repeatedly, and assert earlier line numbers scroll in.
 """
 import re, sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 RUNDIR = "/tmp/rmxfix/i3v"
 
@@ -42,13 +42,7 @@ def main():
     # "● Active in session" placeholder instead of the live content dragged here).
     t.send(b"\x1bt", 0.6)   # Alt+t: new empty tab
     # 1-cell view over this pane.
-    t.prefix(b"xm", 0.7)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.4)
-    t.send("j", 0.2); t.send(" ", 0.3)
-    t.send("v", 0.2); t.send("a", 0.5)
-    t.send("\r", 0.9)
+    sm_compose_view(t, panes=(0,), settle=0.9)
     if not t.has("View 1"):
         print("FAIL: not in view"); t.dump("s"); t.kill(); sys.exit(1)
 

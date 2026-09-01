@@ -24,7 +24,7 @@ Run from the repo root:  PYTHONPATH=tests/pty python3 tests/pty/view_visual_focu
 import re
 import sys
 
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 RUNDIR = "/tmp/rmxvvf"
 COLS, ROWS = 120, 40
@@ -77,14 +77,7 @@ def build_view(t):
     # placeholder in its cell instead of content, and there would be nothing to
     # put a cursor on or yank.
     t.send(b"\x1bt", 0.8)
-    t.prefix(b"xm", 1.0)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)   # expand Tab 1
-    for _ in range(4):                                      # mark all 4 panes
-        t.send("j", 0.2); t.send(" ", 0.3)
-    t.send("v", 0.3); t.send("a", 0.8)                      # AddToView picker
-    t.send("\r", 1.8)                                       # "New view" -> enter
+    sm_compose_view(t, panes=(0, 1, 2, 3), settle=1.8)       # all four -> new view
     t.pump(1.2)
 
 

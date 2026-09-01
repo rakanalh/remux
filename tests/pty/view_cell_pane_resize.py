@@ -42,7 +42,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
-from pty_harness import Tui          # noqa: E402
+from pty_harness import Tui, sm_compose_view   # noqa: E402
 from harness import Client, name_of  # noqa: E402
 
 COLS, ROWS = 120, 40
@@ -106,14 +106,7 @@ def two_stacked_panes(t):
 
 def compose_view(t):
     """Mark both panes in the session manager and alias them into a new view."""
-    t.prefix(b"xm", 0.8)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)   # expand Tab 1
-    t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 1 (top)
-    t.send("j", 0.2); t.send(" ", 0.3)                     # mark pane 2 (bottom)
-    t.send("v", 0.3); t.send("a", 0.7)                     # AddToView picker
-    t.send("\r", 1.5)                                      # "New view" -> enter
+    sm_compose_view(t, panes=(0, 1), settle=1.5)           # top + bottom -> new view
     t.pump(1.0)
 
 

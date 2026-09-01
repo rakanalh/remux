@@ -39,7 +39,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import Tui  # noqa: E402
+from pty_harness import Tui, sm_compose_view  # noqa: E402
 
 COLS, ROWS = 120, 40
 SIDEBAR_W = 30
@@ -122,19 +122,7 @@ def make_two_panes(t):
 
 def compose_view(t):
     """Mark both panes in the session manager and compose them into a view."""
-    t.prefix(b"xm", 1.0)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2)
-    t.send("j", 0.2)
-    t.send("l", 0.5)
-    t.send("j", 0.2)
-    t.send(" ", 0.3)
-    t.send("j", 0.2)
-    t.send(" ", 0.3)
-    t.send("v", 0.3)
-    t.send("a", 0.8)
-    t.send("\r", 2.0)
+    sm_compose_view(t, panes=(0, 1), settle=2.0)
     t.pump(1.0)
 
 

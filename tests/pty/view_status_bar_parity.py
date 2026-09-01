@@ -23,7 +23,7 @@ independently on each side and their (fg, bg, bold) style triples compared.
 Run from the repo root:  python3 tests/pty/view_status_bar_parity.py
 """
 import sys
-from pty_harness import Tui
+from pty_harness import Tui, sm_compose_view
 
 MARK_A = "AAAA_status_marker"
 MARK_B = "BBBB_status_marker"
@@ -62,14 +62,7 @@ def make_two_panes(t):
 
 
 def compose_view(t):
-    t.prefix(b"xm", 0.8)
-    # The manager opens with its search bar focused; Tab hands focus to the tree.
-    t.send(b"\t", 0.3)
-    t.send("j", 0.2); t.send("j", 0.2); t.send("l", 0.5)
-    t.send("j", 0.2); t.send(" ", 0.3)
-    t.send("j", 0.2); t.send(" ", 0.3)
-    t.send("v", 0.3); t.send("a", 0.7)
-    t.send("\r", 1.5)
+    sm_compose_view(t, panes=(0, 1), settle=1.5)
     t.pump(0.8)
 
 
