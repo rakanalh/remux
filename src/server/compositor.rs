@@ -1334,6 +1334,9 @@ pub(crate) struct PaneRenderSnapshot {
     pub cursor_visible: bool,
     /// The pane's DECCKM (application cursor keys) state.
     pub application_cursor_keys: bool,
+    /// The pane's bracketed-paste (mode 2004) state, so a paste into a focused
+    /// View cell is wrapped only when THAT pane asked for the markers.
+    pub bracketed_paste: bool,
 }
 
 /// Snapshot a single pane's rendered screen into a standalone cell buffer.
@@ -1376,6 +1379,7 @@ pub(crate) fn render_pane_snapshot_at(screen: &Screen, scroll_offset: usize) -> 
         cursor_y: screen.cursor_y.min(rows.saturating_sub(1)),
         cursor_visible: screen.cursor_visible && scroll_offset == 0,
         application_cursor_keys: screen.application_cursor_keys,
+        bracketed_paste: screen.bracketed_paste,
     }
 }
 

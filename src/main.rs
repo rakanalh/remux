@@ -5219,11 +5219,38 @@ async fn run_client_loop(
                             );
                             continue;
                         }
-                        // Wrap pasted text in bracketed paste sequences.
+                        // Bracketed paste is a HANDSHAKE: the markers go out only
+                        // to a pane that asked for them with `CSI ? 2004 h`. remux
+                        // used to wrap unconditionally, so a raw-mode reader that
+                        // never asked got 12 bytes of garbage around the text --
+                        // vim read the leading `ESC` as Escape and ran `[200~` as
+                        // normal-mode commands.
+                        //
+                        // WHICH pane's flag decides depends on where the bytes are
+                        // about to go, exactly as DECCKM does for a keystroke: a
+                        // live view routes to the focused CELL by identity
+                        // (`send_to_focused_cell` below), so that cell's pane
+                        // answers; otherwise the foreground pane does. A cell with
+                        // no snapshot yet has told us nothing, so it falls back to
+                        // wrapping -- "unknown" means "behave as remux did before"
+                        // everywhere in this feature, here as on the wire.
+                        let wrap = match active_view.map(|av| &views[av]) {
+                            Some(v) => v
+                                .cells
+                                .get(v.focused)
+                                .and_then(|c| c.snapshot.as_ref())
+                                .map(|s| s.bracketed_paste)
+                                .unwrap_or(true),
+                            None => input.bracketed_paste,
+                        };
                         let mut data = Vec::new();
-                        data.extend_from_slice(b"\x1b[200~");
+                        if wrap {
+                            data.extend_from_slice(b"\x1b[200~");
+                        }
                         data.extend_from_slice(text.as_bytes());
-                        data.extend_from_slice(b"\x1b[201~");
+                        if wrap {
+                            data.extend_from_slice(b"\x1b[201~");
+                        }
                         if let Some(av) = active_view {
                             // A client showing a view is DETACHED, so a paste sent
                             // to the foreground would be dropped by the server.
@@ -5427,11 +5454,12 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so, scroll_offset: srv_so }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so }) => {
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
+                        input.bracketed_paste = bp;
                         scroll_offset = so;
                         // Server render is authoritative for the viewport top;
                         // keep the dedicated highlight coordinate in sync.
@@ -5469,10 +5497,11 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so, scroll_offset: srv_so }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so }) => {
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
+                        input.bracketed_paste = bp;
                         scroll_offset = so;
                         // Server render is authoritative for the viewport top;
                         // keep the dedicated highlight coordinate in sync.
@@ -5508,10 +5537,11 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, viewport_top: so, scroll_offset: srv_so }) => {
+                    Some(ServerMessage::ScrollRender { pane_x, pane_y, pane_width, pane_height, delta, new_rows, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so }) => {
                         log::debug!("srv: ScrollRender delta={} pane=({},{} {}x{}) viewport_top={} scroll_offset={}", delta, pane_x, pane_y, pane_width, pane_height, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;
+                        input.bracketed_paste = bp;
                         scroll_offset = so;
                         // Server render is authoritative for the viewport top;
                         // keep the dedicated highlight coordinate in sync.
@@ -6253,6 +6283,7 @@ async fn run_client_loop(
                         cursor_y,
                         cursor_visible,
                         application_cursor_keys,
+                        bracketed_paste,
                         session_name: pc_session,
                         tab_name: pc_tab,
                         session_visible,
@@ -6271,6 +6302,7 @@ async fn run_client_loop(
                             cursor_y,
                             cursor_visible,
                             application_cursor_keys,
+                            bracketed_paste,
                             session_visible,
                         };
                         // Cell title = `session / tab`, host-prefixed for a remote

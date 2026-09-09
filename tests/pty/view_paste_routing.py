@@ -11,9 +11,13 @@ Two assertions, both needed:
   * NORMAL TAB (the regression gate): a paste still reaches the foreground pane.
   * VIEW: the same paste reaches the focused cell's aliased pane.
 
-The pane is `/bin/sh` in canonical mode, so the pasted bytes are echoed back by
-the line discipline -- the marker shows up on the pane's input line (wrapped in
-the echoed `^[[200~` / `^[[201~` markers) without ever being executed.
+The pane is `/bin/sh` sitting at a prompt, so the pasted text lands on its input
+line -- visible, and never executed, because nothing sends a newline after it.
+This asserts on the TEXT only, deliberately: whether the `^[[200~` / `^[[201~`
+markers accompany it is the pane's own business now that remux wraps a paste
+only for a pane that asked for bracketed paste (mode 2004). That handshake is
+what `bracketed_paste.py` tests; this harness tests only that the bytes reach
+the right pane.
 """
 import sys
 from pty_harness import Tui, sm_compose_view

@@ -210,6 +210,19 @@ pub struct Screen {
     pub lock_renders: bool,
     /// DECCKM: application cursor keys mode (CSI ? 1 h/l).
     pub application_cursor_keys: bool,
+    /// Bracketed paste mode (CSI ? 2004 h/l): whether the program in this pane
+    /// has ASKED to have pasted text wrapped in `ESC[200~` / `ESC[201~`.
+    ///
+    /// Bracketed paste is a handshake, and this is the half remux was missing.
+    /// The client used to wrap unconditionally, so a raw-mode reader that never
+    /// asked got 12 bytes of garbage around the text -- vim read the leading
+    /// `ESC` as the Escape key and ran `[200~` as normal-mode commands.
+    ///
+    /// It lives here beside DECCKM rather than beside the saved grid because
+    /// 2004 is a TERMINAL-level mode -- what the terminal does to input -- not a
+    /// property of the screen buffer, so it deliberately does not follow the
+    /// alt-screen switch (1047/1049).
+    pub bracketed_paste: bool,
     /// Whether the application has enabled mouse tracking (modes 1000/1002/1003).
     pub mouse_tracking: bool,
     /// Whether the application asked for MOTION reports too (modes 1002
@@ -271,6 +284,7 @@ impl Screen {
             scp_hyperlink: None,
             lock_renders: false,
             application_cursor_keys: false,
+            bracketed_paste: false,
             mouse_tracking: false,
             mouse_motion: false,
             mouse_sgr: false,
@@ -1487,6 +1501,10 @@ impl vte::Perform for Screen {
                         let mode = param_slice[0];
                         match mode {
                             1 => self.application_cursor_keys = true,
+                            // 2004 = bracketed paste. Until this arm existed the
+                            // mode fell into the catch-all below and the client
+                            // wrapped every paste regardless.
+                            2004 => self.bracketed_paste = true,
                             25 => self.cursor_visible = true,
                             2026 => self.lock_renders = true,
                             // Mouse tracking: 1000=normal, 1002=button-event, 1003=any-event.
@@ -1544,6 +1562,7 @@ impl vte::Perform for Screen {
                         let mode = param_slice[0];
                         match mode {
                             1 => self.application_cursor_keys = false,
+                            2004 => self.bracketed_paste = false,
                             25 => self.cursor_visible = false,
                             2026 => self.lock_renders = false,
                             // Mouse tracking: 1000=normal, 1002=button-event, 1003=any-event.
@@ -1578,6 +1597,20 @@ impl vte::Perform for Screen {
                                     self.mouse_tracking = false;
                                     self.mouse_motion = false;
                                     self.mouse_sgr = false;
+                                    // `bracketed_paste` is deliberately NOT reset
+                                    // here, and the asymmetry with the mouse flags
+                                    // above is the cost of being wrong. A stuck
+                                    // mouse flag makes the WHEEL unusable for as
+                                    // long as the pane lives, and nothing ever
+                                    // clears it. A stuck 2004 costs one paste with
+                                    // visible markers, and both readline and zle
+                                    // re-emit 2004h/2004l around every line they
+                                    // read -- so the next shell prompt overwrites
+                                    // whatever a crashed app left behind. Clearing
+                                    // it would break the common case outright: a
+                                    // shell with paste legitimately armed is then
+                                    // one alt-screen command away from silently
+                                    // losing it. A real terminal leaves it set.
                                 }
                             }
                             1047 if self.alt_screen_active => {
@@ -1593,7 +1626,9 @@ impl vte::Perform for Screen {
                                 self.alt_screen_active = false;
                                 // Safety: reset mouse flags on leaving the alt screen
                                 // (see mode 1049 above) to recover the common
-                                // "app gone, flag stuck" case.
+                                // "app gone, flag stuck" case. `bracketed_paste` is
+                                // deliberately excluded, for the reason recorded
+                                // there.
                                 self.mouse_tracking = false;
                                 self.mouse_motion = false;
                                 self.mouse_sgr = false;
@@ -2181,6 +2216,65 @@ mod tests {
         assert!(!s.mouse_tracking);
         assert!(!s.mouse_motion);
         assert!(!s.mouse_sgr);
+    }
+
+    #[test]
+    fn test_bracketed_paste_decset() {
+        let mut s = make_screen();
+        assert!(!s.bracketed_paste);
+
+        // The handshake half remux was missing: an application asks for
+        // bracketed paste with `CSI ? 2004 h` and gives it up with `... l`.
+        s.process_output(b"\x1b[?2004h");
+        assert!(s.bracketed_paste);
+        s.process_output(b"\x1b[?2004l");
+        assert!(!s.bracketed_paste);
+
+        // An unrelated private mode must not disturb it in either direction --
+        // 2004 used to fall into the catch-all arm with every other unknown
+        // mode, so "the flag is untouched" is exactly the old behaviour and
+        // needs pinning as the NEW behaviour too.
+        s.process_output(b"\x1b[?2004h");
+        s.process_output(b"\x1b[?1000h");
+        s.process_output(b"\x1b[?25l");
+        assert!(s.bracketed_paste);
+    }
+
+    #[test]
+    fn test_bracketed_paste_is_terminal_state_not_screen_state() {
+        let mut s = make_screen();
+
+        // Judgement call 1: 2004 does NOT follow the alt-screen switch. It is a
+        // TERMINAL-level mode -- what the terminal does to input -- not a
+        // property of the screen buffer, which is why `Screen` keeps it beside
+        // DECCKM (mode 1) rather than beside the saved grid. A shell that armed
+        // bracketed paste on the primary screen still has it armed when a
+        // full-screen app that never touched 2004 exits.
+        s.process_output(b"\x1b[?2004h");
+        s.process_output(b"\x1b[?1049h");
+        assert!(s.alt_screen_active);
+        assert!(s.bracketed_paste);
+        s.process_output(b"\x1b[?1049l");
+        assert!(!s.alt_screen_active);
+        assert!(s.bracketed_paste);
+
+        // Judgement call 2: an app that dies with the flag set does NOT get it
+        // cleared for it, unlike the mouse flags one arm above (see
+        // `test_leaving_alt_screen_resets_mouse_tracking`). The asymmetry is the
+        // cost of being wrong. A stuck mouse flag makes the WHEEL unusable for
+        // as long as the pane lives and nothing ever resets it; a stuck 2004
+        // costs a single paste with visible markers, and both readline and zle
+        // re-emit `2004h`/`2004l` around every line they read, so the very next
+        // shell prompt overwrites whatever the corpse left behind. Clearing it
+        // would instead break the common case outright -- a shell with paste
+        // legitimately armed, one alt-screen command away from silently losing
+        // it. A real terminal leaves it set; so do we.
+        s.process_output(b"\x1b[?2004l");
+        assert!(!s.bracketed_paste);
+        s.process_output(b"\x1b[?1049h");
+        s.process_output(b"\x1b[?2004h");
+        s.process_output(b"\x1b[?1049l");
+        assert!(s.bracketed_paste);
     }
 
     #[test]

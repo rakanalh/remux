@@ -4638,20 +4638,21 @@ async fn handle_mouse_scroll(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, popup) = build_composite(
-        &session_name,
-        cols,
-        rows,
-        &mode,
-        state,
-        panes,
-        config,
-        None,
-        None,
-        0,
-        &config.compositor_theme(),
-    )
-    .await;
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup) =
+        build_composite(
+            &session_name,
+            cols,
+            rows,
+            &mode,
+            state,
+            panes,
+            config,
+            None,
+            None,
+            0,
+            &config.compositor_theme(),
+        )
+        .await;
 
     // Find the pane under the cursor; fall back to whichever pane owns input
     // (the popup while it is up, else the active tab's focused pane).
@@ -4822,20 +4823,21 @@ async fn handle_mouse_click(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, popup) = build_composite(
-        &session_name,
-        cols,
-        rows,
-        &mode,
-        state,
-        panes,
-        config,
-        None,
-        None,
-        0,
-        &config.compositor_theme(),
-    )
-    .await;
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup) =
+        build_composite(
+            &session_name,
+            cols,
+            rows,
+            &mode,
+            state,
+            panes,
+            config,
+            None,
+            None,
+            0,
+            &config.compositor_theme(),
+        )
+        .await;
 
     let target = hit_test_with_popup(x, y, &hit_regions, &pane_rects, popup);
     log::debug!(
@@ -5025,20 +5027,21 @@ async fn handle_mouse_drag(
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, popup) = build_composite(
-        &session_name,
-        cols,
-        rows,
-        &mode,
-        state,
-        panes,
-        config,
-        None,
-        None,
-        0,
-        &config.compositor_theme(),
-    )
-    .await;
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup) =
+        build_composite(
+            &session_name,
+            cols,
+            rows,
+            &mode,
+            state,
+            panes,
+            config,
+            None,
+            None,
+            0,
+            &config.compositor_theme(),
+        )
+        .await;
 
     // Find which pane the drag started in (the popup first, when it is up).
     let start_target = hit_test_with_popup(start_x, start_y, &hit_regions, &pane_rects, popup);
@@ -6821,6 +6824,7 @@ async fn stream_pane_content(
                         cursor_y: snap.cursor_y,
                         cursor_visible: snap.cursor_visible,
                         application_cursor_keys: snap.application_cursor_keys,
+                        bracketed_paste: snap.bracketed_paste,
                         session_name: session_name.clone(),
                         tab_name: tab_name.clone(),
                         session_visible,
@@ -7008,6 +7012,7 @@ async fn send_full_render_to_client(
         _hit_regions,
         _pane_rects,
         application_cursor_keys,
+        bracketed_paste,
         _popup,
     ) = build_composite(
         session_name,
@@ -7147,6 +7152,7 @@ async fn send_full_render_to_client(
                 cursor_style,
                 focused_pane_rect: Some(fpr),
                 application_cursor_keys,
+                bracketed_paste,
                 viewport_top,
                 scroll_offset,
             });
@@ -7159,6 +7165,7 @@ async fn send_full_render_to_client(
                 cursor_style,
                 focused_pane_rect,
                 application_cursor_keys,
+                bracketed_paste,
                 viewport_top,
                 scroll_offset,
             });
@@ -7211,6 +7218,7 @@ async fn broadcast_full_render(
         _hit_regions,
         _pane_rects,
         application_cursor_keys,
+        bracketed_paste,
         _popup,
     ) = build_composite(
         session_name,
@@ -7305,6 +7313,7 @@ async fn broadcast_full_render(
                         cursor_style,
                         focused_pane_rect,
                         application_cursor_keys,
+                        bracketed_paste,
                         viewport_top,
                         // Only live-tail clients are targeted here (see the
                         // `scroll_offset == 0` filter above).
@@ -7324,6 +7333,7 @@ async fn broadcast_full_render(
                         cursor_style,
                         focused_pane_rect,
                         application_cursor_keys,
+                        bracketed_paste,
                         viewport_top,
                         scroll_offset: 0,
                     }
@@ -7341,6 +7351,7 @@ async fn broadcast_full_render(
                     cursor_style,
                     focused_pane_rect,
                     application_cursor_keys,
+                    bracketed_paste,
                     viewport_top,
                     scroll_offset: 0,
                 }
@@ -7432,6 +7443,7 @@ async fn build_composite(
     HitRegions,
     Vec<(PaneId, Rect)>,
     bool, // application_cursor_keys
+    bool, // bracketed_paste
     // The visible popup as `(popup_pane, popup_rect)`. Deliberately NOT folded
     // into `pane_rects`: that stays the layout's own rects (popup-independent),
     // so callers can hit-test the popup FIRST without the overlay ever
@@ -7451,6 +7463,8 @@ async fn build_composite(
                 None,
                 HitRegions::default(),
                 Vec::new(),
+                // No pane to read an input mode off; not a claim about one.
+                false,
                 false,
                 None,
             );
@@ -7468,6 +7482,8 @@ async fn build_composite(
                 None,
                 HitRegions::default(),
                 Vec::new(),
+                // No pane to read an input mode off; not a claim about one.
+                false,
                 false,
                 None,
             );
@@ -7700,6 +7716,12 @@ async fn build_composite(
         .get(&scroll_target)
         .map(|p| p.screen.application_cursor_keys)
         .unwrap_or(false);
+    // Bracketed paste is an input mode too, so the same rule applies: a paste
+    // goes wherever the keystrokes go, which is the popup while it owns input.
+    let bracketed_paste = ps
+        .get(&scroll_target)
+        .map(|p| p.screen.bracketed_paste)
+        .unwrap_or(false);
 
     (
         cells,
@@ -7711,6 +7733,7 @@ async fn build_composite(
         hit_regions,
         pane_rects,
         application_cursor_keys,
+        bracketed_paste,
         popup,
     )
 }

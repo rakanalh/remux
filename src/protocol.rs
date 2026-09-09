@@ -513,6 +513,20 @@ pub enum ServerMessage {
         /// Whether the focused pane has application cursor keys (DECCKM) active.
         #[serde(default)]
         application_cursor_keys: bool,
+        /// Whether the focused pane has asked for bracketed paste (mode 2004),
+        /// so the client wraps a paste in `ESC[200~`/`ESC[201~` only for a pane
+        /// that wants them.
+        ///
+        /// The default is `true`, and it does NOT mean "the mode is on" -- it
+        /// means "this server is too old to tell us, so behave exactly as it did
+        /// before". Defaulting to `false` would trade a latent bug for a live
+        /// regression: an un-upgraded server would silently stop bracketing for
+        /// every zsh/bash user, which is the case that works today.
+        ///
+        /// No `PROTOCOL_VERSION` bump: the field decodes both ways, the same
+        /// reasoning `DirectoryListing::home` records for being added at 11.
+        #[serde(default = "default_true")]
+        bracketed_paste: bool,
         /// Index in the combined scrollback+grid buffer of the first displayed line.
         #[serde(default)]
         viewport_top: usize,
@@ -540,6 +554,20 @@ pub enum ServerMessage {
         /// Whether the focused pane has application cursor keys (DECCKM) active.
         #[serde(default)]
         application_cursor_keys: bool,
+        /// Whether the focused pane has asked for bracketed paste (mode 2004),
+        /// so the client wraps a paste in `ESC[200~`/`ESC[201~` only for a pane
+        /// that wants them.
+        ///
+        /// The default is `true`, and it does NOT mean "the mode is on" -- it
+        /// means "this server is too old to tell us, so behave exactly as it did
+        /// before". Defaulting to `false` would trade a latent bug for a live
+        /// regression: an un-upgraded server would silently stop bracketing for
+        /// every zsh/bash user, which is the case that works today.
+        ///
+        /// No `PROTOCOL_VERSION` bump: the field decodes both ways, the same
+        /// reasoning `DirectoryListing::home` records for being added at 11.
+        #[serde(default = "default_true")]
+        bracketed_paste: bool,
         /// Index in the combined scrollback+grid buffer of the first displayed line.
         #[serde(default)]
         viewport_top: usize,
@@ -574,6 +602,20 @@ pub enum ServerMessage {
         cursor_style: u8,
         focused_pane_rect: Option<PaneRect>,
         application_cursor_keys: bool,
+        /// Whether the focused pane has asked for bracketed paste (mode 2004),
+        /// so the client wraps a paste in `ESC[200~`/`ESC[201~` only for a pane
+        /// that wants them.
+        ///
+        /// The default is `true`, and it does NOT mean "the mode is on" -- it
+        /// means "this server is too old to tell us, so behave exactly as it did
+        /// before". Defaulting to `false` would trade a latent bug for a live
+        /// regression: an un-upgraded server would silently stop bracketing for
+        /// every zsh/bash user, which is the case that works today.
+        ///
+        /// No `PROTOCOL_VERSION` bump: the field decodes both ways, the same
+        /// reasoning `DirectoryListing::home` records for being added at 11.
+        #[serde(default = "default_true")]
+        bracketed_paste: bool,
         /// Index in the combined scrollback+grid buffer of the first displayed line.
         #[serde(default)]
         viewport_top: usize,
@@ -747,6 +789,12 @@ pub enum ServerMessage {
         /// cell encodes arrows/nav for THAT pane, not the foreground session's.
         #[serde(default)]
         application_cursor_keys: bool,
+        /// The source pane's bracketed-paste (2004) state, so a paste into a
+        /// focused cell is wrapped for THAT pane, not the foreground session's.
+        /// Defaults `true` for the same reason as on the render messages: an
+        /// older server that omits it must keep behaving as it does today.
+        #[serde(default = "default_true")]
+        bracketed_paste: bool,
         /// The pane's session and tab names, for the cell's border title
         /// (`session / tab`, host-prefixed for remotes by the client). Kept live
         /// so a rename updates the label. `#[serde(default)]` keeps the message

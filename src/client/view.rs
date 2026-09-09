@@ -57,6 +57,11 @@ pub struct PaneSnapshot {
     pub cursor_visible: bool,
     /// The source pane's DECCKM state, used to encode input to a focused cell.
     pub application_cursor_keys: bool,
+    /// The source pane's bracketed-paste (2004) state, so a paste into a focused
+    /// cell is wrapped only when THAT pane asked for the markers -- the cell is
+    /// the pane the bytes reach, and the foreground session's mode says nothing
+    /// about it.
+    pub bracketed_paste: bool,
     /// Whether the source pane is currently "session-visible" -- shown in the
     /// active tab of at least one attached client, so its real session drives it
     /// at full size. When `true`, the cell renders an "Active in session"
@@ -1346,6 +1351,7 @@ mod tests {
             cursor_y: 0,
             cursor_visible: false,
             application_cursor_keys: false,
+            bracketed_paste: false,
             session_visible: false,
         }
     }
@@ -1412,6 +1418,7 @@ mod tests {
             cursor_y: 0,
             cursor_visible: false,
             application_cursor_keys: false,
+            bracketed_paste: false,
             session_visible: false,
         }
     }
@@ -2258,6 +2265,7 @@ mod tests {
             cursor_y: 0,
             cursor_visible: false,
             application_cursor_keys: false,
+            bracketed_paste: false,
             session_visible: false,
         };
         let view = ClientView {

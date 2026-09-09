@@ -565,6 +565,14 @@ pub struct InputHandler {
     pub session_manager: Option<crate::client::session_manager::SessionManagerState>,
     /// Whether the focused pane has DECCKM (application cursor keys) active.
     pub application_cursor_keys: bool,
+    /// Whether the focused pane has asked for bracketed paste (mode 2004).
+    ///
+    /// Initialised `true`, unlike DECCKM beside it, and for the same reason the
+    /// wire field defaults `true`: before the first frame arrives we do not know
+    /// the pane's mode, and the safe unknown is the behaviour remux already had
+    /// (always wrap). Starting `false` would drop the markers for a shell that
+    /// wants them if a paste ever beat the first render.
+    pub bracketed_paste: bool,
     /// State for the folder selection overlay.
     pub folder_select: Option<FolderSelectOverlay>,
     /// State for the session quick-switch overlay.
@@ -1368,6 +1376,7 @@ impl InputHandler {
             search_state: None,
             session_manager: None,
             application_cursor_keys: false,
+            bracketed_paste: true,
             folder_select: None,
             session_switch: None,
             view_picker: None,
