@@ -635,8 +635,13 @@ impl SidebarPlugin for FilesPlugin {
                 }
             }
             // The session tree is the sessions panel's and the agent list the
-            // agents panel's.
-            PluginEvent::SessionTree { .. } | PluginEvent::Agents { .. } => {}
+            // agents panel's. So is the focused pane's IDENTITY: this panel
+            // follows the very same pane, but by its DIRECTORY, and takes that
+            // from `FocusedCwd` above -- the two are derived from one walk, so
+            // reading the id here would be a second name for what it already has.
+            PluginEvent::SessionTree { .. }
+            | PluginEvent::Agents { .. }
+            | PluginEvent::FocusedPane { .. } => {}
         }
     }
 

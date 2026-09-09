@@ -1158,16 +1158,24 @@ async fn dispatch_plugin_request(
     }
 }
 
-/// The working directory of the pane the user is focused on, read out of a
-/// session tree: the current session's active tab's focused pane.
+/// The pane the user is focused on, read out of a session tree: the current
+/// session's active tab's focused pane.
 ///
 /// All three qualifiers matter. `is_focused` is per-tab, so every tab names one
 /// and `is_active` is what picks between them; `is_current` is per-recipient, so
 /// it names the session THIS client is attached to on that server.
-fn focused_pane_cwd(
-    folders: &[crate::protocol::FolderTreeEntry],
-    unfiled: &[crate::protocol::SessionTreeEntry],
-) -> Option<String> {
+///
+/// Returns the ENTRY rather than one field of it, because two broadcasts are
+/// derived from the same answer -- [`PluginEvent::FocusedCwd`] takes its `cwd`
+/// and [`PluginEvent::FocusedPane`] its `id`. One walk is what keeps them
+/// agreeing about WHICH pane: split into two walks they could drift, and a
+/// panel marking one pane while another browsed a different pane's directory is
+/// the same disagreement `PluginRequest`'s note records for `foreground()`
+/// against the tree.
+fn focused_pane<'a>(
+    folders: &'a [crate::protocol::FolderTreeEntry],
+    unfiled: &'a [crate::protocol::SessionTreeEntry],
+) -> Option<&'a crate::protocol::PaneTreeEntry> {
     folders
         .iter()
         .flat_map(|f| f.sessions.iter())
@@ -1175,7 +1183,6 @@ fn focused_pane_cwd(
         .find(|s| s.is_current)
         .and_then(|s| s.tabs.iter().find(|t| t.is_active))
         .and_then(|t| t.panes.iter().find(|p| p.is_focused))
-        .and_then(|p| p.cwd.clone())
 }
 
 /// Make sure every live connection carries this push subscription, and forget
@@ -5871,10 +5878,29 @@ async fn run_client_loop(
                             // panel's own: no event, no respawn, whatever the
                             // panel decided.
                             if mgr.is_foreground(&src) {
+                                // ONE walk feeding both events -- see
+                                // `focused_pane`. The `files` panel follows this
+                                // pane's directory and the `agents` panel marks
+                                // its row, and they must be talking about the
+                                // same pane.
+                                let focused = focused_pane(&folders, &unfiled);
                                 chrome.broadcast(
                                     &crate::client::sidebar::PluginEvent::FocusedCwd {
                                         conn: src.clone(),
-                                        cwd: focused_pane_cwd(&folders, &unfiled),
+                                        cwd: focused.and_then(|p| p.cwd.clone()),
+                                    },
+                                );
+                                // Announced on every foreground tree too, and
+                                // deliberately not deduplicated here either, for
+                                // the reason given just above: the panel's own
+                                // comparison is the one that counts, and a dedup
+                                // at this site would put the decision in two
+                                // places and silently defeat the end-to-end test
+                                // of the panel's.
+                                chrome.broadcast(
+                                    &crate::client::sidebar::PluginEvent::FocusedPane {
+                                        conn: src.clone(),
+                                        pane_id: focused.map(|p| p.id),
                                     },
                                 );
                             }
@@ -6764,6 +6790,138 @@ mod tests {
 
     fn local(name: &str) -> (ConnId, String) {
         (ConnId::Local, name.to_string())
+    }
+
+    fn pane(id: u64, is_focused: bool, cwd: Option<&str>) -> crate::protocol::PaneTreeEntry {
+        crate::protocol::PaneTreeEntry {
+            id,
+            name: format!("p{id}"),
+            is_focused,
+            cwd: cwd.map(|s| s.to_string()),
+        }
+    }
+
+    fn tab(
+        id: u64,
+        is_active: bool,
+        panes: Vec<crate::protocol::PaneTreeEntry>,
+    ) -> crate::protocol::TabTreeEntry {
+        crate::protocol::TabTreeEntry {
+            id,
+            name: format!("t{id}"),
+            panes,
+            is_active,
+        }
+    }
+
+    fn session(
+        name: &str,
+        is_current: bool,
+        tabs: Vec<crate::protocol::TabTreeEntry>,
+    ) -> crate::protocol::SessionTreeEntry {
+        crate::protocol::SessionTreeEntry {
+            name: name.to_string(),
+            tabs,
+            client_count: 1,
+            is_current,
+        }
+    }
+
+    /// The three qualifiers, all exercised at once: the answer is the CURRENT
+    /// session's ACTIVE tab's FOCUSED pane, and every other tab names a focused
+    /// pane of its own that must not be picked.
+    #[test]
+    fn focused_pane_takes_the_current_sessions_active_tabs_focused_pane() {
+        let unfiled = vec![
+            session(
+                "other",
+                false,
+                vec![tab(1, true, vec![pane(10, true, Some("/wrong/session"))])],
+            ),
+            session(
+                "mine",
+                true,
+                vec![
+                    tab(2, false, vec![pane(20, true, Some("/wrong/tab"))]),
+                    tab(
+                        3,
+                        true,
+                        vec![
+                            pane(30, false, Some("/wrong/pane")),
+                            pane(31, true, Some("/right")),
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        let found = focused_pane(&[], &unfiled).expect("a focused pane");
+        assert_eq!(found.id, 31);
+        assert_eq!(found.cwd.as_deref(), Some("/right"));
+    }
+
+    /// Sessions inside folders are searched too, not just the unfiled ones.
+    #[test]
+    fn focused_pane_looks_inside_folders() {
+        let folders = vec![crate::protocol::FolderTreeEntry {
+            name: "work".to_string(),
+            sessions: vec![session(
+                "mine",
+                true,
+                vec![tab(1, true, vec![pane(7, true, Some("/in/a/folder"))])],
+            )],
+        }];
+        assert_eq!(focused_pane(&folders, &[]).map(|p| p.id), Some(7));
+    }
+
+    /// No session is the client's -- it is attached to nothing on this server.
+    #[test]
+    fn focused_pane_is_none_when_no_session_is_current() {
+        let unfiled = vec![session(
+            "other",
+            false,
+            vec![tab(1, true, vec![pane(10, true, Some("/somewhere"))])],
+        )];
+        assert!(focused_pane(&[], &unfiled).is_none());
+    }
+
+    /// `is_active` is `#[serde(default)]`, so a server too old to send it marks
+    /// no tab -- which reads as "unknown", and unknown must produce nothing
+    /// rather than a guess at the first tab.
+    #[test]
+    fn focused_pane_is_none_when_the_current_session_has_no_active_tab() {
+        let unfiled = vec![session(
+            "mine",
+            true,
+            vec![
+                tab(1, false, vec![pane(10, true, Some("/a"))]),
+                tab(2, false, vec![pane(11, true, Some("/b"))]),
+            ],
+        )];
+        assert!(focused_pane(&[], &unfiled).is_none());
+    }
+
+    #[test]
+    fn focused_pane_is_none_when_the_active_tab_marks_no_focused_pane() {
+        let unfiled = vec![session(
+            "mine",
+            true,
+            vec![tab(1, true, vec![pane(10, false, Some("/a"))])],
+        )];
+        assert!(focused_pane(&[], &unfiled).is_none());
+    }
+
+    /// The entry is returned whole so that one walk can feed both broadcasts;
+    /// a pane whose cwd could not be read is still the focused PANE.
+    #[test]
+    fn focused_pane_still_names_the_pane_when_its_cwd_is_unreadable() {
+        let unfiled = vec![session(
+            "mine",
+            true,
+            vec![tab(1, true, vec![pane(42, true, None)])],
+        )];
+        let found = focused_pane(&[], &unfiled).expect("a focused pane");
+        assert_eq!(found.id, 42);
+        assert!(found.cwd.is_none(), "and the cwd half is honestly absent");
     }
 
     #[test]

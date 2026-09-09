@@ -274,10 +274,12 @@ impl SidebarPlugin for SessionsPlugin {
                 }
             }
             // The agent list is the `agents` panel's and the directory events
-            // are the `files` panel's; the pre-resolved focused cwd is already
-            // in the tree this panel holds.
+            // are the `files` panel's; the pre-resolved focused cwd and focused
+            // pane are both already in the tree this panel holds, which is why
+            // it derives its own highlight rather than following either.
             PluginEvent::Agents { .. }
             | PluginEvent::FocusedCwd { .. }
+            | PluginEvent::FocusedPane { .. }
             | PluginEvent::DirectoryListing { .. } => {}
         }
     }

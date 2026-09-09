@@ -91,6 +91,25 @@ pub enum PluginEvent {
     /// foreground moved to a remote -- and go on showing the OLD machine's
     /// directory.
     FocusedCwd { conn: ConnId, cwd: Option<String> },
+    /// WHICH pane the user is focused on, as the FOREGROUND server reports it,
+    /// or `None` when there is no pane to name -- not attached, a session with
+    /// no active tab, or a tab whose focused pane the tree does not mark.
+    ///
+    /// The same walk as [`PluginEvent::FocusedCwd`], and literally the same
+    /// call: one `focused_pane` result feeds both broadcasts. A panel marking
+    /// the current pane and a panel following that pane's directory therefore
+    /// cannot disagree about which pane it is -- two independent walks drifting
+    /// apart is the same failure mode [`PluginRequest`] records for
+    /// `foreground()` against the tree, and one walk is what forecloses it.
+    ///
+    /// `conn` is half of the identity, not decoration, for the reason the pane
+    /// id alone cannot carry: pane ids are per-SERVER counters, so two connected
+    /// machines both have a pane 1, and a panel comparing the id alone would
+    /// mark a row on the wrong machine.
+    FocusedPane {
+        conn: ConnId,
+        pane_id: Option<crate::protocol::PaneId>,
+    },
     /// The contents of a directory on `conn`, as that server reported them.
     ///
     /// Broadcast rather than panel-targeted, and correlated by `(conn, path)`

@@ -16,6 +16,10 @@ What it covers:
      is the theme's bell colour
   4  Enter jumps across a SESSION boundary -- checked by what appears in the
      content area, not by trusting a label
+  3b the current-pane caret MARKS the pane the user is in, MOVES when they
+     switch panes, and vanishes when they land on a pane that is not an agent.
+     Moving is the point: a caret painted on the first row and never updated
+     passes any check that only asks whether one appeared
   5  a refresh that removes an entry ABOVE the selection does not retarget it:
      Enter still goes where the user pointed (identity, not index). Set up so
      that index-preservation and identity-preservation give DIFFERENT answers --
@@ -252,6 +256,55 @@ def content_rows(screen):
     return [r[SIDEBAR_W:] for r in screen.display]
 
 
+CARET = "\u25b8"
+CARET_X = 1  # panel-relative: col 0 is the state marker, col 2 the label
+
+
+def caret_rows(screen):
+    """The panel rows carrying the current-pane caret, panel-relative.
+
+    Read as a CELL at the fixed column the caret occupies, never by scanning a
+    row for the glyph. Two reasons: at most one row may ever be marked and only
+    a count can see a second one, and a row of this screen also holds the
+    content area, where a `\u25b8` from a pane's own output would be indistinguishable
+    from the panel's -- the bug a row scan invites and a fixed-column read
+    cannot have.
+    """
+    return [
+        y for y, r in enumerate(panel_rows(screen))
+        if r[CARET_X:CARET_X + 1] == CARET
+    ]
+
+
+def focused_pane_id(w, session):
+    """`session`'s active tab's focused pane id, from the SERVER's own tree.
+
+    Ground truth for where the user is, independent of anything the panel
+    renders. `is_active` and `is_focused` are session state rather than
+    per-recipient, so reading them through this wire client says the same thing
+    it says to the PTY client -- unlike `is_current`, which is why this takes the
+    session by name instead of asking the tree which one is current.
+    """
+    w.send("ListSessionTree")
+    end = time.time() + 3.0
+    while time.time() < end:
+        msg = w.recv()
+        if isinstance(msg, dict) and "SessionTree" in msg:
+            body = msg["SessionTree"]
+            for sess in list(body["unfiled"]) + [
+                s for f in body["folders"] for s in f["sessions"]
+            ]:
+                if sess["name"] != session:
+                    continue
+                for t in sess["tabs"]:
+                    if not t.get("is_active"):
+                        continue
+                    for p in t["panes"]:
+                        if p["is_focused"]:
+                            return p["id"]
+    raise SystemExit(f"no active tab / focused pane for {session}")
+
+
 def marker_fg(screen, panel_y):
     """The colour of the state marker on panel row `panel_y`."""
     return str(screen.buffer[FRAME + panel_y][FRAME].fg)
@@ -382,6 +435,84 @@ def scenario():
     check("3 the working agent wears the theme's activity colour",
           ACTIVITY in colours, list(zip(colours, listed)))
 
+    # -- 3b: the current-pane caret ------------------------------------------
+    #
+    # Focus is still on the CONTENT here -- the panel has not been touched yet --
+    # which is the only state that draws the caret at all.
+    #
+    # alpha tab 0 is [notanagent | spin / ALPHATAG]: notanagent fills the left
+    # column, spin and ALPHATAG split the right one. Every move below is
+    # ground-truthed against the server's tree rather than against an assumed
+    # layout, and the assertion that matters is that the caret MOVES.
+    ids = alpha_pane_ids(seeds[0])
+    not_an_agent, spin_id, alpha_id = ids[0], ids[1], ids[2]
+    log("alpha tab 0 panes:", ids)
+
+    def caret_now(label):
+        """The single marked panel row, after letting the tree push land."""
+        wait_until(pump, lambda: len(caret_rows(screen)) <= 1, timeout=3.0)
+        marked = caret_rows(screen)
+        check(f"3b at most one row is ever marked ({label})",
+              len(marked) <= 1, (marked, panel_rows(screen)))
+        return marked[0] if len(marked) == 1 else None
+
+    # The seed left focus on ALPHATAG, the last pane it created.
+    check("3b the harness starts where it thinks it does",
+          focused_pane_id(seeds[0], "alpha") == alpha_id,
+          (focused_pane_id(seeds[0], "alpha"), ids))
+    ok = wait_until(pump, lambda: len(caret_rows(screen)) == 1)
+    at_alpha = caret_now("on ALPHATAG")
+    check("3b the pane the user is in is marked", ok and at_alpha is not None,
+          (caret_rows(screen), panel_rows(screen)))
+    check("3b the caret sits on an agent row, not the header",
+          at_alpha is not None and at_alpha >= 1, at_alpha)
+
+    # Alt-k: up into `spin`, the OTHER agent in this tab. Its label is identical
+    # to ALPHATAG's (`claude alpha/0`), so only the row INDEX can tell the two
+    # apart -- which is exactly why the check is on the index.
+    child.send(b"\x1bk")
+    pump(0.8)
+    check("3b the pane focus really moved (server-side)",
+          focused_pane_id(seeds[0], "alpha") == spin_id,
+          (focused_pane_id(seeds[0], "alpha"), ids))
+    at_spin = caret_now("on spin")
+    check("3b the caret MOVES to the newly focused pane",
+          at_spin is not None and at_spin != at_alpha, (at_alpha, at_spin))
+
+    # Alt-h: left into `notanagent`, which the panel does not list. `notanagent`
+    # is not the leftmost thing on screen -- the sidebar is -- but it is the
+    # left NEIGHBOUR of `spin`, so this move stays inside the content.
+    child.send(b"\x1bh")
+    pump(0.8)
+    check("3b focus really moved onto the non-agent pane",
+          focused_pane_id(seeds[0], "alpha") == not_an_agent,
+          (focused_pane_id(seeds[0], "alpha"), ids))
+    ok = wait_until(pump, lambda: len(caret_rows(screen)) == 0)
+    check("3b a focused pane that is not an agent marks nothing",
+          ok, (caret_rows(screen), panel_rows(screen)))
+
+    # Alt-l: back into the right column, and the caret comes back.
+    child.send(b"\x1bl")
+    pump(0.8)
+    check("3b focus came back to an agent pane",
+          focused_pane_id(seeds[0], "alpha") in (spin_id, alpha_id),
+          (focused_pane_id(seeds[0], "alpha"), ids))
+    ok = wait_until(pump, lambda: len(caret_rows(screen)) == 1)
+    check("3b the caret returns when an agent pane is focused again", ok,
+          (caret_rows(screen), panel_rows(screen)))
+
+    # And it is hidden while the PANEL itself has focus: the caret answers
+    # "where am I?", and driving this list is not being in a pane.
+    child.send(b"\x1b2")
+    pump(0.8)
+    check("3b the caret is hidden while the panel has focus",
+          len(caret_rows(screen)) == 0, (caret_rows(screen), panel_rows(screen)))
+    child.send(b"\x1bl")  # leave the sidebar the way it was entered
+    pump(0.8)
+    check("3b and comes back on leaving the panel",
+          wait_until(pump, lambda: len(caret_rows(screen)) == 1),
+          (caret_rows(screen), panel_rows(screen)))
+
     # -- 4: Enter jumps across a session boundary ----------------------------
     body_before = "\n".join(content_rows(screen))
     check("4 the client is attached to alpha to start with",
@@ -398,6 +529,13 @@ def scenario():
     body = "\n".join(content_rows(screen))
     check("4 Enter on an agent row lands in ITS session",
           "BETATAG" in body, repr(body[-400:]))
+    # The jump leaves the sidebar, so the caret is drawable again -- and the
+    # foreground session changed, so it has to have moved onto beta's row.
+    ok = wait_until(pump, lambda: len(caret_rows(screen)) == 1)
+    marked = caret_rows(screen)
+    check("4 the caret follows the jump across the session boundary",
+          ok and "beta" in panel_rows(screen)[marked[0]],
+          (marked, panel_rows(screen)))
 
     # -- 5: a refresh that removes a row above the selection ------------------
     #
@@ -431,6 +569,13 @@ def scenario():
     check("5 Enter still goes where the user pointed, not to the new occupant "
           "of that index (THIRDTAG, not BETATAG)",
           "THIRDTAG" in body and "BETATAG" not in body, repr(body[-400:]))
+    # THIRDTAG is alpha's tab 1, so the caret must now name a tab it has not
+    # named once in this run.
+    ok = wait_until(pump, lambda: len(caret_rows(screen)) == 1)
+    marked = caret_rows(screen)
+    check("5 the caret follows the jump across the tab boundary",
+          ok and "alpha/1" in panel_rows(screen)[marked[0]],
+          (marked, panel_rows(screen)))
 
     check("client still alive", child.isalive())
     try:

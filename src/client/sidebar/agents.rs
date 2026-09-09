@@ -12,6 +12,12 @@
 //! sessions panel produces and the same client-side jump path -- there is
 //! deliberately no second "go to that pane" implementation.
 //!
+//! One row may carry a `\u{25B8}` caret marking the pane the user is currently
+//! in. It is fed by [`super::PluginEvent::FocusedPane`] -- the client's walk of
+//! the foreground server's tree, the same call that feeds the `files` panel's
+//! directory -- rather than derived here, for the reason that event documents:
+//! this panel gets an agent LIST, which says nothing about where the user is.
+//!
 //! The identity is `(ConnId, PaneId)`, never the pane id alone. Pane ids are
 //! per-SERVER counters, so two connected machines both have a pane 1; keying on
 //! the id would let a refresh on one server point the selection at the other's
@@ -26,6 +32,16 @@ use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{AgentEntry, AgentState, CellColor, PaneId, RenderCell};
+
+/// The mark on the row whose pane the user is currently in.
+///
+/// Column 1 is unused in this row layout -- the state marker is column 0 and the
+/// label starts at column 2 -- so the caret costs no width, shifts no text, and
+/// leaves the state marker's colour, which is the whole point of the panel,
+/// exactly where it was. A mark that had to be squeezed in anywhere else would
+/// have had to buy the space from one of those two.
+const CARET: char = '\u{25B8}';
+const CARET_X: usize = 1;
 
 /// One rendered row: an agent, and the server it lives on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +73,11 @@ pub struct AgentsPlugin {
     lists: Vec<(ConnId, ConnAgents)>,
     /// The flattened rows, in render order.
     rows: Vec<Row>,
+    /// The pane the user is currently in, if the panel has been told of one and
+    /// it is on a connection the panel is listing. A row IDENTITY, never a row
+    /// index: the list is rebuilt on every push, and an index would follow
+    /// whichever agent slid into that slot.
+    current: Option<(ConnId, PaneId)>,
     nav: NavList,
 }
 
@@ -65,6 +86,7 @@ impl AgentsPlugin {
         Self {
             lists: Vec::new(),
             rows: Vec::new(),
+            current: None,
             nav: NavList::new(),
         }
     }
@@ -186,6 +208,16 @@ impl SidebarPlugin for AgentsPlugin {
         true
     }
 
+    /// Yes -- indirectly, exactly as the `files` panel's does. This panel never
+    /// reads a `SessionTree`, but [`PluginEvent::FocusedPane`] is derived from
+    /// one, so a client whose only panel is this one would otherwise subscribe
+    /// to no tree, receive no focus event, and never draw the current-pane
+    /// caret at all. The agent list itself rides its own subscription and is
+    /// unaffected either way.
+    fn wants_session_tree(&self) -> bool {
+        true
+    }
+
     fn render(
         &self,
         cols: u16,
@@ -272,6 +304,27 @@ impl SidebarPlugin for AgentsPlugin {
                 Self::state_fg(row.entry.state, theme),
                 row_bg.clone(),
             );
+            // The current-pane caret, in the ROW's colours rather than a colour
+            // of its own: that way it rides the selection bar instead of
+            // punching a hole in it, and the state marker beside it keeps the
+            // colour the panel exists to show. See `CARET` for why column 1 is
+            // free.
+            //
+            // Suppressed while THIS panel has focus. The caret answers "where am
+            // I?", and while the user is driving this list the honest answer is
+            // "in the sidebar", not in any pane. (A different sidebar holding
+            // focus is invisible from here -- `focused` is the only focus signal
+            // a panel gets -- so that case still shows the caret.)
+            if !focused && self.current.as_ref() == Some(&row.key()) {
+                draw_text(
+                    &mut grid,
+                    CARET_X as u16,
+                    y,
+                    CARET.encode_utf8(&mut [0u8; 4]),
+                    fg.clone(),
+                    row_bg.clone(),
+                );
+            }
             draw_text(&mut grid, 2, y, &Self::label(row), fg, row_bg);
         }
 
@@ -333,15 +386,33 @@ impl SidebarPlugin for AgentsPlugin {
                 }
                 self.rebuild();
             }
+            PluginEvent::FocusedPane { conn, pane_id } => {
+                // Replaced outright rather than merged. The event always names
+                // the FOREGROUND connection, so the foreground moving to another
+                // machine drops the old machine's caret by construction -- no
+                // conn-changed branch to get wrong, and no way for two carets to
+                // exist at once. `None` clears it: there is a foreground, and it
+                // names no pane (detached, or a session with no active tab).
+                self.current = pane_id.map(|id| (conn.clone(), id));
+            }
             PluginEvent::ConnectionLost { conn } => {
+                // The caret named a pane on THAT machine. Pane ids are
+                // per-server counters, so leaving it standing would let it land
+                // on another machine's pane of the same id -- a different pane
+                // entirely, and the reason the connection is half of the key.
+                if self.current.as_ref().is_some_and(|(c, _)| c == conn) {
+                    self.current = None;
+                }
                 let before = self.lists.len();
                 self.lists.retain(|(id, _)| id != conn);
                 if self.lists.len() != before {
                     self.rebuild();
                 }
             }
-            // The session tree is the sessions panel's, and the directory
-            // events are the `files` panel's.
+            // The tree itself is the sessions panel's -- this panel subscribes
+            // to it only so the focused-pane event above is derived at all --
+            // the cwd is the `files` panel's half of that same walk, and the
+            // directory events are the `files` panel's too.
             PluginEvent::SessionTree { .. }
             | PluginEvent::FocusedCwd { .. }
             | PluginEvent::DirectoryListing { .. } => {}
@@ -376,6 +447,26 @@ mod tests {
         }
     }
 
+    fn focus(conn: ConnId, pane_id: Option<PaneId>) -> PluginEvent {
+        PluginEvent::FocusedPane { conn, pane_id }
+    }
+
+    /// The panel-row index carrying the current-pane caret, and how many rows
+    /// carry one. Read as a CELL at the fixed column the caret lives in, not by
+    /// scanning text: at most one row may ever be marked, and a count is the
+    /// only way to see a second one.
+    fn caret(p: &AgentsPlugin, cols: u16, rows: u16, focused: bool) -> (Option<usize>, usize) {
+        let theme = CompositorTheme::default();
+        let grid = p.render(cols, rows, focused, &theme);
+        let marked: Vec<usize> = grid
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.get(CARET_X).map(|c| c.c) == Some(CARET))
+            .map(|(y, _)| y)
+            .collect();
+        (marked.first().copied(), marked.len())
+    }
+
     fn unsupported(conn: ConnId) -> PluginEvent {
         PluginEvent::Agents {
             conn,
@@ -393,10 +484,19 @@ mod tests {
         }
     }
 
-    /// The panel's visible rows, from a real render.
+    /// The panel's visible rows, from a real render of the FOCUSED panel.
     fn painted(p: &AgentsPlugin, cols: u16, rows: u16) -> Vec<String> {
+        painted_with(p, cols, rows, true)
+    }
+
+    /// As [`painted`], with the panel's own focus chosen.
+    ///
+    /// Worth the second helper because the caret is suppressed while this panel
+    /// has focus: a caret assertion routed through `painted` would render a
+    /// panel that cannot draw one, so it would pass whatever the code did.
+    fn painted_with(p: &AgentsPlugin, cols: u16, rows: u16, focused: bool) -> Vec<String> {
         let theme = CompositorTheme::default();
-        p.render(cols, rows, true, &theme)
+        p.render(cols, rows, focused, &theme)
             .iter()
             .map(|row| {
                 row.iter()
@@ -775,13 +875,250 @@ mod tests {
         assert_eq!(painted(&p, 24, 4)[1], "no agents");
     }
 
+    // -- the current-pane caret -------------------------------------------
+
     #[test]
-    fn the_panel_asks_for_agents_and_not_for_the_session_tree() {
+    fn the_caret_marks_the_focused_pane_and_no_other_row() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![
+                agent(1, "claude", "a", AgentState::Idle),
+                agent(2, "claude", "b", AgentState::Idle),
+                agent(3, "claude", "c", AgentState::Idle),
+            ],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(2)));
+        assert_eq!(
+            caret(&p, 24, 5, false),
+            (Some(2), 1),
+            "pane 2 is the second agent row, at panel row 2, and it is the only mark"
+        );
+    }
+
+    #[test]
+    fn the_caret_moves_when_the_focused_pane_does() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![
+                agent(1, "claude", "a", AgentState::Idle),
+                agent(2, "claude", "b", AgentState::Idle),
+            ],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        assert_eq!(caret(&p, 24, 5, false).0, Some(1));
+        p.on_event(&focus(ConnId::Local, Some(2)));
+        assert_eq!(
+            caret(&p, 24, 5, false),
+            (Some(2), 1),
+            "the old mark must go, not accumulate"
+        );
+    }
+
+    /// The focused pane is very often NOT an agent pane -- an editor, a shell --
+    /// and no caret beats a caret on whichever agent happens to sit nearby.
+    #[test]
+    fn a_focused_pane_that_is_not_an_agent_marks_nothing() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "a", AgentState::Idle)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(99)));
+        assert_eq!(caret(&p, 24, 5, false).1, 0);
+    }
+
+    /// `None` is "there is a foreground, and it names no pane" -- detached, or a
+    /// session with no active tab. It must CLEAR a caret, not leave the last one
+    /// standing.
+    #[test]
+    fn a_focus_event_carrying_no_pane_clears_the_caret() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "a", AgentState::Idle)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        assert_eq!(caret(&p, 24, 5, false).1, 1, "the caret was there to clear");
+        p.on_event(&focus(ConnId::Local, None));
+        assert_eq!(caret(&p, 24, 5, false).1, 0);
+    }
+
+    /// With no focus event at all -- the panel has just been built -- there is
+    /// nothing to mark.
+    #[test]
+    fn a_panel_that_has_heard_no_focus_marks_nothing() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "a", AgentState::Idle)],
+        ));
+        assert_eq!(caret(&p, 24, 5, false).1, 0);
+    }
+
+    /// The caret answers "where am I?", and while the user is driving this list
+    /// the answer is "in the sidebar". The two halves are the same setup, so the
+    /// focus flag is provably the cause.
+    #[test]
+    fn the_caret_is_hidden_while_this_panel_itself_has_focus() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "a", AgentState::Idle)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        assert_eq!(caret(&p, 24, 5, false).1, 1, "unfocused: marked");
+        assert_eq!(caret(&p, 24, 5, true).1, 0, "focused: not marked");
+    }
+
+    #[test]
+    fn the_caret_displaces_neither_the_state_marker_nor_the_label() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "work", AgentState::Idle)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        let theme = CompositorTheme::default();
+        let grid = p.render(24, 3, false, &theme);
+        assert_eq!(grid[1][0].c, '\u{25CF}', "the state marker keeps column 0");
+        assert_eq!(grid[1][CARET_X].c, CARET);
+        let text: String = grid[1][2..].iter().map(|c| c.c).collect();
+        assert!(
+            text.starts_with("claude work/0"),
+            "the label still starts at column 2, got {text:?}"
+        );
+        // And the row without the caret is otherwise identical.
+        assert_eq!(
+            painted_with(&p, 24, 3, false)[1].trim_start_matches(|c| c != 'c'),
+            painted(&p, 24, 3)[1].trim_start_matches(|c| c != 'c')
+        );
+    }
+
+    /// The tree push and the agent push are separate subscriptions, so either
+    /// can arrive first. A caret resolved when the event ARRIVED would be lost
+    /// by the arrival that has not happened yet; matched at render time, the
+    /// order cannot matter.
+    #[test]
+    fn a_focus_that_arrives_before_the_agent_list_still_marks_its_row() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&focus(ConnId::Local, Some(2)));
+        assert_eq!(caret(&p, 24, 5, false).1, 0, "nothing to mark yet");
+        p.on_event(&push(
+            ConnId::Local,
+            vec![
+                agent(1, "claude", "a", AgentState::Idle),
+                agent(2, "claude", "b", AgentState::Idle),
+            ],
+        ));
+        assert_eq!(caret(&p, 24, 5, false), (Some(2), 1));
+    }
+
+    /// The panel's standing doctrine: the state colour is the whole point, and
+    /// nothing painted on the row may swallow it.
+    #[test]
+    fn the_state_colour_survives_on_a_row_that_is_both_current_and_selected() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "work", AgentState::NeedsInput)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        let theme = CompositorTheme::default();
+        // Row 0 is both the selection (a fresh panel selects it) and the current
+        // pane -- the case most likely to regress, since the selection bar is
+        // painted over the whole row first.
+        let grid = p.render(20, 3, false, &theme);
+        assert_eq!(
+            grid[1][0].fg, theme.tab_bell_fg,
+            "the caret must not swallow the state colour any more than the selection may"
+        );
+        assert_eq!(grid[1][CARET_X].c, CARET);
+        assert_eq!(
+            grid[1][CARET_X].bg, grid[1][3].bg,
+            "and the caret rides the selection bar rather than punching a hole in it"
+        );
+    }
+
+    /// Pane ids are per-server counters. A caret held for a machine that went
+    /// away must not reappear on another machine's pane of the same id -- which
+    /// is the whole reason the connection is half of the key.
+    #[test]
+    fn a_lost_connection_takes_its_caret_and_does_not_hand_it_to_the_same_id_elsewhere() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "here", AgentState::Idle)],
+        ));
+        p.on_event(&push(
+            remote("pi"),
+            vec![agent(1, "claude", "far", AgentState::Idle)],
+        ));
+        // Two machines, both with a pane 1. The caret is on the REMOTE's.
+        p.on_event(&focus(remote("pi"), Some(1)));
+        assert_eq!(
+            caret(&p, 24, 5, false),
+            (Some(2), 1),
+            "row 2 is the remote's pane 1, not the local one at row 1"
+        );
+        p.on_event(&PluginEvent::ConnectionLost { conn: remote("pi") });
+        assert_eq!(
+            caret(&p, 24, 5, false).1,
+            0,
+            "the local pane 1 is still listed; a caret keyed on the id alone would land on it"
+        );
+    }
+
+    /// A drop of a connection the caret was NOT on must leave it alone.
+    #[test]
+    fn another_connection_going_away_leaves_the_caret_where_it_is() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "here", AgentState::Idle)],
+        ));
+        p.on_event(&push(
+            remote("pi"),
+            vec![agent(1, "claude", "far", AgentState::Idle)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        p.on_event(&PluginEvent::ConnectionLost { conn: remote("pi") });
+        assert_eq!(caret(&p, 24, 5, false), (Some(1), 1));
+    }
+
+    /// The foreground moving to another machine replaces the caret rather than
+    /// adding one: the event names the foreground, so there is only ever one.
+    #[test]
+    fn the_foreground_moving_to_another_machine_moves_the_caret_with_it() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "here", AgentState::Idle)],
+        ));
+        p.on_event(&push(
+            remote("pi"),
+            vec![agent(1, "claude", "far", AgentState::Idle)],
+        ));
+        p.on_event(&focus(ConnId::Local, Some(1)));
+        assert_eq!(caret(&p, 24, 5, false), (Some(1), 1));
+        p.on_event(&focus(remote("pi"), Some(1)));
+        assert_eq!(
+            caret(&p, 24, 5, false),
+            (Some(2), 1),
+            "the previous machine's caret must not survive alongside the new one"
+        );
+    }
+
+    /// Indirectly, exactly as the `files` panel does: this panel reads no tree,
+    /// but the focus event it marks with is derived from one.
+    #[test]
+    fn the_panel_subscribes_to_the_tree_the_focus_event_is_derived_from() {
         let p = AgentsPlugin::new();
         assert!(p.wants_agents());
         assert!(
-            !p.wants_session_tree(),
-            "it must put no tree traffic on the wire"
+            p.wants_session_tree(),
+            "no subscription, no tree, no focus event, no caret -- ever"
         );
     }
 
