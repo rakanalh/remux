@@ -341,7 +341,26 @@ impl Pty {
         }
     }
 
-    /// Write input bytes to the PTY master.
+    /// Write input bytes to the PTY master, synchronously.
+    ///
+    /// **Tests only, and the `cfg` is the enforcement rather than a convention.**
+    /// This loop is written as if the descriptor were blocking, and it is not:
+    /// [`start_reader`] sets `O_NONBLOCK` on a `try_clone`d master, a dup shares
+    /// the open file description, so the flag lands on the pane's one and only
+    /// master. The first `EAGAIN` -- the slave's input queue is a few KB and the
+    /// program in the pane has not drained it -- therefore returned `Err` with
+    /// the remainder SILENTLY DROPPED, and the daemon's callers logged the error
+    /// and carried on without telling the client. That is the truncated (and,
+    /// when the very first `write` was the one to block, vanished) paste.
+    ///
+    /// The daemon writes through [`start_writer`]'s queue instead. Compiling
+    /// this away outside tests is what makes it impossible to reintroduce the
+    /// bug by reaching for the obvious-looking method.
+    ///
+    /// The unit tests below keep it because they write a handful of bytes to a
+    /// PTY nobody is reading yet, which never blocks -- and because several of
+    /// them are plain `#[test]`s with no runtime to spawn a writer task on.
+    #[cfg(test)]
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < data.len() {
@@ -610,6 +629,118 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
     (handle, rx)
 }
 
+/// Spawn a background tokio task that writes queued buffers to the PTY master,
+/// and return the task handle with the sending end of its queue.
+///
+/// The mirror image of [`start_reader`], and it exists for the same reason that
+/// one does: the master is `O_NONBLOCK`, so a write can only be finished by
+/// waiting for the descriptor to become writable again, and the daemon has
+/// nowhere to wait. Every daemon write goes through here -- user input, `View`
+/// cell input, `SendKey`, and the DA/DSR replies the emulator owes an
+/// application. **One queue for all of them**, because they share a single
+/// byte stream: a second path would let a terminal-query reply overtake the
+/// keystrokes typed before it.
+///
+/// Takes an **owned** descriptor -- give it a `dup` of the master, not the
+/// master itself. `AsyncFd` deregisters from the reactor before closing what it
+/// owns, which is the ordering that keeps the fd NUMBER from being reissued to
+/// the next PTY while a registration for it still exists; see the long comment
+/// in [`start_reader`] for the pane-loses-all-output bug that cost.
+///
+/// The queue is **unbounded**, matching [`start_reader`] and tmux's own
+/// unbounded buffering of pane input. The consequence is worth naming: a pane
+/// whose program never reads its input QUEUES rather than drops, so memory
+/// grows with what is typed at it, and a large buffer ahead of a smaller one
+/// blocks it (head-of-line). Both are inherent to preserving the byte stream --
+/// the alternative to waiting is discarding, which is the bug this replaced.
+pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSender<Vec<u8>>) {
+    let raw = master_fd.as_raw_fd();
+    log::debug!("pty: start_writer watching fd={raw}");
+
+    // Set non-blocking mode, which `AsyncFd` requires. Already true in practice
+    // (the reader's dup shares the open file description), but this task must
+    // not depend on another one having run first.
+    // SAFETY: `master_fd` owns a valid descriptor for the whole call.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let handle = tokio::spawn(async move {
+        let async_fd = match AsyncFd::with_interest(master_fd, Interest::WRITABLE) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log::error!("start_writer: failed to create AsyncFd: {e}");
+                return;
+            }
+        };
+
+        while let Some(buf) = rx.recv().await {
+            let mut offset = 0;
+            while offset < buf.len() {
+                let mut guard = match async_fd.writable().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        log::error!("start_writer: writable() failed: {e}");
+                        return;
+                    }
+                };
+
+                match guard.try_io(|inner| {
+                    nix::unistd::write(inner.get_ref(), &buf[offset..])
+                        .map_err(std::io::Error::from)
+                        .and_then(|n| {
+                            if n == 0 {
+                                // A short write of nothing at all on a non-empty
+                                // buffer. `try_io` only clears readiness for
+                                // `WouldBlock`, so looping on this would spin the
+                                // executor; report it as the error `write_all`
+                                // reports and let the arm below abandon the
+                                // buffer.
+                                Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                            } else {
+                                Ok(n)
+                            }
+                        })
+                }) {
+                    Ok(Ok(n)) => offset += n,
+                    Ok(Err(e))
+                        if matches!(e.raw_os_error(), Some(libc::EIO) | Some(libc::EBADF)) =>
+                    {
+                        // The child is gone (`EIO` on a master whose slave has
+                        // closed) or the descriptor was pulled from under us.
+                        // Expected at pane close, so `debug!` -- the pane's
+                        // reader reaches EOF at the same moment and the reap
+                        // path reports the exit properly.
+                        log::debug!("start_writer: fd={raw} closed while writing ({e})");
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        // Abandon this buffer but keep the task: a later write
+                        // may well succeed, and exiting here would silently make
+                        // the pane unwritable for the rest of its life. Bytes,
+                        // never their content -- see CLAUDE.md's logging rules.
+                        log::warn!(
+                            "start_writer: fd={raw} write failed after {offset} of {} byte(s): {e}",
+                            buf.len()
+                        );
+                        break;
+                    }
+                    Err(_would_block) => continue,
+                }
+            }
+        }
+
+        // The senders are gone: the pane's `PaneData` was dropped. `async_fd`
+        // drops here, deregistering before it closes the descriptor it owns.
+        log::debug!("pty: start_writer for fd={raw} finished");
+    });
+
+    (handle, tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +941,72 @@ mod tests {
             "-sh",
             "an empty `args` must reproduce the pre-`args` login argv[0] exactly"
         );
+    }
+
+    /// A buffer far larger than the PTY's input queue reaches the program in the
+    /// pane WHOLE.
+    ///
+    /// The witness for the paste-truncation bug at this level. `write_input` --
+    /// which every daemon path used to call -- fails this outright: Linux's pty
+    /// input queue is a few KB, the first `write` past it returns `EAGAIN` on
+    /// the non-blocking master, and its loop returns `Err` having silently
+    /// abandoned the tail.
+    ///
+    /// The receiver is `cat > file`, so the assertion is on what the CHILD wrote
+    /// out, not on anything this process can arrange. Compared by CONTENT: a
+    /// writer that resumed at the wrong offset keeps the length a size check
+    /// would accept.
+    #[tokio::test]
+    async fn start_writer_delivers_a_buffer_larger_than_the_pty_input_queue() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let out = std::env::temp_dir().join(format!("remux-writer-{}-{nanos}", std::process::id()));
+        let args = vec!["-c".to_string(), format!("cat > {}", out.display())];
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &args, None, None).expect("failed to spawn PTY");
+
+        // Drain the master's OUTPUT side for the whole test. The line discipline
+        // ECHOES everything written here, and with nobody reading that back the
+        // output queue fills, `cat` blocks writing the echo, stops reading its
+        // input, and the writer parks for ever on a queue nothing empties. That
+        // deadlock is a property of the test rig, not of the code under test.
+        let (_reader, mut rx) = start_reader(pty.master_fd.try_clone().unwrap());
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let (_writer, tx) = start_writer(pty.master_fd.try_clone().unwrap());
+
+        // 64-byte lines, deliberately: the pty is in CANONICAL mode, whose line
+        // buffer truncates any single line past 4095 bytes -- which would look
+        // exactly like the dropped tail this test exists to catch, from a cause
+        // that has nothing to do with the writer.
+        let payload: Vec<u8> = (0..500)
+            .map(|n| format!("line{n:06}-{}\n", "x".repeat(52)))
+            .collect::<String>()
+            .into_bytes();
+        tx.send(payload.clone()).expect("writer task is gone");
+        tx.send(vec![4]).expect("writer task is gone"); // Ctrl-D ends `cat`
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            got = std::fs::read(&out).unwrap_or_default();
+            if got.len() >= payload.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(&out);
+
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "the pane received {} of {} bytes",
+            got.len(),
+            payload.len()
+        );
+        assert!(got == payload, "the bytes arrived, but not in order");
     }
 
     /// The complement, and the case the `files` panel needs: a command given

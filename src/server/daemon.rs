@@ -346,6 +346,21 @@ struct PaneData {
     /// running holds an epoll registration on a descriptor number that the next
     /// PTY will be handed -- see `pty::start_reader` for what that cost.
     reader: tokio::task::JoinHandle<()>,
+    /// Sending end of the pane's input queue, drained by `writer`.
+    ///
+    /// The ONLY way the daemon writes to a pane. `Pty::write_input` is
+    /// `#[cfg(test)]` so that stays true by compilation rather than by habit:
+    /// the master is non-blocking, and a synchronous loop over it dropped the
+    /// tail of any write the slave's input queue could not take -- a truncated
+    /// or entirely vanished paste. See [`pty::start_writer`].
+    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// The background writer task draining `input_tx`.
+    ///
+    /// Held for the same reason `reader` is: dropping a `JoinHandle` detaches
+    /// the task rather than stopping it, and a writer left running holds an
+    /// epoll registration on a descriptor number that the next PTY will be
+    /// handed -- see `pty::start_reader` for what that cost.
+    writer: tokio::task::JoinHandle<()>,
     /// True once a PTY-forwarding task has been spawned for this pane.
     /// start_pty_forwarding is called from many sites (attach, session/tab
     /// switches); without this guard each call would spawn a competing task
@@ -382,6 +397,32 @@ struct PaneData {
     agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
 }
 
+impl PaneData {
+    /// Queue bytes for the pane's PTY.
+    ///
+    /// Never writes the descriptor here. The master is `O_NONBLOCK` and this is
+    /// called under the `panes` lock, so the only two things this function could
+    /// do itself are drop the bytes it cannot place (the paste-truncation bug)
+    /// or block a runtime thread while holding a lock the whole daemon contends
+    /// for. It hands them to [`pty::start_writer`]'s task instead.
+    ///
+    /// **Infallible, and that is the contract rather than an oversight.** The
+    /// one thing that can go wrong is a closed channel -- a pane whose
+    /// `PaneData` is being torn down -- and it is logged here. Handing the
+    /// caller an `Err` for it would be worse than useless: `handle_input`
+    /// propagates, so every keystroke aimed at a pane that is already going away
+    /// would become an `error handling client message` line, and the two callers
+    /// that log an error themselves would carry a branch nothing can reach.
+    fn send_input(&self, data: &[u8]) {
+        if self.input_tx.send(data.to_vec()).is_err() {
+            log::warn!(
+                "server: dropping {} input byte(s) for a pane whose writer has exited",
+                data.len()
+            );
+        }
+    }
+}
+
 impl Drop for PaneData {
     fn drop(&mut self) {
         // Stop the reader with the pane. Its descriptor is its own, so the abort
@@ -389,6 +430,15 @@ impl Drop for PaneData {
         // child left a grandchild holding the slave open -- the read would never
         // reach EOF and the task would park forever.
         self.reader.abort();
+        // Same for the writer, and it needs the abort MORE than the reader does.
+        // Closing `input_tx` (which happens when this struct's fields drop,
+        // after this function returns) only ends the task once it is back at
+        // `recv()` -- and a task parked in `writable()` on a slave queue nothing
+        // is draining never gets there. A child that has exited would fail out
+        // with `EIO`, but a stopped process, or a grandchild still holding the
+        // slave open, would not, and the task would hold its dup and its
+        // reactor registration for the life of the server.
+        self.writer.abort();
     }
 }
 
@@ -1612,9 +1662,7 @@ entries={} error={:?} truncated={}",
                 let ps = panes.lock().await;
                 match ps.get(&pane_id) {
                     Some(pane_data) => {
-                        if let Err(e) = pane_data.pty.write_input(&data) {
-                            log::warn!("server: InputToPane pane_id={pane_id} write failed: {e}");
-                        }
+                        pane_data.send_input(&data);
                         true
                     }
                     None => false,
@@ -1971,7 +2019,7 @@ async fn handle_input(
 
     let mut ps = panes.lock().await;
     if let Some(pane_data) = ps.get_mut(&active_pane) {
-        pane_data.pty.write_input(data)?;
+        pane_data.send_input(data);
 
         // Ctrl+L (0x0C / FF): shells' readline/zsh clear-screen typically emits
         // only \e[H\e[2J (no \e[3J), so the scrollback would otherwise survive.
@@ -2806,9 +2854,7 @@ async fn handle_command(
             };
             let panes_lock = panes.lock().await;
             if let Some(pane) = panes_lock.get(&pane_id) {
-                if let Err(e) = pane.pty.write_input(&bytes) {
-                    log::error!("failed to write SendKey to pane {pane_id}: {e}");
-                }
+                pane.send_input(&bytes);
             }
         }
         RemuxCommand::PaneNew => {
@@ -4229,7 +4275,7 @@ async fn write_to_pane(
 ) -> Result<()> {
     let ps = panes.lock().await;
     if let Some(pane_data) = ps.get(&pane_id) {
-        pane_data.pty.write_input(bytes)?;
+        pane_data.send_input(bytes);
     }
     Ok(())
 }
@@ -6204,6 +6250,13 @@ async fn spawn_pane(
         .try_clone()
         .context("failed to duplicate the PTY master for the reader")?;
     let (reader_handle, pty_rx) = pty::start_reader(reader_fd);
+    // ...and so does the writer, for the same reason and with the same
+    // discipline: an `AsyncFd` must own what it registers.
+    let writer_fd = pty_instance
+        .master_fd
+        .try_clone()
+        .context("failed to duplicate the PTY master for the writer")?;
+    let (writer_handle, input_tx) = pty::start_writer(writer_fd);
     let screen = Screen::new(cols, rows, config.general.scrollback_lines);
 
     let mut ps = panes.lock().await;
@@ -6214,6 +6267,8 @@ async fn spawn_pane(
             screen,
             pty_rx,
             reader: reader_handle,
+            input_tx,
+            writer: writer_handle,
             forwarding_started: false,
             streamed_session_visible: false,
             last_output: std::time::Instant::now(),
@@ -8162,7 +8217,7 @@ async fn start_forwarding_for_pane(
                             let ps = panes.lock().await;
                             if let Some(pane_data) = ps.get(&pane_id) {
                                 for resp in &responses {
-                                    let _ = pane_data.pty.write_input(resp);
+                                    pane_data.send_input(resp);
                                 }
                             }
                         }
@@ -8449,7 +8504,7 @@ async fn materialize_session(
                             let ps = panes.lock().await;
                             if let Some(pane_data) = ps.get(&pane_id) {
                                 for resp in &responses {
-                                    let _ = pane_data.pty.write_input(resp);
+                                    pane_data.send_input(resp);
                                 }
                             }
                         }
