@@ -176,9 +176,10 @@ pub enum SessionManagerAction {
         new_name: String,
     },
     RefreshTree,
-    /// Add one or more existing panes (marked, or the highlighted pane) to a
-    /// client-only view. Handled entirely client-side (opens the view picker);
-    /// never forwarded to the server.
+    /// Add one or more existing panes (the marked ones, else the highlighted
+    /// pane, else every pane of the highlighted tab) to a client-only view.
+    /// Handled entirely client-side (opens the view picker); never forwarded
+    /// to the server.
     AddToView {
         panes: Vec<(ConnId, u64)>,
     },
@@ -507,9 +508,11 @@ impl SessionManagerState {
         self.marked.len()
     }
 
-    /// Take the panes to add to a view: the marked set (drained) if non-empty,
-    /// else the single highlighted pane (if the selected row is a pane), else
-    /// empty. Draining clears the marks so a subsequent action starts fresh.
+    /// Take the panes to add to a view: the marked set (drained) if non-empty;
+    /// else the highlighted row's panes -- the pane itself on a pane row, or
+    /// every pane of the tab in tree order on a tab row (collapsed or not);
+    /// else empty. Session and other rows yield nothing. Draining clears the
+    /// marks so a subsequent action starts fresh.
     pub fn take_marked_or_highlighted_panes(&mut self) -> Vec<(ConnId, u64)> {
         if !self.marked.is_empty() {
             return std::mem::take(&mut self.marked);
@@ -523,6 +526,16 @@ impl SessionManagerState {
             Some(NodeType::Pane {
                 server, pane_id, ..
             }) => vec![(server.clone(), *pane_id)],
+            Some(NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            }) => self
+                .model
+                .panes_of_tab(server, session, *tab_index)
+                .into_iter()
+                .map(|id| (server.clone(), id))
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -1041,7 +1054,8 @@ impl SessionManagerState {
                 _ => SessionManagerAction::None,
             },
             AddToView => {
-                // Marked panes (or the highlighted pane) are added to a view.
+                // Marked panes (else the highlighted pane, or every pane of the
+                // highlighted tab) are added to a view.
                 // Drop any whose server is no longer connected so a stale mark
                 // from a since-disconnected remote can't be added.
                 let mut panes = self.take_marked_or_highlighted_panes();
@@ -2703,15 +2717,64 @@ mod tests {
         assert_eq!(panes, vec![(ConnId::Local, 11u64)]);
     }
 
-    #[test]
-    fn test_take_empty_on_non_pane_with_no_marks() {
-        let mut state = two_pane_state();
-        // Highlight the tab (not a pane), no marks -> empty.
-        state.model.selected = state
+    fn first_tab_row(state: &SessionManagerState) -> usize {
+        state
             .model
             .rows
             .iter()
             .position(|r| matches!(&r.node_type, NodeType::Tab { .. }))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_take_on_tab_row_returns_all_its_panes_in_tree_order() {
+        let mut state = two_pane_state();
+        state.model.selected = first_tab_row(&state);
+        assert_eq!(
+            state.take_marked_or_highlighted_panes(),
+            vec![(ConnId::Local, 10u64), (ConnId::Local, 11u64)]
+        );
+    }
+
+    #[test]
+    fn test_take_on_tab_row_prefers_marks_when_present() {
+        let mut state = two_pane_state();
+        state.model.selected = pane_row_by_id(&state, 11);
+        state.toggle_mark();
+        state.model.selected = first_tab_row(&state);
+        assert_eq!(
+            state.take_marked_or_highlighted_panes(),
+            vec![(ConnId::Local, 11u64)]
+        );
+    }
+
+    #[test]
+    fn test_take_on_collapsed_tab_row_still_returns_all_its_panes() {
+        let mut state = two_pane_state();
+        state.model.selected = first_tab_row(&state);
+        state.collapse_selected();
+        // Collapsed: the pane rows are gone, so the answer must come from the
+        // tree data, not from the rows beneath the highlight.
+        assert!(!state
+            .model
+            .rows
+            .iter()
+            .any(|r| matches!(&r.node_type, NodeType::Pane { .. })));
+        state.model.selected = first_tab_row(&state);
+        assert_eq!(
+            state.take_marked_or_highlighted_panes(),
+            vec![(ConnId::Local, 10u64), (ConnId::Local, 11u64)]
+        );
+    }
+
+    #[test]
+    fn test_take_empty_on_session_row_with_no_marks() {
+        let mut state = two_pane_state();
+        state.model.selected = state
+            .model
+            .rows
+            .iter()
+            .position(|r| matches!(&r.node_type, NodeType::Session { .. }))
             .unwrap();
         assert!(state.take_marked_or_highlighted_panes().is_empty());
     }

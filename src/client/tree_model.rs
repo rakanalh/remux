@@ -429,6 +429,27 @@ impl TreeModel {
         self.rebuild_rows();
     }
 
+    /// Every pane id of one tab, in tree order, read from the tree DATA rather
+    /// than the rows -- so it answers for a collapsed (or filtered-out) tab too.
+    ///
+    /// Sessions are searched folders first, then unfiled, the order
+    /// [`TreeModel::rebuild_rows`] lays them out in; `tab_index` is the same
+    /// enumerate index [`NodeType::Tab`] carries. Empty when the server, the
+    /// session or the tab is unknown.
+    pub fn panes_of_tab(&self, server: &ConnId, session: &str, tab_index: usize) -> Vec<u64> {
+        let Some((folders, unfiled)) = self.trees.get(server) else {
+            return Vec::new();
+        };
+        folders
+            .iter()
+            .flat_map(|f| f.sessions.iter())
+            .chain(unfiled.iter())
+            .find(|s| s.name == session)
+            .and_then(|s| s.tabs.get(tab_index))
+            .map(|t| t.panes.iter().map(|p| p.id).collect())
+            .unwrap_or_default()
+    }
+
     /// Whether `server` is present in the roster and currently connected.
     pub fn is_connected(&self, server: &ConnId) -> bool {
         self.roster
