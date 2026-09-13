@@ -1181,8 +1181,59 @@ fn focused_pane<'a>(
         .flat_map(|f| f.sessions.iter())
         .chain(unfiled.iter())
         .find(|s| s.is_current)
-        .and_then(|s| s.tabs.iter().find(|t| t.is_active))
+        .and_then(active_tab_focused_pane)
+}
+
+/// A session's active tab's focused pane. `None` when no tab is marked active
+/// (an older peer) or the active tab marks no focused pane.
+fn active_tab_focused_pane(
+    session: &crate::protocol::SessionTreeEntry,
+) -> Option<&crate::protocol::PaneTreeEntry> {
+    session
+        .tabs
+        .iter()
+        .find(|t| t.is_active)
         .and_then(|t| t.panes.iter().find(|p| p.is_focused))
+}
+
+/// The pane `Prefix+w a` adds to a view: the target session's active tab's
+/// focused pane.
+///
+/// The session is `want` by name when given (the caller passes it only when
+/// `current_attached` is on the SAME connection as the tree, so a same-named
+/// session on another machine can never match), else the one marked
+/// `is_current`.
+///
+/// `is_focused` is per-tab -- every tab names one -- so `is_active` is what
+/// picks the tab. That field is `#[serde(default)]`: an older peer marks no tab
+/// at all, and only then does this fall back to the first focused pane in tab
+/// order, which is the best that tree can say.
+fn view_add_target(
+    folders: &[crate::protocol::FolderTreeEntry],
+    unfiled: &[crate::protocol::SessionTreeEntry],
+    want: Option<&str>,
+) -> Option<crate::protocol::PaneId> {
+    let session = folders
+        .iter()
+        .flat_map(|f| f.sessions.iter())
+        .chain(unfiled.iter())
+        .find(|s| match want {
+            Some(name) => s.name == name,
+            None => s.is_current,
+        })?;
+    if session.tabs.iter().any(|t| t.is_active) {
+        return active_tab_focused_pane(session).map(|p| p.id);
+    }
+    log::debug!(
+        "view: session {:?} marks no active tab (older peer?); taking the first focused pane",
+        session.name
+    );
+    session
+        .tabs
+        .iter()
+        .flat_map(|t| t.panes.iter())
+        .find(|p| p.is_focused)
+        .map(|p| p.id)
 }
 
 /// Make sure every live connection carries this push subscription, and forget
@@ -5971,36 +6022,18 @@ async fn run_client_loop(
                         }
                         // Resolve a pending "add focused pane to a view" request
                         // BEFORE `folders`/`unfiled` are moved into the session
-                        // manager below. `is_focused` is per-tab (every tab reports
-                        // its focused pane), and this message carries no active-tab
-                        // marker, so within the current session we take the first
-                        // focused pane found (multi-tab active-tab disambiguation is
-                        // a known limitation).
+                        // manager below. `view_add_target` picks the session's
+                        // ACTIVE tab's focused pane (`is_focused` alone is per-tab).
+                        // The attached session's NAME is only meaningful on its own
+                        // connection: a same-named session on another machine must
+                        // not match, so on any other `src` we fall back to
+                        // `is_current`.
                         if pending_view_add && mgr.is_foreground(&src) {
-                            let want = current_attached.as_ref().map(|(_, s)| s.clone());
-                            let mut found: Option<crate::protocol::PaneId> = None;
-                            'find: for s in folders
-                                .iter()
-                                .flat_map(|f| f.sessions.iter())
-                                .chain(unfiled.iter())
-                            {
-                                let is_target = match &want {
-                                    Some(name) => &s.name == name,
-                                    None => s.is_current,
-                                };
-                                if !is_target {
-                                    continue;
-                                }
-                                for tab in &s.tabs {
-                                    for p in &tab.panes {
-                                        if p.is_focused {
-                                            found = Some(p.id);
-                                            break 'find;
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(pid) = found {
+                            let want = current_attached
+                                .as_ref()
+                                .filter(|(conn, _)| *conn == src)
+                                .map(|(_, s)| s.as_str());
+                            if let Some(pid) = view_add_target(&folders, &unfiled, want) {
                                 pending_panes.push((src.clone(), pid));
                             }
                             // Consumed: don't let a later tree re-resolve it.
@@ -6954,6 +6987,60 @@ mod tests {
         let found = focused_pane(&[], &unfiled).expect("a focused pane");
         assert_eq!(found.id, 42);
         assert!(found.cwd.is_none(), "and the cwd half is honestly absent");
+    }
+
+    /// The reported bug: every tab marks one focused pane, so the first tab's
+    /// pane must lose to the ACTIVE tab's.
+    #[test]
+    fn view_add_target_takes_the_active_tabs_focused_pane_not_the_first_tabs() {
+        let unfiled = vec![session(
+            "mine",
+            true,
+            vec![
+                tab(1, false, vec![pane(10, true, None)]),
+                tab(2, true, vec![pane(20, false, None), pane(21, true, None)]),
+            ],
+        )];
+        assert_eq!(view_add_target(&[], &unfiled, None), Some(21));
+    }
+
+    /// An older peer sends no `is_active` at all (`#[serde(default)]`), so the
+    /// only answer left is the first focused pane -- better than adding nothing.
+    #[test]
+    fn view_add_target_falls_back_to_the_first_focused_pane_without_an_active_tab() {
+        let unfiled = vec![session(
+            "mine",
+            true,
+            vec![
+                tab(1, false, vec![pane(10, true, None)]),
+                tab(2, false, vec![pane(20, true, None)]),
+            ],
+        )];
+        assert_eq!(view_add_target(&[], &unfiled, None), Some(10));
+    }
+
+    /// A named session wins over `is_current`, and still resolves by ITS
+    /// active tab -- the name comes from `current_attached`, which can lead the
+    /// server's `is_current` right after a switch.
+    #[test]
+    fn view_add_target_resolves_a_named_session_by_its_active_tab() {
+        let folders = vec![crate::protocol::FolderTreeEntry {
+            name: "work".to_string(),
+            sessions: vec![session(
+                "named",
+                false,
+                vec![
+                    tab(1, false, vec![pane(30, true, None)]),
+                    tab(2, true, vec![pane(31, false, None), pane(32, true, None)]),
+                ],
+            )],
+        }];
+        let unfiled = vec![session(
+            "current",
+            true,
+            vec![tab(3, true, vec![pane(40, true, None)])],
+        )];
+        assert_eq!(view_add_target(&folders, &unfiled, Some("named")), Some(32));
     }
 
     #[test]
