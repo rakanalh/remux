@@ -8,10 +8,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::TreeModel;
+use crate::client::tree_model::ViewEntry;
 use crate::client::whichkey::DrawCommand;
 use crate::config::keybindings::{SessionManagerBinding, SessionManagerBindings};
 use crate::config::theme::Theme;
-use crate::protocol::{FolderTreeEntry, SessionTreeEntry};
+use crate::protocol::{CellId, FolderTreeEntry, SessionTreeEntry, ViewId};
 use crate::server::compositor::{
     box_bottom_line, box_rule_line, box_top_line_titled, BOX_TEE_LEFT, BOX_TEE_RIGHT, BOX_VERTICAL,
 };
@@ -29,10 +30,25 @@ pub use crate::client::tree_model::NodeType;
 /// recorded separately in `sub_mode_server`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenameKind {
-    Session { name: String },
-    Folder { name: String },
-    Tab { session: String, tab_index: usize },
-    Pane { session: String, pane_id: u64 },
+    Session {
+        name: String,
+    },
+    Folder {
+        name: String,
+    },
+    Tab {
+        session: String,
+        tab_index: usize,
+    },
+    Pane {
+        session: String,
+        pane_id: u64,
+    },
+    /// A view on the LOCAL registry, addressed by id so a concurrent rename
+    /// elsewhere cannot retarget it.
+    View {
+        id: ViewId,
+    },
 }
 
 /// Sub-modes within the session manager for multi-step actions.
@@ -175,6 +191,25 @@ pub enum SessionManagerAction {
         kind: RenameKind,
         new_name: String,
     },
+    /// Enter (display) the view `id`. Resolved by id against the client's
+    /// current view cache, never by index.
+    EnterView {
+        id: ViewId,
+    },
+    /// Enter the view `id` with focus on its cell `cell_id`.
+    EnterViewCell {
+        id: ViewId,
+        cell_id: CellId,
+    },
+    /// Remove cell `cell_id` from view `id` (the aliased pane is untouched).
+    RemoveViewCell {
+        id: ViewId,
+        cell_id: CellId,
+    },
+    /// Delete the view `id` for every terminal. Emitted only after confirmation.
+    DeleteView {
+        id: ViewId,
+    },
     RefreshTree,
     /// Add one or more existing panes (the marked ones, else the highlighted
     /// pane, else every pane of the highlighted tab) to a client-only view.
@@ -285,18 +320,22 @@ fn binding_label(b: SessionManagerBinding) -> &'static str {
         FolderDelete => "folder del",
         FolderRename => "folder rename",
         AddToView => "add to view",
+        ViewRename => "view rename",
+        ViewRemoveCell => "view rm cell",
+        ViewDelete => "view delete",
     }
 }
 
 /// Group ordering for footer chords: session (s*), folder (f*), tab (t*),
-/// pane (p*), then anything else. Gives a stable, readable grouping.
+/// pane (p*), view (v*), then anything else. Gives a stable, readable grouping.
 fn chord_group_rank(chord: &str) -> u8 {
     match chord.chars().next() {
         Some('s') => 0,
         Some('f') => 1,
         Some('t') => 2,
         Some('p') => 3,
-        _ => 4,
+        Some('v') => 4,
+        _ => 5,
     }
 }
 
@@ -410,6 +449,11 @@ impl SessionManagerState {
     ) {
         self.model.update_tree(server, folders, unfiled, dormant);
         self.snap_to_current_session();
+    }
+
+    /// Replace the local server's views (the Views group) and rebuild rows.
+    pub fn set_views(&mut self, views: Vec<ViewEntry>) {
+        self.model.set_views(views);
     }
 
     /// Put the selection on the current session, ONCE.
@@ -618,6 +662,20 @@ impl SessionManagerState {
             NodeType::DormantSession { name, .. } => {
                 SessionManagerAction::ResurrectSession(name.clone())
             }
+            // The group only groups: Enter toggles it, as on the Saved group.
+            NodeType::ViewsGroup => {
+                self.toggle_expand();
+                SessionManagerAction::None
+            }
+            // Deliberately NOT "Enter on a non-leaf reveals its children": a
+            // view is a destination, like a session. `l`/`h` still expand it.
+            NodeType::View { id } => SessionManagerAction::EnterView { id: *id },
+            NodeType::ViewCell {
+                view_id, cell_id, ..
+            } => SessionManagerAction::EnterViewCell {
+                id: *view_id,
+                cell_id: *cell_id,
+            },
         }
     }
 
@@ -647,8 +705,13 @@ impl SessionManagerState {
                 }
             },
             // Leaf: nothing to expand.
-            NodeType::Pane { .. } | NodeType::DormantSession { .. } => SessionManagerAction::None,
-            // Folder / Session / Tab / SavedGroup: reveal children without switching.
+            // (A view cell is a leaf too: without this arm `l` on one would
+            // insert its empty expansion key.)
+            NodeType::Pane { .. } | NodeType::DormantSession { .. } | NodeType::ViewCell { .. } => {
+                SessionManagerAction::None
+            }
+            // Folder / Session / Tab / SavedGroup / ViewsGroup / View: reveal
+            // children without switching.
             _ => {
                 self.expand_selected();
                 SessionManagerAction::None
@@ -661,36 +724,67 @@ impl SessionManagerState {
     /// Works on any connected server (Local or a connected remote). Panes,
     /// server nodes, the saved group, and dormant sessions are never deletable.
     pub fn handle_delete_key(&mut self) -> SessionManagerAction {
-        let row = match self.model.rows.get(self.model.selected) {
-            Some(r) => r.clone(),
+        let node = match self.model.rows.get(self.model.selected) {
+            Some(r) => r.node_type.clone(),
             None => return SessionManagerAction::None,
         };
-        let description = match &row.node_type {
+        self.arm_delete(node)
+    }
+
+    /// Enter the delete confirmation for `target`, which need not be the
+    /// selected row: `vd` on a view CELL arms the delete of its VIEW.
+    ///
+    /// A view is deletable exactly as a session is (so plain `d` on a view row
+    /// deletes it too); a cell is not, as a pane is not.
+    fn arm_delete(&mut self, target: NodeType) -> SessionManagerAction {
+        let description = match &target {
             NodeType::Folder { name, .. } => format!("folder '{}'", name),
             NodeType::Session { name, .. } => format!("session '{}'", name),
             NodeType::Tab {
                 session, tab_index, ..
             } => format!("tab {} in '{}'", tab_index, session),
-            // Cannot delete panes, server nodes, or the saved group / dormant
-            // sessions.
+            NodeType::View { id } => match self.model.view_name(*id) {
+                Some(name) => format!("view '{name}'"),
+                None => return SessionManagerAction::None,
+            },
+            // Cannot delete panes, server nodes, the saved group / dormant
+            // sessions, the Views group, or a view cell.
             NodeType::Pane { .. }
             | NodeType::Server { .. }
             | NodeType::SavedGroup { .. }
-            | NodeType::DormantSession { .. } => {
+            | NodeType::DormantSession { .. }
+            | NodeType::ViewsGroup
+            | NodeType::ViewCell { .. } => {
                 return SessionManagerAction::None;
             }
         };
         // Guard: only connected servers can be structurally edited.
-        let server = row.node_type.server();
+        let server = target.server();
         if !self.is_connected(&server) {
             return SessionManagerAction::None;
         }
         self.sub_mode_server = server;
         self.sub_mode = SubMode::ConfirmDelete {
-            target: row.node_type.clone(),
+            target,
             description,
         };
         SessionManagerAction::None
+    }
+
+    /// The view a row belongs to: a view row's own id, or a cell's parent view.
+    fn view_of(node: &NodeType) -> Option<ViewId> {
+        match node {
+            NodeType::View { id } => Some(*id),
+            NodeType::ViewCell { view_id, .. } => Some(*view_id),
+            NodeType::Server { .. }
+            | NodeType::Folder { .. }
+            | NodeType::Session { .. }
+            | NodeType::Tab { .. }
+            | NodeType::Pane { .. }
+            | NodeType::SavedGroup { .. }
+            | NodeType::DormantSession { .. }
+            | NodeType::ViewsGroup => None,
+        }
     }
 
     /// Handle confirmation response in ConfirmDelete sub-mode.
@@ -720,12 +814,18 @@ impl SessionManagerState {
         // up. Deleting by name regardless would resurrect a race the capture
         // exists to close, so abort instead.
         let key = self.model.node_key(&target);
-        if !self
-            .model
-            .rows
-            .iter()
-            .any(|r| self.model.node_key(&r.node_type) == key)
-        {
+        // A view is looked up in the model's DATA by id: `vd` on a cell arms a
+        // target whose row may not be the one on screen, and a rename under the
+        // prompt keeps the same id, so it must still be deleted.
+        let still_there = if let NodeType::View { id } = &target {
+            self.model.view_name(*id).is_some()
+        } else {
+            self.model
+                .rows
+                .iter()
+                .any(|r| self.model.node_key(&r.node_type) == key)
+        };
+        if !still_there {
             log::warn!(
                 "session_manager: delete aborted -- {key:?} disappeared while the \
                  confirmation prompt was open"
@@ -754,7 +854,10 @@ impl SessionManagerState {
             NodeType::Pane { .. }
             | NodeType::Server { .. }
             | NodeType::SavedGroup { .. }
-            | NodeType::DormantSession { .. } => SessionManagerAction::None,
+            | NodeType::DormantSession { .. }
+            | NodeType::ViewsGroup
+            | NodeType::ViewCell { .. } => SessionManagerAction::None,
+            NodeType::View { id } => SessionManagerAction::DeleteView { id: *id },
         }
     }
 
@@ -821,7 +924,12 @@ impl SessionManagerState {
     fn structural_target_server(&self) -> Option<ConnId> {
         let row = self.model.rows.get(self.model.selected)?;
         match &row.node_type {
-            NodeType::SavedGroup { .. } | NodeType::DormantSession { .. } => None,
+            // Creating a folder or session "in" a view means nothing.
+            NodeType::SavedGroup { .. }
+            | NodeType::DormantSession { .. }
+            | NodeType::ViewsGroup
+            | NodeType::View { .. }
+            | NodeType::ViewCell { .. } => None,
             _ => {
                 let server = row.node_type.server();
                 if self.is_connected(&server) {
@@ -1066,6 +1174,33 @@ impl SessionManagerState {
                     SessionManagerAction::AddToView { panes }
                 }
             }
+            // Views live on the LOCAL registry, so these target Local whatever
+            // connection a cell's pane is on. A cell row acts on its view.
+            ViewRename => {
+                if let Some(id) = Self::view_of(&node) {
+                    self.enter_rename(ConnId::Local, RenameKind::View { id });
+                }
+                SessionManagerAction::None
+            }
+            // A cell row ONLY, and unconfirmed, like `w x`.
+            ViewRemoveCell => {
+                if let NodeType::ViewCell {
+                    view_id, cell_id, ..
+                } = &node
+                {
+                    SessionManagerAction::RemoveViewCell {
+                        id: *view_id,
+                        cell_id: *cell_id,
+                    }
+                } else {
+                    SessionManagerAction::None
+                }
+            }
+            // Confirmed, like `sx`/`fx`; the prompt names the VIEW.
+            ViewDelete => match Self::view_of(&node) {
+                Some(id) => self.arm_delete(NodeType::View { id }),
+                None => SessionManagerAction::None,
+            },
         }
     }
 
@@ -1084,13 +1219,19 @@ impl SessionManagerState {
     pub fn confirm_rename(&mut self) -> SessionManagerAction {
         let server = self.sub_mode_server.clone();
         let action = if let SubMode::Rename { kind, buffer } = &self.sub_mode {
-            if buffer.is_empty() {
+            // A view name is trimmed, as `w r` trims it, so a blank one is empty.
+            let name = if let RenameKind::View { .. } = kind {
+                buffer.trim()
+            } else {
+                buffer.as_str()
+            };
+            if name.is_empty() {
                 SessionManagerAction::None
             } else {
                 SessionManagerAction::Rename {
                     server,
                     kind: kind.clone(),
-                    new_name: buffer.clone(),
+                    new_name: name.to_string(),
                 }
             }
         } else {
@@ -1281,7 +1422,9 @@ impl SessionManagerState {
                 // NOT the '*' focus/current marker) in place of its blank indent.
                 let expand_marker = match &row.node_type {
                     NodeType::Pane { .. } if is_marked => "\u{25CF} ",
-                    NodeType::Pane { .. } | NodeType::DormantSession { .. } => "  ",
+                    NodeType::Pane { .. }
+                    | NodeType::DormantSession { .. }
+                    | NodeType::ViewCell { .. } => "  ",
                     _ => {
                         if row.is_expanded {
                             "\u{25BC} "
@@ -1374,6 +1517,10 @@ impl SessionManagerState {
                     RenameKind::Folder { name } => format!("folder '{name}'"),
                     RenameKind::Tab { .. } => "tab".to_string(),
                     RenameKind::Pane { .. } => "pane".to_string(),
+                    RenameKind::View { id } => match self.model.view_name(*id) {
+                        Some(name) => format!("view '{name}'"),
+                        None => "view".to_string(),
+                    },
                 };
                 format!(" Rename {label}: {buffer}_ ")
             }
@@ -1805,6 +1952,377 @@ mod tests {
             SessionManagerAction::DeleteSession { server: ConnId::Local, ref name } if name == "project-a"
         ));
         assert!(matches!(state.sub_mode, SubMode::Navigate));
+    }
+
+    // -- Views group: rows, chords, Enter -------------------------------------
+
+    /// `local_tree` plus view 7 "dev" with two cells: pane 10 (in the tree,
+    /// "zsh") and pane 99 (not in any tree).
+    fn views_state() -> SessionManagerState {
+        let mut state = SessionManagerState::new();
+        local_tree(&mut state);
+        state.set_views(vec![(
+            7,
+            "dev".to_string(),
+            vec![(1, ConnId::Local, 10), (2, ConnId::Local, 99)],
+        )]);
+        state
+    }
+
+    fn row_where(state: &SessionManagerState, pred: impl Fn(&NodeType) -> bool) -> usize {
+        state
+            .model
+            .rows
+            .iter()
+            .position(|r| pred(&r.node_type))
+            .unwrap_or_else(|| panic!("no such row in {:?}", row_labels(state)))
+    }
+
+    fn select_view(state: &mut SessionManagerState) {
+        state.model.selected = row_where(state, |n| matches!(n, NodeType::View { id: 7 }));
+    }
+
+    fn select_cell(state: &mut SessionManagerState, cell: u64) {
+        state.model.selected = row_where(
+            state,
+            |n| matches!(n, NodeType::ViewCell { view_id: 7, cell_id, .. } if *cell_id == cell),
+        );
+    }
+
+    fn select_views_group(state: &mut SessionManagerState) {
+        state.model.selected = row_where(state, |n| matches!(n, NodeType::ViewsGroup));
+    }
+
+    #[test]
+    fn the_manager_shows_the_views_group_it_is_fed() {
+        let state = views_state();
+        let labels = row_labels(&state);
+        let group = labels.iter().position(|l| l == "views").expect("views row");
+        assert_eq!(
+            &labels[group..group + 4],
+            &["views", "view:7", "viewcell:1", "viewcell:2"],
+            "{labels:?}"
+        );
+        let cells: Vec<&str> = state.model.rows[group + 2..group + 4]
+            .iter()
+            .map(|r| r.display_name.as_str())
+            .collect();
+        assert_eq!(cells, ["zsh", "pane-99"]);
+    }
+
+    #[test]
+    fn vx_on_a_view_row_does_nothing() {
+        let mut state = views_state();
+        for select in [select_view, select_views_group] {
+            select(&mut state);
+            let action = state.apply_binding(SessionManagerBinding::ViewRemoveCell);
+            assert_eq!(action, SessionManagerAction::None);
+            assert_eq!(state.sub_mode, SubMode::Navigate);
+        }
+        state.model.selected = session_row(&state, "project-a");
+        assert_eq!(
+            state.apply_binding(SessionManagerBinding::ViewRemoveCell),
+            SessionManagerAction::None
+        );
+    }
+
+    #[test]
+    fn vx_on_a_cell_row_removes_that_cell_unconfirmed() {
+        let mut state = views_state();
+        select_cell(&mut state, 2);
+        assert_eq!(
+            state.apply_binding(SessionManagerBinding::ViewRemoveCell),
+            SessionManagerAction::RemoveViewCell { id: 7, cell_id: 2 }
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate, "`w x` is not confirmed");
+    }
+
+    #[test]
+    fn vr_on_a_cell_row_renames_its_parent_view() {
+        let mut state = views_state();
+        select_cell(&mut state, 1);
+        assert_eq!(
+            state.apply_binding(SessionManagerBinding::ViewRename),
+            SessionManagerAction::None
+        );
+        assert!(
+            matches!(
+                &state.sub_mode,
+                SubMode::Rename {
+                    kind: RenameKind::View { id: 7 },
+                    ..
+                }
+            ),
+            "{:?}",
+            state.sub_mode
+        );
+        if let SubMode::Rename { buffer, .. } = &mut state.sub_mode {
+            buffer.push_str("ops");
+        }
+        assert_eq!(
+            state.confirm_rename(),
+            SessionManagerAction::Rename {
+                server: ConnId::Local,
+                kind: RenameKind::View { id: 7 },
+                new_name: "ops".to_string(),
+            }
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn vr_on_a_view_row_renames_it_and_elsewhere_does_nothing() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.apply_binding(SessionManagerBinding::ViewRename);
+        assert!(matches!(
+            &state.sub_mode,
+            SubMode::Rename {
+                kind: RenameKind::View { id: 7 },
+                ..
+            }
+        ));
+
+        let mut state = views_state();
+        select_views_group(&mut state);
+        state.apply_binding(SessionManagerBinding::ViewRename);
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+        state.model.selected = session_row(&state, "project-a");
+        state.apply_binding(SessionManagerBinding::ViewRename);
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn a_blank_view_rename_is_a_noop_and_a_padded_one_is_trimmed() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.apply_binding(SessionManagerBinding::ViewRename);
+        if let SubMode::Rename { buffer, .. } = &mut state.sub_mode {
+            buffer.push_str("   ");
+        }
+        assert_eq!(state.confirm_rename(), SessionManagerAction::None);
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+
+        state.apply_binding(SessionManagerBinding::ViewRename);
+        if let SubMode::Rename { buffer, .. } = &mut state.sub_mode {
+            buffer.push_str("  ops ");
+        }
+        assert!(matches!(
+            state.confirm_rename(),
+            SessionManagerAction::Rename { new_name, .. } if new_name == "ops"
+        ));
+    }
+
+    #[test]
+    fn the_view_rename_prompt_names_the_view() {
+        let mut state = views_state();
+        select_cell(&mut state, 2);
+        state.apply_binding(SessionManagerBinding::ViewRename);
+        let theme = crate::config::theme::Theme::default();
+        let text: String = state
+            .render(120, 40, &theme)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert!(text.contains("Rename view 'dev'"), "{text}");
+    }
+
+    #[test]
+    fn vd_on_a_cell_row_confirms_then_deletes_its_view() {
+        let mut state = views_state();
+        select_cell(&mut state, 2);
+        assert_eq!(
+            state.apply_binding(SessionManagerBinding::ViewDelete),
+            SessionManagerAction::None
+        );
+        assert_eq!(
+            state.sub_mode,
+            SubMode::ConfirmDelete {
+                target: NodeType::View { id: 7 },
+                description: "view 'dev'".to_string(),
+            }
+        );
+        assert_eq!(
+            state.handle_confirm_delete(true),
+            SessionManagerAction::DeleteView { id: 7 }
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn vd_on_a_view_row_confirms_and_n_cancels() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.apply_binding(SessionManagerBinding::ViewDelete);
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
+        assert_eq!(
+            state.handle_confirm_delete(false),
+            SessionManagerAction::None
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn vd_elsewhere_does_nothing() {
+        let mut state = views_state();
+        select_views_group(&mut state);
+        assert_eq!(
+            state.apply_binding(SessionManagerBinding::ViewDelete),
+            SessionManagerAction::None
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+        state.model.selected = session_row(&state, "project-a");
+        state.apply_binding(SessionManagerBinding::ViewDelete);
+        assert_eq!(
+            state.sub_mode,
+            SubMode::Navigate,
+            "vd must not arm a SESSION delete"
+        );
+    }
+
+    /// The `sx` stale-target rule, for views: a view deleted elsewhere while
+    /// the prompt is up must not be deleted "again" -- and, since ids are never
+    /// reused by the registry, sending it would be harmless only by accident.
+    #[test]
+    fn a_view_delete_confirmed_after_the_view_vanished_sends_nothing() {
+        let mut state = views_state();
+        select_cell(&mut state, 1);
+        state.apply_binding(SessionManagerBinding::ViewDelete);
+        assert!(matches!(state.sub_mode, SubMode::ConfirmDelete { .. }));
+
+        // Another terminal deletes it; the `ViewList` refresh lands.
+        state.set_views(Vec::new());
+
+        assert_eq!(
+            state.handle_confirm_delete(true),
+            SessionManagerAction::None
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn a_view_delete_follows_its_id_through_a_rename_under_the_prompt() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.apply_binding(SessionManagerBinding::ViewDelete);
+        state.set_views(vec![(
+            7,
+            "renamed".to_string(),
+            vec![(1, ConnId::Local, 10)],
+        )]);
+        assert_eq!(
+            state.handle_confirm_delete(true),
+            SessionManagerAction::DeleteView { id: 7 }
+        );
+    }
+
+    #[test]
+    fn enter_on_a_view_row_enters_it_rather_than_expanding() {
+        let mut state = views_state();
+        select_view(&mut state);
+        let before = row_labels(&state);
+        assert_eq!(
+            state.handle_enter(),
+            SessionManagerAction::EnterView { id: 7 }
+        );
+        assert_eq!(row_labels(&state), before, "Enter must not toggle the view");
+    }
+
+    #[test]
+    fn enter_on_a_view_cell_row_enters_its_view_at_that_cell() {
+        let mut state = views_state();
+        select_cell(&mut state, 2);
+        assert_eq!(
+            state.handle_enter(),
+            SessionManagerAction::EnterViewCell { id: 7, cell_id: 2 }
+        );
+    }
+
+    #[test]
+    fn enter_on_the_views_group_toggles_it() {
+        let mut state = views_state();
+        select_views_group(&mut state);
+        assert_eq!(state.handle_enter(), SessionManagerAction::None);
+        assert!(!row_labels(&state).iter().any(|l| l == "view:7"));
+        assert_eq!(state.handle_enter(), SessionManagerAction::None);
+        assert!(row_labels(&state).iter().any(|l| l == "view:7"));
+    }
+
+    #[test]
+    fn l_and_h_expand_and_collapse_a_view_but_a_cell_is_a_leaf() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.collapse_selected();
+        assert!(!row_labels(&state).iter().any(|l| l == "viewcell:1"));
+        assert_eq!(state.handle_expand(), SessionManagerAction::None);
+        assert!(row_labels(&state).iter().any(|l| l == "viewcell:1"));
+
+        select_cell(&mut state, 1);
+        let before = state.model.expanded.clone();
+        assert_eq!(state.handle_expand(), SessionManagerAction::None);
+        assert_eq!(
+            state.model.expanded, before,
+            "`l` on a cell must expand nothing"
+        );
+    }
+
+    #[test]
+    fn plain_d_deletes_a_view_like_it_deletes_a_session_but_not_a_cell() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.handle_delete_key();
+        assert!(matches!(
+            &state.sub_mode,
+            SubMode::ConfirmDelete {
+                target: NodeType::View { id: 7 },
+                ..
+            }
+        ));
+
+        let mut state = views_state();
+        select_cell(&mut state, 1);
+        state.handle_delete_key();
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn create_keys_do_nothing_from_a_view_row() {
+        let mut state = views_state();
+        select_view(&mut state);
+        state.handle_create_session_key();
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+        select_cell(&mut state, 1);
+        state.handle_create_folder_key();
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    #[test]
+    fn the_default_chords_reach_the_view_bindings() {
+        let mut state = views_state();
+        for (second, want) in [
+            ('r', SessionManagerBinding::ViewRename),
+            ('x', SessionManagerBinding::ViewRemoveCell),
+            ('d', SessionManagerBinding::ViewDelete),
+        ] {
+            assert_eq!(state.feed_chord('v'), ChordOutcome::Pending);
+            assert_eq!(state.feed_chord(second), ChordOutcome::Binding(want));
+        }
+    }
+
+    #[test]
+    fn the_footer_lists_the_view_chords() {
+        let state = views_state();
+        let cells = state.footer_cells();
+        for (key, label) in [
+            ("vr", "view rename"),
+            ("vx", "view rm cell"),
+            ("vd", "view delete"),
+        ] {
+            assert!(
+                cells.iter().any(|(k, l)| k == key && l == label),
+                "{key} missing from {cells:?}"
+            );
+        }
     }
 
     #[test]
@@ -3044,6 +3562,9 @@ mod tests {
                 }
                 NodeType::SavedGroup { .. } => "saved".to_string(),
                 NodeType::DormantSession { name, .. } => format!("dormant:{name}"),
+                NodeType::ViewsGroup => "views".to_string(),
+                NodeType::View { id } => format!("view:{id}"),
+                NodeType::ViewCell { cell_id, .. } => format!("viewcell:{cell_id}"),
             })
             .collect()
     }

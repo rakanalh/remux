@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::client::registry::{ConnId, RemoteState};
-use crate::protocol::{FolderTreeEntry, PaneId, SessionTreeEntry};
+use crate::protocol::{CellId, FolderTreeEntry, PaneId, SessionTreeEntry, ViewId};
 
 // ---------------------------------------------------------------------------
 // NodeType / TreeRow
@@ -57,10 +57,29 @@ pub enum NodeType {
         server: ConnId,
         name: String,
     },
+    /// Header row for the Views group. Views live on the LOCAL server's
+    /// registry, so the group only ever renders under the Local server node.
+    ViewsGroup,
+    /// One view. Keyed by its server-assigned id, never its name, so a rename
+    /// keeps its expansion and its selection.
+    View {
+        id: ViewId,
+    },
+    /// One cell of a view: an alias of `pane_id` on `conn`. `conn` is where the
+    /// PANE lives; the cell itself (like its view) belongs to Local.
+    ViewCell {
+        view_id: ViewId,
+        cell_id: CellId,
+        conn: ConnId,
+        pane_id: PaneId,
+    },
 }
 
 impl NodeType {
     /// The connection this node belongs to.
+    ///
+    /// The view rows answer `Local` -- including a cell aliasing a remote pane:
+    /// every view operation is an intent to the local server's registry.
     pub fn server(&self) -> ConnId {
         match self {
             NodeType::Server { id, .. } => id.clone(),
@@ -70,9 +89,17 @@ impl NodeType {
             | NodeType::Pane { server, .. }
             | NodeType::SavedGroup { server }
             | NodeType::DormantSession { server, .. } => server.clone(),
+            NodeType::ViewsGroup | NodeType::View { .. } | NodeType::ViewCell { .. } => {
+                ConnId::Local
+            }
         }
     }
 }
+
+/// One view as the tree model sees it: `(id, name, cells)`, each cell
+/// `(cell_id, conn, pane_id)` in the view's own cell order. A plain data shape
+/// so the model never depends on the client's `ClientView` cache.
+pub type ViewEntry = (ViewId, String, Vec<(CellId, ConnId, PaneId)>);
 
 /// Where activating a tree row goes.
 ///
@@ -194,6 +221,22 @@ fn dormant_key(server: &ConnId, name: &str) -> String {
     format!("dormant:{}:{}", server.key(), name)
 }
 
+/// Expansion key for the Views group. Views are Local-only, so there is one.
+fn views_key() -> String {
+    "views:local".to_string()
+}
+
+/// Expansion key for a view row -- by ID, so a rename keeps its expansion.
+fn view_key(id: ViewId) -> String {
+    format!("view:{id}")
+}
+
+/// Filter/selection key for a view cell row. Cells never expand, so this key
+/// never appears in `expanded`.
+fn view_cell_key(view_id: ViewId, cell_id: CellId) -> String {
+    format!("viewcell:{view_id}:{cell_id}")
+}
+
 // ---------------------------------------------------------------------------
 // ConnTrees / TreeModel
 // ---------------------------------------------------------------------------
@@ -253,6 +296,10 @@ pub struct TreeModel {
     /// rendered as a "Saved (resurrect)" group. Dormant sessions are a
     /// Local-server concept for now.
     dormant: Vec<String>,
+    /// The local server's views, rendered as a Views group under the Local
+    /// server node. Only the session-manager overlay feeds this; the sidebar's
+    /// sessions panel never does, so it never shows the group.
+    views: Vec<ViewEntry>,
     /// Direct hits from the most recent [`TreeModel::rebuild_rows`] (see
     /// [`Filter::hits`]); empty when no query is active. Refreshed on every
     /// rebuild and read only by [`TreeModel::on_query_changed`] to place the
@@ -275,6 +322,9 @@ impl TreeModel {
         expanded.insert(server_key(&ConnId::Local));
         // Expand the Saved group by default so dormant sessions are discoverable.
         expanded.insert(saved_key(&ConnId::Local));
+        // Likewise the Views group. Inserted ONCE, here: a later `set_views`
+        // must never re-open a group the user collapsed.
+        expanded.insert(views_key());
         Self {
             rows: Vec::new(),
             selected: 0,
@@ -290,6 +340,7 @@ impl TreeModel {
             trees: HashMap::new(),
             seen_keys: HashMap::new(),
             dormant: Vec::new(),
+            views: Vec::new(),
             filter_hits: HashSet::new(),
         }
     }
@@ -353,10 +404,15 @@ impl TreeModel {
                 tab_index: *tab_index,
                 pane_id: *pane_id,
             }),
+            // View rows are not session jumps: entering a view is its own
+            // action, which the overlay emits from its own Enter handling.
             NodeType::Server { .. }
             | NodeType::Folder { .. }
             | NodeType::SavedGroup { .. }
-            | NodeType::DormantSession { .. } => None,
+            | NodeType::DormantSession { .. }
+            | NodeType::ViewsGroup
+            | NodeType::View { .. }
+            | NodeType::ViewCell { .. } => None,
         }
     }
 
@@ -463,6 +519,56 @@ impl TreeModel {
             .get(server)
             .map(|(folders, _)| folders.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Replace the local server's views and rebuild rows.
+    ///
+    /// A view this model has never seen auto-expands, through the same
+    /// cumulative `seen_keys` rule `update_tree` applies to folders and
+    /// sessions -- so a refresh (every `ViewList`) cannot re-open a view the
+    /// user collapsed. Keys are view IDS: a rename is not a new view.
+    pub fn set_views(&mut self, views: Vec<ViewEntry>) {
+        let known_keys = self.seen_keys.entry(ConnId::Local).or_default();
+        for (id, _, _) in &views {
+            let key = view_key(*id);
+            if known_keys.insert(key.clone()) {
+                self.expanded.insert(key);
+            }
+        }
+        self.views = views;
+        self.rebuild_rows();
+    }
+
+    /// The label of a view cell: the aliased pane's name from this model's own
+    /// tree data, prefixed `host: ` for a remote (the view's own cell-title
+    /// style). `pane-<id>` when the pane is not in any tree the model holds.
+    fn view_cell_label(&self, conn: &ConnId, pane_id: PaneId) -> String {
+        let name = self
+            .trees
+            .get(conn)
+            .and_then(|(folders, unfiled)| {
+                folders
+                    .iter()
+                    .flat_map(|f| f.sessions.iter())
+                    .chain(unfiled.iter())
+                    .flat_map(|s| s.tabs.iter())
+                    .flat_map(|t| t.panes.iter())
+                    .find(|p| p.id == pane_id)
+            })
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("pane-{pane_id}"));
+        match conn {
+            ConnId::Local => name,
+            ConnId::Remote(host) => format!("{host}: {name}"),
+        }
+    }
+
+    /// The current name of the view `id`, if the model still knows it.
+    pub fn view_name(&self, id: ViewId) -> Option<&str> {
+        self.views
+            .iter()
+            .find(|(vid, _, _)| *vid == id)
+            .map(|(_, name, _)| name.as_str())
     }
 
     /// Move the selection down one row (alias of [`TreeModel::select_next`]).
@@ -670,6 +776,41 @@ impl TreeModel {
                 if any_dormant {
                     f.visible.insert(saved_key(id));
                     f.force_expand.insert(saved_key(id));
+                    f.force_expand.insert(skey.clone());
+                }
+
+                // The Views group shows when a view name or a cell label
+                // matches; a matching view keeps all of its cells browsable.
+                let mut any_view = false;
+                for (vid, name, cells) in &self.views {
+                    let vkey = view_key(*vid);
+                    let view_hit = hit(name);
+                    let mut cell_hit = false;
+                    for (cid, conn, pane_id) in cells {
+                        let this_hit = hit(&self.view_cell_label(conn, *pane_id));
+                        if this_hit || view_hit {
+                            let ckey = view_cell_key(*vid, *cid);
+                            if this_hit {
+                                f.hits.insert(ckey.clone());
+                            }
+                            f.visible.insert(ckey);
+                        }
+                        cell_hit |= this_hit;
+                    }
+                    if view_hit {
+                        f.hits.insert(vkey.clone());
+                    }
+                    if view_hit || cell_hit {
+                        f.visible.insert(vkey.clone());
+                        any_view = true;
+                    }
+                    if cell_hit {
+                        f.force_expand.insert(vkey);
+                    }
+                }
+                if any_view {
+                    f.visible.insert(views_key());
+                    f.force_expand.insert(views_key());
                     f.force_expand.insert(skey);
                 }
             }
@@ -820,6 +961,12 @@ impl TreeModel {
                     }
                 }
 
+                // The Views group: after the live sessions, before Saved.
+                // Views are the LOCAL server's registry, so Local only.
+                if *id == ConnId::Local {
+                    self.add_view_rows(&mut rows, filter);
+                }
+
                 // Render the "Saved (resurrect)" group at the bottom of the
                 // Local server's children. Dormant sessions are Local-only.
                 let gkey = saved_key(id);
@@ -884,6 +1031,59 @@ impl TreeModel {
         }
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
+        }
+    }
+
+    /// The Views group, its views and their cells. Omitted entirely when there
+    /// are no views (or the active query hides them all).
+    fn add_view_rows(&self, rows: &mut Vec<TreeRow>, filter: Option<&Filter>) {
+        if self.views.is_empty() || !filter_allows(filter, &views_key()) {
+            return;
+        }
+        let group_expanded = self.is_expanded(&views_key(), filter);
+        rows.push(TreeRow {
+            indent: 1,
+            node_type: NodeType::ViewsGroup,
+            display_name: "Views".to_string(),
+            is_expanded: group_expanded,
+            is_current: false,
+        });
+        if !group_expanded {
+            return;
+        }
+        for (vid, name, cells) in &self.views {
+            let vkey = view_key(*vid);
+            if !filter_allows(filter, &vkey) {
+                continue;
+            }
+            let view_expanded = self.is_expanded(&vkey, filter);
+            rows.push(TreeRow {
+                indent: 2,
+                node_type: NodeType::View { id: *vid },
+                display_name: name.clone(),
+                is_expanded: view_expanded,
+                is_current: false,
+            });
+            if !view_expanded {
+                continue;
+            }
+            for (cid, conn, pane_id) in cells {
+                if !filter_allows(filter, &view_cell_key(*vid, *cid)) {
+                    continue;
+                }
+                rows.push(TreeRow {
+                    indent: 3,
+                    node_type: NodeType::ViewCell {
+                        view_id: *vid,
+                        cell_id: *cid,
+                        conn: conn.clone(),
+                        pane_id: *pane_id,
+                    },
+                    display_name: self.view_cell_label(conn, *pane_id),
+                    is_expanded: false,
+                    is_current: false,
+                });
+            }
         }
     }
 
@@ -1029,8 +1229,12 @@ impl TreeModel {
                 tab_index,
             } => tab_key(server, session, *tab_index),
             NodeType::SavedGroup { server } => saved_key(server),
-            // Panes and dormant sessions don't expand.
-            NodeType::Pane { .. } | NodeType::DormantSession { .. } => String::new(),
+            NodeType::ViewsGroup => views_key(),
+            NodeType::View { id } => view_key(*id),
+            // Panes, dormant sessions and view cells don't expand.
+            NodeType::Pane { .. } | NodeType::DormantSession { .. } | NodeType::ViewCell { .. } => {
+                String::new()
+            }
         }
     }
 
@@ -1050,6 +1254,9 @@ impl TreeModel {
                 ..
             } => pane_key(server, session, *pane_id),
             NodeType::DormantSession { server, name } => dormant_key(server, name),
+            NodeType::ViewCell {
+                view_id, cell_id, ..
+            } => view_cell_key(*view_id, *cell_id),
             other => self.node_key(other),
         }
     }
@@ -1563,6 +1770,255 @@ mod tests {
         model.update_tree(ConnId::Local, Vec::new(), Vec::new(), Vec::new());
         assert!(model.selected <= before);
         assert!(model.selected < model.rows.len());
+    }
+
+    // -- Views group ----------------------------------------------------------
+
+    /// `two_conn_fixture` plus a dormant local session, so the Views group has
+    /// a live session above it AND a Saved group below it to be placed between.
+    fn views_fixture() -> TreeModel {
+        let (mut model, per_conn) = two_conn_fixture();
+        let local = per_conn[0].1.clone();
+        model.update_tree(
+            ConnId::Local,
+            local.folders,
+            local.unfiled,
+            vec!["archived".to_string()],
+        );
+        model
+    }
+
+    /// View 7 "dev": local pane 11 ("top") then pane 20 on `pi` ("sh").
+    fn one_view() -> Vec<ViewEntry> {
+        vec![(
+            7,
+            "dev".to_string(),
+            vec![(1, ConnId::Local, 11), (2, remote("pi"), 20)],
+        )]
+    }
+
+    #[test]
+    fn the_views_group_renders_between_live_sessions_and_the_saved_group() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        assert_eq!(
+            labels(&model),
+            vec![
+                (0, "local".to_string()),
+                (1, "work".to_string()),
+                (2, "alpha".to_string()),
+                (3, "editor".to_string()),
+                (1, "Views".to_string()),
+                (2, "dev".to_string()),
+                (3, "top".to_string()),
+                (3, "pi: sh".to_string()),
+                (1, "Saved (resurrect)".to_string()),
+                (2, "\u{1F4A4} archived".to_string()),
+                (0, "pi".to_string()),
+            ]
+        );
+        let kinds: Vec<&NodeType> = model.rows.iter().map(|r| &r.node_type).collect();
+        assert_eq!(kinds[4], &NodeType::ViewsGroup);
+        assert_eq!(kinds[5], &NodeType::View { id: 7 });
+        assert_eq!(
+            kinds[7],
+            &NodeType::ViewCell {
+                view_id: 7,
+                cell_id: 2,
+                conn: remote("pi"),
+                pane_id: 20
+            }
+        );
+        // None of them is a session jump.
+        for idx in 4..8 {
+            model.selected = idx;
+            assert_eq!(model.jump_target(), None, "row {idx}");
+        }
+    }
+
+    #[test]
+    fn the_views_group_is_omitted_when_there_are_no_views() {
+        let mut model = views_fixture();
+        model.set_views(Vec::new());
+        assert!(!model
+            .rows
+            .iter()
+            .any(|r| matches!(r.node_type, NodeType::ViewsGroup)));
+
+        // ... and it goes away again when the last view does.
+        model.set_views(one_view());
+        assert!(model
+            .rows
+            .iter()
+            .any(|r| matches!(r.node_type, NodeType::ViewsGroup)));
+        model.set_views(Vec::new());
+        assert!(
+            !model.rows.iter().any(|r| matches!(
+                r.node_type,
+                NodeType::ViewsGroup | NodeType::View { .. } | NodeType::ViewCell { .. }
+            )),
+            "{:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn a_renamed_view_keeps_its_collapsed_state() {
+        // Keyed by NAME, the renamed view would be a never-seen key and
+        // auto-expand under the user.
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        expand(&mut model, "dev");
+        model.selected = row_of(&model, "dev");
+        model.collapse_selected();
+        assert!(!model.rows.iter().any(|r| r.display_name == "top"));
+
+        let mut renamed = one_view();
+        renamed[0].1 = "renamed".to_string();
+        model.set_views(renamed);
+
+        assert!(
+            model.rows.iter().any(|r| r.display_name == "renamed"),
+            "{:?}",
+            labels(&model)
+        );
+        assert!(
+            !model.rows.iter().any(|r| r.display_name == "top"),
+            "the rename re-expanded the view: {:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn a_renamed_view_keeps_the_selection_on_its_cell() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        model.selected = row_of(&model, "pi: sh");
+        let mut renamed = one_view();
+        renamed[0].1 = "renamed".to_string();
+        // A cell ahead of it goes too, so the index genuinely shifts.
+        renamed[0].2.remove(0);
+        model.set_views(renamed);
+        assert_eq!(
+            model.selected_row().map(|r| r.display_name.as_str()),
+            Some("pi: sh"),
+            "{:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_re_expand_a_collapsed_views_group_or_view() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+
+        // Collapse the view, then the group that holds it.
+        model.selected = row_of(&model, "dev");
+        model.collapse_selected();
+        model.selected = row_of(&model, "Views");
+        model.collapse_selected();
+        let rows_before = labels(&model);
+        assert!(!model.rows.iter().any(|r| r.display_name == "dev"));
+
+        // Every `ViewList` refreshes the model with the same data.
+        model.set_views(one_view());
+        assert_eq!(labels(&model), rows_before, "refresh re-flattened the tree");
+
+        // Re-open only the group: the view must still be collapsed.
+        model.selected = row_of(&model, "Views");
+        model.expand_selected();
+        model.set_views(one_view());
+        assert!(model.rows.iter().any(|r| r.display_name == "dev"));
+        assert!(
+            !model.rows.iter().any(|r| r.display_name == "top"),
+            "refresh re-expanded a collapsed view: {:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn a_new_view_auto_expands() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        let mut two = one_view();
+        two.push((8, "ops".to_string(), vec![(1, ConnId::Local, 10)]));
+        model.set_views(two);
+        let ops = row_of(&model, "ops");
+        assert_eq!(
+            model.rows.get(ops + 1).map(|r| r.display_name.as_str()),
+            Some("sh"),
+            "{:?}",
+            labels(&model)
+        );
+    }
+
+    #[test]
+    fn a_view_cell_label_is_the_pane_name_prefixed_for_a_remote_with_a_fallback() {
+        let mut model = views_fixture();
+        model.set_views(vec![(
+            7,
+            "dev".to_string(),
+            vec![
+                (1, ConnId::Local, 11),
+                (2, remote("pi"), 20),
+                (3, ConnId::Local, 999),
+                (4, remote("pi"), 998),
+                (5, remote("gone"), 20),
+            ],
+        )]);
+        let dev = row_of(&model, "dev");
+        let cells: Vec<String> = model.rows[dev + 1..dev + 6]
+            .iter()
+            .map(|r| r.display_name.clone())
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                "top".to_string(),
+                "pi: sh".to_string(),
+                "pane-999".to_string(),
+                "pi: pane-998".to_string(),
+                // A remote the model has no tree for: its pane 20 is not pi's.
+                "gone: pane-20".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_matching_a_view_name_keeps_the_group_visible() {
+        let mut model = views_fixture();
+        model.set_views(one_view());
+        for c in "dev".chars() {
+            model.push_query_char(c);
+        }
+        assert!(
+            model.rows.iter().any(|r| r.display_name == "dev"),
+            "{:?}",
+            labels(&model)
+        );
+        assert_eq!(
+            model.selected_row().map(|r| &r.node_type),
+            Some(&NodeType::View { id: 7 }),
+            "the selection must land on the direct hit"
+        );
+        // A query matching nothing in the views hides the group.
+        model.clear_query();
+        for c in "alpha".chars() {
+            model.push_query_char(c);
+        }
+        assert!(!model
+            .rows
+            .iter()
+            .any(|r| matches!(r.node_type, NodeType::ViewsGroup)));
+    }
+
+    #[test]
+    fn view_name_reads_the_current_name_by_id() {
+        let mut model = views_fixture();
+        assert_eq!(model.view_name(7), None);
+        model.set_views(one_view());
+        assert_eq!(model.view_name(7), Some("dev"));
+        assert_eq!(model.view_name(8), None);
     }
 
     #[test]

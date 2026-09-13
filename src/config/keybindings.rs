@@ -1288,6 +1288,12 @@ pub enum SessionManagerBinding {
     FolderRename,
     /// Add the marked panes (or the highlighted pane) to a client-only view.
     AddToView,
+    /// Rename the highlighted view (or the view of the highlighted cell).
+    ViewRename,
+    /// Remove the highlighted cell from its view (the pane itself is untouched).
+    ViewRemoveCell,
+    /// Delete the highlighted view (or the view of the highlighted cell).
+    ViewDelete,
 }
 
 impl SessionManagerBinding {
@@ -1310,6 +1316,9 @@ impl SessionManagerBinding {
             "FolderDelete" => Self::FolderDelete,
             "FolderRename" => Self::FolderRename,
             "AddToView" => Self::AddToView,
+            "ViewRename" => Self::ViewRename,
+            "ViewRemoveCell" => Self::ViewRemoveCell,
+            "ViewDelete" => Self::ViewDelete,
             _ => return None,
         })
     }
@@ -1336,6 +1345,9 @@ fn default_session_manager_chords() -> Vec<(&'static str, SessionManagerBinding)
         ("fx", FolderDelete),
         ("fr", FolderRename),
         ("va", AddToView),
+        ("vr", ViewRename),
+        ("vx", ViewRemoveCell),
+        ("vd", ViewDelete),
     ]
 }
 
@@ -2600,13 +2612,27 @@ mod tests {
     #[test]
     fn session_manager_bindings_defaults() {
         let b = SessionManagerBindings::default();
-        // All 16 default chords are present.
-        assert_eq!(b.len(), 16);
+        // All 19 default chords are present.
+        assert_eq!(b.len(), 19);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
         assert_eq!(b.chord('t', 'r'), Some(SessionManagerBinding::TabRename));
         assert_eq!(b.chord('s', 'x'), Some(SessionManagerBinding::SessionClose));
         assert_eq!(b.chord('f', 'r'), Some(SessionManagerBinding::FolderRename));
         assert_eq!(b.chord('v', 'a'), Some(SessionManagerBinding::AddToView));
+        assert_eq!(b.chord('v', 'r'), Some(SessionManagerBinding::ViewRename));
+        assert_eq!(
+            b.chord('v', 'x'),
+            Some(SessionManagerBinding::ViewRemoveCell)
+        );
+        assert_eq!(b.chord('v', 'd'), Some(SessionManagerBinding::ViewDelete));
+        // ... and each is nameable from a config file.
+        for (name, want) in [
+            ("ViewRename", SessionManagerBinding::ViewRename),
+            ("ViewRemoveCell", SessionManagerBinding::ViewRemoveCell),
+            ("ViewDelete", SessionManagerBinding::ViewDelete),
+        ] {
+            assert_eq!(SessionManagerBinding::from_name(name), Some(want));
+        }
         // First chars of the 2-char chords are prefixes.
         assert!(b.is_prefix('t'));
         assert!(b.is_prefix('p'));
@@ -2624,7 +2650,7 @@ mod tests {
         // An empty table (section absent) yields exactly the defaults.
         let value = toml::Value::Table(toml::map::Map::new());
         let b = SessionManagerBindings::from_toml(&value);
-        assert_eq!(b.len(), 16);
+        assert_eq!(b.len(), 19);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
     }
 
@@ -2654,7 +2680,7 @@ mod tests {
         "#;
         let value: toml::Value = toml_str.parse().unwrap();
         let b = SessionManagerBindings::from_toml(&value);
-        assert_eq!(b.len(), 16);
+        assert_eq!(b.len(), 19);
         assert_eq!(b.chord('t', 'n'), Some(SessionManagerBinding::TabNew));
     }
 

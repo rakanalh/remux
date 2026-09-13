@@ -2210,6 +2210,24 @@ async fn leave_active_view(
     Ok(())
 }
 
+/// The client's view cache in the session manager's plain shape: each view's
+/// id, name, and cells as `(cell_id, conn, pane_id)` in cell order.
+fn session_manager_views(
+    views: &[crate::client::view::ClientView],
+) -> Vec<crate::client::tree_model::ViewEntry> {
+    views
+        .iter()
+        .map(|v| {
+            let cells = v
+                .cells
+                .iter()
+                .map(|c| (c.id, c.conn.clone(), c.pane_id))
+                .collect();
+            (v.id, v.name.clone(), cells)
+        })
+        .collect()
+}
+
 /// The inner client event loop.
 async fn run_client_loop(
     mgr: &mut ConnectionManager,
@@ -3631,6 +3649,7 @@ async fn run_client_loop(
                                 if let Some(sm) = input.session_manager.as_mut() {
                                     sm.set_foreground(mgr.foreground().clone());
                                     sm.set_roster(mgr.server_roster());
+                                    sm.set_views(session_manager_views(&views));
                                 }
                                 // Refresh every connected server's subtree.
                                 for id in mgr.connected_ids() {
@@ -3670,6 +3689,7 @@ async fn run_client_loop(
                                 if let Some(sm) = input.session_manager.as_mut() {
                                     sm.set_foreground(mgr.foreground().clone());
                                     sm.set_roster(mgr.server_roster());
+                                    sm.set_views(session_manager_views(&views));
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.clear_overlay(c, r)?;
                                     let draw_cmds = sm.render(c, r, &theme);
@@ -3731,6 +3751,12 @@ async fn run_client_loop(
                                 log::debug!("input: SessionManagerAction {:?}", sm_action);
                                 // Clone out of the borrow so we can mutate `input`/`mgr` freely.
                                 let sm_action = sm_action.clone();
+                                // The cell an `EnterViewCell` names, read before the
+                                // match below moves the action.
+                                let entered_cell = match &sm_action {
+                                    SessionManagerAction::EnterViewCell { cell_id, .. } => Some(*cell_id),
+                                    _ => None,
+                                };
                                 match sm_action {
                                     SessionManagerAction::ConnectRemote(name) => {
                                         // Lazily connect the remote server node, then
@@ -3895,27 +3921,119 @@ async fn run_client_loop(
                                     SessionManagerAction::Rename { server, kind, new_name } => {
                                         use crate::client::session_manager::RenameKind;
                                         let cmd = match kind {
-                                            RenameKind::Session { name } => RemuxCommand::SessionRenameByName {
+                                            RenameKind::Session { name } => Some(RemuxCommand::SessionRenameByName {
                                                 old: name.clone(),
                                                 new: new_name.clone(),
-                                            },
-                                            RenameKind::Folder { name } => RemuxCommand::FolderRename {
+                                            }),
+                                            RenameKind::Folder { name } => Some(RemuxCommand::FolderRename {
                                                 old: name.clone(),
                                                 new: new_name.clone(),
-                                            },
-                                            RenameKind::Tab { session, tab_index } => RemuxCommand::TabRenameByIndex {
+                                            }),
+                                            RenameKind::Tab { session, tab_index } => Some(RemuxCommand::TabRenameByIndex {
                                                 session: session.clone(),
                                                 tab_index,
                                                 name: new_name.clone(),
-                                            },
-                                            RenameKind::Pane { session, pane_id } => RemuxCommand::PaneRenameById {
+                                            }),
+                                            RenameKind::Pane { session, pane_id } => Some(RemuxCommand::PaneRenameById {
                                                 session: session.clone(),
                                                 pane_id,
                                                 name: new_name.clone(),
-                                            },
+                                            }),
+                                            // Views live on the LOCAL registry, whatever
+                                            // `server` says. No tree refresh: the
+                                            // `ViewList` broadcast is the refresh, and it
+                                            // re-feeds this overlay (see the `ViewList` arm).
+                                            RenameKind::View { id } => {
+                                                mgr.send(
+                                                    &ConnId::Local,
+                                                    ClientMessage::ViewRename { id, name: new_name.clone() },
+                                                )
+                                                .await?;
+                                                None
+                                            }
                                         };
-                                        mgr.send(&server, ClientMessage::Command(cmd)).await?;
-                                        mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                        if let Some(cmd) = cmd {
+                                            mgr.send(&server, ClientMessage::Command(cmd)).await?;
+                                            mgr.send(&server, ClientMessage::ListSessionTree).await?;
+                                        }
+                                    }
+                                    // Removing or deleting the view on screen needs no
+                                    // teardown here: the resulting local `ViewList`
+                                    // unsubscribes a removed cell's pane (the pane-set
+                                    // diff) and leaves a deleted view to the session.
+                                    SessionManagerAction::RemoveViewCell { id, cell_id } => {
+                                        mgr.send(&ConnId::Local, ClientMessage::ViewRemoveCell { id, cell_id }).await?;
+                                    }
+                                    SessionManagerAction::DeleteView { id } => {
+                                        mgr.send(&ConnId::Local, ClientMessage::ViewDelete { id }).await?;
+                                    }
+                                    SessionManagerAction::EnterView { id }
+                                    | SessionManagerAction::EnterViewCell { id, .. } => {
+                                        // Closed exactly as a session jump closes it.
+                                        input.session_manager = None;
+                                        input.mode = Mode::Normal;
+                                        let (c, r) = crossterm::terminal::size()?;
+                                        renderer.clear_overlay(c, r)?;
+                                        mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                        // BY ID against the cache as it is NOW: the
+                                        // manager's rows can be one `ViewList` behind it,
+                                        // so an index would be the wrong view.
+                                        let target = views.iter().position(|v| v.id == id);
+                                        match target {
+                                            None => {
+                                                log::warn!("session manager: view {id} is gone; not entering it");
+                                            }
+                                            Some(idx) if active_view == Some(idx) => {
+                                                // Already on screen: re-entering would
+                                                // Detach and re-subscribe for nothing.
+                                            }
+                                            Some(idx) => {
+                                                enter_view(
+                                                    mgr,
+                                                    &mut views,
+                                                    &mut active_view,
+                                                    &mut active_view_id,
+                                                    &mut chrome,
+                                                    &mut mouse_grab,
+                                                    idx,
+                                                    &current_attached,
+                                                    &mut renderer,
+                                                    &input,
+                                                    &whichkey,
+                                                    &theme,
+                                                    &compositor_theme,
+                                                    &view_border_style,
+                                                    &which_key_position,
+                                                    viewport_top,
+                                                    focused_pane_rect.as_ref(),
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                        // Whatever is displayed now is repainted without
+                                        // the overlay (a view's composite is not in the
+                                        // front buffer `clear_overlay` restores).
+                                        if let Some(av) = active_view {
+                                            paint_view(
+                                                &mut renderer,
+                                                &chrome,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &compositor_theme,
+                                                &view_border_style,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        }
+                                        if let (Some(cell_id), Some(_)) = (entered_cell, target) {
+                                            // Focus is server-owned: the `ViewList` this
+                                            // produces is what moves it on screen.
+                                            mgr.send(&ConnId::Local, ClientMessage::ViewSetFocus { id, cell_id }).await?;
+                                        }
+                                        renderer.flush()?;
                                     }
                                     SessionManagerAction::RefreshTree => {
                                         for id in mgr.connected_ids() {
@@ -6615,6 +6733,40 @@ async fn run_client_loop(
                                     renderer.render_whichkey_overlay(&draw_cmds)?;
                                     renderer.flush()?;
                                 }
+                            }
+
+                            // Same for an OPEN session manager's Views group: a view
+                            // renamed, emptied or deleted anywhere (including by this
+                            // overlay's own `vr`/`vx`/`vd`) shows without reopening.
+                            // Painted AFTER the branches above, which repaint the
+                            // screen underneath it (the deleted-view leave does).
+                            if input.session_manager.is_some() {
+                                if let Some(sm) = input.session_manager.as_mut() {
+                                    sm.set_views(session_manager_views(&views));
+                                }
+                                let (c, r) = crossterm::terminal::size()?;
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else {
+                                    renderer.clear_overlay(c, r)?;
+                                }
+                                if let Some(ref sm) = input.session_manager {
+                                    let draw_cmds = sm.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                }
+                                renderer.flush()?;
                             }
                         }
                     }
