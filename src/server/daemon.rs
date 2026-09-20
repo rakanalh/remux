@@ -2060,10 +2060,16 @@ async fn handle_input(
 /// A no-op for a client already at the tail, which is the overwhelmingly common
 /// case -- so this costs one lock and no repaint per keystroke.
 ///
-/// Scoped tightly, so it can only ever undo a scroll the same keystroke made
-/// pointless:
+/// `handle_command` is the second caller, for the commands
+/// [`RemuxCommand::returns_to_live_tail`] names: a command that moves focus or
+/// reshapes the layout makes a scroll pointless in exactly the same way typing
+/// does, and a scrolled client is otherwise skipped by `broadcast_full_render`
+/// and sees no frame at all.
 ///
-/// * Only the client that typed. Another client scrolled back through the same
+/// Scoped tightly, so it can only ever undo a scroll the triggering command or
+/// keystroke made pointless:
+///
+/// * Only the requesting client. Another client scrolled back through the same
 ///   session keeps its offset -- `scroll_offset` is per-client and this touches
 ///   exactly one entry.
 /// * Only the attached-session viewport. A View cell's scrollback is the
@@ -2092,7 +2098,7 @@ async fn snap_client_to_live_tail(
                     && client.mode != SEARCH_MODE =>
             {
                 log::debug!(
-                    "server: input returns client_id={client_id} to the live tail from offset={}",
+                    "server: returning client_id={client_id} to the live tail from offset={}",
                     client.scroll_offset
                 );
                 client.scroll_offset = 0;
@@ -2241,6 +2247,23 @@ async fn handle_command(
                         RemuxCommand::ResizeDown(a) => (0, a as i16),
                         _ => unreachable!(),
                     };
+                    // This arm renders and returns, so it never reaches the
+                    // snap below `match cmd`. Without this the popup could be
+                    // resized under a scrolled client and the broadcast at the
+                    // bottom of the arm would skip it -- the same silent-command
+                    // defect, reached by the one route that gets past the guard.
+                    // The rule itself still lives only in `returns_to_live_tail`.
+                    if cmd.returns_to_live_tail(&session_name) {
+                        snap_client_to_live_tail(
+                            client_id,
+                            state,
+                            panes,
+                            clients,
+                            config,
+                            prev_frames,
+                        )
+                        .await;
+                    }
                     {
                         let mut st = state.lock().await;
                         if let Some(sess) = st.sessions.get_mut(&session_name) {
@@ -2296,6 +2319,21 @@ async fn handle_command(
                 _ => {}
             }
         }
+    }
+
+    // A scrolled client is excluded from `broadcast_full_render` -- deliberately,
+    // since that is also the PTY-output path -- so a command that reshapes the
+    // screen would otherwise produce no frame for it at all. End the scroll
+    // before dispatching, for the commands `RemuxCommand::returns_to_live_tail`
+    // names. Do not "fix" this by rendering scrolled clients from the broadcast
+    // instead; that filter is what keeps another pane's output from yanking a
+    // scrolled reader to the bottom.
+    //
+    // Placed below every early return above -- the popup guard's block list in
+    // particular -- so a command that is about to be refused cannot cost the
+    // user their place in the scrollback.
+    if cmd.returns_to_live_tail(&session_name) {
+        snap_client_to_live_tail(client_id, state, panes, clients, config, prev_frames).await;
     }
 
     match cmd {

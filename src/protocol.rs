@@ -1251,6 +1251,126 @@ pub enum RemuxCommand {
     },
 }
 
+impl RemuxCommand {
+    /// Whether executing this command should first return the requesting
+    /// client to the live tail of its attached session.
+    ///
+    /// `broadcast_full_render` skips clients with a non-zero `scroll_offset`,
+    /// and that exclusion is load-bearing: it is also the PTY-output path, so
+    /// another pane's output must never yank a scrolled reader to the bottom.
+    /// The consequence is that a command which reshapes the screen produces no
+    /// frame at all for a scrolled client -- focus moves, the highlight does
+    /// not, and the session reads as frozen. Snapping first is what makes such
+    /// a command visible, and the filter itself must stay as it is.
+    ///
+    /// `attached_session` is the REQUESTER's own attached session, empty when
+    /// it has none. The session manager's explicit-target commands name the
+    /// session they act on, and that target is frequently not the requester's;
+    /// comparing the two here rather than at the call site keeps the target out
+    /// of a second `match` over the same variants, which could drift from this
+    /// one.
+    ///
+    /// The `match` is exhaustive with no `_` arm on purpose: a command added
+    /// later must be classified deliberately rather than inherit a default --
+    /// and one carrying a target session has it in scope to compare.
+    pub fn returns_to_live_tail(&self, attached_session: &str) -> bool {
+        match self {
+            // Geometry, focus or the visible tab changes -- the screen the user
+            // is looking at is no longer the one the command acted on.
+            RemuxCommand::TabNew
+            | RemuxCommand::TabClose
+            | RemuxCommand::TabGoto(_)
+            | RemuxCommand::TabNext
+            | RemuxCommand::TabPrev
+            | RemuxCommand::TabMove(_)
+            | RemuxCommand::PaneNew
+            | RemuxCommand::PaneClose
+            | RemuxCommand::PaneSplitVertical
+            | RemuxCommand::PaneSplitHorizontal
+            | RemuxCommand::PaneFocusLeft
+            | RemuxCommand::PaneFocusRight
+            | RemuxCommand::PaneFocusUp
+            | RemuxCommand::PaneFocusDown
+            | RemuxCommand::PaneStackAdd
+            | RemuxCommand::PaneStackNext
+            | RemuxCommand::PaneStackPrev
+            | RemuxCommand::PaneMoveLeft
+            | RemuxCommand::PaneMoveRight
+            | RemuxCommand::PaneMoveUp
+            | RemuxCommand::PaneMoveDown
+            | RemuxCommand::PaneToggleZoom
+            | RemuxCommand::PopupToggle
+            | RemuxCommand::ResizeLeft(_)
+            | RemuxCommand::ResizeRight(_)
+            | RemuxCommand::ResizeUp(_)
+            | RemuxCommand::ResizeDown(_)
+            | RemuxCommand::LayoutNext
+            | RemuxCommand::SetMaster
+            // `SessionSwitch*` name a session too, but they ATTACH the
+            // requester to it, so the screen they reshape is always the one it
+            // is about to be looking at -- unconditional, not target-compared.
+            | RemuxCommand::SessionSwitchTab { .. }
+            | RemuxCommand::SessionSwitchPane { .. }
+            | RemuxCommand::SessionSwitchLast => true,
+
+            // The session manager's explicit-target commands. They reshape the
+            // named session, which is usually NOT the requester's: closing a tab
+            // in someone else's session moves nothing on this client's screen,
+            // so snapping it would cost the user their place in the scrollback
+            // for a change they cannot see. An unattached requester compares
+            // against "", which matches no real session -- also correctly false.
+            RemuxCommand::TabCloseByIndex { session, .. }
+            | RemuxCommand::TabMoveByIndex { session, .. }
+            | RemuxCommand::PaneCloseById { session, .. }
+            | RemuxCommand::PaneNewInTab { session, .. }
+            // `TabNewInSession` belongs here and not in the `false` group
+            // below: `create_tab_in_session` calls `create_tab`, which makes the
+            // new tab ACTIVE, then refreshes the target session -- so against
+            // the requester's own session it replaces the whole screen, which is
+            // a larger change than `PaneNewInTab`, not a smaller one.
+            | RemuxCommand::TabNewInSession { session } => session == attached_session,
+
+            // Entering copy mode or the search prompt FROM a scrolled position
+            // is the reason the user scrolled in the first place; snapping
+            // would throw away exactly what they scrolled back to reach.
+            RemuxCommand::EnterVisualMode | RemuxCommand::EnterSearchMode => false,
+
+            // Everything else. The rule is "snap when NOT repainting reads as
+            // FROZEN", not "snap whenever a cell would differ" -- and the rename
+            // arms are where those two part company. `TabRenameByIndex` does
+            // repaint the target session (via `refresh_target_session`), so a
+            // scrolled client's tab label goes stale until it returns to the
+            // tail. That is a cosmetic nit; a session that will not respond is
+            // not. Neither is worth the place in the history the user
+            // deliberately scrolled back to, so the renames stay here
+            // deliberately. Do not extend the rule to them.
+            RemuxCommand::TabRename(_)
+            | RemuxCommand::TabRenameByIndex { .. }
+            | RemuxCommand::PaneRename(_)
+            | RemuxCommand::PaneRenameById { .. }
+            | RemuxCommand::SessionNew { .. }
+            | RemuxCommand::SessionDetach
+            | RemuxCommand::SessionRename(_)
+            | RemuxCommand::SessionRenameByName { .. }
+            | RemuxCommand::SessionList
+            | RemuxCommand::SessionSave
+            | RemuxCommand::SessionMoveToFolder
+            | RemuxCommand::FolderNew(_)
+            | RemuxCommand::FolderDelete(_)
+            | RemuxCommand::FolderList
+            | RemuxCommand::FolderRename { .. }
+            | RemuxCommand::FolderMoveSession { .. }
+            | RemuxCommand::BufferEditInEditor
+            | RemuxCommand::ToggleStyle
+            | RemuxCommand::EnterNormal
+            | RemuxCommand::EnterCommandMode
+            | RemuxCommand::SendKey(_)
+            | RemuxCommand::OpenSessionManager
+            | RemuxCommand::RemoteConnect(_) => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Action registry
 // ---------------------------------------------------------------------------

@@ -13,8 +13,8 @@ The discriminator is therefore WHO ends the scroll, read out of the server log:
     asked. This is the client half working: it can only happen if `is_scrolled`
     is true at maximum scroll, which is only true if the client reads the render
     frames' new `scroll_offset` instead of `viewport_top` (which is 0 there).
-  * `server: input returns client_id=..` -- the server had to snap it, because
-    the client did not ask.
+  * `server: returning client_id=.. to the live tail` -- the server had to snap
+    it, because the client did not ask.
 
 At maximum scroll the first must appear and the second must not: the client
 sends `ScrollReset` before the `Input` for the same keystroke, so by the time
