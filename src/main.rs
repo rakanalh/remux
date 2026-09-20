@@ -964,12 +964,11 @@ fn resize_of(cmd: &RemuxCommand) -> Option<(crate::server::layout::FocusDirectio
 /// it reweights the focused panel, which leaves the content rect alone and only
 /// needs a repaint.
 ///
-/// There is deliberately no live-view branch. A view cannot coexist with panel
-/// focus -- `SidebarIntent::Focus` is refused while one is up and `enter_view`
-/// drops panel focus -- and this runs AFTER `handle_view_command`, which
-/// consumes `Resize*` for the view's cells. So a resize while a view is live
-/// never reaches here, and one that did would find focus on the content and
-/// fall through.
+/// There is deliberately no live-view branch, and none is needed: this runs
+/// AFTER `handle_view_command`, which consumes EVERY `Resize*` while a view is
+/// live -- for the view's cells with focus on the content, and as a logged
+/// swallow with focus in a panel. So a resize while a view is up never reaches
+/// here at all.
 async fn handle_chrome_resize(
     cmd: &RemuxCommand,
     chrome: &mut crate::client::chrome::Chrome,
@@ -979,20 +978,21 @@ async fn handle_chrome_resize(
     renderer: &mut Renderer,
     compositor_theme: &crate::config::theme::CompositorTheme,
 ) -> Result<bool> {
-    // The unasserted invariant this function's safety rests on. It neither
-    // re-subscribes view cells nor consults the view's geometry, so if a panel
-    // could hold focus while a view is live, a sidebar resize would move the
-    // content rect out from under that view without re-subscribing its cells.
-    // Three call sites depend on this and none of them check it, so assert it
-    // where the damage would happen -- a future view-entry path that forgets
-    // `chrome.leave_sidebar()` should trip here in debug, not corrupt a view.
+    // The invariant this function's safety rests on. It neither re-subscribes
+    // view cells nor consults the view's geometry, so a sidebar resize reaching
+    // here with a view live would move the content rect out from under that
+    // view and leave its cells sized for a rect that no longer exists. Three
+    // call sites depend on `handle_view_command` having swallowed the command
+    // first and none of them check it, so assert it where the damage would
+    // happen rather than where it is prevented.
     debug_assert!(
         !(matches!(
             chrome.focus,
             crate::client::chrome::ChromeFocus::Sidebar { .. }
         ) && active_view.is_some()),
-        "panel focus while a view is live: a sidebar resize would move the \
-         content rect under the view without re-subscribing its cells"
+        "a resize reached the chrome with a view live: `handle_view_command` \
+         must consume every `Resize*` while a view is up, or the content rect \
+         moves under the view without its cells being re-subscribed"
     );
     let Some((dir, amount)) = resize_of(cmd) else {
         return Ok(false);
@@ -1810,11 +1810,10 @@ async fn enter_view(
     }
     *active_view = Some(target_idx);
     *active_view_id = Some(views[target_idx].id);
-    // A view takes the keyboard for its cells: the sidebar key-routing gate is
-    // `active_view.is_none()`, so focus left in a panel here would be focus
-    // nothing can reach. Reachable via a prefix chord (the gate also requires
-    // `Mode::Normal`, which a chord leaves). `leave_sidebar` mirrors
-    // `focused_panel` first, so leaving the view returns to the same panel.
+    // A view OPENS on its cells: whatever the user was doing in a panel, the
+    // thing they just asked for is the view, so the keyboard goes there. They
+    // can step back into the sidebar with a directional key. `leave_sidebar`
+    // mirrors `focused_panel` first, so that step returns to the same panel.
     chrome.leave_sidebar();
     // The view branch of the mouse loop `continue`s above the grab bookkeeping,
     // so a grab set before entering would never see its release. Drop it here
@@ -1915,9 +1914,16 @@ async fn send_to_focused_cell(
 /// of `move_focus`) into a target `cell_id` and sent as `ViewSetFocus`.
 ///
 /// - `PaneFocus{Left,Right,Up,Down}` -> resolve the neighbor cell locally, send
-///   `ViewSetFocus { cell_id }`.
+///   `ViewSetFocus { cell_id }`; with no neighbour that way, hand the key to
+///   `chrome::intercept_focus` so a sidebar on that edge can take the keyboard
+///   (and, from inside a panel, give it back). Still consumed either way --
+///   see the directional branch for why a fall-through would reach the masked
+///   server.
 /// - `LayoutNext` -> `ViewCycleLayout`.
-/// - `Resize{Left,Right,Up,Down}` -> `ViewResizeCell { dir, amount }`.
+/// - `Resize{Left,Right,Up,Down}` -> `ViewResizeCell { dir, amount }` with focus
+///   on the cells; with a PANEL focused, resize the SIDEBAR here instead and
+///   re-subscribe the view's cells to the content rect that moved
+///   (`handle_chrome_resize` cannot: it repaints with `chrome.paint`).
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
 /// - `PaneToggleZoom` -> `ViewToggleZoom`.
 /// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
@@ -1929,6 +1935,9 @@ async fn send_to_focused_cell(
 ///   path runs and the client exits.
 /// - `SendKey(bytes)` -> route the raw bytes to the focused cell's pane by
 ///   identity (best-effort), never to the foreground (per-terminal, unchanged).
+/// - `Resize{Left,Right,Up,Down}` while a PANEL holds the keyboard -> swallowed.
+///   `handle_chrome_resize` moves the content rect without re-subscribing the
+///   view's cells, and it runs after this.
 /// - every other structural / server command -> NO-OP: consumed, nothing sent.
 #[allow(clippy::too_many_arguments)]
 async fn handle_view_command(
@@ -1937,13 +1946,14 @@ async fn handle_view_command(
     views: &mut [crate::client::view::ClientView],
     av: usize,
     renderer: &mut Renderer,
-    chrome: &crate::client::chrome::Chrome,
+    chrome: &mut crate::client::chrome::Chrome,
     input: &InputHandler,
     whichkey: &mut WhichKeyPopup,
     theme: &crate::config::theme::Theme,
     compositor_theme: &crate::config::theme::CompositorTheme,
     border_style: &crate::config::BorderStyle,
     which_key_position: &crate::config::WhichKeyPosition,
+    status_bar: &crate::config::StatusBarPosition,
     viewport_top: usize,
     focused_pane_rect: Option<&crate::protocol::PaneRect>,
     cols: u16,
@@ -1991,31 +2001,86 @@ async fn handle_view_command(
     };
     if let Some(dir) = dir {
         hide_whichkey!();
-        // Resolve the neighbor cell with THIS terminal's geometry (a clone probe
-        // so the cache isn't mutated), then intent the shared focus change. The
-        // repaint arrives via the resulting `ViewList`.
         // Resolved against the rect the view is PAINTED into, not the raw
         // terminal: with a sidebar open the two differ, and a neighbour
         // computed from the wrong width is the wrong cell.
         let content = chrome.content_rect(cols, rows);
-        let cells = crate::client::view::cells_area(crate::server::layout::Rect {
+        let area = crate::server::layout::Rect {
             x: 0,
             y: 0,
             width: content.width,
             height: content.height,
-        });
-        let mut probe = views[av].clone();
-        if probe.move_focus(dir, cells) {
-            let cell_id = probe.focused_id();
-            mgr.send(
-                &ConnId::Local,
-                ClientMessage::ViewSetFocus {
-                    id: view_id,
-                    cell_id,
-                },
-            )
-            .await?;
+        };
+        // A panel already holds the keyboard: this is the way OUT, and the view
+        // must not see the key at all. Running `move_focus` first would move a
+        // CELL and leave the user stuck in the sidebar.
+        let mut handled = matches!(
+            chrome.focus,
+            crate::client::chrome::ChromeFocus::Sidebar { .. }
+        ) && crate::client::chrome::intercept_focus(
+            chrome,
+            dir.clone(),
+            None,
+            cols,
+            rows,
+            status_bar,
+        );
+        if !handled {
+            // Resolve the neighbor cell with THIS terminal's geometry (a clone
+            // probe so the cache isn't mutated), then intent the shared focus
+            // change. The repaint arrives via the resulting `ViewList`.
+            let cells = crate::client::view::cells_area(area);
+            let mut probe = views[av].clone();
+            if probe.move_focus(dir.clone(), cells) {
+                let cell_id = probe.focused_id();
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::ViewSetFocus {
+                        id: view_id,
+                        cell_id,
+                    },
+                )
+                .await?;
+                handled = true;
+            }
         }
+        if !handled {
+            // At the view's edge. `focused_pane_rect` names a server pane that
+            // is not on screen while a view is up, so the edge test runs against
+            // the focused CELL -- inset to its INTERIOR, because that is the
+            // shape `intercept_focus` expects (the server reports a pane's
+            // interior) and it adds the border back itself.
+            let rect = crate::client::view::cell_rects(&views[av], area)
+                .get(views[av].focused)
+                .copied()
+                .flatten()
+                .map(|r| {
+                    let (ix, iy, iw, ih) = crate::client::view::cell_interior(
+                        r.x as usize,
+                        r.y as usize,
+                        r.width as usize,
+                        r.height as usize,
+                        border_style,
+                    );
+                    crate::protocol::PaneRect {
+                        x: ix as u16,
+                        y: iy as u16,
+                        width: iw as u16,
+                        height: ih as u16,
+                    }
+                });
+            crate::client::chrome::intercept_focus(
+                chrome,
+                dir,
+                rect.as_ref(),
+                cols,
+                rows,
+                status_bar,
+            );
+        }
+        // Consumed even when nothing took it. The foreground server is MASKED
+        // behind the view, so a fall-through would move focus in a session the
+        // user is not looking at.
         repaint!();
         return Ok(true);
     }
@@ -2043,6 +2108,45 @@ async fn handle_view_command(
                 RemuxCommand::ResizeDown(_) => FocusDirection::Down,
                 _ => unreachable!(),
             };
+            // A panel holds the keyboard, so the resize is the SIDEBAR's. Done
+            // here rather than by `handle_chrome_resize`, which repaints with
+            // `chrome.paint` and never re-subscribes: moving the content rect
+            // resizes the view's CELLS, and a cell still demanding its old size
+            // shows a pane reflowed to a rect that is no longer on screen. This
+            // is the sidebar-toggle path's pair (`subscribe_view_cells` +
+            // `paint_view`) applied to the same geometry change.
+            if matches!(
+                chrome.focus,
+                crate::client::chrome::ChromeFocus::Sidebar { .. }
+            ) {
+                // `Renderer::size`, not the `cols`/`rows` passed in, because
+                // `subscribe_view_cells` lays the cells out against the front
+                // buffer and the two disagree inside the SIGWINCH window.
+                let (tc, tr) = renderer.size();
+                let before = chrome.content_rect(tc, tr);
+                let persisted_before =
+                    crate::client::sidebar_state::SidebarState::from_chrome(chrome);
+                if crate::client::chrome::intercept_resize(chrome, dir, *amount, tc, tr) {
+                    if crate::client::sidebar_state::SidebarState::from_chrome(chrome)
+                        != persisted_before
+                    {
+                        crate::client::sidebar_state::save(chrome);
+                    }
+                    let content = chrome.content_rect(tc, tr);
+                    if content != before {
+                        sync_content_rect(renderer, &content);
+                        mgr.send_foreground(ClientMessage::Resize {
+                            cols: content.width,
+                            rows: content.height,
+                        })
+                        .await?;
+                        subscribe_view_cells(mgr, chrome, renderer, &mut views[av], border_style)
+                            .await?;
+                    }
+                }
+                repaint!();
+                return Ok(true);
+            }
             if !views[av].cells.is_empty() {
                 let cell_id = views[av].focused_id();
                 mgr.send(
@@ -2201,9 +2305,11 @@ async fn leave_active_view(
         *active_view = None;
         *active_view_id = None;
         // Symmetric with `enter_view`: the screen goes back to the content, so
-        // focus does too (a panel focused before the view was entered has not
-        // been reachable since), and a grab claimed while the view swallowed
-        // the mouse must not survive into the next gesture.
+        // focus does too. This is a real transition now, not a tidy-up of an
+        // unreachable state -- a panel CAN hold the keyboard inside a view --
+        // and leaving on the panel would drop the user somewhere they did not
+        // ask to be. A grab claimed while the view swallowed the mouse must not
+        // survive into the next gesture either.
         chrome.leave_sidebar();
         *mouse_grab = None;
     }
@@ -2539,37 +2645,56 @@ async fn run_client_loop(
                         // half-typed prefix chord owns the keyboard FIRST -- the
                         // prefix is let through, so without the mode check the
                         // NEXT key of `Prefix x m` would be eaten by the plugin
-                        // and command mode would be unreachable from a panel. A
-                        // live view owns the keyboard for its cells -- the
-                        // panels are still PAINTED beside it, but nothing routes
-                        // keys to them -- so the chrome claims nothing while one
-                        // is up. `enter_view` drops panel focus for that reason.
+                        // and command mode would be unreachable from a panel.
+                        //
+                        // A live view deliberately does NOT bar this gate, and
+                        // adding `active_view.is_none()` back would strand the
+                        // keyboard: `handle_view_command` hands a panel the
+                        // focus on a directional key at the view's edge, and a
+                        // panel holding focus that no key can reach is the bug
+                        // that entry exists to fix. `enter_view` still drops
+                        // panel focus, so a view always OPENS on its cells --
+                        // only a deliberate step puts the keyboard in a panel.
+                        //
+                        // A `debug_assert!` stood here forbidding panel focus
+                        // with a view live, and NOTHING replaces it, because
+                        // that state is now legal rather than merely unreached.
+                        // What the assertion protected is asserted where the
+                        // damage would be done instead: `handle_chrome_resize`
+                        // still refuses to see a live view, because a resize
+                        // there would move the content rect without
+                        // re-subscribing the view's cells.
                         //
                         // Panels are laid out against the front buffer, so the
                         // sizes come from `Renderer::size` -- see `panel_at` for
                         // the SIGWINCH window a fresh `terminal::size()` reopens.
-                        // The other half of the `handle_chrome_resize`
-                        // invariant: panel focus and a live view must never
-                        // coexist. Asserted on the gate itself, so a new
-                        // view-entry path that forgets `leave_sidebar()` trips
-                        // here in debug rather than silently stranding the
-                        // keyboard in a panel no key can reach.
-                        debug_assert!(
-                            !(matches!(
-                                chrome.focus,
-                                crate::client::chrome::ChromeFocus::Sidebar { .. }
-                            ) && active_view.is_some()),
-                            "panel focus survived into a live view: the sidebar key gate \
-                             requires `active_view.is_none()`, so the panel would hold \
-                             focus that no keystroke can reach"
-                        );
-                        if active_view.is_none() && input.mode == Mode::Normal && !input.has_overlay() {
+                        if input.mode == Mode::Normal && !input.has_overlay() {
                             let (tc, tr) = renderer.size();
                             match chrome.focused_panel(tc, tr) {
                                 Some((sidebar, panel)) => {
                                     if key.code == crossterm::event::KeyCode::Esc {
                                         chrome.leave_sidebar();
-                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                        // A view composites the content rect
+                                        // itself, and only `paint_view` puts its
+                                        // cursor back; `chrome.paint` would
+                                        // leave it wherever the panel left it.
+                                        if let Some(av) = active_view {
+                                            paint_view(
+                                                &mut renderer,
+                                                &chrome,
+                                                &views[av],
+                                                &input,
+                                                &whichkey,
+                                                &theme,
+                                                &compositor_theme,
+                                                &view_border_style,
+                                                &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect.as_ref(),
+                                            )?;
+                                        } else {
+                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                        }
                                         renderer.flush()?;
                                         continue;
                                     }
@@ -2719,13 +2844,14 @@ async fn run_client_loop(
                                         &mut views,
                                         av,
                                         &mut renderer,
-                                        &chrome,
+                                        &mut chrome,
                                         &input,
                                         &mut whichkey,
                                         &theme,
                                         &compositor_theme,
                                         &view_border_style,
                                         &which_key_position,
+                                        &config.appearance.status_bar_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
                                         cols,
@@ -2846,13 +2972,14 @@ async fn run_client_loop(
                                             &mut views,
                                             av,
                                             &mut renderer,
-                                            &chrome,
+                                            &mut chrome,
                                             &input,
                                             &mut whichkey,
                                             &theme,
                                             &compositor_theme,
                                             &view_border_style,
                                             &which_key_position,
+                                            &config.appearance.status_bar_position,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
                                             cols,
@@ -2932,18 +3059,17 @@ async fn run_client_loop(
                             InputAction::ModeChanged(mode) => {
                                 log::debug!("input: ModeChanged to {:?}", mode);
                                 // A panel keeps the keyboard only in Normal
-                                // mode: the sidebar key gate is
-                                // `active_view.is_none() && mode == Normal`.
+                                // mode: the sidebar key gate also requires it.
                                 // Leaving Normal (a chord into Visual/Search,
                                 // the palette, the session manager) therefore
-                                // routes every key to the server while
-                                // `chrome.focus` still names a panel -- which
-                                // kept painting a focused header for a panel
-                                // that no longer had the keyboard. Drop the
-                                // focus so the invariant holds in every mode,
-                                // not just the one it was written for.
-                                // `leave_sidebar` mirrors `focused_panel`
-                                // first, so returning re-enters the same panel.
+                                // routes every key past the panel while
+                                // `chrome.focus` still names it -- which kept
+                                // painting a focused header for a panel that no
+                                // longer had the keyboard. Drop the focus so
+                                // the rule holds in every mode, not just the
+                                // one it was written for. `leave_sidebar`
+                                // mirrors `focused_panel` first, so returning
+                                // re-enters the same panel.
                                 if mode != Mode::Normal
                                     && matches!(
                                         chrome.focus,
@@ -2955,7 +3081,26 @@ async fn run_client_loop(
                                     );
                                     chrome.leave_sidebar();
                                     let (tc, tr) = renderer.size();
-                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                    // Reachable inside a view now, and there the
+                                    // content rect is the view's composite: only
+                                    // `paint_view` puts its cursor back.
+                                    if let Some(av) = active_view {
+                                        paint_view(
+                                            &mut renderer,
+                                            &chrome,
+                                            &views[av],
+                                            &input,
+                                            &whichkey,
+                                            &theme,
+                                            &compositor_theme,
+                                            &view_border_style,
+                                            &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect.as_ref(),
+                                        )?;
+                                    } else {
+                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                    }
                                 }
                                 let mode_str = match mode {
                                     Mode::Normal => "NORMAL",
@@ -3206,13 +3351,14 @@ async fn run_client_loop(
                                         &mut views,
                                         av,
                                         &mut renderer,
-                                        &chrome,
+                                        &mut chrome,
                                         &input,
                                         &mut whichkey,
                                         &theme,
                                         &compositor_theme,
                                         &view_border_style,
                                         &which_key_position,
+                                        &config.appearance.status_bar_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
                                         cols,
@@ -4526,13 +4672,14 @@ async fn run_client_loop(
                                         &mut views,
                                         av,
                                         &mut renderer,
-                                        &chrome,
+                                        &mut chrome,
                                         &input,
                                         &mut whichkey,
                                         &theme,
                                         &compositor_theme,
                                         &view_border_style,
                                         &which_key_position,
+                                        &config.appearance.status_bar_position,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
                                         cols,
@@ -4654,10 +4801,15 @@ async fn run_client_loop(
                                     renderer.clear_overlay(tc, tr)?;
                                 }
                                 // FOCUS intents are refused while a view is live.
-                                // The sidebar key gate is `active_view.is_none()`,
-                                // so a focused panel could not receive a keystroke
-                                // -- focusing one would silently swallow the
-                                // keyboard. TOGGLE is honoured: the view is
+                                // A panel CAN hold the keyboard there -- a
+                                // directional key deliberately hands it one --
+                                // so this is a deliberate scope choice, not a
+                                // technical impossibility: these name an EDGE
+                                // with no regard for where the user is, so
+                                // `Prefix b H` would pull them out of a cell
+                                // they never left. Lifting it is a decision
+                                // about behaviour, not a bug to fix.
+                                // TOGGLE is honoured: the view is
                                 // composited into the content rect now, and the
                                 // panels it would show or hide are on screen next
                                 // to it, so a toggle that did nothing would read as
@@ -4792,6 +4944,17 @@ async fn run_client_loop(
                         // handlers resolve the target from the client's attached
                         // session. Entering a view detaches, so those would find
                         // no session and silently do nothing.
+                        //
+                        // KNOWN GAP: this branch swallows EVERY mouse event, so
+                        // while a view is up a click can neither enter a panel
+                        // nor leave one -- the panel routing and the
+                        // "a press in the content returns focus there" rule
+                        // below are both past the `continue`s here. A panel CAN
+                        // hold the keyboard in a view (see the sidebar key gate
+                        // and `handle_view_command`'s directional branch), so
+                        // that focus is keyboard-only: `Alt+<dir>` and `Esc` are
+                        // the ways out. Deliberate -- the ask was directional
+                        // keys -- and not a trap, since both ways out work.
                         if let Some(av) = active_view {
                             // The view is composited into the CONTENT rect, so
                             // every hit test below runs in content coordinates

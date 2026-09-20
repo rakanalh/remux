@@ -576,6 +576,566 @@ def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
     return finish(t, name, fails)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Alt+<dir> at a view's edge cell must reach the sidebar.
+#
+# The user's report was "with the right sidebar hidden and reshown, Alt+l does
+# not navigate into the widgets". The hide/show is a red herring -- the real
+# condition is that a VIEW is active. `handle_view_command`'s directional branch
+# ran `probe.move_focus` and then returned `Ok(true)` unconditionally, so a key
+# at the view's edge was swallowed before `intercept_focus` ever saw it.
+#
+# These run against the user's own sidebar shape -- edge = "right", size = 30,
+# the `agents` and `files` plugins -- rather than `placeholder`, so the harness
+# is not testing a fixture the report never involved.
+# ---------------------------------------------------------------------------
+
+RIGHT_W = 30
+RIGHT_X0 = COLS - RIGHT_W  # 90
+
+# A colour nothing else in the default theme uses, so "the active border colour
+# appears in the sidebar's columns" cannot be satisfied by anything but focus.
+ACTIVE_FG = "ff00aa"
+
+CFG_RIGHT = f"""
+[appearance.theme]
+frame_active_fg = "#{ACTIVE_FG}"
+
+[[sidebar]]
+edge = "right"
+size = {RIGHT_W}
+visible = true
+
+  [[sidebar.panel]]
+  plugin = "agents"
+  weight = 1
+
+  [[sidebar.panel]]
+  plugin = "files"
+  weight = 1
+"""
+
+# Same theme, no `[[sidebar]]` at all: `panel_rects` is empty, so every sidebar
+# code path is unreachable and a directional key at the view's edge has nowhere
+# to go but the swallow.
+CFG_RIGHT_NO_SIDEBAR = f"""
+[appearance.theme]
+frame_active_fg = "#{ACTIVE_FG}"
+"""
+
+ALT_H, ALT_J, ALT_K, ALT_L = b"\x1bh", b"\x1bj", b"\x1bk", b"\x1bl"
+
+# Assembled BY the shell, never present in the line that is typed: a shell
+# echoes what it is given, so a marker visible in the command proves nothing.
+MARKER_CMD = "printf 'RAN:%s\\n' {}\r"
+
+
+def active_fg_cells(t, x0, x1):
+    """Every (row, col) in [x0, x1) painted in the active border colour."""
+    out = []
+    for y in range(t.rows):
+        for x in range(x0, min(x1, t.cols)):
+            if str(t.screen.buffer[y][x].fg) == ACTIVE_FG:
+                out.append((y, x))
+    return out
+
+
+def sidebar_has_keyboard(t):
+    """Does the right sidebar carry the focused colour on its frame/header?
+
+    `draw_sidebar_frame` and `nav::draw_header` both ask
+    `compositor::border_fg(theme, focused)`, so this is the same answer the
+    chrome itself is painting from.
+    """
+    return bool(active_fg_cells(t, RIGHT_X0, COLS))
+
+
+def focused_panel_header(t):
+    """The header row of the right sidebar's panel that paints as FOCUSED.
+
+    `nav::draw_header` colours a panel's title with
+    `compositor::border_fg(theme, focused)`, so a header carrying the active
+    colour is the panel the chrome believes has the keyboard -- and it is what
+    the user reads to find out where their keys are going. Narrower than
+    `sidebar_has_keyboard`, which the sidebar's own frame also satisfies.
+    """
+    for y in range(t.rows):
+        row = t.rows_text()[y]
+        for x in range(RIGHT_X0, min(COLS, t.cols)):
+            if str(t.screen.buffer[y][x].fg) != ACTIVE_FG:
+                continue
+            if t.screen.buffer[y][x].data.strip() in ("", *BOX):
+                continue
+            # The sidebar is framed in the border style, so its bar carries a
+            # box glyph on each side of the header text.
+            return row[RIGHT_X0:].strip("".join(BOX) + " ")
+    return None
+
+
+def focused_cell_span(t):
+    """(first, last) column of the view's ACTIVE cell border, or None."""
+    cols = [x for (_, x) in active_fg_cells(t, 0, RIGHT_X0)]
+    return (min(cols), max(cols)) if cols else None
+
+
+def sidebar_left_frame(t):
+    """The screen column the right sidebar's own frame starts at.
+
+    Row 0 carries two top-left corners with a right sidebar up: the view's at
+    column 0 and the sidebar's at the seam, so the LAST one is the sidebar's.
+    Reading it rather than assuming `RIGHT_X0` is what lets a resize be
+    observed.
+    """
+    at = t.rows_text()[0].rfind("\u256d")
+    return at if at > 0 else None
+
+
+def stty_reading_right(t):
+    """Run `stty size` in the focused cell and read the line it printed.
+
+    The right-sidebar twin of `stty_reading`: rows are split on the cell
+    borders, so the sidebar's own columns cannot contribute a token. The LAST
+    such reading on screen, not the first -- an earlier one scrolls up and
+    would report the size from before whatever the test just changed.
+    """
+    t.send("stty size\r", 1.8)
+    found = None
+    for row in t.rows_text():
+        for tok in row.split("\u2502"):
+            parts = tok.strip().split()
+            if len(parts) == 2 and all(p.isdigit() for p in parts):
+                found = tok.strip()
+    return found
+
+
+def pane_focus_leaks(tail):
+    """Every `PaneFocus*` the SERVER was asked to run in this slice of the log."""
+    import re
+
+    return re.findall(r"msg=Command\((PaneFocus\w+)\)", tail)
+
+
+def focus_left_cell(t):
+    """Put view focus on the LEFT cell, whatever it was on.
+
+    `Alt+h` at the leftmost cell has nowhere to go (the sidebar is on the RIGHT),
+    so repeating it is a safe no-op rather than a guess about where compose left
+    the focus.
+    """
+    t.send(ALT_H, 0.6)
+    t.send(ALT_H, 0.6)
+
+
+def test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar():
+    """The user's exact scenario. A view is live, focus is on the rightmost
+    cell, `Alt+l` must hand the keyboard to the sidebar.
+
+    Before the fix the directional branch of `handle_view_command` returned
+    `Ok(true)` whatever `move_focus` answered, so the key never reached
+    `intercept_focus` and the sidebar could not be entered from a view at all.
+    """
+    name = "test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar"
+    t = Tui("/tmp/rmx-sbv7", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+
+    # Harness self-test FIRST, on the path that already worked: with no view up,
+    # `Alt+l` from the rightmost pane enters the sidebar. If `sidebar_has_keyboard`
+    # cannot report a focused sidebar here, every assertion below is vacuous.
+    t.send(ALT_L, 1.0)
+    if not sidebar_has_keyboard(t):
+        print("ABORT: the focus observable never fires even without a view --")
+        print("       the assertions below would pass on a broken client.")
+        t.dump("observable blind")
+        t.kill()
+        sys.exit(1)
+    t.send(ALT_H, 1.0)
+    if sidebar_has_keyboard(t):
+        fails.append("Alt+h did not leave the sidebar on the no-view path")
+
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    # Normalise, then step to the RIGHT cell so the key under test is at the edge.
+    focus_left_cell(t)
+    left_span = focused_cell_span(t)
+    t.send(ALT_L, 0.8)
+    right_span = focused_cell_span(t)
+    if left_span is None or right_span is None:
+        fails.append(f"no focused cell border found ({left_span}, {right_span})")
+    elif right_span == left_span:
+        fails.append(
+            f"Alt+l inside the view did not move focus to the second cell: "
+            f"{left_span} -> {right_span}"
+        )
+    if sidebar_has_keyboard(t):
+        fails.append(
+            "Alt+l from the LEFT cell entered the sidebar -- the rect the edge "
+            "test ran against is one cell too generous"
+        )
+
+    log_before = t.log("server")
+    t.send(ALT_L, 1.2)
+
+    if not sidebar_has_keyboard(t):
+        t.dump("Alt+l at the view's right edge")
+        fails.append("Alt+l at the view's right edge did not focus the sidebar")
+    leaked = pane_focus_leaks(t.log("server")[len(log_before):])
+    if leaked:
+        fails.append(f"the key was forwarded to the masked server as {leaked}")
+
+    # Where the keys went has to be VISIBLE, not merely true: a user who cannot
+    # see the focused panel cannot tell a captured key from a dropped one.
+    header = focused_panel_header(t)
+    if header is None:
+        t.dump("no panel header painted focused")
+        fails.append("no panel header painted in the focused colour")
+
+    # Pin the keyboard on the TOP panel: `files` (the bottom one) acts on Enter
+    # by opening a split, and the marker line below ends in one.
+    t.send(ALT_K, 0.6)
+    if focused_panel_header(t) != "Agents":
+        fails.append(
+            f"Alt+k did not land on the Agents panel: "
+            f"{focused_panel_header(t)!r}"
+        )
+    t.send(MARKER_CMD.format(7), 1.5)
+    hits = [(i, r.index("RAN:7")) for i, r in enumerate(t.rows_text()) if "RAN:7" in r]
+    if hits:
+        t.dump("marker leaked to a cell")
+        fails.append(
+            f"the keystrokes reached a view cell's pane instead of the sidebar "
+            f"at {hits}"
+        )
+    if sidebar_has_keyboard(t) is False:
+        fails.append("the sidebar lost focus while being typed into")
+
+    return finish(t, name, fails)
+
+
+def test_alt_h_from_a_panel_returns_to_the_cell_the_view_left_from():
+    """The other half of the same bug: leaving.
+
+    With focus in a panel and a view live, `Alt+h` was captured by the view and
+    moved a CELL instead of returning to it. The `Sidebar` branch must skip
+    `move_focus` entirely -- and the cell it returns to is the one the user left
+    from, not cell 0.
+    """
+    name = "test_alt_h_from_a_panel_returns_to_the_cell_the_view_left_from"
+    t = Tui("/tmp/rmx-sbv8", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    t.send(ALT_L, 0.8)          # -> the right cell
+    right_span = focused_cell_span(t)
+    t.send(ALT_L, 1.2)          # -> the sidebar
+    if not sidebar_has_keyboard(t):
+        t.dump("never entered the sidebar")
+        fails.append("Alt+l never focused the sidebar, so the leave path is untested")
+        return finish(t, name, fails)
+
+    log_before = t.log("server")
+    t.send(ALT_H, 1.2)
+    if sidebar_has_keyboard(t):
+        t.dump("Alt+h from the panel")
+        fails.append("Alt+h did not leave the sidebar")
+    leaked = pane_focus_leaks(t.log("server")[len(log_before):])
+    if leaked:
+        fails.append(f"leaving the panel forwarded {leaked} to the masked server")
+
+    back_span = focused_cell_span(t)
+    if back_span != right_span:
+        fails.append(
+            f"focus came back to a different cell: left from {right_span}, "
+            f"returned to {back_span}"
+        )
+
+    # And the keyboard really is the view's again -- in the RIGHT cell's pane.
+    t.send(MARKER_CMD.format(8), 1.5)
+    hits = [(i, r.index("RAN:8")) for i, r in enumerate(t.rows_text()) if "RAN:8" in r]
+    if not hits:
+        t.dump("marker never landed")
+        fails.append("after leaving the panel a keystroke reached no pane at all")
+    elif back_span is not None and any(x < back_span[0] for _, x in hits):
+        fails.append(
+            f"the keystroke landed left of the cell it should have returned to: "
+            f"{hits} vs cell span {back_span}"
+        )
+
+    # Escape is the other way out, and in a view only `paint_view` puts the
+    # cell's cursor back -- `chrome.paint` alone would leave it where the panel
+    # had it.
+    t.send(ALT_L, 1.2)
+    if not sidebar_has_keyboard(t):
+        fails.append("Alt+l did not re-enter the sidebar for the Escape case")
+    t.send(b"\x1b", 1.2)
+    if sidebar_has_keyboard(t):
+        fails.append("Escape did not release the panel while a view was live")
+    if t.screen.cursor.hidden:
+        fails.append("Escape out of a panel left the view's cursor hidden")
+    if "View 1" not in t.rows_text()[-1]:
+        fails.append(f"Escape left the view: {t.rows_text()[-1].rstrip()!r}")
+
+    return finish(t, name, fails)
+
+
+def test_alt_l_from_a_non_edge_cell_still_moves_within_the_view():
+    """A cell with a neighbour to its right keeps its key.
+
+    This is what pins the rect convention: the edge test runs against the
+    focused CELL's interior, so a non-edge cell can never satisfy it.
+    """
+    name = "test_alt_l_from_a_non_edge_cell_still_moves_within_the_view"
+    t = Tui("/tmp/rmx-sbv9", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    before = focused_cell_span(t)
+    log_before = t.log("server")
+    t.send(ALT_L, 1.0)
+    after = focused_cell_span(t)
+
+    if sidebar_has_keyboard(t):
+        t.dump("sidebar stole a non-edge key")
+        fails.append("Alt+l from the left cell entered the sidebar")
+    if before is None or after is None:
+        fails.append(f"no focused cell border found ({before}, {after})")
+    elif after == before:
+        fails.append(f"Alt+l did not move view focus: {before} -> {after}")
+    elif after[0] <= before[0]:
+        fails.append(f"Alt+l moved focus LEFT: {before} -> {after}")
+    leaked = pane_focus_leaks(t.log("server")[len(log_before):])
+    if leaked:
+        fails.append(f"a within-view move forwarded {leaked} to the masked server")
+
+    return finish(t, name, fails)
+
+
+def test_alt_l_at_a_views_edge_with_no_sidebar_reaches_no_server():
+    """With no sidebar to enter the key stays swallowed.
+
+    `handle_view_command` must not become `Ok(probe.move_focus(..))`: the
+    foreground server is MASKED while a view is up, and a `PaneFocusRight`
+    arriving there moves focus in a session the user is not looking at.
+    """
+    name = "test_alt_l_at_a_views_edge_with_no_sidebar_reaches_no_server"
+    t = Tui("/tmp/rmx-sbv10", cols=COLS, rows=ROWS, config=CFG_RIGHT_NO_SIDEBAR).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    t.send(ALT_L, 0.8)          # -> the rightmost cell
+    log_before = t.log("server")
+    t.send(ALT_L, 1.2)          # at the edge, nothing to enter
+    t.send(ALT_L, 1.2)
+
+    leaked = pane_focus_leaks(t.log("server")[len(log_before):])
+    if leaked:
+        fails.append(f"a swallowed key leaked to the masked server as {leaked}")
+    if "View 1" not in t.rows_text()[-1]:
+        fails.append(f"no longer in the view: {t.rows_text()[-1].rstrip()!r}")
+
+    return finish(t, name, fails)
+
+
+def test_alt_l_with_only_the_focused_cell_placed_does_not_panic():
+    """Zoom hides every cell but the focused one, so `cell_rects` is all `None`
+    bar one. The rect lookup has to cope with that without indexing blindly.
+
+    The zoomed cell fills the whole cell area, so it IS at the right edge and
+    entering the sidebar is the CORRECT outcome -- the thing being pinned is
+    that the client survives the layout at all.
+    """
+    name = "test_alt_l_with_only_the_focused_cell_placed_does_not_panic"
+    t = Tui("/tmp/rmx-sbv11", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    t.prefix(b"f", 1.2)         # PaneToggleZoom -> ViewToggleZoom
+    if " Z" not in t.rows_text()[-1]:
+        fails.append(f"the view did not zoom: {t.rows_text()[-1].rstrip()!r}")
+
+    log_before = t.log("server")
+    t.send(ALT_L, 1.2)
+    t.send(ALT_L, 1.2)
+    if not t.alive():
+        fails.append("the client died on a directional key in a zoomed view")
+        return finish(t, name, fails)
+    if not sidebar_has_keyboard(t):
+        t.dump("zoomed cell at the edge")
+        fails.append(
+            "the zoomed cell spans the whole cell area, so Alt+l should have "
+            "entered the sidebar"
+        )
+    leaked = pane_focus_leaks(t.log("server")[len(log_before):])
+    if leaked:
+        fails.append(f"a zoomed-view key leaked to the masked server as {leaked}")
+
+    return finish(t, name, fails)
+
+
+
+
+def test_hiding_the_sidebar_from_inside_it_does_not_strand_the_keyboard():
+    """`Prefix b l` stays allowed while a view is live, so it can be pressed from
+    INSIDE the sidebar it hides. The keyboard must come back to the view.
+
+    `toggle_edge` drops focus to the content when it hides the sidebar holding
+    it, but nothing proved that on this path -- and a panel that is no longer
+    painted cannot show the user where their keys went.
+    """
+    name = "test_hiding_the_sidebar_from_inside_it_does_not_strand_the_keyboard"
+    t = Tui("/tmp/rmx-sbv12", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    t.send(ALT_L, 0.8)          # -> the right cell
+    right_span = focused_cell_span(t)
+    t.send(ALT_L, 1.2)          # -> the sidebar
+    if not sidebar_has_keyboard(t):
+        t.dump("never entered the sidebar")
+        fails.append("Alt+l never focused the sidebar, so the hide path is untested")
+        return finish(t, name, fails)
+
+    t.prefix(b"bl", 1.8)        # the default sidebar group, toggle right
+    if t.has("Agents"):
+        fails.append("the sidebar is still painted after the toggle")
+    if not t.alive():
+        fails.append("the client died hiding the sidebar it was focused in")
+        return finish(t, name, fails)
+
+    # The keyboard is the view's again -- and in the cell it left from.
+    t.send(MARKER_CMD.format(12), 1.8)
+    hits = [(i, r.index("RAN:12")) for i, r in enumerate(t.rows_text()) if "RAN:12" in r]
+    if not hits:
+        t.dump("keyboard stranded after the hide")
+        fails.append("after hiding the focused sidebar no keystroke reached a pane")
+    elif right_span is not None and any(x < right_span[0] for _, x in hits):
+        fails.append(
+            f"the keystroke landed outside the cell the user left from: "
+            f"{hits} vs {right_span}"
+        )
+    if "View 1" not in t.rows_text()[-1]:
+        fails.append(f"the hide left the view: {t.rows_text()[-1].rstrip()!r}")
+
+    return finish(t, name, fails)
+
+
+def test_leaving_the_view_from_a_panel_hands_the_keyboard_to_the_session():
+    """`enter_view` drops panel focus; the reverse has to be safe too.
+
+    `leave_active_view` calls `chrome.leave_sidebar()`, which used to be a
+    tidy-up of a state nothing could reach. It is a real transition now: the
+    user really can be in a panel when the view closes.
+    """
+    name = "test_leaving_the_view_from_a_panel_hands_the_keyboard_to_the_session"
+    t = Tui("/tmp/rmx-sbv13", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    t.send(ALT_L, 0.8)
+    t.send(ALT_L, 1.2)          # -> the sidebar
+    if not sidebar_has_keyboard(t):
+        t.dump("never entered the sidebar")
+        fails.append("Alt+l never focused the sidebar, so the exit path is untested")
+        return finish(t, name, fails)
+
+    t.prefix(b"wq", 2.5)        # leave the view
+    if t.has("View 1"):
+        fails.append("`Prefix w q` did not leave the view")
+    if not t.alive():
+        fails.append("the client died leaving a view from a panel")
+        return finish(t, name, fails)
+    if sidebar_has_keyboard(t):
+        fails.append("focus stayed in the panel after the view closed")
+
+    # The session has the keyboard back.
+    t.send(MARKER_CMD.format(13), 1.8)
+    if not any("RAN:13" in r for r in t.rows_text()):
+        t.dump("keyboard lost on view exit")
+        fails.append("after leaving the view from a panel no keystroke reached a pane")
+
+    return finish(t, name, fails)
+
+
+def test_a_resize_from_a_panel_inside_a_view_moves_the_sidebar_and_the_cells():
+    """With a panel focused, `Resize*` is the SIDEBAR's -- and the view's cells
+    have to be re-demanded at the content rect it moved.
+
+    A sidebar resize that repainted without re-subscribing would leave each cell
+    showing a pane reflowed to a rect that is no longer on screen; `stty size`
+    inside the cell is what sees that, and a border check would not.
+    """
+    name = "test_a_resize_from_a_panel_inside_a_view_moves_the_sidebar_and_the_cells"
+    t = Tui("/tmp/rmx-sbv14", cols=COLS, rows=ROWS, config=CFG_RIGHT).start()
+    fails = []
+    make_two_panes(t)
+    compose_view(t)
+    require_in_view(t, fails)
+
+    focus_left_cell(t)
+    t.send(ALT_L, 0.8)
+    before = stty_reading_right(t)
+
+    t.send(ALT_L, 1.2)          # -> the sidebar
+    if not sidebar_has_keyboard(t):
+        t.dump("never entered the sidebar")
+        fails.append("Alt+l never focused the sidebar, so the resize path is untested")
+        return finish(t, name, fails)
+
+    seam_before = sidebar_left_frame(t)
+    # `Prefix p R` is the sticky resize group. A RIGHT sidebar GROWS towards the
+    # left (`resize_focused` pairs `(Right, Left)` as growth), so `h` is the
+    # press that moves it -- `l` would shrink it into its panels' minimums.
+    t.prefix(b"pRh", 2.0)
+    seam_after = sidebar_left_frame(t)
+    t.send(b"\x1b", 0.6)       # leave the sticky group
+
+    if seam_before is None or seam_after is None:
+        fails.append(f"no cell border found ({seam_before}, {seam_after})")
+    elif seam_after == seam_before:
+        t.dump("the sidebar did not move")
+        fails.append(
+            f"the resize did not move the sidebar's edge: it stayed at {seam_before}"
+        )
+
+    # Back into the view and re-read the CELL's own idea of its size.
+    t.send(ALT_H, 1.2)
+    if sidebar_has_keyboard(t):
+        fails.append("Alt+h did not leave the sidebar after the resize")
+    after = stty_reading_right(t)
+    if before is None or after is None:
+        fails.append(f"no stty reading ({before!r}, {after!r})")
+    elif after == before:
+        fails.append(
+            f"the cell was never re-demanded at the new content width: "
+            f"still {after!r}"
+        )
+    else:
+        print(f"  the cell went from {before!r} to {after!r} across the resize")
+
+    return finish(t, name, fails)
+
+
 if __name__ == "__main__":
     from pty_harness import BIN
 
@@ -589,6 +1149,14 @@ if __name__ == "__main__":
         test_entering_a_view_releases_sidebar_focus,
         test_toggling_a_sidebar_inside_a_view_reflows_the_cells,
         test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup,
+        test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar,
+        test_alt_h_from_a_panel_returns_to_the_cell_the_view_left_from,
+        test_alt_l_from_a_non_edge_cell_still_moves_within_the_view,
+        test_alt_l_at_a_views_edge_with_no_sidebar_reaches_no_server,
+        test_alt_l_with_only_the_focused_cell_placed_does_not_panic,
+        test_hiding_the_sidebar_from_inside_it_does_not_strand_the_keyboard,
+        test_leaving_the_view_from_a_panel_hands_the_keyboard_to_the_session,
+        test_a_resize_from_a_panel_inside_a_view_moves_the_sidebar_and_the_cells,
     ):
         ok = test() and ok
     print("ALL PASS" if ok else "FAILURES")

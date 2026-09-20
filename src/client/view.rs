@@ -495,7 +495,7 @@ fn cell_border_fg(theme: &CompositorTheme, focused: bool) -> CellColor {
 /// [`draw_cell`], [`focused_cursor`] and [`cell_content_size`] all go through
 /// this, so cursor placement and subscription sizing can never disagree with
 /// what was painted.
-fn cell_interior(
+pub(crate) fn cell_interior(
     rx: usize,
     ry: usize,
     rw: usize,
