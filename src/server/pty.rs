@@ -1,6 +1,7 @@
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -126,6 +127,27 @@ impl Pty {
         let OpenptyResult { master, slave } =
             openpty(&winsize, None).context("failed to open PTY pair")?;
 
+        // `openpty` returns both descriptors WITHOUT `FD_CLOEXEC`, so every later
+        // `fork`/`exec` inherits them: a pane's shell was found holding a copy of
+        // every EARLIER pane's master, and so was everything that shell ran.
+        //
+        // That is not untidiness. A pane's master is what reports the pane's
+        // death, and while a sibling shell holds a copy the closed pane's slave
+        // still has a peer, so the pane's own shell never receives its hangup.
+        // Only the base master leaked: the reader's and writer's copies come from
+        // `OwnedFd::try_clone`, which uses `F_DUPFD_CLOEXEC`.
+        //
+        // The SLAVE is marked for the same reason over a narrower window.
+        // `spawn_pane` is `async`, runs per client connection and calls this
+        // function without the `panes` lock, so two pane creations can interleave
+        // and one pane's `openpty` can land between another's `openpty` and its
+        // `fork`. An inherited slave holds a pane open exactly as an inherited
+        // master does.
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+                .context("failed to set FD_CLOEXEC on the PTY pair")?;
+        }
+
         // SAFETY: We are about to fork. The child process will exec immediately,
         // so we avoid calling any async-signal-unsafe functions beyond what is
         // strictly necessary for setting up the terminal and executing the shell.
@@ -151,6 +173,21 @@ impl Pty {
                 unistd::dup2(slave.as_raw_fd(), libc::STDIN_FILENO).expect("dup2 stdin failed");
                 unistd::dup2(slave.as_raw_fd(), libc::STDOUT_FILENO).expect("dup2 stdout failed");
                 unistd::dup2(slave.as_raw_fd(), libc::STDERR_FILENO).expect("dup2 stderr failed");
+
+                // `dup2` clears `FD_CLOEXEC` on the descriptor it creates, so the
+                // three above are already exec-safe -- except when the slave
+                // ALREADY is one of 0, 1 or 2. `dup2(fd, fd)` returns without
+                // changing anything, so the flag set before the fork would survive
+                // and `exec` would close the pane's own terminal. Clearing it here
+                // keeps the pane's stdio working for whatever descriptor number
+                // `openpty` happened to return.
+                for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                    if fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).is_err() {
+                        // SAFETY: async-signal-safe, and a pane without stdio
+                        // cannot run. Same handling as the TIOCSCTTY failure above.
+                        unsafe { libc::_exit(1) }
+                    }
+                }
 
                 // Close the original slave fd if it is not one of 0/1/2.
                 if slave.as_raw_fd() > 2 {
@@ -756,6 +793,21 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let status = pty.try_wait().expect("try_wait failed");
         assert!(status.is_some(), "child should have exited");
+    }
+
+    /// The pane's master must not survive an `exec`, or the NEXT pane's shell
+    /// inherits it and the pane it belongs to can never be hung up. Asserted on
+    /// the flag rather than on a child's fd table so it holds on every platform
+    /// the server builds for, not only the ones with `/proc`.
+    #[test]
+    fn the_pty_master_is_close_on_exec() {
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
+        let flags = fcntl(pty.master_fd.as_raw_fd(), FcntlArg::F_GETFD).expect("F_GETFD failed");
+        assert!(
+            FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC),
+            "the PTY master is inheritable across exec (F_GETFD = {flags:#x})"
+        );
     }
 
     #[test]
