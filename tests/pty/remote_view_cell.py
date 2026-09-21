@@ -261,45 +261,121 @@ def sm_open(c):
     c.prefix(b"xm", 1.0)
     # The manager opens with its search bar focused; Tab hands focus to the tree.
     c.send(b"\t", 0.3)
-def sm_goto_row(c, needle, max_steps=25):
-    """Move the overlay cursor down (`j`) until the highlighted row matches
-    `needle`. Works for the session manager and the switcher alike."""
-    for _ in range(max_steps):
-        row = sm_selected_row(c)
-        if row is not None and needle in row:
-            return True
-        c.send("j", 0.2)
-    row = sm_selected_row(c)
-    return row is not None and needle in row
+BOX_TL, BOX_TR, BOX_BL, BOX_V = "╭", "╮", "╰", "│"
+SM_TITLE = "Session Manager"
+SWITCHER_TITLE = "Switch Session"
+
+
+def popup_interior(c, title):
+    """Locate the overlay carrying `title` by its own border corners.
+
+    Returns `(top_y, x0, x1)`, where `x0` up to but not including `x1` is the
+    popup's interior columns.
+
+    The corners are searched OUTWARD FROM THE TITLE rather than from the ends of
+    the line, because a displayed View paints its own box around the whole
+    screen: the title row then holds the view's corners at columns 0 and
+    `cols - 1` as well as the overlay's, and reading the outermost pair gives the
+    view's box instead of the overlay's.
+    """
+    for y, line in enumerate(c.rows_text()):
+        at = line.find(title)
+        if at < 0:
+            continue
+        left = line.rfind(BOX_TL, 0, at)
+        right = line.find(BOX_TR, at)
+        if left >= 0 and right >= 0:
+            return y, left + 1, right
+    return None
+
+
+def overlay_rows(c):
+    """Every interior row of whichever overlay is on screen, as (y, text, bg).
+
+    The session manager and the switcher have different interior shapes (the
+    manager carries a search row, a footer of key hints and `├` separators
+    between them), so the scan keeps the rows whose left edge is a plain `│` and
+    stops at the bottom-left corner. That covers both without an offset tuned to
+    either one.
+    """
+    found = None
+    for title in (SM_TITLE, SWITCHER_TITLE):
+        found = popup_interior(c, title)
+        if found:
+            break
+    if not found:
+        return []
+    top_y, x0, x1 = found
+    scr = c.screen
+    out = []
+    for y in range(top_y + 1, scr.lines):
+        edge = scr.buffer[y][x0 - 1].data
+        if edge == BOX_BL:
+            break
+        if edge != BOX_V:
+            continue
+        row = scr.buffer[y]
+        bgs = [row[x].bg for x in range(x0, x1)]
+        text = "".join(row[x].data for x in range(x0, x1)).rstrip()
+        out.append((y, text, max(set(bgs), key=bgs.count)))
+    return out
 
 
 def sm_selected_row(c):
     """The overlay row under the cursor: the row whose dominant background differs
     from the overlay's own (overlays paint the selected row with the theme's
     highlight color)."""
-    scr = c.screen
-    x0, x1 = 28, 78
-    dom = []
-    for y in range(scr.lines):
-        row = scr.buffer[y]
-        bgs = [row[x].bg for x in range(x0, x1)]
-        dom.append(max(set(bgs), key=bgs.count))
-    inside = [b for b in dom if b != "default"]
-    if not inside:
+    rows = overlay_rows(c)
+    if not rows:
         return None
-    modal = max(set(inside), key=inside.count)
-    for y, b in enumerate(dom):
-        if b != "default" and b != modal:
-            row = scr.buffer[y]
-            return "".join(row[x].data for x in range(x0, x1)).rstrip()
+    bgs = [bg for _, _, bg in rows]
+    modal = max(set(bgs), key=bgs.count)
+    for _, text, bg in rows:
+        if bg != modal:
+            return text
     return None
+
+
+def sm_goto(c, pred, max_steps=25):
+    """Move the overlay cursor down (`j`) until the highlighted row satisfies
+    `pred`. Works for the session manager and the switcher alike."""
+    for _ in range(max_steps):
+        row = sm_selected_row(c)
+        if row is not None and pred(row):
+            return True
+        c.send("j", 0.2)
+    row = sm_selected_row(c)
+    return row is not None and pred(row)
+
+
+def sm_goto_row(c, needle, max_steps=25):
+    """Move the cursor to the first row containing `needle`."""
+    return sm_goto(c, lambda row: needle in row, max_steps)
+
+
+def sm_goto_server(c, name):
+    """Move the cursor to the TOP-LEVEL tree node for the server called `name`.
+
+    A substring match on a server name is not usable once a View exists. The
+    tree then also carries that view's CELLS, each labelled `<server>: <command>`
+    and painted ABOVE the server node, so `"mini"` selects the cell row first and
+    the `l` that follows expands nothing. Server nodes are the only rows the tree
+    paints at indent 0, which is what separates them from a cell.
+    """
+    def is_node(row):
+        if row.startswith(" "):
+            return False
+        label = row.strip().lstrip("▶▼").strip()
+        return label == name or label.startswith(name + " ")
+
+    return sm_goto(c, is_node)
 
 
 def compose_view_over_remote_pane(c):
     """Session manager: expand the `mini` remote down to its first pane, mark it,
     and create + enter a NEW view over it."""
     sm_open(c)
-    assert sm_goto_row(c, "mini"), "remote node 'mini' not in the tree"
+    assert sm_goto_server(c, "mini"), "remote node 'mini' not in the tree"
     c.send("l", 0.9)          # expand the remote server node
     c.send("j", 0.3)          # -> its session
     c.send("l", 0.4)          # expand the session
@@ -333,7 +409,7 @@ def attach_remote_session(c):
     """Session manager: attach to the REMOTE server's session, making the remote
     the client's FOREGROUND connection."""
     sm_open(c)
-    assert sm_goto_row(c, "mini"), "remote node 'mini' not in the tree"
+    assert sm_goto_server(c, "mini"), "remote node 'mini' not in the tree"
     c.send("l", 0.9)               # expand -> its sessions appear
     assert sm_goto_row(c, "rbox"), "remote session 'rbox' not listed"
     c.send("\r", 1.5)              # SwitchSession -> foreground handoff
