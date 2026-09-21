@@ -69,6 +69,17 @@ pub enum SubMode {
         /// What the prompt says, captured with the target so the two agree.
         description: String,
     },
+    /// Waiting for confirmation that a connected remote should be disconnected.
+    ///
+    /// Its own sub-mode rather than a reuse of `ConfirmDelete`: nothing is
+    /// deleted, and a prompt reading "Delete pi?" over a server row is exactly
+    /// the wrong thing to show someone about to press `y`.
+    ///
+    /// Carries the remote's NAME for the reason `ConfirmDelete` carries its
+    /// target node: a `SubscribeSessionTree` push can rebuild the tree between
+    /// `d` and `y`, and re-reading the selection then would disconnect a remote
+    /// the prompt never named.
+    ConfirmDisconnect { name: String },
     /// Creating a new folder -- text buffer for the name.
     CreateFolder(String),
     /// Creating a new session.
@@ -117,6 +128,10 @@ pub enum CreatePhase {
 pub enum SessionManagerAction {
     /// Expand a not-yet-connected remote server node (triggers a lazy connect).
     ConnectRemote(String),
+    /// Disconnect a connected remote at the user's request, so it stops
+    /// appearing in the switcher and the tree until they reconnect it. Emitted
+    /// only after the [`SubMode::ConfirmDisconnect`] prompt is confirmed.
+    DisconnectRemote(String),
     SwitchSession {
         server: ConnId,
         session: String,
@@ -617,7 +632,12 @@ impl SessionManagerState {
                         SessionManagerAction::None
                     }
                     RemoteState::Connecting => SessionManagerAction::None,
-                    RemoteState::NotConnected | RemoteState::Failed(_) => {
+                    // A user-disconnected remote reconnects on exactly the keys
+                    // that connect a never-dialled one: nothing in the tree
+                    // should need a different gesture because of how it got idle.
+                    RemoteState::NotConnected
+                    | RemoteState::Failed(_)
+                    | RemoteState::Disconnected => {
                         // Force-expand so children appear once the tree arrives,
                         // and kick off the lazy connect.
                         self.model.force_expand_server(id);
@@ -719,16 +739,48 @@ impl SessionManagerState {
         }
     }
 
-    /// Handle 'd' key -- enter delete confirmation sub-mode.
+    /// Handle 'd' key -- enter the delete, or on a connected remote's server row
+    /// the disconnect, confirmation sub-mode.
     ///
-    /// Works on any connected server (Local or a connected remote). Panes,
-    /// server nodes, the saved group, and dormant sessions are never deletable.
+    /// Deletion works on any connected server (Local or a connected remote).
+    /// Panes, the saved group, and dormant sessions are never deletable.
     pub fn handle_delete_key(&mut self) -> SessionManagerAction {
         let node = match self.model.rows.get(self.model.selected) {
             Some(r) => r.node_type.clone(),
             None => return SessionManagerAction::None,
         };
+        // A server row has nothing to delete, so on a CONNECTED remote `d` means
+        // "disconnect" instead: the nearest thing to "take this off my session
+        // manager" that a server row admits.
+        if let NodeType::Server {
+            id: ConnId::Remote(name),
+            state: RemoteState::Connected,
+        } = &node
+        {
+            self.sub_mode = SubMode::ConfirmDisconnect { name: name.clone() };
+            return SessionManagerAction::None;
+        }
         self.arm_delete(node)
+    }
+
+    /// Handle the confirmation response in [`SubMode::ConfirmDisconnect`].
+    ///
+    /// Acts on the name captured when `d` was pressed, never on the current
+    /// selection -- see the sub-mode's own doc.
+    pub fn handle_confirm_disconnect(&mut self, confirmed: bool) -> SessionManagerAction {
+        let name = match &self.sub_mode {
+            SubMode::ConfirmDisconnect { name } => name.clone(),
+            // Not in the prompt: nothing was confirmed.
+            _ => {
+                self.sub_mode = SubMode::Navigate;
+                return SessionManagerAction::None;
+            }
+        };
+        self.sub_mode = SubMode::Navigate;
+        if !confirmed {
+            return SessionManagerAction::None;
+        }
+        SessionManagerAction::DisconnectRemote(name)
     }
 
     /// Enter the delete confirmation for `target`, which need not be the
@@ -1271,9 +1323,25 @@ impl SessionManagerState {
             .collect();
         // Fixed navigation keys are only shown in the full (non-pending) view.
         if pending.is_none() {
+            // `d` is the one fixed key whose meaning depends on the row: on a
+            // connected remote's server row it disconnects, everywhere else it
+            // deletes. A footer that said only one of them would be wrong on
+            // whichever row the user is actually on.
+            let d_label = match self
+                .model
+                .rows
+                .get(self.model.selected)
+                .map(|r| &r.node_type)
+            {
+                Some(NodeType::Server {
+                    id: ConnId::Remote(_),
+                    state: RemoteState::Connected,
+                }) => "disconnect",
+                _ => "delete",
+            };
             for (k, l) in [
                 ("Enter", "open"),
-                ("d", "delete"),
+                ("d", d_label),
                 ("Esc", "close"),
                 ("j/k", "nav"),
             ] {
@@ -1526,6 +1594,9 @@ impl SessionManagerState {
             }
             SubMode::ConfirmDelete { description, .. } => {
                 format!(" Delete {}? (y/n) ", description)
+            }
+            SubMode::ConfirmDisconnect { name } => {
+                format!(" Disconnect {name}? (y/n) ")
             }
             SubMode::CreateFolder(buf) => {
                 format!(" Folder name: {}_ ", buf)
@@ -2354,6 +2425,175 @@ mod tests {
         state.model.selected = remote_idx;
         let action = state.handle_enter();
         assert!(matches!(action, SessionManagerAction::ConnectRemote(ref n) if n == "pi"));
+    }
+
+    /// A roster of local + one remote in `state`, with the selection parked on
+    /// the remote's server row.
+    fn state_on_remote_row(state_of_remote: RemoteState) -> SessionManagerState {
+        let mut state = SessionManagerState::new();
+        state.set_roster(vec![
+            (
+                ConnId::Local,
+                "local".to_string(),
+                RemoteState::Connected,
+                None,
+            ),
+            (
+                ConnId::Remote("pi".to_string()),
+                "pi".to_string(),
+                state_of_remote,
+                None,
+            ),
+        ]);
+        let idx = state
+            .model
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(&r.node_type, NodeType::Server { id: ConnId::Remote(n), .. } if n == "pi")
+            })
+            .expect("remote server row");
+        state.model.selected = idx;
+        state
+    }
+
+    /// `d` on a CONNECTED remote's server row arms the disconnect confirmation
+    /// -- its own sub-mode, with its own wording, not the delete prompt's.
+    #[test]
+    fn d_on_a_connected_remote_arms_the_disconnect_confirmation() {
+        let mut state = state_on_remote_row(RemoteState::Connected);
+
+        let action = state.handle_delete_key();
+
+        assert_eq!(action, SessionManagerAction::None, "arming emits nothing");
+        assert_eq!(
+            state.sub_mode,
+            SubMode::ConfirmDisconnect {
+                name: "pi".to_string()
+            }
+        );
+    }
+
+    /// `y` disconnects the remote the PROMPT named. The name is captured when `d`
+    /// is pressed for the reason `ConfirmDelete` captures its target: a server
+    /// push can rebuild the tree between the two keystrokes and slide the
+    /// selection onto a different row.
+    #[test]
+    fn y_disconnects_the_remote_the_prompt_named() {
+        let mut state = state_on_remote_row(RemoteState::Connected);
+        state.handle_delete_key();
+
+        // The tree rebuilds under the prompt and the selection lands on local.
+        state.model.selected = 0;
+
+        let action = state.handle_confirm_disconnect(true);
+
+        assert_eq!(
+            action,
+            SessionManagerAction::DisconnectRemote("pi".to_string())
+        );
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    /// `n` (and anything else) cancels: no action, and the remote is untouched.
+    #[test]
+    fn declining_the_disconnect_confirmation_cancels_it() {
+        let mut state = state_on_remote_row(RemoteState::Connected);
+        state.handle_delete_key();
+
+        let action = state.handle_confirm_disconnect(false);
+
+        assert_eq!(action, SessionManagerAction::None);
+        assert_eq!(state.sub_mode, SubMode::Navigate);
+    }
+
+    /// The local server has no connection to end, and neither does a remote that
+    /// is not up. `d` on any of those rows stays the no-op it has always been --
+    /// notably it must not fall through to the delete prompt either.
+    #[test]
+    fn d_is_inert_on_local_and_on_remotes_that_are_not_connected() {
+        let mut local_only = SessionManagerState::new();
+        local_only.set_roster(vec![(
+            ConnId::Local,
+            "local".to_string(),
+            RemoteState::Connected,
+            None,
+        )]);
+        local_only.model.selected = 0;
+        assert_eq!(local_only.handle_delete_key(), SessionManagerAction::None);
+        assert_eq!(local_only.sub_mode, SubMode::Navigate);
+
+        for st in [
+            RemoteState::NotConnected,
+            RemoteState::Connecting,
+            RemoteState::Failed("boom".to_string()),
+            RemoteState::Disconnected,
+        ] {
+            let mut state = state_on_remote_row(st.clone());
+            assert_eq!(
+                state.handle_delete_key(),
+                SessionManagerAction::None,
+                "{st:?}"
+            );
+            assert_eq!(state.sub_mode, SubMode::Navigate, "{st:?}");
+        }
+    }
+
+    /// Reconnecting takes the SAME keys that connect a never-dialled remote:
+    /// Enter and `l`.
+    #[test]
+    fn enter_and_l_reconnect_a_disconnected_remote() {
+        let mut state = state_on_remote_row(RemoteState::Disconnected);
+        assert_eq!(
+            state.handle_enter(),
+            SessionManagerAction::ConnectRemote("pi".to_string())
+        );
+
+        let mut state = state_on_remote_row(RemoteState::Disconnected);
+        assert_eq!(
+            state.handle_expand(),
+            SessionManagerAction::ConnectRemote("pi".to_string())
+        );
+    }
+
+    /// The prompt says which remote, so a user who armed it on the wrong row can
+    /// see that before pressing `y`.
+    #[test]
+    fn the_disconnect_prompt_names_the_remote() {
+        let mut state = state_on_remote_row(RemoteState::Connected);
+        state.handle_delete_key();
+        let theme = crate::config::theme::Theme::default();
+
+        let text: String = state
+            .render(100, 40, &theme)
+            .iter()
+            .map(|c| c.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("Disconnect pi? (y/n)"),
+            "prompt missing from the overlay: {text}"
+        );
+        assert!(
+            !text.contains("Delete pi"),
+            "the disconnect prompt must not read as a delete"
+        );
+    }
+
+    /// The footer's `d` must say what `d` will do on the row under the cursor:
+    /// on a connected remote it disconnects, everywhere else it deletes.
+    #[test]
+    fn the_footer_labels_d_for_the_selected_row() {
+        let state = state_on_remote_row(RemoteState::Connected);
+        let cells = state.footer_cells();
+        let d = cells.iter().find(|(k, _)| k == "d").expect("a `d` cell");
+        assert_eq!(d.1, "disconnect");
+
+        let state = state_on_remote_row(RemoteState::NotConnected);
+        let cells = state.footer_cells();
+        let d = cells.iter().find(|(k, _)| k == "d").expect("a `d` cell");
+        assert_eq!(d.1, "delete");
     }
 
     #[test]

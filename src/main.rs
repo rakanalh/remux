@@ -1724,6 +1724,17 @@ fn reach_conn(mgr: &mut ConnectionManager, conn: &ConnId) -> Option<String> {
             Some(format!("connecting to {name}…"))
         }
         RemoteState::Connecting => Some(format!("connecting to {name}…")),
+        // Only the LABEL: deleting this arm sends `Disconnected` to the catch-all,
+        // which also refuses to dial, so no harness goes red for it (checked by
+        // deleting it). What it buys is naming who ended the connection on the one
+        // cell that can see it -- a cell added to a view AFTER the disconnect, whose
+        // `ViewCell::disconnected` was never set, since `handle_connection_drop`
+        // marks only the cells that existed when the drop happened. Reaching that
+        // needs a second terminal composing the view, so it is untested.
+        //
+        // Keep the arm ahead of the catch-all anyway: a guard added there later that
+        // dialled would bring back the connection the user just closed.
+        RemoteState::Disconnected => Some(format!("disconnected: {name}")),
         _ => Some(format!("not connected: {name}")),
     }
 }
@@ -1754,6 +1765,274 @@ async fn unsubscribe_view_cells(
         }
     }
     Ok(())
+}
+
+/// Record that `name`'s transport is gone -- unless the USER is the reason it is.
+///
+/// A user disconnect kills the ssh child, so its pipe reports EOF a moment later
+/// and the same cleanup runs a second time through `Incoming::Closed`. Everything
+/// else on that path is idempotent, but `fail_remote` is not: it would overwrite
+/// [`RemoteState::Disconnected`] with `Failed("connection lost")`, which redials
+/// nothing but does put an error on a row the user closed deliberately.
+fn mark_dropped(mgr: &mut ConnectionManager, name: &str) {
+    if mgr.remote_state(name) == RemoteState::Disconnected {
+        log::debug!("srv: connection closed for user-disconnected '{name}'; state left as is");
+        return;
+    }
+    mgr.fail_remote(name, "connection lost".to_string());
+}
+
+/// The client state [`handle_connection_drop`] and [`disconnect_remote_now`]
+/// need, bundled so the two do not each take a parameter list nobody can read.
+///
+/// It is built at the three call sites (the `Incoming::Closed` arm and the two
+/// disconnect handlers) out of the event loop's own locals, and is consumed by
+/// the call.
+struct DropCtx<'a> {
+    mgr: &'a mut ConnectionManager,
+    renderer: &'a mut Renderer,
+    chrome: &'a mut crate::client::chrome::Chrome,
+    views: &'a mut [crate::client::view::ClientView],
+    active_view: &'a mut Option<usize>,
+    input: &'a mut InputHandler,
+    whichkey: &'a WhichKeyPopup,
+    theme: &'a crate::config::theme::Theme,
+    compositor_theme: &'a crate::config::theme::CompositorTheme,
+    view_border_style: &'a crate::config::BorderStyle,
+    which_key_position: &'a crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&'a crate::protocol::PaneRect>,
+    last_local_session: &'a Option<String>,
+    current_attached: &'a mut Option<(ConnId, String)>,
+    previous_attached: &'a mut Option<(ConnId, String)>,
+    wants_session_tree: bool,
+    wants_agents: bool,
+}
+
+/// Disconnect the remote `name` at the user's request: end the transport, then
+/// run the SAME cleanup a dropped connection runs.
+///
+/// One function behind the session manager's `d y` and the `RemoteDisconnect`
+/// command, so the two cannot drift. Naming a remote that is not up is a no-op
+/// beyond a log line.
+async fn disconnect_remote_now(name: &str, cx: DropCtx<'_>) -> Result<AfterDrop> {
+    let state = cx.mgr.remote_state(name);
+    if state != RemoteState::Connected && state != RemoteState::Connecting {
+        log::warn!("disconnect '{name}': not connected ({state:?}); nothing to do");
+        return Ok(AfterDrop::Continue);
+    }
+    log::info!("disconnecting remote '{name}' at the user's request");
+    let id = ConnId::Remote(name.to_string());
+    // Read the generation BEFORE the teardown: `disconnect_remote` does not
+    // advance it (only installing a transport does), so this is the generation of
+    // the connection being ended and the cleanup below is therefore current.
+    let generation = cx.mgr.current_generation(&id);
+    // Order matters: the state must read `Disconnected` BEFORE the cleanup runs,
+    // so `mark_dropped` inside it -- and again when the ssh EOF arrives as an
+    // `Incoming::Closed` -- leaves it alone instead of reporting a lost
+    // connection the user caused on purpose.
+    cx.mgr.disconnect_remote(name);
+    handle_connection_drop(&id, generation, cx).await
+}
+
+/// What the caller must do after [`handle_connection_drop`] has run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterDrop {
+    /// Carry on with the event loop.
+    Continue,
+    /// Nothing is left to render for: leave the client's main loop.
+    ExitClient,
+}
+
+/// Everything a connection going away requires of the client, whether the far
+/// end hung up (`Incoming::Closed`) or the user disconnected the remote from the
+/// session manager.
+///
+/// Both paths must do the identical work (tell the panels, mark the view cells,
+/// hand the foreground back to local), so they share one body rather than two
+/// that drift. The user path calls
+/// [`ConnectionManager::disconnect_remote`] FIRST and this second: every step
+/// here is idempotent (the `!cell.disconnected` guard, a `set_foreground` to a
+/// connection already in front), so the `Closed` that the ssh pipe's EOF
+/// delivers a moment later runs it again harmlessly.
+///
+/// `generation` is the transport the drop belongs to. A stale one is discarded
+/// whole: a disconnect followed immediately by a reconnect leaves the OLD
+/// reader's EOF still in flight, and running this for it would tear down the
+/// connection that just came up.
+async fn handle_connection_drop(
+    src: &ConnId,
+    generation: u64,
+    cx: DropCtx<'_>,
+) -> Result<AfterDrop> {
+    if !cx.mgr.is_current_generation(src, generation) {
+        log::debug!(
+            "srv: ignoring a Closed from a superseded transport for {src:?} \
+             (generation {generation}, now {})",
+            cx.mgr.current_generation(src)
+        );
+        return Ok(AfterDrop::Continue);
+    }
+    let DropCtx {
+        mgr,
+        renderer,
+        chrome,
+        views,
+        active_view,
+        input,
+        whichkey,
+        theme,
+        compositor_theme,
+        view_border_style,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        last_local_session,
+        current_attached,
+        previous_attached,
+        wants_session_tree,
+        wants_agents,
+    } = cx;
+    log::debug!("srv: connection closed src={:?}", src);
+    // Panels scope their state by connection: tell them
+    // before anything else here can `continue` or return.
+    if wants_session_tree || wants_agents {
+        chrome
+            .broadcast(&crate::client::sidebar::PluginEvent::ConnectionLost { conn: src.clone() });
+        // Repaint so the dropped server's rows go away.
+        // Skipped over a live view: the cells below are
+        // about to be marked disconnected, and painting
+        // twice would show the stale half first.
+        if active_view.is_none() {
+            let (tc, tr) = renderer.size();
+            chrome.paint(
+                renderer,
+                tc,
+                tr,
+                compositor_theme,
+                focused_pane_rect.filter(|_| active_view.is_none()),
+            )?;
+            renderer.flush()?;
+        }
+    }
+    // Mark every view cell (across ALL views) that aliases a
+    // pane on the dropped connection as disconnected. Done at
+    // the very top of the arm, before the several early
+    // returns/continues below, so no drop path skips it. If
+    // the active view was touched, repaint so the label shows.
+    let mut active_view_touched = false;
+    for (vi, view) in views.iter_mut().enumerate() {
+        for cell in view.cells.iter_mut() {
+            if cell.conn == *src && !cell.disconnected {
+                cell.disconnected = true;
+                if *active_view == Some(vi) {
+                    active_view_touched = true;
+                }
+            }
+        }
+    }
+    if active_view_touched {
+        if let Some(av) = *active_view {
+            paint_view(
+                renderer,
+                chrome,
+                &views[av],
+                input,
+                whichkey,
+                theme,
+                compositor_theme,
+                view_border_style,
+                which_key_position,
+                viewport_top,
+                focused_pane_rect,
+            )?;
+        }
+    }
+    if mgr.is_foreground(src) {
+        match src {
+            // Local foreground drop: exit the client (unchanged).
+            ConnId::Local => return Ok(AfterDrop::ExitClient),
+            // Foreground remote drop: fall back to local; MUST
+            // NOT exit the client.
+            ConnId::Remote(name) => {
+                log::warn!("foreground remote '{name}' dropped; falling back to local");
+                mark_dropped(mgr, name);
+                // The standalone `attach-remote` flow has no local
+                // connection to fall back to — exit gracefully.
+                if !mgr.connected_ids().contains(&ConnId::Local) {
+                    log::warn!("no local connection to fall back to; exiting");
+                    return Ok(AfterDrop::ExitClient);
+                }
+                mgr.set_foreground(ConnId::Local);
+                let content = content_rect_now(chrome)?;
+                mgr.send(
+                    &ConnId::Local,
+                    ClientMessage::Resize {
+                        cols: content.width,
+                        rows: content.height,
+                    },
+                )
+                .await?;
+                if let Some(session) = last_local_session.clone() {
+                    // Reattach; the server responds with a fresh FullRender.
+                    mgr.send(
+                        &ConnId::Local,
+                        ClientMessage::Attach {
+                            session_name: session.clone(),
+                        },
+                    )
+                    .await?;
+                    record_switch(current_attached, previous_attached, ConnId::Local, session);
+                } else {
+                    // Nothing to fall back to: open the session manager.
+                    input.mode = Mode::SessionManager;
+                    input.session_manager = Some(input.new_session_manager());
+                    if let Some(sm) = input.session_manager.as_mut() {
+                        sm.set_foreground(mgr.foreground().clone());
+                        sm.set_roster(mgr.server_roster());
+                    }
+                    for id in mgr.connected_ids() {
+                        mgr.send(&id, ClientMessage::ListSessionTree).await?;
+                    }
+                    mgr.send(
+                        &ConnId::Local,
+                        ClientMessage::ModeChanged {
+                            mode: "SESSION_MANAGER".to_string(),
+                        },
+                    )
+                    .await?;
+                }
+                // If the session manager was open when the remote
+                // dropped, refresh it so the node stops showing
+                // Connected and reflects the new foreground.
+                if let Some(sm) = input.session_manager.as_mut() {
+                    sm.set_foreground(mgr.foreground().clone());
+                    sm.set_roster(mgr.server_roster());
+                    let (c, r) = crossterm::terminal::size()?;
+                    renderer.clear_overlay(c, r)?;
+                    let draw_cmds = sm.render(c, r, theme);
+                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                    renderer.flush()?;
+                }
+            }
+        }
+    } else {
+        // A background remote dropped: mark it Failed and, if the
+        // session manager is open, refresh its roster/rows.
+        if let ConnId::Remote(name) = src {
+            mark_dropped(mgr, name);
+        }
+        if let Some(sm) = input.session_manager.as_mut() {
+            sm.set_foreground(mgr.foreground().clone());
+            sm.set_roster(mgr.server_roster());
+            let (c, r) = crossterm::terminal::size()?;
+            renderer.clear_overlay(c, r)?;
+            let draw_cmds = sm.render(c, r, theme);
+            renderer.render_whichkey_overlay(&draw_cmds)?;
+            renderer.flush()?;
+        }
+    }
+    Ok(AfterDrop::Continue)
 }
 
 /// Map the client's [`ConnId`] to the wire [`ConnDescriptor`] carried in a
@@ -3870,6 +4149,44 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
+                            InputAction::RemoteDisconnect(name) => {
+                                log::debug!("input: RemoteDisconnect name={name}");
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // The same body the session manager's `d y`
+                                // reaches, so the command cannot drift from the
+                                // gesture. A name that is not a connected remote
+                                // warns and changes nothing.
+                                if disconnect_remote_now(
+                                    &name,
+                                    DropCtx {
+                                        mgr,
+                                        renderer: &mut renderer,
+                                        chrome: &mut chrome,
+                                        views: &mut views,
+                                        active_view: &mut active_view,
+                                        input: &mut input,
+                                        whichkey: &whichkey,
+                                        theme: &theme,
+                                        compositor_theme: &compositor_theme,
+                                        view_border_style: &view_border_style,
+                                        which_key_position: &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect: focused_pane_rect.as_ref(),
+                                        last_local_session: &last_local_session,
+                                        current_attached: &mut current_attached,
+                                        previous_attached: &mut previous_attached,
+                                        wants_session_tree,
+                                        wants_agents,
+                                    },
+                                )
+                                .await? == AfterDrop::ExitClient
+                                {
+                                    return Ok(());
+                                }
+                            }
                             InputAction::SessionManagerClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
@@ -3908,6 +4225,16 @@ async fn run_client_loop(
                                         match mgr.connect_remote(&name).await {
                                             Ok(()) => {
                                                 mgr.send(&ConnId::Remote(name.clone()), ClientMessage::ListSessionTree).await?;
+                                                // A live view's cells on this remote
+                                                // are holding a `disconnected` label.
+                                                // Nothing else re-subscribes them
+                                                // until the next keystroke moves the
+                                                // layout, so do it here: the
+                                                // reconnect is the event that made
+                                                // them reachable again.
+                                                if let Some(av) = active_view {
+                                                    subscribe_view_cells(mgr, &chrome, &renderer, &mut views[av], &view_border_style).await?;
+                                                }
                                             }
                                             Err(e) => {
                                                 log::warn!("connect remote '{name}' failed: {e:#}");
@@ -3922,6 +4249,35 @@ async fn run_client_loop(
                                             let draw_cmds = sm.render(c, r, &theme);
                                             renderer.render_whichkey_overlay(&draw_cmds)?;
                                             renderer.flush()?;
+                                        }
+                                    }
+                                    SessionManagerAction::DisconnectRemote(name) => {
+                                        if disconnect_remote_now(
+                                            &name,
+                                            DropCtx {
+                                                mgr,
+                                                renderer: &mut renderer,
+                                                chrome: &mut chrome,
+                                                views: &mut views,
+                                                active_view: &mut active_view,
+                                                input: &mut input,
+                                                whichkey: &whichkey,
+                                                theme: &theme,
+                                                compositor_theme: &compositor_theme,
+                                                view_border_style: &view_border_style,
+                                                which_key_position: &which_key_position,
+                                                viewport_top,
+                                                focused_pane_rect: focused_pane_rect.as_ref(),
+                                                last_local_session: &last_local_session,
+                                                current_attached: &mut current_attached,
+                                                previous_attached: &mut previous_attached,
+                                                wants_session_tree,
+                                                wants_agents,
+                                            },
+                                        )
+                                        .await? == AfterDrop::ExitClient
+                                        {
+                                            return Ok(());
                                         }
                                     }
                                     SessionManagerAction::SwitchSession { server, session } => {
@@ -5653,123 +6009,36 @@ async fn run_client_loop(
                         }
                         continue;
                     }
-                    Incoming::Closed(src) => {
-                        log::debug!("srv: connection closed src={:?}", src);
-                        // Panels scope their state by connection: tell them
-                        // before anything else here can `continue` or return.
-                        if wants_session_tree || wants_agents {
-                            chrome.broadcast(&crate::client::sidebar::PluginEvent::ConnectionLost {
-                                conn: src.clone(),
-                            });
-                            // Repaint so the dropped server's rows go away.
-                            // Skipped over a live view: the cells below are
-                            // about to be marked disconnected, and painting
-                            // twice would show the stale half first.
-                            if active_view.is_none() {
-                                let (tc, tr) = renderer.size();
-                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
-                                renderer.flush()?;
-                            }
+                    Incoming::Closed(src, generation) => {
+                        match handle_connection_drop(
+                            &src,
+                            generation,
+                            DropCtx {
+                                mgr,
+                                renderer: &mut renderer,
+                                chrome: &mut chrome,
+                                views: &mut views,
+                                active_view: &mut active_view,
+                                input: &mut input,
+                                whichkey: &whichkey,
+                                theme: &theme,
+                                compositor_theme: &compositor_theme,
+                                view_border_style: &view_border_style,
+                                which_key_position: &which_key_position,
+                                viewport_top,
+                                focused_pane_rect: focused_pane_rect.as_ref(),
+                                last_local_session: &last_local_session,
+                                current_attached: &mut current_attached,
+                                previous_attached: &mut previous_attached,
+                                wants_session_tree,
+                                wants_agents,
+                            },
+                        )
+                        .await?
+                        {
+                            AfterDrop::ExitClient => return Ok(()),
+                            AfterDrop::Continue => continue,
                         }
-                        // Mark every view cell (across ALL views) that aliases a
-                        // pane on the dropped connection as disconnected. Done at
-                        // the very top of the arm, before the several early
-                        // returns/continues below, so no drop path skips it. If
-                        // the active view was touched, repaint so the label shows.
-                        let mut active_view_touched = false;
-                        for (vi, view) in views.iter_mut().enumerate() {
-                            for cell in view.cells.iter_mut() {
-                                if cell.conn == src && !cell.disconnected {
-                                    cell.disconnected = true;
-                                    if active_view == Some(vi) {
-                                        active_view_touched = true;
-                                    }
-                                }
-                            }
-                        }
-                        if active_view_touched {
-                            if let Some(av) = active_view {
-                                paint_view(
-                                    &mut renderer,
-                                    &chrome,
-                                    &views[av],
-                                    &input,
-                                    &whichkey,
-                                    &theme,
-                                    &compositor_theme,
-                                    &view_border_style,
-                                    &which_key_position,
-                                    viewport_top,
-                                    focused_pane_rect.as_ref(),
-                                )?;
-                            }
-                        }
-                        if mgr.is_foreground(&src) {
-                            match &src {
-                                // Local foreground drop: exit the client (unchanged).
-                                ConnId::Local => return Ok(()),
-                                // Foreground remote drop: fall back to local; MUST
-                                // NOT exit the client.
-                                ConnId::Remote(name) => {
-                                    log::warn!("foreground remote '{name}' dropped; falling back to local");
-                                    mgr.fail_remote(name, "connection lost".to_string());
-                                    // The standalone `attach-remote` flow has no local
-                                    // connection to fall back to — exit gracefully.
-                                    if !mgr.connected_ids().contains(&ConnId::Local) {
-                                        log::warn!("no local connection to fall back to; exiting");
-                                        return Ok(());
-                                    }
-                                    mgr.set_foreground(ConnId::Local);
-                                    let content = content_rect_now(&chrome)?;
-                                    mgr.send(&ConnId::Local, ClientMessage::Resize { cols: content.width, rows: content.height }).await?;
-                                    if let Some(session) = last_local_session.clone() {
-                                        // Reattach; the server responds with a fresh FullRender.
-                                        mgr.send(&ConnId::Local, ClientMessage::Attach { session_name: session.clone() }).await?;
-                                        record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, session);
-                                    } else {
-                                        // Nothing to fall back to: open the session manager.
-                                        input.mode = Mode::SessionManager;
-                                        input.session_manager = Some(input.new_session_manager());
-                                        if let Some(sm) = input.session_manager.as_mut() {
-                                            sm.set_foreground(mgr.foreground().clone());
-                                            sm.set_roster(mgr.server_roster());
-                                        }
-                                        for id in mgr.connected_ids() {
-                                            mgr.send(&id, ClientMessage::ListSessionTree).await?;
-                                        }
-                                        mgr.send(&ConnId::Local, ClientMessage::ModeChanged { mode: "SESSION_MANAGER".to_string() }).await?;
-                                    }
-                                    // If the session manager was open when the remote
-                                    // dropped, refresh it so the node stops showing
-                                    // Connected and reflects the new foreground.
-                                    if let Some(sm) = input.session_manager.as_mut() {
-                                        sm.set_foreground(mgr.foreground().clone());
-                                        sm.set_roster(mgr.server_roster());
-                                        let (c, r) = crossterm::terminal::size()?;
-                                        renderer.clear_overlay(c, r)?;
-                                        let draw_cmds = sm.render(c, r, &theme);
-                                        renderer.render_whichkey_overlay(&draw_cmds)?;
-                                        renderer.flush()?;
-                                    }
-                                }
-                            }
-                        } else {
-                            // A background remote dropped: mark it Failed and, if the
-                            // session manager is open, refresh its roster/rows.
-                            if let ConnId::Remote(name) = &src {
-                                mgr.fail_remote(name, "connection lost".to_string());
-                            }
-                            if let Some(sm) = input.session_manager.as_mut() {
-                                sm.set_foreground(mgr.foreground().clone());
-                                sm.set_roster(mgr.server_roster());
-                                let (c, r) = crossterm::terminal::size()?;
-                                renderer.clear_overlay(c, r)?;
-                                let draw_cmds = sm.render(c, r, &theme);
-                                renderer.render_whichkey_overlay(&draw_cmds)?;
-                                renderer.flush()?;
-                            }
-                        }
-                        continue;
                     }
                 };
                 // Background connections' renders are dropped: only the foreground

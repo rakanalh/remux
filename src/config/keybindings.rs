@@ -1098,6 +1098,9 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         // A destination/alias is a single token (no spaces), so `args.first()`
         // is correct here -- returns `None` when no argument is given.
         "RemoteConnect" => args.first().map(|s| RemuxCommand::RemoteConnect(s.clone())),
+        "RemoteDisconnect" => args
+            .first()
+            .map(|s| RemuxCommand::RemoteDisconnect(s.clone())),
 
         // -- usize arg commands -----------------------------------------------
         "TabGoto" => {
@@ -1657,6 +1660,13 @@ mod tests {
     fn parse_command_remote_connect_missing_arg() {
         // No argument -> None, so an empty command does nothing.
         assert_eq!(parse_command("RemoteConnect"), None);
+        // Disconnect names a remote from the roster, so the same shape applies:
+        // one token, and no argument means no command rather than an empty name.
+        assert_eq!(
+            parse_command("RemoteDisconnect pi"),
+            Some(RemuxCommand::RemoteDisconnect("pi".into()))
+        );
+        assert_eq!(parse_command("RemoteDisconnect"), None);
     }
 
     #[test]

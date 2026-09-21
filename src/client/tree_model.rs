@@ -903,6 +903,9 @@ impl TreeModel {
                 RemoteState::NotConnected => " (offline)".to_string(),
                 RemoteState::Connecting => " (connecting…)".to_string(),
                 RemoteState::Failed(msg) => format!(" (failed: {msg})"),
+                // Distinct from `(offline)` because the vanishing subtree alone
+                // looks identical to a remote that was never connected.
+                RemoteState::Disconnected => " (disconnected)".to_string(),
             };
             // A connected server built from different source than this client
             // is flagged so the user knows before silently hitting version skew.

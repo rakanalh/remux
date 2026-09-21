@@ -1177,6 +1177,11 @@ pub enum RemuxCommand {
     /// name of a remote already declared in `[remotes]`. Opens the session
     /// manager and makes the remote and its sessions visible.
     RemoteConnect(String),
+    /// Disconnect a connected remote (client-side command). The argument is the
+    /// remote's name as the roster shows it. The connection is closed and the
+    /// remote's sessions leave the switcher and the session tree until the user
+    /// reconnects it; nothing on the far server is stopped.
+    RemoteDisconnect(String),
     /// Open folder selection popup to move current session (client-side only).
     SessionMoveToFolder,
     /// Switch to a specific tab in a specific session.
@@ -1366,7 +1371,8 @@ impl RemuxCommand {
             | RemuxCommand::EnterCommandMode
             | RemuxCommand::SendKey(_)
             | RemuxCommand::OpenSessionManager
-            | RemuxCommand::RemoteConnect(_) => false,
+            | RemuxCommand::RemoteConnect(_)
+            | RemuxCommand::RemoteDisconnect(_) => false,
         }
     }
 }
@@ -1547,6 +1553,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("BufferEditInEditor"),
             ActionSpec::server("OpenSessionManager"),
             ActionSpec::server("RemoteConnect").arg("<user@host|alias>", "pi"),
+            ActionSpec::server("RemoteDisconnect").arg("<alias|dest>", "pi"),
             ActionSpec::server("SessionMoveToFolder"),
             ActionSpec::server("SessionSwitchLast").label("last session"),
             ActionSpec::server("ToggleStyle"),
@@ -2351,6 +2358,7 @@ mod tests {
             RemuxCommand::BufferEditInEditor => Some("BufferEditInEditor"),
             RemuxCommand::OpenSessionManager => Some("OpenSessionManager"),
             RemuxCommand::RemoteConnect(_) => Some("RemoteConnect"),
+            RemuxCommand::RemoteDisconnect(_) => Some("RemoteDisconnect"),
             RemuxCommand::ToggleStyle => Some("ToggleStyle"),
             RemuxCommand::LayoutNext => Some("LayoutNext"),
             RemuxCommand::SetMaster => Some("SetMaster"),

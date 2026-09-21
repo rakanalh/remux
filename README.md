@@ -370,12 +370,12 @@ It opens on the **tree**, with the highlight already on the session you are atta
 | `Up` / `Down` | Navigate the tree |
 | `/` | Focus the search bar (filter the tree); `Tab` / `Down` / `Enter` hands focus back |
 | `Enter` | Switch to node (or expand it) |
-| `l` / `Right` / `+` | Expand (including connecting a remote) |
+| `l` / `Right` / `+` | Expand (including connecting a remote, or reconnecting a disconnected one) |
 | `h` / `Left` / `-` | Collapse |
 | `}` / `{` | Switch tab within the highlighted session |
 | `n` | New session |
 | `c` | New folder |
-| `d` | Delete session |
+| `d` | Delete session — or, on a **connected remote's** server row, disconnect it (`y` to confirm) |
 | `m` | Move session |
 | `Space` | Mark/unmark the highlighted pane (multi-select, across servers) |
 | `v a` | Add the marked panes (or the highlighted one) to a view |
@@ -427,6 +427,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `BufferEditInEditor` | — | Open the focused pane's scrollback in `$EDITOR`. |
 | `OpenSessionManager` | — | Open the tree-view session manager overlay. |
 | `RemoteConnect` | `<user@host\|alias>` | Connect to a remote server over SSH — an SSH destination/`~/.ssh/config` host, or a `[remotes.<name>]` alias. |
+| `RemoteDisconnect` | `<alias\|dest>` | Disconnect a connected remote. Its sessions leave the switcher and the session tree until you reconnect it; nothing on the far server is stopped. |
 | `SessionMoveToFolder` | — | Open a folder picker to move the current session. |
 | `SessionSwitchLast` | — | Toggle back to the previously-attached session. |
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |

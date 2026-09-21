@@ -403,6 +403,10 @@ pub enum InputAction {
     /// Connect to a remote (dest or alias), opening the session manager so the
     /// remote and its sessions become visible.
     RemoteConnect(String),
+    /// Disconnect the named remote (from the `RemoteDisconnect` command). The
+    /// session manager's `d y` reaches the same code through
+    /// [`SessionManagerAction::DisconnectRemote`].
+    RemoteDisconnect(String),
     /// Close the session manager overlay.
     SessionManagerClose,
     /// An action from the session manager (switch, delete, create, etc.).
@@ -1979,6 +1983,13 @@ impl InputHandler {
                             self.session_manager = Some(self.new_session_manager());
                             return InputAction::RemoteConnect(dest.clone());
                         }
+                        RemuxCommand::RemoteDisconnect(name) => {
+                            // Unlike `RemoteConnect`, this does NOT open the
+                            // session manager: connecting exists to make a
+                            // remote's sessions browsable, and there is nothing
+                            // to browse on one just closed.
+                            return InputAction::RemoteDisconnect(name.clone());
+                        }
                         RemuxCommand::SessionMoveToFolder => {
                             return InputAction::FolderSelectOpen;
                         }
@@ -2382,6 +2393,20 @@ impl InputHandler {
                     }
                     _ => {
                         let _ = sm.handle_confirm_delete(false);
+                        InputAction::SessionManagerUpdate
+                    }
+                };
+            }
+            SubMode::ConfirmDisconnect { .. } => {
+                // `ConfirmDelete`'s shape exactly: `y` confirms, anything else
+                // cancels rather than leaving a live confirmation armed.
+                return match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let action = sm.handle_confirm_disconnect(true);
+                        InputAction::SessionManagerAction(action)
+                    }
+                    _ => {
+                        let _ = sm.handle_confirm_disconnect(false);
                         InputAction::SessionManagerUpdate
                     }
                 };

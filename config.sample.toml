@@ -537,6 +537,11 @@
 # Remote commands:
 #   RemoteConnect <dest|alias>      — Connect to a remote server (SSH destination
 #                                     or a `[remotes.<name>]` alias)
+#   RemoteDisconnect <alias|dest>   — Disconnect a connected remote: its sessions
+#                                     leave the switcher and the session tree
+#                                     until you reconnect it. Nothing on the far
+#                                     server is stopped. Also `d` then `y` on the
+#                                     remote's row in the session manager.
 
 # -----------------------------------------------------------------------------
 # SIDEBARS

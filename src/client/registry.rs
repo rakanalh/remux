@@ -51,14 +51,43 @@ pub enum RemoteState {
     Connecting,
     Connected,
     Failed(String),
+    /// The user disconnected this remote in this client run
+    /// ([`ConnectionManager::disconnect_remote`]). Distinct from
+    /// `NotConnected`, which is "never dialled yet" and therefore eligible for
+    /// the lazy dial a View cell starts: this one must NOT be redialled behind
+    /// the user's back.
+    ///
+    /// The paths allowed to redial it are the ones the user drives: Enter or `l`
+    /// on its session-manager row (`handle_enter` / `handle_expand` ->
+    /// `ConnectRemote`), a jump that needs it (`switch_to_server`), and the
+    /// `RemoteConnect` command. Everything else must leave it alone, which is why
+    /// `begin_connect_remote` matches `NotConnected` rather than excluding a list
+    /// of states.
+    Disconnected,
 }
+
+/// The generation every `ConnId::Local` reader is tagged with.
+///
+/// The local connection is never reinstalled: losing it exits the client, so
+/// there is no second transport for a stale `Closed` to belong to. Pinning it at
+/// one fixed value makes `is_current_generation` answer `true` for Local without
+/// a special case at each call site.
+const LOCAL_GENERATION: u64 = 0;
 
 /// A message routed in from one of the connections' reader tasks.
 pub enum Incoming {
     /// A decoded server message from the given connection.
     Message(ConnId, ServerMessage),
-    /// The given connection's reader hit EOF or an error.
-    Closed(ConnId),
+    /// The given connection's reader hit EOF or an error, tagged with the
+    /// [`RemoteEntry::generation`] the reader was spawned for.
+    ///
+    /// The tag is what tells a CURRENT drop from a stale one. Disconnecting and
+    /// immediately reconnecting (`d`, `y`, Enter with no pause) installs a new
+    /// transport while the old reader's EOF is still in flight, and an untagged
+    /// `Closed` would then tear down the connection that just came up. Purely
+    /// client-internal: nothing here crosses the wire, so it is not a protocol
+    /// change.
+    Closed(ConnId, u64),
     /// A background dial started by [`ConnectionManager::begin_connect_remote`]
     /// finished: the named remote either handed back a connected client or an
     /// error message. Delivered through the same channel as everything else so
@@ -86,6 +115,11 @@ struct RemoteEntry {
     /// config-derived entries are eligible for removal by [`update_remotes`]
     /// when they disappear from a reloaded config.
     from_config: bool,
+    /// Which transport this entry is on, incremented by [`install_remote`] each
+    /// time a new one is adopted. Every reader task is spawned tagged with the
+    /// generation it reads for, so an [`Incoming::Closed`] from a superseded
+    /// transport is recognised and ignored instead of tearing down the live one.
+    generation: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +164,7 @@ impl ConnectionManager {
         mgr.initial_view_infos = local.take_captured_views();
         let (reader, writer, _child) = local.into_split();
         mgr.writers.insert(ConnId::Local, writer);
-        mgr.spawn_reader(ConnId::Local, reader);
+        mgr.spawn_reader(ConnId::Local, LOCAL_GENERATION, reader);
         mgr
     }
 
@@ -150,6 +184,7 @@ impl ConnectionManager {
                 server_version,
                 _child: None,
                 from_config: false,
+                generation: 1,
             },
         );
         let (reader, writer, child) = client.into_split();
@@ -157,7 +192,7 @@ impl ConnectionManager {
         if let Some(entry) = mgr.remotes.get_mut(name) {
             entry._child = child;
         }
-        mgr.spawn_reader(id, reader);
+        mgr.spawn_reader(id, 1, reader);
         mgr
     }
 
@@ -176,6 +211,7 @@ impl ConnectionManager {
                         server_version: None,
                         _child: None,
                         from_config: true,
+                        generation: 0,
                     },
                 )
             })
@@ -200,7 +236,12 @@ impl ConnectionManager {
 
     /// Spawn a reader task that pumps decoded messages from `reader` into the
     /// shared channel as [`Incoming`] values, emitting `Closed` on EOF/error.
-    fn spawn_reader(&self, id: ConnId, mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>) {
+    fn spawn_reader(
+        &self,
+        id: ConnId,
+        generation: u64,
+        mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    ) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             loop {
@@ -212,7 +253,7 @@ impl ConnectionManager {
                         }
                     }
                     Ok(None) | Err(_) => {
-                        let _ = tx.send(Incoming::Closed(id.clone()));
+                        let _ = tx.send(Incoming::Closed(id.clone(), generation));
                         break;
                     }
                 }
@@ -239,6 +280,7 @@ impl ConnectionManager {
             server_version: None,
             _child: None,
             from_config: false,
+            generation: 0,
         });
     }
 
@@ -254,8 +296,8 @@ impl ConnectionManager {
     ///   [`add_remote`]) marked config-derived.
     ///
     /// Entries no longer present in `new_remotes` are removed ONLY when they are
-    /// config-derived (`from_config == true`), currently `NotConnected` or
-    /// `Failed`, and not the foreground. Ad-hoc remotes (added via
+    /// config-derived (`from_config == true`), currently idle (`NotConnected`,
+    /// `Failed` or `Disconnected`), and not the foreground. Ad-hoc remotes (added via
     /// `RemoteConnect`/`add_remote`) and any `Connected`/`Connecting` remote are
     /// never dropped here.
     ///
@@ -279,6 +321,7 @@ impl ConnectionManager {
                             server_version: None,
                             _child: None,
                             from_config: true,
+                            generation: 0,
                         },
                     );
                 }
@@ -286,7 +329,7 @@ impl ConnectionManager {
         }
 
         // Remove config-derived entries that dropped out of the config, but only
-        // if they are idle (NotConnected/Failed) and not the foreground.
+        // if they are idle and not the foreground.
         let to_remove: Vec<String> = self
             .remotes
             .iter()
@@ -295,7 +338,9 @@ impl ConnectionManager {
                     && !new_remotes.contains_key(*name)
                     && matches!(
                         entry.state,
-                        RemoteState::NotConnected | RemoteState::Failed(_)
+                        RemoteState::NotConnected
+                            | RemoteState::Failed(_)
+                            | RemoteState::Disconnected
                     )
                     && self.foreground != ConnId::Remote((*name).clone())
             })
@@ -355,22 +400,27 @@ impl ConnectionManager {
 
     /// Adopt a freshly dialed remote client as the transport for `name`: store
     /// its writer, keep the ssh child alive, record the reported version, mark
-    /// the entry `Connected` and spawn its reader task. Shared by the blocking
-    /// [`connect_remote`](Self::connect_remote) and the background
-    /// [`finish_remote_dial`](Self::finish_remote_dial).
+    /// the entry `Connected`, advance its generation and spawn its reader task.
+    /// Shared by the blocking [`connect_remote`](Self::connect_remote) and the
+    /// background [`finish_remote_dial`](Self::finish_remote_dial).
     fn install_remote(&mut self, name: &str, client: RemuxClient) {
         let id = ConnId::Remote(name.to_string());
         // Capture the reported version before `into_split` consumes it.
         let server_version = client.server_version().to_string();
         let (reader, writer, child) = client.into_split();
         self.writers.insert(id.clone(), writer);
+        // The reader is tagged with the generation this transport is installed
+        // AT, so the bump must happen before it is spawned.
+        let mut generation = LOCAL_GENERATION;
         if let Some(entry) = self.remotes.get_mut(name) {
             entry._child = child;
             entry.state = RemoteState::Connected;
             entry.server_version = Some(server_version);
+            entry.generation += 1;
+            generation = entry.generation;
         }
-        self.spawn_reader(id, reader);
-        log::info!("registry: remote '{name}' connected");
+        self.spawn_reader(id, generation, reader);
+        log::info!("registry: remote '{name}' connected (generation {generation})");
     }
 
     /// Start connecting to a named remote **in the background**, reporting the
@@ -383,10 +433,10 @@ impl ConnectionManager {
     /// immediately; the caller must feed the resulting `RemoteDialed` to
     /// [`finish_remote_dial`](Self::finish_remote_dial).
     ///
-    /// No-op (returning `false`) unless the remote is known and idle
-    /// (`NotConnected`), so repeated calls — the View subscribe pass runs on
-    /// every layout/focus change — never pile up dials, and a `Failed` remote is
-    /// not retried behind the user's back.
+    /// No-op (returning `false`) unless the remote is known and `NotConnected`,
+    /// so repeated calls — the View subscribe pass runs on every layout/focus
+    /// change — never pile up dials, and no other state is dialled behind the
+    /// user's back (see [`RemoteState::Disconnected`]).
     pub fn begin_connect_remote(&mut self, name: &str) -> bool {
         let config = match self.remotes.get(name) {
             Some(entry) if entry.state == RemoteState::NotConnected => entry.config.clone(),
@@ -434,6 +484,13 @@ impl ConnectionManager {
             log::debug!("registry: dropping late dial for already-connected '{name}'");
             return true;
         }
+        // The user disconnected this remote while the dial was in flight.
+        // Installing it now would hand them back the connection they just ended
+        // -- and `Disconnected` exists precisely to mean "not without asking".
+        if self.remote_state(name) == RemoteState::Disconnected {
+            log::debug!("registry: dropping dial for user-disconnected '{name}'");
+            return false;
+        }
         match result {
             Ok(client) => {
                 self.install_remote(name, *client);
@@ -452,6 +509,40 @@ impl ConnectionManager {
         if let Some(entry) = self.remotes.get_mut(name) {
             entry.state = state;
         }
+    }
+
+    /// Disconnect a remote AT THE USER'S REQUEST: tear its transport down like
+    /// [`fail_remote`](Self::fail_remote) and record [`RemoteState::Disconnected`],
+    /// which is what keeps the lazy dial paths from bringing it straight back.
+    ///
+    /// Only a live entry (`Connected`, or `Connecting` with a dial in flight) is
+    /// touched. An unknown, `NotConnected`, `Failed` or already-`Disconnected`
+    /// remote is left exactly as it is: there was no connection to end, and
+    /// overwriting `Failed` would throw away the reason it failed.
+    pub fn disconnect_remote(&mut self, name: &str) {
+        match self.remotes.get(name).map(|e| &e.state) {
+            Some(RemoteState::Connected) | Some(RemoteState::Connecting) => {}
+            _ => {
+                log::debug!("registry: disconnect_remote('{name}') -- nothing live to end");
+                return;
+            }
+        }
+        // Dropping the writer and the child is the whole teardown, because
+        // `_child` is `kill_on_drop`. For a `Connected` remote that kills the ssh
+        // (and with it the far relay) here. For a `Connecting` one it does not:
+        // the child is still inside the dial task's `RemuxClient`, so it dies when
+        // `finish_remote_dial` drops that, which can be as late as the 10s dial
+        // timeout. The user-visible state changes immediately either way.
+        self.writers.remove(&ConnId::Remote(name.to_string()));
+        if let Some(entry) = self.remotes.get_mut(name) {
+            entry.state = RemoteState::Disconnected;
+            entry._child = None;
+            // Same reason `fail_remote` would: a stamp from the connection that
+            // just ended would be compared against on the next reconnect before
+            // the new handshake has replaced it.
+            entry.server_version = None;
+        }
+        log::info!("registry: remote '{name}' disconnected by the user");
     }
 
     /// Mark a remote `Failed` and tear down its transport (writer + child) so
@@ -511,6 +602,35 @@ impl ConnectionManager {
     // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
+
+    /// Whether an [`Incoming::Closed`] tagged `generation` describes the
+    /// transport this connection is on NOW.
+    ///
+    /// `false` means the reader that sent it has been superseded by a reconnect,
+    /// so the drop it reports is already over and acting on it would tear down a
+    /// live connection. Local is always current (see [`LOCAL_GENERATION`]), and so
+    /// is an unknown remote, whose `Closed` has no live transport to damage.
+    pub fn is_current_generation(&self, id: &ConnId, generation: u64) -> bool {
+        match id {
+            ConnId::Local => true,
+            ConnId::Remote(name) => match self.remotes.get(name) {
+                Some(entry) => entry.generation == generation,
+                None => true,
+            },
+        }
+    }
+
+    /// The generation the named connection's current transport is on, for a
+    /// caller that has to report a drop it is causing itself.
+    pub fn current_generation(&self, id: &ConnId) -> u64 {
+        match id {
+            ConnId::Local => LOCAL_GENERATION,
+            ConnId::Remote(name) => self
+                .remotes
+                .get(name)
+                .map_or(LOCAL_GENERATION, |e| e.generation),
+        }
+    }
 
     /// Current state of a named remote (or `NotConnected` if unknown).
     pub fn remote_state(&self, name: &str) -> RemoteState {
@@ -908,6 +1028,189 @@ mod tests {
         // Idle remotes never report a mismatch.
         assert_eq!(roster[1].3, None);
         assert_eq!(roster[2].3, None);
+    }
+
+    /// `disconnect_remote` is the USER's "stop talking to this remote": the
+    /// transport goes away like a failure, but the state records that the user
+    /// asked, so nothing dials it again behind their back.
+    #[test]
+    fn disconnect_remote_tears_down_and_records_the_user_choice() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("alpha", RemoteState::Connected);
+        mgr.remotes.get_mut("alpha").unwrap().server_version = Some("0.1.0+x".to_string());
+        mgr.writers.insert(
+            ConnId::Remote("alpha".to_string()),
+            Box::new(tokio::io::sink()),
+        );
+        assert_eq!(
+            mgr.connected_ids(),
+            vec![ConnId::Remote("alpha".to_string())]
+        );
+
+        mgr.disconnect_remote("alpha");
+
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Disconnected);
+        // The transport is gone, so the remote is no longer a send target and
+        // drops out of every `connected_ids()` consumer (the switcher included).
+        assert!(!mgr
+            .writers
+            .contains_key(&ConnId::Remote("alpha".to_string())));
+        assert!(mgr.connected_ids().is_empty());
+        // Same bookkeeping `fail_remote` clears: a stale version would be
+        // reported as skew the moment the entry looked connected again.
+        assert_eq!(mgr.remotes["alpha"].server_version, None);
+        assert_eq!(mgr.version_mismatch(&ConnId::Remote("alpha".into())), None);
+    }
+
+    /// Disconnecting an unknown or already-idle remote is a no-op, not a panic:
+    /// the command palette can name anything.
+    #[test]
+    fn disconnect_remote_on_an_unknown_or_idle_remote_is_inert() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.disconnect_remote("ghost");
+        assert_eq!(mgr.remote_state("ghost"), RemoteState::NotConnected);
+        // An idle entry is left where it was rather than being moved to
+        // `Disconnected`: the user never had a connection to end.
+        mgr.disconnect_remote("alpha");
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::NotConnected);
+    }
+
+    /// A config reload must not resurrect a disconnected remote. `update_remotes`
+    /// refreshes config in place for every state, and `auto_connect` is honoured
+    /// once at startup -- so the thing to pin is that the state survives.
+    #[test]
+    fn update_remotes_leaves_a_disconnected_entry_disconnected() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("alpha", RemoteState::Connected);
+        mgr.disconnect_remote("alpha");
+
+        let mut new_map = sample_remotes();
+        new_map.insert(
+            "alpha".to_string(),
+            RemoteConfig {
+                ssh: "user@alpha".to_string(),
+                auto_connect: true,
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Disconnected);
+        assert!(mgr.remotes["alpha"].config.auto_connect);
+    }
+
+    /// A disconnected remote is IDLE, so a config that no longer mentions it
+    /// drops it, exactly as it drops a `NotConnected`/`Failed` one. Otherwise
+    /// the roster would carry a row nothing can ever reach again.
+    #[test]
+    fn update_remotes_removes_a_disconnected_config_absent_entry() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("zulu", RemoteState::Connected);
+        mgr.disconnect_remote("zulu");
+
+        let mut new_map = HashMap::new();
+        new_map.insert(
+            "alpha".to_string(),
+            RemoteConfig {
+                ssh: "user@alpha".to_string(),
+                ..Default::default()
+            },
+        );
+        mgr.update_remotes(&new_map);
+
+        assert!(!mgr.has_remote("zulu"));
+        assert!(mgr.has_remote("alpha"));
+    }
+
+    /// Stand in for [`install_remote`] in a test: adopt a transport for `name`
+    /// exactly as it does, minus the `RemuxClient` a unit test cannot build.
+    ///
+    /// The bump and the writer are what matter to the generation gate, so they are
+    /// reproduced here rather than mocked away. Returns the new generation.
+    fn fake_install(mgr: &mut ConnectionManager, name: &str) -> u64 {
+        mgr.writers.insert(
+            ConnId::Remote(name.to_string()),
+            Box::new(tokio::io::sink()),
+        );
+        let entry = mgr.remotes.get_mut(name).expect("a known remote");
+        entry.state = RemoteState::Connected;
+        entry.generation += 1;
+        entry.generation
+    }
+
+    /// The stale-`Closed` race: `d`, `y`, Enter with no pause reconnects the remote
+    /// while the OLD reader's EOF is still in flight. That `Closed` carries the
+    /// generation it was spawned for, so it is recognised as superseded.
+    ///
+    /// This pins the GATE. That the gate is consulted before the cleanup runs is
+    /// pinned by `tests/pty/session_manager_disconnect.py` case 8, which sends the
+    /// three keys with nothing between them against the real client.
+    #[test]
+    fn a_closed_from_a_superseded_transport_is_not_current() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        let remote = ConnId::Remote("alpha".to_string());
+
+        let first = fake_install(&mut mgr, "alpha");
+        assert!(mgr.is_current_generation(&remote, first));
+
+        mgr.disconnect_remote("alpha");
+        // Disconnecting does not advance the generation: the reader that is about
+        // to report EOF is still the current one, so its `Closed` must be acted on
+        // (that is what lets `mark_dropped` see `Disconnected` and leave it alone).
+        assert_eq!(mgr.current_generation(&remote), first);
+        assert!(mgr.is_current_generation(&remote, first));
+
+        let second = fake_install(&mut mgr, "alpha");
+        assert_eq!(second, first + 1);
+        assert!(
+            !mgr.is_current_generation(&remote, first),
+            "the old reader's Closed would tear down the reconnected transport"
+        );
+        assert!(mgr.is_current_generation(&remote, second));
+        // What the gate protects: the entry is live again.
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Connected);
+        assert_eq!(mgr.connected_ids(), vec![remote]);
+    }
+
+    /// Local is always current: it is never reinstalled (losing it exits the
+    /// client), so there is no second transport for a stale `Closed` to belong to.
+    /// An unknown remote is current too -- its `Closed` has nothing live to damage.
+    #[test]
+    fn local_and_unknown_connections_are_always_current() {
+        let mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        assert!(mgr.is_current_generation(&ConnId::Local, LOCAL_GENERATION));
+        assert!(mgr.is_current_generation(&ConnId::Local, 99));
+        assert!(mgr.is_current_generation(&ConnId::Remote("ghost".into()), 7));
+    }
+
+    /// Disconnecting mid-dial: the entry is live enough to end (an ssh child is
+    /// running), and the dial that lands afterwards must not install itself.
+    #[test]
+    fn disconnect_remote_cancels_an_in_flight_dial() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("alpha", RemoteState::Connecting);
+
+        mgr.disconnect_remote("alpha");
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Disconnected);
+
+        // The late dial's FAILURE must not overwrite the user's choice with
+        // `Failed` either -- the state is the record of what they asked for, and
+        // an error about a connection they cancelled is noise.
+        assert!(!mgr.finish_remote_dial("alpha", Err("connection timed out".to_string())));
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Disconnected);
+    }
+
+    /// The View subscribe pass runs on every layout/focus change, so the lazy
+    /// dial must refuse a user-disconnected remote structurally -- not because
+    /// some caller remembered to check.
+    #[test]
+    fn begin_connect_remote_refuses_a_disconnected_remote() {
+        let mut mgr = ConnectionManager::empty(&sample_remotes(), ConnId::Local);
+        mgr.set_state("alpha", RemoteState::Connected);
+        mgr.disconnect_remote("alpha");
+
+        assert!(!mgr.begin_connect_remote("alpha"));
+        assert_eq!(mgr.remote_state("alpha"), RemoteState::Disconnected);
     }
 
     #[test]
