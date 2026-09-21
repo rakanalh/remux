@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -565,6 +565,71 @@ fn reap_child(pid: Pid) {
     log::warn!("pty: child {pid} did not exit after SIGKILL; leaving it unreaped");
 }
 
+/// How long a PTY task waits for a readiness event before asking the descriptor
+/// directly.
+///
+/// The reader and the writer both normally wait on the reactor and are woken the
+/// moment the master is ready. On macOS that cannot be relied on. Tokio's
+/// `AsyncFd` is kqueue there, and tmux's `osdep-darwin.c` disables both kqueue and
+/// poll on the grounds that they "don't work on anything except socket file
+/// descriptors". The observed symptom: a pane created from the session manager
+/// while nobody was attached stayed blank for 4.7 hours on a user's Mac, with its
+/// shell's prompt already written to the master, and bytes started flowing 1ms
+/// after the first keystroke was WRITTEN to that same descriptor.
+///
+/// One second is a compromise between the two ways this can be wrong. Shorter
+/// costs a syscall per pane per interval for ever on the platforms where readiness
+/// works perfectly; longer is how long a pane can stay blank on the platform where
+/// it does not.
+const READINESS_FALLBACK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What one direct read of a PTY master found.
+#[derive(Debug)]
+enum FallbackRead {
+    /// Bytes were waiting although no readiness event ever arrived.
+    Data(usize),
+    /// The slave side is closed and the pane's child is gone.
+    Eof,
+    /// Nothing was waiting, which is the answer whenever readiness works.
+    WouldBlock,
+    Failed(std::io::Error),
+}
+
+/// Read a PTY master directly, without going through the reactor.
+///
+/// Called only from the reader task and only after [`READINESS_FALLBACK`] passed
+/// with no readiness event, so there is still exactly one reader of the
+/// descriptor and no interleaving to reason about.
+///
+/// A partial read is not drained here. One read per interval is enough to unstick
+/// a pane whose readiness never arrives, and draining in a loop would put an
+/// unbounded read loop on a path that runs against every idle pane.
+fn fallback_read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> FallbackRead {
+    // SAFETY: `fd` is an open descriptor borrowed for this call, and `buf` is a
+    // slice whose length bounds the read.
+    let n = unsafe {
+        libc::read(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if n > 0 {
+        return FallbackRead::Data(n as usize);
+    }
+    if n == 0 {
+        return FallbackRead::Eof;
+    }
+    let err = std::io::Error::last_os_error();
+    // `ErrorKind` rather than a match on `EAGAIN` and `EWOULDBLOCK`: the two are
+    // the same value on Linux, so listing both is an unreachable pattern there.
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        FallbackRead::WouldBlock
+    } else {
+        FallbackRead::Failed(err)
+    }
+}
+
 /// Spawn a background tokio task that continuously reads from the PTY master
 /// and sends output chunks through a channel.
 ///
@@ -616,14 +681,43 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
             }
         };
 
+        // Once per task, not once per occurrence. The fallback fires on a timer, so
+        // an unconditional warning would write a line per pane per second for the
+        // life of the server, and `server.log` is never rotated.
+        let mut warned_fallback = false;
+
         loop {
-            let mut guard = match async_fd.readable().await {
-                Ok(g) => g,
-                Err(e) => {
-                    log::error!("start_reader: readable() failed: {e}");
-                    break;
-                }
-            };
+            let mut guard =
+                match tokio::time::timeout(READINESS_FALLBACK, async_fd.readable()).await {
+                    Ok(Ok(g)) => g,
+                    Ok(Err(e)) => {
+                        log::error!("start_reader: readable() failed: {e}");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        match fallback_read(async_fd.get_ref().as_fd(), &mut buf) {
+                            FallbackRead::Data(n) => {
+                                if !warned_fallback {
+                                    warned_fallback = true;
+                                    log::warn!(
+                                        "pty: reader fallback delivered {n} bytes on fd={raw} \
+                                     without a readiness event"
+                                    );
+                                }
+                                if tx.send(buf[..n].to_vec()).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            FallbackRead::Eof => break,
+                            FallbackRead::WouldBlock => {}
+                            FallbackRead::Failed(e) => {
+                                log::error!("start_reader: read error: {e}");
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                };
 
             match guard.try_io(|inner| {
                 // SAFETY: The fd is valid (caller guarantees it) and we read
@@ -714,14 +808,64 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
             }
         };
 
+        // See the reader: once per task, because the fallback runs on a timer.
+        let mut warned_fallback = false;
+
         while let Some(buf) = rx.recv().await {
             let mut offset = 0;
             while offset < buf.len() {
-                let mut guard = match async_fd.writable().await {
-                    Ok(g) => g,
-                    Err(e) => {
+                let mut guard = match tokio::time::timeout(READINESS_FALLBACK, async_fd.writable())
+                    .await
+                {
+                    Ok(Ok(g)) => g,
+                    Ok(Err(e)) => {
                         log::error!("start_writer: writable() failed: {e}");
                         return;
+                    }
+                    Err(_elapsed) => {
+                        // The same readiness hazard the reader guards against, on
+                        // the other direction of the same descriptor: attempt the
+                        // pending write rather than wait for an event that may
+                        // never come.
+                        match nix::unistd::write(async_fd.get_ref(), &buf[offset..]) {
+                            // A write of nothing at all on a slice the loop
+                            // condition keeps non-empty. Abandoned rather than
+                            // retried, matching what the readiness path does with
+                            // the same answer: retrying is the one way this arm
+                            // could loop for the life of the pane.
+                            Ok(0) => {
+                                log::warn!(
+                                    "start_writer: fd={raw} fallback wrote nothing of {} \
+                                     remaining byte(s)",
+                                    buf.len() - offset
+                                );
+                                break;
+                            }
+                            Ok(n) => {
+                                if !warned_fallback {
+                                    warned_fallback = true;
+                                    log::warn!(
+                                        "pty: writer fallback wrote {n} byte(s) on fd={raw} \
+                                         without a readiness event"
+                                    );
+                                }
+                                offset += n;
+                            }
+                            Err(nix::errno::Errno::EAGAIN) => {}
+                            Err(e @ (nix::errno::Errno::EIO | nix::errno::Errno::EBADF)) => {
+                                log::debug!("start_writer: fd={raw} closed while writing ({e})");
+                                return;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "start_writer: fd={raw} write failed after {offset} of {} \
+                                     byte(s): {e}",
+                                    buf.len()
+                                );
+                                break;
+                            }
+                        }
+                        continue;
                     }
                 };
 
@@ -933,6 +1077,68 @@ mod tests {
             argv0.starts_with('-'),
             "expected a login shell (argv[0] beginning with '-'), got $0={argv0:?}"
         );
+    }
+
+    /// A PTY pair with no child, and a non-blocking master, which is the state
+    /// [`fallback_read`] is always called in.
+    fn idle_pair() -> OpenptyResult {
+        let pair = openpty(
+            &Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+            None,
+        )
+        .expect("openpty failed");
+        let raw = pair.master.as_raw_fd();
+        // SAFETY: `pair.master` owns a valid descriptor for the whole test.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        pair
+    }
+
+    /// The case the fallback exists for: bytes are waiting on the master and no
+    /// readiness event is involved at all.
+    #[test]
+    fn the_fallback_read_delivers_bytes_waiting_on_the_master() {
+        let pair = idle_pair();
+        nix::unistd::write(&pair.slave, b"probe").expect("write to slave failed");
+        let mut buf = [0u8; 64];
+        match fallback_read(pair.master.as_fd(), &mut buf) {
+            FallbackRead::Data(n) => assert_eq!(&buf[..n], b"probe"),
+            other => panic!("expected the waiting bytes, got {other:?}"),
+        }
+    }
+
+    /// Every idle pane takes this branch once per interval, so it must be the
+    /// cheap "nothing here" answer and not an error the reader would break on.
+    #[test]
+    fn the_fallback_read_reports_would_block_on_an_idle_master() {
+        let pair = idle_pair();
+        let mut buf = [0u8; 64];
+        match fallback_read(pair.master.as_fd(), &mut buf) {
+            FallbackRead::WouldBlock => {}
+            other => panic!("expected WouldBlock on an idle master, got {other:?}"),
+        }
+    }
+
+    /// A closed slave must reach an arm the reader BREAKS on, and which arm that
+    /// is depends on the platform: Linux answers `EIO` rather than a zero-length
+    /// read. Both are accepted because both end the reader.
+    #[test]
+    fn the_fallback_read_reports_the_slave_closing() {
+        let pair = idle_pair();
+        drop(pair.slave);
+        let mut buf = [0u8; 64];
+        match fallback_read(pair.master.as_fd(), &mut buf) {
+            FallbackRead::Eof => {}
+            FallbackRead::Failed(e) if e.raw_os_error() == Some(libc::EIO) => {}
+            other => panic!("expected EOF or EIO once the slave closed, got {other:?}"),
+        }
     }
 
     /// Read the value of a `KEY=value` sentinel line out of a PTY.
