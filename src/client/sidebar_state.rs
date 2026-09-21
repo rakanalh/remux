@@ -104,9 +104,7 @@ impl SidebarState {
 /// `$XDG_STATE_HOME/remux/sidebar.json`, with the same fallback chain the log
 /// directory uses so both land in one place.
 fn state_path() -> PathBuf {
-    dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    crate::paths::state_home()
         .join("remux")
         .join("sidebar.json")
 }

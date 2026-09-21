@@ -4,6 +4,7 @@
 
 mod client;
 mod config;
+mod paths;
 mod protocol;
 mod screen;
 mod server;
@@ -290,10 +291,7 @@ async fn main() -> Result<()> {
         Some(Commands::Relay) => "relay.log",
         _ => "client.log",
     };
-    let log_dir = dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("remux");
+    let log_dir = paths::state_home().join("remux");
     std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
     let log_path = log_dir.join(log_filename);
     let log_file = std::fs::OpenOptions::new()

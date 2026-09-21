@@ -12,7 +12,7 @@ use super::Config;
 
 /// Return the path to the config file, if determinable.
 pub fn config_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("remux").join("config.toml"))
+    crate::paths::config_file()
 }
 
 /// Watch the config file for changes, reloading and sending new Config values

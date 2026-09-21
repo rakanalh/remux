@@ -319,8 +319,8 @@ impl Config {
     /// If the file does not exist, returns the default configuration.
     /// If the file exists but contains invalid TOML, returns an error.
     pub fn load() -> anyhow::Result<Self> {
-        let config_path = match dirs::config_dir() {
-            Some(dir) => dir.join("remux").join("config.toml"),
+        let config_path = match crate::paths::config_file() {
+            Some(path) => path,
             None => return Ok(Self::default()),
         };
 
