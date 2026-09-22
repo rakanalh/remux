@@ -1,11 +1,19 @@
 """A scrolled client must still be repainted by the commands that reshape its screen.
 
-`broadcast_full_render` deliberately skips clients whose `scroll_offset != 0` --
-that filter exists so another pane's PTY output cannot yank a scrolled reader to
-the tail, and it must stay. The side effect is that while a client is scrolled
-back, focus/layout/tab commands change the server's state and produce NO frame
-at all: the active-pane border stays on the old pane and the session reads as
-frozen until the user types (`ClientMessage::Input` already snaps to the tail).
+`broadcast_full_render` deliberately skips a client whose FOCUSED pane is
+scrolled -- that filter exists so another pane's PTY output cannot yank a
+scrolled reader to the tail, and it must stay. The side effect is that while
+that pane is scrolled back, layout commands change the server's state and
+produce NO frame at all: the active-pane border stays on the old pane and the
+session reads as frozen until the user types (`ClientMessage::Input` already
+snaps to the tail).
+
+A scroll offset belongs to a PANE, not to the client, so moving focus between
+panes or tabs no longer snaps: the user scrolled a build log back, looked at a
+second pane, and expects the log where they left it. `run_focus_move_negative`
+pins that, and `tests/frame/mouse_scroll_per_pane.py` covers the content the
+frames carry across such a move. The commands here are the ones that still
+snap, and they still must.
 
 Each case runs against a FRESH server -- `TabNew` moves focus to a pane with no
 scrollback and would poison a shared one -- and is asserted twice:
@@ -89,16 +97,11 @@ def fill_history(s):
     s.settle()
 
 
-def build(rundir, pre_focus=None):
+def build(rundir):
     """Two side-by-side panes; the focused one holds >1 screen of history."""
     s = Attached(rundir)
     s.command("PaneSplitVertical")
     s.settle()
-    if pre_focus:
-        # Park focus on the pane the case will scroll, so the command under
-        # test is guaranteed to MOVE focus rather than no-op at an edge.
-        s.command(pre_focus)
-        s.settle()
     fill_history(s)
     return s
 
@@ -119,27 +122,136 @@ def scroll_back(s):
 
 def run_case(cmd, scrolled):
     label = f"{cmd}{'/scrolled' if scrolled else '/live'}"
-    pre = {"PaneFocusRight": "PaneFocusLeft",
-           "PaneFocusLeft": "PaneFocusRight"}.get(cmd)
     slug = cmd.lower() + ("s" if scrolled else "l")
-    s = build(f"{RUNDIR_BASE}/{slug}", pre)
+    s = build(f"{RUNDIR_BASE}/{slug}")
     try:
         if scrolled:
             scroll_back(s)
-        before = s.fpr
         s.command(cmd)
         _, r = s.pump(1.2)
         assert r, f"{label}: SILENT -- the command produced no frame for this client"
         assert r[-1][1] == 0, \
             f"{label}: client left at scroll_offset={r[-1][1]}, not returned to the live tail"
-        if pre:
-            # The bug the user reported is the highlight not moving, which a
-            # bare frame-count check would pass on.
-            assert before and s.fpr and before["x"] != s.fpr["x"], \
-                f"{label}: focused_pane_rect did not move ({before} -> {s.fpr})"
     finally:
         s.close()
     print(f"PASS {label}")
+
+
+def run_focus_move_negative():
+    """Moving focus off a scrolled pane and back must return to the offset.
+
+    The offset belongs to the pane, so leaving it does not make the position
+    pointless. Both legs are asserted, and the second is the one that matters:
+    focusing AWAY reports the newly focused pane's 0 whether or not the first
+    pane kept anything, so a case that stopped there would pass on a server
+    that snapped.
+
+    `focused_pane_rect` is checked on both legs too. Without it, "no frame
+    arrived at all" -- the frozen border the snap used to prevent -- would read
+    as a pass on the first leg and be invisible on the second.
+
+    The direction matters: `build` leaves focus on the pane the split created,
+    which is the RIGHT one, and that is also the pane `fill_history` filled. So
+    the leg that moves AWAY has to be `PaneFocusLeft`. `PaneFocusRight` from
+    there is a no-op at the edge, and the case would assert against a screen
+    no command had touched.
+    """
+    s = build(f"{RUNDIR_BASE}/focusmove")
+    try:
+        scroll_back(s)
+        scrolled_rect = s.fpr
+        s.command("PaneFocusLeft")
+        _, r = s.pump(1.2)
+        assert r, "focus-move: SILENT -- focusing away produced no frame"
+        assert s.fpr and s.fpr["x"] != scrolled_rect["x"], \
+            f"focus-move: focused_pane_rect did not move ({scrolled_rect} -> {s.fpr})"
+        assert r[-1][1] == 0, \
+            f"focus-move: the newly focused pane reports scroll_offset={r[-1][1]}"
+
+        s.command("PaneFocusRight")
+        _, r = s.pump(1.2)
+        assert r, ("focus-move: SILENT -- focusing BACK onto the scrolled pane "
+                   "produced no frame, so its border is stale")
+        assert s.fpr and s.fpr["x"] == scrolled_rect["x"], \
+            f"focus-move: focus did not return ({s.fpr} != {scrolled_rect})"
+        assert r[-1][1] == SCROLL_BY, (
+            f"focus-move: scroll_offset={r[-1][1]} on return, expected "
+            f"{SCROLL_BY} -- the pane's place in the scrollback was snapped away")
+    finally:
+        s.close()
+    print("PASS PaneFocusLeft+PaneFocusRight/scrolled (offset stays with the pane)")
+
+
+def run_tab_move_negative():
+    """Moving to another TAB and back must land on the scrolled pane's offset.
+
+    `TabNext`/`TabPrev`/`TabGoto` left `returns_to_live_tail` alongside the
+    focus moves and for the same reason, so they need a case of their own:
+    re-adding any of them to that list would otherwise be caught only by
+    `run_focus_move_negative`, which exercises a different command.
+
+    Both legs are asserted. The first reports the OTHER tab's pane, which is 0
+    whether or not the scrolled pane kept anything, so a case that stopped
+    there would pass on a server that snapped.
+    """
+    s = build(f"{RUNDIR_BASE}/tabmove")
+    try:
+        # A second tab to move to. `TabNew` still snaps, so it is created
+        # BEFORE the scroll rather than after.
+        s.command("TabNew")
+        s.settle()
+        s.command("TabPrev")
+        s.settle()
+        scroll_back(s)
+
+        s.command("TabNext")
+        _, r = s.pump(1.2)
+        assert r, "tab-move: SILENT -- switching to the other tab produced no frame"
+        assert r[-1][1] == 0, \
+            f"tab-move: the other tab's pane reports scroll_offset={r[-1][1]}"
+
+        s.command("TabPrev")
+        _, r = s.pump(1.2)
+        assert r, ("tab-move: SILENT -- returning to the tab holding the scrolled "
+                   "pane produced no frame, so that tab's screen is stale")
+        assert r[-1][1] == SCROLL_BY, (
+            f"tab-move: scroll_offset={r[-1][1]} on return, expected {SCROLL_BY} "
+            "-- the pane's place in the scrollback was snapped away")
+    finally:
+        s.close()
+    print("PASS TabNext+TabPrev/scrolled (offset stays with the pane)")
+
+
+def run_stack_move_negative():
+    """The same for `PaneStackNext`/`PaneStackPrev`, which also left the list.
+
+    `PaneStackAdd` stacks a fresh pane on the focused one and focuses the new
+    one, so the history filled by `build` is one `PaneStackPrev` away.
+    """
+    s = build(f"{RUNDIR_BASE}/stackmove")
+    try:
+        s.command("PaneStackAdd")
+        s.settle()
+        s.command("PaneStackPrev")
+        s.settle()
+        scroll_back(s)
+
+        s.command("PaneStackNext")
+        _, r = s.pump(1.2)
+        assert r, "stack-move: SILENT -- cycling the stack produced no frame"
+        assert r[-1][1] == 0, \
+            f"stack-move: the other stacked pane reports scroll_offset={r[-1][1]}"
+
+        s.command("PaneStackPrev")
+        _, r = s.pump(1.2)
+        assert r, ("stack-move: SILENT -- cycling back to the scrolled pane "
+                   "produced no frame")
+        assert r[-1][1] == SCROLL_BY, (
+            f"stack-move: scroll_offset={r[-1][1]} on return, expected "
+            f"{SCROLL_BY} -- the pane's place in the scrollback was snapped away")
+    finally:
+        s.close()
+    print("PASS PaneStackNext+PaneStackPrev/scrolled (offset stays with the pane)")
 
 
 def run_negative():
@@ -428,8 +540,10 @@ def run_tab_new_own_session_positive():
     print("PASS TabNewInSession/scrolled+own-session (snapped)")
 
 
-COMMANDS = ["PaneFocusRight", "PaneFocusLeft", "PaneSplitHorizontal",
-            "LayoutNext", "PaneToggleZoom", "TabNew"]
+# Focus, tab and stack moves are deliberately absent: they no longer snap. See
+# `run_focus_move_negative`, `run_tab_move_negative` and
+# `run_stack_move_negative`.
+COMMANDS = ["PaneSplitHorizontal", "LayoutNext", "PaneToggleZoom", "TabNew"]
 
 
 def main():
@@ -441,7 +555,9 @@ def main():
             except AssertionError as e:
                 failures.append(str(e))
                 print(f"FAIL {e}")
-    for probe in (run_negative, run_popup_negative, run_popup_resize_positive,
+    for probe in (run_negative, run_focus_move_negative,
+                  run_tab_move_negative, run_stack_move_negative,
+                  run_popup_negative, run_popup_resize_positive,
                   run_cross_session_negative, run_own_session_positive,
                   run_tab_new_other_session_negative,
                   run_tab_new_own_session_positive):

@@ -1260,7 +1260,7 @@ impl RemuxCommand {
     /// Whether executing this command should first return the requesting
     /// client to the live tail of its attached session.
     ///
-    /// `broadcast_full_render` skips clients with a non-zero `scroll_offset`,
+    /// `broadcast_full_render` skips a client whose FOCUSED pane is scrolled,
     /// and that exclusion is load-bearing: it is also the PTY-output path, so
     /// another pane's output must never yank a scrolled reader to the bottom.
     /// The consequence is that a command which reshapes the screen produces no
@@ -1284,21 +1284,12 @@ impl RemuxCommand {
             // is looking at is no longer the one the command acted on.
             RemuxCommand::TabNew
             | RemuxCommand::TabClose
-            | RemuxCommand::TabGoto(_)
-            | RemuxCommand::TabNext
-            | RemuxCommand::TabPrev
             | RemuxCommand::TabMove(_)
             | RemuxCommand::PaneNew
             | RemuxCommand::PaneClose
             | RemuxCommand::PaneSplitVertical
             | RemuxCommand::PaneSplitHorizontal
-            | RemuxCommand::PaneFocusLeft
-            | RemuxCommand::PaneFocusRight
-            | RemuxCommand::PaneFocusUp
-            | RemuxCommand::PaneFocusDown
             | RemuxCommand::PaneStackAdd
-            | RemuxCommand::PaneStackNext
-            | RemuxCommand::PaneStackPrev
             | RemuxCommand::PaneMoveLeft
             | RemuxCommand::PaneMoveRight
             | RemuxCommand::PaneMoveUp
@@ -1340,6 +1331,25 @@ impl RemuxCommand {
             // would throw away exactly what they scrolled back to reach.
             RemuxCommand::EnterVisualMode | RemuxCommand::EnterSearchMode => false,
 
+            // Moving BETWEEN panes or tabs. A scroll offset belongs to one
+            // pane, so leaving that pane does not make its position pointless:
+            // the user scrolled a build log back, looked at a second pane, and
+            // expects the log where they left it. These commands are still the
+            // silent-command hazard the doc comment above describes, because
+            // the pane they move focus TO may itself be scrolled and
+            // `broadcast_full_render` skips a client whose focused pane is
+            // scrolled. [`RemuxCommand::repaints_scrolled_requester`] names
+            // them for the targeted repaint that replaces the snap.
+            RemuxCommand::PaneFocusLeft
+            | RemuxCommand::PaneFocusRight
+            | RemuxCommand::PaneFocusUp
+            | RemuxCommand::PaneFocusDown
+            | RemuxCommand::PaneStackNext
+            | RemuxCommand::PaneStackPrev
+            | RemuxCommand::TabNext
+            | RemuxCommand::TabPrev
+            | RemuxCommand::TabGoto(_) => false,
+
             // Everything else. The rule is "snap when NOT repainting reads as
             // FROZEN", not "snap whenever a cell would differ" -- and the rename
             // arms are where those two part company. `TabRenameByIndex` does
@@ -1374,6 +1384,36 @@ impl RemuxCommand {
             | RemuxCommand::RemoteConnect(_)
             | RemuxCommand::RemoteDisconnect(_) => false,
         }
+    }
+
+    /// Whether the requesting client must be repainted on its own after this
+    /// command, when the pane it now focuses is scrolled back.
+    ///
+    /// These commands move focus between panes or tabs without ending any
+    /// scroll, so the pane they land on can have a non-zero offset. A client in
+    /// that state is skipped by `broadcast_full_render`, which would leave the
+    /// active-pane border on the pane focus just left and read as a frozen
+    /// session. The requester therefore gets its own frame, composited at its
+    /// own per-pane offsets, instead of losing its place in the scrollback to a
+    /// snap.
+    ///
+    /// The set is exactly what [`RemuxCommand::returns_to_live_tail`] no longer
+    /// claims: a command that snaps is repainted by the snap itself, and one
+    /// that changes neither focus nor tab leaves the frozen-border case
+    /// unreachable.
+    pub fn repaints_scrolled_requester(&self) -> bool {
+        matches!(
+            self,
+            RemuxCommand::PaneFocusLeft
+                | RemuxCommand::PaneFocusRight
+                | RemuxCommand::PaneFocusUp
+                | RemuxCommand::PaneFocusDown
+                | RemuxCommand::PaneStackNext
+                | RemuxCommand::PaneStackPrev
+                | RemuxCommand::TabNext
+                | RemuxCommand::TabPrev
+                | RemuxCommand::TabGoto(_)
+        )
     }
 }
 

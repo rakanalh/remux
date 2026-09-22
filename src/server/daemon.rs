@@ -481,10 +481,30 @@ struct ClientConnection {
     mouse_selection: Option<MouseSelection>,
     /// Search match info: (current_match, total_matches).
     search_info: Option<(usize, usize)>,
-    /// Scroll offset for the focused pane (0 = live view, >0 = scrolled back).
-    scroll_offset: usize,
-    /// Previous scroll_offset, for detecting scroll delta.
+    /// Per-(this client, pane) scroll offset into the panes of the ATTACHED
+    /// SESSION (0/absent = live view, >0 = scrolled back).
+    ///
+    /// One offset per client would be wrong in two ways a user sees: the wheel
+    /// over a pane that does not own input would move whichever pane does, and
+    /// moving focus to a second pane and back would lose the first pane's
+    /// position. The offset belongs to the pane, so it is stored per pane.
+    ///
+    /// Deliberately NOT the same map as [`ClientConnection::pane_scroll`],
+    /// which is View-cell state cleared on `UnsubscribePane`: sharing them
+    /// would wipe a pane's session scrollback when a View that aliases it is
+    /// torn down.
+    ///
+    /// Entries are clamped at RENDER time (a resize can shrink the scrollback
+    /// an entry addresses) and removed when the pane is reaped.
+    session_scroll: std::collections::HashMap<PaneId, usize>,
+    /// The offset [`ClientConnection::prev_scroll_pane`] last rendered at, for
+    /// detecting an incremental scroll worth a `ScrollRender`.
     prev_scroll_offset: usize,
+    /// The pane `prev_scroll_offset` was measured on. A `ScrollRender` shifts
+    /// the client's existing pixels by a delta, so a delta taken across two
+    /// DIFFERENT panes would scroll one pane's rows by the other's movement.
+    /// A change of pane forces a full repaint instead.
+    prev_scroll_pane: Option<PaneId>,
     /// Set when the client's scroll offset changed; forces the next broadcast
     /// to send a FullRender so the diff baseline can't desync from the client's
     /// screen across a scroll transition.
@@ -511,7 +531,7 @@ struct ClientConnection {
     subscribed_panes: std::collections::HashMap<PaneId, Option<(u16, u16)>>,
     /// Per-(this client, pane) scroll offset into a subscribed pane's scrollback,
     /// driven by `ScrollPane` (a View cell's mouse wheel). Independent of the
-    /// foreground `scroll_offset` and of other clients viewing the same pane.
+    /// foreground `session_scroll` and of other clients viewing the same pane.
     /// `0`/absent = live view. Cleared on `UnsubscribePane` and pane close.
     pane_scroll: std::collections::HashMap<PaneId, usize>,
     /// Per-(this client, pane) drag-selection over a subscribed pane, in the
@@ -546,6 +566,23 @@ struct ClientConnection {
     /// the two payloads are dirtied by different things -- structure versus
     /// pane output -- and a client wanting one must not pay for the other.
     agents_subscribed: bool,
+}
+
+impl ClientConnection {
+    /// This client's scroll offset into `pane_id`, unclamped.
+    fn scroll_of(&self, pane_id: PaneId) -> usize {
+        self.session_scroll.get(&pane_id).copied().unwrap_or(0)
+    }
+
+    /// Store `offset` for `pane_id`, dropping the entry at the live tail so
+    /// "is anything scrolled?" stays a test of emptiness.
+    fn set_scroll(&mut self, pane_id: PaneId, offset: usize) {
+        if offset == 0 {
+            self.session_scroll.remove(&pane_id);
+        } else {
+            self.session_scroll.insert(pane_id, offset);
+        }
+    }
 }
 
 /// The Remux server.
@@ -869,8 +906,9 @@ impl RemuxServer {
                     mode: "NORMAL".to_string(),
                     mouse_selection: None,
                     search_info: None,
-                    scroll_offset: 0,
+                    session_scroll: std::collections::HashMap::new(),
                     prev_scroll_offset: 0,
+                    prev_scroll_pane: None,
                     needs_full_render: false,
                     drag: None,
                     autoscroll_repeat: None,
@@ -1222,7 +1260,7 @@ async fn handle_client_message(
         ClientMessage::Input { data } => {
             handle_input(client_id, &data, state, panes, clients).await?;
             // Typing leaves scrollback, as it does in tmux and zellij. The
-            // server owns `scroll_offset`, so the server ends it -- see
+            // server owns `session_scroll`, so the server ends it -- see
             // `snap_client_to_live_tail` for why the client cannot be trusted to
             // ask.
             snap_client_to_live_tail(client_id, state, panes, clients, config, prev_frames).await;
@@ -1242,7 +1280,11 @@ async fn handle_client_message(
             .await
         }
         ClientMessage::Command(cmd) => {
-            handle_command(
+            // Read before `cmd` moves. The repaint belongs AFTER dispatch, and
+            // here rather than inside `handle_command`, whose arms return from
+            // a dozen places.
+            let repaint = cmd.repaints_scrolled_requester();
+            let result = handle_command(
                 client_id,
                 cmd,
                 state,
@@ -1252,7 +1294,12 @@ async fn handle_client_message(
                 prev_frames,
                 dormant,
             )
-            .await
+            .await;
+            if repaint {
+                repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames)
+                    .await;
+            }
+            result
         }
         ClientMessage::CreateSession { name, folder } => {
             let result = handle_create_session(
@@ -1419,7 +1466,18 @@ async fn handle_client_message(
             }
         },
         ClientMessage::ScrollDelta { delta } => {
-            handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
+            // No coordinates, so this scrolls whichever pane owns input.
+            handle_scroll_delta(
+                client_id,
+                delta,
+                None,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
         }
         ClientMessage::MouseScroll { x, y, up } => {
             handle_mouse_scroll(
@@ -1437,18 +1495,21 @@ async fn handle_client_message(
         }
         ClientMessage::ScrollReset => {
             log::debug!("server: ScrollReset client_id={client_id}");
+            // The client asks for this when it is about to send input, so it
+            // means the pane that input goes to. Another pane this client
+            // scrolled is reading history and keeps its offset.
+            let target = client_input_target(client_id, state, clients).await;
+            let session_name = target.as_ref().map(|(sn, _)| sn.clone());
             {
                 let mut cls = clients.lock().await;
                 if let Some(client) = cls.get_mut(&client_id) {
-                    client.scroll_offset = 0;
+                    if let Some((_, pane_id)) = target {
+                        client.set_scroll(pane_id, 0);
+                    }
                     client.prev_scroll_offset = 0;
                     client.needs_full_render = true;
                 }
             }
-            let session_name = {
-                let cls = clients.lock().await;
-                cls.get(&client_id).and_then(|c| c.session_name.clone())
-            };
             if let Some(session_name) = session_name {
                 send_full_render_to_client(
                     client_id,
@@ -1458,6 +1519,7 @@ async fn handle_client_message(
                     clients,
                     config,
                     prev_frames,
+                    RenderCtx::default(),
                 )
                 .await;
             }
@@ -1471,20 +1533,12 @@ async fn handle_client_message(
             // the two orders deadlock the whole daemon, and the session-tree
             // pusher now runs `state -> clients` on a background task whenever
             // anyone is subscribed, which a sidebar does permanently.
-            let session_name = {
-                let cls = clients.lock().await;
-                cls.get(&client_id).and_then(|c| c.session_name.clone())
-            };
-            let focused_pane_id = match session_name {
-                Some(ref sn) => {
-                    let st = state.lock().await;
-                    st.sessions
-                        .get(sn)
-                        .and_then(|sess| sess.tabs.get(sess.active_tab).map(|t| t.focused_pane))
-                }
-                None => None,
-            };
-            if let (Some(_sn), Some(fp)) = (session_name, focused_pane_id) {
+            //
+            // The pane is resolved by `client_input_target`, which honours the
+            // popup. The client asks for this to size its own scrollbar against
+            // the offset it holds, and that offset belongs to the pane taking
+            // input: while the popup is up, that is the popup.
+            if let Some((_sn, fp)) = client_input_target(client_id, state, clients).await {
                 let total_lines = {
                     let ps = panes.lock().await;
                     ps.get(&fp).map(|p| p.screen.total_lines()).unwrap_or(0)
@@ -1908,6 +1962,18 @@ async fn handle_attach(
     let (cols, rows) = {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
+            if client.session_name.as_deref() != Some(session_name) {
+                // These offsets index panes of the session being left. Nothing
+                // reads an entry for a pane outside the attached session, so
+                // keeping them shows nothing wrong -- but a non-empty map
+                // defeats the emptiness check in `snap_client_to_live_tail`,
+                // which is what keeps a keystroke off the `state` lock. One
+                // switch away from a scrolled pane would otherwise charge this
+                // client that lock on every keystroke it ever sends again.
+                client.session_scroll.clear();
+                client.prev_scroll_offset = 0;
+                client.prev_scroll_pane = None;
+            }
             client.session_name = Some(session_name.to_string());
             (client.cols, client.rows)
         } else {
@@ -1958,6 +2024,7 @@ async fn handle_attach(
         clients,
         config,
         prev_frames,
+        RenderCtx::default(),
     )
     .await;
 
@@ -2038,7 +2105,7 @@ async fn handle_input(
 
 /// Return this client's viewport to the live tail, repainting only if it moved.
 ///
-/// **Why the server does this and not the client.** `scroll_offset` is
+/// **Why the server does this and not the client.** `session_scroll` is
 /// server-owned state, and the render messages' `viewport_top` is an absolute
 /// line index -- which is exactly `0` at maximum scroll, the same value the live
 /// tail reports. A client that inferred "am I scrolled?" from `viewport_top`
@@ -2061,17 +2128,23 @@ async fn handle_input(
 /// case -- so this costs one lock and no repaint per keystroke.
 ///
 /// `handle_command` is the second caller, for the commands
-/// [`RemuxCommand::returns_to_live_tail`] names: a command that moves focus or
-/// reshapes the layout makes a scroll pointless in exactly the same way typing
-/// does, and a scrolled client is otherwise skipped by `broadcast_full_render`
-/// and sees no frame at all.
+/// [`RemuxCommand::returns_to_live_tail`] names: a command that reshapes the
+/// layout makes a scroll pointless in exactly the same way typing does, and a
+/// client whose focused pane is scrolled is otherwise skipped by
+/// `broadcast_full_render` and sees no frame at all. A command that only moves
+/// focus between panes or tabs is NOT in that set, because the offset belongs
+/// to the pane being left; it takes the targeted repaint that
+/// [`RemuxCommand::repaints_scrolled_requester`] names instead.
 ///
 /// Scoped tightly, so it can only ever undo a scroll the triggering command or
 /// keystroke made pointless:
 ///
 /// * Only the requesting client. Another client scrolled back through the same
-///   session keeps its offset -- `scroll_offset` is per-client and this touches
-///   exactly one entry.
+///   session keeps its offset -- `session_scroll` is per-client and this
+///   touches exactly one client's map.
+/// * Only the pane that owns input. The keystroke lands in one pane, so only
+///   that pane's position is made pointless by it; a second pane this client
+///   scrolled back is still being read and keeps its offset.
 /// * Only the attached-session viewport. A View cell's scrollback is the
 ///   per-(client, pane) `pane_scroll`, which this never reads, so cell input
 ///   (`InputToPane`, a different arm entirely) cannot move a scrolled cell.
@@ -2089,40 +2162,132 @@ async fn snap_client_to_live_tail(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let session_name = {
-        let mut cls = clients.lock().await;
-        match cls.get_mut(&client_id) {
+    {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            // `session_scroll` empty is the per-keystroke common case, and it
+            // answers "is anything of this client's scrolled?" without
+            // resolving which pane owns input. Resolving that takes the `state`
+            // lock, so without this arm every keystroke would contend for it.
             Some(client)
-                if client.scroll_offset != 0
-                    && client.mode != COPY_MODE
-                    && client.mode != SEARCH_MODE =>
-            {
-                log::debug!(
-                    "server: returning client_id={client_id} to the live tail from offset={}",
-                    client.scroll_offset
-                );
-                client.scroll_offset = 0;
-                client.prev_scroll_offset = 0;
-                // The client's diff baseline is a scrolled frame, so the repaint
-                // below must be a full one.
-                client.needs_full_render = true;
-                client.session_name.clone()
-            }
+                if client.mode != COPY_MODE
+                    && client.mode != SEARCH_MODE
+                    && !client.session_scroll.is_empty() => {}
             _ => return,
         }
-    };
-    if let Some(session_name) = session_name {
-        send_full_render_to_client(
-            client_id,
-            &session_name,
-            state,
-            panes,
-            clients,
-            config,
-            prev_frames,
-        )
-        .await;
     }
+    let Some((session_name, pane_id)) = client_input_target(client_id, state, clients).await else {
+        return;
+    };
+    {
+        let mut cls = clients.lock().await;
+        let Some(client) = cls.get_mut(&client_id) else {
+            return;
+        };
+        let offset = client.scroll_of(pane_id);
+        if offset == 0 {
+            return;
+        }
+        log::debug!(
+            "server: returning client_id={client_id} pane_id={pane_id} to the live tail from offset={offset}"
+        );
+        client.set_scroll(pane_id, 0);
+        client.prev_scroll_offset = 0;
+        // The client's diff baseline is a scrolled frame, so the repaint
+        // below must be a full one.
+        client.needs_full_render = true;
+    }
+    send_full_render_to_client(
+        client_id,
+        &session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        RenderCtx::default(),
+    )
+    .await;
+}
+
+/// Send this client its own frame when the pane it now focuses is scrolled
+/// back.
+///
+/// `broadcast_full_render` skips such a client, because that path is also the
+/// PTY-output path and repainting there would drag a reader of this pane to the
+/// bottom. A focus or tab move is not output, though: it changes which pane is
+/// highlighted and, on a tab move, the whole screen. Without a frame the border
+/// stays on the pane focus just left and the session reads as frozen, which is
+/// what the snap used to prevent at the cost of the user's place in the
+/// scrollback.
+///
+/// A no-op when the focused pane is at the live tail, because the broadcast the
+/// command already made covered that client.
+async fn repaint_scrolled_requester(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let Some((session_name, pane_id)) = client_input_target(client_id, state, clients).await else {
+        return;
+    };
+    {
+        let mut cls = clients.lock().await;
+        let Some(client) = cls.get_mut(&client_id) else {
+            return;
+        };
+        if client.scroll_of(pane_id) == 0 {
+            return;
+        }
+    }
+    // Diffed rather than sent whole. The baseline holds what this client has on
+    // screen whatever offsets that frame was composited at, so it is a valid
+    // thing to diff against, and a command that moved focus by one pane changes
+    // a border and little else. The case this saves the most is a command that
+    // found nothing to do -- `PaneFocusLeft` against the left edge still reaches
+    // here, and its frame is then empty rather than a repaint of the screen.
+    send_full_render_to_client(
+        client_id,
+        &session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        RenderCtx {
+            diff_against_baseline: true,
+            ..RenderCtx::default()
+        },
+    )
+    .await;
+}
+
+/// The session this client is attached to and the pane that owns its keyboard
+/// input: the popup while it is up, else the active tab's focused pane.
+///
+/// Takes `clients` and RELEASES it before `state`. Holding it across the
+/// `state` lock would be a `clients -> state` order against the
+/// `state -> panes -> clients` every other path here uses, and two tasks on the
+/// two orders deadlock the daemon.
+async fn client_input_target(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> Option<(String, PaneId)> {
+    let session_name = {
+        let cls = clients.lock().await;
+        cls.get(&client_id).and_then(|c| c.session_name.clone())?
+    };
+    let pane_id = {
+        let st = state.lock().await;
+        st.sessions
+            .get(&session_name)
+            .and_then(Session::input_target)?
+    };
+    Some((session_name, pane_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3035,6 +3200,7 @@ async fn handle_command(
                 clients,
                 config,
                 prev_frames,
+                RenderCtx::default(),
             )
             .await;
         }
@@ -3084,6 +3250,7 @@ async fn handle_command(
                 clients,
                 config,
                 prev_frames,
+                RenderCtx::default(),
             )
             .await;
         }
@@ -4372,46 +4539,58 @@ async fn forward_button(
     write_to_pane(panes, pane_id, &bytes).await
 }
 
-/// Apply a scroll delta to the client's server-owned scroll offset, clamp it to
-/// the valid range, and send a render if the offset changed. Shared by the
+/// Apply a scroll delta to this client's offset into ONE pane, clamp it to the
+/// valid range, and send a render if the offset changed. Shared by the
 /// `ScrollDelta` message (keyboard/visual scrolling) and the plain-shell
 /// fallback of `MouseScroll`.
+///
+/// `target_pane` is `None` for a keyboard scroll, which has no coordinates and
+/// therefore means the pane that owns input (the popup while it is up). The
+/// wheel passes the pane its hit test resolved, which is why the wheel over a
+/// pane that does not own input scrolls that pane and not the focused one.
 #[allow(clippy::too_many_arguments)]
 async fn handle_scroll_delta(
     client_id: u64,
     delta: i32,
+    target_pane: Option<PaneId>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    // Apply delta to server-owned scroll offset, clamp to valid range.
-    let (session_name, old_offset) = {
+    let session_name = {
         let cls = clients.lock().await;
-        let sn = cls.get(&client_id).and_then(|c| c.session_name.clone());
-        let so = cls.get(&client_id).map(|c| c.scroll_offset).unwrap_or(0);
-        (sn, so)
+        cls.get(&client_id).and_then(|c| c.session_name.clone())
+    };
+    // Resolved once, then reused for the old offset, the clamp, the
+    // selection-extend and the entry this writes back.
+    let focused_pane_id = match target_pane {
+        Some(p) => Some(p),
+        None => match &session_name {
+            Some(sn) => {
+                let st = state.lock().await;
+                st.sessions.get(sn).and_then(Session::input_target)
+            }
+            None => None,
+        },
+    };
+    let old_offset = {
+        let cls = clients.lock().await;
+        match (cls.get(&client_id), focused_pane_id) {
+            (Some(c), Some(fp)) => c.scroll_of(fp),
+            _ => 0,
+        }
     };
     let new_offset = if delta > 0 {
         old_offset.saturating_add(delta as usize)
     } else {
         old_offset.saturating_sub((-delta) as usize)
     };
-    // The pane that owns input also owns this client's scroll offset (and any
-    // active selection) -- so the popup scrolls while it is up. Resolved once,
-    // reused for the clamp and the selection-extend.
-    let focused_pane_id = match &session_name {
-        Some(sn) => {
-            let st = state.lock().await;
-            st.sessions.get(sn).and_then(Session::input_target)
-        }
-        None => None,
-    };
     // Clamp to max scrollable range
     let max_offset = if let Some(fp) = focused_pane_id {
         let ps = panes.lock().await;
-        // Clamp against the focused pane's inner grid height
+        // Clamp against the scrolled pane's inner grid height
         // (screen.rows == grid.len()), which is exactly the number of content
         // rows blit_screen draws for the pane. Using the client terminal rows
         // here would over-subtract (it ignores the status bar and pane
@@ -4459,12 +4638,12 @@ async fn handle_scroll_delta(
     );
     {
         let mut cls = clients.lock().await;
-        if let Some(client) = cls.get_mut(&client_id) {
-            client.scroll_offset = clamped;
+        if let (Some(client), Some(fp)) = (cls.get_mut(&client_id), focused_pane_id) {
+            client.set_scroll(fp, clamped);
             client.needs_full_render = true;
         }
     }
-    // If a mouse drag-selection is active on the focused pane, extend it to the
+    // If a mouse drag-selection is active on the scrolled pane, extend it to the
     // newly revealed edge so a scroll (mouse wheel or keyboard) grows the
     // selection to cover the scrolled-into text -- mirroring drag-autoscroll. The
     // anchor stays pinned in absolute coords; the moving end follows the scroll,
@@ -4485,6 +4664,7 @@ async fn handle_scroll_delta(
                 clients,
                 config,
                 prev_frames,
+                RenderCtx::default(),
             )
             .await;
         }
@@ -4687,7 +4867,7 @@ async fn handle_mouse_scroll(
             config,
             None,
             None,
-            0,
+            &HashMap::new(),
             &config.compositor_theme(),
         )
         .await;
@@ -4747,8 +4927,20 @@ async fn handle_mouse_scroll(
             } else {
                 -(WHEEL_LINES as i32)
             };
-            log::debug!("server: MouseScroll->remux-scroll client_id={client_id} delta={delta}");
-            handle_scroll_delta(client_id, delta, state, panes, clients, config, prev_frames).await
+            log::debug!(
+                "server: MouseScroll->remux-scroll client_id={client_id} pane_id={target_pane} delta={delta}"
+            );
+            handle_scroll_delta(
+                client_id,
+                delta,
+                Some(target_pane),
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
         }
     }
 }
@@ -4872,7 +5064,7 @@ async fn handle_mouse_click(
             config,
             None,
             None,
-            0,
+            &HashMap::new(),
             &config.compositor_theme(),
         )
         .await;
@@ -4937,6 +5129,8 @@ async fn handle_mouse_click(
                 mark_session_tree_dirty();
                 broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
                     .await;
+                repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames)
+                    .await;
             }
         }
         ClickTarget::Tab(tab_index) => {
@@ -4944,6 +5138,8 @@ async fn handle_mouse_click(
                 let mut st = state.lock().await;
                 let _ = st.goto_tab(&session_name, tab_index);
             }
+            // The clicked tab's focused pane may be one this client scrolled
+            // back, which the broadcast below would skip.
             // `TabTreeEntry::is_active` is in the pushed payload, so a tab-bar
             // click is a tree change exactly as the keyboard routes are -- and
             // this arm has to say so itself. `handle_mouse_click` is reached
@@ -4951,6 +5147,7 @@ async fn handle_mouse_click(
             // whose tail is what marks the tree dirty for every command.
             mark_session_tree_dirty();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+            repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
         }
         ClickTarget::StackLabel(pane_id) => {
             // Activate the stacked pane.
@@ -4971,6 +5168,7 @@ async fn handle_mouse_click(
             // in the pushed payload.
             mark_session_tree_dirty();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+            repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
         }
         ClickTarget::None => {}
     }
@@ -5076,7 +5274,7 @@ async fn handle_mouse_drag(
             config,
             None,
             None,
-            0,
+            &HashMap::new(),
             &config.compositor_theme(),
         )
         .await;
@@ -5155,24 +5353,15 @@ async fn handle_mouse_drag(
     let at_top = end_row == 0;
     let at_bottom = content_height > 0 && end_row == content_height - 1;
 
-    // Auto-scroll only applies when the drag target is the client's FOCUSED
-    // pane -- the per-client scroll_offset belongs to that pane. A non-focused
-    // target always renders at the live view (offset 0).
-    let focused_pane = {
-        let st = state.lock().await;
-        st.sessions
-            .get(&session_name)
-            .and_then(|s| s.tabs.get(s.active_tab).map(|t| t.focused_pane))
-    };
-    let is_focused = focused_pane == Some(target_pane);
-
-    // Read the client's current scroll offset and the state of any in-progress
-    // drag gesture.
+    // The scroll offset that maps these screen coordinates to lines is the one
+    // the client holds for the pane being dragged over, focused or not: a
+    // selection started in a pane scrolled back through history must land on
+    // the text the user can see there.
     let (scroll_offset, gesture) = {
         let cls = clients.lock().await;
         match cls.get(&client_id) {
             Some(c) => (
-                c.scroll_offset,
+                c.scroll_of(target_pane),
                 c.drag
                     .as_ref()
                     .map(|d| (d.pane_id, d.anchor_col, d.anchor_abs)),
@@ -5185,7 +5374,7 @@ async fn handle_mouse_drag(
         Some((pid, _, _)) => pid != target_pane,
         None => true,
     };
-    let base_offset = if is_focused { scroll_offset } else { 0 };
+    let base_offset = scroll_offset;
 
     // Compute the new scroll offset (focused pane only), the anchor in absolute
     // coordinates, the end point in absolute coordinates, and the anchor's row
@@ -5214,11 +5403,11 @@ async fn handle_mouse_drag(
             (col, abs)
         };
 
-        // Edge auto-scroll, focused pane only. A final drag (button release) never
-        // scrolls: the selection must end exactly where the user let go, so the
-        // yanked range matches the highlight shown at release instead of pulling
-        // in one extra edge line.
-        let new_offset = if is_focused && !is_final && may_scroll {
+        // Edge auto-scroll. A final drag (button release) never scrolls: the
+        // selection must end exactly where the user let go, so the yanked range
+        // matches the highlight shown at release instead of pulling in one
+        // extra edge line.
+        let new_offset = if !is_final && may_scroll {
             if at_top {
                 (scroll_offset + 1).min(screen_max_scroll_offset)
             } else if at_bottom {
@@ -5229,7 +5418,7 @@ async fn handle_mouse_drag(
         } else {
             scroll_offset
         };
-        let new_base = if is_focused { new_offset } else { 0 };
+        let new_base = new_offset;
 
         let end_abs = screen.abs_of_row(new_base, end_row);
         let anchor_row_i64 = screen.row_of_abs(new_base, anchor_abs);
@@ -5258,7 +5447,7 @@ async fn handle_mouse_drag(
     let end_col = local_end_x;
 
     // Commit the gesture, the new scroll offset, and the derived selection.
-    let offset_changed = is_focused && new_offset != scroll_offset;
+    let offset_changed = new_offset != scroll_offset;
     {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
@@ -5276,11 +5465,9 @@ async fn handle_mouse_drag(
                 d.end_abs = end_abs;
                 d.end_col = end_col;
             }
-            if is_focused {
-                client.scroll_offset = new_offset;
-                if offset_changed {
-                    client.needs_full_render = true;
-                }
+            if offset_changed {
+                client.set_scroll(target_pane, new_offset);
+                client.needs_full_render = true;
             }
             client.mouse_selection = Some(MouseSelection {
                 pane_id: target_pane,
@@ -5288,11 +5475,10 @@ async fn handle_mouse_drag(
                 end: (end_col, end_row),
             });
             // Arm/disarm the repeating edge-scroll timer. Keep firing only while
-            // resting on a focused-pane edge that still has room to scroll;
-            // disarm exactly at the scrollback top / live bottom so the timer
-            // stops instead of spinning. A final drag never arms.
-            client.autoscroll_repeat = if is_focused
-                && !is_final
+            // resting on a content edge that still has room to scroll; disarm
+            // exactly at the scrollback top / live bottom so the timer stops
+            // instead of spinning. A final drag never arms.
+            client.autoscroll_repeat = if !is_final
                 && may_scroll
                 && ((at_top && new_offset < screen_max_scroll_offset)
                     || (at_bottom && new_offset > 0))
@@ -5364,6 +5550,7 @@ async fn handle_mouse_drag(
         clients,
         config,
         prev_frames,
+        RenderCtx::default(),
     )
     .await;
 
@@ -5469,7 +5656,7 @@ async fn handle_pane_mouse_click(
 ///   geometry; the server has no layout rect for a cell), so there is no
 ///   composite/hit-test step;
 /// * the scroll offset auto-scroll moves is the per-(client, pane) `pane_scroll`
-///   that the wheel already drives, not the foreground `scroll_offset`;
+///   that the wheel already drives, not the foreground `session_scroll`;
 /// * the repaint is a per-subscriber `PaneContent`, not a session frame.
 #[allow(clippy::too_many_arguments)]
 async fn handle_pane_mouse_drag(
@@ -7009,6 +7196,36 @@ async fn invalidate_session_baselines(
     }
 }
 
+/// What the caller of [`send_full_render_to_client`] already knows, so the
+/// render can skip work the caller has done or afford a cheaper message.
+///
+/// `RenderCtx::default()` is "assume nothing": refresh the pane names and send
+/// whole cells. Most callers use it, because for them this is a one-shot
+/// repaint where neither saving pays for a claim that could be wrong.
+#[derive(Clone, Copy, Default)]
+struct RenderCtx {
+    /// Send a `RenderDiff` when the client's saved baseline still describes its
+    /// screen. Set by the two paths that repaint a client the shared broadcast
+    /// skipped: the per-client broadcast, which runs once per PTY output chunk
+    /// for as long as a non-focused pane stays scrolled, and
+    /// [`repaint_scrolled_requester`], whose command often changes a border and
+    /// nothing else.
+    ///
+    /// Safe on any path, because a baseline is only ever stored as a frame the
+    /// client was actually sent. It is left off elsewhere because those callers
+    /// gain nothing measurable from it.
+    diff_against_baseline: bool,
+    /// The caller has already run [`update_auto_pane_names`] for this pass.
+    /// That function sweeps `/proc` for every pane in the tab, so running it
+    /// twice for one frame doubles the syscalls it costs.
+    names_are_fresh: bool,
+    /// The client's `needs_full_render`, when the caller consumed the flag
+    /// instead of leaving it. A diff against a baseline the flag distrusts
+    /// would leave whatever the client has on screen that the baseline does not
+    /// describe.
+    force_full: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_full_render_to_client(
     client_id: u64,
@@ -7018,6 +7235,7 @@ async fn send_full_render_to_client(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    ctx: RenderCtx,
 ) {
     // Render at the consistent session size (min over all attached clients),
     // not the caller's own dimensions, so this client's frames never mix sizes
@@ -7027,7 +7245,7 @@ async fn send_full_render_to_client(
     log::debug!(
         "server: send_full_render_to_client client_id={client_id} session={session_name:?} dims={cols}x{rows}"
     );
-    let (mode, selection, client_search_info, scroll_offset) = {
+    let (mode, selection, client_search_info, client_scroll) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
         let mode = client
@@ -7035,11 +7253,37 @@ async fn send_full_render_to_client(
             .unwrap_or_else(|| "NORMAL".to_string());
         let selection = client.and_then(|c| c.mouse_selection.clone());
         let si = client.and_then(|c| c.search_info);
-        let so = client.map(|c| c.scroll_offset).unwrap_or(0);
-        (mode, selection, si, so)
+        let scroll = client.map(|c| c.session_scroll.clone()).unwrap_or_default();
+        (mode, selection, si, scroll)
+    };
+    // The pane that owns input is the one the wire's single `scroll_offset`
+    // describes: the client gates its `ScrollReset` on that field, and the
+    // reset it then asks for applies to the pane its keystrokes reach. It is
+    // also the pane a `ScrollRender` delta shifts, and the one whose scroll
+    // hides the cursor.
+    let focused_pane = {
+        let st = state.lock().await;
+        st.sessions
+            .get(session_name)
+            .and_then(Session::input_target)
+    };
+    // Clamped exactly as `build_composite` clamps the map it renders, so the
+    // field cannot report a position the frame does not show.
+    let scroll_offset = match focused_pane {
+        Some(fp) => {
+            let ps = panes.lock().await;
+            let max = ps
+                .get(&fp)
+                .map(|p| p.screen.max_scroll_offset())
+                .unwrap_or(0);
+            client_scroll.get(&fp).copied().unwrap_or(0).min(max)
+        }
+        None => 0,
     };
     // Update auto-detected pane names before rendering.
-    update_auto_pane_names(session_name, state, panes).await;
+    if !ctx.names_are_fresh {
+        update_auto_pane_names(session_name, state, panes).await;
+    }
     let (
         cells,
         cursor_x,
@@ -7062,7 +7306,7 @@ async fn send_full_render_to_client(
         config,
         selection.as_ref(),
         client_search_info,
-        scroll_offset,
+        &client_scroll,
         &config.compositor_theme(),
     )
     .await;
@@ -7074,14 +7318,7 @@ async fn send_full_render_to_client(
 
     // Compute viewport_top: the scrollback line index of the first displayed line.
     let viewport_top = {
-        let st = state.lock().await;
-        let fp = st
-            .sessions
-            .get(session_name)
-            .and_then(|s| s.tabs.get(s.active_tab))
-            .map(|t| t.focused_pane);
-        drop(st);
-        if let Some(fp) = fp {
+        if let Some(fp) = focused_pane {
             let ps = panes.lock().await;
             ps.get(&fp)
                 .map(|p| {
@@ -7105,18 +7342,26 @@ async fn send_full_render_to_client(
         }
     };
 
-    // Only save this client's baseline for live view (scroll_offset == 0).
-    // Scrolled frames must not pollute the diff baseline: when the client
-    // returns to the live view it renders here again and repopulates it.
-    if scroll_offset == 0 {
-        let mut pf = prev_frames.lock().await;
-        pf.insert(client_id, cells.clone());
-    }
-
-    let mut cls = clients.lock().await;
-    if let Some(client) = cls.get_mut(&client_id) {
-        let prev_so = client.prev_scroll_offset;
+    // Decide under the `clients` lock and release it before `prev_frames`:
+    // the two are never held together anywhere in this file, which is what
+    // keeps this path from deadlocking against `invalidate_session_baselines`.
+    let plan = {
+        let mut cls = clients.lock().await;
+        let Some(client) = cls.get_mut(&client_id) else {
+            return;
+        };
+        // A `ScrollRender` tells the client to shift the pixels it already has
+        // by a delta. Across a change of focused pane the two offsets belong to
+        // different panes, so their difference describes no movement at all and
+        // would shift one pane's rows by the other's scroll.
+        let same_pane = client.prev_scroll_pane == focused_pane;
+        let prev_so = if same_pane {
+            client.prev_scroll_offset
+        } else {
+            0
+        };
         client.prev_scroll_offset = scroll_offset;
+        client.prev_scroll_pane = focused_pane;
 
         // Detect incremental scroll for ScrollRender optimization.
         let delta = scroll_offset as i64 - prev_so as i64;
@@ -7133,7 +7378,8 @@ async fn send_full_render_to_client(
         // guarantees the client's on-screen buffer is repainted authoritatively
         // at the scroll boundary rather than relying on an accumulated series of
         // incremental shifts to have landed the earliest lines exactly right.
-        let use_scroll_render = scroll_offset > 0
+        let use_scroll_render = same_pane
+            && scroll_offset > 0
             && prev_so > 0
             && viewport_top > 0
             && abs_delta > 0
@@ -7143,9 +7389,14 @@ async fn send_full_render_to_client(
         log::debug!(
             "server: render decision client_id={client_id} scroll_offset={scroll_offset} prev_so={prev_so} delta={delta} use_scroll_render={use_scroll_render}"
         );
+        (client.tx.clone(), use_scroll_render, delta, abs_delta)
+    };
+    let (tx, use_scroll_render, delta, abs_delta) = plan;
 
-        if use_scroll_render {
-            let fpr = focused_pane_rect.unwrap();
+    if use_scroll_render {
+        // `use_scroll_render` already required a rect, so this branch cannot be
+        // reached without one.
+        if let Some(fpr) = focused_pane_rect {
             let px = fpr.x as usize;
             let py = fpr.y as usize;
             let pw = fpr.width as usize;
@@ -7177,7 +7428,7 @@ async fn send_full_render_to_client(
                     .collect()
             };
 
-            let _ = client.tx.send(ServerMessage::ScrollRender {
+            let _ = tx.send(ServerMessage::ScrollRender {
                 pane_x: fpr.x,
                 pane_y: fpr.y,
                 pane_width: fpr.width,
@@ -7194,21 +7445,76 @@ async fn send_full_render_to_client(
                 viewport_top,
                 scroll_offset,
             });
-        } else {
-            let _ = client.tx.send(ServerMessage::FullRender {
-                cells,
-                cursor_x,
-                cursor_y,
-                cursor_visible,
-                cursor_style,
-                focused_pane_rect,
-                application_cursor_keys,
-                bracketed_paste,
-                viewport_top,
-                scroll_offset,
-            });
+            // A `ScrollRender` repaints the focused pane's rect only, so the
+            // rest of this client's screen is still the previous frame. Saving
+            // `cells` as the baseline would claim otherwise. The baseline is
+            // left as it was, which is the last whole frame this client got.
+            return;
         }
     }
+
+    // The baseline must equal what this client has on screen, because the next
+    // broadcast diffs against it. A `FullRender` and a `RenderDiff` both leave
+    // the client showing exactly `cells`, so both save it.
+    let mut pf = prev_frames.lock().await;
+    let baseline = if ctx.diff_against_baseline && !ctx.force_full {
+        pf.get(&client_id)
+    } else {
+        None
+    };
+    // `compute_diff` never clears cells that exist only in a larger previous
+    // frame, so a diff across a size change would leave stale content on the
+    // rows the new frame does not reach.
+    let size_changed = baseline.is_some_and(|prev: &Vec<Vec<RenderCell>>| {
+        prev.len() != cells.len() || prev.first().map(Vec::len) != cells.first().map(Vec::len)
+    });
+    let threshold = cells.len() * cells.first().map(Vec::len).unwrap_or(0) / 2;
+    let msg = match baseline {
+        Some(prev_cells) if !size_changed => {
+            let changes = compute_diff(prev_cells, &cells);
+            if changes.len() > threshold {
+                ServerMessage::FullRender {
+                    cells: cells.clone(),
+                    cursor_x,
+                    cursor_y,
+                    cursor_visible,
+                    cursor_style,
+                    focused_pane_rect,
+                    application_cursor_keys,
+                    bracketed_paste,
+                    viewport_top,
+                    scroll_offset,
+                }
+            } else {
+                ServerMessage::RenderDiff {
+                    changes,
+                    cursor_x,
+                    cursor_y,
+                    cursor_visible,
+                    cursor_style,
+                    focused_pane_rect,
+                    application_cursor_keys,
+                    bracketed_paste,
+                    viewport_top,
+                    scroll_offset,
+                }
+            }
+        }
+        _ => ServerMessage::FullRender {
+            cells: cells.clone(),
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+            focused_pane_rect,
+            application_cursor_keys,
+            bracketed_paste,
+            viewport_top,
+            scroll_offset,
+        },
+    };
+    let _ = tx.send(msg);
+    pf.insert(client_id, cells);
 }
 
 async fn broadcast_full_render(
@@ -7254,10 +7560,10 @@ async fn broadcast_full_render(
         cursor_style,
         focused_pane_rect,
         _hit_regions,
-        _pane_rects,
+        pane_rects,
         application_cursor_keys,
         bracketed_paste,
-        _popup,
+        popup,
     ) = build_composite(
         session_name,
         cols,
@@ -7268,7 +7574,7 @@ async fn broadcast_full_render(
         config,
         selection.as_ref(),
         si,
-        0,
+        &HashMap::new(),
         &config.compositor_theme(),
     )
     .await;
@@ -7295,29 +7601,96 @@ async fn broadcast_full_render(
         }
     };
 
+    // What this client can SEE scrolled. An offset on a pane the frame does not
+    // draw changes nothing in it, so it must not cost that client the shared
+    // frame.
+    //
+    // Taken from the rects `build_composite` just returned rather than from the
+    // layout tree, which makes that true BY CONSTRUCTION instead of by a list
+    // of exceptions: `compute_layout` emits one entry per pane it gave area to,
+    // so a zoom contributes only the zoomed pane and a stack only its active
+    // one. Reading the tree with `all_pane_ids` gets the zoom right and the
+    // stack wrong, and a pane buried in a stack then costs its client the
+    // shared frame for a byte-identical result.
+    let visible_panes: Vec<PaneId> = pane_rects
+        .iter()
+        .map(|(id, _)| *id)
+        .chain(popup.map(|(id, _)| id))
+        .collect();
+    let input_target = {
+        let st = state.lock().await;
+        st.sessions
+            .get(session_name)
+            .and_then(Session::input_target)
+    };
+
     // The composite `cells` is identical for every live client (all at the
     // session render size), so it is computed once above. The diff, however, is
     // per-client: each client is diffed against *its own* baseline so a client
     // whose size differs from another's never diffs against a poisoned frame.
     //
-    // Collect the eligible (attached, non-scrolled) clients and their senders
-    // under the `clients` lock, then drop it before locking `prev_frames`. This
-    // keeps lock ordering uniform (never `clients`+`prev_frames` nested) and
-    // avoids deadlock against `invalidate_session_baselines`. Scrolled clients
-    // are excluded here; they get a FullRender via `send_full_render_to_client`
-    // when they scroll and are refreshed when they return to the live view.
+    // Collect the eligible clients and their senders under the `clients` lock,
+    // then drop it before locking `prev_frames`. This keeps lock ordering
+    // uniform (never `clients`+`prev_frames` nested) and avoids deadlock
+    // against `invalidate_session_baselines`.
+    //
+    // Three outcomes, because a scroll now belongs to a pane rather than to the
+    // client:
+    //
+    // * The pane that owns input is scrolled: skipped, exactly as before. This
+    //   is also the PTY-output path, so repainting here would let a second
+    //   pane's output drag the reader of this one to the bottom.
+    // * Some other visible pane is scrolled: the shared frame would paint that
+    //   pane live and destroy the position, so this client is composited on its
+    //   own, below, and diffed against its own baseline.
+    // * Nothing visible is scrolled: the shared frame, as before.
+    //
+    // KNOWN AND ACCEPTED, and the two cases differ: a scrolled FOCUSED pane
+    // freezes the whole of that client's screen, because it is skipped here
+    // entirely and nothing else repaints it. A scrolled NON-focused pane keeps
+    // repainting, but at its offset FROM THE BOTTOM, so what it shows drifts
+    // upward as that pane's own output grows. tmux pins history to a line
+    // instead of to a distance from the tail. Do not fix either one here.
+    //
+    // The offsets are compared CLAMPED, the way `build_composite` renders them.
+    // An entry can outlive the scrollback it addressed, and the one that does
+    // so silently is a pane that entered an alternate-screen application after
+    // being scrolled: its max is 0 while the entry is not, so an unclamped test
+    // would route its client through the per-client path for a frame identical
+    // to the shared one, and keep doing it until somebody scrolled that pane
+    // again.
+    let visible_max: HashMap<PaneId, usize> = {
+        let ps = panes.lock().await;
+        visible_panes
+            .iter()
+            .filter_map(|id| ps.get(id).map(|p| (*id, p.screen.max_scroll_offset())))
+            .collect()
+    };
+    let clamped_scroll = |c: &ClientConnection, pane_id: PaneId| -> usize {
+        let max = visible_max.get(&pane_id).copied().unwrap_or(0);
+        c.scroll_of(pane_id).min(max)
+    };
+
+    let mut per_client: Vec<(u64, bool)> = Vec::new();
     let targets: Vec<(u64, mpsc::UnboundedSender<ServerMessage>, bool)> = {
         let mut cls = clients.lock().await;
-        cls.iter_mut()
-            .filter(|(_, c)| {
-                c.session_name.as_deref() == Some(session_name) && c.scroll_offset == 0
-            })
-            .map(|(id, c)| {
-                let force_full = c.needs_full_render;
-                c.needs_full_render = false; // consume it
-                (*id, c.tx.clone(), force_full)
-            })
-            .collect()
+        let mut shared = Vec::new();
+        for (id, c) in cls.iter_mut() {
+            if c.session_name.as_deref() != Some(session_name) {
+                continue;
+            }
+            if input_target.is_some_and(|fp| clamped_scroll(c, fp) != 0) {
+                continue;
+            }
+            let force_full = c.needs_full_render;
+            c.needs_full_render = false; // consume it
+            if visible_panes.iter().any(|p| clamped_scroll(c, *p) != 0) {
+                per_client.push((*id, force_full));
+            } else {
+                shared.push((*id, c.tx.clone(), force_full));
+            }
+        }
+        shared
     };
 
     let threshold = cols as usize * rows as usize / 2;
@@ -7398,6 +7771,27 @@ async fn broadcast_full_render(
         let _ = tx.send(msg);
         pf.insert(cid, cells.clone());
     }
+    // Released before the per-client renders: `send_full_render_to_client`
+    // takes this lock itself.
+    drop(pf);
+
+    for (cid, force_full) in per_client {
+        send_full_render_to_client(
+            cid,
+            session_name,
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            RenderCtx {
+                diff_against_baseline: true,
+                names_are_fresh: true,
+                force_full,
+            },
+        )
+        .await;
+    }
 }
 
 /// Update display names for panes that don't have a custom name by
@@ -7469,7 +7863,9 @@ async fn build_composite(
     _config: &Arc<Config>,
     selection: Option<&MouseSelection>,
     search_info: Option<(usize, usize)>,
-    scroll_offset: usize,
+    // This client's per-pane scroll offsets, unclamped. Empty for a caller that
+    // only wants the geometry, which does not depend on them.
+    client_scroll: &HashMap<PaneId, usize>,
     compositor_theme: &crate::config::theme::CompositorTheme,
 ) -> (
     Vec<Vec<RenderCell>>,
@@ -7575,16 +7971,26 @@ async fn build_composite(
         .filter(|id| ps.contains_key(id))
         .map(|id| (id, layout::popup_rect(area, sess.popup_size)));
 
-    // Scroll offsets belong to whichever pane currently owns input: while the
-    // popup is up it scrolls, and the pane behind it stays put.
-    let scroll_target = popup.map(|(id, _)| id).unwrap_or(tab.focused_pane);
-    let scroll_offsets = if scroll_offset > 0 {
-        let mut offsets = HashMap::new();
-        offsets.insert(scroll_target, scroll_offset);
-        offsets
-    } else {
-        HashMap::new()
-    };
+    // The pane that owns input: the popup while it is up, else the focused one.
+    let input_pane = popup.map(|(id, _)| id).unwrap_or(tab.focused_pane);
+
+    // Clamp here rather than on every mutation of the client's map: an offset
+    // can outlive the scrollback it addressed (eviction, or a resize whose
+    // reflow shortens the history), and render time is the one place that
+    // always sees the current bound.
+    let scroll_offsets: HashMap<PaneId, usize> = client_scroll
+        .iter()
+        .filter_map(|(pane_id, offset)| {
+            // The popup is not in the layout, so it is not in `pane_screens`.
+            let max = pane_screens
+                .get(pane_id)
+                .copied()
+                .or_else(|| ps.get(pane_id).map(|p| &p.screen))
+                .map(Screen::max_scroll_offset)?;
+            let clamped = (*offset).min(max);
+            (clamped > 0).then_some((*pane_id, clamped))
+        })
+        .collect();
 
     let (mut cells, mut hit_regions) = composite(
         &effective_layout,
@@ -7751,13 +8157,13 @@ async fn build_composite(
 
     // DECCKM follows input, so it comes from the popup while it owns input.
     let application_cursor_keys = ps
-        .get(&scroll_target)
+        .get(&input_pane)
         .map(|p| p.screen.application_cursor_keys)
         .unwrap_or(false);
     // Bracketed paste is an input mode too, so the same rule applies: a paste
     // goes wherever the keystrokes go, which is the popup while it owns input.
     let bracketed_paste = ps
-        .get(&scroll_target)
+        .get(&input_pane)
         .map(|p| p.screen.bracketed_paste)
         .unwrap_or(false);
 
@@ -7903,6 +8309,7 @@ async fn notify_panes_exited(
     for conn in cls.values_mut() {
         for &(pane_id, exit_code) in exits {
             conn.pane_scroll.remove(&pane_id);
+            conn.session_scroll.remove(&pane_id);
             conn.pane_selection.remove(&pane_id);
             if conn.subscribed_panes.remove(&pane_id).is_some() {
                 let _ = conn.tx.send(ServerMessage::Event(SessionEvent::PaneExited {
