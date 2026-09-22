@@ -35,6 +35,29 @@ Covers `SubscribeAgents` / `UnsubscribeAgents` / `AgentList`:
      exactly that shape, which is what makes the fix testable at all on a
      machine nobody can run macOS on.
 
+ 16. **a pane whose foreground LEADER is a LAUNCHER is listed on the agent it
+     started.** This is the npm-shim bug: `codex` installs as a Node script
+     that `spawn()`s the native binary with stdio inherited and STAYS ALIVE as
+     its parent, so the foreground process group's leader is node -- whose
+     `comm` is `MainThread` from Node 22 on and whose `argv[0]` is `node` --
+     and the real agent is a CHILD inside the same group. Neither of the
+     leader's names can ever match, so `codex` was in the shipped defaults and
+     undetectable at the same time.
+ 17. **and a launcher for something UNLISTED still is not listed.** The walk is
+     a rescue for the panes the leader rule missed, not a licence to list every
+     pane with a process tree under it.
+ 18. **a listed leader outranks a listed descendant.** The leader is tried
+     first, which is what leaves every pane the old rule got right decided by
+     the old rule -- and only a listed leader with a differently listed child
+     can tell the two orders apart.
+ 19. **an agent the user PARKED drops off the list, and comes back on `fg`.**
+     The walk is confined to the foreground process GROUP. A `Ctrl-Z`'d agent
+     is in a group of its own and the pane it left behind shows a shell
+     prompt, so listing it would report the SHELL's silence as the agent's
+     state. Leader-only detection never listed a parked job; this is what keeps
+     that true. The process is asserted ALIVE and stopped first, because "the
+     pane is not listed" is answered just as well by a process that died.
+
 Uses a stand-in `claude` script on `PATH`, so nothing here needs a real agent
 installed.
 
@@ -68,6 +91,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 
@@ -97,6 +121,7 @@ while read line; do
     menu) printf 'Which color do you like?\\n\\n❯ 1. Blue\\n  2. Red\\n  3. Yellow\\n  4. Type something.\\n  5. Chat about this\\n\\nEnter to select · ↑/↓ to navigate · Esc to cancel\\n' ;;
     answered) printf '\\033[2J\\033[H'; printf "⏺ User answered Claude's questions:\\n  ⎿  · Which color do you like? → Blue\\n" ;;
     clear) printf '\\033[2J\\033[H'; printf 'back to work\\n' ;;
+    child) "@BINDIR@/codex" 600 & ;;
     *) printf 'ok\\n' ;;
   esac
 done
@@ -114,6 +139,20 @@ NOT_AGENT = AGENT
 # (`2.1.251`) and `argv[0]` stays `claude`, which is the macOS shape exactly.
 VERSIONED = "2.1.251"
 
+# Cases 16-18's stand-ins, and they cannot be `#!` scripts either -- `comm` for
+# a script is the SCRIPT's name, which would let case 16 pass on the LEADER and
+# prove nothing about the walk. A copied ELF is a real second process with its
+# own `comm`.
+CHILD_AGENT = "codex"
+CHILD_NOT_AGENT = "notanagentchild"
+
+# A wrapper that is NOT an agent, running one as a child and staying alive as
+# its parent -- the shape of an npm shim (`codex`'s `bin/codex.js` is a Node
+# script that `spawn()`s the native binary with stdio inherited and does not
+# exec away). `subprocess.run` blocks, so python3 stays the process group's
+# LEADER for as long as the child runs, and `python3` matches nothing.
+WRAPPER_LAUNCH = "python3 -c 'import subprocess; subprocess.run([\"{path}\", \"600\"])'\n"
+
 # Typed into the pane's shell. `exec -a` is not POSIX and `/bin/sh` is the
 # harness shell, so `python3` sets the argv vector instead.
 VERSIONED_LAUNCH = (
@@ -122,7 +161,7 @@ VERSIONED_LAUNCH = (
 
 CONFIG = """
 [agents]
-commands = ["claude"]
+commands = ["claude", "codex"]
 working_ms = 1000
 scan_rows = 12
 
@@ -156,12 +195,22 @@ def write_bins():
     for name, body in (("claude", AGENT), ("notanagent", NOT_AGENT)):
         p = f"{BINDIR}/{name}"
         with open(p, "w") as f:
-            f.write(body)
+            # The stand-in's `child` arm launches another stand-in by absolute
+            # path, so it has to be told where they live.
+            f.write(body.replace("@BINDIR@", BINDIR))
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     real = shutil.which("sleep")
     if real is None:
         raise SystemExit("case 12 needs a real ELF to copy, and `sleep` is not on PATH")
-    shutil.copy(real, f"{BINDIR}/{VERSIONED}")
+    # Cases 16-18 prove their jobs are ALIVE before asking whether the pane is
+    # listed, and case 17 is the reason: "the pane is not listed" is satisfied
+    # perfectly by a job that never started. Without `pgrep` that liveness
+    # check answers "no processes" to everything and the whole guard is green
+    # on nothing.
+    if shutil.which("pgrep") is None:
+        raise SystemExit("cases 16-18 need `pgrep` to prove their processes are alive")
+    for name in (VERSIONED, CHILD_AGENT, CHILD_NOT_AGENT):
+        shutil.copy(real, f"{BINDIR}/{name}")
     os.environ["PATH"] = BINDIR + ":" + os.environ["PATH"]
 
 
@@ -212,6 +261,94 @@ def first_list(c, timeout=1.5):
 
 def states(agents):
     return {(a["command"], a["state"]) for a in agents}
+
+
+def listed_ids(c):
+    """The pane ids in a fresh sample -- `None` when the server did not reply.
+
+    **`None` and `set()` are different answers and every negative check here
+    depends on the difference.** `first_list` times out to `None`, so a server
+    that answered NOTHING and a server that answered "no agents" reach a caller
+    as the same empty value, and "the pane is not listed" is then satisfied by
+    silence. That is what cases 17 and 19 assert against, so they compare the
+    whole id SET to the panes known to be running rather than testing one pane
+    for absence.
+    """
+    c.send("UnsubscribeAgents")
+    c.drain(0.3)
+    c.send("SubscribeAgents")
+    got = first_list(c)
+    return None if got is None else {a["pane_id"] for a in got}
+
+
+def resubscribe(c):
+    """A FRESH sample of the agent list, taken now.
+
+    The only way to ask about a pane that writes no output: nothing dirties it,
+    every other agent may be Idle, and the pusher parks -- so waiting on the
+    stream waits for a push that is never coming. A subscribe is answered at
+    once with a list collected then and there (case 1), which is what re-reads
+    the pane.
+    """
+    c.send("UnsubscribeAgents")
+    c.drain(0.3)
+    c.send("SubscribeAgents")
+    return first_list(c) or []
+
+
+def poll_for_new_pane(c, before, timeout=8.0):
+    """Re-sample until an agent appears in a pane that is not in `before`.
+
+    Returns `(entry_or_None, last_list_seen)`. `before` is what makes this
+    answerable: without it, "some pane is listed" is satisfied by a pane that
+    has been listed since case 9.
+    """
+    fresh, got = None, []
+    end = time.time() + timeout
+    while time.time() < end and fresh is None:
+        time.sleep(0.5)
+        got = resubscribe(c)
+        fresh = next((a for a in got if a["pane_id"] not in before), None)
+    return fresh, got
+
+
+def pids_matching(pattern):
+    """The pids whose full command line contains `pattern`."""
+    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    return [int(x) for x in r.stdout.split()]
+
+
+def proc_state(pid):
+    """A process's scheduling state letter -- `T` while it is stopped.
+
+    Read from the LAST `)` for the same reason the server does: `comm` is raw
+    and may contain spaces and parentheses.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            line = f.read()
+    except OSError:
+        return None
+    return line[line.rindex(")") + 1 :].split()[0]
+
+
+def proc_pgid(pid):
+    """A process's process-group id, read the way the server reads it."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            line = f.read()
+    except OSError:
+        return None
+    return int(line[line.rindex(")") + 1 :].split()[2])
+
+
+def proc_cmdline(pid):
+    """A process's argv, NUL-separated on disk, joined with spaces."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().decode("utf-8", "replace").replace("\0", " ").strip()
+    except OSError:
+        return ""
 
 
 # `agents: pane_id=<id> <command> -> <State> (<why>)`, the classification line.
@@ -295,6 +432,17 @@ def main():
     finally:
         log2 = srv2.log()
         srv2.kill()
+
+    # No strays. The stand-ins outlive nothing on purpose: `sleep 600` copies
+    # left running would be a 62-harness suite's worth of litter, and the
+    # SIGHUP a closing PTY master sends is not something this run should have
+    # to take on trust.
+    # `-9`: a STOPPED process leaves a SIGTERM pending until something
+    # continues it, and case 19 parks one on purpose.
+    subprocess.run(["pkill", "-9", "-f", BINDIR + "/"], capture_output=True)
+    time.sleep(0.5)
+    left = pids_matching(BINDIR + "/")
+    check(not left, f"the run left no stand-in processes behind ({left})")
 
     check("panicked at" not in log, "no panic in the server log")
     check("panicked at" not in log2, "no panic in the shipped-pattern server log")
@@ -533,10 +681,7 @@ def run(srv):
     # an empty baseline making the "a NEW pane appeared" check answerable by a
     # pane that had been listed since case 9. A subscribe is answered at once
     # (case 1), which is what makes it a reliable snapshot.
-    c.send("UnsubscribeAgents")
-    c.drain(0.5)
-    c.send("SubscribeAgents")
-    before = {a["pane_id"] for a in first_list(c) or []}
+    before = {a["pane_id"] for a in resubscribe(c)}
     # Without this the case is a false green waiting to happen: if the list
     # arrived empty, "some pane_id is not in `before`" would be satisfied by one
     # of the two `claude` panes that have been listed since case 9.
@@ -552,15 +697,7 @@ def run(srv):
     # so a `wait_for` here waits for a push that is never coming and reports the
     # pane missing whether the fix works or not. A subscribe is answered with a
     # fresh sample (case 1), which is the only thing that re-reads this pane.
-    fresh, got = None, []
-    end = time.time() + 8.0
-    while time.time() < end and fresh is None:
-        time.sleep(0.5)
-        c.send("UnsubscribeAgents")
-        c.drain(0.3)
-        c.send("SubscribeAgents")
-        got = first_list(c) or []
-        fresh = next((a for a in got if a["pane_id"] not in before), None)
+    fresh, got = poll_for_new_pane(c, before)
     check(
         fresh is not None,
         f"12 a pane whose process NAME is {VERSIONED!r} is listed on its argv[0] ({got})",
@@ -571,6 +708,194 @@ def run(srv):
     check(
         fresh is not None and fresh["command"] == "claude",
         f"12 and it is reported under the configured spelling, not {VERSIONED!r} ({fresh})",
+    )
+
+    # -- 16: a LAUNCHER is looked through to the agent it started ------------
+    #
+    # The npm-shim shape: `codex` installs as a Node script that `spawn()`s the
+    # native binary with stdio inherited and STAYS ALIVE as its parent, so the
+    # foreground process GROUP's leader is node -- `comm` `MainThread` from Node
+    # 22 on, `argv[0]` `node` -- and the agent is a CHILD inside the same group.
+    # Neither of the leader's names can ever match, and the pane was invisible.
+    # python3 stands in for node: same shape, no toolchain needed.
+    before = {a["pane_id"] for a in resubscribe(c)}
+    c.send({"Command": "TabNew"})
+    time.sleep(0.5)
+    c.drain(0.3)
+    launch = WRAPPER_LAUNCH.format(path=f"{BINDIR}/{CHILD_AGENT}")
+    c.send({"Input": {"data": list(launch.encode())}})
+    fresh, got = poll_for_new_pane(c, before)
+    # Asserted BEFORE the listing check: "the pane is listed" would be a claim
+    # about a job that had already exited, and "the pane is not listed" (case
+    # 17) is satisfied perfectly by a job that never started.
+    alive = pids_matching(f"{BINDIR}/{CHILD_AGENT}")
+    check(
+        len(alive) >= 2,
+        f"16 the wrapper and the agent it started are both running ({alive})",
+    )
+    check(
+        fresh is not None,
+        f"16 a pane whose foreground LEADER is a launcher is listed on its child ({got})",
+    )
+    check(
+        fresh is not None and fresh["command"] == CHILD_AGENT,
+        f"16 and under the configured spelling of the CHILD, not the launcher ({fresh})",
+    )
+
+    # -- 17: ...and a launcher for something unlisted still is not -----------
+    #
+    # The walk must rescue the panes the leader rule missed, not list every pane
+    # with a process tree under it.
+    before = {a["pane_id"] for a in resubscribe(c)}
+    c.send({"Command": "TabNew"})
+    time.sleep(0.5)
+    c.drain(0.3)
+    launch = WRAPPER_LAUNCH.format(path=f"{BINDIR}/{CHILD_NOT_AGENT}")
+    c.send({"Input": {"data": list(launch.encode())}})
+    fresh, _ = poll_for_new_pane(c, before, timeout=4.0)
+    alive = pids_matching(f"{BINDIR}/{CHILD_NOT_AGENT}")
+    check(
+        len(alive) >= 2,
+        f"17 the unlisted wrapper and its unlisted child are both running ({alive})",
+    )
+    # The id SET, not `fresh is None`. A server that replied with nothing at
+    # all -- or did not reply -- satisfies "no new pane" perfectly, so the
+    # negative is stated as "the answer is exactly the panes we already knew
+    # about". Case 12 has always carried this guard; the refactor that gave
+    # these cases their polling helper dropped it.
+    ids = listed_ids(c)
+    check(
+        ids == before,
+        f"17 and the pane running them is not listed, in a reply that still "
+        f"names the others ({ids} vs {before})",
+    )
+    check(fresh is None, f"17 and no new pane appeared while polling ({fresh})")
+
+    # -- 18: the LEADER is tried first, and a match there ends the walk ------
+    #
+    # The order is load-bearing: every pane the old rule got right must stay
+    # decided by the old rule. A listed leader that starts a DIFFERENTLY listed
+    # child is the only shape that can tell the two orders apart.
+    before = {a["pane_id"] for a in resubscribe(c)}
+    c.send({"Command": "TabNew"})
+    time.sleep(0.5)
+    c.drain(0.3)
+    c.send({"Input": {"data": list(b"claude\n")}})
+    fresh, got = poll_for_new_pane(c, before)
+    check(
+        fresh is not None and fresh["command"] == "claude",
+        f"18 the listed leader is listed as itself to begin with ({got})",
+    )
+    if fresh is None:
+        c.close()
+        return
+    leader_pane = fresh["pane_id"]
+    # Now give that leader a listed CHILD, in the same process group.
+    was = set(pids_matching(f"{BINDIR}/{CHILD_AGENT}"))
+    c.send({"Input": {"data": list(b"child\n")}})
+    started, end = set(), time.time() + 5.0
+    while time.time() < end and not started:
+        time.sleep(0.3)
+        started = set(pids_matching(f"{BINDIR}/{CHILD_AGENT}")) - was
+    check(
+        bool(started),
+        f"18 the listed leader really did start a listed child ({started})",
+    )
+    # **And that the child is in the LEADER's process group**, which is what
+    # makes this case discriminate at all. The walk only ever considers
+    # candidates inside the foreground group, so a child that had ended up in
+    # a group of its own would be dropped by the pgid filter and the pane would
+    # report `claude` under EITHER ordering -- a green that proves nothing. The
+    # group leader's pid IS the pgid, so naming it is what identifies the group.
+    child_pid = next(iter(started)) if started else None
+    group_leader = proc_pgid(child_pid) if child_pid else None
+    leader_argv = proc_cmdline(group_leader) if group_leader else ""
+    check(
+        f"{BINDIR}/claude" in leader_argv,
+        f"18 and the child shares the process group led by the stand-in agent "
+        f"(pgid {group_leader}, argv {leader_argv!r})",
+    )
+    got = resubscribe(c)
+    entry = next((a for a in got if a["pane_id"] == leader_pane), None)
+    check(
+        entry is not None and entry["command"] == "claude",
+        f"18 and the pane is still reported as the LEADER, not the child ({entry})",
+    )
+
+    # -- 19: a PARKED agent drops off the list, and comes back --------------
+    #
+    # The walk looks THROUGH a launcher; it does not pick up jobs the user put
+    # down. `Ctrl-Z` moves the agent into a process group of its own and hands
+    # the terminal back to the shell, so the pane's screen is a shell prompt --
+    # and classifying THAT screen reports the shell's silence as the agent's
+    # state. Leader-only detection never listed a parked job, so this case is
+    # the non-regression, not a new rule.
+    was = set(pids_matching(f"{BINDIR}/{CHILD_AGENT} 600"))
+    before = {a["pane_id"] for a in resubscribe(c)}
+    c.send({"Command": "TabNew"})
+    time.sleep(0.5)
+    c.drain(0.3)
+    c.send({"Input": {"data": list(f"{BINDIR}/{CHILD_AGENT} 600\n".encode())}})
+    fresh, got = poll_for_new_pane(c, before)
+    check(
+        fresh is not None and fresh["command"] == CHILD_AGENT,
+        f"19 the agent is listed while it is in the foreground ({got})",
+    )
+    if fresh is None:
+        c.close()
+        return
+    parked_pane = fresh["pane_id"]
+    while_listed = {a["pane_id"] for a in got}
+    started, end = set(), time.time() + 4.0
+    while time.time() < end and not started:
+        time.sleep(0.3)
+        started = set(pids_matching(f"{BINDIR}/{CHILD_AGENT} 600")) - was
+    check(bool(started), f"19 and this case knows which process it is ({started})")
+
+    c.send({"Input": {"data": [0x1a]}})  # Ctrl-Z
+    stopped, end = None, time.time() + 4.0
+    while time.time() < end and stopped != "T":
+        time.sleep(0.3)
+        stopped = proc_state(next(iter(started)))
+    # WITHOUT this the check below is answerable by a process that simply died,
+    # which would prove nothing about the process-group filter.
+    check(
+        stopped == "T",
+        f"19 the parked agent is still ALIVE, and stopped (state {stopped!r})",
+    )
+    # As in case 17: every sample must be a real reply that still names the
+    # other agents, with only this pane missing from it. `parked not in ids`
+    # alone is answered by a server that said nothing.
+    want = while_listed - {parked_pane}
+    # The drop is WAITED for before it is required to hold, because a job that
+    # has just stopped may still own the terminal: the shell takes it back when
+    # it notices the stop, and `state == "T"` is the earlier of those two
+    # instants. Measured rather than assumed -- a probe of this exact shape saw
+    # the stopped job named as the pane's foreground process for a sample or
+    # two before the shell reclaimed it. Waiting costs the case nothing: a
+    # filter that did not work fails BOTH halves, since the wait then times out
+    # and the three samples below still name the pane.
+    end = time.time() + 6.0
+    while time.time() < end and listed_ids(c) != want:
+        time.sleep(0.4)
+    absent = []
+    for _ in range(3):
+        time.sleep(0.6)
+        absent.append(listed_ids(c))
+    check(
+        all(ids == want for ids in absent),
+        f"19 and its pane drops off the list while it is parked, in replies "
+        f"that still name the others ({absent} vs {want})",
+    )
+
+    c.send({"Input": {"data": list(b"fg\n")}})
+    back, end = None, time.time() + 8.0
+    while time.time() < end and back is None:
+        time.sleep(0.5)
+        back = next((a for a in resubscribe(c) if a["pane_id"] == parked_pane), None)
+    check(
+        back is not None and back["command"] == CHILD_AGENT,
+        f"19 and comes straight back when it is resumed ({back})",
     )
 
     c.close()

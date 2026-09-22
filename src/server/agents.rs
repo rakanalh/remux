@@ -8,7 +8,10 @@
 //!   `tcgetpgrp` is what sees past that. It then matches on TWO names -- the
 //!   process name and its `argv[0]` -- because the platforms answer differently
 //!   and Claude Code falls in the gap; see
-//!   [`crate::server::daemon::ProcessNames`]. Deliberately scoped to agent
+//!   [`crate::server::daemon::ProcessNames`]. And when the leader is a LAUNCHER
+//!   rather than the agent -- an npm shim, `npx`, `bunx` -- the job underneath
+//!   it is walked too, because the shim stays alive as the agent's parent and
+//!   neither of ITS names can ever match. Deliberately scoped to agent
 //!   detection -- pane NAMES are untouched, because fixing them the same way
 //!   would rename every pane border in the product and that needs its own
 //!   decision.
@@ -47,6 +50,7 @@ use regex::Regex;
 use crate::config::agents::AgentsConfig;
 use crate::protocol::AgentState;
 use crate::screen::Screen;
+use crate::server::daemon::ProcessNames;
 
 /// Whether this build can detect agents at all.
 ///
@@ -110,21 +114,233 @@ pub const DETECTION_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = 
 /// which is what `AgentEntry::command` promises and what `classify`'s
 /// per-command patterns are scoped against.
 ///
+/// The whole foreground JOB is asked, not just its leader. An agent installed
+/// through npm is a launcher -- `codex` is a Node shim that `spawn()`s the real
+/// binary and stays ALIVE as its parent, so the process group's leader is node
+/// (whose `comm` is `MainThread` from Node 22 on) and the agent is a child
+/// inside the same group. Neither of the leader's names can ever match, and
+/// that pane was invisible. `npx` and `bunx` have the same shape.
+///
+/// The leader is still tried FIRST and on its own, which is load-bearing twice
+/// over: it leaves every pane the old rule got right decided by the old rule,
+/// and it means a pane that matches costs no walk at all. Only a leader that
+/// MISSES pays for [`job_candidates`], and an idle shell pays one empty
+/// `children` read for it.
+///
+/// Listing the launchers in `[agents] commands` instead would be the wrong fix
+/// in the obvious way: `node` names every REPL on the machine.
+///
+/// The walk is confined to the foreground process GROUP. A child that has been
+/// parked -- `Ctrl-Z`, or `&` under an interactive shell -- is in a group of its
+/// own, and the pane it left behind is showing a shell prompt: classifying that
+/// screen would report the SHELL's silence as the agent's state. Leader-only
+/// detection never listed a parked job, so this is what keeps that true.
+///
 /// The log line is the only diagnostic anyone gets for "the panel is empty but
 /// the agent is right there", so it says which names were read rather than just
-/// that nothing matched. See [`log_detection`] for why it is deduplicated
-/// instead of levelled down.
+/// that nothing matched -- and, when a launcher was looked through, which pid
+/// the agent was actually found at. See [`log_detection`] for why it is
+/// deduplicated instead of levelled down.
 pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<String> {
     let pgid = nix::unistd::tcgetpgrp(fd).ok()?;
-    let pid = pgid.as_raw();
-    let names = crate::server::daemon::get_process_names(pid);
-    let matched = rules.match_command(&names.name, names.argv0.as_deref());
-    log_detection(pid, &names, matched);
-    matched.map(|c| c.to_string())
+    let leader_pid = pgid.as_raw();
+    let leader = crate::server::daemon::get_process_names(leader_pid);
+    if let Some(command) = rules.match_command(&leader.name, leader.argv0.as_deref()) {
+        let command = command.to_string();
+        log_detection(leader_pid, &leader, Detected::Leader(&command));
+        return Some(command);
+    }
+    // Only the processes of THIS job. `child_pids` lists every child the
+    // leader has, and a job the user PARKED -- `Ctrl-Z`, or `&` under an
+    // interactive shell -- is in another process group while the pane's screen
+    // shows a shell prompt. Listing it would report the shell's silence as the
+    // agent's state, and leader-only detection never listed a parked job, so
+    // keeping it unlisted is the non-regression rather than a narrowing. A
+    // candidate outside the group is not descended through either: its own
+    // children are in the parked job too.
+    //
+    // `tcgetpgrp` returns the group's ID, so `leader_pid` IS the pgid to match.
+    let in_job = |pid: i32| {
+        crate::server::daemon::child_pids(pid)
+            .into_iter()
+            .filter(|&child| crate::server::daemon::process_pgid(child) == Some(leader_pid))
+            .collect::<Vec<_>>()
+    };
+    // The leader has already been asked, so its own entry is dropped rather
+    // than its names being read a second time.
+    let descendants = job_candidates(leader_pid, in_job).skip(1);
+    let hit = first_match(
+        rules,
+        descendants.map(|pid| (pid, crate::server::daemon::get_process_names(pid))),
+    );
+    match hit {
+        Some((pid, names, command)) => {
+            let command = command.to_string();
+            log_detection(
+                leader_pid,
+                &leader,
+                Detected::Descendant {
+                    pid,
+                    names: &names,
+                    command: &command,
+                },
+            );
+            Some(command)
+        }
+        None => {
+            log_detection(leader_pid, &leader, Detected::Nothing);
+            None
+        }
+    }
 }
 
-/// Say what this pane's process was called and what it was taken for -- ONCE
-/// per distinct answer.
+/// How many generations past the foreground leader the job walk looks.
+///
+/// Three, because a launcher chain is short and a process tree is not: `npx`
+/// -> the shim -> the agent is the deepest real case, and everything below
+/// that is the agent's OWN children (a `git`, a `rg`, a build) which no
+/// configured command should ever be found among.
+const MAX_DEPTH: u32 = 3;
+
+/// How many processes the job walk will name before giving up, the leader
+/// included.
+///
+/// This is a COST bound, not a correctness one. `collect_agents`
+/// (`server/daemon.rs`) runs the walk for every pane at up to ten samples a
+/// second, and a pane whose
+/// leader is a build tool has a wide tree under it -- so the walk is capped
+/// rather than allowed to become a `/proc` sweep driven by whatever the user is
+/// running. A launcher starts ONE agent, so a real hit is in the first few
+/// candidates or it is not there.
+const MAX_CANDIDATES: usize = 32;
+
+/// The foreground job's processes in the order they should be tried: the
+/// leader, then its descendants breadth-first, bounded by [`MAX_DEPTH`] and
+/// [`MAX_CANDIDATES`].
+///
+/// `children` is a parameter rather than a direct `/proc` read so the ORDER and
+/// the BOUNDS can be tested without a process tree to arrange.
+fn job_candidates<F: FnMut(i32) -> Vec<i32>>(leader: i32, children: F) -> JobWalk<F> {
+    JobWalk {
+        frontier: vec![leader],
+        next: 0,
+        depth: 0,
+        yielded: 0,
+        done: false,
+        children,
+    }
+}
+
+/// [`job_candidates`]' iterator. A generation is expanded only when the
+/// previous one has been exhausted, so a caller that stops at the first hit
+/// never pays for the generation below it.
+struct JobWalk<F> {
+    frontier: Vec<i32>,
+    next: usize,
+    depth: u32,
+    yielded: usize,
+    /// Set by every route out, and checked before anything else.
+    ///
+    /// **An explicit flag rather than a state the three exits happen to leave
+    /// behind.** Two of them did leave a self-consistent state and one did not:
+    /// the generation that finds no children has already emptied `frontier`,
+    /// and returning from there left the cursor pointing past the end of an
+    /// empty vec, so the NEXT poll walked straight past the "is this
+    /// generation finished" test and indexed it. `collect()` and a `for` loop
+    /// both stop at the first `None` and never saw it; a fused iterator is
+    /// contractually pollable for ever, and this one runs against panes that
+    /// are closing underneath it.
+    done: bool,
+    children: F,
+}
+
+impl<F> JobWalk<F> {
+    /// End the walk for good, and say so.
+    fn finish(&mut self) -> Option<i32> {
+        self.done = true;
+        None
+    }
+}
+
+/// Declared, not merely true: `done` is what makes it hold, and a caller is
+/// entitled to rely on it.
+impl<F: FnMut(i32) -> Vec<i32>> std::iter::FusedIterator for JobWalk<F> {}
+
+impl<F: FnMut(i32) -> Vec<i32>> Iterator for JobWalk<F> {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<i32> {
+        if self.done {
+            return None;
+        }
+        if self.yielded >= MAX_CANDIDATES {
+            return self.finish();
+        }
+        if self.next == self.frontier.len() {
+            if self.depth >= MAX_DEPTH {
+                return self.finish();
+            }
+            let parents = std::mem::take(&mut self.frontier);
+            let mut deeper = Vec::new();
+            for parent in parents {
+                deeper.extend((self.children)(parent));
+                if deeper.len() >= MAX_CANDIDATES {
+                    break;
+                }
+            }
+            if deeper.is_empty() {
+                return self.finish();
+            }
+            self.frontier = deeper;
+            self.next = 0;
+            self.depth += 1;
+        }
+        let pid = self.frontier[self.next];
+        self.next += 1;
+        self.yielded += 1;
+        Some(pid)
+    }
+}
+
+/// The first candidate that is a configured agent, with the pid it was found
+/// at and the names it went by.
+///
+/// The pid comes back because the CALLER has to know whether the leader or
+/// something under it matched -- that is the whole of the "why is my wrapper
+/// listed" diagnostic. The names come back so the log can say what the matched
+/// process called itself without reading it a second time.
+///
+/// `candidates` is consumed lazily and abandoned at the first hit, which is
+/// what keeps a pane whose leader matches from costing a walk at all.
+fn first_match<I>(rules: &AgentRules, candidates: I) -> Option<(i32, ProcessNames, &str)>
+where
+    I: IntoIterator<Item = (i32, ProcessNames)>,
+{
+    for (pid, names) in candidates {
+        if let Some(command) = rules.match_command(&names.name, names.argv0.as_deref()) {
+            return Some((pid, names, command));
+        }
+    }
+    None
+}
+
+/// What a sample concluded about one pane's foreground job.
+#[derive(Clone, Copy)]
+enum Detected<'a> {
+    /// The foreground leader is itself a configured agent.
+    Leader(&'a str),
+    /// Something the leader started is.
+    Descendant {
+        pid: i32,
+        names: &'a ProcessNames,
+        command: &'a str,
+    },
+    /// Nothing in the job is.
+    Nothing,
+}
+
+/// Say what this pane's foreground job was called and what it was taken for --
+/// ONCE per distinct answer.
 ///
 /// **The dedupe is what makes this loggable at all.** There is no level quiet
 /// enough to hide behind: `main.rs` pins the logger at `Debug` and never reads
@@ -134,30 +350,43 @@ pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<Stri
 /// somebody debugging "the panel is empty" actually wants, and it is the only
 /// thing that can answer "so what DID this platform call it".
 ///
-/// A pane matched on its own name is the ordinary case and says nothing.
+/// A pane matched on the LEADER's own name is the ordinary case and says
+/// nothing.
+///
+/// A descendant that did NOT match is never logged either, and that is the
+/// difference between a diagnostic and a firehose: a pane running a build
+/// cycles through dozens of short-lived pids, each of which would be a new key
+/// and would churn the cache below to uselessness. Only the pane's ANSWER is
+/// logged, once.
 ///
 /// The cache is CLEARED rather than evicted when it fills. It exists to suppress
 /// repeats, not to remember, so the worst a clear costs is one repeated line --
 /// against an eviction policy whose bound would have to be argued for.
-fn log_detection(pid: i32, names: &crate::server::daemon::ProcessNames, matched: Option<&str>) {
+fn log_detection(pid: i32, names: &ProcessNames, outcome: Detected<'_>) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
-    /// One logged answer: the pid, both names it went by, and whether it was
-    /// taken for an agent.
-    type Answer = (i32, String, Option<String>, bool);
-    /// Distinct foreground processes remembered before starting over.
+    /// One logged answer: the leader's pid and both its names, the pid of the
+    /// descendant that rescued it if any, and what the job was taken for.
+    type Answer = (i32, String, Option<String>, Option<i32>, Option<String>);
+    /// Distinct answers remembered before starting over.
     const CAP: usize = 256;
     static SEEN: OnceLock<Mutex<HashSet<Answer>>> = OnceLock::new();
 
-    if matched == Some(names.name.as_str()) {
+    let (child, command) = match outcome {
+        Detected::Leader(command) => (None, Some(command)),
+        Detected::Descendant { pid, command, .. } => (Some(pid), Some(command)),
+        Detected::Nothing => (None, None),
+    };
+    if child.is_none() && command == Some(names.name.as_str()) {
         return;
     }
     let key = (
         pid,
         names.name.clone(),
         names.argv0.clone(),
-        matched.is_some(),
+        child,
+        command.map(|c| c.to_string()),
     );
     let mut seen = SEEN
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -170,15 +399,28 @@ fn log_detection(pid: i32, names: &crate::server::daemon::ProcessNames, matched:
         return;
     }
     drop(seen);
-    match matched {
-        Some(command) => log::debug!(
+    match outcome {
+        Detected::Leader(command) => log::debug!(
             "agents: pid={pid} is {command:?}, matched on argv[0] {:?} -- \
              this platform names the process {:?}",
             names.argv0,
             names.name
         ),
-        None => log::debug!(
-            "agents: pid={pid} is not a configured agent: name={:?} argv0={:?}",
+        Detected::Descendant {
+            pid: child_pid,
+            names: child,
+            command,
+        } => log::debug!(
+            "agents: pid={pid} (name={:?} argv0={:?}) is a launcher for {command:?}, \
+             found at pid={child_pid} (name={:?} argv0={:?})",
+            names.name,
+            names.argv0,
+            child.name,
+            child.argv0
+        ),
+        Detected::Nothing => log::debug!(
+            "agents: pid={pid} is not a configured agent, and nor is anything in its job: \
+             name={:?} argv0={:?}",
             names.name,
             names.argv0
         ),
@@ -610,6 +852,239 @@ mod tests {
         );
     }
 
+    // -- the other shipped agents, from captured screens --------------------
+
+    const OMP_BLOCKED: [&str; 11] = [
+        "╭─ Allow tool: bash ──────╮",
+        "│                                                                                                                                          │",
+        "│ Command: touch /tmp/omp_probe_z                                                                                                          │",
+        "│                                                                                                                                          │",
+        "│   Approve                                                                                                                               │",
+        "│    Deny                                                                                                                                  │",
+        "│                                                                                                                                          │",
+        "│ up/down navigate  enter select  esc cancel                                                                                               │",
+        "│                                                                                                                                          │",
+        "╰──────╯",
+        " ⠴ 47s · 󰪣 qwen3.8:27b ·  ~/Work/Personal/Remux ·  master *6 ·  11.9%/262K 󰁨",
+    ];
+
+    const OMP_ANSWERED: [&str; 10] = [
+        " Tip: Say `orchestrate` in your message to drive a multi-phase task with parallel subagents — watch",
+        "      it glow as you type",
+        "──────",
+        " Update Available",
+        " New version 18.2.9 is available. Run: omp update",
+        "──────",
+        " Run this exact shell command and nothing else, do not explain: touch /tmp/omp_probe_z",
+        "╭──────╮",
+        "│ $ touch /tmp/omp_probe_z                                                                                                                 │",
+        "├─── Output ──────┤",
+    ];
+
+    const OPENCODE_BLOCKED: [&str; 11] = [
+        "  ┃",
+        "  ┃  △ Permission required                                                                              Connect from 75+ providers to",
+        "  ┃    ← Access external directory /tmp                                                                 use other models, including",
+        "  ┃                                                                                                     Claude, GPT, Gemini etc",
+        "  ┃  Patterns",
+        "  ┃                                                                                                     Connect provider        /connect",
+        "  ┃  - /tmp/*",
+        "  ┃",
+        "  ┃                                                                                                 ~/Work/Personal/Remux:master",
+        "  ┃   Allow once   Allow always   Reject           ctrl+f fullscreen  ⇆ select  enter confirm",
+        "  ┃                                                                                                 • OpenCode 1.18.32",
+    ];
+
+    const OPENCODE_ANSWERED: [&str; 10] = [
+        "  ┃",
+        "  ┃  (no output)                                                                                    LSP",
+        "  ┃                                                                                                 LSPs are disabled",
+        "     Done.",
+        "     ▣  Build · Big Pickle · 9.4s",
+        "                                                                                                      ⬖ Getting started                ✕",
+        "                                                                                                        OpenCode includes free models",
+        "                                                                                                        so you can start immediately.",
+        "                                                                                                        Connect from 75+ providers to",
+        "                                                                                                        use other models, including",
+    ];
+
+    /// The four approval dialog titles present in the installed codex 0.156.0
+    /// native binary, read with `strings`, plus the decline option its modal
+    /// draws.
+    ///
+    /// **These are BINARY strings, not a captured screen, and the difference
+    /// matters.** codex could not be driven to a real approval on either
+    /// machine available: this Linux box is refused by the API for every model
+    /// (`The 'gpt-5-codex' model is not supported when using Codex with a
+    /// ChatGPT account.`) and the Mac hangs. So unlike `omp` and `opencode`
+    /// below, nobody has watched one of these prompts appear OR clear. See
+    /// `the_shipped_codex_patterns_are_binary_strings_never_a_watched_prompt`.
+    ///
+    /// Two further strings were extracted and deliberately NOT made patterns:
+    /// `" needs your approval."` and ``"Yes, and don't ask again for commands
+    /// that start with `"``. The first is ordinary enough to appear in an
+    /// agent's own prose, and a false `NeedsInput` never decays; the second is
+    /// an option of the same modal the titles already catch.
+    const CODEX_APPROVALS: [&str; 5] = [
+        "Would you like to run the following command?",
+        "Would you like to make the following edits?",
+        "Would you like to grant these permissions?",
+        "Would you like to send input to terminal",
+        "No, and tell Codex what to do differently",
+    ];
+
+    /// omp's approval box is a blocked agent, with zero configuration.
+    ///
+    /// Captured live from omp 18.1.19. The pattern keys on the box TITLE, which
+    /// names the tool being approved (`bash`, `edit`, `write`), so one rule
+    /// covers every tool kind rather than one per kind.
+    #[test]
+    fn the_shipped_patterns_recognise_omps_real_approval_box() {
+        let r = shipped();
+        let screen: Vec<String> = OMP_BLOCKED.iter().map(|s| s.to_string()).collect();
+        let v = r.classify("omp", &screen, Duration::from_secs(30));
+        assert_eq!(v.state, AgentState::NeedsInput, "{v:?}");
+        assert_eq!(v.reason, Reason::Pattern("omp-allow".to_string()));
+    }
+
+    /// ...and the ANSWERED screen is not. MEASURED, not argued: the same pane
+    /// was re-snapshotted at +4s, +8s, +12s and +16s after Enter on `Approve`,
+    /// and the whole box is gone from every one of them. This is what stops the
+    /// pattern pinning a pane red for the rest of the session.
+    #[test]
+    fn the_answered_omp_box_is_not_a_blocked_signal() {
+        let r = shipped();
+        let screen: Vec<String> = OMP_ANSWERED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            r.classify("omp", &screen, Duration::from_secs(30)).state,
+            AgentState::Idle
+        );
+    }
+
+    /// opencode's permission prompt, captured live from opencode 1.18.32.
+    ///
+    /// Two patterns, and each is asserted ON ITS OWN below, because either can
+    /// scroll out of the window without the other: the header sits several
+    /// lines above the options row.
+    #[test]
+    fn the_shipped_patterns_recognise_opencodes_real_permission_prompt() {
+        let r = shipped();
+        let screen: Vec<String> = OPENCODE_BLOCKED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            r.classify("opencode", &screen, Duration::from_secs(30))
+                .state,
+            AgentState::NeedsInput
+        );
+        for (line, want) in [
+            (OPENCODE_BLOCKED[1], "opencode-permission"),
+            (OPENCODE_BLOCKED[9], "opencode-allow"),
+        ] {
+            let v = r.classify("opencode", &[line.to_string()], Duration::from_secs(30));
+            assert_eq!(v.state, AgentState::NeedsInput, "{line:?}");
+            assert_eq!(v.reason, Reason::Pattern(want.to_string()), "{line:?}");
+        }
+        // The options row COLLAPSED, which is what buys `\s+` in that pattern.
+        //
+        // The width sweep does NOT cover this and cannot: rewrapping a line
+        // changes where the rows break, never the characters, so
+        // `visible_bottom` hands the pattern back the original run of spaces at
+        // every width and a literal-space pattern sweeps green. The run between
+        // the options is LAYOUT rather than content, and only a differently
+        // spaced line can tell the two pattern styles apart. (One capture at
+        // one width cannot show what opencode does to that gap; the pattern
+        // simply has no reason to depend on it.) Verified by mutation: a
+        // literal-space `opencode-allow` fails here and nowhere else in the
+        // suite.
+        let collapsed = "  \u{2503}  Allow once Allow always Reject  enter confirm";
+        assert_eq!(
+            r.classify(
+                "opencode",
+                &[collapsed.to_string()],
+                Duration::from_secs(30)
+            )
+            .state,
+            AgentState::NeedsInput,
+            "the options row must match however the agent spaced it"
+        );
+    }
+
+    /// ...and the ANSWERED screen is not. MEASURED the same way: re-snapshotted
+    /// at +4s through +16s, and both the header and the options row are gone.
+    #[test]
+    fn the_answered_opencode_permission_is_not_a_blocked_signal() {
+        let r = shipped();
+        let screen: Vec<String> = OPENCODE_ANSWERED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            r.classify("opencode", &screen, Duration::from_secs(30))
+                .state,
+            AgentState::Idle
+        );
+    }
+
+    /// The codex patterns, against the strings in the shipped binary.
+    ///
+    /// **There is no answered-screen counterpart to this test, and there is not
+    /// supposed to be.** Every other agent here has one because its prompt was
+    /// watched appearing and then clearing. codex could not be driven to an
+    /// approval at all (see [`CODEX_APPROVALS`]), so that these strings
+    /// DISAPPEAR once answered is INFERRED from how the other agents behave,
+    /// not observed. If codex ever becomes runnable here, the missing test is
+    /// the answered screen -- and if it turns out a title lingers, these
+    /// patterns pin the pane red for the session and must be narrowed.
+    #[test]
+    fn the_shipped_codex_patterns_are_binary_strings_never_a_watched_prompt() {
+        let r = shipped();
+        for line in CODEX_APPROVALS {
+            let v = r.classify("codex", &[line.to_string()], Duration::from_secs(30));
+            assert_eq!(v.state, AgentState::NeedsInput, "{line:?} -> {v:?}");
+        }
+    }
+
+    /// The old `codex-yn` pattern (`\[y(es)?/n(o)?\]`) is GONE, and this pins
+    /// it out.
+    ///
+    /// codex prints no such prompt -- nothing of the shape is in its binary --
+    /// so it could only ever have fired on something else's output passing
+    /// through the pane. That is not a harmless false positive: `NeedsInput`
+    /// never decays on silence, so one `[y/n]` from a script, a diff or a test
+    /// log pinned that pane red for the rest of the session.
+    #[test]
+    fn a_yes_no_prompt_no_longer_pins_a_codex_pane_red() {
+        let r = shipped();
+        for line in ["Continue? [y/N]", "overwrite? [yes/no]"] {
+            assert_eq!(
+                r.classify("codex", &[line.to_string()], Duration::from_secs(30))
+                    .state,
+                AgentState::Idle,
+                "{line:?}"
+            );
+        }
+    }
+
+    /// One agent's prompt must never decide another agent's pane. The patterns
+    /// are command-scoped, and these two look nothing alike, so a cross hit
+    /// would mean a pattern had been shipped unscoped.
+    #[test]
+    fn one_agents_prompt_does_not_decide_another_agents_pane() {
+        let r = shipped();
+        let omp: Vec<String> = OMP_BLOCKED.iter().map(|s| s.to_string()).collect();
+        let oc: Vec<String> = OPENCODE_BLOCKED.iter().map(|s| s.to_string()).collect();
+        for command in ["opencode", "claude", "codex"] {
+            assert_eq!(
+                r.classify(command, &omp, Duration::from_secs(30)).state,
+                AgentState::Idle,
+                "omp's box decided a {command} pane"
+            );
+        }
+        for command in ["omp", "claude", "codex"] {
+            assert_eq!(
+                r.classify(command, &oc, Duration::from_secs(30)).state,
+                AgentState::Idle,
+                "opencode's prompt decided a {command} pane"
+            );
+        }
+    }
+
     #[test]
     fn recent_output_reads_as_working() {
         let r = rules(Vec::new(), 500);
@@ -980,17 +1455,33 @@ mod tests {
     #[test]
     fn every_shipped_question_matches_at_every_pane_width() {
         let r = shipped();
-        for question in CLAUDE_QUESTIONS {
+        // Every agent's captured blocked line, not just claude's. A pattern
+        // written against a wide capture and matched with literal runs of
+        // SPACES passes at the width it was captured at and fails everywhere
+        // else, because a narrow pane rewraps the row -- which is exactly why
+        // `opencode-allow` joins its three options with `\s+`.
+        let mut lines: Vec<(&str, &str)> =
+            CLAUDE_QUESTIONS.iter().map(|q| ("claude", *q)).collect();
+        lines.push(("omp", OMP_BLOCKED[0]));
+        lines.push(("opencode", OPENCODE_BLOCKED[1]));
+        lines.push(("opencode", OPENCODE_BLOCKED[9]));
+        for line in CODEX_APPROVALS {
+            lines.push(("codex", line));
+        }
+        for (command, question) in lines {
             for cols in 8..=60u16 {
-                let mut screen = Screen::new(cols, 12, 100);
+                // 40 rows, not 12. `visible_bottom` reads the LIVE grid and
+                // never the scrollback, and a 130-column capture rewrapped to
+                // eight columns is seventeen rows -- so on a short screen the
+                // head of the line scrolls into history and this test measures
+                // scrollback rather than the rewrapping it is about. (A pattern
+                // genuinely cannot match a prompt that has scrolled away; that
+                // is the design, and it is not what is under test here.)
+                let mut screen = Screen::new(cols, 40, 100);
                 screen.process_output(question.as_bytes());
                 assert_eq!(
-                    r.classify(
-                        "claude",
-                        &r.visible_bottom(&screen),
-                        Duration::from_secs(60)
-                    )
-                    .state,
+                    r.classify(command, &r.visible_bottom(&screen), Duration::from_secs(60))
+                        .state,
                     AgentState::NeedsInput,
                     "{question:?} read as not-blocked at {cols} columns: {:?}",
                     r.visible_bottom(&screen)
@@ -1076,5 +1567,153 @@ mod tests {
         let mut screen = Screen::new(20, 3, 100);
         screen.process_output(b"a\r\nb\r\nc");
         assert_eq!(r.visible_bottom(&screen).len(), 3);
+    }
+
+    // -- the job walk -----------------------------------------------------
+
+    /// A synthetic process tree, so the walk can be tested without a `/proc`.
+    fn tree<'a>(edges: &'a [(i32, &'a [i32])]) -> impl Fn(i32) -> Vec<i32> + 'a {
+        move |pid| {
+            edges
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, kids)| kids.to_vec())
+                .unwrap_or_default()
+        }
+    }
+
+    fn names(name: &str, argv0: Option<&str>) -> ProcessNames {
+        ProcessNames {
+            name: name.to_string(),
+            argv0: argv0.map(|a| a.to_string()),
+        }
+    }
+
+    #[test]
+    fn the_leader_is_the_first_candidate_and_the_rest_are_breadth_first() {
+        let kids = tree(&[(1, &[2, 3]), (2, &[4]), (3, &[5])]);
+        let got: Vec<i32> = job_candidates(1, kids).collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// The walk is bounded because it runs for EVERY pane at up to 10 Hz. A
+    /// pane whose leader is a build tool has a wide, deep tree underneath it.
+    #[test]
+    fn the_walk_stops_at_the_depth_bound() {
+        // A chain, one child each: 1 -> 2 -> 3 -> 4 -> 5.
+        let kids = tree(&[(1, &[2]), (2, &[3]), (3, &[4]), (4, &[5])]);
+        let got: Vec<i32> = job_candidates(1, kids).collect();
+        assert_eq!(got, vec![1, 2, 3, 4], "depth 4 is past the bound");
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_candidate_bound() {
+        let wide: Vec<i32> = (100..200).collect();
+        let kids = |pid: i32| if pid == 1 { wide.clone() } else { Vec::new() };
+        let got: Vec<i32> = job_candidates(1, kids).collect();
+        assert_eq!(got.len(), MAX_CANDIDATES);
+        assert_eq!(got[0], 1, "the leader is still first");
+    }
+
+    /// A leader with nothing under it costs ONE children lookup, not a sweep.
+    #[test]
+    fn a_childless_leader_ends_the_walk() {
+        let got: Vec<i32> = job_candidates(1, |_| Vec::new()).collect();
+        assert_eq!(got, vec![1]);
+    }
+
+    /// **Polled PAST exhaustion, on every route out.**
+    ///
+    /// `collect()` stops at the first `None` and so cannot see this, which is
+    /// why `a_childless_leader_ends_the_walk` passed over a walk that PANICKED
+    /// on its second `None`: the generation that found no children had already
+    /// emptied `frontier` while leaving the cursor where it was, so the poll
+    /// after it indexed an empty vec. The childless route is the ordinary one
+    /// -- every pane whose leader misses and has no children takes it, on every
+    /// sample -- and this runs on a timer against panes that are closing, where
+    /// a panic is the one thing the module promises not to do.
+    #[test]
+    fn the_walk_is_fused_on_every_route_out() {
+        /// One way for the walk to run out.
+        type Route = (&'static str, Box<dyn Fn(i32) -> Vec<i32>>);
+        let routes: [Route; 3] = [
+            // Ran out of children.
+            ("childless", Box::new(|_| Vec::new())),
+            // Ran out of depth.
+            ("deep", Box::new(|pid| vec![pid + 1])),
+            // Ran out of candidates.
+            (
+                "wide",
+                Box::new(|pid| {
+                    if pid == 1 {
+                        (100..300).collect()
+                    } else {
+                        Vec::new()
+                    }
+                }),
+            ),
+        ];
+        for (name, children) in routes {
+            let mut walk = job_candidates(1, children);
+            while walk.next().is_some() {}
+            for poll in 0..3 {
+                assert_eq!(walk.next(), None, "{name}: poll {poll} past the end");
+            }
+        }
+    }
+
+    /// THE npm-shim BUG, as a unit test.
+    ///
+    /// `codex` installs as a Node shim that `spawn()`s the real binary and
+    /// stays alive as its parent, so the foreground process GROUP's leader is
+    /// node -- whose `comm` is `MainThread` on Node 22+ and whose `argv[0]` is
+    /// `node`. Neither can ever match, and the pane was invisible.
+    #[test]
+    fn a_wrapper_is_recognised_by_the_job_it_started() {
+        let r = shipped();
+        let candidates = vec![
+            (10, names("MainThread", Some("node"))),
+            (11, names("codex", Some("/opt/codex/bin/codex"))),
+        ];
+        let (pid, _, command) =
+            first_match(&r, candidates).expect("the child is a configured agent");
+        assert_eq!(pid, 11);
+        assert_eq!(command, "codex");
+    }
+
+    /// The leader is tried first, and a match there ends it -- the walk is a
+    /// rescue for panes the old rule missed, never a re-decision of one it
+    /// already got right.
+    #[test]
+    fn a_configured_leader_outranks_a_configured_descendant() {
+        let r = shipped();
+        let candidates = vec![(10, names("claude", None)), (11, names("codex", None))];
+        let (pid, _, command) = first_match(&r, candidates).expect("the leader is an agent");
+        assert_eq!((pid, command), (10, "claude"));
+    }
+
+    #[test]
+    fn a_job_of_unconfigured_processes_is_not_an_agent() {
+        let r = shipped();
+        let candidates = vec![
+            (10, names("python3", Some("python3"))),
+            (11, names("notanagent", Some("notanagent"))),
+        ];
+        assert!(first_match(&r, candidates).is_none());
+    }
+
+    /// Reading a process's names is two `/proc` reads, so the candidates must
+    /// be consumed LAZILY: a hit on the leader must not cost a walk.
+    #[test]
+    fn no_candidate_past_the_hit_is_ever_read() {
+        use std::cell::Cell;
+        let r = shipped();
+        let reads = Cell::new(0);
+        let candidates = [10, 11, 12].into_iter().map(|pid| {
+            reads.set(reads.get() + 1);
+            (pid, names(if pid == 10 { "claude" } else { "codex" }, None))
+        });
+        assert!(first_match(&r, candidates).is_some());
+        assert_eq!(reads.get(), 1, "the walk stopped at the first hit");
     }
 }

@@ -656,7 +656,8 @@
 #                 dim is idle. `j`/`k`/`g`/`G` move and Enter jumps to that
 #                 pane, wherever it is. Configure WHICH commands count as an
 #                 agent, and what a blocked one looks like, under `[agents]`
-#                 below — the defaults cover `claude` and `codex` with no setup.
+#                 below — the defaults cover `claude`, `codex`, `omp` and
+#                 `opencode` with no setup.
 #   placeholder — a fixed test fixture that paints its own name and size. Useful
 #                 for checking geometry; there is no reason to configure it.
 #
@@ -765,7 +766,12 @@
 #
 #   commands   — the foreground commands that count as an agent. A pane running
 #                anything else is not listed at all.
-#                (default: ["claude", "codex", "aider", "gemini"])
+#                (default: ["claude", "codex", "aider", "gemini", "omp",
+#                "opencode"]). Name the AGENT, never the launcher that starts
+#                it: an npm- or bun-installed agent runs as a `node`/`bun`
+#                shim that stays alive as the agent's parent, and the job under
+#                the shim is walked for you. Listing `node` would put every
+#                REPL on the machine in the panel.
 #   working_ms — how recently output must have reached a pane for it to read as
 #                "working" (default: 500).
 #   scan_rows  — how many LOGICAL LINES up from the bottom of the pane's LIVE
@@ -863,14 +869,16 @@
 # survive being cut in half by a narrow pane.
 #
 # Detection reads the pane's foreground process group and then asks the OS to
-# name that process — `/proc/<pid>/comm` on Linux, `sysinfo` on macOS. Both work;
+# name that process — `/proc/<pid>/comm` on Linux, `sysinfo` on macOS — and, if
+# that process is a launcher rather than an agent, the processes it started.
+# Both platforms work;
 # every other platform cannot, and says so rather than pretending: the panel
 # shows "<server>: no detection" instead of an empty list that would read
 # as "you have no agents running". It is the SERVER's platform that decides, so
 # a macOS client attached to a Linux server (or the reverse) detects fine.
 #
 # [agents]
-# commands = ["claude", "codex", "aider", "gemini"]
+# commands = ["claude", "codex", "aider", "gemini", "omp", "opencode"]
 # working_ms = 500
 # scan_rows = 24
 #
@@ -883,6 +891,41 @@
 #   name = "claude-select"
 #   command = "claude"
 #   regex = "(?i)enter to select.*esc to cancel"
+#
+#   [[agents.pattern]]
+#   name = "codex-approve"
+#   command = "codex"
+#   regex = "(?i)would you like to (run|make|grant|send)"
+#
+#   [[agents.pattern]]
+#   name = "codex-decline"
+#   command = "codex"
+#   regex = "(?i)no, and tell codex what to do differently"
+#
+#   [[agents.pattern]]
+#   name = "omp-allow"
+#   command = "omp"
+#   regex = "(?i)allow tool:"
+#
+#   [[agents.pattern]]
+#   name = "opencode-permission"
+#   command = "opencode"
+#   regex = "(?i)permission required"
+#
+#   [[agents.pattern]]
+#   name = "opencode-allow"
+#   command = "opencode"
+#   regex = "(?i)allow once\\s+allow always\\s+reject"
+#
+# Two grades of evidence, and the line does not run along agent names.
+# claude-select, omp-allow and the two opencode patterns were matched against a
+# real pane — blocked, and then again after answering — so both that they fire
+# and that they STOP are observed. claude-proceed and the two codex patterns
+# were read out of the shipped binaries with `strings`: the wordings are real,
+# but nobody here has watched one of those prompts appear or clear, because
+# codex could not be driven as far as an approval. If a pane ever sticks on
+# "needs input", that is the pattern to correct — a state that never decays is
+# the price of matching a prompt that never leaves the screen.
 
 # -----------------------------------------------------------------------------
 # REMOTES

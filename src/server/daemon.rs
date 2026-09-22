@@ -268,6 +268,177 @@ pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
     }
 }
 
+/// The pids `pid` is the direct parent of.
+///
+/// Used to look THROUGH a launcher: an npm-installed agent is a Node shim that
+/// `spawn()`s the real binary and stays alive as its parent, so the foreground
+/// process group's LEADER is the shim and the agent is a child inside the same
+/// group. [`crate::server::agents::foreground_command`] walks these; the bounds
+/// on that walk live there, because they are a property of the sampling loop
+/// rather than of the lookup.
+///
+/// An empty vec means "no children, or this platform will not say", and the two
+/// are deliberately not distinguished: every caller does the same thing with
+/// both, which is to stop.
+///
+/// # Linux
+///
+/// `/proc/<pid>/task/<tid>/children`, for EVERY thread -- a multi-threaded
+/// parent may have forked from a worker thread, and that child is listed only
+/// under the thread that made it. The file is `CONFIG_PROC_CHILDREN`-gated, so
+/// a kernel built without it silently reports nothing and detection falls back
+/// to the leader-only behaviour it had before this existed.
+///
+/// **Bounded, in READS as well as in results.** The caller's walk caps how many
+/// processes it will NAME, which says nothing about how many files were opened
+/// to find them: a leader with 120 threads is 120 `children` reads for every
+/// pane, on every sample, at up to ten a second -- and it is the output-heavy
+/// panes (a build, a test run, a browser) that have both the thread count and
+/// the pusher ticking. So both the number of threads consulted and the number
+/// of children collected stop at [`CHILD_CAP`], the same shape the macOS arm
+/// already had.
+///
+/// The cost of the cap is that a child forked from the 65th thread of a
+/// 65-thread launcher is not seen. No shipped agent looks like that -- the ones
+/// measured all spawn from the main thread -- and an unbounded per-sample sweep
+/// of another program's thread list is the worse of the two risks.
+#[cfg(target_os = "linux")]
+pub(crate) fn child_pids(pid: i32) -> Vec<i32> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for task in tasks.flatten().take(CHILD_CAP) {
+        let Ok(raw) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        out.extend(
+            raw.split_ascii_whitespace()
+                .filter_map(|t| t.parse::<i32>().ok()),
+        );
+        if out.len() >= CHILD_CAP {
+            out.truncate(CHILD_CAP);
+            break;
+        }
+    }
+    out
+}
+
+/// How many children [`child_pids`] will report, and -- on Linux -- how many
+/// threads it will ask. Both platforms stop here.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const CHILD_CAP: usize = 64;
+
+/// See the Linux variant. macOS answers this directly, through `libproc`.
+///
+/// `proc_listchildpids` takes a buffer size in BYTES and returns a COUNT of
+/// pids (`libproc.c` divides the byte count by `sizeof(int)` before returning
+/// it, exactly as `proc_listallpids` does -- which is how `sysinfo` reads it,
+/// `sysinfo-0.35.2/src/unix/apple/macos/process.rs:783`). The buffer is
+/// ZEROED and the result filtered rather than trusted verbatim, so a kernel
+/// that returned bytes instead would leave zeros to be dropped rather than
+/// uninitialised memory to be read as a pid.
+///
+/// The buffer is fixed: the caller's walk is bounded far below this, so a
+/// process with hundreds of children is truncated on purpose rather than
+/// retried with a bigger allocation.
+///
+/// Never RUN on a Mac, only type-checked -- the same standing as
+/// `get_process_names`' macOS arm.
+#[cfg(target_os = "macos")]
+pub(crate) fn child_pids(pid: i32) -> Vec<i32> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    let mut buf = [0i32; CHILD_CAP];
+    let n = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            std::mem::size_of_val(&buf) as libc::c_int,
+        )
+    };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let n = (n as usize).min(CHILD_CAP);
+    buf[..n].iter().copied().filter(|p| *p > 0).collect()
+}
+
+/// Fallback for platforms with no known way to list a process's children. See
+/// [`crate::server::agents::DETECTION_SUPPORTED`]: nothing could match anyway.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn child_pids(_pid: i32) -> Vec<i32> {
+    Vec::new()
+}
+
+/// The process GROUP `pid` belongs to, or `None` if it cannot be read.
+///
+/// This is what keeps the job walk to the job: a child of the foreground
+/// leader is only part of the same JOB if it is in the same process group, and
+/// one the user has parked (`Ctrl-Z`, or `&` under an interactive shell) is
+/// not. See [`crate::server::agents::foreground_command`] for why a parked
+/// agent must stay unlisted.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_pgid(pid: i32) -> Option<i32> {
+    if pid <= 0 {
+        return None;
+    }
+    pgid_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The `pgrp` field of a `/proc/<pid>/stat` line: `pid (comm) state ppid pgrp`.
+///
+/// **Parsed from the LAST `)`, never by splitting the line.** `comm` is up to
+/// 15 bytes of whatever the process last called itself, written raw and
+/// unescaped -- it may contain spaces, parentheses or both, and a Node worker
+/// thread or a browser helper routinely does. Counting whitespace fields from
+/// the start, or stopping at the first `)`, reads some byte of the NAME as the
+/// pgid; that answer matches no real group, so every descendant would be
+/// filtered out and the walk would quietly stop finding anything. A line that
+/// does not have the shape is refused rather than guessed at.
+#[cfg(target_os = "linux")]
+fn pgid_from_stat(line: &str) -> Option<i32> {
+    let mut fields = line[line.rfind(')')? + 1..].split_whitespace();
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+/// See the Linux variant. macOS answers from `libproc`'s BSD info block.
+///
+/// `proc_pidinfo` returns the number of bytes it wrote, so a short answer is a
+/// failure and is treated as one rather than read out of a half-filled struct.
+/// Never RUN on a Mac, only type-checked.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_pgid(pid: i32) -> Option<i32> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let wrote = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (wrote == size).then_some(info.pbi_pgid as i32)
+}
+
+/// Fallback for platforms that cannot say. `None` filters every candidate out,
+/// which is the same answer [`child_pids`] already gives there.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_pgid(_pid: i32) -> Option<i32> {
+    None
+}
+
 /// Return the runtime directory used for the socket and pid files.
 fn runtime_dir() -> PathBuf {
     dirs::runtime_dir()
@@ -9610,5 +9781,43 @@ mod tests {
     #[test]
     fn saved_custom_not_restorable_when_none() {
         assert!(!saved_custom_is_restorable(&None, &[1, 2]));
+    }
+
+    /// The `/proc` parser, which only exists on Linux.
+    #[cfg(target_os = "linux")]
+    mod stat {
+        use super::super::pgid_from_stat;
+
+        /// `/proc/<pid>/stat`, as the kernel writes it: pid, comm in parentheses,
+        /// then state, ppid and pgrp.
+        #[test]
+        fn the_stat_line_gives_up_its_process_group() {
+            // state R, ppid 693892, pgrp 693891 -- the THIRD field after the
+            // comm, checked against `ps -o pgid=` on a live process.
+            let line = "693899 (rtk) R 693892 693891 693890 0 -1 4194304 501 0";
+            assert_eq!(pgid_from_stat(line), Some(693891));
+        }
+
+        /// **The parse starts at the LAST `)`, and that is the whole of it.**
+        ///
+        /// `comm` is up to 15 bytes of whatever the process called itself, and it
+        /// is not escaped or quoted: a Node worker thread, a browser tab or
+        /// anything else may put a space, a parenthesis or both in there. Splitting
+        /// on whitespace, or on the FIRST `)`, reads the wrong field -- and the
+        /// wrong field is a pgid that matches nothing, so every descendant is
+        /// filtered out and the walk silently stops finding anything.
+        #[test]
+        fn a_comm_containing_spaces_and_a_paren_does_not_move_the_fields() {
+            let line = "42 (we ) ird) S 7 1234 99 0 -1 0 0 0";
+            assert_eq!(pgid_from_stat(line), Some(1234));
+        }
+
+        #[test]
+        fn a_stat_line_that_is_not_one_is_refused_rather_than_guessed() {
+            assert_eq!(pgid_from_stat(""), None);
+            assert_eq!(pgid_from_stat("42 (sh"), None);
+            assert_eq!(pgid_from_stat("42 (sh) S 7"), None);
+            assert_eq!(pgid_from_stat("42 (sh) S 7 notanumber"), None);
+        }
     }
 }

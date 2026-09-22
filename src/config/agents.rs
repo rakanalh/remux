@@ -8,16 +8,26 @@
 //! differently. Keeping them in `config.toml` makes that a config edit instead
 //! of a rebuild, which is the same call `herdr` makes with its TOML manifests.
 //!
-//! Defaults ship for `claude` and `codex` so the panel works with nothing
-//! configured. They are best-effort by nature: if an agent changes its prompt,
-//! the fix is `[[agents.pattern]]`, not a patch.
+//! `commands` ships with the agents this project knows about (`claude`,
+//! `codex`, `aider`, `gemini`, `omp`, `opencode`), and blocked-prompt patterns
+//! ship for `claude` and `codex`, so the panel works with nothing configured.
+//! They are best-effort by nature: if an agent changes its prompt, the fix is
+//! `[[agents.pattern]]`, not a patch.
 //!
 //! The server reads this at startup, so an edit needs `remux restart`.
 
 use serde::Deserialize;
 
+/// The commands that count as an agent out of the box.
+///
+/// These are NAMES of agents, never of the launchers that start them. `node`,
+/// `bun` and `npx` are deliberately absent: an npm-shipped agent is a script
+/// run by an interpreter, and listing the interpreter would put every Node REPL
+/// in the panel. The foreground JOB is walked instead, so a shim is looked
+/// through to the agent it started -- see
+/// [`crate::server::agents::foreground_command`].
 fn default_commands() -> Vec<String> {
-    ["claude", "codex", "aider", "gemini"]
+    ["claude", "codex", "aider", "gemini", "omp", "opencode"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -102,7 +112,19 @@ impl Default for AgentsConfig {
     }
 }
 
-/// The shipped patterns: enough for `claude` and `codex` to work unconfigured.
+/// The shipped patterns: enough for `claude`, `codex`, `omp` and `opencode` to
+/// work unconfigured.
+///
+/// **Two grades of evidence sit in this list, and the split does NOT run along
+/// agent lines.** `claude-select`, `omp-allow` and the two `opencode` patterns
+/// were matched against a real pane, blocked and then answered, so both that
+/// they FIRE and that they STOP are observed. `claude-proceed` and the two
+/// `codex` patterns come from `strings` over the shipped binary: the wordings
+/// are real, but no one here has watched one of those prompts appear or clear.
+///
+/// `claude-proceed` is on the weaker side of that line and it is easy to miss,
+/// because it sits next to `claude-select` and they name the same agent. Do not
+/// level the comments up to each other.
 ///
 /// **Deliberately no menu-ROW pattern -- and that is not in tension with the
 /// question-menu FOOTER pattern that IS shipped.** An earlier default matched
@@ -197,13 +219,90 @@ fn default_patterns() -> Vec<AgentPattern> {
             "claude",
             r"(?i)enter to select.*esc to cancel",
         ),
-        // Codex's command-approval prompt.
+        // Codex's approval dialogs. MEASURED the way the claude ones were --
+        // `strings` over the installed 0.156.0 native binary
+        // (`@openai/codex-linux-x64/.../bin/codex`) -- and NOT, unlike the two
+        // below, watched on a live screen. codex could not be driven to an
+        // approval on either machine available: this Linux box is refused by
+        // the API for every model (`The 'gpt-5-codex' model is not supported
+        // when using Codex with a ChatGPT account.`) and the Mac hangs. So the
+        // titles are real; that they DISAPPEAR once answered is inferred from
+        // how the other agents behave, not observed. `NeedsInput` never decays,
+        // so if one of these turns out to linger in the transcript it pins the
+        // pane red for the session and must be narrowed.
+        //
+        // The binary's four dialog titles are `Would you like to run the
+        // following command?`, `...make the following edits?`, `...grant these
+        // permissions?` and `...send input to terminal`.
+        //
+        // `codex-decline` matches an OPTION of that same modal, which is the
+        // point rather than a duplicate of the titles: the window scanned is
+        // the bottom of the screen, and a tall dialog can push its title out of
+        // it while the options are still drawn. The one string NOT made a
+        // pattern is `" needs your approval."`, which is ordinary enough to
+        // appear in the agent's own prose -- and a false `NeedsInput` does not
+        // decay. (`Yes, and don't ask again...` would serve as well as the
+        // `No, ...` row; one option row is enough.)
+        //
+        // These REPLACE `codex-allow` and `codex-yn`, which matched nothing in
+        // the binary. `codex-yn` (`\[y(es)?/n(o)?\]`) was worse than useless:
+        // codex prints no such prompt, so it could only fire on something
+        // else's output passing through the pane -- a script, a diff, a test
+        // log -- and a false `NeedsInput` pins the pane red for the rest of the
+        // session because it never decays.
         p(
-            "codex-allow",
+            "codex-approve",
             "codex",
-            r"(?i)allow (this )?command|approve this (command|action)",
+            r"(?i)would you like to (run|make|grant|send)",
         ),
-        p("codex-yn", "codex", r"(?i)\[y(es)?/n(o)?\]"),
+        p(
+            "codex-decline",
+            "codex",
+            r"(?i)no, and tell codex what to do differently",
+        ),
+        // omp's approval box, CAPTURED LIVE from 18.1.19 -- blocked and then
+        // answered, the same evidence `claude-select` rests on. The box title
+        // names the tool being approved (`bash`, `edit`, `write`), so keying on
+        // the title covers every tool kind with one rule instead of one per
+        // kind. Answering it removes the whole box: the pane was re-snapshotted
+        // at +4s, +8s, +12s and +16s and no part of the title survives in any
+        // of them, which is what stops this holding a pane red for ever.
+        p("omp-allow", "omp", r"(?i)allow tool:"),
+        // opencode's permission prompt, CAPTURED LIVE from 1.18.32, also
+        // blocked and then answered. Two patterns because the header and the
+        // options row are several lines apart and either can leave the
+        // `scan_rows` window on its own. Both are gone from the +4s snapshot
+        // onwards.
+        // This is the widest false-positive surface of the five: `permission
+        // required` is ordinary text in an HTTP 403, a docker error and an npm
+        // failure, so an opencode pane that merely PRINTS one reads NeedsInput
+        // until it scrolls out of the window. Shipped anyway, because the
+        // alternative is guessing a tighter anchor from a single capture and
+        // missing the real prompt, which is the failure that has no symptom. If
+        // it is reported, narrow it -- against a new capture -- rather than
+        // removing it.
+        p(
+            "opencode-permission",
+            "opencode",
+            r"(?i)permission required",
+        ),
+        // `\s+` between the options, never literal runs of spaces: the run
+        // between them is LAYOUT, not content -- one capture at one width
+        // cannot show how opencode re-lays it out, and a pattern has no reason
+        // to depend on a gap it is not matching.
+        //
+        // The width sweep is NOT what guards this, and assuming it was would
+        // have shipped a literal-space pattern with a green suite: rewrapping a
+        // line changes where the ROWS break and never its characters, so
+        // `visible_bottom` hands the pattern back the original spacing at every
+        // width. The guard is the collapsed-spacing assertion in
+        // `the_shipped_patterns_recognise_opencodes_real_permission_prompt`,
+        // which is the only test in the suite a literal-space version fails.
+        p(
+            "opencode-allow",
+            "opencode",
+            r"(?i)allow once\s+allow always\s+reject",
+        ),
     ]
 }
 
@@ -235,6 +334,19 @@ mod tests {
                 .any(|p| p.command.as_deref() == Some("claude")),
             "claude works with zero setup or it does not work"
         );
+    }
+
+    /// The shipped list is what makes the panel work with zero configuration,
+    /// so every agent we claim to support has to be in it.
+    #[test]
+    fn the_defaults_list_every_agent_we_ship_for() {
+        let cfg = parse("");
+        for command in ["claude", "codex", "aider", "gemini", "omp", "opencode"] {
+            assert!(
+                cfg.commands.contains(&command.to_string()),
+                "{command:?} is missing from the shipped commands"
+            );
+        }
     }
 
     #[test]
