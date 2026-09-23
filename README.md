@@ -19,6 +19,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Dormant "resurrect" sessions** — with `save_sessions = true` and `automatic_restore = false`, saved sessions load as dormant entries instead of coming live. They appear in the session manager and are materialized on demand when you switch to one.
 - **Folder organization** — group sessions into named folders in the session tree for tidy management.
 - **Session switcher** — a quick switcher (`Alt-s`) that aggregates local **and** remote sessions into one list so you can jump anywhere without opening the full manager.
+- **Agent switcher** — `Alt-a` (or `Ctrl-a x a`) lists every pane running an AI agent, on local **and** connected remote servers, with the same state colours as the agents panel. `j`/`k` (or the arrows) and `g`/`G` move, `Enter` jumps to the pane, `Esc` closes. It works with no agents sidebar configured.
 - **Last session toggle** — `Alt-o` (or `Ctrl-a x o`) flips back to the previously-attached session, like tmux's last-session.
 - **Session manager** — a tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — across both local and remote servers.
 
@@ -327,6 +328,7 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | `Alt-1` … `Alt-9` | Jump to tab 1–9 |
 | `Alt-t` | New tab |
 | `Alt-s` | Quick session switcher (local + remote) |
+| `Alt-a` | Agent switcher (local + remote) |
 | `Alt-o` | Last session (toggle) |
 | `Alt-z` | Toggle pane zoom |
 | `Alt-p` | Toggle the popup terminal |
@@ -452,7 +454,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `EnterCommandMode` | — | Enter Command mode (navigate the leader tree). |
 | `EnterVisualMode` | — | Enter Visual/copy mode. |
 
-> A few binding-only actions are handled directly by the client and so aren't in the palette list above: `EnterSearchMode`, `SendKey <key-notation>`, `SessionQuickSwitch`, and `CommandPaletteOpen`.
+> A few binding-only actions are handled directly by the client and so aren't in the palette list above: `EnterSearchMode`, `SendKey <key-notation>`, `SessionQuickSwitch`, `AgentQuickSwitch`, and `CommandPaletteOpen`.
 
 ## Chaining commands
 

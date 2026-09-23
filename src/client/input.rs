@@ -439,6 +439,16 @@ pub enum InputAction {
     /// entirely client-side by the event loop, which tracks the current and
     /// previous attached `(server, session)`.
     SessionSwitchLast,
+    /// Open the agent switcher overlay. The event loop seeds it and subscribes
+    /// to every connection's agent list while it is open.
+    AgentSwitchOpen,
+    /// Agent switcher updated (re-render needed).
+    AgentSwitchUpdate,
+    /// Agent switcher confirmed: go to that pane through the client's one jump
+    /// path.
+    AgentSwitchConfirm(crate::client::tree_model::JumpTarget),
+    /// Agent switcher closed without a jump.
+    AgentSwitchClose,
     // -- Views (client-only virtual tabs; never forwarded to the server) --
     /// Create a new empty view with the given name and activate it.
     NewView(String),
@@ -581,6 +591,8 @@ pub struct InputHandler {
     pub folder_select: Option<FolderSelectOverlay>,
     /// State for the session quick-switch overlay.
     pub session_switch: Option<SessionSwitchOverlay>,
+    /// The agent switcher overlay, while it is open.
+    pub agent_switch: Option<AgentSwitchOverlay>,
     /// State for the view-picker overlay (choose which View to add a pane to).
     pub view_picker: Option<ViewPickerOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
@@ -1091,20 +1103,6 @@ impl SessionSwitchOverlay {
         }
     }
 
-    /// The number of group-separator header rows the current `entries` produce.
-    fn separator_count(&self) -> usize {
-        let views_present = !self.views.is_empty();
-        let mut count = 0usize;
-        let mut prev: Option<&ConnId> = None;
-        for entry in &self.entries {
-            if Self::separator_before(prev, &entry.server, views_present) {
-                count += 1;
-            }
-            prev = Some(&entry.server);
-        }
-        count
-    }
-
     /// Render the session switch popup as draw commands.
     pub fn render(
         &self,
@@ -1112,155 +1110,251 @@ impl SessionSwitchOverlay {
         screen_rows: u16,
         theme: &crate::config::theme::Theme,
     ) -> Vec<crate::client::whichkey::DrawCommand> {
-        use crate::client::whichkey::DrawCommand;
-        let mut commands = Vec::new();
-
-        let popup_width = 40u16.min(screen_cols);
-        // Height accounts for the two borders, every session row, and one row
-        // per group-separator header interleaved between the groups. When views
-        // are present they add their own "Views" header row plus one row each.
-        let separator_count = self.separator_count();
-        let views_block = if self.views.is_empty() {
-            0
-        } else {
-            self.views.len() + 1
-        };
-        let popup_height =
-            ((self.entries.len() + separator_count + views_block + 2) as u16).min(screen_rows);
-        let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
-        let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
-
-        let fg = theme.whichkey_fg;
-        let bg = theme.whichkey_bg;
-        let sel_fg = theme.whichkey_bg;
-        let sel_bg = theme.whichkey_fg;
-        let border_fg = theme.separator_fg;
-        let inner_width = (popup_width - 2) as usize;
-
-        // Fill background
-        for row in 0..popup_height {
-            commands.push(DrawCommand {
-                x: start_x,
-                y: start_y + row,
-                text: " ".repeat(popup_width as usize),
-                fg,
-                bg,
-            });
-        }
-
-        // Top border with title
-        let title = " Switch Session ";
-        let border_len = inner_width.saturating_sub(title.len());
-        let left_b = border_len / 2;
-        let right_b = border_len - left_b;
-        commands.push(DrawCommand {
-            x: start_x,
-            y: start_y,
-            text: box_top_line_titled(left_b, title, right_b),
-            fg: border_fg,
-            bg,
-        });
-
-        // Session list, with a labeled separator header preceding each remote
-        // group. `row_offset` is the running screen row under the top border;
-        // separators consume a row of their own, so we cannot derive the row
-        // from the entry index alone.
-        let mut row_offset: u16 = 1;
-
-        // Views section (client-only virtual tabs) is rendered FIRST, above the
+        let mut rows = Vec::new();
+        // Views section (client-only virtual tabs) comes FIRST, above the
         // session groups, under a labeled "Views" header. Selection indices
         // `0..views.len()` map to these rows.
-        if !self.views.is_empty() && row_offset < popup_height - 1 {
-            let label = format!("{BOX_HORIZONTAL} Views ");
-            let label_chars = label.chars().count();
-            let sep_text = if label_chars >= inner_width {
-                label.chars().take(inner_width).collect::<String>()
-            } else {
-                format!(
-                    "{label}{}",
-                    BOX_HORIZONTAL.to_string().repeat(inner_width - label_chars)
-                )
-            };
-            let sep_y = start_y + row_offset;
-            commands.push(DrawCommand {
-                x: start_x,
-                y: sep_y,
-                text: BOX_VERTICAL.to_string(),
-                fg: border_fg,
-                bg,
-            });
-            commands.push(DrawCommand {
-                x: start_x + 1,
-                y: sep_y,
-                text: sep_text,
-                fg: border_fg,
-                bg,
-            });
-            commands.push(DrawCommand {
-                x: start_x + 1 + inner_width as u16,
-                y: sep_y,
-                text: BOX_VERTICAL.to_string(),
-                fg: border_fg,
-                bg,
-            });
-            row_offset += 1;
-
+        if !self.views.is_empty() {
+            rows.push(SwitchRow::Header("Views".to_string()));
             for (i, name) in self.views.iter().enumerate() {
-                if row_offset >= popup_height - 1 {
-                    break;
-                }
-                let y = start_y + row_offset;
-                let is_selected = i == self.selected;
-                let text = format!("  {name}");
-                let padded = if text.len() >= inner_width {
-                    text.chars().take(inner_width).collect::<String>()
-                } else {
-                    format!("{}{}", text, " ".repeat(inner_width - text.len()))
-                };
-                let (row_fg, row_bg) = if is_selected {
-                    (sel_fg, sel_bg)
-                } else {
-                    (fg, bg)
-                };
-                commands.push(DrawCommand {
-                    x: start_x,
-                    y,
-                    text: BOX_VERTICAL.to_string(),
-                    fg: border_fg,
-                    bg,
-                });
-                commands.push(DrawCommand {
-                    x: start_x + 1,
-                    y,
-                    text: padded,
-                    fg: row_fg,
-                    bg: row_bg,
-                });
-                commands.push(DrawCommand {
-                    x: start_x + 1 + inner_width as u16,
-                    y,
-                    text: BOX_VERTICAL.to_string(),
-                    fg: border_fg,
-                    bg,
-                });
-                row_offset += 1;
+                rows.push(SwitchRow::item(format!("  {name}"), i == self.selected));
             }
         }
-
         let views_present = !self.views.is_empty();
         let mut prev_server: Option<&ConnId> = None;
         for (i, entry) in self.entries.iter().enumerate() {
-            // Draw a group-separator header when the server group changes (and,
+            // A group-separator header when the server group changes (and,
             // when a Views section precedes the list, before the first group so
             // the Local rows are clearly under their own "Local" header).
             if Self::separator_before(prev_server, &entry.server, views_present) {
-                // Stop at/below the bottom border.
-                if row_offset >= popup_height - 1 {
-                    break;
+                rows.push(SwitchRow::Header(Self::server_display(&entry.server)));
+            }
+            prev_server = Some(&entry.server);
+            // Session entries occupy the combined-index region after the views.
+            // The currently-attached session on its server is marked with a
+            // leading '*' (one per connected server may be marked).
+            let marker = if entry.is_current { "* " } else { "  " };
+            rows.push(SwitchRow::item(
+                format!("{marker}{}", Self::entry_label(entry)),
+                self.views.len() + i == self.selected,
+            ));
+        }
+        render_switch_popup(" Switch Session ", &rows, screen_cols, screen_rows, theme)
+    }
+}
+
+/// The agent switcher: every pane running an agent, on every connected server,
+/// for jumping to.
+///
+/// The list, its order, its labels, its notes and its state colours are the
+/// agents panel's own (`sidebar::agents`), and navigation is the panels' shared
+/// [`NavList`](crate::client::sidebar::nav::NavList), so a selection survives a
+/// refresh by identity exactly as it does in the panel.
+#[derive(Debug)]
+pub struct AgentSwitchOverlay {
+    roster: crate::client::sidebar::agents::AgentRoster,
+    rows: Vec<crate::client::sidebar::agents::AgentRow>,
+    nav: crate::client::sidebar::nav::NavList,
+    /// Whether any connection has reported yet, so an empty list reads as
+    /// "no agents" only once it is an answer rather than a pending question.
+    heard: bool,
+    /// The pane the user is in, as `(connection, pane)`. Its row gets the
+    /// current-pane background unless the selection is on it.
+    current: Option<(ConnId, crate::server::layout::PaneId)>,
+    /// The resolved colours for the state markers and the current row. Taken
+    /// from the compositor theme when the overlay opens, because the overlay
+    /// renders against the client theme alone.
+    theme: crate::config::theme::CompositorTheme,
+}
+
+impl AgentSwitchOverlay {
+    /// An overlay seeded with whatever `roster` already holds. `heard` says
+    /// whether that is a real answer: a roster kept fresh by a live subscription
+    /// is one even when empty.
+    pub fn new(
+        roster: crate::client::sidebar::agents::AgentRoster,
+        heard: bool,
+        theme: crate::config::theme::CompositorTheme,
+    ) -> Self {
+        let mut overlay = Self {
+            roster,
+            rows: Vec::new(),
+            nav: crate::client::sidebar::nav::NavList::new(),
+            heard,
+            current: None,
+            theme,
+        };
+        overlay.rebuild();
+        overlay
+    }
+
+    /// Take `conn`'s latest agent list.
+    pub fn apply_agents(
+        &mut self,
+        conn: &ConnId,
+        agents: &[crate::protocol::AgentEntry],
+        supported: bool,
+    ) {
+        self.roster.apply(conn, agents, supported);
+        self.heard = true;
+        self.rebuild();
+    }
+
+    /// Forget a connection that went away.
+    pub fn drop_conn(&mut self, conn: &ConnId) {
+        if self.current.as_ref().is_some_and(|(c, _)| c == conn) {
+            self.current = None;
+        }
+        if self.roster.drop_conn(conn) {
+            self.rebuild();
+        }
+    }
+
+    /// Record the pane the user is in.
+    pub fn set_current(&mut self, current: Option<(ConnId, crate::server::layout::PaneId)>) {
+        self.current = current;
+    }
+
+    fn rebuild(&mut self) {
+        let previous = self.rows.get(self.nav.selected()).map(|r| r.key());
+        self.rows = self.roster.rows();
+        let keys: Vec<_> = self.rows.iter().map(|r| r.key()).collect();
+        self.nav.reselect(&keys, previous.as_ref());
+    }
+
+    fn selected_target(&self) -> Option<crate::client::tree_model::JumpTarget> {
+        self.rows.get(self.nav.selected()).map(|r| r.jump_target())
+    }
+
+    /// Render the agent switcher popup as draw commands.
+    pub fn render(
+        &self,
+        screen_cols: u16,
+        screen_rows: u16,
+        theme: &crate::config::theme::Theme,
+    ) -> Vec<crate::client::whichkey::DrawCommand> {
+        use crate::client::renderer::cell_color_to_crossterm;
+        use crate::client::sidebar::agents::state_fg;
+        let current_bg = cell_color_to_crossterm(&self.theme.sidebar_current_bg);
+        let mut rows: Vec<SwitchRow> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let is_current = self.current.as_ref() == Some(&row.key());
+                SwitchRow::Item {
+                    // Column 1 is the state marker, the same glyph the panel
+                    // draws, in its state colour on every row.
+                    text: format!(" \u{25CF} {}", row.label()),
+                    selected: i == self.nav.selected(),
+                    marker: Some((
+                        1,
+                        cell_color_to_crossterm(&state_fg(row.entry.state, &self.theme)),
+                    )),
+                    bg: is_current.then_some(current_bg),
                 }
-                let label = format!("{BOX_HORIZONTAL} {} ", Self::server_display(&entry.server));
+            })
+            .collect();
+        if self.rows.is_empty() {
+            let text = if self.heard { "  no agents" } else { "  ..." };
+            rows.push(SwitchRow::item(text.to_string(), false));
+        }
+        for note in self.roster.notes() {
+            rows.push(SwitchRow::item(format!("  {note}"), false));
+        }
+        render_switch_popup(" Switch Agent ", &rows, screen_cols, screen_rows, theme)
+    }
+}
+
+/// One row of a quick-switch popup.
+#[derive(Debug, Clone)]
+pub enum SwitchRow {
+    /// A labeled group separator, drawn as a rule.
+    Header(String),
+    /// A list row. `marker` recolours one character of `text`, by char index;
+    /// `bg` replaces the popup background on an unselected row.
+    Item {
+        text: String,
+        selected: bool,
+        marker: Option<(usize, crossterm::style::Color)>,
+        bg: Option<crossterm::style::Color>,
+    },
+}
+
+impl SwitchRow {
+    fn item(text: String, selected: bool) -> Self {
+        SwitchRow::Item {
+            text,
+            selected,
+            marker: None,
+            bg: None,
+        }
+    }
+}
+
+/// Lay out a quick-switch popup: a titled box centred on the screen, one line
+/// per row, the selected row in the popup's inverted colours.
+///
+/// The session and agent switchers both draw through this, so they look and
+/// clip the same way.
+pub fn render_switch_popup(
+    title: &str,
+    rows: &[SwitchRow],
+    screen_cols: u16,
+    screen_rows: u16,
+    theme: &crate::config::theme::Theme,
+) -> Vec<crate::client::whichkey::DrawCommand> {
+    use crate::client::whichkey::DrawCommand;
+    let mut commands = Vec::new();
+
+    let popup_width = 40u16.min(screen_cols);
+    let popup_height = ((rows.len() + 2) as u16).min(screen_rows);
+    let start_x = (screen_cols.saturating_sub(popup_width)) / 2;
+    let start_y = (screen_rows.saturating_sub(popup_height)) / 2;
+
+    let fg = theme.whichkey_fg;
+    let bg = theme.whichkey_bg;
+    let sel_fg = theme.whichkey_bg;
+    let sel_bg = theme.whichkey_fg;
+    let border_fg = theme.separator_fg;
+    let inner_width = (popup_width - 2) as usize;
+
+    // Fill background
+    for row in 0..popup_height {
+        commands.push(DrawCommand {
+            x: start_x,
+            y: start_y + row,
+            text: " ".repeat(popup_width as usize),
+            fg,
+            bg,
+        });
+    }
+
+    // Top border with title
+    let border_len = inner_width.saturating_sub(title.len());
+    let left_b = border_len / 2;
+    let right_b = border_len - left_b;
+    commands.push(DrawCommand {
+        x: start_x,
+        y: start_y,
+        text: box_top_line_titled(left_b, title, right_b),
+        fg: border_fg,
+        bg,
+    });
+
+    for (i, row) in rows.iter().enumerate() {
+        // The screen row under the top border.
+        let row_offset = 1 + i as u16;
+        // Stop at/below the bottom border.
+        if row_offset >= popup_height.saturating_sub(1) {
+            break;
+        }
+        let y = start_y + row_offset;
+        let (text, row_fg, row_bg, marker) = match row {
+            SwitchRow::Header(label) => {
+                let label = format!("{BOX_HORIZONTAL} {label} ");
                 let label_chars = label.chars().count();
-                let sep_text = if label_chars >= inner_width {
+                let text = if label_chars >= inner_width {
                     label.chars().take(inner_width).collect::<String>()
                 } else {
                     format!(
@@ -1268,93 +1362,74 @@ impl SessionSwitchOverlay {
                         BOX_HORIZONTAL.to_string().repeat(inner_width - label_chars)
                     )
                 };
-                let sep_y = start_y + row_offset;
-                commands.push(DrawCommand {
-                    x: start_x,
-                    y: sep_y,
-                    text: BOX_VERTICAL.to_string(),
-                    fg: border_fg,
-                    bg,
-                });
-                commands.push(DrawCommand {
-                    x: start_x + 1,
-                    y: sep_y,
-                    text: sep_text,
-                    fg: border_fg,
-                    bg,
-                });
-                commands.push(DrawCommand {
-                    x: start_x + 1 + inner_width as u16,
-                    y: sep_y,
-                    text: BOX_VERTICAL.to_string(),
-                    fg: border_fg,
-                    bg,
-                });
-                row_offset += 1;
+                (text, border_fg, bg, None)
             }
-            prev_server = Some(&entry.server);
-
-            // Stop at/below the bottom border.
-            if row_offset >= popup_height - 1 {
-                break;
-            }
-            let y = start_y + row_offset;
-            // Session entries occupy the combined-index region after the views,
-            // so entry `i` is highlighted when `selected == views.len() + i`.
-            let is_selected = self.views.len() + i == self.selected;
-            // Mark the currently-attached session on its server with a leading
-            // '*' (one per connected server may be marked).
-            let marker = if entry.is_current { "* " } else { "  " };
-            let text = format!("{marker}{}", Self::entry_label(entry));
-            let padded = if text.len() >= inner_width {
-                text.chars().take(inner_width).collect::<String>()
-            } else {
-                format!("{}{}", text, " ".repeat(inner_width - text.len()))
-            };
-
-            let (row_fg, row_bg) = if is_selected {
-                (sel_fg, sel_bg)
-            } else {
-                (fg, bg)
-            };
-
-            commands.push(DrawCommand {
-                x: start_x,
-                y,
-                text: BOX_VERTICAL.to_string(),
-                fg: border_fg,
-                bg,
-            });
-            commands.push(DrawCommand {
-                x: start_x + 1,
-                y,
-                text: padded,
-                fg: row_fg,
+            SwitchRow::Item {
+                text,
+                selected,
+                marker,
                 bg: row_bg,
-            });
-            commands.push(DrawCommand {
-                x: start_x + 1 + inner_width as u16,
-                y,
-                text: BOX_VERTICAL.to_string(),
-                fg: border_fg,
-                bg,
-            });
-            row_offset += 1;
-        }
-
-        // Bottom border
-        let help_line_y = start_y + popup_height - 1;
-        let bottom_line = box_bottom_line(inner_width);
+            } => {
+                // Padded by CHARACTERS, so a row holding a multi-byte glyph
+                // still fills the box exactly.
+                let chars = text.chars().count();
+                let padded = if chars >= inner_width {
+                    text.chars().take(inner_width).collect::<String>()
+                } else {
+                    format!("{text}{}", " ".repeat(inner_width - chars))
+                };
+                let (row_fg, row_bg) = if *selected {
+                    (sel_fg, sel_bg)
+                } else {
+                    (fg, row_bg.unwrap_or(bg))
+                };
+                (padded, row_fg, row_bg, *marker)
+            }
+        };
         commands.push(DrawCommand {
             x: start_x,
-            y: help_line_y,
-            text: bottom_line,
+            y,
+            text: BOX_VERTICAL.to_string(),
             fg: border_fg,
             bg,
         });
-
-        commands
+        commands.push(DrawCommand {
+            x: start_x + 1,
+            y,
+            text: text.clone(),
+            fg: row_fg,
+            bg: row_bg,
+        });
+        if let Some((at, color)) = marker {
+            if let Some(ch) = text.chars().nth(at) {
+                commands.push(DrawCommand {
+                    x: start_x + 1 + at as u16,
+                    y,
+                    text: ch.to_string(),
+                    fg: color,
+                    bg: row_bg,
+                });
+            }
+        }
+        commands.push(DrawCommand {
+            x: start_x + 1 + inner_width as u16,
+            y,
+            text: BOX_VERTICAL.to_string(),
+            fg: border_fg,
+            bg,
+        });
     }
+
+    // Bottom border
+    commands.push(DrawCommand {
+        x: start_x,
+        y: start_y + popup_height.saturating_sub(1),
+        text: box_bottom_line(inner_width),
+        fg: border_fg,
+        bg,
+    });
+
+    commands
 }
 
 impl InputHandler {
@@ -1383,6 +1458,7 @@ impl InputHandler {
             bracketed_paste: true,
             folder_select: None,
             session_switch: None,
+            agent_switch: None,
             view_picker: None,
             pending_editor_open: false,
         }
@@ -1446,6 +1522,9 @@ impl InputHandler {
         // If the session switch overlay is active, capture keystrokes for it.
         if self.session_switch.is_some() {
             return self.handle_session_switch_key(key);
+        }
+        if self.agent_switch.is_some() {
+            return self.handle_agent_switch_key(key);
         }
 
         // If the view picker overlay is active, capture keystrokes for it.
@@ -1601,6 +1680,7 @@ impl InputHandler {
             || self.session_manager.is_some()
             || self.folder_select.is_some()
             || self.session_switch.is_some()
+            || self.agent_switch.is_some()
             || self.view_picker.is_some()
     }
 
@@ -1837,8 +1917,8 @@ impl InputHandler {
     /// `InputAction` the main loop acts on.
     ///
     /// Every path that can name an action -- a keybinding leaf, an Alt
-    /// shortcut, the command palette -- funnels through here, so all sixteen
-    /// client actions behave identically however they are reached.
+    /// shortcut, the command palette -- funnels through here, so every client
+    /// action behaves identically however it is reached.
     fn begin_client_action(&mut self, action: ClientAction) -> InputAction {
         match action {
             ClientAction::CommandPaletteOpen => {
@@ -1850,6 +1930,12 @@ impl InputHandler {
                 self.mode = Mode::Command;
                 self.session_switch = Some(SessionSwitchOverlay::new());
                 InputAction::SessionSwitchOpen
+            }
+            // The overlay itself is built by the event loop, which holds the
+            // agent lists and the theme it is seeded from.
+            ClientAction::AgentQuickSwitch => {
+                self.mode = Mode::Command;
+                InputAction::AgentSwitchOpen
             }
             ClientAction::ViewNew => {
                 // Prompt for a name via the rename overlay; the confirm maps to
@@ -2961,6 +3047,42 @@ impl InputHandler {
                 }
             }
             _ => InputAction::None,
+        }
+    }
+
+    /// Handle a keystroke while the agent switcher is open.
+    ///
+    /// No type-to-filter: a key the list has no use for does nothing, exactly
+    /// as in the session switcher, and is never forwarded to the pane.
+    fn handle_agent_switch_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.agent_switch.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+        let close = |this: &mut Self, action: InputAction| {
+            this.agent_switch = None;
+            this.mode = Mode::Normal;
+            action
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => close(self, InputAction::AgentSwitchClose),
+            KeyCode::Char('l') => match overlay.selected_target() {
+                Some(target) => close(self, InputAction::AgentSwitchConfirm(target)),
+                None => close(self, InputAction::AgentSwitchClose),
+            },
+            _ => match crate::client::sidebar::nav::nav_key(&key) {
+                Some(crate::client::sidebar::nav::NavKey::Activate) => {
+                    match overlay.selected_target() {
+                        Some(target) => close(self, InputAction::AgentSwitchConfirm(target)),
+                        None => close(self, InputAction::AgentSwitchClose),
+                    }
+                }
+                Some(cmd) => {
+                    overlay.nav.apply(cmd, overlay.rows.len());
+                    InputAction::AgentSwitchUpdate
+                }
+                None => InputAction::None,
+            },
         }
     }
 
@@ -4949,7 +5071,6 @@ mod tests {
         // No group-separator header should appear for a Local-only list: the
         // only rows starting with the box-drawing dash are the top and bottom
         // borders (which begin with the rounded corners, not a bare dash).
-        assert_eq!(overlay.separator_count(), 0);
         let mid_dash_rows = commands
             .iter()
             .filter(|c| c.x == 1 && c.text.starts_with('\u{2500}'))
@@ -4977,9 +5098,6 @@ mod tests {
                 ("r2".to_string(), false, None),
             ],
         );
-
-        // One separator for the single remote group.
-        assert_eq!(overlay.separator_count(), 1);
 
         let theme = Theme::default();
         // Screen tall enough that the popup is not clamped.
@@ -5866,5 +5984,251 @@ mod tests {
         assert_eq!(action, InputAction::ModeChanged(Mode::Search));
         assert_eq!(handler.mode, Mode::Search);
         assert!(handler.command_palette.is_none());
+    }
+
+    // -- Agent switcher -------------------------------------------------------
+
+    fn agent(
+        pane_id: crate::server::layout::PaneId,
+        session: &str,
+        state: crate::protocol::AgentState,
+    ) -> crate::protocol::AgentEntry {
+        crate::protocol::AgentEntry {
+            pane_id,
+            session: session.to_string(),
+            tab_index: 0,
+            command: "claude".to_string(),
+            state,
+        }
+    }
+
+    /// Local `a`/`b`, then a remote `far` with a pane 1 of its own: two
+    /// machines sharing a pane id is the case identity exists for.
+    fn agent_switch_handler() -> InputHandler {
+        use crate::protocol::AgentState;
+        let mut roster = crate::client::sidebar::agents::AgentRoster::new();
+        roster.apply(
+            &ConnId::Local,
+            &[
+                agent(1, "a", AgentState::Idle),
+                agent(2, "b", AgentState::NeedsInput),
+            ],
+            true,
+        );
+        roster.apply(&remote("pi"), &[agent(1, "far", AgentState::Working)], true);
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        handler.agent_switch = Some(AgentSwitchOverlay::new(
+            roster,
+            true,
+            crate::config::theme::CompositorTheme::default(),
+        ));
+        handler
+    }
+
+    fn agent_rows(commands: &[crate::client::whichkey::DrawCommand]) -> Vec<String> {
+        commands
+            .iter()
+            .filter(|c| c.text.contains("claude") || c.text.contains("no agents"))
+            .map(|c| c.text.trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn alt_a_opens_the_agent_switcher() {
+        let mut handler = InputHandler::with_defaults();
+        let action = handler.handle_key(make_key(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert_eq!(action, InputAction::AgentSwitchOpen);
+        assert_eq!(handler.mode, Mode::Command);
+    }
+
+    #[test]
+    fn the_agent_switcher_lists_like_the_panel_local_first_host_prefixed() {
+        let handler = agent_switch_handler();
+        let theme = crate::config::theme::Theme::default();
+        let cmds = handler
+            .agent_switch
+            .as_ref()
+            .unwrap()
+            .render(80, 24, &theme);
+        assert_eq!(
+            agent_rows(&cmds),
+            vec![
+                " \u{25CF} claude a/0",
+                " \u{25CF} claude b/0",
+                " \u{25CF} claude pi:far/0"
+            ]
+        );
+    }
+
+    #[test]
+    fn j_then_enter_jumps_to_that_pane_on_that_server() {
+        let mut handler = agent_switch_handler();
+        handler.handle_key(char_key('j'));
+        handler.handle_key(char_key('j'));
+        let action = handler.handle_key(enter_key());
+        assert_eq!(
+            action,
+            InputAction::AgentSwitchConfirm(crate::client::tree_model::JumpTarget::Pane {
+                conn: remote("pi"),
+                session: "far".to_string(),
+                tab_index: 0,
+                pane_id: 1,
+            })
+        );
+        assert!(handler.agent_switch.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn k_wraps_and_g_and_shift_g_reach_the_ends() {
+        let mut handler = agent_switch_handler();
+        handler.handle_key(char_key('k'));
+        assert_eq!(handler.agent_switch.as_ref().unwrap().nav.selected(), 2);
+        handler.handle_key(char_key('g'));
+        assert_eq!(handler.agent_switch.as_ref().unwrap().nav.selected(), 0);
+        handler.handle_key(char_key('G'));
+        assert_eq!(handler.agent_switch.as_ref().unwrap().nav.selected(), 2);
+    }
+
+    /// No type-to-filter: a printable key is swallowed. It neither narrows the
+    /// list nor reaches the pane, and the overlay stays open.
+    #[test]
+    fn a_printable_key_neither_filters_nor_leaks() {
+        let mut handler = agent_switch_handler();
+        let theme = crate::config::theme::Theme::default();
+        let before = agent_rows(
+            &handler
+                .agent_switch
+                .as_ref()
+                .unwrap()
+                .render(80, 24, &theme),
+        );
+        let action = handler.handle_key(char_key('x'));
+        assert_eq!(action, InputAction::None);
+        let after = agent_rows(
+            &handler
+                .agent_switch
+                .as_ref()
+                .unwrap()
+                .render(80, 24, &theme),
+        );
+        assert_eq!(before, after);
+        assert!(handler.agent_switch.is_some());
+    }
+
+    #[test]
+    fn esc_closes_the_agent_switcher() {
+        let mut handler = agent_switch_handler();
+        assert_eq!(handler.handle_key(esc_key()), InputAction::AgentSwitchClose);
+        assert!(handler.agent_switch.is_none());
+        assert_eq!(handler.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn the_agent_switcher_selection_follows_its_agent_across_a_refresh() {
+        use crate::protocol::AgentState;
+        let mut handler = agent_switch_handler();
+        handler.handle_key(char_key('j'));
+        // Local pane 1 goes away, so pane 2 slides into the selected index's
+        // neighbour. The selection must stay on pane 2 by identity.
+        handler.agent_switch.as_mut().unwrap().apply_agents(
+            &ConnId::Local,
+            &[agent(2, "b", AgentState::NeedsInput)],
+            true,
+        );
+        match handler.handle_key(enter_key()) {
+            InputAction::AgentSwitchConfirm(t) => assert_eq!(t.conn(), &ConnId::Local),
+            other => panic!("expected a confirm, got {other:?}"),
+        }
+    }
+
+    fn row_bg_and_marker(
+        cmds: &[crate::client::whichkey::DrawCommand],
+        label: &str,
+    ) -> (crossterm::style::Color, crossterm::style::Color) {
+        let row = cmds.iter().find(|c| c.text.contains(label)).unwrap();
+        let marker = cmds
+            .iter()
+            .find(|c| c.y == row.y && c.text == "\u{25CF}")
+            .unwrap();
+        (row.bg, marker.fg)
+    }
+
+    #[test]
+    fn the_state_marker_takes_the_panels_state_colour() {
+        use crate::client::renderer::cell_color_to_crossterm;
+        let handler = agent_switch_handler();
+        let ct = crate::config::theme::CompositorTheme::default();
+        let cmds = handler.agent_switch.as_ref().unwrap().render(
+            80,
+            24,
+            &crate::config::theme::Theme::default(),
+        );
+        assert_eq!(
+            row_bg_and_marker(&cmds, "claude b/0").1,
+            cell_color_to_crossterm(&ct.tab_bell_fg)
+        );
+        assert_eq!(
+            row_bg_and_marker(&cmds, "pi:far/0").1,
+            cell_color_to_crossterm(&ct.tab_activity_fg)
+        );
+    }
+
+    #[test]
+    fn the_current_pane_row_gets_the_current_background_unless_selected() {
+        use crate::client::renderer::cell_color_to_crossterm;
+        let mut handler = agent_switch_handler();
+        let ct = crate::config::theme::CompositorTheme::default();
+        let theme = crate::config::theme::Theme::default();
+        let current_bg = cell_color_to_crossterm(&ct.sidebar_current_bg);
+        let sw = handler.agent_switch.as_mut().unwrap();
+        // The REMOTE's pane 1, not the local one: identity is (conn, pane).
+        sw.set_current(Some((remote("pi"), 1)));
+        let cmds = sw.render(80, 24, &theme);
+        assert_eq!(row_bg_and_marker(&cmds, "pi:far/0").0, current_bg);
+        assert_ne!(row_bg_and_marker(&cmds, "claude a/0").0, current_bg);
+        // Selected AND current: the selection bar wins, the marker keeps its
+        // state colour.
+        handler.handle_key(char_key('G'));
+        let cmds = handler
+            .agent_switch
+            .as_ref()
+            .unwrap()
+            .render(80, 24, &theme);
+        let (bg, fg) = row_bg_and_marker(&cmds, "pi:far/0");
+        assert_eq!(bg, theme.whichkey_fg, "the selection bar");
+        assert_eq!(fg, cell_color_to_crossterm(&ct.tab_activity_fg));
+    }
+
+    #[test]
+    fn an_empty_answer_says_no_agents_and_a_blind_server_says_so() {
+        let mut roster = crate::client::sidebar::agents::AgentRoster::new();
+        roster.apply(&ConnId::Local, &[], true);
+        roster.apply(&remote("mac"), &[], false);
+        let sw = AgentSwitchOverlay::new(
+            roster,
+            true,
+            crate::config::theme::CompositorTheme::default(),
+        );
+        let cmds = sw.render(80, 24, &crate::config::theme::Theme::default());
+        let text: Vec<&str> = cmds.iter().map(|c| c.text.trim_end()).collect();
+        assert!(text.contains(&"  no agents"), "{text:?}");
+        assert!(text.contains(&"  mac: no detection"), "{text:?}");
+    }
+
+    #[test]
+    fn enter_on_an_empty_switcher_closes_it() {
+        let mut handler = InputHandler::with_defaults();
+        handler.agent_switch = Some(AgentSwitchOverlay::new(
+            crate::client::sidebar::agents::AgentRoster::new(),
+            false,
+            crate::config::theme::CompositorTheme::default(),
+        ));
+        assert_eq!(
+            handler.handle_key(enter_key()),
+            InputAction::AgentSwitchClose
+        );
+        assert!(handler.agent_switch.is_none());
     }
 }

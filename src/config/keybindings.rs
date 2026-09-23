@@ -196,6 +196,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
             "Session",
             vec![
                 ('s', leaf("switch", "SessionQuickSwitch")),
+                ('a', leaf("switch agent", "AgentQuickSwitch")),
                 ('o', leaf("last session", "SessionSwitchLast")),
                 ('n', leaf("new", "SessionNew")),
                 ('r', leaf("rename", "SessionRename")),
@@ -783,6 +784,7 @@ impl Default for ShortcutBindings {
         // Misc quick actions.
         bindings.insert(alt_key('t'), cmd("TabNew"));
         bindings.insert(alt_key('s'), cmd("SessionQuickSwitch"));
+        bindings.insert(alt_key('a'), cmd("AgentQuickSwitch"));
         bindings.insert(alt_key('o'), cmd("SessionSwitchLast"));
         bindings.insert(alt_key('z'), cmd("PaneToggleZoom"));
         bindings.insert(alt_key('p'), cmd("PopupToggle"));
@@ -2850,6 +2852,7 @@ mod tests {
         for (name, want) in [
             ("CommandPaletteOpen", ClientAction::CommandPaletteOpen),
             ("SessionQuickSwitch", ClientAction::SessionQuickSwitch),
+            ("AgentQuickSwitch", ClientAction::AgentQuickSwitch),
             ("ViewNew", ClientAction::ViewNew),
             ("ViewAddPane", ClientAction::ViewAddPane),
             ("ViewRename", ClientAction::ViewRename),
@@ -2978,6 +2981,7 @@ mod tests {
     #[test]
     fn humanize_uses_registry_labels() {
         assert_eq!(humanize_command("SessionQuickSwitch"), "switch session");
+        assert_eq!(humanize_command("AgentQuickSwitch"), "switch agent");
         assert_eq!(humanize_command("ViewRemovePane"), "remove cell");
         // Names with no label override still fall back to the PascalCase split,
         // including strings that are not in the registry at all.

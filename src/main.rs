@@ -19,8 +19,8 @@ use futures::StreamExt;
 
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
-    FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget, SessionSwitchOverlay,
-    SidebarIntent,
+    AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
+    SessionSwitchOverlay, SidebarIntent,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
@@ -1453,6 +1453,12 @@ fn relay_overlays(
         let draw_cmds = ss.render(c, r, theme);
         renderer.render_whichkey_overlay(&draw_cmds)?;
     }
+    // Re-render agent switch overlay on top if active
+    else if let Some(ref sw) = input.agent_switch {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = sw.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
+    }
     // Re-render view picker overlay on top if active
     else if let Some(ref vp) = input.view_picker {
         let (c, r) = crossterm::terminal::size()?;
@@ -1942,6 +1948,10 @@ async fn handle_connection_drop(
         wants_agents,
     } = cx;
     log::debug!("srv: connection closed src={:?}", src);
+    // An open agent switcher must not offer a jump to a machine that is gone.
+    if let Some(sw) = input.agent_switch.as_mut() {
+        sw.drop_conn(src);
+    }
     // Panels scope their state by connection: tell them
     // before anything else here can `continue` or return.
     if wants_session_tree || wants_agents {
@@ -2906,6 +2916,9 @@ async fn run_client_loop(
     // and a client may configure either panel without the other.
     let mut wants_agents = chrome.wants_agents();
     let mut agents_subscribed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+    // Every subscribed connection's latest agent list, so the switcher opens
+    // with the list already on screen when a panel keeps it subscribed.
+    let mut agent_roster = crate::client::sidebar::agents::AgentRoster::new();
 
     loop {
         // Lay the panels out and act on what they ask for, before anything can
@@ -2926,14 +2939,32 @@ async fn run_client_loop(
             "the session tree",
         )
         .await;
+        // The agents panel and an open agent switcher each need the push; the
+        // server keeps ONE flag per client, so the client decides for both.
+        let agent_push_wanted = wants_agents || input.agent_switch.is_some();
         reconcile_push_subscription(
-            wants_agents,
+            agent_push_wanted,
             &mut agents_subscribed,
             mgr,
             ClientMessage::SubscribeAgents,
             "the agent list",
         )
         .await;
+        if !agent_push_wanted && !agents_subscribed.is_empty() {
+            // The switcher closed and no panel wants the list. Unsubscribing
+            // here, never at the close itself, is what keeps a panel's
+            // subscription alive: this runs only when neither wants it.
+            for id in &agents_subscribed {
+                log::debug!("agents: unsubscribing from the agent list on {id:?}");
+                if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
+                    log::warn!("agents: UnsubscribeAgents to {id:?} failed: {e:#}");
+                }
+            }
+            agents_subscribed.clear();
+        }
+        // The held lists are only current while subscribed, so a connection
+        // that is not must not seed the next switcher with a stale list.
+        agent_roster.retain(|id| agents_subscribed.contains(id));
         // How long until some VISIBLE panel wants ticking, computed fresh each
         // pass. `None` -- no sidebar, none visible, or no panel that polls --
         // disables the timer branch below entirely, so a client with no such
@@ -4821,6 +4852,101 @@ async fn run_client_loop(
                                     mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 }
                             }
+                            InputAction::AgentSwitchOpen => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                // Seeded from the lists already held, which are
+                                // current for every connection subscribed right
+                                // now. The rest are subscribed on the next pass
+                                // of the loop (see `agent_push_wanted`), and each
+                                // answers at once.
+                                input.agent_switch = Some(AgentSwitchOverlay::new(
+                                    agent_roster.clone(),
+                                    agent_roster.has_reports(),
+                                    compositor_theme.clone(),
+                                ));
+                                // The pane the user is in comes from the
+                                // foreground's tree, answered below in the
+                                // `SessionTree` arm.
+                                mgr.send_foreground(ClientMessage::ListSessionTree).await?;
+                                let (c, r) = crossterm::terminal::size()?;
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else if let Some(ref sw) = input.agent_switch {
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = sw.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                            }
+                            InputAction::AgentSwitchUpdate => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                if let Some(av) = active_view {
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                } else if let Some(ref sw) = input.agent_switch {
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = sw.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::AgentSwitchConfirm(target) => {
+                                input.agent_switch = None;
+                                input.mode = Mode::Normal;
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                // The agents panel's jump, and the session
+                                // manager's: see `switch_to_target`.
+                                switch_to_target(
+                                    mgr,
+                                    &mut renderer,
+                                    &mut chrome,
+                                    &views,
+                                    &mut active_view,
+                                    &mut active_view_id,
+                                    &mut mouse_grab,
+                                    &mut last_local_session,
+                                    &mut current_attached,
+                                    &mut previous_attached,
+                                    target,
+                                ).await?;
+                            }
+                            InputAction::AgentSwitchClose => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                input.agent_switch = None;
+                                input.mode = Mode::Normal;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
@@ -6455,12 +6581,19 @@ async fn run_client_loop(
                             "srv: AgentList src={:?} agents={} supported={}",
                             src, agents.len(), detection_supported
                         );
+                        agent_roster.apply(&src, &agents, detection_supported);
+                        let switcher_open = input.agent_switch.is_some();
+                        if let Some(sw) = input.agent_switch.as_mut() {
+                            sw.apply_agents(&src, &agents, detection_supported);
+                        }
                         if wants_agents {
                             chrome.broadcast(&crate::client::sidebar::PluginEvent::Agents {
                                 conn: src.clone(),
                                 agents,
                                 supported: detection_supported,
                             });
+                        }
+                        if wants_agents || switcher_open {
                             // Repaint exactly as the session tree's arm does:
                             // over a live view `paint_view` ends with
                             // `chrome.paint`, so it is the one that has to run.
@@ -6480,6 +6613,12 @@ async fn run_client_loop(
                                 )?;
                             } else {
                                 let (tc, tr) = renderer.size();
+                                // The switcher is an overlay, outside the front
+                                // buffer: a shorter list would leave the old
+                                // popup's last rows on screen.
+                                if switcher_open {
+                                    renderer.clear_overlay(tc, tr)?;
+                                }
                                 chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
                                 relay_overlays(
                                     &mut renderer,
@@ -6655,6 +6794,22 @@ async fn run_client_loop(
                             }
                             // Consumed: don't let a later tree re-resolve it.
                             pending_view_add = false;
+                        }
+                        // The agent switcher marks the pane the user is in, by
+                        // the same walk that feeds the agents panel's mark.
+                        if mgr.is_foreground(&src) {
+                            if let Some(sw) = input.agent_switch.as_mut() {
+                                let current =
+                                    focused_pane(&folders, &unfiled).map(|p| (src.clone(), p.id));
+                                sw.set_current(current);
+                                if active_view.is_none() {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    let draw_cmds = sw.render(c, r, &theme);
+                                    renderer.render_whichkey_overlay(&draw_cmds)?;
+                                    renderer.flush()?;
+                                }
+                            }
                         }
                         // The session-switch popup aggregates every connected
                         // server's tree, so it accepts trees from ANY source

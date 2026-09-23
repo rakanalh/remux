@@ -34,18 +34,54 @@ use crate::client::tree_model::JumpTarget;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{AgentEntry, AgentState, CellColor, PaneId, RenderCell};
 
-/// One rendered row: an agent, and the server it lives on.
+/// One listed agent, and the server it lives on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Row {
-    conn: ConnId,
-    entry: AgentEntry,
+pub struct AgentRow {
+    pub conn: ConnId,
+    pub entry: AgentEntry,
 }
 
-impl Row {
+impl AgentRow {
     /// The row's identity across refreshes. See the module docs for why the
     /// connection is half of it.
-    fn key(&self) -> (ConnId, PaneId) {
+    pub fn key(&self) -> (ConnId, PaneId) {
         (self.conn.clone(), self.entry.pane_id)
+    }
+
+    /// The label beside the marker, e.g. `claude main/1` -- host-prefixed for a
+    /// remote, since two machines routinely have a session of the same name.
+    pub fn label(&self) -> String {
+        let where_ = match &self.conn {
+            ConnId::Local => format!("{}/{}", self.entry.session, self.entry.tab_index),
+            ConnId::Remote(name) => {
+                format!("{name}:{}/{}", self.entry.session, self.entry.tab_index)
+            }
+        };
+        format!("{} {}", self.entry.command, where_)
+    }
+
+    /// Where Enter on this row goes: the client's one jump path, keyed by
+    /// connection and pane.
+    pub fn jump_target(&self) -> JumpTarget {
+        JumpTarget::Pane {
+            conn: self.conn.clone(),
+            session: self.entry.session.clone(),
+            tab_index: self.entry.tab_index,
+            pane_id: self.entry.pane_id,
+        }
+    }
+}
+
+/// The colour a state's marker is drawn in.
+///
+/// The theme's existing activity roles rather than new ones: a panel that
+/// invented its own red would disagree with the status bar's bell marker on
+/// the same terminal.
+pub fn state_fg(state: AgentState, theme: &CompositorTheme) -> CellColor {
+    match state {
+        AgentState::NeedsInput => theme.tab_bell_fg.clone(),
+        AgentState::Working => theme.tab_activity_fg.clone(),
+        AgentState::Idle => theme.status_bar_fg.clone(),
     }
 }
 
@@ -58,92 +94,79 @@ struct ConnAgents {
     supported: bool,
 }
 
-pub struct AgentsPlugin {
+/// Every connection's last `AgentList`, and the order agents are listed in.
+///
+/// Shared by the agents panel and the agent switcher, so the two list the same
+/// agents in the same order with the same notes.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRoster {
     /// Per-connection lists, in arrival order. Order is stable across pushes so
     /// a refresh on one server does not reshuffle the list under the user.
     lists: Vec<(ConnId, ConnAgents)>,
-    /// The flattened rows, in render order.
-    rows: Vec<Row>,
-    /// The pane the user is currently in, if the panel has been told of one and
-    /// it is on a connection the panel is listing. A row IDENTITY, never a row
-    /// index: the list is rebuilt on every push, and an index would follow
-    /// whichever agent slid into that slot.
-    current: Option<(ConnId, PaneId)>,
-    nav: NavList,
 }
 
-impl AgentsPlugin {
+impl AgentRoster {
     pub fn new() -> Self {
-        Self {
-            lists: Vec::new(),
-            rows: Vec::new(),
-            current: None,
-            nav: NavList::new(),
-        }
+        Self::default()
     }
 
-    /// Rebuild [`AgentsPlugin::rows`], keeping the selection on the row it was
-    /// on.
-    fn rebuild(&mut self) {
-        let previous = self.rows.get(self.nav.selected()).map(|r| r.key());
-        // Local first, then remotes in arrival order: the same fixed head the
-        // sessions panel gives its roster, so the two panels agree about where
-        // "this machine" is.
-        let mut rows = Vec::new();
-        for (conn, listed) in self
-            .lists
-            .iter()
-            .filter(|(c, _)| *c == ConnId::Local)
-            .chain(self.lists.iter().filter(|(c, _)| *c != ConnId::Local))
-        {
-            for entry in &listed.agents {
-                rows.push(Row {
-                    conn: conn.clone(),
-                    entry: entry.clone(),
-                });
-            }
-        }
-        self.rows = rows;
-        let keys: Vec<(ConnId, PaneId)> = self.rows.iter().map(|r| r.key()).collect();
-        self.nav.reselect(&keys, previous.as_ref());
-    }
-
-    /// The colour a state's marker is drawn in.
-    ///
-    /// The theme's existing activity roles rather than new ones: a panel that
-    /// invented its own red would disagree with the status bar's bell marker on
-    /// the same terminal.
-    fn state_fg(state: AgentState, theme: &CompositorTheme) -> CellColor {
-        match state {
-            AgentState::NeedsInput => theme.tab_bell_fg.clone(),
-            AgentState::Working => theme.tab_activity_fg.clone(),
-            AgentState::Idle => theme.status_bar_fg.clone(),
-        }
-    }
-
-    /// The label beside the marker, e.g. `claude main/1` -- host-prefixed for a
-    /// remote, since two machines routinely have a session of the same name.
-    fn label(row: &Row) -> String {
-        let where_ = match &row.conn {
-            ConnId::Local => format!("{}/{}", row.entry.session, row.entry.tab_index),
-            ConnId::Remote(name) => {
-                format!("{name}:{}/{}", row.entry.session, row.entry.tab_index)
-            }
+    /// Replace what `conn` reported, keeping its place in the order.
+    pub fn apply(&mut self, conn: &ConnId, agents: &[AgentEntry], supported: bool) {
+        let listed = ConnAgents {
+            agents: agents.to_vec(),
+            supported,
         };
-        format!("{} {}", row.entry.command, where_)
+        match self.lists.iter_mut().find(|(id, _)| id == conn) {
+            Some(slot) => slot.1 = listed,
+            None => self.lists.push((conn.clone(), listed)),
+        }
     }
 
-    /// One line per server that cannot detect agents at all, in the same order
-    /// the rows are built in.
-    ///
-    /// Rendered BELOW the agent rows and deliberately not part of
-    /// [`AgentsPlugin::rows`]: it is an explanation, not a destination, so it
-    /// must not be selectable and Enter must never land on it.
-    fn notes(&self) -> Vec<String> {
+    /// Forget `conn`. Returns whether it had reported anything.
+    pub fn drop_conn(&mut self, conn: &ConnId) -> bool {
+        let before = self.lists.len();
+        self.lists.retain(|(id, _)| id != conn);
+        self.lists.len() != before
+    }
+
+    /// Whether any connection has reported, even an empty list.
+    pub fn has_reports(&self) -> bool {
+        !self.lists.is_empty()
+    }
+
+    /// Keep only the connections `keep` accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(&ConnId) -> bool) {
+        self.lists.retain(|(id, _)| keep(id));
+    }
+
+    /// Local first, then remotes in arrival order: the same fixed head the
+    /// sessions panel gives its roster, so the two agree about where "this
+    /// machine" is.
+    fn ordered(&self) -> impl Iterator<Item = &(ConnId, ConnAgents)> {
         self.lists
             .iter()
             .filter(|(c, _)| *c == ConnId::Local)
             .chain(self.lists.iter().filter(|(c, _)| *c != ConnId::Local))
+    }
+
+    /// Every agent, in listing order.
+    pub fn rows(&self) -> Vec<AgentRow> {
+        self.ordered()
+            .flat_map(|(conn, listed)| {
+                listed.agents.iter().map(|entry| AgentRow {
+                    conn: conn.clone(),
+                    entry: entry.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// One line per server that cannot detect agents at all, in listing order.
+    ///
+    /// An explanation, not a destination: callers render these apart from the
+    /// rows so they can never be selected or jumped to.
+    pub fn notes(&self) -> Vec<String> {
+        self.ordered()
             .filter(|(_, listed)| !listed.supported)
             .map(|(conn, _)| {
                 let host = match conn {
@@ -165,16 +188,43 @@ impl AgentsPlugin {
             })
             .collect()
     }
+}
+
+pub struct AgentsPlugin {
+    roster: AgentRoster,
+    /// The flattened rows, in render order.
+    rows: Vec<AgentRow>,
+    /// The pane the user is currently in, if the panel has been told of one and
+    /// it is on a connection the panel is listing. A row IDENTITY, never a row
+    /// index: the list is rebuilt on every push, and an index would follow
+    /// whichever agent slid into that slot.
+    current: Option<(ConnId, PaneId)>,
+    nav: NavList,
+}
+
+impl AgentsPlugin {
+    pub fn new() -> Self {
+        Self {
+            roster: AgentRoster::new(),
+            rows: Vec::new(),
+            current: None,
+            nav: NavList::new(),
+        }
+    }
+
+    /// Rebuild [`AgentsPlugin::rows`], keeping the selection on the row it was
+    /// on.
+    fn rebuild(&mut self) {
+        let previous = self.rows.get(self.nav.selected()).map(|r| r.key());
+        self.rows = self.roster.rows();
+        let keys: Vec<(ConnId, PaneId)> = self.rows.iter().map(|r| r.key()).collect();
+        self.nav.reselect(&keys, previous.as_ref());
+    }
 
     /// Enter, or a second click: go to that pane.
     fn activate(&self) -> PluginAction {
         match self.rows.get(self.nav.selected()) {
-            Some(row) => PluginAction::JumpTo(JumpTarget::Pane {
-                conn: row.conn.clone(),
-                session: row.entry.session.clone(),
-                tab_index: row.entry.tab_index,
-                pane_id: row.entry.pane_id,
-            }),
+            Some(row) => PluginAction::JumpTo(row.jump_target()),
             None => PluginAction::None,
         }
     }
@@ -234,7 +284,7 @@ impl SidebarPlugin for AgentsPlugin {
         // line rather than a truncated set when they do not fit: partial lists
         // invite "which servers?" with no way to ask.
         let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
-        let all_notes = self.notes();
+        let all_notes = self.roster.notes();
         let budget = if self.rows.is_empty() {
             capacity
         } else {
@@ -300,10 +350,10 @@ impl SidebarPlugin for AgentsPlugin {
                 0,
                 y,
                 "\u{25CF}",
-                Self::state_fg(row.entry.state, theme),
+                state_fg(row.entry.state, theme),
                 row_bg.clone(),
             );
-            draw_text(&mut grid, 2, y, &Self::label(row), fg, row_bg);
+            draw_text(&mut grid, 2, y, &row.label(), fg, row_bg);
         }
 
         // Directly under the last row when the list is short, and at the bottom
@@ -352,16 +402,7 @@ impl SidebarPlugin for AgentsPlugin {
                 agents,
                 supported,
             } => {
-                let listed = ConnAgents {
-                    agents: agents.clone(),
-                    supported: *supported,
-                };
-                match self.lists.iter_mut().find(|(id, _)| id == conn) {
-                    // Replaced in place: the list order is what the panel
-                    // renders, and a refresh must not move a server.
-                    Some(slot) => slot.1 = listed,
-                    None => self.lists.push((conn.clone(), listed)),
-                }
+                self.roster.apply(conn, agents, *supported);
                 self.rebuild();
             }
             PluginEvent::FocusedPane { conn, pane_id } => {
@@ -381,9 +422,7 @@ impl SidebarPlugin for AgentsPlugin {
                 if self.current.as_ref().is_some_and(|(c, _)| c == conn) {
                     self.current = None;
                 }
-                let before = self.lists.len();
-                self.lists.retain(|(id, _)| id != conn);
-                if self.lists.len() != before {
+                if self.roster.drop_conn(conn) {
                     self.rebuild();
                 }
             }
@@ -518,18 +557,12 @@ mod tests {
     fn the_state_marker_takes_the_themes_activity_colours() {
         let theme = CompositorTheme::default();
         assert_eq!(
-            AgentsPlugin::state_fg(AgentState::NeedsInput, &theme),
+            state_fg(AgentState::NeedsInput, &theme),
             theme.tab_bell_fg,
             "urgent shares the bell role"
         );
-        assert_eq!(
-            AgentsPlugin::state_fg(AgentState::Working, &theme),
-            theme.tab_activity_fg
-        );
-        assert_eq!(
-            AgentsPlugin::state_fg(AgentState::Idle, &theme),
-            theme.status_bar_fg
-        );
+        assert_eq!(state_fg(AgentState::Working, &theme), theme.tab_activity_fg);
+        assert_eq!(state_fg(AgentState::Idle, &theme), theme.status_bar_fg);
     }
 
     #[test]

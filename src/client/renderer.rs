@@ -1614,7 +1614,7 @@ fn cursor_style_command(style: u8) -> crossterm::cursor::SetCursorStyle {
 }
 
 /// Convert a protocol `CellColor` to a crossterm `Color`.
-fn cell_color_to_crossterm(color: &CellColor) -> Color {
+pub(crate) fn cell_color_to_crossterm(color: &CellColor) -> Color {
     match color {
         CellColor::Default => Color::Reset,
         CellColor::Indexed(idx) => Color::AnsiValue(*idx),

@@ -1445,6 +1445,9 @@ pub enum ClientAction {
     CommandPaletteOpen,
     /// Open the quick session switcher overlay.
     SessionQuickSwitch,
+    /// Open the agent switcher overlay: every pane running an agent, on every
+    /// connected server.
+    AgentQuickSwitch,
     /// Prompt for a name and create a new (client-side) view.
     ViewNew,
     /// Open the pane picker to add a cell to the active view.
@@ -1626,6 +1629,8 @@ pub fn action_specs() -> &'static [ActionSpec] {
                 .label("command palette"),
             ActionSpec::client("SessionQuickSwitch", ClientAction::SessionQuickSwitch)
                 .label("switch session"),
+            ActionSpec::client("AgentQuickSwitch", ClientAction::AgentQuickSwitch)
+                .label("switch agent"),
             ActionSpec::client("ViewNew", ClientAction::ViewNew).label("new view"),
             ActionSpec::client("ViewAddPane", ClientAction::ViewAddPane).label("add pane"),
             ActionSpec::client("ViewRename", ClientAction::ViewRename).label("rename view"),
