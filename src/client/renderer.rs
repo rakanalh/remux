@@ -71,6 +71,18 @@ pub struct Renderer {
     /// it the panel's `Hide` and the frame's `Show` land in the same flush and
     /// the cursor stays hidden for as long as a sidebar is visible.
     last_cursor: (u16, u16, bool, u8),
+    /// Whether the client draws the status bar itself, in which case a server
+    /// frame's LAST row (the server's bar) is never painted. See
+    /// `chrome::geometry::status_bar_owned`.
+    status_row_owned: bool,
+    /// Row count of the last frame [`Renderer::render_full`] was given, so a
+    /// diff can tell which of its changes land on that frame's last row.
+    frame_rows: usize,
+    /// The last row of the most recent server frame, kept up to date by diffs
+    /// while [`Renderer::status_row_owned`] withholds it from the screen. A
+    /// server too old to describe its status bar leaves the client this row as
+    /// the only copy of it.
+    frame_status_row: Vec<RenderCell>,
 }
 
 impl Renderer {
@@ -85,7 +97,28 @@ impl Renderer {
             content_cols: cols,
             content_rows: rows,
             last_cursor: (0, 0, false, 0),
+            status_row_owned: false,
+            frame_rows: 0,
+            frame_status_row: Vec::new(),
         }
+    }
+
+    /// Set whether the client draws the status bar itself. While it does, the
+    /// last row of every server frame is withheld from the screen and kept in
+    /// [`Renderer::frame_status_row`] instead.
+    ///
+    /// Withheld rather than clipped by the content size alone: a frame sized to
+    /// a smaller client attached to the same session has FEWER rows than the
+    /// content rect, and its bar row would then land in the middle of this
+    /// terminal, above the client's own bar.
+    pub fn set_status_row_owned(&mut self, owned: bool) {
+        self.status_row_owned = owned;
+    }
+
+    /// The server frame's last row as it stands after the latest frame and
+    /// diffs. Only maintained while the status row is owned.
+    pub fn frame_status_row(&self) -> &[RenderCell] {
+        &self.frame_status_row
     }
 
     /// Set the top-left of the content rect. Server frames are written here.
@@ -197,6 +230,14 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
+        self.frame_rows = cells.len();
+        let cells = match cells.split_last() {
+            Some((status, body)) if self.status_row_owned => {
+                self.frame_status_row = status.clone();
+                body
+            }
+            _ => cells,
+        };
         let rows = cells.len();
         let cols = cells.first().map_or(0, |r| r.len());
         log::debug!(
@@ -420,6 +461,12 @@ impl Renderer {
         let (content_right, content_bottom) = self.content_edges();
 
         for change in changes {
+            if self.status_row_owned && change.y as usize + 1 == self.frame_rows {
+                if let Some(slot) = self.frame_status_row.get_mut(change.x as usize) {
+                    *slot = change.cell.clone();
+                }
+                continue;
+            }
             // Change coordinates are content-relative; translate them to the
             // screen and drop anything that falls outside the content rect.
             let sx = change.x as usize + self.origin_x as usize;
@@ -875,6 +922,12 @@ impl Renderer {
         // faithfully restore that. Overlay teardown already re-shows the cursor
         // via `restore_cursor`; this keeps the memory pointing at the truth.
         let saved_cursor = self.last_cursor;
+        // The front buffer's last row is whatever is on the terminal's last
+        // row, which is exactly what must be put back, not a server bar row to
+        // withhold. `frame_rows` is restored too, because the diffs that follow
+        // still describe the last server frame.
+        let saved_status = (self.status_row_owned, self.frame_rows);
+        self.status_row_owned = false;
         // The frame here IS the whole terminal, so the content rect must be the
         // whole terminal too -- otherwise the clears would treat the panel
         // columns as stale remainder and blank them.
@@ -889,6 +942,7 @@ impl Renderer {
         self.content_cols = saved.2;
         self.content_rows = saved.3;
         self.last_cursor = saved_cursor;
+        (self.status_row_owned, self.frame_rows) = saved_status;
         res
     }
 
@@ -908,6 +962,7 @@ impl Renderer {
         // recomputes it for the new size; the origin is left alone.
         self.content_cols = cols;
         self.content_rows = rows;
+        self.status_row_owned = false;
         self.front = vec![vec![RenderCell::default(); cols as usize]; rows as usize];
         // Clear the terminal to avoid stale content from old layout.
         let mut stdout = io::stdout().lock();
@@ -1757,6 +1812,106 @@ mod origin_tests {
         (0..rows)
             .map(|_| text.chars().map(cell).collect::<Vec<_>>())
             .collect()
+    }
+
+    /// A 20x6 terminal with a left sidebar 5 wide: the content rect is 15x6,
+    /// and the client draws the status bar, so the frame's last row is not
+    /// painted and the content rows end one row short.
+    fn owned() -> Renderer {
+        let mut r = Renderer::new(20, 6);
+        r.set_origin(5, 0);
+        r.set_content_size(15, 5);
+        r.set_status_row_owned(true);
+        r
+    }
+
+    #[test]
+    fn an_owned_status_row_is_withheld_from_the_screen_and_kept() {
+        let mut r = owned();
+        let mut frame = grid("pane", 5);
+        frame.push("BAR".chars().map(cell).collect());
+        r.render_full(&frame, 0, 0, false, 0).unwrap();
+        assert_eq!(r.front_buffer()[4][5].c, 'p', "the panes are painted");
+        assert!(
+            r.front_buffer()[5].iter().all(|c| c.c == ' '),
+            "the server's bar must not reach the last row"
+        );
+        let kept: String = r.frame_status_row().iter().map(|c| c.c).collect();
+        assert_eq!(kept, "BAR");
+    }
+
+    #[test]
+    fn a_diff_to_an_owned_status_row_updates_the_kept_row_only() {
+        let mut r = owned();
+        let mut frame = grid("pane", 5);
+        frame.push("BAR".chars().map(cell).collect());
+        r.render_full(&frame, 0, 0, false, 0).unwrap();
+        r.render_diff(
+            &[CellChange {
+                y: 5,
+                x: 1,
+                cell: cell('X'),
+            }],
+            0,
+            0,
+            false,
+            0,
+        )
+        .unwrap();
+        let kept: String = r.frame_status_row().iter().map(|c| c.c).collect();
+        assert_eq!(kept, "BXR");
+        assert!(r.front_buffer()[5].iter().all(|c| c.c == ' '));
+    }
+
+    /// A frame sized to a smaller client on the same session is shorter than
+    /// the content rect. Its bar row must not land mid-screen.
+    #[test]
+    fn a_short_frames_bar_row_is_withheld_too() {
+        let mut r = owned();
+        let mut frame = grid("pane", 2);
+        frame.push("BAR".chars().map(cell).collect());
+        r.render_full(&frame, 0, 0, false, 0).unwrap();
+        assert_eq!(r.front_buffer()[1][5].c, 'p');
+        assert!(
+            r.front_buffer()[2].iter().all(|c| c.c == ' '),
+            "row 2 is where the short frame's bar would have been painted"
+        );
+    }
+
+    #[test]
+    fn without_ownership_the_frames_last_row_is_painted_as_before() {
+        let mut r = Renderer::new(20, 6);
+        let mut frame = grid("pane", 5);
+        frame.push("BAR".chars().map(cell).collect());
+        r.render_full(&frame, 0, 0, false, 0).unwrap();
+        let last: String = r.front_buffer()[5][..3].iter().map(|c| c.c).collect();
+        assert_eq!(last, "BAR");
+    }
+
+    /// `repaint_all` replays the front buffer, whose last row is the client's
+    /// own bar. Withholding it there would blank the bar on every overlay
+    /// teardown.
+    #[test]
+    fn repaint_all_puts_the_terminals_last_row_back() {
+        let mut r = owned();
+        let bar = Rect {
+            x: 0,
+            y: 5,
+            width: 20,
+            height: 1,
+        };
+        r.paint_panel(bar, &grid("CLIENTBAR", 1)).unwrap();
+        r.repaint_all().unwrap();
+        let last: String = r.front_buffer()[5][..9].iter().map(|c| c.c).collect();
+        assert_eq!(last, "CLIENTBAR");
+        let mut frame = grid("pane", 5);
+        frame.push("BAR".chars().map(cell).collect());
+        r.render_full(&frame, 0, 0, false, 0).unwrap();
+        assert_eq!(
+            r.front_buffer()[5][0].c,
+            'C',
+            "ownership survives the repaint"
+        );
     }
 
     #[test]

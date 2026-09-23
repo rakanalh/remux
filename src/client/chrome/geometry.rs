@@ -100,6 +100,13 @@ pub fn effective_sizes(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16)
 }
 
 /// The rect handed to the server as the client's `Resize`.
+///
+/// Its LAST row is the server's status-bar row. With no sidebar it is on
+/// screen, as it has always been. With a sidebar the client draws the bar
+/// itself across the terminal's last row (see [`status_bar_owned`]), so the
+/// last row of this rect is VIRTUAL: the renderer drops it, and with a bottom
+/// sidebar the screen row it would name belongs to that sidebar. The rect keeps
+/// its size either way, so the `Resize` the server sees does not change.
 pub fn content_rect(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Rect {
     let sizes = effective_sizes(sidebars, term_cols, term_rows);
     let mut x = 0u16;
@@ -272,21 +279,104 @@ pub fn frame_size_inset(style: &BorderStyle, edge: SidebarEdge) -> u16 {
     }
 }
 
+/// Whether the client draws the status bar itself, across the terminal's last
+/// row, rather than showing the server's.
+///
+/// True exactly when a sidebar takes space, which is exactly when the content
+/// rect is not the whole terminal. The server draws the bar as wide as the
+/// content rect, so between two sidebars it would stop short of both edges and
+/// its right-aligned segments would sit at the content's right edge. With no
+/// sidebar the server's bar already spans the terminal, and it is left alone so
+/// that case is unchanged.
+pub fn status_bar_owned(content: Rect, term_cols: u16, term_rows: u16) -> bool {
+    content
+        != Rect {
+            x: 0,
+            y: 0,
+            width: term_cols,
+            height: term_rows,
+        }
+}
+
+/// The screen row the client draws the status bar on, or `None` when the
+/// server's own bar is shown. See [`status_bar_owned`].
+pub fn status_bar_rect(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Option<Rect> {
+    let content = content_rect(sidebars, term_cols, term_rows);
+    (term_rows > 0 && status_bar_owned(content, term_cols, term_rows)).then_some(Rect {
+        x: 0,
+        y: term_rows - 1,
+        width: term_cols,
+        height: 1,
+    })
+}
+
+/// Map a mouse position bound for the content to the server frame's
+/// coordinates.
+///
+/// Positions are clamped into the content rect, so a gesture that strayed over
+/// a sidebar stays on the content edge instead of underflowing. When the client
+/// owns the status bar, a position on the terminal's last row is on the
+/// client's bar. It maps to the server's bar row, the content rect's last, at
+/// the SAME column: both bars are laid out from column 0 by the same code, so
+/// the server's tab hit regions line up with what the user clicked.
+pub fn content_point(
+    content: Rect,
+    term_cols: u16,
+    term_rows: u16,
+    col: u16,
+    row: u16,
+) -> (u16, u16) {
+    let last_x = content.width.saturating_sub(1);
+    let last_y = content.height.saturating_sub(1);
+    if status_bar_owned(content, term_cols, term_rows) && row + 1 == term_rows {
+        return (col.min(last_x), last_y);
+    }
+    (
+        col.saturating_sub(content.x).min(last_x),
+        row.saturating_sub(content.y).min(last_y),
+    )
+}
+
+/// Whether a position is on the client's status bar beyond the columns the
+/// server's bar covers. The client's bar is as wide as the terminal and the
+/// server's only as wide as the content rect, so nothing on the server answers
+/// a press there; [`content_point`] would clamp it onto the server bar's last
+/// column instead.
+pub fn past_the_server_bar(
+    content: Rect,
+    term_cols: u16,
+    term_rows: u16,
+    col: u16,
+    row: u16,
+) -> bool {
+    status_bar_owned(content, term_cols, term_rows) && row + 1 == term_rows && col >= content.width
+}
+
 /// Absolute screen rects for every visible sidebar's BAR -- its full extent,
 /// frame included -- as `(sidebar_index, rect)`.
 ///
-/// Vertical sidebars span the full terminal height and are laid out from each
-/// edge inward, so two on the same edge stack side by side rather than
-/// overlapping; the bottom sidebar spans only the columns between the
-/// verticals, which own the corners.
+/// Vertical sidebars span the terminal height down to the status bar, which
+/// the client draws across the last row whenever a sidebar is shown. They are
+/// laid out from each edge inward, so two on the same edge stack side by side
+/// rather than overlapping. The bottom sidebar sits directly above the status
+/// bar and spans only the columns between the verticals, which own the
+/// corners.
 pub fn bar_rects(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Vec<(usize, Rect)> {
     let sizes = effective_sizes(sidebars, term_cols, term_rows);
     let content = content_rect(sidebars, term_cols, term_rows);
     let mut out = Vec::new();
 
+    // The rows above the status bar. With no sidebar nothing below is laid
+    // out, so the bar row is only given up when there is something to give it
+    // to.
+    let body_rows = if status_bar_owned(content, term_cols, term_rows) {
+        term_rows.saturating_sub(1)
+    } else {
+        term_rows
+    };
     let mut left_x = 0u16;
     let mut right_x = term_cols;
-    let mut bottom_y = term_rows;
+    let mut bottom_y = body_rows;
 
     for (i, s) in sidebars.iter().enumerate() {
         let size = sizes[i];
@@ -299,7 +389,7 @@ pub fn bar_rects(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Ve
                     x: left_x,
                     y: 0,
                     width: size,
-                    height: term_rows,
+                    height: body_rows,
                 };
                 left_x += size;
                 r
@@ -310,7 +400,7 @@ pub fn bar_rects(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Ve
                     x: right_x,
                     y: 0,
                     width: size,
-                    height: term_rows,
+                    height: body_rows,
                 }
             }
             SidebarEdge::Bottom => {
@@ -338,9 +428,9 @@ pub fn bar_rects(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Ve
 /// frame itself belongs to no panel), and a panel's `min_size` is measured
 /// against it.
 ///
-/// Vertical sidebars span the full terminal height and stack their panels
-/// vertically; the bottom sidebar spans only the columns between the verticals
-/// and stacks its panels horizontally.
+/// Vertical sidebars span the terminal height down to the status bar and stack
+/// their panels vertically; the bottom sidebar spans only the columns between
+/// the verticals and stacks its panels horizontally. See [`bar_rects`].
 pub fn panel_rects(
     sidebars: &[SidebarGeom],
     term_cols: u16,
@@ -596,7 +686,8 @@ mod tests {
     fn verticals_own_the_corners_so_bottom_spans_between_them() {
         // Decision 2 in the spec: the bottom sidebar's bar starts after the left
         // sidebar and ends before the right one, while the verticals run the
-        // full terminal height.
+        // full terminal height down to the status bar, which the client draws
+        // across the last row whenever a sidebar is shown.
         //
         // Asserted on `bar_rects`, which is where this fact now lives: a
         // sidebar's BAR is what claims terminal space, and the frame is drawn
@@ -619,7 +710,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 30,
-                height: 40
+                height: 39
             }
         );
         assert_eq!(
@@ -628,14 +719,14 @@ mod tests {
                 x: 100,
                 y: 0,
                 width: 20,
-                height: 40
+                height: 39
             }
         );
         assert_eq!(
             bottom,
             Rect {
                 x: 30,
-                y: 34,
+                y: 33,
                 width: 70,
                 height: 6
             }
@@ -663,7 +754,7 @@ mod tests {
                 x: 1,
                 y: 1,
                 width: 28,
-                height: 38
+                height: 37
             }
         );
         assert_eq!(
@@ -672,14 +763,14 @@ mod tests {
                 x: 101,
                 y: 1,
                 width: 18,
-                height: 38
+                height: 37
             }
         );
         assert_eq!(
             bottom,
             Rect {
                 x: 31,
-                y: 35,
+                y: 34,
                 width: 68,
                 height: 4
             }
@@ -707,7 +798,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 29,
-                height: 40
+                height: 39
             }
         );
         assert_eq!(
@@ -716,14 +807,14 @@ mod tests {
                 x: 101,
                 y: 0,
                 width: 19,
-                height: 40
+                height: 39
             }
         );
         assert_eq!(
             bottom,
             Rect {
                 x: 30,
-                y: 35,
+                y: 34,
                 width: 70,
                 height: 5
             }
@@ -896,9 +987,9 @@ mod tests {
 
     #[test]
     fn stacked_panels_split_by_weight() {
-        // Was 20/10 over the full 30-row bar. The interior is 28 rows, and one
-        // of those is the rule between the two panels, so 27 rows divide 2:1
-        // into 18 and 9 with the rule at bar-local row 19.
+        // A 30-row terminal gives a 29-row bar above the status bar and a
+        // 27-row interior. One of those is the rule between the two panels, so
+        // 26 rows divide 2:1 into 17 and 9 with the rule at bar-local row 18.
         let sbs = [sb(SidebarEdge::Left, 30, &[2, 1])];
         let rects = panel_rects(&sbs, 100, 30, &ZJ);
         assert_eq!(rects.len(), 2);
@@ -908,14 +999,14 @@ mod tests {
                 x: 1,
                 y: 1,
                 width: 28,
-                height: 18
+                height: 17
             }
         );
         assert_eq!(
             rects[1].2,
             Rect {
                 x: 1,
-                y: 20,
+                y: 19,
                 width: 28,
                 height: 9
             }
@@ -930,12 +1021,13 @@ mod tests {
     #[test]
     fn weight_remainder_goes_to_the_last_panel() {
         // Was: 31 rows over weights 1,1,1 must not lose a row. The arithmetic
-        // now runs on the INTERIOR minus the rules -- a 32-row terminal gives a
-        // 30-row interior, two rules leave 28 for content, and 28 over three
+        // now runs on the INTERIOR minus the rules -- a 33-row terminal gives a
+        // 32-row bar above the status bar and a 30-row interior, two rules
+        // leave 28 for content, and 28 over three
         // equal weights is 9/9/10. The invariant is the same one: content plus
         // rules must fill the interior exactly, with nothing lost to rounding.
         let sbs = [sb(SidebarEdge::Left, 30, &[1, 1, 1])];
-        let rects = panel_rects(&sbs, 100, 32, &ZJ);
+        let rects = panel_rects(&sbs, 100, 33, &ZJ);
         assert_eq!(rects.len(), 3);
         let content: u16 = rects.iter().map(|(_, _, r)| r.height).sum();
         let rules = rects.len() as u16 - 1;
@@ -957,7 +1049,7 @@ mod tests {
             rects[0].2,
             Rect {
                 x: 1,
-                y: 25,
+                y: 24,
                 width: 48,
                 height: 4
             }
@@ -966,7 +1058,7 @@ mod tests {
             rects[1].2,
             Rect {
                 x: 50,
-                y: 25,
+                y: 24,
                 width: 49,
                 height: 4
             }
@@ -1042,12 +1134,13 @@ mod tests {
                 },
             ],
         }];
-        // 10 rows total, so an 8-row interior. The second panel's weighted
+        // 11 rows total: a 10-row bar above the status bar, so an 8-row
+        // interior. The second panel's weighted
         // share of the 7 rows left after the rule is 0, below its min of 8, so
         // it is dropped -- and dropping it returns the rule as well, leaving the
         // survivor the whole 8-row interior (it was the whole 10-row bar before
         // frames).
-        let rects = panel_rects(&sbs, 100, 10, &ZJ);
+        let rects = panel_rects(&sbs, 100, 11, &ZJ);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].2.height, 8);
     }
@@ -1055,9 +1148,10 @@ mod tests {
     #[test]
     fn a_panel_min_size_is_measured_against_the_interior_not_the_bar() {
         // The discriminating case for checking mins after the frame: a 10-row
-        // bar has an 8-row interior, so a panel asking for 9 rows does NOT fit
-        // even though the bar is big enough for it. Measuring against the bar
-        // would lay out a panel one row taller than the rect it is handed.
+        // bar (an 11-row terminal less the status bar) has an 8-row interior,
+        // so a panel asking for 9 rows does NOT fit even though the bar is big
+        // enough for it. Measuring against the bar would lay out a panel one
+        // row taller than the rect it is handed.
         let sbs = [SidebarGeom {
             edge: SidebarEdge::Left,
             size: 30,
@@ -1075,7 +1169,7 @@ mod tests {
                 },
             ],
         }];
-        let rects = panel_rects(&sbs, 100, 10, &ZJ);
+        let rects = panel_rects(&sbs, 100, 11, &ZJ);
         assert_eq!(rects.len(), 1, "both panels were kept in an 8-row interior");
         assert_eq!(rects[0].2.height, 8);
     }
@@ -1149,12 +1243,13 @@ mod tests {
         let rects = bar_rects(&sbs, 100, 40);
         let first = rects.iter().find(|(s, _)| *s == 0).unwrap().1;
         let second = rects.iter().find(|(s, _)| *s == 1).unwrap().1;
-        // First declared sits closest to the bottom edge; the second stacks above it.
+        // First declared sits closest to the bottom edge, directly above the
+        // status bar row; the second stacks above it.
         assert_eq!(
             first,
             Rect {
                 x: 0,
-                y: 34,
+                y: 33,
                 width: 100,
                 height: 6
             }
@@ -1163,7 +1258,7 @@ mod tests {
             second,
             Rect {
                 x: 0,
-                y: 30,
+                y: 29,
                 width: 100,
                 height: 4
             }
@@ -1188,7 +1283,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 20,
-                height: 30
+                height: 29
             }
         );
         assert_eq!(
@@ -1197,7 +1292,7 @@ mod tests {
                 x: 20,
                 y: 0,
                 width: 10,
-                height: 30
+                height: 29
             }
         );
         assert_eq!(content_rect(&sbs, 100, 30).x, 30);
@@ -1219,5 +1314,108 @@ mod tests {
             "second same-axis sidebar takes only the leftover budget"
         );
         assert_eq!(content_rect(&sbs, 100, 30).width, MIN_CONTENT_COLS);
+    }
+
+    // -- the client-drawn status bar ---------------------------------------
+
+    #[test]
+    fn with_no_sidebar_the_server_keeps_its_status_bar() {
+        assert_eq!(status_bar_rect(&[], 100, 30), None);
+        assert!(!status_bar_owned(content_rect(&[], 100, 30), 100, 30));
+        // A sidebar that is configured but hidden takes no space, so it must not
+        // take the bar either.
+        let mut hidden = sb(SidebarEdge::Left, 30, &[1]);
+        hidden.visible = false;
+        assert_eq!(status_bar_rect(&[hidden], 100, 30), None);
+    }
+
+    #[test]
+    fn any_shown_sidebar_puts_the_bar_across_the_whole_last_row() {
+        let full_width = Some(Rect {
+            x: 0,
+            y: 29,
+            width: 100,
+            height: 1,
+        });
+        for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+            assert_eq!(
+                status_bar_rect(&[sb(edge, 8, &[1])], 100, 30),
+                full_width,
+                "{edge:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn left_and_right_sidebars_stop_one_row_above_the_status_bar() {
+        let sbs = [
+            sb(SidebarEdge::Left, 20, &[1]),
+            sb(SidebarEdge::Right, 15, &[1]),
+        ];
+        let bar = status_bar_rect(&sbs, 100, 30).unwrap();
+        for (_, r) in bar_rects(&sbs, 100, 30) {
+            assert_eq!(r.y + r.height, bar.y, "{r:?} must end where the bar begins");
+        }
+    }
+
+    #[test]
+    fn the_bottom_sidebar_sits_directly_above_the_status_bar() {
+        let sbs = [sb(SidebarEdge::Bottom, 6, &[1])];
+        let bar = status_bar_rect(&sbs, 100, 30).unwrap();
+        let bottom = bar_rects(&sbs, 100, 30)[0].1;
+        assert_eq!(bottom.y + bottom.height, bar.y);
+        // The panes end directly above the sidebar, so directional entry and
+        // the pane area are unchanged by the move.
+        let content = content_rect(&sbs, 100, 30);
+        let panes = pane_area(content, &StatusBarPosition::Bottom);
+        assert_eq!(panes.y + panes.height, bottom.y);
+    }
+
+    /// The server is sent the same `Resize` as before the bar moved: the rect
+    /// keeps its size and only its last row stops being on screen.
+    #[test]
+    fn owning_the_bar_does_not_change_the_rect_the_server_is_sent() {
+        let sbs = [
+            sb(SidebarEdge::Left, 20, &[1]),
+            sb(SidebarEdge::Bottom, 6, &[1]),
+        ];
+        assert_eq!(
+            content_rect(&sbs, 100, 30),
+            Rect {
+                x: 20,
+                y: 0,
+                width: 80,
+                height: 24
+            }
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_client_bar_lands_on_the_servers_bar_row_at_the_same_column() {
+        let sbs = [
+            sb(SidebarEdge::Left, 20, &[1]),
+            sb(SidebarEdge::Bottom, 6, &[1]),
+        ];
+        let content = content_rect(&sbs, 100, 30);
+        // Column 5 is under the left sidebar in every row but the last. On the
+        // bar it is column 5 of the server's bar row, NOT content column 0.
+        assert_eq!(content_point(content, 100, 30, 5, 29), (5, 23));
+        // Past the server bar's width it clamps rather than leaving the row,
+        // which is right for a drag and wrong for a press.
+        assert_eq!(content_point(content, 100, 30, 99, 29), (79, 23));
+        assert!(past_the_server_bar(content, 100, 30, 80, 29));
+        assert!(!past_the_server_bar(content, 100, 30, 79, 29));
+        assert!(!past_the_server_bar(content, 100, 30, 90, 28));
+        // Elsewhere the mapping is the plain clamped translation.
+        assert_eq!(content_point(content, 100, 30, 25, 3), (5, 3));
+        assert_eq!(content_point(content, 100, 30, 5, 3), (0, 3));
+    }
+
+    #[test]
+    fn with_no_sidebar_a_click_maps_exactly_as_before() {
+        let content = content_rect(&[], 100, 30);
+        assert_eq!(content_point(content, 100, 30, 7, 29), (7, 29));
+        assert_eq!(content_point(content, 100, 30, 99, 0), (99, 0));
+        assert!(!past_the_server_bar(content, 100, 30, 99, 29));
     }
 }

@@ -240,10 +240,12 @@ def test_view_paints_inside_the_content_rect():
     # view must not do is paint a border in the sidebar's INTERIOR, which holds
     # only the placeholder's text -- and its own leftmost border must sit
     # exactly on the seam.
+    # The sidebar's box runs from row 0 to the row above the status bar, which
+    # the client draws across the last row, so its interior is rows 1..ROWS-3.
     all_rows = t.rows_text()
     intruders = [
         (y, x)
-        for y, row in enumerate(all_rows[1 : len(all_rows) - 1], start=1)
+        for y, row in enumerate(all_rows[1 : len(all_rows) - 2], start=1)
         for x, ch in enumerate(row[1 : SIDEBAR_W - 1], start=1)
         if ch in BOX
     ]
@@ -258,21 +260,19 @@ def test_view_paints_inside_the_content_rect():
             f"({SIDEBAR_W})"
         )
 
+    # With a sidebar shown the client draws the view's status bar across the
+    # WHOLE last row, from column 0, and the sidebar's box ends on the row
+    # above it. `tests/pty/status_bar_sidebars.py` pins the bar's colours.
     bar = t.rows_text()[-1]
     if "View 1" not in bar:
         fails.append(f"the view status bar is missing: {bar.rstrip()!r}")
-    elif bar.index("View 1") < SIDEBAR_W:
+    elif not bar.startswith(" [NORMAL]"):
+        fails.append(f"the view status bar does not start at column 0: {bar!r}")
+    above = t.rows_text()[-2]
+    if set(above[:SIDEBAR_W]) - set("\u2570\u2500\u256f"):
         fails.append(
-            f"the view status bar starts at column {bar.index('View 1')}, "
-            f"inside the sidebar"
-        )
-    # The sidebar's own bottom border owns that row now, so the band must be
-    # exactly that border -- any other glyph there is the view's status bar
-    # having run past the seam.
-    if set(bar[:SIDEBAR_W]) - set("\u2570\u2500\u256f"):
-        fails.append(
-            f"the view status bar overwrote the panel's bottom row: "
-            f"{bar[:SIDEBAR_W]!r}"
+            f"the sidebar's bottom border is not on the row above the bar: "
+            f"{above[:SIDEBAR_W]!r}"
         )
 
     # And the panel is still there -- the whole point is that it survived.

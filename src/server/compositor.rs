@@ -109,6 +109,12 @@ pub fn hit_test(
 // ---------------------------------------------------------------------------
 
 /// Information needed to render the status bar.
+///
+/// Also sent to the client with every frame, because a client showing sidebars
+/// draws the bar itself across the whole terminal. The frame is shared by every
+/// client attached to the session and is sized to the smallest of them, so it
+/// cannot carry a bar at each client's own width.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatusInfo {
     /// Current mode name (e.g. "NORMAL", "COMMAND", "VISUAL", "SEARCH").
     pub mode: String,
@@ -1521,6 +1527,20 @@ pub fn draw_right_segments(
     }
 }
 
+/// The status bar as one row `cols` wide, laid out exactly as the server lays
+/// out the last row of a frame.
+///
+/// The client uses this when it draws the bar itself. Sharing the layout is
+/// what lets a click on the client's bar be forwarded to the server unchanged:
+/// the tabs start at column 0 in both, so the server's tab hit regions match
+/// the columns the user sees.
+pub fn status_bar_row(info: &StatusInfo, cols: u16, theme: &CompositorTheme) -> Vec<RenderCell> {
+    let mut buffer = vec![vec![RenderCell::default(); cols as usize]];
+    let mut hit_regions = HitRegions::default();
+    draw_status_bar(&mut buffer, cols, 1, info, &mut hit_regions, theme);
+    buffer.pop().unwrap_or_default()
+}
+
 /// Draw the status bar on the last row of the buffer.
 fn draw_status_bar(
     buffer: &mut [Vec<RenderCell>],
@@ -1763,6 +1783,48 @@ mod tests {
             convert_color(&Color::Rgb(10, 20, 30)),
             CellColor::Rgb(10, 20, 30)
         );
+    }
+
+    /// The client's own bar and the frame's last row come from the same
+    /// layout, which is what lets a click on one be forwarded to the other.
+    #[test]
+    fn status_bar_row_is_the_frames_last_row() {
+        let layout = LayoutNode::new_stack(1);
+        let screen = Screen::new(40, 5, 100);
+        let mut pane_screens = HashMap::new();
+        pane_screens.insert(1, &screen);
+        let status = StatusInfo {
+            mode: "NORMAL".to_string(),
+            session_name: "main".to_string(),
+            tabs: vec![
+                ("one".to_string(), true, TabActivity::None),
+                ("two".to_string(), false, TabActivity::Bell),
+            ],
+            layout_mode: "grid".to_string(),
+            search_info: Some((0, 3)),
+        };
+        let theme = CompositorTheme::default();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let (frame, _) = composite(
+            &layout,
+            &pane_screens,
+            area,
+            &BorderStyle::TmuxStyle,
+            &status,
+            40,
+            5,
+            0,
+            1,
+            None,
+            &HashMap::new(),
+            &theme,
+        );
+        assert_eq!(status_bar_row(&status, 40, &theme), frame[4]);
     }
 
     #[test]

@@ -5027,7 +5027,7 @@ async fn handle_mouse_scroll(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup, _status) =
         build_composite(
             &session_name,
             cols,
@@ -5224,7 +5224,7 @@ async fn handle_mouse_click(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup, _status) =
         build_composite(
             &session_name,
             cols,
@@ -5434,7 +5434,7 @@ async fn handle_mouse_drag(
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup, _status) =
         build_composite(
             &session_name,
             cols,
@@ -7467,6 +7467,7 @@ async fn send_full_render_to_client(
         application_cursor_keys,
         bracketed_paste,
         _popup,
+        status,
     ) = build_composite(
         session_name,
         cols,
@@ -7655,6 +7656,7 @@ async fn send_full_render_to_client(
                     bracketed_paste,
                     viewport_top,
                     scroll_offset,
+                    status: status.clone(),
                 }
             } else {
                 ServerMessage::RenderDiff {
@@ -7668,6 +7670,7 @@ async fn send_full_render_to_client(
                     bracketed_paste,
                     viewport_top,
                     scroll_offset,
+                    status: status.clone(),
                 }
             }
         }
@@ -7682,6 +7685,7 @@ async fn send_full_render_to_client(
             bracketed_paste,
             viewport_top,
             scroll_offset,
+            status: status.clone(),
         },
     };
     let _ = tx.send(msg);
@@ -7735,6 +7739,7 @@ async fn broadcast_full_render(
         application_cursor_keys,
         bracketed_paste,
         popup,
+        status,
     ) = build_composite(
         session_name,
         cols,
@@ -7900,6 +7905,7 @@ async fn broadcast_full_render(
                         // Only live-tail clients are targeted here (see the
                         // `scroll_offset == 0` filter above).
                         scroll_offset: 0,
+                        status: status.clone(),
                     }
                 } else {
                     log::debug!(
@@ -7918,6 +7924,7 @@ async fn broadcast_full_render(
                         bracketed_paste,
                         viewport_top,
                         scroll_offset: 0,
+                        status: status.clone(),
                     }
                 }
             }
@@ -7936,6 +7943,7 @@ async fn broadcast_full_render(
                     bracketed_paste,
                     viewport_top,
                     scroll_offset: 0,
+                    status: status.clone(),
                 }
             }
         };
@@ -8054,6 +8062,9 @@ async fn build_composite(
     // so callers can hit-test the popup FIRST without the overlay ever
     // masquerading as a layout pane.
     Option<(PaneId, Rect)>,
+    // What the status bar row shows. `None` only when there is no session or
+    // tab to describe, which is also when the frame is blank.
+    Option<StatusInfo>,
 ) {
     let st = state.lock().await;
     let sess = match st.sessions.get(session_name) {
@@ -8071,6 +8082,7 @@ async fn build_composite(
                 // No pane to read an input mode off; not a claim about one.
                 false,
                 false,
+                None,
                 None,
             );
         }
@@ -8090,6 +8102,7 @@ async fn build_composite(
                 // No pane to read an input mode off; not a claim about one.
                 false,
                 false,
+                None,
                 None,
             );
         }
@@ -8350,6 +8363,7 @@ async fn build_composite(
         application_cursor_keys,
         bracketed_paste,
         popup,
+        Some(status_info),
     )
 }
 

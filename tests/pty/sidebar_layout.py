@@ -231,8 +231,9 @@ def test_all_three_edges_corner_ownership():
     """Verticals own the corners; the bottom sidebar spans only between them.
 
     Design-doc assertion 9. The left (20) and right (16) sidebars run the full
-    terminal height, so the bottom sidebar (5 rows) is inset to the content
-    columns and its panel starts at the content origin, not at column 0.
+    terminal height down to the status bar, so the bottom sidebar (5 rows) is
+    inset to the content columns and its panel starts at the content origin,
+    not at column 0.
     """
     env = make_env(SIDEBAR_CFG_THREE)
     child, screen, pump, raw = spawn(env)
@@ -253,11 +254,12 @@ def test_all_three_edges_corner_ownership():
         rows[1][COLS - right_w + 1 :].startswith("Placeholder")
     ), f"right panel missing: {rows[1][COLS - right_w:]!r}"
 
-    # The bottom sidebar occupies the last 5 rows, inset between the verticals:
+    # The bottom sidebar occupies the 5 rows above the status bar, inset
+    # between the verticals:
     # its BOX starts at the content origin and never claims a corner. The
     # corner test is now on the box's top-left glyph rather than on where the
     # panel text begins -- the box is what claims the space.
-    top = rows[ROWS - 5]
+    top = rows[ROWS - 6]
     assert (
         top[left_w] == "\u256d"
     ), f"bottom sidebar's box does not start at the content origin: {top!r}"
@@ -270,18 +272,20 @@ def test_all_three_edges_corner_ownership():
     assert (
         "\u256e" not in top[COLS - right_w :]
     ), f"bottom sidebar claimed the right corner: {top!r}"
-    band = rows[ROWS - 4]
+    band = rows[ROWS - 5]
     assert (
         band.index("Placeholder") == left_w + 1
     ), f"bottom panel not one cell inside the content origin: {band!r}"
 
-    # And the content shrank vertically to make room: the server's frame and
-    # status bar must both end above the bottom band.
+    # And the content shrank vertically to make room: the panes end above the
+    # bottom band, and the status bar, which the client draws across the whole
+    # terminal whenever a sidebar is shown, is below it on the last row and
+    # nowhere else.
     status = [i for i, r in enumerate(rows) if "[NORMAL]" in r]
-    assert status, "status bar missing"
-    assert (
-        status[0] < ROWS - 5
-    ), f"content still reaches into the bottom sidebar (status row {status[0]})"
+    assert status == [ROWS - 1], f"status bar not (only) on the last row: {status}"
+    assert rows[ROWS - 7][left_w] == "\u2570", (
+        f"the panes do not end directly above the bottom band: {rows[ROWS - 7]!r}"
+    )
 
     teardown(child, env)
     check_no_panic()

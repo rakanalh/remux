@@ -33,6 +33,9 @@ BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 RUNDIR = "/tmp/rmx-sbb"
 COLS, ROWS = 100, 30
 SIDEBAR_W = 30
+# With a sidebar shown the client draws the status bar across the last row, so
+# a sidebar's last row is the one above it.
+SIDEBAR_BOTTOM = ROWS - 2
 
 # Distinctive theme colours so pyte reports an unambiguous hex for each.
 FRAME_FG = "585b70"
@@ -213,13 +216,15 @@ def test_zellij_style_draws_a_box_around_the_sidebar():
     bad = []
     if rows[0][0] != TL or rows[0][w - 1] != TR:
         bad.append(f"top corners: {rows[0][:w]!r}")
-    if rows[ROWS - 1][0] != BL or rows[ROWS - 1][w - 1] != BR:
-        bad.append(f"bottom corners: {rows[ROWS - 1][:w]!r}")
+    if rows[SIDEBAR_BOTTOM][0] != BL or rows[SIDEBAR_BOTTOM][w - 1] != BR:
+        bad.append(f"bottom corners: {rows[SIDEBAR_BOTTOM][:w]!r}")
     if rows[0][1 : w - 1] != HORZ * (w - 2):
         bad.append(f"top edge: {rows[0][:w]!r}")
-    if rows[ROWS - 1][1 : w - 1] != HORZ * (w - 2):
-        bad.append(f"bottom edge: {rows[ROWS - 1][:w]!r}")
-    sides = [y for y in range(1, ROWS - 1) if rows[y][0] != VERT or rows[y][w - 1] != VERT]
+    if rows[SIDEBAR_BOTTOM][1 : w - 1] != HORZ * (w - 2):
+        bad.append(f"bottom edge: {rows[SIDEBAR_BOTTOM][:w]!r}")
+    sides = [
+        y for y in range(1, SIDEBAR_BOTTOM) if rows[y][0] != VERT or rows[y][w - 1] != VERT
+    ]
     if sides:
         bad.append(f"rows missing a side edge: {sides[:5]}")
     if bad:
@@ -263,7 +268,7 @@ def test_tmux_style_draws_a_seam_and_no_box():
     rows = screen.display
 
     bad = []
-    seam = [y for y in range(ROWS) if rows[y][9] != VERT]
+    seam = [y for y in range(SIDEBAR_BOTTOM + 1) if rows[y][9] != VERT]
     if seam:
         bad.append(f"rows missing the seam divider at column 9: {seam[:5]}")
     boxed = [y for y in range(ROWS) if rows[y][0] in BOX]

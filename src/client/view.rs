@@ -1202,6 +1202,36 @@ fn put_str(
     x
 }
 
+/// The view's status bar as one row `cols` wide, laid out by
+/// [`draw_status_bar`]. For the client's own full-width bar; see
+/// `chrome::geometry::status_bar_owned`.
+pub fn status_bar_row(
+    mode: &str,
+    view_name: &str,
+    cell_title: Option<&str>,
+    layout_name: &str,
+    cols: u16,
+    theme: &CompositorTheme,
+) -> Vec<RenderCell> {
+    let mut buf = vec![vec![RenderCell::default(); cols as usize]];
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: 1,
+    };
+    draw_status_bar(
+        &mut buf,
+        area,
+        mode,
+        view_name,
+        cell_title,
+        layout_name,
+        theme,
+    );
+    buf.pop().unwrap_or_default()
+}
+
 /// Draw the view's status bar on the LAST row of `area` (the row reserved by
 /// [`cells_area`]). Mirrors the normal (server) status bar's left/right layout:
 /// the input `mode` (`[NORMAL]`, themed like the real bar), the `view_name`,

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::server::compositor::StatusInfo;
 use crate::server::layout::FocusDirection;
 
 /// Unique identifier for a pane within the server.
@@ -541,6 +542,14 @@ pub enum ServerMessage {
         /// and so never asked to return to the tail.
         #[serde(default)]
         scroll_offset: usize,
+        /// What the frame's last row shows, for a client that draws the status
+        /// bar itself (see [`StatusInfo`]). `None` from a server too old to
+        /// send it; that client then shows the frame's own last row.
+        ///
+        /// No `PROTOCOL_VERSION` bump: the field decodes both ways, the same
+        /// reasoning `DirectoryListing::home` records for being added at 11.
+        #[serde(default)]
+        status: Option<StatusInfo>,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -582,6 +591,9 @@ pub enum ServerMessage {
         /// and so never asked to return to the tail.
         #[serde(default)]
         scroll_offset: usize,
+        /// As [`ServerMessage::FullRender::status`].
+        #[serde(default)]
+        status: Option<StatusInfo>,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -1725,6 +1737,47 @@ mod tests {
         let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         match decoded {
             ServerMessage::Error { message } => assert_eq!(message, "not found"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// A server that predates the field sends no `status`; the frame must
+    /// still decode, as `None`. And the field survives a round trip, since the
+    /// client draws its own bar from it.
+    #[test]
+    fn a_frame_status_decodes_both_ways() {
+        let old = r#"{"RenderDiff":{"changes":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
+        match serde_json::from_str::<ServerMessage>(old).unwrap() {
+            ServerMessage::RenderDiff { status, .. } => assert_eq!(status, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let info = StatusInfo {
+            mode: "NORMAL".into(),
+            session_name: "main".into(),
+            tabs: vec![(
+                "one".into(),
+                false,
+                crate::server::session::TabActivity::Bell,
+            )],
+            layout_mode: "bsp".into(),
+            search_info: Some((1, 4)),
+        };
+        let msg = ServerMessage::FullRender {
+            cells: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            cursor_style: 0,
+            focused_pane_rect: None,
+            application_cursor_keys: false,
+            bracketed_paste: true,
+            viewport_top: 0,
+            scroll_offset: 0,
+            status: Some(info.clone()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::FullRender { status, .. } => assert_eq!(status, Some(info)),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

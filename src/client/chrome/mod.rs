@@ -15,8 +15,9 @@ use anyhow::Result;
 // is a binary crate, so a `pub use` nothing outside `geometry` imports trips
 // `unused_imports` under `-D warnings`.
 pub use geometry::{
-    bar_rects, content_rect, effective_sizes, frame_size_inset, pane_area, panel_rects,
-    sidebar_frame, PanelGeom, SidebarEdge, SidebarGeom,
+    bar_rects, content_point, content_rect, effective_sizes, frame_size_inset, pane_area,
+    panel_rects, past_the_server_bar, sidebar_frame, status_bar_rect, PanelGeom, SidebarEdge,
+    SidebarGeom,
 };
 
 use crate::client::renderer::Renderer;
@@ -206,6 +207,37 @@ impl Chrome {
             .into_iter()
             .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
             .map(|(i, _)| i)
+    }
+
+    /// The row the client draws the status bar on, or `None` while the
+    /// server's own bar is shown. See [`geometry::status_bar_owned`].
+    pub fn status_bar_rect(&self, term_cols: u16, term_rows: u16) -> Option<Rect> {
+        status_bar_rect(&self.geoms(), term_cols, term_rows)
+    }
+
+    /// Paint the status bar across the terminal's last row, when the client
+    /// owns it.
+    ///
+    /// `build` lays the row out for a given width and is only called when there
+    /// is a row to paint. Nothing is emitted when the front buffer already
+    /// holds that row: this runs after every server frame, and the bar changes
+    /// far less often than the panes do.
+    pub fn paint_status_bar(
+        &self,
+        renderer: &mut Renderer,
+        term_cols: u16,
+        term_rows: u16,
+        build: impl FnOnce(u16) -> Vec<RenderCell>,
+    ) -> Result<()> {
+        let Some(rect) = self.status_bar_rect(term_cols, term_rows) else {
+            return Ok(());
+        };
+        let mut row = build(rect.width);
+        row.resize(rect.width as usize, RenderCell::default());
+        if renderer.front_buffer().get(rect.y as usize) == Some(&row) {
+            return Ok(());
+        }
+        renderer.paint_panel(rect, &[row])
     }
 
     /// Whether any sidebar currently occupies space.

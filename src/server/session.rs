@@ -232,7 +232,7 @@ impl Session {
 /// Only ever applies to *background* tabs (a tab that is not its session's
 /// `active_tab`); the foreground tab is always [`TabActivity::None`] because it
 /// is being viewed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TabActivity {
     /// No pending activity (default / cleared on focus).
     #[default]
