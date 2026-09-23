@@ -568,6 +568,7 @@ frame_bg = "#1e1e2e"                # unset by default: borders keep the termina
 pane_label_fg = "#cdd6f4"           # unset by default: the label takes the border color
 status_bar_bg = { rgb = [40, 40, 40] }
 tab_inactive_bg = { ansi = 237 }    # the block behind an inactive tab in a pane's tab strip
+sidebar_current_bg = "#3e385e"      # the agents panel row for the pane you are in
 layout_indicator_bg = { ansi = 245 }  # the bsp/grid/… indicator, in views too
 session_name_fg = "#94e2d5"
 ```

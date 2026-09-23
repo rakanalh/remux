@@ -192,6 +192,12 @@ pub struct ThemeConfig {
     /// inheriting `status_bar_bg`: they sit flat on the bar rather than reading
     /// as a raised block.
     pub tab_inactive_bg: ThemeColor,
+    /// Background of the full-width bar on the agents panel row whose pane the
+    /// user is currently in. Must stay distinct from BOTH selection bars
+    /// (`tab_active_bg` while the panel has focus, `tab_inactive_bg` while it
+    /// does not): the two marks are shown together while the user scrolls the
+    /// list, and one that matched a selection bar would read as a second cursor.
+    pub sidebar_current_bg: ThemeColor,
     pub whichkey_fg: ThemeColor,
     pub whichkey_bg: ThemeColor,
     pub whichkey_key_fg: ThemeColor,
@@ -268,6 +274,10 @@ impl Default for ThemeConfig {
             tab_active_bg: ThemeColor::Rgb(137, 180, 250), // blue
             tab_inactive_fg: ThemeColor::Rgb(147, 153, 178), // overlay2
             tab_inactive_bg: ThemeColor::Indexed(237),  // the historical literal
+            // A dim violet: a different HUE from the neutral grey of 237 and far
+            // darker than the blue focused bar, so the state markers and the
+            // label stay readable on it.
+            sidebar_current_bg: ThemeColor::Rgb(62, 56, 94),
 
             // Which-key popup
             whichkey_fg: ThemeColor::Rgb(205, 214, 244), // text
@@ -437,6 +447,7 @@ pub struct CompositorTheme {
     pub tab_active_bg: CellColor,
     pub tab_inactive_fg: CellColor,
     pub tab_inactive_bg: CellColor,
+    pub sidebar_current_bg: CellColor,
     pub whichkey_fg: CellColor,
     pub whichkey_bg: CellColor,
     pub whichkey_key_fg: CellColor,
@@ -478,6 +489,7 @@ impl CompositorTheme {
             tab_active_bg: config.tab_active_bg.to_cell_color(),
             tab_inactive_fg: config.tab_inactive_fg.to_cell_color(),
             tab_inactive_bg: config.tab_inactive_bg.to_cell_color(),
+            sidebar_current_bg: config.sidebar_current_bg.to_cell_color(),
             whichkey_fg: config.whichkey_fg.to_cell_color(),
             whichkey_bg: config.whichkey_bg.to_cell_color(),
             whichkey_key_fg: config.whichkey_key_fg.to_cell_color(),
@@ -624,6 +636,7 @@ mod tests {
         assert_eq!(ct.tab_active_bg, CellColor::Rgb(137, 180, 250)); // blue
         assert_eq!(ct.tab_inactive_fg, CellColor::Rgb(147, 153, 178)); // overlay2
         assert_eq!(ct.tab_inactive_bg, CellColor::Indexed(237));
+        assert_eq!(ct.sidebar_current_bg, CellColor::Rgb(62, 56, 94));
 
         // Status-bar right-hand segments and activity markers: the named roles
         // must default to the literals the renderers used to hardcode.

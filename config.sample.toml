@@ -129,6 +129,12 @@
 # tab_inactive_fg = "#9399b2"
 # tab_inactive_bg = { ansi = 237 }
 
+# The agents sidebar panel paints the row of the pane you are currently in as a
+# full-width bar in this colour. Keep it distinct from `tab_active_bg` and
+# `tab_inactive_bg`, which the panel uses for its j/k selection (focused and
+# unfocused); the selection wins on a row that is both.
+# sidebar_current_bg = "#3e385e"
+
 # Background-activity markers on inactive status-bar tabs: `!` for a bell,
 # `●` for output, `✓` for a tab that has gone quiet.
 # tab_bell_fg = "bright_red"
