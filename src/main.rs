@@ -606,6 +606,7 @@ async fn main() -> Result<()> {
 
 /// Ensure a server is running, starting one in the background if needed.
 async fn ensure_server_running() -> Result<()> {
+    daemon::prepare_runtime_dir()?;
     let sock = socket_path();
     log::debug!(
         "ensure_server_running: checking socket at {}",
@@ -709,6 +710,9 @@ async fn ensure_server_running() -> Result<()> {
 /// existing graceful path, which saves session state before removing the socket
 /// and pid files.
 async fn stop_server() -> Result<bool> {
+    // The pid file names the process to signal; one in a directory another
+    // user controls could name any process of ours.
+    daemon::prepare_runtime_dir()?;
     let sock = socket_path();
     let pid_file = daemon::pid_path();
 

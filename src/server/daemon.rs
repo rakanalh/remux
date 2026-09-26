@@ -500,9 +500,87 @@ pub(crate) fn process_pgid(_pid: i32) -> Option<i32> {
 
 /// Return the runtime directory used for the socket and pid files.
 fn runtime_dir() -> PathBuf {
-    dirs::runtime_dir()
-        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    xdg_runtime_dir().unwrap_or_else(fallback_runtime_dir)
+}
+
+fn xdg_runtime_dir() -> Option<PathBuf> {
+    dirs::runtime_dir().or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
+}
+
+/// `$TMPDIR/remux-<uid>` (TMPDIR defaulting to `/tmp`), for a session with no
+/// XDG runtime directory. Per user and private, because the temp directory is
+/// shared: a socket straight in `/tmp` could be connected to, or created
+/// first, by any other user on the machine.
+fn fallback_runtime_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("remux-{}", own_uid()))
+}
+
+/// Make the runtime directory ready to hold the socket, or to trust a socket
+/// found in it, and return it.
+///
+/// An XDG runtime directory is the login session's, private to this user by
+/// the spec, and is used as it is. The fallback is created mode 0700, and then
+/// REFUSED unless it is a real directory (not a symlink) owned by this user
+/// with no group or other permission: another user who made it first would
+/// otherwise own the socket every client of ours connects to.
+pub fn prepare_runtime_dir() -> Result<PathBuf> {
+    if let Some(dir) = xdg_runtime_dir() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating runtime directory {}", dir.display()))?;
+        return Ok(dir);
+    }
+    let dir = fallback_runtime_dir();
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", dir.display()));
+            }
+        }
+    }
+    check_private_dir(&dir, own_uid())?;
+    Ok(dir)
+}
+
+/// Whether `dir` is a directory, not a symlink, owned by `uid`, and closed to
+/// group and other.
+fn check_private_dir(dir: &std::path::Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("inspecting {}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!("refusing to use {}: it is not a directory", dir.display());
+    }
+    if meta.uid() != uid {
+        anyhow::bail!(
+            "refusing to use {}: it is owned by uid {}, not by this user (uid {uid})",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    if meta.mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "refusing to use {}: its mode {:o} lets other users in; it must be 0700",
+            dir.display(),
+            meta.mode() & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// This process's effective uid.
+fn own_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether a connection from `peer_uid` may talk to a server run by
+/// `own_uid`. The socket's own mode keeps other users out already; this is the
+/// check that does not depend on a file mode being right.
+fn peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid
 }
 
 /// Return the path to the Unix domain socket used for client-server
@@ -1054,16 +1132,19 @@ impl RemuxServer {
             log::info!("save_sessions disabled: persistence is off");
         }
 
+        prepare_runtime_dir()?;
         let path = socket_path();
-        // Create parent directory if needed.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("creating socket directory")?;
-        }
         // Remove stale socket if present.
         let _ = std::fs::remove_file(&path);
 
         let listener = UnixListener::bind(&path).context("binding Unix listener")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {} to this user", path.display()))?;
+        }
         log::info!("server listening on {}", path.display());
+        let own_uid = own_uid();
 
         // Record our PID so `remux stop` can signal us for a graceful save-and-
         // exit. Best-effort: a write failure here must not abort startup.
@@ -1139,9 +1220,20 @@ impl RemuxServer {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _addr)) => {
-                            server.handle_new_connection(stream).await;
-                        }
+                        Ok((stream, _addr)) => match stream.peer_cred() {
+                            Ok(cred) if peer_allowed(cred.uid(), own_uid) => {
+                                server.handle_new_connection(stream).await;
+                            }
+                            Ok(cred) => {
+                                log::warn!(
+                                    "server: refusing a connection from uid {} (this server runs as uid {own_uid})",
+                                    cred.uid()
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("server: refusing a connection whose peer is unknown: {e}");
+                            }
+                        },
                         Err(e) => {
                             log::error!("accept error: {e}");
                         }
@@ -10436,6 +10528,46 @@ mod tests {
         let mut short = 1i32.to_ne_bytes().to_vec();
         short.extend_from_slice(b"/tmp/x/sssss\0claude\0");
         assert_eq!(argv0(&short).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn only_a_private_directory_of_ours_holds_the_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = super::own_uid();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("remux-test");
+        std::fs::create_dir(&dir).unwrap();
+        let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+
+        set(0o700).unwrap();
+        assert!(super::check_private_dir(&dir, uid).is_ok());
+
+        set(0o755).unwrap();
+        let err = super::check_private_dir(&dir, uid).unwrap_err().to_string();
+        assert!(err.contains("755") && err.contains("0700"), "{err}");
+
+        set(0o700).unwrap();
+        let err = super::check_private_dir(&dir, uid + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owned by uid"), "{err}");
+
+        let link = root.path().join("remux-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let err = super::check_private_dir(&link, uid)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a directory"),
+            "a symlink is refused: {err}"
+        );
+    }
+
+    #[test]
+    fn only_this_user_may_connect() {
+        assert!(super::peer_allowed(1000, 1000));
+        assert!(!super::peer_allowed(1001, 1000));
+        assert!(!super::peer_allowed(0, 1000), "not even root");
     }
 
     /// On macOS a pane is named by `argv[0]`: the `KERN_PROCARGS2` read must

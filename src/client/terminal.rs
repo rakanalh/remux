@@ -86,6 +86,7 @@ impl RemuxClient {
 
     /// Connect to the local server over the Unix domain socket.
     pub async fn connect_local() -> Result<Self> {
+        crate::server::daemon::prepare_runtime_dir()?;
         let path = socket_path();
         log::debug!("terminal: connect_local socket_path={}", path.display());
         let stream = UnixStream::connect(&path)
