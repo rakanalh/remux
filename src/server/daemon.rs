@@ -5397,8 +5397,26 @@ impl RemuxServer {
 
         prepare_runtime_dir()?;
         let path = socket_path();
-        // Remove stale socket if present.
-        let _ = std::fs::remove_file(&path);
+        // Only a socket nobody listens on is stale. Unlinking a live server's
+        // socket would leave that server running, and every session in it,
+        // where no client can reach it.
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(_) => anyhow::bail!(
+                "a remux server is already listening on {}; `remux stop` it first",
+                path.display()
+            ),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("probing {}", path.display()));
+            }
+        }
 
         let listener = UnixListener::bind(&path).context("binding Unix listener")?;
         {
