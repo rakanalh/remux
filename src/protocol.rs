@@ -92,7 +92,13 @@ pub enum ConnDescriptor {
 /// [`RemuxCommand::PaneStackIntoUp`] and [`RemuxCommand::PaneStackIntoDown`].
 /// An old server cannot parse a `Command` carrying one of them, so the bump
 /// turns that into a refused handshake on the new client.
-pub const PROTOCOL_VERSION: u32 = 12;
+///
+/// 12 -> 13: moving a pane to another tab. Adds
+/// [`RemuxCommand::PaneMoveToTabTarget`], which an old server cannot parse.
+/// `feat/subagent-panes` also branched from master at 12 with its own message
+/// changes, so whichever of the two merges second takes the next free number
+/// instead of 13, for the reason the 4 -> 6 entry gives.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -1176,6 +1182,13 @@ pub enum RemuxCommand {
     PaneStackIntoRight,
     PaneStackIntoUp,
     PaneStackIntoDown,
+    /// Move the attached session's focused pane, PTY and all, into the tab
+    /// with this id, or into a new tab when `tab_id` is `None`. By id rather
+    /// than index so that a tab closed or reordered by another client makes the
+    /// move fail instead of hitting a different tab.
+    PaneMoveToTabTarget {
+        tab_id: Option<u64>,
+    },
     PaneRename(String),
     PaneToggleZoom,
     /// Show/hide the session's popup terminal -- a floating, centered pane drawn
@@ -1357,6 +1370,7 @@ impl RemuxCommand {
             | RemuxCommand::PaneStackIntoRight
             | RemuxCommand::PaneStackIntoUp
             | RemuxCommand::PaneStackIntoDown
+            | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
             | RemuxCommand::PopupToggle
             | RemuxCommand::ResizeLeft(_)
@@ -1499,6 +1513,9 @@ pub enum ClientAction {
     /// Open the agent switcher overlay: every pane running an agent, on every
     /// connected server.
     AgentQuickSwitch,
+    /// Open the tab picker that moves the focused pane to another tab of its
+    /// session, or to a new one.
+    PaneMoveToTab,
     /// Prompt for a name and create a new (client-side) view.
     ViewNew,
     /// Open the pane picker to add a cell to the active view.
@@ -1686,6 +1703,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
                 .label("switch session"),
             ActionSpec::client("AgentQuickSwitch", ClientAction::AgentQuickSwitch)
                 .label("switch agent"),
+            ActionSpec::client("PaneMoveToTab", ClientAction::PaneMoveToTab).label("move to tab"),
             ActionSpec::client("ViewNew", ClientAction::ViewNew).label("new view"),
             ActionSpec::client("ViewAddPane", ClientAction::ViewAddPane).label("add pane"),
             ActionSpec::client("ViewRename", ClientAction::ViewRename).label("rename view"),
@@ -1913,6 +1931,8 @@ mod tests {
                 tab_index: 3,
                 delta: -1,
             },
+            RemuxCommand::PaneMoveToTabTarget { tab_id: Some(7) },
+            RemuxCommand::PaneMoveToTabTarget { tab_id: None },
         ];
 
         for cmd in cases {
@@ -2538,7 +2558,8 @@ mod tests {
             | RemuxCommand::PaneNewInTab { .. }
             | RemuxCommand::PaneCloseById { .. }
             | RemuxCommand::PaneRenameById { .. }
-            | RemuxCommand::TabMoveByIndex { .. } => None,
+            | RemuxCommand::TabMoveByIndex { .. }
+            | RemuxCommand::PaneMoveToTabTarget { .. } => None,
         }
     }
 

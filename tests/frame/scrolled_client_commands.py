@@ -540,6 +540,57 @@ def run_tab_new_own_session_positive():
     print("PASS TabNewInSession/scrolled+own-session (snapped)")
 
 
+def run_move_to_tab_refused_negative():
+    """A `PaneMoveToTabTarget` the server REFUSES must not snap.
+
+    Whether the target tab still exists is only known from the state, so the
+    refusal is decided before the snap. The id used is one no tab has.
+
+    Vacuity guard: the refusal must appear in the log, and the tab count must be
+    unchanged, so the case cannot pass on a command that never arrived.
+    """
+    s = build(f"{RUNDIR_BASE}/mtt_refused")
+    try:
+        before = session_tree(s)
+        stale = max(t["id"] for t in before["main"]["tabs"]) + 1000
+        scroll_back(s)
+        mark = len(s.srv.log())
+        s.command({"PaneMoveToTabTarget": {"tab_id": stale}})
+        s.pump(0.8)
+        assert "refused: TargetNotFound" in s.srv.log()[mark:], \
+            "move-to-tab/refused: the server did not refuse the stale id"
+
+        s.c.send({"ScrollDelta": {"delta": 1}})
+        _, r = s.pump(0.8)
+        assert r, "move-to-tab/refused: the follow-up scroll produced no render"
+        assert r[-1][1] == SCROLL_BY + 1, (
+            f"move-to-tab/refused: scroll_offset={r[-1][1]}, expected "
+            f"{SCROLL_BY + 1} -- snapped for a move the server then refused")
+        assert tab_count(session_tree(s), "main") == tab_count(before, "main"), \
+            "move-to-tab/refused: the tab count changed"
+    finally:
+        s.close()
+    print("PASS PaneMoveToTabTarget/scrolled+stale-id (refused, so not snapped)")
+
+
+def run_move_to_tab_positive():
+    """An accepted `PaneMoveToTabTarget` makes the new tab active, so it snaps."""
+    s = build(f"{RUNDIR_BASE}/mtt_ok")
+    try:
+        n_before = tab_count(session_tree(s), "main")
+        scroll_back(s)
+        s.command({"PaneMoveToTabTarget": {"tab_id": None}})
+        _, r = s.pump(1.2)
+        assert r, "move-to-tab/ok: SILENT -- the pane moved and no frame reached this client"
+        assert r[-1][1] == 0, \
+            f"move-to-tab/ok: client left at scroll_offset={r[-1][1]}, not at the live tail"
+        assert tab_count(session_tree(s), "main") == n_before + 1, \
+            "move-to-tab/ok: no new tab -- the move did not run"
+    finally:
+        s.close()
+    print("PASS PaneMoveToTabTarget/scrolled+new-tab (snapped)")
+
+
 # Focus, tab and stack moves are deliberately absent: they no longer snap. See
 # `run_focus_move_negative`, `run_tab_move_negative` and
 # `run_stack_move_negative`.
@@ -560,7 +611,8 @@ def main():
                   run_popup_negative, run_popup_resize_positive,
                   run_cross_session_negative, run_own_session_positive,
                   run_tab_new_other_session_negative,
-                  run_tab_new_own_session_positive):
+                  run_tab_new_own_session_positive,
+                  run_move_to_tab_refused_negative, run_move_to_tab_positive):
         try:
             probe()
         except AssertionError as e:

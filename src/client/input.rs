@@ -449,6 +449,16 @@ pub enum InputAction {
     AgentSwitchConfirm(crate::client::tree_model::JumpTarget),
     /// Agent switcher closed without a jump.
     AgentSwitchClose,
+    /// Open the tab picker for moving the focused pane. The event loop builds
+    /// the overlay, because it knows which connection the command goes to.
+    TabPickerOpen,
+    /// Tab picker updated (re-render needed).
+    TabPickerUpdate,
+    /// Tab picker confirmed: move the focused pane on `conn` to the tab with
+    /// this id, or to a new tab when `tab_id` is `None`.
+    TabPickerConfirm { conn: ConnId, tab_id: Option<u64> },
+    /// Tab picker closed without a move.
+    TabPickerClose,
     // -- Views (client-only virtual tabs; never forwarded to the server) --
     /// Create a new empty view with the given name and activate it.
     NewView(String),
@@ -595,6 +605,8 @@ pub struct InputHandler {
     pub agent_switch: Option<AgentSwitchOverlay>,
     /// State for the view-picker overlay (choose which View to add a pane to).
     pub view_picker: Option<ViewPickerOverlay>,
+    /// The tab picker for moving the focused pane, while it is open.
+    pub tab_picker: Option<TabPickerOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
 }
@@ -1266,6 +1278,139 @@ impl AgentSwitchOverlay {
     }
 }
 
+/// The tab picker behind `PaneMoveToTab`: the other tabs of the session the
+/// focused pane is in, plus a `+ new tab` row, for moving that pane.
+///
+/// It is pinned to the connection that was in the foreground when it opened.
+/// Its tree is read from that connection only and the command goes back to it,
+/// so a foreground switch while the picker is open cannot send one server's tab
+/// id to another server.
+#[derive(Debug)]
+pub struct TabPickerOverlay {
+    conn: ConnId,
+    /// `None` until the first tree from `conn` arrives.
+    tabs: Option<Vec<TabChoice>>,
+    nav: crate::client::sidebar::nav::NavList,
+}
+
+#[derive(Debug)]
+struct TabChoice {
+    id: u64,
+    /// 1-based, as the status bar and `TabGoto` number tabs.
+    position: usize,
+    name: String,
+}
+
+/// What a tree told the tab picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabPickerTree {
+    /// The picker has rows to offer.
+    Offer,
+    /// The picker must close: the session is one tab holding one pane, which
+    /// the only candidate (`+ new tab`) would rebuild as it is, or the tree
+    /// names no current session with an active tab.
+    Nothing,
+}
+
+impl TabPickerOverlay {
+    pub fn new(conn: ConnId) -> Self {
+        Self {
+            conn,
+            tabs: None,
+            nav: crate::client::sidebar::nav::NavList::new(),
+        }
+    }
+
+    pub fn conn(&self) -> &ConnId {
+        &self.conn
+    }
+
+    /// Rebuild the rows from a tree sent by [`TabPickerOverlay::conn`].
+    ///
+    /// The highlight follows the tab it was on by id, because two tabs can share
+    /// a name and a tab above it can close. On the first tree it starts on the
+    /// first existing tab, or on `+ new tab` when there is none.
+    pub fn apply_tree(
+        &mut self,
+        folders: &[crate::protocol::FolderTreeEntry],
+        unfiled: &[crate::protocol::SessionTreeEntry],
+    ) -> TabPickerTree {
+        let Some(session) = folders
+            .iter()
+            .flat_map(|f| f.sessions.iter())
+            .chain(unfiled.iter())
+            .find(|s| s.is_current)
+        else {
+            return TabPickerTree::Nothing;
+        };
+        let Some(source) = session.tabs.iter().position(|t| t.is_active) else {
+            return TabPickerTree::Nothing;
+        };
+        if session.tabs.len() == 1 && session.tabs[source].panes.len() <= 1 {
+            return TabPickerTree::Nothing;
+        }
+        let tabs: Vec<TabChoice> = session
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != source)
+            .map(|(i, t)| TabChoice {
+                id: t.id,
+                position: i + 1,
+                name: t.name.clone(),
+            })
+            .collect();
+        let first_tree = self.tabs.is_none();
+        let previous = self.target();
+        self.tabs = Some(tabs);
+        let keys = self.keys();
+        if first_tree {
+            self.nav.set_selected(if keys.len() > 1 { 1 } else { 0 });
+        } else {
+            self.nav.reselect(&keys, previous.as_ref());
+        }
+        TabPickerTree::Offer
+    }
+
+    /// Row keys in render order: `None` is `+ new tab`, `Some(id)` a tab.
+    fn keys(&self) -> Vec<Option<u64>> {
+        std::iter::once(None)
+            .chain(self.tabs.iter().flatten().map(|t| Some(t.id)))
+            .collect()
+    }
+
+    fn navigate(&mut self, cmd: crate::client::sidebar::nav::NavKey) {
+        if self.tabs.is_some() {
+            let len = self.keys().len();
+            self.nav.apply(cmd, len);
+        }
+    }
+
+    /// What Enter would move the pane to: `Some(None)` for a new tab,
+    /// `Some(Some(id))` for an existing tab, and `None` while still loading.
+    pub fn target(&self) -> Option<Option<u64>> {
+        self.tabs.as_ref()?;
+        self.keys().get(self.nav.selected()).copied()
+    }
+
+    pub fn render(
+        &self,
+        screen_cols: u16,
+        screen_rows: u16,
+        theme: &crate::config::theme::Theme,
+    ) -> Vec<crate::client::whichkey::DrawCommand> {
+        let rows: Vec<SwitchRow> = match &self.tabs {
+            None => vec![SwitchRow::item("  loading...".to_string(), false)],
+            Some(tabs) => std::iter::once("  + new tab".to_string())
+                .chain(tabs.iter().map(|t| format!("  {}: {}", t.position, t.name)))
+                .enumerate()
+                .map(|(i, text)| SwitchRow::item(text, i == self.nav.selected()))
+                .collect(),
+        };
+        render_switch_popup(" Move pane to tab ", &rows, screen_cols, screen_rows, theme)
+    }
+}
+
 /// One row of a quick-switch popup.
 #[derive(Debug, Clone)]
 pub enum SwitchRow {
@@ -1460,6 +1605,7 @@ impl InputHandler {
             session_switch: None,
             agent_switch: None,
             view_picker: None,
+            tab_picker: None,
             pending_editor_open: false,
         }
     }
@@ -1525,6 +1671,10 @@ impl InputHandler {
         }
         if self.agent_switch.is_some() {
             return self.handle_agent_switch_key(key);
+        }
+
+        if self.tab_picker.is_some() {
+            return self.handle_tab_picker_key(key);
         }
 
         // If the view picker overlay is active, capture keystrokes for it.
@@ -1682,6 +1832,7 @@ impl InputHandler {
             || self.session_switch.is_some()
             || self.agent_switch.is_some()
             || self.view_picker.is_some()
+            || self.tab_picker.is_some()
     }
 
     /// Whether this key is a way into command mode: the configured leader, or a
@@ -1936,6 +2087,10 @@ impl InputHandler {
             ClientAction::AgentQuickSwitch => {
                 self.mode = Mode::Command;
                 InputAction::AgentSwitchOpen
+            }
+            ClientAction::PaneMoveToTab => {
+                self.mode = Mode::Command;
+                InputAction::TabPickerOpen
             }
             ClientAction::ViewNew => {
                 // Prompt for a name via the rename overlay; the confirm maps to
@@ -3080,6 +3235,37 @@ impl InputHandler {
                 Some(cmd) => {
                     overlay.nav.apply(cmd, overlay.rows.len());
                     InputAction::AgentSwitchUpdate
+                }
+                None => InputAction::None,
+            },
+        }
+    }
+
+    /// Handle a keystroke while the tab picker is open. A key the list has no
+    /// use for does nothing and never reaches the pane.
+    fn handle_tab_picker_key(&mut self, key: KeyEvent) -> InputAction {
+        let overlay = match self.tab_picker.as_mut() {
+            Some(o) => o,
+            None => return InputAction::None,
+        };
+        let close = |this: &mut Self, action: InputAction| {
+            this.tab_picker = None;
+            this.mode = Mode::Normal;
+            action
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => close(self, InputAction::TabPickerClose),
+            _ => match crate::client::sidebar::nav::nav_key(&key) {
+                Some(crate::client::sidebar::nav::NavKey::Activate) => match overlay.target() {
+                    Some(tab_id) => {
+                        let conn = overlay.conn().clone();
+                        close(self, InputAction::TabPickerConfirm { conn, tab_id })
+                    }
+                    None => InputAction::None,
+                },
+                Some(cmd) => {
+                    overlay.navigate(cmd);
+                    InputAction::TabPickerUpdate
                 }
                 None => InputAction::None,
             },
@@ -6233,5 +6419,260 @@ mod tests {
             InputAction::AgentSwitchClose
         );
         assert!(handler.agent_switch.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tab_picker_tests {
+    use super::*;
+    use crate::protocol::{PaneTreeEntry, SessionTreeEntry, TabTreeEntry};
+    use crossterm::event::{KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn tab(id: u64, name: &str, active: bool, panes: usize) -> TabTreeEntry {
+        TabTreeEntry {
+            id,
+            name: name.to_string(),
+            panes: (0..panes as u64)
+                .map(|p| PaneTreeEntry {
+                    id: id * 100 + p,
+                    name: String::new(),
+                    is_focused: p == 0,
+                    cwd: None,
+                })
+                .collect(),
+            is_active: active,
+        }
+    }
+
+    fn session(name: &str, current: bool, tabs: Vec<TabTreeEntry>) -> SessionTreeEntry {
+        SessionTreeEntry {
+            name: name.to_string(),
+            tabs,
+            client_count: 1,
+            is_current: current,
+        }
+    }
+
+    fn picker_with(tabs: Vec<TabTreeEntry>) -> (TabPickerOverlay, TabPickerTree) {
+        let mut p = TabPickerOverlay::new(ConnId::Local);
+        let verdict = p.apply_tree(&[], &[session("main", true, tabs)]);
+        (p, verdict)
+    }
+
+    fn row_texts(p: &TabPickerOverlay) -> Vec<String> {
+        let theme = crate::config::theme::Theme::default();
+        p.render(60, 30, &theme)
+            .into_iter()
+            .map(|c| c.text.trim().to_string())
+            .filter(|t| !t.is_empty() && !t.starts_with(BOX_VERTICAL))
+            .collect()
+    }
+
+    fn handler_with(p: TabPickerOverlay) -> InputHandler {
+        let mut h = InputHandler::with_defaults();
+        h.mode = Mode::Command;
+        h.tab_picker = Some(p);
+        h
+    }
+
+    #[test]
+    fn lists_the_new_tab_row_then_every_tab_but_the_source() {
+        let (p, verdict) = picker_with(vec![
+            tab(1, "one", false, 1),
+            tab(2, "two", true, 2),
+            tab(3, "three", false, 1),
+        ]);
+        assert_eq!(verdict, TabPickerTree::Offer);
+        let rows = row_texts(&p);
+        let listed: Vec<&str> = rows
+            .iter()
+            .map(String::as_str)
+            .filter(|t| t.starts_with('+') || t.contains(": "))
+            .collect();
+        assert_eq!(listed, vec!["+ new tab", "1: one", "3: three"]);
+        assert!(rows.iter().any(|t| t.contains("Move pane to tab")));
+    }
+
+    #[test]
+    fn a_session_from_another_server_or_not_current_is_not_listed() {
+        let mut p = TabPickerOverlay::new(ConnId::Local);
+        let verdict = p.apply_tree(
+            &[],
+            &[
+                session(
+                    "other",
+                    false,
+                    vec![tab(7, "x", true, 1), tab(8, "y", false, 1)],
+                ),
+                session(
+                    "main",
+                    true,
+                    vec![tab(1, "one", true, 1), tab(2, "two", false, 1)],
+                ),
+            ],
+        );
+        assert_eq!(verdict, TabPickerTree::Offer);
+        assert_eq!(p.keys(), vec![None, Some(2)]);
+    }
+
+    #[test]
+    fn highlight_starts_on_the_first_existing_tab() {
+        let (p, _) = picker_with(vec![tab(1, "one", true, 1), tab(2, "two", false, 1)]);
+        assert_eq!(p.target(), Some(Some(2)));
+    }
+
+    #[test]
+    fn highlight_starts_on_new_tab_when_no_other_tab_exists() {
+        let (p, verdict) = picker_with(vec![tab(1, "one", true, 2)]);
+        assert_eq!(verdict, TabPickerTree::Offer);
+        assert_eq!(p.target(), Some(None));
+    }
+
+    #[test]
+    fn one_tab_holding_one_pane_offers_nothing() {
+        let (_, verdict) = picker_with(vec![tab(1, "one", true, 1)]);
+        assert_eq!(verdict, TabPickerTree::Nothing);
+    }
+
+    #[test]
+    fn a_tree_without_a_current_session_offers_nothing() {
+        let mut p = TabPickerOverlay::new(ConnId::Local);
+        let verdict = p.apply_tree(
+            &[],
+            &[session(
+                "main",
+                false,
+                vec![tab(1, "one", true, 1), tab(2, "two", false, 1)],
+            )],
+        );
+        assert_eq!(verdict, TabPickerTree::Nothing);
+    }
+
+    #[test]
+    fn highlight_follows_the_tab_id_across_a_refresh() {
+        let (mut p, _) = picker_with(vec![
+            tab(1, "src", true, 1),
+            tab(2, "dup", false, 1),
+            tab(3, "dup", false, 1),
+        ]);
+        p.navigate(crate::client::sidebar::nav::NavKey::Down);
+        assert_eq!(p.target(), Some(Some(3)));
+
+        p.apply_tree(
+            &[],
+            &[session(
+                "main",
+                true,
+                vec![
+                    tab(1, "src", true, 1),
+                    tab(9, "dup", false, 1),
+                    tab(2, "dup", false, 1),
+                    tab(3, "dup", false, 1),
+                ],
+            )],
+        );
+        assert_eq!(p.target(), Some(Some(3)));
+    }
+
+    #[test]
+    fn enter_while_loading_does_nothing_and_keeps_the_picker_open() {
+        let mut h = handler_with(TabPickerOverlay::new(ConnId::Local));
+        assert_eq!(h.handle_key(key(KeyCode::Enter)), InputAction::None);
+        assert!(h.tab_picker.is_some());
+        assert_eq!(h.mode, Mode::Command);
+        assert!(row_texts(h.tab_picker.as_ref().expect("picker"))
+            .iter()
+            .any(|t| t == "loading..."));
+    }
+
+    #[test]
+    fn enter_sends_the_highlighted_tab_to_the_pinned_connection() {
+        let mut p = TabPickerOverlay::new(ConnId::Remote("mini".into()));
+        p.apply_tree(
+            &[],
+            &[session(
+                "main",
+                true,
+                vec![
+                    tab(1, "a", false, 1),
+                    tab(2, "b", true, 1),
+                    tab(3, "c", false, 1),
+                ],
+            )],
+        );
+        let mut h = handler_with(p);
+        assert_eq!(
+            h.handle_key(key(KeyCode::Char('j'))),
+            InputAction::TabPickerUpdate
+        );
+        assert_eq!(
+            h.handle_key(key(KeyCode::Enter)),
+            InputAction::TabPickerConfirm {
+                conn: ConnId::Remote("mini".into()),
+                tab_id: Some(3),
+            }
+        );
+        assert!(h.tab_picker.is_none());
+        assert_eq!(h.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn enter_on_the_new_tab_row_asks_for_a_new_tab() {
+        let (p, _) = picker_with(vec![tab(1, "one", true, 1), tab(2, "two", false, 1)]);
+        let mut h = handler_with(p);
+        assert_eq!(h.handle_key(key(KeyCode::Up)), InputAction::TabPickerUpdate);
+        assert_eq!(
+            h.handle_key(key(KeyCode::Enter)),
+            InputAction::TabPickerConfirm {
+                conn: ConnId::Local,
+                tab_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn esc_and_q_close_without_a_move() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let (p, _) = picker_with(vec![tab(1, "one", true, 1), tab(2, "two", false, 1)]);
+            let mut h = handler_with(p);
+            assert_eq!(h.handle_key(key(code)), InputAction::TabPickerClose);
+            assert!(h.tab_picker.is_none());
+            assert_eq!(h.mode, Mode::Normal);
+        }
+    }
+
+    #[test]
+    fn an_unused_key_is_swallowed() {
+        let (p, _) = picker_with(vec![tab(1, "one", true, 1), tab(2, "two", false, 1)]);
+        let mut h = handler_with(p);
+        assert_eq!(h.handle_key(key(KeyCode::Char('x'))), InputAction::None);
+        assert!(h.tab_picker.is_some());
+    }
+
+    #[test]
+    fn prefix_p_t_opens_the_picker() {
+        let mut h = InputHandler::with_defaults();
+        let ctrl_a = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        h.handle_key(ctrl_a);
+        h.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(
+            h.handle_key(key(KeyCode::Char('t'))),
+            InputAction::TabPickerOpen
+        );
+        assert_eq!(h.mode, Mode::Command);
     }
 }

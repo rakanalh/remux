@@ -275,6 +275,76 @@ pub struct Tab {
 }
 
 impl Tab {
+    fn with_pane(id: TabId, name: &str, pane: PaneId, layout_mode: LayoutMode) -> Self {
+        Tab {
+            id,
+            name: name.to_string(),
+            layout: LayoutNode::new_stack(pane),
+            focused_pane: pane,
+            layout_mode,
+            pane_order: vec![pane],
+            zoomed_pane: None,
+            saved_custom_layout: None,
+            activity: TabActivity::None,
+            last_output: None,
+        }
+    }
+
+    /// Take `pane` out of the layout tree and `pane_order` without touching
+    /// its PTY. Returns the pane the tree shows in its place, or `None` when
+    /// the tab is now empty. The caller decides where focus goes.
+    ///
+    /// Detaching the zoomed pane un-zooms the tab, as tmux does:
+    /// `zoomed_pane` names the pane painted full-area, so a detached id there
+    /// would paint a pane the tab no longer owns.
+    pub fn detach_pane(&mut self, pane: PaneId) -> Option<PaneId> {
+        let survivor = self.layout.close_pane(pane);
+        self.pane_order.retain(|&id| id != pane);
+        if self.zoomed_pane == Some(pane) {
+            self.zoomed_pane = None;
+        }
+        survivor
+    }
+
+    /// Rebuild an automatic layout from `pane_order` around the focused pane.
+    /// A `Custom` tree is the user's own arrangement and is left as it is.
+    pub fn rebuild_if_automatic(&mut self) {
+        if self.layout_mode.is_automatic() {
+            self.layout = self
+                .layout_mode
+                .build_tree(&self.pane_order, self.focused_pane);
+        }
+    }
+
+    /// Whether [`Tab::place_auto`] can place a pane here. A `Custom` tab
+    /// places it by splitting its focused pane, which fails when that pane is
+    /// missing from the tree.
+    pub fn can_place_auto(&self) -> bool {
+        self.layout_mode.is_automatic()
+            || layout::all_pane_ids(&self.layout).contains(&self.focused_pane)
+    }
+
+    /// Lay out `pane` the way `PanePlacement::Auto` places a new pane: an
+    /// automatic tab is rebuilt with it, a `Custom` tab gets a vertical split
+    /// of its focused pane. `pane` must already be in `pane_order`, because an
+    /// automatic rebuild reads it. Returns `false` when the split found no
+    /// focused pane to split; [`Tab::can_place_auto`] answers that in advance.
+    pub fn place_auto(&mut self, pane: PaneId) -> bool {
+        if self.layout_mode.is_automatic() {
+            self.layout = self.layout_mode.build_tree(&self.pane_order, pane);
+            true
+        } else {
+            self.layout.split_vertical(self.focused_pane, pane)
+        }
+    }
+
+    /// Focus a pane that was just added to this tab. This releases the zoom,
+    /// because a zoom would hide the new arrangement behind one pane.
+    pub fn focus_new_pane(&mut self, pane: PaneId) {
+        self.focused_pane = pane;
+        self.zoomed_pane = None;
+    }
+
     /// **The one answer to "which panes does this tab own".**
     ///
     /// `pane_order` and the layout tree are two views of the same set (see
@@ -498,6 +568,50 @@ pub(crate) fn assert_popup_invariant(sess: &Session, context: &str) {
     if let Err(e) = check_structural_invariant(sess) {
         panic!("[{context}] {e}");
     }
+}
+
+/// Where [`ServerState::move_pane_to_tab`] puts the pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveTarget {
+    Tab(TabId),
+    NewTab,
+}
+
+impl From<Option<TabId>> for MoveTarget {
+    fn from(tab_id: Option<TabId>) -> Self {
+        match tab_id {
+            Some(id) => MoveTarget::Tab(id),
+            None => MoveTarget::NewTab,
+        }
+    }
+}
+
+/// Why [`ServerState::move_pane_to_tab`] left the state untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveRefused {
+    NoSession,
+    /// The daemon's popup guard in `handle_command` blocks the command before
+    /// it reaches this function, so that guard is the primary check. This
+    /// variant keeps the public function safe for a caller that skips the
+    /// guard. While the popup is shown, the user works in the popup, so the
+    /// tab's focused pane is not the pane they asked to move.
+    PopupVisible,
+    PaneNotInAnyTab,
+    TargetNotFound,
+    TargetIsSourceTab,
+    SolePaneInSoleTab,
+    TargetLayoutMissingFocus,
+}
+
+struct MovePlan {
+    source_idx: usize,
+    /// `None` when the pane goes to a new tab.
+    target_idx: Option<usize>,
+}
+
+enum Destination {
+    Existing(usize),
+    New(TabId),
 }
 
 /// Fallback popup size for a session deserialized from disk (the field is
@@ -860,18 +974,7 @@ impl ServerState {
             None
         };
 
-        let tab = Tab {
-            id: tab_id,
-            name: "Tab 1".to_string(),
-            layout: LayoutNode::new_stack(pane_id),
-            focused_pane: pane_id,
-            layout_mode,
-            pane_order: vec![pane_id],
-            zoomed_pane: None,
-            saved_custom_layout: None,
-            activity: TabActivity::None,
-            last_output: None,
-        };
+        let tab = Tab::with_pane(tab_id, "Tab 1", pane_id, layout_mode);
 
         let session = Session {
             name: name.to_string(),
@@ -1100,22 +1203,150 @@ impl ServerState {
             .get_mut(session)
             .ok_or_else(|| anyhow::anyhow!("session '{}' not found", session))?;
 
-        let tab = Tab {
-            id: tab_id,
-            name: name.to_string(),
-            layout: LayoutNode::new_stack(pane_id),
-            focused_pane: pane_id,
-            layout_mode,
-            pane_order: vec![pane_id],
-            zoomed_pane: None,
-            saved_custom_layout: None,
-            activity: TabActivity::None,
-            last_output: None,
-        };
+        let tab = Tab::with_pane(tab_id, name, pane_id, layout_mode);
 
         sess.tabs.push(tab);
         sess.active_tab = sess.tabs.len() - 1;
         Ok(pane_id)
+    }
+
+    /// Decide whether [`ServerState::move_pane_to_tab`] would move `pane` to
+    /// `target`, without changing anything. The daemon asks this before it
+    /// returns a scrolled client to the live tail, so a refused move does not
+    /// cost that client its scroll position.
+    pub fn check_move_pane_to_tab(
+        &self,
+        session: &str,
+        pane: PaneId,
+        target: MoveTarget,
+    ) -> std::result::Result<(), MoveRefused> {
+        self.plan_move(session, pane, target).map(|_| ())
+    }
+
+    fn plan_move(
+        &self,
+        session: &str,
+        pane: PaneId,
+        target: MoveTarget,
+    ) -> std::result::Result<MovePlan, MoveRefused> {
+        let sess = self.sessions.get(session).ok_or(MoveRefused::NoSession)?;
+        if sess.popup_visible {
+            return Err(MoveRefused::PopupVisible);
+        }
+        if sess.popup_pane == Some(pane) {
+            return Err(MoveRefused::PaneNotInAnyTab);
+        }
+        let source_idx = sess
+            .tabs
+            .iter()
+            .position(|t| t.pane_order.contains(&pane))
+            .ok_or(MoveRefused::PaneNotInAnyTab)?;
+        let target_idx = match target {
+            MoveTarget::Tab(id) => {
+                let target_idx = sess
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == id)
+                    .ok_or(MoveRefused::TargetNotFound)?;
+                if target_idx == source_idx {
+                    return Err(MoveRefused::TargetIsSourceTab);
+                }
+                if !sess.tabs[target_idx].can_place_auto() {
+                    return Err(MoveRefused::TargetLayoutMissingFocus);
+                }
+                Some(target_idx)
+            }
+            MoveTarget::NewTab => {
+                if sess.tabs.len() == 1 && sess.tabs[source_idx].pane_order.len() == 1 {
+                    return Err(MoveRefused::SolePaneInSoleTab);
+                }
+                None
+            }
+        };
+        Ok(MovePlan {
+            source_idx,
+            target_idx,
+        })
+    }
+
+    /// Move a live pane out of its tab and into `target`, keeping its id, and
+    /// make the target the session's active tab with the pane focused. Returns
+    /// the target's index after the move.
+    ///
+    /// Only the layout bookkeeping changes: the caller owns the PTY, which is
+    /// never touched. An emptied source tab is removed. Every refusal is decided
+    /// before the first mutation, so a refused move leaves the session exactly
+    /// as it was.
+    pub fn move_pane_to_tab(
+        &mut self,
+        session: &str,
+        pane: PaneId,
+        target: MoveTarget,
+    ) -> std::result::Result<usize, MoveRefused> {
+        let MovePlan {
+            source_idx,
+            target_idx,
+        } = self.plan_move(session, pane, target)?;
+        let destination = match target_idx {
+            Some(idx) => Destination::Existing(idx),
+            None => Destination::New(self.next_tab_id()),
+        };
+        let sess = self
+            .sessions
+            .get_mut(session)
+            .ok_or(MoveRefused::NoSession)?;
+        let new_tab_name = format!("Tab {}", sess.tabs.len() + 1);
+
+        let source = &mut sess.tabs[source_idx];
+        let name = layout::get_pane_name(&source.layout, pane).unwrap_or_default();
+        let custom_name = layout::get_pane_custom_name(&source.layout, pane).flatten();
+        let survivor = source.detach_pane(pane);
+        match survivor {
+            Some(survivor) => {
+                if source.focused_pane == pane {
+                    source.focus_pane(survivor);
+                }
+                source.rebuild_if_automatic();
+            }
+            None => {
+                sess.tabs.remove(source_idx);
+            }
+        }
+
+        let target_idx = match destination {
+            Destination::Existing(target_idx) => {
+                let idx = if survivor.is_none() && source_idx < target_idx {
+                    target_idx - 1
+                } else {
+                    target_idx
+                };
+                let tab = &mut sess.tabs[idx];
+                tab.pane_order.push(pane);
+                tab.place_auto(pane);
+                tab.focus_new_pane(pane);
+                idx
+            }
+            Destination::New(id) => {
+                sess.tabs.push(Tab::with_pane(
+                    id,
+                    &new_tab_name,
+                    pane,
+                    LayoutMode::default(),
+                ));
+                sess.tabs.len() - 1
+            }
+        };
+
+        let tab = &mut sess.tabs[target_idx];
+        layout::set_pane_name(&mut tab.layout, pane, &name);
+        if let Some(custom_name) = custom_name {
+            layout::set_pane_custom_name(&mut tab.layout, pane, &custom_name);
+        }
+        tab.activity = TabActivity::None;
+        tab.last_output = None;
+        sess.active_tab = target_idx;
+        debug_check_invariant(sess, "move_pane_to_tab");
+        Ok(target_idx)
     }
 
     /// Close a tab by index. Returns the pane IDs that need cleanup and
@@ -3214,5 +3445,513 @@ mod popup_invariant_tests {
                 .contains(&sess_of(&st, &name).popup_pane.expect("popup")),
             "the popup is in neither side"
         );
+    }
+}
+
+#[cfg(test)]
+mod move_pane_to_tab_tests {
+    use super::*;
+    use crate::server::layout::{BspLayout, CustomLayout, MonocleLayout};
+
+    /// One session, `main`, whose tabs hold the given pane counts. Every tab
+    /// uses its own layout mode; panes are added the way `PaneNew` adds them.
+    fn state_with_tabs(tabs: &[(usize, LayoutMode)]) -> (ServerState, Vec<Vec<PaneId>>) {
+        let mut st = ServerState::new();
+        let (first_count, first_mode) = &tabs[0];
+        let first = st
+            .create_session(
+                "main",
+                None,
+                BorderStyle::ZellijStyle,
+                first_mode.clone(),
+                (80, 80),
+            )
+            .expect("create_session");
+        let mut ids = vec![grow_tab(&mut st, 0, first, *first_count)];
+        for (i, (count, mode)) in tabs.iter().enumerate().skip(1) {
+            let seed = st
+                .create_tab("main", &format!("Tab {}", i + 1), mode.clone())
+                .expect("create_tab");
+            ids.push(grow_tab(&mut st, i, seed, *count));
+        }
+        let sess = st.sessions.get_mut("main").expect("session");
+        sess.active_tab = 0;
+        assert_popup_invariant(sess, "fixture");
+        (st, ids)
+    }
+
+    fn grow_tab(st: &mut ServerState, idx: usize, seed: PaneId, count: usize) -> Vec<PaneId> {
+        let mut ids = vec![seed];
+        for _ in 1..count {
+            let new_id = st.next_pane_id();
+            let tab = &mut st.sessions.get_mut("main").expect("session").tabs[idx];
+            let focused = tab.focused_pane;
+            tab.pane_order.push(new_id);
+            if tab.layout_mode.is_automatic() {
+                tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_id);
+            } else {
+                tab.layout.split_vertical(focused, new_id);
+            }
+            tab.focused_pane = new_id;
+            ids.push(new_id);
+        }
+        ids
+    }
+
+    fn sess(st: &ServerState) -> &Session {
+        st.sessions.get("main").expect("session")
+    }
+
+    fn tab_id(st: &ServerState, idx: usize) -> TabId {
+        sess(st).tabs[idx].id
+    }
+
+    fn snapshot(st: &ServerState) -> String {
+        let s = sess(st);
+        format!(
+            "{}|{}|{}|{:?}",
+            serde_json::to_string(s).expect("serialize"),
+            s.active_tab,
+            s.popup_visible,
+            s.tabs.iter().map(|t| t.activity).collect::<Vec<_>>()
+        )
+    }
+
+    fn custom() -> LayoutMode {
+        LayoutMode::Custom(CustomLayout)
+    }
+
+    fn bsp() -> LayoutMode {
+        LayoutMode::Bsp(BspLayout)
+    }
+
+    fn sorted(mut v: Vec<PaneId>) -> Vec<PaneId> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn move_pane_to_tab_into_an_automatic_tab_appends_and_rebuilds() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let (a, b, c) = (ids[0][0], ids[0][1], ids[1][0]);
+        let target = tab_id(&st, 1);
+
+        let idx = st.move_pane_to_tab("main", b, MoveTarget::Tab(target));
+
+        assert_eq!(idx, Ok(1));
+        let s = sess(&st);
+        assert_eq!(s.active_tab, 1);
+        assert_eq!(s.tabs[0].pane_order, vec![a]);
+        assert_eq!(s.tabs[0].focused_pane, a, "focus moves to the survivor");
+        assert_eq!(s.tabs[1].pane_order, vec![c, b]);
+        assert_eq!(s.tabs[1].focused_pane, b, "focus follows the pane");
+        let expected = bsp().build_tree(&[c, b], b);
+        assert_eq!(
+            format!("{:?}", s.tabs[1].layout),
+            format!("{expected:?}"),
+            "an automatic target is rebuilt from pane_order"
+        );
+        assert_popup_invariant(s, "into automatic");
+    }
+
+    #[test]
+    fn move_pane_to_tab_into_a_custom_tab_splits_its_focused_pane_vertically() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, custom())]);
+        let (b, c) = (ids[0][1], ids[1][0]);
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+
+        let tab = &sess(&st).tabs[1];
+        match &tab.layout {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(*direction, Direction::Vertical);
+                assert_eq!(layout::all_pane_ids(first), vec![c]);
+                assert_eq!(layout::all_pane_ids(second), vec![b]);
+            }
+            other => panic!("expected a vertical split, got {other:?}"),
+        }
+        assert!(matches!(tab.layout_mode, LayoutMode::Custom(_)));
+        assert_eq!(tab.focused_pane, b);
+        assert_popup_invariant(sess(&st), "into custom");
+    }
+
+    #[test]
+    fn move_pane_to_tab_new_tab_is_built_as_tab_new_would_build_it() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom())]);
+        let (a, b) = (ids[0][0], ids[0][1]);
+        let source = tab_id(&st, 0);
+
+        assert_eq!(st.move_pane_to_tab("main", b, MoveTarget::NewTab), Ok(1));
+
+        let s = sess(&st);
+        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(s.active_tab, 1);
+        assert_eq!(s.tabs[0].pane_order, vec![a]);
+        let new = &s.tabs[1];
+        assert_eq!(new.name, "Tab 2");
+        assert_ne!(new.id, source);
+        assert!(matches!(new.layout_mode, LayoutMode::Bsp(_)));
+        assert_eq!(new.pane_order, vec![b]);
+        assert_eq!(layout::all_pane_ids(&new.layout), vec![b]);
+        assert_eq!(new.focused_pane, b);
+        assert_eq!(new.zoomed_pane, None);
+        assert_popup_invariant(s, "new tab");
+    }
+
+    #[test]
+    fn move_pane_to_tab_new_tab_mints_an_id_no_existing_tab_has() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let existing: Vec<TabId> = sess(&st).tabs.iter().map(|t| t.id).collect();
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::NewTab),
+            Ok(2)
+        );
+        assert!(!existing.contains(&sess(&st).tabs[2].id));
+    }
+
+    #[test]
+    fn move_pane_to_tab_new_tab_is_named_from_the_count_before_the_source_goes() {
+        let (mut st, ids) = state_with_tabs(&[(1, custom()), (1, bsp())]);
+        let (a, b) = (ids[0][0], ids[1][0]);
+
+        assert_eq!(st.move_pane_to_tab("main", a, MoveTarget::NewTab), Ok(1));
+
+        let s = sess(&st);
+        assert_eq!(s.tabs.len(), 2, "the emptied source tab is removed");
+        assert_eq!(s.tabs[0].pane_order, vec![b]);
+        assert_eq!(s.tabs[1].pane_order, vec![a]);
+        assert_eq!(s.tabs[1].name, "Tab 3");
+        assert_eq!(s.active_tab, 1);
+        assert_popup_invariant(s, "new tab from emptied source");
+    }
+
+    #[test]
+    fn move_pane_to_tab_emptied_source_before_target_is_removed() {
+        let (mut st, ids) = state_with_tabs(&[(1, custom()), (1, bsp()), (1, bsp())]);
+        let (a, c) = (ids[0][0], ids[2][0]);
+        let target = tab_id(&st, 2);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", a, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+
+        let s = sess(&st);
+        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(
+            s.active_tab, 1,
+            "target index shifts down past the removed source"
+        );
+        assert_eq!(s.tabs[1].id, target);
+        assert_eq!(s.tabs[1].pane_order, vec![c, a]);
+        assert_popup_invariant(s, "source before target");
+    }
+
+    #[test]
+    fn move_pane_to_tab_emptied_source_after_target_is_removed() {
+        let (mut st, ids) = state_with_tabs(&[(1, bsp()), (1, bsp()), (1, custom())]);
+        let (a, c) = (ids[0][0], ids[2][0]);
+        st.sessions.get_mut("main").expect("session").active_tab = 2;
+        let target = tab_id(&st, 0);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", c, MoveTarget::Tab(target)),
+            Ok(0)
+        );
+
+        let s = sess(&st);
+        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(s.active_tab, 0);
+        assert_eq!(s.tabs[0].id, target);
+        assert_eq!(s.tabs[0].pane_order, vec![a, c]);
+        assert_popup_invariant(s, "source after target");
+    }
+
+    #[test]
+    fn move_pane_to_tab_moves_a_pane_out_of_a_background_tab() {
+        let (mut st, ids) = state_with_tabs(&[(1, bsp()), (2, bsp())]);
+        let (a, d) = (ids[0][0], ids[1][1]);
+        let target = tab_id(&st, 0);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", d, MoveTarget::Tab(target)),
+            Ok(0)
+        );
+        let s = sess(&st);
+        assert_eq!(s.tabs[0].pane_order, vec![a, d]);
+        assert_eq!(s.tabs[1].pane_order, vec![ids[1][0]]);
+        assert_popup_invariant(s, "background source");
+    }
+
+    #[test]
+    fn move_pane_to_tab_keeps_the_source_focus_when_another_pane_moves() {
+        let (mut st, ids) = state_with_tabs(&[(3, custom()), (1, bsp())]);
+        let (a, c) = (ids[0][0], ids[0][2]);
+        let target = tab_id(&st, 1);
+        assert_eq!(sess(&st).tabs[0].focused_pane, c);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", a, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        assert_eq!(sess(&st).tabs[0].focused_pane, c);
+    }
+
+    #[test]
+    fn move_pane_to_tab_rebuilds_an_automatic_source() {
+        let (mut st, ids) = state_with_tabs(&[(3, bsp()), (1, bsp())]);
+        let (a, b, c) = (ids[0][0], ids[0][1], ids[0][2]);
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", c, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        let src = &sess(&st).tabs[0];
+        assert_eq!(src.pane_order, vec![a, b]);
+        let expected = bsp().build_tree(&[a, b], src.focused_pane);
+        assert_eq!(format!("{:?}", src.layout), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn move_pane_to_tab_clears_the_zoom_of_the_moved_pane_on_the_source() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let b = ids[0][1];
+        st.sessions.get_mut("main").expect("session").tabs[0].zoomed_pane = Some(b);
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        assert_eq!(sess(&st).tabs[0].zoomed_pane, None);
+        assert_popup_invariant(sess(&st), "source zoom");
+    }
+
+    #[test]
+    fn move_pane_to_tab_clears_the_zoom_of_the_target() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (2, bsp())]);
+        let b = ids[0][1];
+        let zoomed = ids[1][0];
+        st.sessions.get_mut("main").expect("session").tabs[1].zoomed_pane = Some(zoomed);
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        assert_eq!(sess(&st).tabs[1].zoomed_pane, None);
+    }
+
+    #[test]
+    fn move_pane_to_tab_clears_the_target_activity_as_goto_tab_does() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        {
+            let t = &mut st.sessions.get_mut("main").expect("session").tabs[1];
+            t.activity = TabActivity::Bell;
+            t.last_output = Some(Instant::now());
+        }
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        let t = &sess(&st).tabs[1];
+        assert_eq!(t.activity, TabActivity::None);
+        assert_eq!(t.last_output, None);
+    }
+
+    #[test]
+    fn move_pane_to_tab_carries_the_custom_name_into_a_custom_target() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, custom())]);
+        let b = ids[0][1];
+        layout::set_pane_custom_name(
+            &mut st.sessions.get_mut("main").expect("session").tabs[0].layout,
+            b,
+            "logs",
+        );
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        assert_eq!(
+            layout::get_pane_custom_name(&sess(&st).tabs[1].layout, b),
+            Some(Some("logs".to_string()))
+        );
+    }
+
+    #[test]
+    fn move_pane_to_tab_carries_the_custom_name_into_an_automatic_target() {
+        let (mut st, ids) =
+            state_with_tabs(&[(2, custom()), (2, LayoutMode::Monocle(MonocleLayout))]);
+        let b = ids[0][1];
+        layout::set_pane_custom_name(
+            &mut st.sessions.get_mut("main").expect("session").tabs[0].layout,
+            b,
+            "logs",
+        );
+        let target = tab_id(&st, 1);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            Ok(1)
+        );
+        assert_eq!(
+            layout::get_pane_custom_name(&sess(&st).tabs[1].layout, b),
+            Some(Some("logs".to_string()))
+        );
+    }
+
+    #[test]
+    fn move_pane_to_tab_carries_the_custom_name_into_a_new_tab() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom())]);
+        let b = ids[0][1];
+        layout::set_pane_custom_name(
+            &mut st.sessions.get_mut("main").expect("session").tabs[0].layout,
+            b,
+            "logs",
+        );
+
+        assert_eq!(st.move_pane_to_tab("main", b, MoveTarget::NewTab), Ok(1));
+        assert_eq!(
+            layout::get_pane_custom_name(&sess(&st).tabs[1].layout, b),
+            Some(Some("logs".to_string()))
+        );
+    }
+
+    #[test]
+    fn move_pane_to_tab_refuses_a_stale_tab_id_without_changing_anything() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let stale = sess(&st).tabs.iter().map(|t| t.id).max().expect("tabs") + 100;
+        let before = snapshot(&st);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(stale)),
+            Err(MoveRefused::TargetNotFound)
+        );
+        assert_eq!(snapshot(&st), before);
+    }
+
+    #[test]
+    fn move_pane_to_tab_refuses_the_sole_pane_of_the_sole_tab_to_a_new_tab() {
+        let (mut st, ids) = state_with_tabs(&[(1, custom())]);
+        let before = snapshot(&st);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][0], MoveTarget::NewTab),
+            Err(MoveRefused::SolePaneInSoleTab)
+        );
+        assert_eq!(snapshot(&st), before);
+    }
+
+    #[test]
+    fn move_pane_to_tab_refuses_the_source_tab_as_target() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let source = tab_id(&st, 0);
+        let before = snapshot(&st);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(source)),
+            Err(MoveRefused::TargetIsSourceTab)
+        );
+        assert_eq!(snapshot(&st), before);
+    }
+
+    #[test]
+    fn move_pane_to_tab_refuses_while_the_popup_is_visible() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let popup = st.next_pane_id();
+        {
+            let s = st.sessions.get_mut("main").expect("session");
+            s.popup_pane = Some(popup);
+            s.popup_visible = true;
+        }
+        let target = tab_id(&st, 1);
+        let before = snapshot(&st);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(target)),
+            Err(MoveRefused::PopupVisible)
+        );
+        assert_eq!(snapshot(&st), before);
+    }
+
+    #[test]
+    fn move_pane_to_tab_never_moves_the_popup_pane() {
+        let (mut st, _ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
+        let popup = st.next_pane_id();
+        st.sessions.get_mut("main").expect("session").popup_pane = Some(popup);
+        let target = tab_id(&st, 1);
+        let before = snapshot(&st);
+
+        for t in [MoveTarget::Tab(target), MoveTarget::NewTab] {
+            assert_eq!(
+                st.move_pane_to_tab("main", popup, t),
+                Err(MoveRefused::PaneNotInAnyTab)
+            );
+        }
+        assert_eq!(snapshot(&st), before);
+        assert_popup_invariant(sess(&st), "popup never moved");
+    }
+
+    #[test]
+    fn move_pane_to_tab_refuses_an_unknown_session() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom())]);
+        assert_eq!(
+            st.move_pane_to_tab("nope", ids[0][1], MoveTarget::NewTab),
+            Err(MoveRefused::NoSession)
+        );
+    }
+
+    #[test]
+    fn move_pane_to_tab_refuses_a_custom_target_whose_focus_is_not_in_its_tree() {
+        let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, custom())]);
+        st.sessions.get_mut("main").expect("session").tabs[1].focused_pane = 9999;
+        let target = tab_id(&st, 1);
+        let before = snapshot(&st);
+
+        assert_eq!(
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(target)),
+            Err(MoveRefused::TargetLayoutMissingFocus)
+        );
+        assert_eq!(
+            snapshot(&st),
+            before,
+            "a refused move must not detach the pane"
+        );
+    }
+
+    #[test]
+    fn move_pane_to_tab_keeps_every_pane_in_exactly_one_tab() {
+        let (mut st, ids) = state_with_tabs(&[(3, bsp()), (2, custom()), (1, bsp())]);
+        let all: Vec<PaneId> = sorted(ids.concat());
+        let t2 = tab_id(&st, 2);
+        let t1 = tab_id(&st, 1);
+        assert!(st
+            .move_pane_to_tab("main", ids[0][0], MoveTarget::Tab(t2))
+            .is_ok());
+        assert!(st
+            .move_pane_to_tab("main", ids[1][1], MoveTarget::NewTab)
+            .is_ok());
+        assert!(st
+            .move_pane_to_tab("main", ids[2][0], MoveTarget::Tab(t1))
+            .is_ok());
+
+        let s = sess(&st);
+        assert_popup_invariant(s, "sequence");
+        let owned = sorted(s.tabs.iter().flat_map(|t| t.pane_order.clone()).collect());
+        assert_eq!(owned, all);
     }
 }

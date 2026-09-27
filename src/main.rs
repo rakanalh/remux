@@ -20,7 +20,7 @@ use futures::StreamExt;
 use crate::client::editor::copy_to_clipboard;
 use crate::client::input::{
     AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
-    SessionSwitchOverlay, SidebarIntent,
+    SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
@@ -1458,6 +1458,10 @@ fn relay_overlays(
         let (c, r) = crossterm::terminal::size()?;
         let draw_cmds = sw.render(c, r, theme);
         renderer.render_whichkey_overlay(&draw_cmds)?;
+    } else if let Some(ref tp) = input.tab_picker {
+        let (c, r) = crossterm::terminal::size()?;
+        let draw_cmds = tp.render(c, r, theme);
+        renderer.render_whichkey_overlay(&draw_cmds)?;
     }
     // Re-render view picker overlay on top if active
     else if let Some(ref vp) = input.view_picker {
@@ -1951,6 +1955,14 @@ async fn handle_connection_drop(
     // An open agent switcher must not offer a jump to a machine that is gone.
     if let Some(sw) = input.agent_switch.as_mut() {
         sw.drop_conn(src);
+    }
+    // The tab picker names tabs of that one machine, so it has nothing left
+    // to offer.
+    if input.tab_picker.as_ref().is_some_and(|tp| tp.conn() == src) {
+        input.tab_picker = None;
+        input.mode = Mode::Normal;
+        let (tc, tr) = renderer.size();
+        renderer.clear_overlay(tc, tr)?;
     }
     // Panels scope their state by connection: tell them
     // before anything else here can `continue` or return.
@@ -4953,6 +4965,73 @@ async fn run_client_loop(
                                 input.mode = Mode::Normal;
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
+                            InputAction::TabPickerOpen => {
+                                if whichkey.visible {
+                                    whichkey.hide();
+                                    renderer.clear_overlay(cols, rows)?;
+                                }
+                                if let Some(av) = active_view {
+                                    // A view's cells alias panes of any session
+                                    // on any machine, so there is no source tab
+                                    // to move the focused cell's pane out of.
+                                    log::debug!("tab picker: not opened, a view is displayed");
+                                    input.mode = Mode::Normal;
+                                    paint_view(
+                                        &mut renderer,
+                                        &chrome,
+                                        &views[av],
+                                        &input,
+                                        &whichkey,
+                                        &theme,
+                                        &compositor_theme,
+                                        &view_border_style,
+                                        &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect.as_ref(),
+                                    )?;
+                                    renderer.flush()?;
+                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                } else {
+                                    // The foreground is where every other server
+                                    // command goes, and it holds the session the
+                                    // focused pane is in. The picker pins it, so
+                                    // the tree it lists and the command it sends
+                                    // name the same server.
+                                    let conn = mgr.foreground().clone();
+                                    mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+                                    let picker = TabPickerOverlay::new(conn);
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
+                                    renderer.flush()?;
+                                    input.tab_picker = Some(picker);
+                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "COMMAND".to_string() }).await?;
+                                }
+                            }
+                            InputAction::TabPickerUpdate => {
+                                if let Some(ref tp) = input.tab_picker {
+                                    let (c, r) = crossterm::terminal::size()?;
+                                    renderer.clear_overlay(c, r)?;
+                                    renderer.render_whichkey_overlay(&tp.render(c, r, &theme))?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            InputAction::TabPickerConfirm { ref conn, tab_id } => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget { tab_id });
+                                if let Err(e) = mgr.send(conn, cmd).await {
+                                    log::info!("tab picker: move not sent to {conn:?}: {e}");
+                                }
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
+                            InputAction::TabPickerClose => {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                renderer.flush()?;
+                                mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                            }
                             InputAction::SessionSwitchClose => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
@@ -6816,6 +6895,22 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
+                        }
+                        if let Some(picker) = input.tab_picker.as_mut().filter(|p| *p.conn() == src) {
+                            let (c, r) = crossterm::terminal::size()?;
+                            renderer.clear_overlay(c, r)?;
+                            match picker.apply_tree(&folders, &unfiled) {
+                                TabPickerTree::Offer => {
+                                    renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
+                                }
+                                TabPickerTree::Nothing => {
+                                    log::debug!("tab picker: closed, no other tab and no pane to break out");
+                                    input.tab_picker = None;
+                                    input.mode = Mode::Normal;
+                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                }
+                            }
+                            renderer.flush()?;
                         }
                         // The session-switch popup aggregates every connected
                         // server's tree, so it accepts trees from ANY source

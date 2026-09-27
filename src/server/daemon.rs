@@ -2762,6 +2762,7 @@ async fn handle_command(
                 | RemuxCommand::PaneStackIntoRight
                 | RemuxCommand::PaneStackIntoUp
                 | RemuxCommand::PaneStackIntoDown
+                | RemuxCommand::PaneMoveToTabTarget { .. }
                 | RemuxCommand::PaneToggleZoom
                 | RemuxCommand::LayoutNext
                 | RemuxCommand::SetMaster => {
@@ -2787,6 +2788,22 @@ async fn handle_command(
     // Placed below every early return above -- the popup guard's block list in
     // particular -- so a command that is about to be refused cannot cost the
     // user their place in the scrollback.
+    //
+    // `PaneMoveToTabTarget` is refused here for the same reason: whether its
+    // target tab still exists is only known from the state, not the command.
+    if let RemuxCommand::PaneMoveToTabTarget { tab_id } = cmd {
+        let target = session::MoveTarget::from(tab_id);
+        let st = state.lock().await;
+        let Some(pane) = move_source_pane(&st, &session_name) else {
+            return Ok(());
+        };
+        if let Err(why) = st.check_move_pane_to_tab(&session_name, pane, target) {
+            log::info!(
+                "server: PaneMoveToTabTarget pane_id={pane} target={target:?} refused: {why:?}"
+            );
+            return Ok(());
+        }
+    }
     if cmd.returns_to_live_tail(&session_name) {
         snap_client_to_live_tail(client_id, state, panes, clients, config, prev_frames).await;
     }
@@ -3231,6 +3248,33 @@ async fn handle_command(
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneMoveToTabTarget { tab_id } => {
+            let target = session::MoveTarget::from(tab_id);
+            let outcome = {
+                let mut st = state.lock().await;
+                match move_source_pane(&st, &session_name) {
+                    Some(pane) => (pane, st.move_pane_to_tab(&session_name, pane, target)),
+                    None => return Ok(()),
+                }
+            };
+            match outcome {
+                (pane, Ok(idx)) => {
+                    log::debug!(
+                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> tab index {idx}"
+                    );
+                }
+                (pane, Err(why)) => {
+                    log::info!(
+                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} refused: {why:?}"
+                    );
+                    return Ok(());
+                }
+            }
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
+            invalidate_session_baselines(&session_name, clients, prev_frames).await;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+            mark_agents_dirty();
         }
         RemuxCommand::PaneStackAdd => {
             create_pane_in_tab(
@@ -3902,20 +3946,10 @@ async fn handle_command(
                         }
                     };
                     let tab = &mut sess.tabs[tab_idx];
-                    let new_focus = tab.layout.close_pane(pane_id);
-                    tab.pane_order.retain(|&id| id != pane_id);
-                    // Closing the zoomed pane un-zooms the tab: `zoomed_pane` is
-                    // the pane that gets painted full-area, so keeping a dead id
-                    // there would paint a pane that no longer exists.
-                    if tab.zoomed_pane == Some(pane_id) {
-                        tab.zoomed_pane = None;
-                    }
-                    match new_focus {
+                    match tab.detach_pane(pane_id) {
                         Some(nf) => {
                             tab.focus_pane(nf);
-                            if tab.layout_mode.is_automatic() {
-                                tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
-                            }
+                            tab.rebuild_if_automatic();
                             session::debug_check_invariant(sess, "PaneCloseById");
                         }
                         None => {
@@ -6658,15 +6692,10 @@ async fn create_pane_in_tab(
                 tab.layout.add_to_stack(focused, new_pane_id);
             }
             PanePlacement::Auto => {
-                if tab.layout_mode.is_automatic() {
-                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, new_pane_id);
-                } else {
-                    tab.layout.split_vertical(focused, new_pane_id);
-                }
+                tab.place_auto(new_pane_id);
             }
         }
-        tab.focused_pane = new_pane_id;
-        tab.zoomed_pane = None;
+        tab.focus_new_pane(new_pane_id);
         log::debug!(
             "server: create_pane_in_tab session={session_name} tab={index} \
              placement={placement:?} new_pane_id={new_pane_id} from focused={focused}"
@@ -8933,6 +8962,23 @@ async fn notify_if_close_declined(
     }
 }
 
+/// The pane `PaneMoveToTabTarget` moves: the attached session's active tab's
+/// focused pane, resolved when the command arrives because focus is where the
+/// user is now.
+fn move_source_pane(st: &ServerState, session_name: &str) -> Option<PaneId> {
+    let pane = st
+        .sessions
+        .get(session_name)
+        .and_then(|s| s.tabs.get(s.active_tab))
+        .map(|t| t.focused_pane);
+    if pane.is_none() {
+        log::info!(
+            "server: PaneMoveToTabTarget refused: session {session_name:?} has no active tab"
+        );
+    }
+    pane
+}
+
 async fn close_pane(
     pane_id: PaneId,
     session_name: &str,
@@ -8985,21 +9031,9 @@ async fn close_pane(
                 return;
             }
 
-            let new_focus = tab.layout.close_pane(pane_id);
-            tab.pane_order.retain(|&id| id != pane_id);
-            // Closing the zoomed pane un-zooms the tab (tmux does the same):
-            // `zoomed_pane` names the pane painted full-area, so a dead id there
-            // would paint a pane that no longer exists.
-            if tab.zoomed_pane == Some(pane_id) {
-                tab.zoomed_pane = None;
-            }
-
-            if let Some(nf) = new_focus {
+            if let Some(nf) = tab.detach_pane(pane_id) {
                 tab.focus_pane(nf);
-                // If in automatic mode, rebuild the tree
-                if tab.layout_mode.is_automatic() {
-                    tab.layout = tab.layout_mode.build_tree(&tab.pane_order, nf);
-                }
+                tab.rebuild_if_automatic();
                 session::debug_check_invariant(sess, "close_pane");
                 CloseAction::Broadcast
             } else {

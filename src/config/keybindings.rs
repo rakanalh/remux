@@ -132,6 +132,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('o', leaf_chain("popup", &["PopupToggle", "EnterNormal"])),
                 ('m', leaf_chain("set master", &["SetMaster", "EnterNormal"])),
                 ('r', leaf("rename", "PaneRename")),
+                ('t', leaf("move to tab", "PaneMoveToTab")),
                 (
                     'a',
                     leaf_chain("stack add", &["PaneStackAdd", "EnterNormal"]),
@@ -2624,6 +2625,7 @@ mod tests {
         assert_eq!(humanize_command("TabGoto 0"), "tab 1");
         assert_eq!(humanize_command("TabGoto 8"), "tab 9");
         assert_eq!(humanize_command("SessionQuickSwitch"), "switch session");
+        assert_eq!(humanize_command("PaneMoveToTab"), "move to tab");
         assert_eq!(humanize_command("SessionSwitchLast"), "last session");
         assert_eq!(humanize_command("LayoutNext"), "next layout");
     }
@@ -2829,6 +2831,7 @@ mod tests {
             "SessionRenameByName",
             "PaneCloseById",
             "TabMoveByIndex",
+            "PaneMoveToTabTarget",
         ] {
             assert_eq!(resolve_action(name), None, "'{name}' must not resolve");
             assert_eq!(parse_command(name), None, "'{name}' must not parse");
@@ -2878,6 +2881,7 @@ mod tests {
             ("CommandPaletteOpen", ClientAction::CommandPaletteOpen),
             ("SessionQuickSwitch", ClientAction::SessionQuickSwitch),
             ("AgentQuickSwitch", ClientAction::AgentQuickSwitch),
+            ("PaneMoveToTab", ClientAction::PaneMoveToTab),
             ("ViewNew", ClientAction::ViewNew),
             ("ViewAddPane", ClientAction::ViewAddPane),
             ("ViewRename", ClientAction::ViewRename),
@@ -3007,6 +3011,7 @@ mod tests {
     fn humanize_uses_registry_labels() {
         assert_eq!(humanize_command("SessionQuickSwitch"), "switch session");
         assert_eq!(humanize_command("AgentQuickSwitch"), "switch agent");
+        assert_eq!(humanize_command("PaneMoveToTab"), "move to tab");
         assert_eq!(humanize_command("ViewRemovePane"), "remove cell");
         // Names with no label override still fall back to the PascalCase split,
         // including strings that are not in the registry at all.

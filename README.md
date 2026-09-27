@@ -28,6 +28,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
 - **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting.
 - **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, and `stack into` to fold an existing pane into a neighbour's stack).
+- **Move to tab** — `Ctrl-a p t` opens a picker of the session's other tabs plus `+ new tab`; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it. A tab left empty closes.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
 - **Five layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid).
@@ -252,6 +253,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `z` | Toggle zoom *(→ Normal)* |
 | `o` | Toggle the popup terminal *(→ Normal)* |
 | `r` | Rename pane |
+| `t` | Move the pane to another tab, or a new one (opens a picker) |
 | `a` | Add pane to stack *(→ Normal)* |
 | `]` | Next pane in stack *(→ Normal)* |
 | `[` | Previous pane in stack *(→ Normal)* |
@@ -423,6 +425,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneMoveUp` | — | Swap the focused pane with the pane above. |
 | `PaneMoveDown` | — | Swap the focused pane with the pane below. |
 | `PaneRename` | `<name>` | Rename the focused pane. |
+| `PaneMoveToTab` | — | Pick another tab of the session (or `+ new tab`) and move the focused pane there. |
 | `PaneToggleZoom` | — | Toggle fullscreen zoom for the focused pane. |
 | `ResizeLeft` | `<amount>` | Resize the focused pane's left edge (default 1). |
 | `ResizeRight` | `<amount>` | Resize the focused pane's right edge (default 1). |

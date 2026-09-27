@@ -322,6 +322,7 @@
 # L = "PaneMoveRight; EnterNormal"
 # z = "PaneToggleZoom; EnterNormal"
 # r = "PaneRename"
+# t = "PaneMoveToTab"
 # a = "PaneStackAdd; EnterNormal"
 # "]" = "PaneStackNext; EnterNormal"
 # "[" = "PaneStackPrev; EnterNormal"
@@ -520,6 +521,7 @@
 #   PaneStackIntoDown               — Move focused pane into the stack below
 #   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
 #   PaneRename <name>               — Rename the focused pane
+#   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
 #   PopupToggle                     — Toggle the floating popup terminal
 #
 # View commands (client-side; a view's cells alias real panes on any machine):
