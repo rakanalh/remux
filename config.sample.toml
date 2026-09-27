@@ -298,6 +298,12 @@
 # a = "PaneStackAdd; EnterNormal"
 # "]" = "PaneStackNext; EnterNormal"
 # "[" = "PaneStackPrev; EnterNormal"
+#
+# [keybindings.command.p.S]
+# h = "PaneStackIntoLeft; EnterNormal"
+# j = "PaneStackIntoDown; EnterNormal"
+# k = "PaneStackIntoUp; EnterNormal"
+# l = "PaneStackIntoRight; EnterNormal"
 
 # Unbind a default key by mapping it to an empty string:
 # [keybindings.command.p]
@@ -481,6 +487,10 @@
 #   PaneStackAdd                    — Add focused pane to a stack
 #   PaneStackNext                   — Focus next pane in stack
 #   PaneStackPrev                   — Focus previous pane in stack
+#   PaneStackIntoLeft               — Move focused pane into the left neighbour's stack
+#   PaneStackIntoRight              — Move focused pane into the right neighbour's stack
+#   PaneStackIntoUp                 — Move focused pane into the stack above
+#   PaneStackIntoDown               — Move focused pane into the stack below
 #   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
 #   PaneRename <name>               — Rename the focused pane
 #   PopupToggle                     — Toggle the floating popup terminal

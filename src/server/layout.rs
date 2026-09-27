@@ -678,6 +678,16 @@ impl LayoutNode {
     ///
     /// Returns `true` if the target stack was found and the pane was added.
     pub fn add_to_stack(&mut self, target_pane: PaneId, new_pane: PaneId) -> bool {
+        self.push_into_stack(target_pane, new_pane, String::new(), None)
+    }
+
+    fn push_into_stack(
+        &mut self,
+        target_pane: PaneId,
+        new_pane: PaneId,
+        name: String,
+        custom_name: Option<String>,
+    ) -> bool {
         match self {
             LayoutNode::Stack {
                 panes,
@@ -686,9 +696,14 @@ impl LayoutNode {
                 active,
             } => {
                 if panes.contains(&target_pane) {
+                    // `names`/`custom_names` may be shorter than `panes` in a
+                    // state file written before they existed. Pad them first so
+                    // the pushed name lands at the same index as the pane.
+                    names.resize(panes.len(), String::new());
+                    custom_names.resize(panes.len(), None);
                     panes.push(new_pane);
-                    names.push(String::new());
-                    custom_names.push(None);
+                    names.push(name);
+                    custom_names.push(custom_name);
                     *active = panes.len() - 1;
                     true
                 } else {
@@ -696,10 +711,10 @@ impl LayoutNode {
                 }
             }
             LayoutNode::Split { first, second, .. } => {
-                if first.add_to_stack(target_pane, new_pane) {
-                    return true;
+                if contains_pane(first, target_pane) {
+                    return first.push_into_stack(target_pane, new_pane, name, custom_name);
                 }
-                second.add_to_stack(target_pane, new_pane)
+                second.push_into_stack(target_pane, new_pane, name, custom_name)
             }
         }
     }
@@ -1343,6 +1358,57 @@ fn leaf_solo_pane_name(node: &LayoutNode, pane: PaneId) -> Option<(String, Optio
         LayoutNode::Split { first, second, .. } => {
             leaf_solo_pane_name(first, pane).or_else(|| leaf_solo_pane_name(second, pane))
         }
+    }
+}
+
+/// Move `pane` out of its slot and into the stack holding `target`, as that
+/// stack's active pane.
+///
+/// The pane's display and custom names travel with it. Its old slot is removed
+/// exactly as [`LayoutNode::close_pane`] removes a closed pane: a stack that
+/// still has other panes keeps them, and an emptied leaf collapses its parent
+/// split.
+///
+/// Returns `false` and leaves the tree untouched when either pane is missing,
+/// or when both already share a stack.
+fn move_pane_into_stack(root: &mut LayoutNode, pane: PaneId, target: PaneId) -> bool {
+    let same_stack = find_stack_for_pane(root, pane).is_some_and(|s| s.contains(&target));
+    if pane == target || same_stack || !contains_pane(root, target) {
+        return false;
+    }
+    let (Some(name), Some(custom_name)) =
+        (get_pane_name(root, pane), get_pane_custom_name(root, pane))
+    else {
+        return false;
+    };
+    // Remove before inserting: while the id sits in two stacks, `close_pane`
+    // could remove the copy that was just inserted.
+    let mut next = root.clone();
+    next.close_pane(pane);
+    if !next.push_into_stack(target, pane, name, custom_name) {
+        return false;
+    }
+    log::debug!("layout: move_pane_into_stack pane={pane} target={target}");
+    *root = next;
+    true
+}
+
+/// `PaneStackInto*`: move `pane` into the stack of its spatial neighbour in
+/// `direction`, chosen by [`find_neighbor`] exactly as `PaneMove*` chooses the
+/// pane to swap with.
+///
+/// Returns `false` and leaves the tree untouched when there is no neighbour in
+/// that direction.
+pub fn stack_into_neighbor(
+    root: &mut LayoutNode,
+    area: Rect,
+    pane: PaneId,
+    direction: FocusDirection,
+    gap_size: u16,
+) -> bool {
+    match find_neighbor(root, area, pane, direction, gap_size) {
+        Some(target) => move_pane_into_stack(root, pane, target),
+        None => false,
     }
 }
 
@@ -2908,6 +2974,186 @@ mod tests {
                 _ => panic!("expected moved leaf as first"),
             },
             _ => panic!("expected Split"),
+        }
+    }
+
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    };
+
+    /// | 1 | 2 |
+    /// |   | 3 |
+    fn left_and_right_column() -> LayoutNode {
+        LayoutNode::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::new_stack(1)),
+            second: Box::new(LayoutNode::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::new_stack(2)),
+                second: Box::new(LayoutNode::new_stack(3)),
+            }),
+        }
+    }
+
+    fn rect_of(node: &LayoutNode, pane: PaneId) -> Option<Rect> {
+        compute_layout(node, AREA, 0)
+            .into_iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, r)| r)
+    }
+
+    #[test]
+    fn stack_into_left_takes_the_neighbours_slot_and_collapses_its_own() {
+        let mut node = left_and_right_column();
+        let left_slot = rect_of(&node, 1).unwrap();
+
+        assert!(stack_into_neighbor(
+            &mut node,
+            AREA,
+            3,
+            FocusDirection::Left,
+            0
+        ));
+
+        assert_eq!(find_stack_for_pane(&node, 3), Some(vec![1, 3]));
+        assert_eq!(rect_of(&node, 3), Some(left_slot));
+        assert_eq!(
+            rect_of(&node, 1),
+            None,
+            "the target is hidden behind the mover"
+        );
+        // The right column's split collapsed, so pane 2 fills the whole column.
+        assert_eq!(rect_of(&node, 2).unwrap().height, AREA.height);
+        assert_eq!(active_pane_ids(&node), vec![3, 2]);
+    }
+
+    #[test]
+    fn stack_into_up_joins_the_pane_above() {
+        let mut node = left_and_right_column();
+        assert!(stack_into_neighbor(
+            &mut node,
+            AREA,
+            3,
+            FocusDirection::Up,
+            0
+        ));
+        assert_eq!(find_stack_for_pane(&node, 3), Some(vec![2, 3]));
+        assert_eq!(all_pane_ids(&node), vec![1, 2, 3]);
+        assert_eq!(rect_of(&node, 3).unwrap().height, AREA.height);
+    }
+
+    #[test]
+    fn stack_into_from_a_multi_pane_stack_leaves_the_rest_behind() {
+        let mut node = left_and_right_column();
+        node.add_to_stack(3, 4);
+        assert!(stack_into_neighbor(
+            &mut node,
+            AREA,
+            4,
+            FocusDirection::Left,
+            0
+        ));
+
+        assert_eq!(find_stack_for_pane(&node, 4), Some(vec![1, 4]));
+        assert_eq!(find_stack_for_pane(&node, 3), Some(vec![3]));
+        assert_eq!(active_pane_ids(&node), vec![4, 2, 3]);
+    }
+
+    #[test]
+    fn stack_into_keeps_a_sane_active_in_the_source_stack() {
+        // Source stack [3, 4, 5] with 4 active: after 4 leaves, 5 slides into
+        // index 1 and stays the visible pane.
+        let mut node = left_and_right_column();
+        node.add_to_stack(3, 4);
+        node.add_to_stack(3, 5);
+        node.stack_prev(5);
+        assert!(move_pane_into_stack(&mut node, 4, 1));
+        assert_eq!(
+            find_stack_names(&node, 3).map(|(_, panes, active)| (panes, active)),
+            Some((vec![3, 5], 1))
+        );
+    }
+
+    #[test]
+    fn stack_into_without_a_neighbour_changes_nothing() {
+        let mut node = left_and_right_column();
+        let before = format!("{node:?}");
+        assert!(!stack_into_neighbor(
+            &mut node,
+            AREA,
+            1,
+            FocusDirection::Left,
+            0
+        ));
+        assert!(!stack_into_neighbor(
+            &mut node,
+            AREA,
+            2,
+            FocusDirection::Right,
+            0
+        ));
+        assert!(!stack_into_neighbor(
+            &mut node,
+            AREA,
+            3,
+            FocusDirection::Down,
+            0
+        ));
+        assert_eq!(format!("{node:?}"), before);
+
+        let mut lone = LayoutNode::new_stack(1);
+        assert!(!stack_into_neighbor(
+            &mut lone,
+            AREA,
+            1,
+            FocusDirection::Up,
+            0
+        ));
+        assert_eq!(all_pane_ids(&lone), vec![1]);
+    }
+
+    #[test]
+    fn stack_into_the_same_stack_or_a_missing_pane_changes_nothing() {
+        let mut node = left_and_right_column();
+        node.add_to_stack(1, 4);
+        let before = format!("{node:?}");
+        assert!(!move_pane_into_stack(&mut node, 4, 1));
+        assert!(!move_pane_into_stack(&mut node, 4, 4));
+        assert!(!move_pane_into_stack(&mut node, 4, 99));
+        assert!(!move_pane_into_stack(&mut node, 99, 2));
+        assert_eq!(format!("{node:?}"), before);
+    }
+
+    #[test]
+    fn stack_into_carries_names_in_lockstep() {
+        let mut node = left_and_right_column();
+        set_pane_name(&mut node, 1, "one");
+        set_pane_name(&mut node, 3, "three");
+        set_pane_custom_name(&mut node, 3, "mine");
+
+        assert!(move_pane_into_stack(&mut node, 3, 1));
+
+        match &node {
+            LayoutNode::Split { first, .. } => match first.as_ref() {
+                LayoutNode::Stack {
+                    panes,
+                    names,
+                    custom_names,
+                    active,
+                } => {
+                    assert_eq!(panes, &vec![1, 3]);
+                    assert_eq!(names, &vec!["one".to_string(), "three".to_string()]);
+                    assert_eq!(custom_names, &vec![None, Some("mine".to_string())]);
+                    assert_eq!(*active, 1);
+                }
+                other => panic!("expected the target stack, got {other:?}"),
+            },
+            other => panic!("expected Split, got {other:?}"),
         }
     }
 }

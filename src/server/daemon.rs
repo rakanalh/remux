@@ -2643,6 +2643,10 @@ async fn handle_command(
                 | RemuxCommand::PaneStackAdd
                 | RemuxCommand::PaneStackNext
                 | RemuxCommand::PaneStackPrev
+                | RemuxCommand::PaneStackIntoLeft
+                | RemuxCommand::PaneStackIntoRight
+                | RemuxCommand::PaneStackIntoUp
+                | RemuxCommand::PaneStackIntoDown
                 | RemuxCommand::PaneToggleZoom
                 | RemuxCommand::LayoutNext
                 | RemuxCommand::SetMaster => {
@@ -3060,6 +3064,54 @@ async fn handle_command(
                     // eject to Custom so it isn't rebuilt away.
                     tab.layout = new_tree;
                     tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                }
+            }
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneStackIntoLeft
+        | RemuxCommand::PaneStackIntoRight
+        | RemuxCommand::PaneStackIntoUp
+        | RemuxCommand::PaneStackIntoDown => {
+            let direction = match cmd {
+                RemuxCommand::PaneStackIntoLeft => layout::FocusDirection::Left,
+                RemuxCommand::PaneStackIntoRight => layout::FocusDirection::Right,
+                RemuxCommand::PaneStackIntoUp => layout::FocusDirection::Up,
+                RemuxCommand::PaneStackIntoDown => layout::FocusDirection::Down,
+                _ => unreachable!(),
+            };
+            log::debug!("server: PaneStackInto direction={direction:?}");
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: cols,
+                    height: rows.saturating_sub(1),
+                };
+                // The same two rules `create_pane_in_tab` applies to
+                // `PaneStackAdd`: a manual stack must eject to Custom or the
+                // next automatic rebuild flattens it, and a new arrangement
+                // releases the zoom. Applied only when the move happened, so a
+                // refused move leaves the tab exactly as it was.
+                if layout::stack_into_neighbor(
+                    &mut tab.layout,
+                    area,
+                    tab.focused_pane,
+                    direction,
+                    0,
+                ) {
+                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                    tab.zoomed_pane = None;
+                    session::debug_check_invariant(sess, "PaneStackInto");
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;

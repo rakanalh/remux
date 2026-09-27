@@ -27,7 +27,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 
 - **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
 - **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting.
-- **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`).
+- **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, and `stack into` to fold an existing pane into a neighbour's stack).
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
 - **Five layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid).
@@ -255,7 +255,14 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `a` | Add pane to stack *(→ Normal)* |
 | `]` | Next pane in stack *(→ Normal)* |
 | `[` | Previous pane in stack *(→ Normal)* |
+| `S` | Open the **Stack into** sub-group |
 | `R` | Open the **Resize** sub-group |
+
+#### Pane → Stack into (`p S`)
+
+| Key | Action |
+|-----|--------|
+| `h` / `j` / `k` / `l` | Move the focused pane into the stack of its left / down / up / right neighbour *(→ Normal)* |
 
 #### Pane → Resize (`p R`)
 
@@ -407,6 +414,10 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneStackAdd` | — | Add the focused pane to a stack at its position. |
 | `PaneStackNext` | — | Cycle to the next pane in the current stack. |
 | `PaneStackPrev` | — | Cycle to the previous pane in the current stack. |
+| `PaneStackIntoLeft` | — | Move the focused pane into its left neighbour's stack. |
+| `PaneStackIntoRight` | — | Move the focused pane into its right neighbour's stack. |
+| `PaneStackIntoUp` | — | Move the focused pane into the stack above. |
+| `PaneStackIntoDown` | — | Move the focused pane into the stack below. |
 | `PaneMoveLeft` | — | Swap the focused pane with its left neighbour. |
 | `PaneMoveRight` | — | Swap the focused pane with its right neighbour. |
 | `PaneMoveUp` | — | Swap the focused pane with the pane above. |

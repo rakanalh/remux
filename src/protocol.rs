@@ -86,7 +86,13 @@ pub enum ConnDescriptor {
 /// the only thing this number is for. Pinned by
 /// `directory_listing_home_round_trips_and_defaults`. The entry exists so that a
 /// field with no ladder line does not read as an oversight.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// 11 -> 12: folding an existing pane into a neighbour's stack. Adds
+/// [`RemuxCommand::PaneStackIntoLeft`], [`RemuxCommand::PaneStackIntoRight`],
+/// [`RemuxCommand::PaneStackIntoUp`] and [`RemuxCommand::PaneStackIntoDown`].
+/// An old server cannot parse a `Command` carrying one of them, so the bump
+/// turns that into a refused handshake on the new client.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -1129,6 +1135,12 @@ pub enum RemuxCommand {
     PaneMoveRight,
     PaneMoveUp,
     PaneMoveDown,
+    /// Move the focused pane into the stack of its neighbour in that
+    /// direction, as that stack's active pane.
+    PaneStackIntoLeft,
+    PaneStackIntoRight,
+    PaneStackIntoUp,
+    PaneStackIntoDown,
     PaneRename(String),
     PaneToggleZoom,
     /// Show/hide the session's popup terminal -- a floating, centered pane drawn
@@ -1306,6 +1318,10 @@ impl RemuxCommand {
             | RemuxCommand::PaneMoveRight
             | RemuxCommand::PaneMoveUp
             | RemuxCommand::PaneMoveDown
+            | RemuxCommand::PaneStackIntoLeft
+            | RemuxCommand::PaneStackIntoRight
+            | RemuxCommand::PaneStackIntoUp
+            | RemuxCommand::PaneStackIntoDown
             | RemuxCommand::PaneToggleZoom
             | RemuxCommand::PopupToggle
             | RemuxCommand::ResizeLeft(_)
@@ -1589,6 +1605,10 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneMoveRight"),
             ActionSpec::server("PaneMoveUp"),
             ActionSpec::server("PaneMoveDown"),
+            ActionSpec::server("PaneStackIntoLeft"),
+            ActionSpec::server("PaneStackIntoRight"),
+            ActionSpec::server("PaneStackIntoUp"),
+            ActionSpec::server("PaneStackIntoDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
             ActionSpec::server("PopupToggle"),
@@ -2435,6 +2455,10 @@ mod tests {
             RemuxCommand::PaneMoveRight => Some("PaneMoveRight"),
             RemuxCommand::PaneMoveUp => Some("PaneMoveUp"),
             RemuxCommand::PaneMoveDown => Some("PaneMoveDown"),
+            RemuxCommand::PaneStackIntoLeft => Some("PaneStackIntoLeft"),
+            RemuxCommand::PaneStackIntoRight => Some("PaneStackIntoRight"),
+            RemuxCommand::PaneStackIntoUp => Some("PaneStackIntoUp"),
+            RemuxCommand::PaneStackIntoDown => Some("PaneStackIntoDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
             RemuxCommand::PopupToggle => Some("PopupToggle"),

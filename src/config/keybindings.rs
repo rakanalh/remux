@@ -145,6 +145,27 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     leaf_chain("stack prev", &["PaneStackPrev", "EnterNormal"]),
                 ),
                 (
+                    'S',
+                    group(
+                        "Stack into",
+                        vec![
+                            (
+                                'h',
+                                leaf_chain("left", &["PaneStackIntoLeft", "EnterNormal"]),
+                            ),
+                            (
+                                'j',
+                                leaf_chain("down", &["PaneStackIntoDown", "EnterNormal"]),
+                            ),
+                            ('k', leaf_chain("up", &["PaneStackIntoUp", "EnterNormal"])),
+                            (
+                                'l',
+                                leaf_chain("right", &["PaneStackIntoRight", "EnterNormal"]),
+                            ),
+                        ],
+                    ),
+                ),
+                (
                     'R',
                     group_sticky(
                         "Resize",
@@ -1029,6 +1050,10 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "PaneMoveRight" => Some(RemuxCommand::PaneMoveRight),
         "PaneMoveUp" => Some(RemuxCommand::PaneMoveUp),
         "PaneMoveDown" => Some(RemuxCommand::PaneMoveDown),
+        "PaneStackIntoLeft" => Some(RemuxCommand::PaneStackIntoLeft),
+        "PaneStackIntoRight" => Some(RemuxCommand::PaneStackIntoRight),
+        "PaneStackIntoUp" => Some(RemuxCommand::PaneStackIntoUp),
+        "PaneStackIntoDown" => Some(RemuxCommand::PaneStackIntoDown),
         "SessionDetach" => Some(RemuxCommand::SessionDetach),
         "SessionList" => Some(RemuxCommand::SessionList),
         "FolderList" => Some(RemuxCommand::FolderList),
