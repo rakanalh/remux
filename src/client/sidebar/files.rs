@@ -641,7 +641,8 @@ impl SidebarPlugin for FilesPlugin {
             // reading the id here would be a second name for what it already has.
             PluginEvent::SessionTree { .. }
             | PluginEvent::Agents { .. }
-            | PluginEvent::FocusedPane { .. } => {}
+            | PluginEvent::FocusedPane { .. }
+            | PluginEvent::PaneTitle { .. } => {}
         }
     }
 

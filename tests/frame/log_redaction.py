@@ -46,6 +46,10 @@ ARGV_SECRET = "postgresql://sam:hunter2@db.internal/prod-ARGV"
 # whether or not the yank did anything.
 CLIP_HEAD, CLIP_TAIL = "swordfish", "CLIPBOARD"
 CLIP_SECRET = CLIP_HEAD + "-" + CLIP_TAIL
+# A window title, which an agent fills with a summary of what the user asked
+# it. Assembled by `printf` in the pane for the same reason as the clipboard.
+TITLE_HEAD, TITLE_TAIL = "rotate", "prod-credentials-TITLE"
+TITLE_SECRET = TITLE_HEAD + "-" + TITLE_TAIL
 
 
 def check(cond, msg):
@@ -54,6 +58,18 @@ def check(cond, msg):
     else:
         print(f"  FAIL  {msg}")
         FAILURES.append(msg)
+
+
+def first_pane_name(c):
+    """The first pane's name, read off the session tree."""
+    c.send("ListSessionTree")
+    for msg in c.drain(1.0):
+        if name_of(msg) == "SessionTree":
+            for sess in msg["SessionTree"].get("unfiled") or []:
+                for tab in sess.get("tabs") or []:
+                    for pane in tab.get("panes") or []:
+                        return pane["name"]
+    return None
 
 
 def first_pane_id(c):
@@ -163,6 +179,14 @@ def run(srv, result):
         if name_of(m) == "CopyToClipboard"
     ]
     result["yanked"] = any(CLIP_SECRET in d for d in yanked)
+
+    # 6. A window title set by a program. It becomes the pane's name, so it is
+    #    shown everywhere, and must still never be written to the log.
+    c.send({"Input": {"data": list(
+        f"sh -c 'printf \"\\033]2;%s-%s\\007\" {TITLE_HEAD} {TITLE_TAIL}; sleep 3'\n".encode())}})
+    grid.pump(c, 2.0)
+    result["title_named"] = first_pane_name(c) == TITLE_SECRET
+    grid.pump(c, 2.0)
 
     # 1. A keystroke into a view cell. No trailing newline: nothing is RUN, the
     #    bytes just reach the PTY -- which is exactly the shape of typing a
@@ -318,6 +342,20 @@ def main():
     check(
         result.get("yanked") is True,
         f"4 and the server really DID send that selection (row={result.get('marker_row')})",
+    )
+
+    # 6. A window title.
+    check(
+        result.get("title_named") is True,
+        "6 the title really did become the pane's name (otherwise 6 proves nothing)",
+    )
+    check(
+        TITLE_SECRET not in log and TITLE_TAIL not in log,
+        "6 a window title is NOT in the server log",
+    )
+    check(
+        "is now named by its foreground job" in log,
+        "6 while the change of who names the pane IS logged",
     )
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.

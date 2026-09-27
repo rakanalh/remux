@@ -34,8 +34,11 @@ PROTOCOL_VERSION = _protocol_version()
 
 
 class Tui:
-    def __init__(self, rundir, cols=120, rows=40, config=None):
+    def __init__(self, rundir, cols=120, rows=40, config=None, extra_env=None):
         self.rundir = rundir
+        # Merged over the isolated environment, e.g. a `PATH` with stand-in
+        # programs on it. Panes inherit it through the auto-spawned server.
+        self.extra_env = extra_env or {}
         self.cols = cols
         self.rows = rows
         self.child = None
@@ -63,6 +66,7 @@ class Tui:
             "TERM": "xterm-256color",
             "PS1": "$ ",
             "REMUX_ALLOW_NESTED": "1",
+            **self.extra_env,
         }
         self.screen = pyte.Screen(self.cols, self.rows)
         self.stream = pyte.ByteStream(self.screen)

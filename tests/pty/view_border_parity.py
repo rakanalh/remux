@@ -85,8 +85,8 @@ def require_in_view(t):
       * the client-side view status bar (`[MODE]  <view> │ <cell title>`), which
         a normal tab's server status bar (`[MODE]  <session> │ <tab>`) never
         shows -- the view name is the discriminator;
-      * a cell's top-border label is `cell_title` = "<session> / Tab <n>",
-        whereas a normal pane's border is labelled with the process ("sh").
+      * a cell's top-border label is `cell_title` = "<name> · <session> / Tab <n>",
+        whereas a normal pane's border is labelled with the name alone ("sh").
     """
     reasons = []
     if t.has("Session Manager"):
@@ -98,7 +98,9 @@ def require_in_view(t):
         reasons.append(f"status bar is not a view status bar: {status.rstrip()!r}")
     if not t.has("/ Tab 1"):
         reasons.append("no view-cell title ('<session> / Tab 1') on any border")
-    if t.has("╭ sh"):
+    # A view cell over an untitled shell is labelled exactly
+    # "sh · main / Tab 1"; any other "╭ sh " is a normal pane's border.
+    if any(r.count("╭ sh ") > r.count("╭ sh \u00b7 main / Tab 1") for r in t.rows_text()):
         reasons.append("a normal pane border ('╭ sh') is still on screen")
     if reasons:
         print("ABORT: never entered the view -- the comparison would be "

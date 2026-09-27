@@ -1059,6 +1059,55 @@ fn cell_title(cell: &ViewCell) -> String {
     })
 }
 
+/// The label a View cell is given from its source pane's `PaneContent`.
+///
+/// `None` when the server could not place the pane (an empty `session`), so the
+/// cell keeps its `waiting…` fallback. With a `pane_title` template the label
+/// is the pane's name alone, since the template can include `{session}` and
+/// `{tab}` itself. Without one, the name leads and the `session / tab`
+/// location follows, host-prefixed for a remote source. A server that sends no
+/// name gets the location alone.
+pub fn cell_label(
+    conn: &ConnId,
+    session: &str,
+    tab: &str,
+    name: Option<&crate::protocol::PaneNameInfo>,
+    template: Option<&str>,
+) -> Option<String> {
+    if session.is_empty() {
+        return None;
+    }
+    let host = match conn {
+        ConnId::Remote(host) => host.as_str(),
+        ConnId::Local => "",
+    };
+    let location = match conn {
+        ConnId::Remote(host) => format!("{host}: {session} / {tab}"),
+        ConnId::Local => format!("{session} / {tab}"),
+    };
+    let Some(info) = name else {
+        return Some(location);
+    };
+    let name = match &info.custom {
+        Some(custom) => custom.clone(),
+        None => crate::config::pane_title::display_name(
+            template,
+            &crate::config::pane_title::NameParts {
+                title: info.title.as_deref(),
+                command: &info.command,
+                session,
+                tab: info.tab_index,
+                cwd: info.cwd.as_deref(),
+                host,
+            },
+        ),
+    };
+    Some(match template {
+        Some(_) => name,
+        None => format!("{name} \u{b7} {location}"),
+    })
+}
+
 // (The Monocle strip's tab geometry lives in
 // `compositor::tab_strip_layout` — the SAME function that places the tabs
 // `draw_monocle_strip` paints, so a click can never land off the tab drawn
@@ -1328,6 +1377,75 @@ pub fn draw_status_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn name_info(title: Option<&str>) -> crate::protocol::PaneNameInfo {
+        crate::protocol::PaneNameInfo {
+            custom: None,
+            title: title.map(str::to_string),
+            command: "claude".into(),
+            tab_index: 1,
+            cwd: Some("remux".into()),
+        }
+    }
+
+    #[test]
+    fn cell_label_leads_with_the_pane_name() {
+        let info = name_info(Some("Fix the bug"));
+        assert_eq!(
+            cell_label(&ConnId::Local, "main", "Tab 2", Some(&info), None).as_deref(),
+            Some("Fix the bug \u{b7} main / Tab 2")
+        );
+        let untitled = name_info(None);
+        assert_eq!(
+            cell_label(
+                &ConnId::Remote("mini".into()),
+                "main",
+                "Tab 2",
+                Some(&untitled),
+                None
+            )
+            .as_deref(),
+            Some("claude \u{b7} mini: main / Tab 2")
+        );
+    }
+
+    #[test]
+    fn cell_label_with_a_template_is_the_template_alone() {
+        let info = name_info(Some("Fix the bug"));
+        assert_eq!(
+            cell_label(
+                &ConnId::Remote("mini".into()),
+                "main",
+                "Tab 2",
+                Some(&info),
+                Some("{host}/{session}/{tab} {command}: {title} {cwd}")
+            )
+            .as_deref(),
+            Some("mini/main/1 claude: Fix the bug remux")
+        );
+    }
+
+    #[test]
+    fn cell_label_prefers_a_custom_name_and_tolerates_an_old_server() {
+        let mut info = name_info(Some("Fix the bug"));
+        info.custom = Some("api".into());
+        assert_eq!(
+            cell_label(
+                &ConnId::Local,
+                "main",
+                "Tab 2",
+                Some(&info),
+                Some("{title}")
+            )
+            .as_deref(),
+            Some("api")
+        );
+        assert_eq!(
+            cell_label(&ConnId::Local, "main", "Tab 2", None, None).as_deref(),
+            Some("main / Tab 2")
+        );
+        assert_eq!(cell_label(&ConnId::Local, "", "", Some(&info), None), None);
+    }
     use crate::server::compositor::TabStripEntry;
     use crate::server::layout::{
         all_pane_ids, find_neighbor, relocate_pane_to_edge, Direction, GridLayout, MonocleLayout,

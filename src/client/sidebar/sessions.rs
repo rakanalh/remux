@@ -280,7 +280,8 @@ impl SidebarPlugin for SessionsPlugin {
             PluginEvent::Agents { .. }
             | PluginEvent::FocusedCwd { .. }
             | PluginEvent::FocusedPane { .. }
-            | PluginEvent::DirectoryListing { .. } => {}
+            | PluginEvent::DirectoryListing { .. }
+            | PluginEvent::PaneTitle { .. } => {}
         }
     }
 }

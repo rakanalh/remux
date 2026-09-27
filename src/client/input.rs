@@ -5999,6 +5999,9 @@ mod tests {
             tab_index: 0,
             command: "claude".to_string(),
             state,
+            title: None,
+            custom_name: None,
+            cwd: None,
         }
     }
 

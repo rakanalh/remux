@@ -641,7 +641,57 @@ fn fallback_read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> FallbackRead {
 /// ask the caller to keep a borrowed fd alive for the task's lifetime, nobody
 /// could, and the fd number was reissued to the next PTY while this task's epoll
 /// registration still held it. See the comment on `AsyncFd` below.
-pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Vec<u8>>) {
+/// One read from a PTY master.
+#[derive(Debug)]
+pub struct PtyChunk {
+    pub data: Vec<u8>,
+    /// The terminal's foreground process group when the reader woke for these
+    /// bytes, before it read them. `None` when it could not be read.
+    ///
+    /// Sampled here, and not when the daemon processes the bytes, because a
+    /// program that writes its title and exits has usually handed the
+    /// terminal back to the shell by the time the daemon gets to them, and a
+    /// later sample would attribute the program's title to the shell.
+    pub foreground: Option<i32>,
+    pub sampled_at: std::time::Instant,
+    /// The foreground group again, read after these bytes, and only when they
+    /// hold a title (`OSC 0` / `OSC 2`). A reader that woke for earlier bytes,
+    /// such as the echo of a command line, can read the command's title in the
+    /// same read while the command is still running, and this is what sees it.
+    pub foreground_after: Option<i32>,
+}
+
+/// Whether `data` holds the start of an `OSC 0` or `OSC 2` title.
+fn holds_title(data: &[u8]) -> bool {
+    data.windows(4).any(|w| w == b"\x1b]0;" || w == b"\x1b]2;")
+}
+
+fn make_chunk(
+    data: &[u8],
+    foreground: Option<i32>,
+    sampled_at: std::time::Instant,
+    fd: BorrowedFd<'_>,
+) -> PtyChunk {
+    let foreground_after = if holds_title(data) {
+        foreground_of(fd).0
+    } else {
+        None
+    };
+    PtyChunk {
+        data: data.to_vec(),
+        foreground,
+        sampled_at,
+        foreground_after,
+    }
+}
+
+/// The foreground process group of the terminal on `fd`, and when it was read.
+pub(crate) fn foreground_of(fd: BorrowedFd<'_>) -> (Option<i32>, std::time::Instant) {
+    let fg = nix::unistd::tcgetpgrp(fd).ok().map(|p| p.as_raw());
+    (fg, std::time::Instant::now())
+}
+
+pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedReceiver<PtyChunk>) {
     let raw = master_fd.as_raw_fd();
     log::debug!("pty: start_reader watching fd={raw}");
 
@@ -695,6 +745,7 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
                         break;
                     }
                     Err(_elapsed) => {
+                        let (foreground, sampled_at) = foreground_of(async_fd.get_ref().as_fd());
                         match fallback_read(async_fd.get_ref().as_fd(), &mut buf) {
                             FallbackRead::Data(n) => {
                                 if !warned_fallback {
@@ -704,7 +755,13 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
                                      without a readiness event"
                                     );
                                 }
-                                if tx.send(buf[..n].to_vec()).is_err() {
+                                let chunk = make_chunk(
+                                    &buf[..n],
+                                    foreground,
+                                    sampled_at,
+                                    async_fd.get_ref().as_fd(),
+                                );
+                                if tx.send(chunk).is_err() {
                                     break; // Receiver dropped
                                 }
                             }
@@ -719,6 +776,7 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
                     }
                 };
 
+            let (foreground, sampled_at) = foreground_of(async_fd.get_ref().as_fd());
             match guard.try_io(|inner| {
                 // SAFETY: The fd is valid (caller guarantees it) and we read
                 // into a properly sized buffer.
@@ -737,7 +795,13 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
             }) {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    let chunk = make_chunk(
+                        &buf[..n],
+                        foreground,
+                        sampled_at,
+                        async_fd.get_ref().as_fd(),
+                    );
+                    if tx.send(chunk).is_err() {
                         break; // Receiver dropped
                     }
                 }
@@ -979,6 +1043,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
+    #[test]
+    fn a_read_holds_a_title_only_for_osc_0_or_2() {
+        assert!(holds_title(b"x\x1b]2;t\x07"));
+        assert!(holds_title(b"\x1b]0;t\x1b\\"));
+        assert!(!holds_title(b"\x1b]1;icon\x07\x1b]52;c;YQ==\x07"));
+    }
+
     #[tokio::test]
     async fn start_reader_receives_output() {
         let pty =
@@ -999,7 +1070,7 @@ mod tests {
                 data = rx.recv() => {
                     match data {
                         Some(d) => {
-                            collected.extend_from_slice(&d);
+                            collected.extend_from_slice(&d.data);
                             let output = String::from_utf8_lossy(&collected);
                             if output.contains("test_marker") {
                                 break;
@@ -1047,7 +1118,7 @@ mod tests {
                 data = rx.recv() => {
                     match data {
                         Some(d) => {
-                            collected.extend_from_slice(&d);
+                            collected.extend_from_slice(&d.data);
                             let output = String::from_utf8_lossy(&collected);
                             if let Some(start) = output.find("ARGV0=") {
                                 let rest = &output[start + "ARGV0=".len()..];
@@ -1159,7 +1230,7 @@ mod tests {
             tokio::select! {
                 data = rx.recv() => match data {
                     Some(d) => {
-                        collected.extend_from_slice(&d);
+                        collected.extend_from_slice(&d.data);
                         let output = String::from_utf8_lossy(&collected);
                         if let Some(start) = output.find(key) {
                             let rest = &output[start + key.len()..];

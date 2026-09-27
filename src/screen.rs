@@ -241,6 +241,9 @@ pub struct Screen {
     /// a batch of PTY output holding several clipboard writes leaves the last
     /// one, exactly as a real terminal would.
     pub clipboard_pending: Option<String>,
+    /// The latest `OSC 0` / `OSC 2` window title, sanitised; consumed via
+    /// [`Screen::take_title`]. Last write wins within one batch of output.
+    title_pending: Option<String>,
     /// Deferred line-wrap (DECAWM "last column") state. When a printable char
     /// fills the last column, the cursor stays parked on that column and this
     /// flag is set; the actual wrap to the next row happens only when the NEXT
@@ -290,6 +293,7 @@ impl Screen {
             mouse_sgr: false,
             bell_pending: false,
             clipboard_pending: None,
+            title_pending: None,
             pending_wrap: false,
         }
     }
@@ -306,6 +310,12 @@ impl Screen {
     /// to the clients that should act on it as a `CopyToClipboard`.
     pub fn take_clipboard(&mut self) -> Option<String> {
         self.clipboard_pending.take()
+    }
+
+    /// Consume the title set since the last call, if any. An empty string is a
+    /// real answer: programs clear the title that way when they exit.
+    pub fn take_title(&mut self) -> Option<String> {
+        self.title_pending.take()
     }
 
     /// Handle `OSC 52` — an application asking the terminal to put text on the
@@ -1730,9 +1740,14 @@ impl vte::Perform for Screen {
             };
         } else if params.first().map(|p| *p == b"52").unwrap_or(false) {
             self.osc52_clipboard(params);
+        } else if params.first().is_some_and(|p| *p == b"0" || *p == b"2") {
+            // OSC 1 sets only the icon name, which nothing here shows.
+            let raw: Vec<u8> = params
+                .get(1..)
+                .map(|rest| rest.join(&b';'))
+                .unwrap_or_default();
+            self.title_pending = Some(sanitize_title(&String::from_utf8_lossy(&raw)));
         }
-        // Other OSC sequences (e.g. title setting) are acknowledged but currently
-        // ignored. A future version may store the window title.
     }
 
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
@@ -1746,6 +1761,54 @@ impl vte::Perform for Screen {
     fn put(&mut self, _byte: u8) {
         // DCS put - not yet implemented.
     }
+}
+
+/// Longest window title kept, in characters. A title is a label, and the
+/// bytes come straight off a PTY, so one program cannot make every name on
+/// every surface arbitrarily long.
+const MAX_TITLE_CHARS: usize = 256;
+
+/// `raw` without control or invisible format characters, cut to
+/// [`MAX_TITLE_CHARS`]. An escape sequence inside a title would otherwise reach
+/// every client that draws the pane's name, and a bidi override would show a
+/// different name from the one stored.
+fn sanitize_title(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| !c.is_control() && !is_hidden_format(c))
+        .take(MAX_TITLE_CHARS)
+        .collect()
+}
+
+/// Whether `c` is in Unicode category Cf (format), except the zero-width
+/// joiner and non-joiner. Those two shape visible text: the joiner builds
+/// emoji sequences and the non-joiner is required by Persian and other
+/// scripts, so dropping them would change what a title says.
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2040,6 +2103,50 @@ mod tests {
         assert!(base64_decode(b"YWJ==").is_none());
         // A clipboard READ request is not base64 and must not decode.
         assert!(base64_decode(b"?").is_none());
+    }
+
+    #[test]
+    fn osc_0_and_2_set_the_title_with_either_terminator() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b]0;bel form\x07");
+        assert_eq!(s.take_title().as_deref(), Some("bel form"));
+        assert_eq!(s.take_title(), None);
+        s.process_output(b"\x1b]2;st form\x1b\\");
+        assert_eq!(s.take_title().as_deref(), Some("st form"));
+    }
+
+    #[test]
+    fn osc_1_sets_no_title() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b]1;icon\x07");
+        assert_eq!(s.take_title(), None);
+    }
+
+    #[test]
+    fn a_title_keeps_its_semicolons_and_the_last_write_wins() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b]2;first\x07\x1b]2;a;b;c\x07");
+        assert_eq!(s.take_title().as_deref(), Some("a;b;c"));
+    }
+
+    #[test]
+    fn an_empty_title_is_reported_as_a_clear() {
+        let mut s = make_screen();
+        s.process_output(b"\x1b]0;\x07");
+        assert_eq!(s.take_title().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn sanitize_title_drops_controls_and_caps_length() {
+        assert_eq!(sanitize_title("a\u{1b}b\tc\u{85}d"), "abcd");
+        assert_eq!(
+            sanitize_title("Ex\u{202e}erolp\u{202c}\u{200b}\u{feff}\u{2066}!"),
+            "Exerolp!",
+            "bidi controls and zero-width characters go"
+        );
+        assert_eq!(sanitize_title("a\u{200d}b\u{200c}c"), "a\u{200d}b\u{200c}c");
+        let long = "x".repeat(MAX_TITLE_CHARS + 10);
+        assert_eq!(sanitize_title(&long).chars().count(), MAX_TITLE_CHARS);
     }
 
     #[test]

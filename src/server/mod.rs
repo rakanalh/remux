@@ -6,3 +6,4 @@ pub mod layout;
 pub mod persistence;
 pub mod pty;
 pub mod session;
+pub mod title;

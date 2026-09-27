@@ -73,6 +73,10 @@ pub enum PluginEvent {
         /// know", which is not the same as "none", and the panel says so.
         supported: bool,
     },
+    /// The client's `[appearance] pane_title` template. Sent when the sidebars
+    /// are built and on every config reload, so that the agents panel labels
+    /// rows as the switcher does without waiting for the next agent list.
+    PaneTitle { template: Option<String> },
     /// A connection went away; drop anything scoped to it.
     ConnectionLost { conn: ConnId },
     /// The working directory of the pane the user is focused on, as the

@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod keybindings;
+pub mod pane_title;
 pub mod sidebar;
 pub mod theme;
 pub mod watcher;
@@ -143,6 +144,9 @@ pub struct AppearanceConfig {
     /// Height of the popup terminal as a percentage of the session's content
     /// area. Clamped like `popup_width_pct`.
     pub popup_height_pct: u8,
+    /// The template a pane is named by; see [`pane_title`]. `None` names a
+    /// pane by its settled window title, else its foreground command.
+    pub pane_title: Option<String>,
 }
 
 impl Default for AppearanceConfig {
@@ -155,6 +159,7 @@ impl Default for AppearanceConfig {
             which_key_position: WhichKeyPosition::default(),
             popup_width_pct: 80,
             popup_height_pct: 80,
+            pane_title: None,
         }
     }
 }
@@ -330,7 +335,22 @@ impl Config {
 
         let contents = std::fs::read_to_string(&config_path)?;
         let config: Config = toml::from_str(&contents)?;
+        config.warn_unknown_pane_title_placeholders();
         Ok(config)
+    }
+
+    fn warn_unknown_pane_title_placeholders(&self) {
+        let Some(template) = self.appearance.pane_title.as_deref() else {
+            return;
+        };
+        let unknown = pane_title::unknown_placeholders(template);
+        if !unknown.is_empty() {
+            log::warn!(
+                "[appearance] pane_title: unknown placeholder(s) {unknown:?} are shown literally; \
+known ones are {:?}",
+                pane_title::PLACEHOLDERS
+            );
+        }
     }
 
     /// Return the theme for the current configuration.
@@ -616,8 +636,25 @@ mod tests {
             which_key_position: _,
             popup_width_pct: _,
             popup_height_pct: _,
+            pane_title: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
+    }
+
+    #[test]
+    fn pane_title_is_unset_by_default_and_read_from_appearance() {
+        assert_eq!(Config::default().appearance.pane_title, None);
+        let config: Config = toml::from_str(
+            r#"
+            [appearance]
+            pane_title = "{command}: {title}"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.appearance.pane_title.as_deref(),
+            Some("{command}: {title}")
+        );
     }
 
     #[test]

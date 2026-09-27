@@ -509,7 +509,7 @@ struct PaneData {
     pty: Pty,
     screen: Screen,
     /// Receiving end for PTY output from the background reader task.
-    pty_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pty_rx: mpsc::UnboundedReceiver<pty::PtyChunk>,
     /// The background reader task feeding `pty_rx`.
     ///
     /// Held so it can be aborted when the pane goes away. Dropping a
@@ -566,9 +566,122 @@ struct PaneData {
     /// [`crate::server::agents::Reason`] is the same reason with that number
     /// taken out.
     agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
+    /// The pane's `OSC 0` / `OSC 2` titles and its foreground history.
+    title: crate::server::title::TitleTracker,
+    /// Process names and working directory, read outside the `panes` lock by
+    /// [`refresh_pane_names`] so that naming a pane never does a syscall.
+    names: PaneNames,
+}
+
+/// A pane's cached process names and working directory.
+#[derive(Debug, Default)]
+struct PaneNames {
+    /// The shell's name.
+    shell: String,
+    /// The foreground job's name, with its process group.
+    job: Option<(i32, String)>,
+    /// The basename of the shell's working directory.
+    cwd: Option<String>,
+    read_at: Option<std::time::Instant>,
+}
+
+impl PaneNames {
+    /// The name of process group `group`: the job's when it is the cached job,
+    /// else the shell's.
+    fn command(&self, group: i32, shell: i32) -> &str {
+        match &self.job {
+            Some((pgid, name)) if *pgid == group && group != shell => name,
+            _ => &self.shell,
+        }
+    }
+}
+
+/// Whether process group `pgid` still has a member. A group whose members are
+/// all stopped is alive, and `EPERM` means a member exists that we may not
+/// signal.
+fn group_alive(pgid: i32) -> bool {
+    !matches!(
+        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 impl PaneData {
+    /// What to re-read into [`PaneData::names`], if anything.
+    ///
+    /// Everything is re-read when `foreground_changed`, and otherwise once the
+    /// cache is older than [`crate::server::title::SETTLE`]: `cd`, and an
+    /// `exec` in the shell or in a job, change a name or the directory without
+    /// changing the foreground, and a sample taken between a job's fork and
+    /// its exec caches the shell's name for the job.
+    fn names_to_refresh(
+        &self,
+        now: std::time::Instant,
+        foreground_changed: bool,
+    ) -> Option<NameRefresh> {
+        let stale = self
+            .names
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= crate::server::title::SETTLE);
+        (foreground_changed || stale).then(|| NameRefresh {
+            child: self.pty.child_pid,
+            job: self.title.job(),
+        })
+    }
+
+    /// The shell's process group. `Pty::spawn` makes the shell a session
+    /// leader with `setsid`, so its pid is its process group id.
+    fn shell_pgid(&self) -> i32 {
+        self.pty.child_pid.as_raw()
+    }
+
+    /// The pane's settled title and command name, as of `now`. Reads only
+    /// cached state, so it is safe on every render under the `panes` lock.
+    fn name_parts(&self, now: std::time::Instant) -> (Option<&str>, &str) {
+        let shell = self.shell_pgid();
+        let effective = self.title.effective(now, shell);
+        (
+            self.title.current(effective, shell),
+            self.names.command(effective, shell),
+        )
+    }
+
+    /// Feed one PTY read to the emulator and the title tracker.
+    ///
+    /// The chunk carries the foreground group the reader saw when it woke, so
+    /// a title is attributed to the program that wrote it even if that program
+    /// has exited since. The liveness check is a `killpg(0)` that runs only
+    /// when the shell takes the foreground back from a job that set a title,
+    /// once per such job.
+    fn ingest_chunk(&mut self, chunk: &pty::PtyChunk) -> crate::server::title::Transition {
+        let shell = self.shell_pgid();
+        let transition =
+            self.title
+                .note_foreground(chunk.foreground, chunk.sampled_at, shell, group_alive);
+        self.screen.process_output(&chunk.data);
+        if let Some(raw) = self.screen.take_title() {
+            let text = crate::server::title::normalise(&raw);
+            let setter = match (chunk.foreground.unwrap_or(shell), chunk.foreground_after) {
+                (before, Some(after)) if before == shell && after != shell => after,
+                (before, _) => before,
+            };
+            self.title.observe(text, chunk.sampled_at, setter, shell);
+        }
+        transition
+    }
+
+    /// Adopt a title whose settle window is over. Returns whether the pane's
+    /// name may have changed, either because an adopted title did or because a
+    /// job has now held the foreground long enough to name the pane.
+    fn settle_title(&mut self, pane_id: PaneId, now: std::time::Instant) -> bool {
+        let job_named = self.title.foreground_due(now);
+        if job_named {
+            log::debug!("server: pane_id={pane_id} is now named by its foreground job");
+        }
+        let shell = self.shell_pgid();
+        self.title.settle(now, shell) || job_named
+    }
+
     /// Queue bytes for the pane's PTY.
     ///
     /// Never writes the descriptor here. The master is `O_NONBLOCK` and this is
@@ -779,6 +892,7 @@ pub struct RemuxServer {
 impl RemuxServer {
     /// Create a new server instance.
     fn new(config: Config) -> Self {
+        PANE_TITLE.get_or_init(|| config.appearance.pane_title.clone());
         Self {
             state: Arc::new(Mutex::new(ServerState::new())),
             panes: Arc::new(Mutex::new(HashMap::new())),
@@ -994,6 +1108,7 @@ impl RemuxServer {
         if let Ok(mut persisted) =
             crate::server::persistence::PersistedState::from_server(&state, &pane_cwds)
         {
+            forget_titles(&mut persisted.state, &panes);
             // Persist live + still-dormant sessions so a live-only save never
             // clobbers un-resurrected dormant sessions on disk.
             {
@@ -4056,22 +4171,21 @@ async fn send_session_tree_to(
         }
     }
 
-    // Compute pane names from PTY process names.
+    // A user-set custom pane name (PaneRename) takes precedence over the
+    // resolved name, matching what the pane border shows.
     let mut pane_names: HashMap<PaneId, String> = HashMap::new();
     let ps = panes.lock().await;
-    for (&pid, pane) in ps.iter() {
-        let name = get_process_name(pane.pty.child_pid.as_raw());
-        pane_names.insert(pid, name);
-    }
-
-    // A user-set custom pane name (PaneRename) takes precedence over the
-    // auto-detected process name, matching what the pane border shows.
-    for sess in st.sessions.values() {
-        for tab in &sess.tabs {
+    for (session_name, sess) in st.sessions.iter() {
+        for (tab_index, tab) in sess.tabs.iter().enumerate() {
             for pane_id in layout::all_pane_ids(&tab.layout) {
-                if let Some(Some(custom)) = layout::get_pane_custom_name(&tab.layout, pane_id) {
-                    pane_names.insert(pane_id, custom);
-                }
+                let name = match layout::get_pane_custom_name(&tab.layout, pane_id) {
+                    Some(Some(custom)) => custom,
+                    _ => match ps.get(&pane_id) {
+                        Some(pane) => auto_pane_name(pane, session_name, tab_index),
+                        None => continue,
+                    },
+                };
+                pane_names.insert(pane_id, name);
             }
         }
     }
@@ -4184,6 +4298,148 @@ fn mark_agents_dirty() {
     AGENTS_DIRTY.notify_one();
 }
 
+/// Push a pane's new name to the session tree and the agents list. The caller
+/// re-renders and re-streams the pane itself.
+fn mark_pane_retitled() {
+    mark_session_tree_dirty();
+    mark_agents_dirty();
+}
+
+/// Whether a foreground transition changed who names the pane, logging it
+/// when the source of the name flips back to the shell. The flip to a job is
+/// logged by [`PaneData::settle_title`], once the job has held the foreground
+/// long enough to name the pane.
+fn note_transition(pane_id: PaneId, t: crate::server::title::Transition) -> bool {
+    use crate::server::title::Transition;
+    match t {
+        Transition::None => false,
+        Transition::Job(_) => true,
+        Transition::Shell { named } => {
+            if named {
+                log::debug!("server: pane_id={pane_id} is named by its shell again");
+            }
+            true
+        }
+    }
+}
+
+/// Samples a quiet pane's foreground group from the forwarding loop, through
+/// the loop's own duplicate of the master, and without the `panes` lock.
+struct ForegroundWatch {
+    fd: Option<std::os::fd::OwnedFd>,
+    ticks: u32,
+}
+
+impl ForegroundWatch {
+    /// Every tenth idle poll, so a quiet pane costs one `tcgetpgrp` every
+    /// 100ms.
+    const EVERY: u32 = 10;
+
+    async fn new(pane_id: PaneId, panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>) -> Self {
+        let ps = panes.lock().await;
+        let fd = ps
+            .get(&pane_id)
+            .and_then(|pd| pd.pty.master_fd.try_clone().ok());
+        Self { fd, ticks: 0 }
+    }
+
+    fn sample(&mut self) -> Option<(Option<i32>, std::time::Instant)> {
+        self.ticks = self.ticks.wrapping_add(1);
+        if !self.ticks.is_multiple_of(Self::EVERY) {
+            return None;
+        }
+        let fd = self.fd.as_ref()?;
+        Some(pty::foreground_of(std::os::fd::AsFd::as_fd(fd)))
+    }
+}
+
+/// The name of process group `pgid`, whose shell is `shell`. The group leader
+/// can exit before the rest of its group (`sleep 0.1 | sleep 5`), so a live
+/// member is named when the leader is gone, and the shell when none is found.
+fn group_name(pgid: i32, shell: i32) -> String {
+    let member = if process_pgid(pgid) == Some(pgid) {
+        pgid
+    } else {
+        child_pids(shell)
+            .into_iter()
+            .find(|&child| process_pgid(child) == Some(pgid))
+            .unwrap_or(shell)
+    };
+    get_process_name(member)
+}
+
+/// What [`refresh_pane_names`] reads for, taken under the `panes` lock by
+/// [`PaneData::names_to_refresh`].
+struct NameRefresh {
+    child: nix::unistd::Pid,
+    job: Option<i32>,
+}
+
+/// Re-read a pane's process names and working directory into
+/// [`PaneData::names`], with no lock held while reading. Returns whether a
+/// cached value changed.
+async fn refresh_pane_names(
+    pane_id: PaneId,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    what: NameRefresh,
+) -> bool {
+    let now = std::time::Instant::now();
+    let child = what.child;
+    let cwd = persistence::get_pane_cwd(child)
+        .map(|c| crate::config::pane_title::basename(&c).to_string());
+    let shell = get_process_name(child.as_raw());
+    let job = what.job.map(|g| (g, group_name(g, child.as_raw())));
+    let mut ps = panes.lock().await;
+    let Some(pd) = ps.get_mut(&pane_id) else {
+        return false;
+    };
+    let changed = pd.names.cwd != cwd || pd.names.shell != shell || pd.names.job != job;
+    pd.names.cwd = cwd;
+    pd.names.read_at = Some(now);
+    pd.names.shell = shell;
+    pd.names.job = job;
+    changed
+}
+
+/// The server's `[appearance] pane_title`, read once at startup like
+/// [`AGENT_RULES`].
+static PANE_TITLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn pane_title_template() -> Option<&'static str> {
+    PANE_TITLE.get().and_then(|t| t.as_deref())
+}
+
+/// The name a pane that the user has not renamed is shown by on the surfaces
+/// the server renders: its border, the Monocle strip and the session tree.
+/// `{host}` is always empty here, since this server is the pane's own. Reads
+/// only [`PaneData`]'s cached state.
+fn auto_pane_name(pd: &PaneData, session: &str, tab: usize) -> String {
+    let (title, command) = pd.name_parts(std::time::Instant::now());
+    crate::config::pane_title::display_name(
+        pane_title_template(),
+        &crate::config::pane_title::NameParts {
+            title,
+            command,
+            session,
+            tab,
+            cwd: pd.names.cwd.as_deref(),
+            host: "",
+        },
+    )
+}
+
+/// The raw parts a client renders a View cell's label from.
+fn pane_name_info(pd: &PaneData, custom: Option<String>, tab_index: usize) -> PaneNameInfo {
+    let (title, command) = pd.name_parts(std::time::Instant::now());
+    PaneNameInfo {
+        custom,
+        title: title.map(str::to_string),
+        command: command.to_string(),
+        tab_index,
+        cwd: pd.names.cwd.clone(),
+    }
+}
+
 /// The compiled agent rules, built once from the config the server started with.
 ///
 /// A `OnceLock` rather than a field threaded through the call graph: the server
@@ -4248,14 +4504,15 @@ async fn collect_agents(
     }
 
     // Phase 3: place each matched pane in the tree, then classify it.
-    let mut located: HashMap<PaneId, (String, usize)> = HashMap::new();
+    let mut located: HashMap<PaneId, (String, usize, Option<String>)> = HashMap::new();
     {
         let st = state.lock().await;
         for (name, sess) in &st.sessions {
             for (tab_index, tab) in sess.tabs.iter().enumerate() {
                 for pane_id in layout::all_pane_ids(&tab.layout) {
                     if matched.iter().any(|(id, _)| *id == pane_id) {
-                        located.insert(pane_id, (name.clone(), tab_index));
+                        let custom = layout::get_pane_custom_name(&tab.layout, pane_id).flatten();
+                        located.insert(pane_id, (name.clone(), tab_index, custom));
                     }
                 }
             }
@@ -4270,7 +4527,7 @@ async fn collect_agents(
             // A pane in no layout tree is an AUX pane -- a sidebar's own file
             // manager. It belongs to a panel, not to the session tree, and has
             // no session or tab to jump to, so it is not listed.
-            let Some((session, tab_index)) = located.get(&pane_id).cloned() else {
+            let Some((session, tab_index, custom_name)) = located.get(&pane_id).cloned() else {
                 continue;
             };
             let Some(pd) = ps.get_mut(&pane_id) else {
@@ -4299,6 +4556,11 @@ async fn collect_agents(
                 tab_index,
                 command,
                 state: verdict.state,
+                // From the cache the forwarding loop keeps, so that this sample
+                // can neither restart a job's settle window nor do a syscall.
+                title: pd.name_parts(now).0.map(str::to_string),
+                custom_name,
+                cwd: pd.names.cwd.clone(),
             });
         }
     }
@@ -6724,6 +6986,17 @@ async fn spawn_pane(
             streamed_session_visible: false,
             last_output: std::time::Instant::now(),
             agent_verdict: None,
+            title: crate::server::title::TitleTracker::default(),
+            names: PaneNames {
+                // Until the forwarding loop reads the real name, the program
+                // the pane was spawned with.
+                shell: cmd
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .map(|c| crate::config::pane_title::basename(&c).to_string())
+                    .unwrap_or_default(),
+                ..PaneNames::default()
+            },
         },
     );
     Ok(())
@@ -7117,19 +7390,33 @@ async fn session_render_size(
     (cols, rows)
 }
 
-/// Resolve the `(session_name, tab_name)` a pane belongs to, for a View cell's
-/// border title. Scans every session's tabs for the one whose `pane_order`
-/// contains `pane_id`. Returns empty strings when the pane can't be located
+/// Where a pane is, for a View cell's label: its session's and tab's names,
+/// the tab's index, and the name the user gave the pane.
+#[derive(Debug, Default)]
+struct PaneLabels {
+    session: String,
+    tab: String,
+    tab_index: usize,
+    custom_name: Option<String>,
+}
+
+/// Resolve a pane's [`PaneLabels`] by scanning every session's tabs for the one
+/// whose `pane_order` contains `pane_id`. Empty when the pane can't be located
 /// (already closed): the client then falls back to `waiting…`.
-fn pane_labels(st: &ServerState, pane_id: PaneId) -> (String, String) {
+fn pane_labels(st: &ServerState, pane_id: PaneId) -> PaneLabels {
     for sess in st.sessions.values() {
-        for tab in &sess.tabs {
+        for (tab_index, tab) in sess.tabs.iter().enumerate() {
             if tab.panes().contains(&pane_id) {
-                return (sess.name.clone(), tab.name.clone());
+                return PaneLabels {
+                    session: sess.name.clone(),
+                    tab: tab.name.clone(),
+                    tab_index,
+                    custom_name: layout::get_pane_custom_name(&tab.layout, pane_id).flatten(),
+                };
             }
         }
     }
-    (String::new(), String::new())
+    PaneLabels::default()
 }
 
 /// Deliver an application's `OSC 52` clipboard write (drained from the pane's
@@ -7225,7 +7512,12 @@ async fn stream_pane_content(
     if subs.is_empty() {
         return;
     }
-    let (session_name, tab_name) = {
+    let PaneLabels {
+        session: session_name,
+        tab: tab_name,
+        tab_index,
+        custom_name,
+    } = {
         let st = state.lock().await;
         pane_labels(&st, pane_id)
     };
@@ -7235,8 +7527,8 @@ async fn stream_pane_content(
     // before the clients lock is taken again (never nested).
     let outgoing: Vec<(u64, ServerMessage)> = {
         let ps = panes.lock().await;
-        let screen = match ps.get(&pane_id) {
-            Some(pd) => &pd.screen,
+        let (screen, pane_name) = match ps.get(&pane_id) {
+            Some(pd) => (&pd.screen, pane_name_info(pd, custom_name, tab_index)),
             // Pane gone between the subscriber scan and here: nothing to send.
             None => return,
         };
@@ -7276,6 +7568,7 @@ async fn stream_pane_content(
                         session_name: session_name.clone(),
                         tab_name: tab_name.clone(),
                         session_visible,
+                        pane_name: Some(pane_name.clone()),
                     };
                     cache.push((key, m.clone()));
                     m
@@ -8025,10 +8318,8 @@ async fn broadcast_full_render(
     }
 }
 
-/// Update display names for panes that don't have a custom name by
-/// reading the process name from `/proc/<pid>/comm`.
-/// Refresh the auto-detected (process-derived) name of every pane in the
-/// session's active tab.
+/// Refresh the name of every pane in the session's active tab that the user
+/// has not renamed, from [`auto_pane_name`].
 ///
 /// Also marks the session tree dirty, but ONLY when a name actually changed.
 /// This runs on every render and every mouse event, so notifying
@@ -8045,7 +8336,8 @@ async fn update_auto_pane_names(
         Some(s) => s,
         None => return,
     };
-    let tab = match sess.tabs.get_mut(sess.active_tab) {
+    let tab_index = sess.active_tab;
+    let tab = match sess.tabs.get_mut(tab_index) {
         Some(t) => t,
         None => return,
     };
@@ -8067,7 +8359,7 @@ async fn update_auto_pane_names(
         if custom == Some(None) || custom.is_none() {
             // No custom name -- auto-detect from process.
             if let Some(pane_data) = ps.get(&pane_id) {
-                let name = get_process_name(pane_data.pty.child_pid.as_raw());
+                let name = auto_pane_name(pane_data, session_name, tab_index);
                 if layout::get_pane_name(&tab.layout, pane_id).as_deref() != Some(name.as_str()) {
                     changed = true;
                 }
@@ -8849,6 +9141,15 @@ async fn start_forwarding_for_pane(
 
     {
         tokio::spawn(async move {
+            let mut watch = ForegroundWatch::new(pane_id, &panes).await;
+            let first = {
+                let ps = panes.lock().await;
+                ps.get(&pane_id)
+                    .and_then(|pd| pd.names_to_refresh(std::time::Instant::now(), true))
+            };
+            if let Some(what) = first {
+                refresh_pane_names(pane_id, &panes, what).await;
+            }
             loop {
                 let recv_result = {
                     let mut ps = panes.lock().await;
@@ -8879,13 +9180,18 @@ async fn start_forwarding_for_pane(
                             }
                         }
 
-                        let (responses, bell, clipboard) = {
+                        let (responses, bell, clipboard, retitled, fg_changed, refresh) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
+                                let now = std::time::Instant::now();
+                                let mut fg_changed = false;
                                 for chunk in &chunks {
-                                    pane_data.screen.process_output(chunk);
+                                    let t = pane_data.ingest_chunk(chunk);
+                                    fg_changed |= note_transition(pane_id, t);
                                 }
-                                pane_data.last_output = std::time::Instant::now();
+                                pane_data.last_output = now;
+                                let retitled = pane_data.settle_title(pane_id, now);
+                                let refresh = pane_data.names_to_refresh(now, fg_changed);
                                 // Output is what makes an agent `Working`, and
                                 // what clears a `NeedsInput` prompt off the
                                 // screen. Safe under the lock for the same
@@ -8904,11 +9210,25 @@ async fn start_forwarding_for_pane(
                                 // off, so a disallowed write cannot sit pending
                                 // and land the moment it is switched back on.
                                 let clipboard = pane_data.screen.take_clipboard();
-                                (pane_data.screen.take_responses(), bell, clipboard)
+                                (
+                                    pane_data.screen.take_responses(),
+                                    bell,
+                                    clipboard,
+                                    retitled,
+                                    fg_changed,
+                                    refresh,
+                                )
                             } else {
-                                (Vec::new(), false, None)
+                                (Vec::new(), false, None, false, false, None)
                             }
                         };
+                        let renamed = match refresh {
+                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
+                            None => false,
+                        };
+                        if retitled || fg_changed || renamed {
+                            mark_pane_retitled();
+                        }
                         // Record background-tab activity (no-op if this pane's
                         // tab is the foreground/active tab). Panes lock is
                         // released above; acquire state alone to preserve the
@@ -8971,11 +9291,50 @@ async fn start_forwarding_for_pane(
                         break;
                     }
                     None => {
-                        // No data available yet, sleep briefly.
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        let ps = panes.lock().await;
-                        if !ps.contains_key(&pane_id) {
-                            break;
+                        // A quiet pane gets no tagged reads, so its foreground
+                        // is sampled here, and the settle windows end here.
+                        let sample = watch.sample();
+                        let (retitled, fg_changed, refresh) = {
+                            let mut ps = panes.lock().await;
+                            match ps.get_mut(&pane_id) {
+                                Some(pane_data) => {
+                                    let fg_changed = sample.is_some_and(|(fg, at)| {
+                                        let shell = pane_data.shell_pgid();
+                                        let t = pane_data.title.note_foreground(
+                                            fg,
+                                            at,
+                                            shell,
+                                            group_alive,
+                                        );
+                                        note_transition(pane_id, t)
+                                    });
+                                    let now = std::time::Instant::now();
+                                    (
+                                        pane_data.settle_title(pane_id, now),
+                                        fg_changed,
+                                        pane_data.names_to_refresh(now, fg_changed),
+                                    )
+                                }
+                                None => break,
+                            }
+                        };
+                        let renamed = match refresh {
+                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
+                            None => false,
+                        };
+                        if retitled || fg_changed || renamed {
+                            mark_pane_retitled();
+                            stream_pane_content(pane_id, &state, &panes, &clients).await;
+                            broadcast_full_render(
+                                &session_name,
+                                &state,
+                                &panes,
+                                &clients,
+                                &config,
+                                &prev_frames,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -9016,6 +9375,7 @@ async fn save_if_enabled(
     if let Ok(mut persisted) =
         crate::server::persistence::PersistedState::from_server(&st, &pane_cwds)
     {
+        forget_titles(&mut persisted.state, &ps);
         // Persist live + still-dormant sessions so a live-only save never
         // clobbers un-resurrected dormant sessions on disk. No-op (byte-identical
         // to a live-only save) whenever the dormant store is empty, which is the
@@ -9027,6 +9387,28 @@ async fn save_if_enabled(
         }
         if let Err(e) = crate::server::persistence::save_state(&persisted) {
             log::error!("failed to save state: {e}");
+        }
+    }
+}
+
+/// Replace every pane name that did not come from the user with the pane's
+/// process name, in a copy of the state about to be saved. A window title is
+/// runtime-only: it can hold anything a program chose to show, such as a
+/// summary of what the user asked an agent, and it would otherwise be written
+/// to `state.json` and shown again by a pane that no longer runs that program.
+fn forget_titles(state: &mut ServerState, ps: &HashMap<PaneId, PaneData>) {
+    for sess in state.sessions.values_mut() {
+        for tab in sess.tabs.iter_mut() {
+            for pane_id in layout::all_pane_ids(&tab.layout) {
+                if let Some(Some(_)) = layout::get_pane_custom_name(&tab.layout, pane_id) {
+                    continue;
+                }
+                let name = ps
+                    .get(&pane_id)
+                    .map(|pd| pd.names.shell.clone())
+                    .unwrap_or_default();
+                layout::set_pane_name(&mut tab.layout, pane_id, &name);
+            }
         }
     }
 }
@@ -9166,6 +9548,15 @@ async fn materialize_session(
         let session_name = session_name.to_string();
 
         tokio::spawn(async move {
+            let mut watch = ForegroundWatch::new(pane_id, &panes).await;
+            let first = {
+                let ps = panes.lock().await;
+                ps.get(&pane_id)
+                    .and_then(|pd| pd.names_to_refresh(std::time::Instant::now(), true))
+            };
+            if let Some(what) = first {
+                refresh_pane_names(pane_id, &panes, what).await;
+            }
             loop {
                 let recv_result = {
                     let mut ps = panes.lock().await;
@@ -9184,11 +9575,15 @@ async fn materialize_session(
 
                 match recv_result {
                     Some(Ok(data)) => {
-                        let (responses, bell, clipboard) = {
+                        let (responses, bell, clipboard, retitled, fg_changed, refresh) = {
                             let mut ps = panes.lock().await;
                             if let Some(pane_data) = ps.get_mut(&pane_id) {
-                                pane_data.screen.process_output(&data);
-                                pane_data.last_output = std::time::Instant::now();
+                                let now = std::time::Instant::now();
+                                let t = pane_data.ingest_chunk(&data);
+                                let fg_changed = note_transition(pane_id, t);
+                                pane_data.last_output = now;
+                                let retitled = pane_data.settle_title(pane_id, now);
+                                let refresh = pane_data.names_to_refresh(now, fg_changed);
                                 // Output is what makes an agent `Working`, and
                                 // what clears a `NeedsInput` prompt off the
                                 // screen. Safe under the lock for the same
@@ -9196,11 +9591,25 @@ async fn materialize_session(
                                 mark_agents_dirty();
                                 let bell = pane_data.screen.take_bell();
                                 let clipboard = pane_data.screen.take_clipboard();
-                                (pane_data.screen.take_responses(), bell, clipboard)
+                                (
+                                    pane_data.screen.take_responses(),
+                                    bell,
+                                    clipboard,
+                                    retitled,
+                                    fg_changed,
+                                    refresh,
+                                )
                             } else {
-                                (Vec::new(), false, None)
+                                (Vec::new(), false, None, false, false, None)
                             }
                         };
+                        let renamed = match refresh {
+                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
+                            None => false,
+                        };
+                        if retitled || fg_changed || renamed {
+                            mark_pane_retitled();
+                        }
                         {
                             let mut st = state.lock().await;
                             st.record_pane_activity(pane_id, bell, std::time::Instant::now());
@@ -9254,9 +9663,49 @@ async fn materialize_session(
                     }
                     None => {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        let ps = panes.lock().await;
-                        if !ps.contains_key(&pane_id) {
-                            break;
+                        // A quiet pane gets no tagged reads, so its foreground
+                        // is sampled here, and the settle windows end here.
+                        let sample = watch.sample();
+                        let (retitled, fg_changed, refresh) = {
+                            let mut ps = panes.lock().await;
+                            match ps.get_mut(&pane_id) {
+                                Some(pane_data) => {
+                                    let fg_changed = sample.is_some_and(|(fg, at)| {
+                                        let shell = pane_data.shell_pgid();
+                                        let t = pane_data.title.note_foreground(
+                                            fg,
+                                            at,
+                                            shell,
+                                            group_alive,
+                                        );
+                                        note_transition(pane_id, t)
+                                    });
+                                    let now = std::time::Instant::now();
+                                    (
+                                        pane_data.settle_title(pane_id, now),
+                                        fg_changed,
+                                        pane_data.names_to_refresh(now, fg_changed),
+                                    )
+                                }
+                                None => break,
+                            }
+                        };
+                        let renamed = match refresh {
+                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
+                            None => false,
+                        };
+                        if retitled || fg_changed || renamed {
+                            mark_pane_retitled();
+                            stream_pane_content(pane_id, &state, &panes, &clients).await;
+                            broadcast_full_render(
+                                &session_name,
+                                &state,
+                                &panes,
+                                &clients,
+                                &config,
+                                &prev_frames,
+                            )
+                            .await;
                         }
                     }
                 }

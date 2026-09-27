@@ -39,6 +39,8 @@ use crate::protocol::{AgentEntry, AgentState, CellColor, PaneId, RenderCell};
 pub struct AgentRow {
     pub conn: ConnId,
     pub entry: AgentEntry,
+    /// The client's `[appearance] pane_title` template.
+    pub pane_title: Option<String>,
 }
 
 impl AgentRow {
@@ -50,7 +52,35 @@ impl AgentRow {
 
     /// The label beside the marker, e.g. `claude main/1` -- host-prefixed for a
     /// remote, since two machines routinely have a session of the same name.
+    ///
+    /// A name the user gave the pane wins outright. Otherwise a `pane_title`
+    /// template decides; with none, a titled agent is shown by its title alone
+    /// and an untitled one by this command-and-location form.
     pub fn label(&self) -> String {
+        if let Some(custom) = &self.entry.custom_name {
+            return custom.clone();
+        }
+        let host = match &self.conn {
+            ConnId::Local => "",
+            ConnId::Remote(name) => name.as_str(),
+        };
+        let title = self.entry.title.as_deref().filter(|t| !t.is_empty());
+        if let Some(template) = self.pane_title.as_deref() {
+            return crate::config::pane_title::display_name(
+                Some(template),
+                &crate::config::pane_title::NameParts {
+                    title,
+                    command: &self.entry.command,
+                    session: &self.entry.session,
+                    tab: self.entry.tab_index,
+                    cwd: self.entry.cwd.as_deref(),
+                    host,
+                },
+            );
+        }
+        if let Some(title) = title {
+            return title.to_string();
+        }
         let where_ = match &self.conn {
             ConnId::Local => format!("{}/{}", self.entry.session, self.entry.tab_index),
             ConnId::Remote(name) => {
@@ -103,6 +133,8 @@ pub struct AgentRoster {
     /// Per-connection lists, in arrival order. Order is stable across pushes so
     /// a refresh on one server does not reshuffle the list under the user.
     lists: Vec<(ConnId, ConnAgents)>,
+    /// The `[appearance] pane_title` template every row is labelled with.
+    pane_title: Option<String>,
 }
 
 impl AgentRoster {
@@ -120,6 +152,11 @@ impl AgentRoster {
             Some(slot) => slot.1 = listed,
             None => self.lists.push((conn.clone(), listed)),
         }
+    }
+
+    /// Label rows with `template` from now on.
+    pub fn set_pane_title(&mut self, template: Option<String>) {
+        self.pane_title = template;
     }
 
     /// Forget `conn`. Returns whether it had reported anything.
@@ -156,6 +193,7 @@ impl AgentRoster {
                 listed.agents.iter().map(|entry| AgentRow {
                     conn: conn.clone(),
                     entry: entry.clone(),
+                    pane_title: self.pane_title.clone(),
                 })
             })
             .collect()
@@ -433,6 +471,10 @@ impl SidebarPlugin for AgentsPlugin {
             PluginEvent::SessionTree { .. }
             | PluginEvent::FocusedCwd { .. }
             | PluginEvent::DirectoryListing { .. } => {}
+            PluginEvent::PaneTitle { template } => {
+                self.roster.set_pane_title(template.clone());
+                self.rebuild();
+            }
         }
     }
 }
@@ -453,7 +495,63 @@ mod tests {
             tab_index: 0,
             command: command.to_string(),
             state,
+            title: None,
+            custom_name: None,
+            cwd: None,
         }
+    }
+
+    fn row(conn: ConnId, entry: AgentEntry, pane_title: Option<&str>) -> AgentRow {
+        AgentRow {
+            conn,
+            entry,
+            pane_title: pane_title.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_untitled_row_keeps_the_command_and_location() {
+        let e = agent(1, "claude", "main", AgentState::Idle);
+        assert_eq!(row(ConnId::Local, e.clone(), None).label(), "claude main/0");
+        assert_eq!(row(remote("mini"), e, None).label(), "claude mini:main/0");
+    }
+
+    #[test]
+    fn a_titled_row_is_the_title_alone() {
+        let mut e = agent(1, "claude", "main", AgentState::Idle);
+        e.title = Some("Fix the bug".into());
+        assert_eq!(row(remote("mini"), e, None).label(), "Fix the bug");
+    }
+
+    #[test]
+    fn a_new_template_relabels_the_rows_at_once() {
+        let mut p = AgentsPlugin::new();
+        let mut e = agent(1, "claude", "main", AgentState::Idle);
+        e.title = Some("Fix the bug".into());
+        p.on_event(&push(ConnId::Local, vec![e]));
+        assert_eq!(p.rows[0].label(), "Fix the bug");
+        p.on_event(&PluginEvent::PaneTitle {
+            template: Some("{command}: {title}".into()),
+        });
+        assert_eq!(p.rows[0].label(), "claude: Fix the bug");
+    }
+
+    #[test]
+    fn a_template_labels_the_row_and_a_custom_name_beats_it() {
+        let mut e = agent(1, "claude", "main", AgentState::Idle);
+        e.title = Some("Fix the bug".into());
+        e.cwd = Some("remux".into());
+        assert_eq!(
+            row(
+                remote("mini"),
+                e.clone(),
+                Some("{command}: {title} @{host} {cwd}")
+            )
+            .label(),
+            "claude: Fix the bug @mini remux"
+        );
+        e.custom_name = Some("api".into());
+        assert_eq!(row(remote("mini"), e, Some("{title}")).label(), "api");
     }
 
     fn push(conn: ConnId, agents: Vec<AgentEntry>) -> PluginEvent {

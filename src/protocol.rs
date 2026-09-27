@@ -830,6 +830,10 @@ pub enum ServerMessage {
         /// direction (treat as not-visible = stream content as before).
         #[serde(default)]
         session_visible: bool,
+        /// What the cell's label is rendered from. `None` from an older server,
+        /// whose cells keep the `session / tab` label.
+        #[serde(default)]
+        pane_name: Option<PaneNameInfo>,
     },
     /// Direct acknowledgement to the client that issued a `ViewCreate`, carrying
     /// the id the new view was assigned. Sent alongside the `ViewList` broadcast
@@ -930,6 +934,37 @@ pub struct AgentEntry {
     /// entry at all.
     pub command: String,
     pub state: AgentState,
+    /// The pane's settled window title (`OSC 0` / `OSC 2`), if it has one.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The name the user gave the pane, which outranks every other name.
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    /// The basename of the pane's working directory, for a `{cwd}` in the
+    /// client's `pane_title` template.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// What a client needs to name a pane with its own `[appearance] pane_title`
+/// template. The client renders it rather than the server because only the
+/// client knows the remote's name (`{host}`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneNameInfo {
+    /// The name the user gave the pane, which outranks the template.
+    #[serde(default)]
+    pub custom: Option<String>,
+    /// The settled window title, if it is still valid.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The pane's foreground process name.
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub tab_index: usize,
+    /// The basename of the pane's working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// One entry in a [`ServerMessage::DirectoryListing`].

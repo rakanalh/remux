@@ -85,6 +85,33 @@
 # popup_width_pct = 80
 # popup_height_pct = 80
 
+# How a pane is named: on its border and in the Monocle strip, in the session
+# tree, in View cells, in the agents panel and in the Alt-a agent switcher.
+# Placeholders:
+#   {title}    the window title the program set (OSC 0 / OSC 2), once it has
+#              stayed unchanged for a second, with a leading spinner glyph
+#              removed; empty when there is none, or when the program that set
+#              it is not in the foreground: a title your shell set is shown
+#              only at the prompt, and a job such as `top` shows its own title
+#              if it set one
+#   {command}  the foreground job's process (`claude`, `top`) once it has held
+#              the terminal for a second, else the shell (`zsh`)
+#   {session}  the session's name
+#   {tab}      the tab's 0-based index in its session
+#   {cwd}      the last component of the pane's working directory
+#   {host}     the remote's name; empty for a local pane
+# There is no fallback operator. The result is trimmed, and a result that is
+# empty falls back to {command}. An unknown placeholder is shown literally and
+# logged as a warning. There is no brace escaping: `{{title}}` is shown as
+# the literal text `{{title}}`. A name set with PaneRename always wins.
+# Unset (the default): the title when there is one, else the command; an agent
+# with no title is listed as `command session/tab`.
+# The server reads this at startup, so pane borders and the session tree need
+# `remux restart` after a change; View cells and the agents list follow a
+# reload. On a remote, the borders obey the REMOTE machine's config and {host}
+# is empty there.
+# pane_title = "{command}: {title}"
+
 # -----------------------------------------------------------------------------
 # APPEARANCE - THEME
 # -----------------------------------------------------------------------------

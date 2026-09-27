@@ -2707,6 +2707,9 @@ async fn run_client_loop(
     // restart: the panel set can change shape entirely, so there is nothing to
     // carry across.
     let mut chrome = crate::client::chrome::Chrome::from_config(&config.sidebar);
+    chrome.broadcast(&crate::client::sidebar::PluginEvent::PaneTitle {
+        template: config.appearance.pane_title.clone(),
+    });
     // The config supplies the defaults; anything the user changed at runtime
     // last time -- which sidebars are open, how wide, how the panels are
     // weighted -- is layered on top. Applied here, BEFORE the first
@@ -2738,6 +2741,8 @@ async fn run_client_loop(
     // surface the user pressed it on, the next view they open shows the style
     // they last chose.
     let mut view_border_style = config.appearance.border_style.clone();
+    // Re-read on a config reload. The server keeps the value it started with.
+    let mut pane_title = config.appearance.pane_title.clone();
     // The sidebars are framed in the SAME style, so a sidebar sits beside the
     // panes looking like one of them. Seeded here rather than in
     // `Chrome::from_config` so there is exactly one expression of "the style
@@ -2919,6 +2924,7 @@ async fn run_client_loop(
     // Every subscribed connection's latest agent list, so the switcher opens
     // with the list already on screen when a panel keeps it subscribed.
     let mut agent_roster = crate::client::sidebar::agents::AgentRoster::new();
+    agent_roster.set_pane_title(pane_title.clone());
 
     loop {
         // Lay the panels out and act on what they ask for, before anything can
@@ -7092,6 +7098,7 @@ async fn run_client_loop(
                         session_name: pc_session,
                         tab_name: pc_tab,
                         session_visible,
+                        pane_name: pc_name,
                     }) => {
                         // Note: `pane_cols`/`pane_rows` are the PANE's size, not
                         // the terminal's; do not confuse them with the loop's
@@ -7110,19 +7117,13 @@ async fn run_client_loop(
                             bracketed_paste,
                             session_visible,
                         };
-                        // Cell title = `session / tab`, host-prefixed for a remote
-                        // source (`host: session / tab`). Empty session ⇒ the pane
-                        // couldn't be resolved server-side; leave the title unset so
-                        // the cell keeps showing `waiting…`.
-                        let title = if pc_session.is_empty() {
-                            None
-                        } else {
-                            let base = format!("{pc_session} / {pc_tab}");
-                            Some(match &src {
-                                ConnId::Remote(host) => format!("{host}: {base}"),
-                                ConnId::Local => base,
-                            })
-                        };
+                        let title = crate::client::view::cell_label(
+                            &src,
+                            &pc_session,
+                            &pc_tab,
+                            pc_name.as_ref(),
+                            pane_title.as_deref(),
+                        );
                         let mut active_touched = false;
                         // A cell in the active view whose session-visibility just
                         // flipped needs a re-subscribe: entering visibility drops
@@ -7475,6 +7476,8 @@ async fn run_client_loop(
 
                     // Update which-key placement so it changes live too.
                     which_key_position = new_config.appearance.which_key_position.clone();
+                    pane_title = new_config.appearance.pane_title.clone();
+                    agent_roster.set_pane_title(pane_title.clone());
 
                     // Reconcile the remotes roster (update in place / add new /
                     // drop idle config-removed remotes).
@@ -7499,6 +7502,9 @@ async fn run_client_loop(
                         crate::client::chrome::ChromeFocus::Content => None,
                     };
                     chrome = crate::client::chrome::Chrome::from_config(&new_config.sidebar);
+                    chrome.broadcast(&crate::client::sidebar::PluginEvent::PaneTitle {
+                        template: new_config.appearance.pane_title.clone(),
+                    });
                     // The rebuild starts from the config default; the frame has
                     // to go back to the style the client is actually drawing
                     // with, which a runtime `ToggleStyle` may have flipped away
