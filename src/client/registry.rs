@@ -151,6 +151,11 @@ pub struct ConnectionManager {
     /// a terminal that connects after a shared view already exists lists it
     /// immediately. `None` once taken (or when nothing was captured).
     initial_view_infos: Option<Vec<crate::protocol::ViewInfo>>,
+    /// This client's `[appearance] pane_title`, sent to every remote straight
+    /// after its handshake. See [`RemuxClient::announce_naming`]. Shared with
+    /// background dials, which read it when their handshake completes, so a
+    /// config reload during a dial still reaches that remote.
+    pane_title: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ConnectionManager {
@@ -224,6 +229,7 @@ impl ConnectionManager {
             rx,
             local_server_version: None,
             initial_view_infos: None,
+            pane_title: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -379,7 +385,11 @@ impl ConnectionManager {
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), connect).await;
 
         match result {
-            Ok(Ok(client)) => {
+            Ok(Ok(mut client)) => {
+                let template = self.pane_title();
+                if let Err(e) = client.announce_naming(template.as_deref(), name).await {
+                    log::warn!("registry: telling remote '{name}' its pane_title failed: {e:#}");
+                }
                 self.install_remote(name, client);
                 Ok(())
             }
@@ -449,6 +459,7 @@ impl ConnectionManager {
         );
         let tx = self.tx.clone();
         let name = name.to_string();
+        let pane_title = std::sync::Arc::clone(&self.pane_title);
         tokio::spawn(async move {
             let connect = RemuxClient::connect_ssh(
                 &config.ssh,
@@ -459,7 +470,18 @@ impl ConnectionManager {
             );
             let result =
                 match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
-                    Ok(Ok(client)) => Ok(Box::new(client)),
+                    Ok(Ok(mut client)) => {
+                        let template = pane_title
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Err(e) = client.announce_naming(template.as_deref(), &name).await {
+                            log::warn!(
+                                "registry: telling remote '{name}' its pane_title failed: {e:#}"
+                            );
+                        }
+                        Ok(Box::new(client))
+                    }
                     Ok(Err(e)) => Err(format!("{e:#}")),
                     Err(_) => Err("connection timed out".to_string()),
                 };
@@ -500,6 +522,37 @@ impl ConnectionManager {
                 log::warn!("registry: background connect to remote '{name}' failed: {msg}");
                 self.fail_remote(name, msg);
                 false
+            }
+        }
+    }
+
+    /// Record this client's `pane_title`, for the remotes dialled from now on.
+    pub fn set_pane_title(&mut self, template: Option<String>) {
+        *self
+            .pane_title
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = template;
+    }
+
+    fn pane_title(&self) -> Option<String> {
+        self.pane_title
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Tell every live connection this client's `pane_title` again, after a
+    /// config reload changed it.
+    pub async fn announce_pane_title(&mut self) {
+        let template = self.pane_title();
+        for id in self.connected_ids() {
+            let host = match &id {
+                ConnId::Local => String::new(),
+                ConnId::Remote(name) => name.clone(),
+            };
+            let msg = crate::client::terminal::pane_title_message(template.as_deref(), &host);
+            if let Err(e) = self.send(&id, msg).await {
+                log::warn!("registry: telling {id:?} its pane_title failed: {e:#}");
             }
         }
     }

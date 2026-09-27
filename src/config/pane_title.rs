@@ -32,40 +32,72 @@ pub struct NameParts<'a> {
 /// So `{{title}}` reads as the unknown name `{title` followed by a literal `}`,
 /// and renders as `{{title}}`, not as a braced title.
 pub fn render(template: &str, parts: &NameParts<'_>) -> String {
-    let mut out = String::with_capacity(template.len());
+    segments(template, parts)
+        .into_iter()
+        .map(|s| s.text)
+        .collect()
+}
+
+/// A piece of a rendered template: text written in the template itself, or
+/// what a placeholder rendered to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Segment {
+    text: String,
+    literal: bool,
+}
+
+/// `template` rendered piece by piece. An unknown placeholder is literal text.
+fn segments(template: &str, parts: &NameParts<'_>) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let literal = |text: &str| Segment {
+        text: text.to_string(),
+        literal: true,
+    };
     let mut rest = template;
     while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
+        out.push(literal(&rest[..open]));
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
-            out.push_str(&rest[open..]);
+            out.push(literal(&rest[open..]));
             return out;
         };
         let name = &after[..close];
-        match name {
-            "title" => out.push_str(parts.title.unwrap_or("")),
-            "command" => out.push_str(parts.command),
-            "session" => out.push_str(parts.session),
-            "tab" => out.push_str(&parts.tab.to_string()),
-            "cwd" => out.push_str(parts.cwd.unwrap_or("")),
-            "host" => out.push_str(parts.host),
-            _ => {
-                out.push('{');
-                out.push_str(name);
-                out.push('}');
-            }
-        }
+        let value = match name {
+            "title" => Some(parts.title.unwrap_or("").to_string()),
+            "command" => Some(parts.command.to_string()),
+            "session" => Some(parts.session.to_string()),
+            "tab" => Some(parts.tab.to_string()),
+            "cwd" => Some(parts.cwd.unwrap_or("").to_string()),
+            "host" => Some(parts.host.to_string()),
+            _ => None,
+        };
+        out.push(match value {
+            Some(text) => Segment {
+                text,
+                literal: false,
+            },
+            None => literal(&rest[open..open + close + 2]),
+        });
         rest = &after[close + 1..];
     }
-    out.push_str(rest);
+    out.push(literal(rest));
     out
 }
 
+/// Characters that, with whitespace, make up the template text dropped from
+/// either end of a rendered name. A placeholder that renders empty leaves the
+/// separator beside it dangling (`"{command}: {title}"` with no title renders
+/// `zsh:`), and there is no fallback syntax to avoid that.
+const SEPARATORS: &[char] = &[':', '-', '|', '·', '/', ',', '–', '—', '•'];
+
 /// The name a pane is shown by when the user has not renamed it.
 ///
-/// With no template this is the title, else the command. A template that
-/// renders to nothing (`"{title}"` on a pane with no title) falls back to the
-/// command, so that a pane is never unnamed.
+/// With no template this is the title, else the command. From a template,
+/// literal text left at either end that is only whitespace and [`SEPARATORS`]
+/// is dropped, as is surrounding whitespace in the template text; what a
+/// placeholder rendered is never changed, so a title of `/usr/local` or `-v`
+/// is shown as it is. A result that is empty (`"{title}"` on a pane with no
+/// title) falls back to the command, so that a pane is never unnamed.
 pub fn display_name(template: Option<&str>, parts: &NameParts<'_>) -> String {
     match template {
         None => parts
@@ -74,15 +106,42 @@ pub fn display_name(template: Option<&str>, parts: &NameParts<'_>) -> String {
             .unwrap_or(parts.command)
             .to_string(),
         Some(template) => {
-            let rendered = render(template, parts);
-            let trimmed = rendered.trim();
-            if trimmed.is_empty() {
+            let name = trim_ends(segments(template, parts));
+            if name.trim().is_empty() {
                 parts.command.to_string()
             } else {
-                trimmed.to_string()
+                name
             }
         }
     }
+}
+
+/// `segments` joined, without the dangling template text at either end: empty
+/// values and all-separator literals are dropped from each end, and the
+/// whitespace of a literal left at an end is trimmed.
+fn trim_ends(mut segments: Vec<Segment>) -> String {
+    let droppable = |s: &Segment| {
+        if s.literal {
+            s.text
+                .chars()
+                .all(|c| c.is_whitespace() || SEPARATORS.contains(&c))
+        } else {
+            s.text.is_empty()
+        }
+    };
+    while segments.first().is_some_and(droppable) {
+        segments.remove(0);
+    }
+    while segments.last().is_some_and(droppable) {
+        segments.pop();
+    }
+    if let Some(first) = segments.first_mut().filter(|s| s.literal) {
+        first.text = first.text.trim_start().to_string();
+    }
+    if let Some(last) = segments.last_mut().filter(|s| s.literal) {
+        last.text = last.text.trim_end().to_string();
+    }
+    segments.into_iter().map(|s| s.text).collect()
 }
 
 /// The placeholders in `template` that are not in [`PLACEHOLDERS`].
@@ -139,6 +198,66 @@ mod tests {
     }
 
     #[test]
+    fn separators_left_dangling_by_an_empty_placeholder_are_trimmed() {
+        let untitled = NameParts {
+            title: None,
+            host: "",
+            ..parts()
+        };
+        assert_eq!(
+            display_name(Some("{title} - {command}"), &untitled),
+            "claude"
+        );
+        assert_eq!(
+            display_name(Some("{host} | {command} · {title}"), &untitled),
+            "claude"
+        );
+        assert_eq!(display_name(Some("{host}/{session}"), &untitled), "main");
+        assert_eq!(
+            display_name(Some("{command}: {title}"), &parts()),
+            "claude: Fix the bug",
+            "a separator between two values stays"
+        );
+        assert_eq!(
+            display_name(Some("[{command}]"), &untitled),
+            "[claude]",
+            "brackets are not separators"
+        );
+    }
+
+    #[test]
+    fn a_value_is_never_trimmed() {
+        let titled = |title: &'static str| NameParts {
+            title: Some(title),
+            ..parts()
+        };
+        assert_eq!(
+            display_name(Some("{title}"), &titled("/usr/local")),
+            "/usr/local"
+        );
+        assert_eq!(display_name(Some("{title}"), &titled("-v")), "-v");
+        assert_eq!(display_name(Some("{title}"), &titled("/")), "/");
+        assert_eq!(display_name(Some("{title} -"), &titled("C++ -")), "C++ -");
+        let at_root = NameParts {
+            cwd: Some("/"),
+            ..parts()
+        };
+        assert_eq!(display_name(Some("{cwd}"), &at_root), "/");
+        assert_eq!(display_name(Some("[{cwd}]"), &at_root), "[/]");
+        let zsh = NameParts {
+            title: None,
+            command: "zsh",
+            ..parts()
+        };
+        assert_eq!(display_name(Some("{command}: {title}"), &zsh), "zsh");
+        assert_eq!(
+            display_name(Some("{command} {title}"), &titled(" padded ")),
+            "claude  padded ",
+            "the value keeps its own spaces"
+        );
+    }
+
+    #[test]
     fn doubled_braces_are_not_an_escape() {
         assert_eq!(render("{{title}}", &parts()), "{{title}}");
         assert_eq!(unknown_placeholders("{{title}}"), vec!["{title"]);
@@ -178,7 +297,7 @@ mod tests {
         assert_eq!(display_name(Some("{title}"), &untitled), "claude");
         assert_eq!(
             display_name(Some("{command}: {title}"), &untitled),
-            "claude:"
+            "claude"
         );
     }
 

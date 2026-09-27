@@ -44,6 +44,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Server, Client, name_of, only  # noqa: E402
 
 RUNDIR = f"/tmp/rmx-osct-{os.getpid()}"
+# The shell's name as this server reports it, read off the first pane at its
+# prompt: `sh` on Linux, where macOS's `/bin/sh` is a trampoline that execs
+# another shell under its own name.
+SH = "sh"
 COLS, ROWS = 100, 30
 FAILS = []
 
@@ -158,6 +162,9 @@ def set_shell_title(c, v, a, b):
 
 
 def run_default(c, v):
+    global SH
+    time.sleep(1.2)
+    SH = pane_name(c, v) or SH
     # 0. premise.
     typed(c, "sh -c 'printf \"%s%s:%s:%s:%s\\n\" J C $$ $(ps -o pgid= -p $$) "
              "$(ps -o tpgid= -p $$)' | tr -d ' '\r")
@@ -174,23 +181,23 @@ def run_default(c, v):
     typed(c, "sleep 3\r")
     time.sleep(0.4)
     early = pane_name(c, v)
-    check(early == "sh", f"1 a job is not the name before it has held the foreground ({early!r})")
+    check(early == SH, f"1 a job is not the name before it has held the foreground ({early!r})")
     check(wait_name(c, v, "sleep", 2.0), "1 an untitled pane is then named by its foreground job")
-    check(wait_name(c, v, "sh", 4.0), "1 and by its shell again at the prompt")
+    check(wait_name(c, v, SH, 4.0), "1 and by its shell again at the prompt")
 
     # 5. setter exits inside the window.
     typed(c, "sh -c 'printf \"\\033]2;%s%s\\007\" Qu ick; sleep 0.3'; sleep 2\r")
     seen = watch(c, v, 2.2, step=0.05)
     check("Quick" not in seen and "sleep" in seen,
           f"5 a title whose program exited in the window is never adopted ({seen})")
-    check(wait_name(c, v, "sh", 3.0), "5 back at the prompt")
+    check(wait_name(c, v, SH, 3.0), "5 back at the prompt")
 
     # 4. a program's title lives as long as the program.
     typed(c, "sh -c 'printf \"\\033]2;%s%s\\007\" Sub Title; sleep 2.5'\r")
     check(wait_name(c, v, "SubTitle", 2.2), "4 a program's title becomes the name")
-    check(wait_name(c, v, "sh", 3.0), "4 and is dropped when the program exits")
+    check(wait_name(c, v, SH, 3.0), "4 and is dropped when the program exits")
     time.sleep(1.5)
-    check(pane_name(c, v) == "sh", "4 and stays dropped")
+    check(pane_name(c, v) == SH, "4 and stays dropped")
 
     # 10. a pipeline whose group leader is gone.
     # The leader (`true`) exits before any sample can see it alive.
@@ -198,13 +205,13 @@ def run_default(c, v):
     seen = watch(c, v, 3.0, step=0.05)
     check("sleep" in seen and "shell" not in seen,
           f"10 a pipeline is named after its group, never `shell` ({seen})")
-    check(wait_name(c, v, "sh", 3.0), "10 back at the prompt")
+    check(wait_name(c, v, SH, 3.0), "10 back at the prompt")
 
     # 14. a job that execs is renamed after the exec.
     typed(c, "sh -c 'sleep 1.5; exec sleep 6'\r")
-    check(wait_name(c, v, "sh", 1.0), "14 the job is named after its leader before the exec")
+    check(wait_name(c, v, SH, 1.0), "14 the job is named after its leader before the exec")
     check(wait_name(c, v, "sleep", 4.0), f"14 and after the exec by what it became ({pane_name(c, v)!r})")
-    check(wait_name(c, v, "sh", 6.0), "14 back at the prompt")
+    check(wait_name(c, v, SH, 6.0), "14 back at the prompt")
 
     # 2. a shell title settles.
     sent = time.time()
@@ -224,7 +231,7 @@ def run_default(c, v):
     while time.time() < end and v.content is None:
         v.feed(c.drain(0.1))
     info = (v.content or {}).get("pane_name") or {}
-    check(info.get("title") == "Hello Title" and info.get("command") == "sh",
+    check(info.get("title") == "Hello Title" and info.get("command") == SH,
           f"2 PaneContent carries the title and command ({info})")
     c.send({"UnsubscribePane": {"pane_id": pane_id}})
 
@@ -294,10 +301,10 @@ def run_default(c, v):
 
 def run_template(c, v):
     typed(c, "printf '\\033]2;%s%s\\007' Tm pl\r")
-    ok = wait_name(c, v, "sh: Tmpl", 2.5)
+    ok = wait_name(c, v, f"{SH}: Tmpl", 2.5)
     check(ok, f"7 the template names the pane in the tree ({pane_name(c, v)!r})")
     fresh_frame(c, v)
-    check(v.has("sh: Tmpl"), "7 and on the border")
+    check(v.has(f"{SH}: Tmpl"), "7 and on the border")
 
 
 def panes_by_id(c, v):

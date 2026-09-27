@@ -110,7 +110,10 @@ pub enum ConnDescriptor {
 /// 13 -> 14: the `Columns` and `Rows` automatic layouts. Adds
 /// `LayoutMode::Columns` and `LayoutMode::Rows`, which travel in
 /// [`ViewInfo::layout`]; an old peer cannot decode a view carrying one.
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// 14 -> 15: [`ClientMessage::PaneTitle`], the client's naming template. An
+/// old server cannot decode it and would drop the connection.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -320,6 +323,20 @@ pub enum ClientMessage {
     /// Stop receiving [`ServerMessage::AgentList`] pushes. A no-op for a client
     /// that never subscribed.
     UnsubscribeAgents,
+    /// How this client wants panes named: its `[appearance] pane_title`
+    /// template, and the name it knows this server by.
+    ///
+    /// The server renders pane borders, the Monocle strip and the session tree
+    /// it sends to this client with this template instead of its own, so a
+    /// client viewing several servers sees one naming scheme on all of them.
+    /// `template: None` is the built-in naming, not "use the server's". `host`
+    /// is what `{host}` renders as: the remote's name in the client's config,
+    /// empty for the local server. A client that never sends this (an older
+    /// client, or the CLI) is named by the server's own template.
+    PaneTitle {
+        template: Option<String>,
+        host: String,
+    },
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the
     /// server was started with `save_sessions = true` and

@@ -176,6 +176,14 @@ impl RemuxClient {
         write_message(&mut self.writer, &msg).await
     }
 
+    /// Tell the server how this client names panes: its `pane_title` template,
+    /// and `host`, the name it knows this server by (empty for the local
+    /// one). Sent straight after the handshake, before anything is attached,
+    /// so that even the first frame is named this client's way.
+    pub async fn announce_naming(&mut self, template: Option<&str>, host: &str) -> Result<()> {
+        self.send(pane_title_message(template, host)).await
+    }
+
     /// The `remux_version` the server reported during the handshake. Compared
     /// against [`crate::protocol::build_version`] to surface version skew.
     pub fn server_version(&self) -> &str {
@@ -244,6 +252,15 @@ impl RemuxClient {
         Option<Child>,
     ) {
         (self.reader, self.writer, self._child)
+    }
+}
+
+/// The [`ClientMessage::PaneTitle`] that tells a server how this client names
+/// panes.
+pub fn pane_title_message(template: Option<&str>, host: &str) -> ClientMessage {
+    ClientMessage::PaneTitle {
+        template: template.map(str::to_string),
+        host: host.to_string(),
     }
 }
 

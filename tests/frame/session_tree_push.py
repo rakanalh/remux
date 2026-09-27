@@ -206,13 +206,23 @@ def run(srv):
         # `update_auto_pane_names` but never marks the tree dirty itself, so the
         # push below can only come from the name gate.
         c2.send({"Resize": {"cols": 96, "rows": 30}})
-        named = wait_for_tree(c1, 1.5)
+        # Process names are cached per pane and re-read about once a second,
+        # so the push that names the new process can follow a push that does
+        # not, within one read. Every push in the window is read, not just the
+        # first.
         pane_names = []
-        if named is not None:
-            for e in named["SessionTree"]["unfiled"]:
-                if e["name"] == "actor":
-                    for t in e["tabs"]:
-                        pane_names += [p["name"] for p in t["panes"]]
+        named = None
+        end = time.time() + 3.0
+        while time.time() < end and "sleep" not in pane_names:
+            for tree in (m for m in c1.drain(0.1) if name_of(m) == "SessionTree"):
+                named = tree
+                names = []
+                for e in tree["SessionTree"]["unfiled"]:
+                    if e["name"] == "actor":
+                        for t in e["tabs"]:
+                            names += [p["name"] for p in t["panes"]]
+                if "sleep" in names or "sleep" not in pane_names:
+                    pane_names = names
         check(
             named is not None and "sleep" in pane_names,
             f"a real process-name change pushes, naming the new process: {pane_names}",

@@ -103,16 +103,19 @@
 #   {tab}      the tab's 0-based index in its session
 #   {cwd}      the last component of the pane's working directory
 #   {host}     the remote's name; empty for a local pane
-# There is no fallback operator. The result is trimmed, and a result that is
-# empty falls back to {command}. An unknown placeholder is shown literally and
+# There is no fallback operator. Template text left dangling at either end by
+# an empty placeholder is dropped when it is only whitespace and separators
+# (: - | · / , – — •), so "{command}: {title}" on an untitled pane reads `zsh`,
+# not `zsh:`. What a placeholder renders is never trimmed. A result
+# that is empty falls back to {command}. An unknown placeholder is shown literally and
 # logged as a warning. There is no brace escaping: `{{title}}` is shown as
 # the literal text `{{title}}`. A name set with PaneRename always wins.
 # Unset (the default): the title when there is one, else the command; an agent
 # with no title is listed as `command session/tab`.
-# The server reads this at startup, so pane borders and the session tree need
-# `remux restart` after a change; View cells and the agents list follow a
-# reload. On a remote, the borders obey the REMOTE machine's config and {host}
-# is empty there.
+# This client's template names panes on every server it views, remotes
+# included: it is sent to each server, with the remote's name for {host}, and
+# follows a reload without a restart. A server's own pane_title only names
+# panes for a client that sent none (an older client, or the CLI).
 # pane_title = "{command}: {title}"
 
 # -----------------------------------------------------------------------------

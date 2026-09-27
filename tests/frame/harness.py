@@ -49,7 +49,9 @@ class Server:
             "XDG_STATE_HOME": f"{self.rundir}/state",
             "XDG_DATA_HOME": f"{self.rundir}/data",
             "XDG_CONFIG_HOME": f"{self.rundir}/config",
-            "SHELL": "/bin/sh",
+            # `REMUX_TEST_SHELL` swaps the pane shell, e.g. for `/bin/zsh` on a
+            # Mac, where `/bin/sh` is a trampoline that execs another shell.
+            "SHELL": os.environ.get("REMUX_TEST_SHELL", "/bin/sh"),
             "ENV": "/dev/null",
             "TERM": "xterm-256color",
         }

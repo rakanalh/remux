@@ -74,14 +74,13 @@ pub(crate) fn get_process_name(pid: i32) -> String {
         .unwrap_or_else(|_| "shell".to_string())
 }
 
-/// The one `sysinfo::System` this module owns, built on first use.
+/// The one `sysinfo::System` this module owns, built on first use, for
+/// [`get_process_names`]' `argv[0]`.
 ///
-/// Hoisted out of [`get_process_name`] so [`get_process_names`] can share it
-/// rather than construct a second: on macOS `System::new()` calls
-/// `mach_host_self()`, reads the host clock info, enumerates CPUs and allocates
-/// a 200-slot process map before the refresh that does the work, and both
-/// callers run per candidate pane at up to 10 Hz. Refresh kinds are per-CALL,
-/// so sharing the `System` costs the two callers nothing in what they read.
+/// Built once because on macOS `System::new()` calls `mach_host_self()`, reads
+/// the host clock info, enumerates CPUs and allocates a 200-slot process map
+/// before the refresh that does the work, and the caller runs per candidate
+/// pane at up to 10 Hz.
 ///
 /// Still a different one from [`crate::server::persistence::get_pane_cwd`]'s:
 /// that one is private to its function, refreshes a different field (`cwd`) and
@@ -94,50 +93,41 @@ fn proc_system() -> &'static std::sync::Mutex<sysinfo::System> {
     SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()))
 }
 
-/// See the Linux variant for documentation. macOS reads the name through
-/// `sysinfo` because there is no `/proc` filesystem.
+/// See the Linux variant for documentation. macOS has no `/proc`, so the name
+/// is the basename of the executable's path, read with `proc_pidpath` on every
+/// call.
 ///
-/// The `System` is built ONCE and reused, for the reason
-/// [`crate::server::persistence::get_pane_cwd`]'s macOS arm gives at length:
-/// `System::new()` on macOS calls `mach_host_self()`, reads the host clock
-/// info, enumerates CPUs and allocates a 200-slot process map before the
-/// refresh that does the work. This one is called once per candidate pane on
-/// the agents pusher's cadence -- up to 10 Hz while an agent is `Working` --
-/// so a per-call construction would put all of that on a timer.
-///
-/// The `System` is [`proc_system`]'s, shared with [`get_process_names`] and
-/// deliberately NOT `get_pane_cwd`'s -- see `proc_system`'s own docs for why the
-/// line is drawn there. The cost is one more retained `Process` entry per pid
-/// ever queried, bounded by the panes this server has looked at and dropped as
-/// soon as a refresh finds the process dead.
-///
-/// `ProcessRefreshKind::nothing()` is deliberate and sufficient: the process
-/// NAME is base information populated when `sysinfo` first sees the process, not
-/// one of the opt-in fields (`cwd`, `cmd`, `exe`, `environ`, `user`) that need a
-/// `with_*`. Asking for more would refresh data nothing here reads.
-///
-/// A poisoned lock is recovered from rather than propagated, as there: a
-/// panicking caller must not cost every later pane its name.
+/// **Not through `sysinfo`, which is what this used to do.** `sysinfo` sets a
+/// process's name once, when it first sees the pid (`if process.name.is_empty()`
+/// in `sysinfo-0.35.2/src/unix/apple/macos/process.rs`), and an `exec` changes
+/// neither the pid nor its start time, so the entry is never replaced. A new
+/// pane's shell looked at in the instant between the server's fork and the
+/// shell's exec was therefore named `remux` for the rest of its life, and a
+/// program that execs another kept its first name. `proc_pidpath` reads the
+/// kernel's current answer, and costs one syscall where the refresh cost the
+/// `KERN_PROCARGS2` pair.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_process_name(pid: i32) -> String {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+    executable_name(pid).unwrap_or_else(|| "shell".to_string())
+}
+
+/// The basename of `pid`'s executable, as the kernel reports it now.
+#[cfg(target_os = "macos")]
+fn executable_name(pid: i32) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
 
     if pid <= 0 {
-        return "shell".to_string();
+        return None;
     }
-    let spid = Pid::from_u32(pid as u32);
-    let mut system = proc_system()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[spid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    system
-        .process(spid)
-        .map(|p| p.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| "shell".to_string())
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for the length passed.
+    let n =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&buf[..n as usize]));
+    path.file_name().map(|f| f.to_string_lossy().into_owned())
 }
 
 /// Fallback for platforms with no known way to name a foreign process. Always
@@ -216,18 +206,14 @@ pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
     }
 }
 
-/// See the Linux variant for documentation. macOS reads both through `sysinfo`,
-/// in ONE refresh.
+/// See the Linux variant for documentation. macOS reads `argv[0]` through
+/// `sysinfo`, whose refresh runs the `KERN_PROCARGS2` sysctl pair and parses
+/// the arguments out of it.
 ///
-/// One refresh and not two: `update_process` re-runs the `KERN_PROCARGS2`
-/// sysctl pair on every refresh whatever the `ProcessRefreshKind`
-/// (`sysinfo-0.35.2/src/unix/apple/macos/process.rs:700`), so asking for the
-/// name and then the args separately would fetch the whole args-and-environment
-/// buffer twice per pane per sample. Folding them into one call makes the extra
-/// data free: the buffer is already in hand and `with_cmd` only parses it.
-///
-/// `UpdateKind::OnlyIfNotSet` rather than `Always` because `argv[0]` does not
-/// change over a process's life, so the parse is paid once per pid.
+/// The name comes from [`get_process_name`], not from `sysinfo`, for the
+/// reason given there. `argv[0]` is re-parsed on every call
+/// (`UpdateKind::Always`) for the same reason: an `exec` replaces it, and a
+/// parse cached from before one names the program that was replaced.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
@@ -246,13 +232,13 @@ pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[spid]),
         true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
     );
-    match system.process(spid) {
-        Some(p) => ProcessNames {
-            name: p.name().to_string_lossy().to_string(),
-            argv0: p.cmd().first().map(|a| a.to_string_lossy().to_string()),
-        },
+    let argv0 = system
+        .process(spid)
+        .and_then(|p| p.cmd().first().map(|a| a.to_string_lossy().to_string()));
+    match executable_name(pid) {
+        Some(name) => ProcessNames { name, argv0 },
         None => unknown(),
     }
 }
@@ -850,9 +836,18 @@ struct ClientConnection {
     /// the two payloads are dirtied by different things -- structure versus
     /// pane output -- and a client wanting one must not pay for the other.
     agents_subscribed: bool,
+    /// How this client wants panes named, from [`ClientMessage::PaneTitle`].
+    /// `None` until it says, and for ever for an older client or the CLI.
+    naming: Option<Naming>,
 }
 
 impl ClientConnection {
+    /// How to name panes on what is rendered for this client: its own
+    /// template, or this server's for a client that never sent one.
+    fn naming(&self) -> Naming {
+        self.naming.clone().unwrap_or_else(Naming::server)
+    }
+
     /// This client's scroll offset into `pane_id`, unclamped.
     fn scroll_of(&self, pane_id: PaneId) -> usize {
         self.session_scroll.get(&pane_id).copied().unwrap_or(0)
@@ -1205,6 +1200,7 @@ impl RemuxServer {
                     pane_autoscroll_repeat: None,
                     session_tree_subscribed: false,
                     agents_subscribed: false,
+                    naming: None,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -1664,6 +1660,42 @@ async fn handle_client_message(
             let mut cls = clients.lock().await;
             if let Some(conn) = cls.get_mut(&client_id) {
                 conn.agents_subscribed = false;
+            }
+            Ok(())
+        }
+        ClientMessage::PaneTitle { template, host } => {
+            let naming = Naming::new(template, host);
+            let (session, tree_subscribed) = {
+                let mut cls = clients.lock().await;
+                let Some(conn) = cls.get_mut(&client_id) else {
+                    return Ok(());
+                };
+                if conn.naming.as_ref() == Some(&naming) {
+                    return Ok(());
+                }
+                conn.naming = Some(naming);
+                (conn.session_name.clone(), conn.session_tree_subscribed)
+            };
+            // Everything already sent to this client was named the old way.
+            if let Some(session) = session {
+                send_full_render_to_client(
+                    client_id,
+                    &session,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    RenderCtx {
+                        diff_against_baseline: false,
+                        names_are_fresh: false,
+                        force_full: true,
+                    },
+                )
+                .await;
+            }
+            if tree_subscribed {
+                send_session_tree_to(&[client_id], state, panes, clients, dormant).await;
             }
             Ok(())
         }
@@ -4248,23 +4280,29 @@ async fn send_session_tree_to(
     }
 
     // A user-set custom pane name (PaneRename) takes precedence over the
-    // resolved name, matching what the pane border shows.
-    let mut pane_names: HashMap<PaneId, String> = HashMap::new();
+    // resolved name, matching what the pane border shows. Resolved once per
+    // distinct naming among the targets, since each client names panes with
+    // its own template.
     let ps = panes.lock().await;
-    for (session_name, sess) in st.sessions.iter() {
-        for (tab_index, tab) in sess.tabs.iter().enumerate() {
-            for pane_id in layout::all_pane_ids(&tab.layout) {
-                let name = match layout::get_pane_custom_name(&tab.layout, pane_id) {
-                    Some(Some(custom)) => custom,
-                    _ => match ps.get(&pane_id) {
-                        Some(pane) => auto_pane_name(pane, session_name, tab_index),
-                        None => continue,
-                    },
-                };
-                pane_names.insert(pane_id, name);
+    let resolve_names = |naming: &Naming| {
+        let mut pane_names: HashMap<PaneId, String> = HashMap::new();
+        for (session_name, sess) in st.sessions.iter() {
+            for (tab_index, tab) in sess.tabs.iter().enumerate() {
+                for pane_id in layout::all_pane_ids(&tab.layout) {
+                    let name = match layout::get_pane_custom_name(&tab.layout, pane_id) {
+                        Some(Some(custom)) => custom,
+                        _ => match ps.get(&pane_id) {
+                            Some(pane) => auto_pane_name(pane, session_name, tab_index, naming),
+                            None => continue,
+                        },
+                    };
+                    pane_names.insert(pane_id, name);
+                }
             }
         }
-    }
+        pane_names
+    };
+    let mut names_by_naming: Vec<(Naming, HashMap<PaneId, String>)> = Vec::new();
 
     // Working directories, for the `files` sidebar plugin to follow. Resolved
     // ONLY for the pane `build_session_tree` will actually attach one to -- the
@@ -4289,10 +4327,19 @@ async fn send_session_tree_to(
         };
         // `is_current` is per-recipient, so the tree is built per target from
         // the one shared snapshot above.
+        let naming = client.naming();
+        let at = match names_by_naming.iter().position(|(n, _)| *n == naming) {
+            Some(at) => at,
+            None => {
+                let names = resolve_names(&naming);
+                names_by_naming.push((naming, names));
+                names_by_naming.len() - 1
+            }
+        };
         let (folders, unfiled) = st.build_session_tree(
             client.session_name.as_deref(),
             &client_counts,
-            &pane_names,
+            &names_by_naming[at].1,
             &pane_cwds,
         );
         let _ = client.tx.send(ServerMessage::SessionTree {
@@ -4485,21 +4532,47 @@ fn pane_title_template() -> Option<&'static str> {
     PANE_TITLE.get().and_then(|t| t.as_deref())
 }
 
+/// A `pane_title` template and what `{host}` renders as: how the surfaces the
+/// server renders for one client name its panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Naming {
+    template: Option<String>,
+    host: String,
+}
+
+impl Naming {
+    /// A client's naming. `host` is kept only when the template uses it, so
+    /// that clients naming panes the same way compare equal and share one
+    /// composited frame whatever they call this server.
+    fn new(template: Option<String>, host: String) -> Self {
+        let uses_host = template.as_deref().is_some_and(|t| t.contains("{host}"));
+        Self {
+            template,
+            host: if uses_host { host } else { String::new() },
+        }
+    }
+
+    /// This server's own template, for a client that sent none. `{host}` is
+    /// empty, since this server is the pane's own.
+    fn server() -> Self {
+        Self::new(pane_title_template().map(str::to_string), String::new())
+    }
+}
+
 /// The name a pane that the user has not renamed is shown by on the surfaces
 /// the server renders: its border, the Monocle strip and the session tree.
-/// `{host}` is always empty here, since this server is the pane's own. Reads
-/// only [`PaneData`]'s cached state.
-fn auto_pane_name(pd: &PaneData, session: &str, tab: usize) -> String {
+/// Reads only [`PaneData`]'s cached state.
+fn auto_pane_name(pd: &PaneData, session: &str, tab: usize, naming: &Naming) -> String {
     let (title, command) = pd.name_parts(std::time::Instant::now());
     crate::config::pane_title::display_name(
-        pane_title_template(),
+        naming.template.as_deref(),
         &crate::config::pane_title::NameParts {
             title,
             command,
             session,
             tab,
             cwd: pd.names.cwd.as_deref(),
-            host: "",
+            host: &naming.host,
         },
     )
 }
@@ -5397,7 +5470,7 @@ async fn handle_mouse_scroll(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode) = {
+    let (session_name, cols, rows, mode, naming) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -5408,6 +5481,7 @@ async fn handle_mouse_scroll(
             client.cols,
             client.rows,
             client.mode.clone(),
+            client.naming(),
         )
     };
     let session_name = match session_name {
@@ -5430,6 +5504,7 @@ async fn handle_mouse_scroll(
             None,
             &HashMap::new(),
             &config.compositor_theme(),
+            &naming,
         )
         .await;
 
@@ -5583,7 +5658,7 @@ async fn handle_mouse_click(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode) = {
+    let (session_name, cols, rows, mode, naming) = {
         let mut cls = clients.lock().await;
         let client = match cls.get_mut(&client_id) {
             Some(c) => c,
@@ -5605,6 +5680,7 @@ async fn handle_mouse_click(
             client.cols,
             client.rows,
             client.mode.clone(),
+            client.naming(),
         )
     };
     let session_name = match session_name {
@@ -5627,6 +5703,7 @@ async fn handle_mouse_click(
             None,
             &HashMap::new(),
             &config.compositor_theme(),
+            &naming,
         )
         .await;
 
@@ -5804,7 +5881,7 @@ async fn handle_mouse_drag(
     log::debug!(
         "server: MouseDrag client_id={client_id} start=({start_x},{start_y}) end=({end_x},{end_y}) is_final={is_final}"
     );
-    let (session_name, cols, rows, mode) = {
+    let (session_name, cols, rows, mode, naming) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -5815,6 +5892,7 @@ async fn handle_mouse_drag(
             client.cols,
             client.rows,
             client.mode.clone(),
+            client.naming(),
         )
     };
     let session_name = match session_name {
@@ -5840,6 +5918,7 @@ async fn handle_mouse_drag(
             None,
             &HashMap::new(),
             &config.compositor_theme(),
+            &naming,
         )
         .await;
 
@@ -7836,7 +7915,7 @@ async fn send_full_render_to_client(
     log::debug!(
         "server: send_full_render_to_client client_id={client_id} session={session_name:?} dims={cols}x{rows}"
     );
-    let (mode, selection, client_search_info, client_scroll) = {
+    let (mode, selection, client_search_info, client_scroll, naming) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
         let mode = client
@@ -7845,7 +7924,10 @@ async fn send_full_render_to_client(
         let selection = client.and_then(|c| c.mouse_selection.clone());
         let si = client.and_then(|c| c.search_info);
         let scroll = client.map(|c| c.session_scroll.clone()).unwrap_or_default();
-        (mode, selection, si, scroll)
+        let naming = client
+            .map(ClientConnection::naming)
+            .unwrap_or_else(Naming::server);
+        (mode, selection, si, scroll, naming)
     };
     // The pane that owns input is the one the wire's single `scroll_offset`
     // describes: the client gates its `ScrollReset` on that field, and the
@@ -7900,6 +7982,7 @@ async fn send_full_render_to_client(
         client_search_info,
         &client_scroll,
         &config.compositor_theme(),
+        &naming,
     )
     .await;
     let cursor_visible = if scroll_offset > 0 {
@@ -8120,7 +8203,7 @@ async fn broadcast_full_render(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (cols, rows, mode, selection, si, client_count) = {
+    let (cols, rows, mode, selection, si, client_count, naming) = {
         let cls = clients.lock().await;
         let attached: Vec<_> = cls
             .values()
@@ -8139,7 +8222,10 @@ async fn broadcast_full_render(
             .unwrap_or_else(|| "NORMAL".to_string());
         let selection = first.and_then(|c| c.mouse_selection.clone());
         let si = first.and_then(|c| c.search_info);
-        (cols, rows, mode, selection, si, count)
+        // The shared frame names panes the way the first client does. A client
+        // that names them differently is composited on its own, below.
+        let naming = first.map(|c| c.naming()).unwrap_or_else(Naming::server);
+        (cols, rows, mode, selection, si, count, naming)
     };
 
     log::debug!("server: broadcast_full_render session={session_name:?} clients={client_count}");
@@ -8172,6 +8258,7 @@ async fn broadcast_full_render(
         si,
         &HashMap::new(),
         &config.compositor_theme(),
+        &naming,
     )
     .await;
 
@@ -8280,7 +8367,7 @@ async fn broadcast_full_render(
             }
             let force_full = c.needs_full_render;
             c.needs_full_render = false; // consume it
-            if visible_panes.iter().any(|p| clamped_scroll(c, *p) != 0) {
+            if visible_panes.iter().any(|p| clamped_scroll(c, *p) != 0) || c.naming() != naming {
                 per_client.push((*id, force_full));
             } else {
                 shared.push((*id, c.tx.clone(), force_full));
@@ -8424,6 +8511,10 @@ async fn update_auto_pane_names(
     // Skip the pane being actively renamed -- its name is managed by the rename flow.
     let renaming_pane = sess.rename_state.as_ref().map(|(pid, _)| *pid);
 
+    // The names kept in the layout are the server's own. They feed the
+    // tree-dirty check below and are replaced per client when a frame is
+    // composited (see `build_composite`).
+    let server_naming = Naming::server();
     let mut changed = false;
     for pane_id in pane_ids {
         if renaming_pane == Some(pane_id) {
@@ -8434,7 +8525,7 @@ async fn update_auto_pane_names(
         if custom == Some(None) || custom.is_none() {
             // No custom name -- auto-detect from process.
             if let Some(pane_data) = ps.get(&pane_id) {
-                let name = auto_pane_name(pane_data, session_name, tab_index);
+                let name = auto_pane_name(pane_data, session_name, tab_index, &server_naming);
                 if layout::get_pane_name(&tab.layout, pane_id).as_deref() != Some(name.as_str()) {
                     changed = true;
                 }
@@ -8465,6 +8556,8 @@ async fn build_composite(
     // only wants the geometry, which does not depend on them.
     client_scroll: &HashMap<PaneId, usize>,
     compositor_theme: &crate::config::theme::CompositorTheme,
+    // How the client this frame is for names its panes.
+    naming: &Naming,
 ) -> (
     Vec<Vec<RenderCell>>,
     u16,
@@ -8537,7 +8630,27 @@ async fn build_composite(
 
     let ps = panes.lock().await;
     let mut pane_screens: HashMap<PaneId, &Screen> = HashMap::new();
-    let effective_layout = tab.effective_layout();
+    let mut effective_layout = tab.effective_layout();
+    // The names the layout holds are rendered with the server's template, so
+    // the ones the user did not set are rendered again for this client. The
+    // pane being renamed keeps what the rename flow put there.
+    let renaming_pane = sess.rename_state.as_ref().map(|(pid, _)| *pid);
+    for pane_id in layout::all_pane_ids(&effective_layout) {
+        if renaming_pane == Some(pane_id)
+            || matches!(
+                layout::get_pane_custom_name(&tab.layout, pane_id),
+                Some(Some(_))
+            )
+        {
+            continue;
+        }
+        if let Some(pd) = ps.get(&pane_id) {
+            let name = auto_pane_name(pd, session_name, sess.active_tab, naming);
+            if layout::get_pane_name(&effective_layout, pane_id).as_deref() != Some(&name) {
+                layout::set_pane_name(effective_layout.to_mut(), pane_id, &name);
+            }
+        }
+    }
     let pane_rects = layout::compute_layout(&effective_layout, area, 0);
     for (pane_id, _rect) in &pane_rects {
         if let Some(pane_data) = ps.get(pane_id) {
@@ -9967,6 +10080,47 @@ mod tests {
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_host_the_template_does_not_use_does_not_split_the_frame() {
+        use super::Naming;
+        let local = Naming::new(Some("{command}: {title}".into()), String::new());
+        let remote = Naming::new(Some("{command}: {title}".into()), "mini".into());
+        assert_eq!(local, remote);
+        let with_host = |host: &str| Naming::new(Some("{host}:{command}".into()), host.into());
+        assert_ne!(with_host(""), with_host("mini"));
+        assert_eq!(
+            Naming::new(None, "mini".into()),
+            Naming::new(None, String::new())
+        );
+    }
+
+    /// A process first looked at before an `exec` is named by what it became
+    /// after it. A new pane's shell is first seen straight after the fork,
+    /// still named after the server, and a name cached from that sample is
+    /// how every such pane on macOS came to be called `remux`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_is_renamed_by_its_exec() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.6; exec sleep 5"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = super::get_process_name(pid);
+        let before_names = super::get_process_names(pid);
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let after = super::get_process_name(pid);
+        let after_names = super::get_process_names(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(before, "sleep", "the shell has not exec'd yet");
+        assert_ne!(before_names.name, "sleep");
+        assert_eq!(after, "sleep");
+        assert_eq!(after_names.name, "sleep");
+        assert_eq!(after_names.argv0.as_deref(), Some("sleep"));
+    }
 
     /// Build a `ServerState` with the named sessions (each optionally filed
     /// under a folder), returning it alongside the first pane id of the first

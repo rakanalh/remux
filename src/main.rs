@@ -345,6 +345,9 @@ async fn main() -> Result<()> {
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
+            client
+                .announce_naming(config.appearance.pane_title.as_deref(), "")
+                .await?;
 
             // Create a default session or attach to existing one
             // First, ask the server for existing sessions
@@ -396,6 +399,9 @@ async fn main() -> Result<()> {
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
+            client
+                .announce_naming(config.appearance.pane_title.as_deref(), "")
+                .await?;
 
             client
                 .send(ClientMessage::CreateSession {
@@ -419,6 +425,9 @@ async fn main() -> Result<()> {
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
+            client
+                .announce_naming(config.appearance.pane_title.as_deref(), "")
+                .await?;
 
             client
                 .send(ClientMessage::Attach {
@@ -482,6 +491,9 @@ async fn main() -> Result<()> {
             // so we deliberately do NOT call ensure_server_running() locally.
             let mut client = RemuxClient::connect_ssh(&dest, None, None, &[], &remux_path).await?;
             let config = Config::load()?;
+            client
+                .announce_naming(config.appearance.pane_title.as_deref(), &dest)
+                .await?;
 
             client
                 .send(ClientMessage::Attach { session_name: name })
@@ -795,6 +807,8 @@ async fn client_event_loop(
 ) -> Result<()> {
     // Auto-connect any remotes flagged `auto_connect` before entering raw mode,
     // so SSH host-key/password prompts render normally.
+    // Before any remote is dialled: each one is told this at its handshake.
+    mgr.set_pane_title(config.appearance.pane_title.clone());
     connect_auto_remotes(mgr, config).await;
 
     log::debug!("client_event_loop: setting up terminal");
@@ -7572,6 +7586,8 @@ async fn run_client_loop(
                     // Update which-key placement so it changes live too.
                     which_key_position = new_config.appearance.which_key_position.clone();
                     pane_title = new_config.appearance.pane_title.clone();
+                    mgr.set_pane_title(pane_title.clone());
+                    mgr.announce_pane_title().await;
                     agent_roster.set_pane_title(pane_title.clone());
 
                     // Reconcile the remotes roster (update in place / add new /
