@@ -170,8 +170,9 @@ pub struct ClientView {
     pub name: String,
     pub cells: Vec<ViewCell>,
     /// How the cells are arranged. Reuses the server's automatic layout engine
-    /// (Bsp / Master / Monocle / Grid); [`LayoutMode::next`] cycles through them
-    /// (Custom is excluded). Defaults to Grid.
+    /// (Bsp / Master / Monocle / Grid / Columns / Rows); the server cycles it with
+    /// [`LayoutMode::next_enabled`], which never yields Custom. Starts as Grid,
+    /// or the first enabled layout when `[layouts]` disables Grid.
     pub layout: LayoutMode,
     /// Index into `cells` of the focused cell. Always clamped to a valid index
     /// (or 0 when there are no cells) by the mutators below.
@@ -1449,6 +1450,7 @@ mod tests {
     use crate::server::compositor::TabStripEntry;
     use crate::server::layout::{
         all_pane_ids, find_neighbor, relocate_pane_to_edge, Direction, GridLayout, MonocleLayout,
+        RowsLayout,
     };
 
     fn area(w: u16, h: u16) -> Rect {
@@ -2760,17 +2762,21 @@ mod tests {
 
     #[test]
     fn layout_next_cycles_through_all_automatic_modes() {
-        // Default Grid; next() walks the automatic modes and never yields Custom.
+        // From the last automatic mode, next() walks every automatic mode and
+        // never yields Custom.
         let names: Vec<String> = {
-            let mut m = LayoutMode::Grid(GridLayout);
+            let mut m = LayoutMode::Rows(RowsLayout);
             let mut out = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..6 {
                 m = m.next();
                 out.push(m.name().to_string());
             }
             out
         };
-        assert_eq!(names, vec!["bsp", "master", "monocle", "grid"]);
+        assert_eq!(
+            names,
+            vec!["bsp", "master", "monocle", "grid", "columns", "rows"]
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Move to tab** — `Ctrl-a p t` opens a picker of the session's other tabs plus `+ new tab`; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it. A tab left empty closes.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
-- **Five layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid).
+- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows); turn any of them off under `[layouts]`.
 - **Popup terminal** — a scratch terminal that floats centered on top of the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per session — toggle it from any tab and it follows you. Sized as a percentage of the screen (`popup_width_pct` / `popup_height_pct`, default 80×80) and resizable while open with the pane-resize keys. It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
@@ -70,7 +70,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Views** — a virtual tab whose cells are live, read/write **aliases** to existing panes that may live on different machines, sessions, and tabs. Watch and drive several long-running things (builds, logs, agents) from one screen without moving them.
 - **Compose from existing panes** — in the session manager, mark panes with `Space` across any servers/sessions/tabs, then `va` to alias them into a view. `Ctrl-a w a` adds the currently focused pane.
 - **Shared across terminals** — views live on the server, so every terminal on the machine sees the same views in the switcher. Add a pane in one terminal and any terminal displaying that view repaints live; focus, layout, and zoom are mirrored too. (Views are in-memory: they clear when the server restarts.)
-- **Real layouts** — views use the same layout engine as normal tabs (Grid by default; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
+- **Real layouts** — views use the same layout engine as normal tabs (Grid by default, or the first enabled layout if `[layouts]` disables Grid; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
 - **Re-entry via the switcher** — the quick switcher (`Alt-s`) lists views alongside sessions; selecting one enters it.
 
 ### Sidebars & plugins
@@ -137,7 +137,15 @@ Full-screen single pane — only the active pane is visible. Cycle through panes
 
 ### Grid
 
-Equal-size cells in a `ceil(sqrt(n))`-column grid, filled row-major. Every pane gets the same amount of space, which makes it the default for Views (and it works for normal tabs too).
+Equal-size cells in a `ceil(sqrt(n))`-column grid, filled row-major. Every pane gets the same amount of space, which makes it the default for Views (and it works for normal tabs too). With `grid = false` under `[layouts]`, a new View starts in the first enabled layout instead.
+
+### Columns
+
+Every pane side by side, left to right in pane order, each the full height and an equal share of the width.
+
+### Rows
+
+Every pane stacked top to bottom in pane order, each the full width and an equal share of the height.
 
 ### Custom
 
@@ -233,7 +241,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `b` | Open the **Sidebar** group |
 | `v` | Enter Visual mode |
 | `g` | Toggle border style (Zellij ⇄ Tmux) *(→ Normal)* |
-| `Space` | Cycle layout (BSP → Master → Monocle → Grid) *(→ Normal)* |
+| `Space` | Cycle layout (BSP → Master → Monocle → Grid → Columns → Rows) *(→ Normal)* |
 | `f` | Zoom the focused pane *(→ Normal)* |
 | `}` | Next tab *(→ Normal)* |
 | `{` | Previous tab *(→ Normal)* |
@@ -460,7 +468,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `SessionMoveToFolder` | — | Open a folder picker to move the current session. |
 | `SessionSwitchLast` | — | Toggle back to the previously-attached session. |
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
-| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid). |
+| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid → Columns → Rows), skipping any disabled under `[layouts]`. |
 | `SetMaster` | — | Make the focused pane the master pane (Master layout). |
 | `PopupToggle` | — | Show/hide the session's popup terminal (created on first use, kept running while hidden). |
 | `ViewNew` | `[name]` | Create a view and enter it (prompts when no name is given). |
@@ -534,7 +542,7 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
 - **`[appearance]`**
   - `status_bar_position` — `"bottom"`. **`"top"` currently has no effect**: the server always composites the status bar onto the last row. Documented rather than removed because the option is still read; treat `"bottom"` as the only working value.
   - `border_style` — `"zellij_style"` or `"tmux_style"`.
-  - `default_layout` — `"bsp"`, `"master"`, `"monocle"`, or `"custom"`.
+  - `default_layout` — `"bsp"` (the default), `"master"`, `"monocle"`, `"grid"`, `"columns"`, `"rows"`, or `"custom"`: the layout every new tab starts in — a new session's first tab, `TabNew`, `remux new-tab`, and a pane moved to a new tab. If `[layouts]` disables it, new tabs start in the first enabled layout, with a warning in the log.
   - `which_key_position` — `"anchored"`, `"centered"`, or `"full_width"`.
   - `popup_width_pct` / `popup_height_pct` — popup terminal size as a percentage of the content area (default 80 / 80, clamped to 20–100).
   - `pane_title` — a template that names every pane, everywhere: borders and the Monocle strip, the session tree, View cells, the agents panel and the Alt+a switcher. Placeholders: `{title}` (the window title the program set with OSC 0/2, adopted once it has held for a second, with a leading spinner glyph such as Claude Code's `✳` removed, and shown only while the program that set it is in the foreground: a title your shell sets names the pane only while the shell is in the foreground, so a job such as `top`, once it has held the terminal for a second, shows its own title if it set one and nothing otherwise), `{command}` (the foreground job's process once it has held the terminal for a second, else the shell; a pipeline is named after a live member), `{session}`, `{tab}` (the tab's 0-based index, as the agents panel shows it), `{cwd}` (the working directory's last component) and `{host}` (the remote's name, empty locally). The result is trimmed; if it is empty the pane falls back to `{command}`. Unknown placeholders are shown literally, with a warning in the log. There is no brace escaping: `{{title}}` is shown as the literal text `{{title}}`. A title the shell sets less than 500ms before a command starts (for example `printf <title>; make` on one line, or a pasted title line followed by a command) is treated as that command's `preexec` title and dropped when the command ends; a shell that retitles at every prompt recovers within a second. A name set with `PaneRename` always wins. Unset (the default), a pane shows its title when it has one and its command otherwise, and an untitled agent is listed as `command session/tab`. **Borders and the session tree are rendered by the server, which reads this at startup — `remux restart` after a change**; View cells and agent rows are rendered by the client and follow a reload. A remote's borders use the remote's own config, where `{host}` is empty.
@@ -571,6 +579,7 @@ size = 30
   - **A launcher is looked through to the agent it started.** An agent installed through npm or bun is often a shim — `codex` is a Node script that starts the real binary and stays alive as its parent — so the pane's foreground process is `node`, not the agent; the job underneath it is walked too, which is why you list the agent and never the interpreter.
   - **Two grades of evidence ship here, and the line does not run along agent names.** The Claude Code *question menu*, the `omp` and the `opencode` patterns were matched against a real pane, blocked and then answered again, so both that they turn the panel red and that they let it go are observed. The Claude Code *permission* pattern and both `codex` patterns were read out of the shipped binaries instead: the wordings are real, but nobody watched one of those prompts appear or clear — codex could not be driven as far as an approval on either machine available. If a pane ever sticks on *needs input*, this is the section to correct.
   - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings, theme, and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.
+- **`[layouts]`** — `bsp`, `master`, `monocle`, `grid`, `columns`, `rows`, each `true` by default. `false` drops that layout from the `LayoutNext` cycle, for tabs and Views alike; the order of the rest is unchanged. After the last enabled layout, the cycle returns to a remembered Custom arrangement if there is one. A new tab, session or View whose default layout is disabled starts in the first enabled one. Custom is manual and not listed. Disabling everything is treated as enabling everything, with a warning. Read by the server at startup, so `remux restart` after a change; a tab already in a layout you disable keeps it until the next cycle.
 - **`[remotes.<name>]`** — declare SSH-reachable remote servers:
 
 ```toml

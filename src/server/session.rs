@@ -10,8 +10,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use super::layout::{
-    self, find_neighbor, relocate_pane_to_edge, swap_panes, Direction, FocusDirection, GridLayout,
-    LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
+    self, find_neighbor, relocate_pane_to_edge, swap_panes, Direction, EnabledLayouts,
+    FocusDirection, GridLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::config::BorderStyle;
 use crate::protocol::{
@@ -97,13 +97,13 @@ pub struct ServerView {
 }
 
 impl ServerView {
-    /// A fresh empty view (Grid layout, no cells).
-    fn new(id: ViewId, name: String) -> Self {
+    /// A fresh empty view with no cells.
+    fn new(id: ViewId, name: String, layout: LayoutMode) -> Self {
         ServerView {
             id,
             name,
             cells: Vec::new(),
-            layout: LayoutMode::Grid(GridLayout),
+            layout,
             custom_tree: None,
             focused: 0,
             zoomed: false,
@@ -656,10 +656,12 @@ impl ServerState {
         self.views.iter_mut().find(|v| v.id == id)
     }
 
-    /// Create a new empty (Grid-default) view named `name`, returning its id.
-    pub fn view_create(&mut self, name: String) -> ViewId {
+    /// Create a new empty view named `name`, returning its id. Grid unless
+    /// `enabled` excludes it.
+    pub fn view_create(&mut self, name: String, enabled: &EnabledLayouts) -> ViewId {
         let id = self.next_view_id();
-        self.views.push(ServerView::new(id, name));
+        let layout = enabled.or_first(LayoutMode::Grid(GridLayout));
+        self.views.push(ServerView::new(id, name, layout));
         id
     }
 
@@ -729,10 +731,11 @@ impl ServerState {
         }
     }
 
-    /// Cycle view `id` to the next automatic layout, dropping any custom tree.
-    pub fn view_cycle_layout(&mut self, id: ViewId) {
+    /// Cycle view `id` to the next automatic layout `enabled` allows, dropping
+    /// any custom tree.
+    pub fn view_cycle_layout(&mut self, id: ViewId, enabled: &EnabledLayouts) {
         if let Some(v) = self.find_view_mut(id) {
-            v.layout = v.layout.next();
+            v.layout = v.layout.next_enabled(enabled);
             v.custom_tree = None;
         }
     }
@@ -1282,6 +1285,7 @@ impl ServerState {
         session: &str,
         pane: PaneId,
         target: MoveTarget,
+        new_tab_layout: LayoutMode,
     ) -> std::result::Result<usize, MoveRefused> {
         let MovePlan {
             source_idx,
@@ -1327,12 +1331,8 @@ impl ServerState {
                 idx
             }
             Destination::New(id) => {
-                sess.tabs.push(Tab::with_pane(
-                    id,
-                    &new_tab_name,
-                    pane,
-                    LayoutMode::default(),
-                ));
+                sess.tabs
+                    .push(Tab::with_pane(id, &new_tab_name, pane, new_tab_layout));
                 sess.tabs.len() - 1
             }
         };
@@ -1763,7 +1763,7 @@ mod tests {
     fn view_add_cells_assigns_ids_and_splices_custom_tree() {
         use super::super::layout::all_pane_ids;
         let mut st = ServerState::new();
-        let id = st.view_create("V".into());
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
         // Two cells, then seed a custom tree, then add a third: the new cell's
         // stable id is spliced into the manual arrangement (mirrors the old
         // client `add_cell` test that moved to the server).
@@ -1792,7 +1792,7 @@ mod tests {
     fn view_remove_cell_prunes_tree_and_clamps_focus() {
         use super::super::layout::all_pane_ids;
         let mut st = ServerState::new();
-        let id = st.view_create("V".into());
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
         st.view_add_cells(
             id,
             vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
@@ -1818,7 +1818,7 @@ mod tests {
     #[test]
     fn view_cycle_layout_and_zoom_toggle() {
         let mut st = ServerState::new();
-        let id = st.view_create("V".into());
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
         st.view_add_cells(
             id,
             vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
@@ -1829,7 +1829,7 @@ mod tests {
             v.custom_tree = Some(v.auto_tree());
         }
         assert_eq!(st.views[0].layout_name(), "custom");
-        st.view_cycle_layout(id);
+        st.view_cycle_layout(id, &EnabledLayouts::default());
         assert!(
             st.views[0].custom_tree.is_none(),
             "cycling layout drops the custom tree"
@@ -1843,9 +1843,32 @@ mod tests {
     }
 
     #[test]
+    fn view_layout_skips_disabled_layouts() {
+        let enabled = EnabledLayouts {
+            grid: false,
+            columns: false,
+            ..EnabledLayouts::default()
+        };
+        let mut st = ServerState::new();
+        let id = st.view_create("V".into(), &enabled);
+        assert_eq!(
+            st.views[0].layout_name(),
+            "bsp",
+            "Grid disabled: first enabled"
+        );
+        let names: Vec<String> = (0..5)
+            .map(|_| {
+                st.view_cycle_layout(id, &enabled);
+                st.views[0].layout_name().to_string()
+            })
+            .collect();
+        assert_eq!(names, ["master", "monocle", "rows", "bsp", "master"]);
+    }
+
+    #[test]
     fn view_set_master_promotes_focused_cell() {
         let mut st = ServerState::new();
-        let id = st.view_create("V".into());
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
         st.view_add_cells(
             id,
             vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
@@ -1891,7 +1914,7 @@ mod tests {
 
         // Unknown view / empty view are fail-silent.
         st.view_set_master(999);
-        let empty = st.view_create("E".into());
+        let empty = st.view_create("E".into(), &EnabledLayouts::default());
         st.view_set_master(empty);
         assert_eq!(st.views[1].layout_name(), "grid");
     }
@@ -1899,7 +1922,7 @@ mod tests {
     #[test]
     fn view_set_focus_and_delete_are_id_safe() {
         let mut st = ServerState::new();
-        let id = st.view_create("V".into());
+        let id = st.view_create("V".into(), &EnabledLayouts::default());
         st.view_add_cells(
             id,
             vec![(ConnDescriptor::Local, 1), (ConnDescriptor::Local, 2)],
@@ -2837,7 +2860,8 @@ mod tests {
 mod popup_invariant_tests {
     use super::*;
     use crate::server::layout::{
-        BspLayout, CustomLayout, Direction, GridLayout, MasterLayout, MonocleLayout,
+        BspLayout, ColumnsLayout, CustomLayout, Direction, GridLayout, MasterLayout, MonocleLayout,
+        RowsLayout,
     };
 
     const AREA: Rect = Rect {
@@ -2968,6 +2992,8 @@ mod popup_invariant_tests {
             LayoutMode::Master(MasterLayout::default()),
             LayoutMode::Monocle(MonocleLayout),
             LayoutMode::Grid(GridLayout),
+            LayoutMode::Columns(ColumnsLayout),
+            LayoutMode::Rows(RowsLayout),
             LayoutMode::Custom(CustomLayout),
         ] {
             let label = format!("LayoutNext -> {}", mode.name());
@@ -3536,7 +3562,7 @@ mod move_pane_to_tab_tests {
         let (a, b, c) = (ids[0][0], ids[0][1], ids[1][0]);
         let target = tab_id(&st, 1);
 
-        let idx = st.move_pane_to_tab("main", b, MoveTarget::Tab(target));
+        let idx = st.move_pane_to_tab("main", b, MoveTarget::Tab(target), LayoutMode::default());
 
         assert_eq!(idx, Ok(1));
         let s = sess(&st);
@@ -3561,7 +3587,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
 
@@ -3590,7 +3616,10 @@ mod move_pane_to_tab_tests {
         let (a, b) = (ids[0][0], ids[0][1]);
         let source = tab_id(&st, 0);
 
-        assert_eq!(st.move_pane_to_tab("main", b, MoveTarget::NewTab), Ok(1));
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::NewTab, LayoutMode::default()),
+            Ok(1)
+        );
 
         let s = sess(&st);
         assert_eq!(s.tabs.len(), 2);
@@ -3612,7 +3641,7 @@ mod move_pane_to_tab_tests {
         let (mut st, ids) = state_with_tabs(&[(2, custom()), (1, bsp())]);
         let existing: Vec<TabId> = sess(&st).tabs.iter().map(|t| t.id).collect();
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][1], MoveTarget::NewTab),
+            st.move_pane_to_tab("main", ids[0][1], MoveTarget::NewTab, LayoutMode::default()),
             Ok(2)
         );
         assert!(!existing.contains(&sess(&st).tabs[2].id));
@@ -3623,7 +3652,10 @@ mod move_pane_to_tab_tests {
         let (mut st, ids) = state_with_tabs(&[(1, custom()), (1, bsp())]);
         let (a, b) = (ids[0][0], ids[1][0]);
 
-        assert_eq!(st.move_pane_to_tab("main", a, MoveTarget::NewTab), Ok(1));
+        assert_eq!(
+            st.move_pane_to_tab("main", a, MoveTarget::NewTab, LayoutMode::default()),
+            Ok(1)
+        );
 
         let s = sess(&st);
         assert_eq!(s.tabs.len(), 2, "the emptied source tab is removed");
@@ -3641,7 +3673,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 2);
 
         assert_eq!(
-            st.move_pane_to_tab("main", a, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", a, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
 
@@ -3664,7 +3696,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 0);
 
         assert_eq!(
-            st.move_pane_to_tab("main", c, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", c, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(0)
         );
 
@@ -3683,7 +3715,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 0);
 
         assert_eq!(
-            st.move_pane_to_tab("main", d, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", d, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(0)
         );
         let s = sess(&st);
@@ -3700,7 +3732,7 @@ mod move_pane_to_tab_tests {
         assert_eq!(sess(&st).tabs[0].focused_pane, c);
 
         assert_eq!(
-            st.move_pane_to_tab("main", a, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", a, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
         assert_eq!(sess(&st).tabs[0].focused_pane, c);
@@ -3713,7 +3745,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", c, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", c, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
         let src = &sess(&st).tabs[0];
@@ -3730,7 +3762,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
         assert_eq!(sess(&st).tabs[0].zoomed_pane, None);
@@ -3746,7 +3778,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
         assert_eq!(sess(&st).tabs[1].zoomed_pane, None);
@@ -3763,7 +3795,12 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(target)),
+            st.move_pane_to_tab(
+                "main",
+                ids[0][1],
+                MoveTarget::Tab(target),
+                LayoutMode::default()
+            ),
             Ok(1)
         );
         let t = &sess(&st).tabs[1];
@@ -3783,7 +3820,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
         assert_eq!(
@@ -3805,7 +3842,7 @@ mod move_pane_to_tab_tests {
         let target = tab_id(&st, 1);
 
         assert_eq!(
-            st.move_pane_to_tab("main", b, MoveTarget::Tab(target)),
+            st.move_pane_to_tab("main", b, MoveTarget::Tab(target), LayoutMode::default()),
             Ok(1)
         );
         assert_eq!(
@@ -3824,7 +3861,10 @@ mod move_pane_to_tab_tests {
             "logs",
         );
 
-        assert_eq!(st.move_pane_to_tab("main", b, MoveTarget::NewTab), Ok(1));
+        assert_eq!(
+            st.move_pane_to_tab("main", b, MoveTarget::NewTab, LayoutMode::default()),
+            Ok(1)
+        );
         assert_eq!(
             layout::get_pane_custom_name(&sess(&st).tabs[1].layout, b),
             Some(Some("logs".to_string()))
@@ -3838,7 +3878,12 @@ mod move_pane_to_tab_tests {
         let before = snapshot(&st);
 
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(stale)),
+            st.move_pane_to_tab(
+                "main",
+                ids[0][1],
+                MoveTarget::Tab(stale),
+                LayoutMode::default()
+            ),
             Err(MoveRefused::TargetNotFound)
         );
         assert_eq!(snapshot(&st), before);
@@ -3850,7 +3895,7 @@ mod move_pane_to_tab_tests {
         let before = snapshot(&st);
 
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][0], MoveTarget::NewTab),
+            st.move_pane_to_tab("main", ids[0][0], MoveTarget::NewTab, LayoutMode::default()),
             Err(MoveRefused::SolePaneInSoleTab)
         );
         assert_eq!(snapshot(&st), before);
@@ -3863,7 +3908,12 @@ mod move_pane_to_tab_tests {
         let before = snapshot(&st);
 
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(source)),
+            st.move_pane_to_tab(
+                "main",
+                ids[0][1],
+                MoveTarget::Tab(source),
+                LayoutMode::default()
+            ),
             Err(MoveRefused::TargetIsSourceTab)
         );
         assert_eq!(snapshot(&st), before);
@@ -3882,7 +3932,12 @@ mod move_pane_to_tab_tests {
         let before = snapshot(&st);
 
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(target)),
+            st.move_pane_to_tab(
+                "main",
+                ids[0][1],
+                MoveTarget::Tab(target),
+                LayoutMode::default()
+            ),
             Err(MoveRefused::PopupVisible)
         );
         assert_eq!(snapshot(&st), before);
@@ -3898,7 +3953,7 @@ mod move_pane_to_tab_tests {
 
         for t in [MoveTarget::Tab(target), MoveTarget::NewTab] {
             assert_eq!(
-                st.move_pane_to_tab("main", popup, t),
+                st.move_pane_to_tab("main", popup, t, LayoutMode::default()),
                 Err(MoveRefused::PaneNotInAnyTab)
             );
         }
@@ -3910,7 +3965,7 @@ mod move_pane_to_tab_tests {
     fn move_pane_to_tab_refuses_an_unknown_session() {
         let (mut st, ids) = state_with_tabs(&[(2, custom())]);
         assert_eq!(
-            st.move_pane_to_tab("nope", ids[0][1], MoveTarget::NewTab),
+            st.move_pane_to_tab("nope", ids[0][1], MoveTarget::NewTab, LayoutMode::default()),
             Err(MoveRefused::NoSession)
         );
     }
@@ -3923,7 +3978,12 @@ mod move_pane_to_tab_tests {
         let before = snapshot(&st);
 
         assert_eq!(
-            st.move_pane_to_tab("main", ids[0][1], MoveTarget::Tab(target)),
+            st.move_pane_to_tab(
+                "main",
+                ids[0][1],
+                MoveTarget::Tab(target),
+                LayoutMode::default()
+            ),
             Err(MoveRefused::TargetLayoutMissingFocus)
         );
         assert_eq!(
@@ -3940,13 +4000,23 @@ mod move_pane_to_tab_tests {
         let t2 = tab_id(&st, 2);
         let t1 = tab_id(&st, 1);
         assert!(st
-            .move_pane_to_tab("main", ids[0][0], MoveTarget::Tab(t2))
+            .move_pane_to_tab(
+                "main",
+                ids[0][0],
+                MoveTarget::Tab(t2),
+                LayoutMode::default()
+            )
             .is_ok());
         assert!(st
-            .move_pane_to_tab("main", ids[1][1], MoveTarget::NewTab)
+            .move_pane_to_tab("main", ids[1][1], MoveTarget::NewTab, LayoutMode::default())
             .is_ok());
         assert!(st
-            .move_pane_to_tab("main", ids[2][0], MoveTarget::Tab(t1))
+            .move_pane_to_tab(
+                "main",
+                ids[2][0],
+                MoveTarget::Tab(t1),
+                LayoutMode::default()
+            )
             .is_ok());
 
         let s = sess(&st);

@@ -30,6 +30,10 @@ pub struct Config {
     /// the client only paints what it is told.
     #[serde(default)]
     pub agents: agents::AgentsConfig,
+    /// Which automatic layouts `LayoutNext` cycles through. Read by the SERVER,
+    /// which owns every tab's and view's layout.
+    #[serde(default)]
+    pub layouts: crate::server::layout::EnabledLayouts,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +183,8 @@ pub enum WhichKeyPosition {
     FullWidth,
 }
 
-/// Default layout mode for new tabs.
+/// The layout every new tab starts in; see [`Config::new_tab_layout`] for the
+/// `[layouts]` fallback.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultLayout {
@@ -187,6 +192,9 @@ pub enum DefaultLayout {
     Bsp,
     Master,
     Monocle,
+    Grid,
+    Columns,
+    Rows,
     Custom,
 }
 
@@ -198,6 +206,9 @@ impl DefaultLayout {
             DefaultLayout::Bsp => LayoutMode::Bsp(BspLayout),
             DefaultLayout::Master => LayoutMode::Master(MasterLayout::default()),
             DefaultLayout::Monocle => LayoutMode::Monocle(MonocleLayout),
+            DefaultLayout::Grid => LayoutMode::Grid(GridLayout),
+            DefaultLayout::Columns => LayoutMode::Columns(ColumnsLayout),
+            DefaultLayout::Rows => LayoutMode::Rows(RowsLayout),
             DefaultLayout::Custom => LayoutMode::Custom(CustomLayout),
         }
     }
@@ -310,6 +321,7 @@ impl Default for Config {
             remotes: std::collections::HashMap::new(),
             sidebar: Vec::new(),
             agents: agents::AgentsConfig::default(),
+            layouts: crate::server::layout::EnabledLayouts::default(),
         }
     }
 }
@@ -336,7 +348,25 @@ impl Config {
         let contents = std::fs::read_to_string(&config_path)?;
         let config: Config = toml::from_str(&contents)?;
         config.warn_unknown_pane_title_placeholders();
+        if config.layouts.none_enabled() {
+            log::warn!("[layouts]: every layout is disabled; cycling through all of them");
+        }
+        let default = config.appearance.default_layout.to_layout_mode();
+        if !config.layouts.allows(&default) {
+            log::warn!(
+                "[appearance] default_layout = {:?} is disabled under [layouts]; new tabs start in {}",
+                default.name(),
+                config.new_tab_layout().name()
+            );
+        }
         Ok(config)
+    }
+
+    /// The layout every new tab starts in: `default_layout`, or the first
+    /// enabled layout when `[layouts]` disables it.
+    pub fn new_tab_layout(&self) -> crate::server::layout::LayoutMode {
+        self.layouts
+            .or_first(self.appearance.default_layout.to_layout_mode())
     }
 
     fn warn_unknown_pane_title_placeholders(&self) {
@@ -655,6 +685,65 @@ mod tests {
             config.appearance.pane_title.as_deref(),
             Some("{command}: {title}")
         );
+    }
+
+    #[test]
+    fn default_layout_parses_every_value_to_its_layout_mode() {
+        for value in [
+            "bsp", "master", "monocle", "grid", "columns", "rows", "custom",
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[appearance]\ndefault_layout = \"{value}\"\n")).unwrap();
+            assert_eq!(
+                config.appearance.default_layout.to_layout_mode().name(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn new_tab_layout_falls_back_when_the_default_is_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+            [appearance]
+            default_layout = "grid"
+            [layouts]
+            bsp = false
+            grid = false
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.new_tab_layout().name(), "master");
+        assert_eq!(Config::default().new_tab_layout().name(), "bsp");
+        let columns: Config =
+            toml::from_str("[appearance]\ndefault_layout = \"columns\"\n").unwrap();
+        assert_eq!(columns.new_tab_layout().name(), "columns");
+    }
+
+    #[test]
+    fn layouts_are_all_enabled_without_a_section() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.layouts,
+            crate::server::layout::EnabledLayouts::default()
+        );
+        let d = &config.layouts;
+        assert!(d.bsp && d.master && d.monocle && d.grid && d.columns && d.rows);
+    }
+
+    #[test]
+    fn layouts_missing_keys_stay_enabled() {
+        let config: Config = toml::from_str(
+            r#"
+            [layouts]
+            master = false
+            grid = false
+        "#,
+        )
+        .unwrap();
+        let l = &config.layouts;
+        assert!(!l.master && !l.grid);
+        assert!(l.bsp && l.monocle && l.columns && l.rows);
     }
 
     #[test]

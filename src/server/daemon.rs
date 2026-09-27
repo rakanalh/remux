@@ -26,7 +26,7 @@ use crate::server::compositor::{
     HitRegions, MouseSelection, StatusInfo,
 };
 use crate::server::layout::{
-    self, BspLayout, CustomLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
+    self, CustomLayout, EnabledLayouts, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
 use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, PaneIdentity, Pty};
@@ -2121,7 +2121,7 @@ entries={} error={:?} truncated={}",
         ClientMessage::ViewCreate { name } => {
             let id = {
                 let mut st = state.lock().await;
-                st.view_create(name)
+                st.view_create(name, &config.layouts)
             };
             {
                 let cls = clients.lock().await;
@@ -2175,7 +2175,7 @@ entries={} error={:?} truncated={}",
         ClientMessage::ViewCycleLayout { id } => {
             {
                 let mut st = state.lock().await;
-                st.view_cycle_layout(id);
+                st.view_cycle_layout(id, &config.layouts);
             }
             broadcast_view_list(state, clients).await;
             Ok(())
@@ -2920,7 +2920,8 @@ async fn handle_command(
                     .map(|s| s.tabs.len())
                     .unwrap_or(0);
                 let tab_name = format!("Tab {}", tab_count + 1);
-                let pane_id = st.create_tab(&session_name, &tab_name, LayoutMode::default())?;
+                let layout_mode = config.new_tab_layout();
+                let pane_id = st.create_tab(&session_name, &tab_name, layout_mode)?;
                 (pane_id, source_pane_id)
             };
             let focused_cwd = {
@@ -3292,7 +3293,10 @@ async fn handle_command(
             let outcome = {
                 let mut st = state.lock().await;
                 match move_source_pane(&st, &session_name) {
-                    Some(pane) => (pane, st.move_pane_to_tab(&session_name, pane, target)),
+                    Some(pane) => (
+                        pane,
+                        st.move_pane_to_tab(&session_name, pane, target, config.new_tab_layout()),
+                    ),
                     None => return Ok(()),
                 }
             };
@@ -3525,12 +3529,12 @@ async fn handle_command(
                 // tree -- and so the cycle can never park a live zoom in Monocle,
                 // the one mode that refuses to take one.
                 tab.zoomed_pane = None;
-                // Grid (the last automatic before wrap) returns to Custom only
-                // when the saved tree is still restorable (its pane set matches
-                // the live panes); otherwise the cycle stays automatic.
+                // The last enabled automatic mode returns to Custom only when
+                // the saved tree is still restorable (its pane set matches the
+                // live panes); otherwise the cycle stays automatic.
                 let restorable =
                     saved_custom_is_restorable(&tab.saved_custom_layout, &tab.pane_order);
-                tab.layout_mode = next_layout_mode(&tab.layout_mode, restorable);
+                tab.layout_mode = next_layout_mode(&tab.layout_mode, restorable, &config.layouts);
                 log::debug!("server: LayoutNext new_mode={}", tab.layout_mode.name());
                 if tab.layout_mode.is_automatic() {
                     tab.layout = tab
@@ -4094,7 +4098,7 @@ async fn handle_create_session(
     let pane_id = {
         let mut st = state.lock().await;
         let border_style = config.appearance.border_style.clone();
-        let layout_mode = config.appearance.default_layout.to_layout_mode();
+        let layout_mode = config.new_tab_layout();
         let popup_size = (
             config.appearance.popup_width_pct,
             config.appearance.popup_height_pct,
@@ -5735,17 +5739,20 @@ async fn handle_mouse_click(
 
 /// Pure decision for the layout cycle's next mode, factored out for testing.
 ///
-/// The automatic cycle is `Bsp -> Master -> Monocle -> Grid -> Bsp`. Two
-/// custom-aware detours ride on top: leaving `Custom` starts the automatic
-/// cycle at `Bsp`, and reaching `Grid` (the last automatic before wrap) returns
-/// to `Custom` when a restorable custom layout was remembered
-/// (`has_saved_custom`).
-fn next_layout_mode(current: &LayoutMode, has_saved_custom: bool) -> LayoutMode {
-    match current {
-        LayoutMode::Custom(_) => LayoutMode::Bsp(BspLayout),
-        LayoutMode::Grid(_) if has_saved_custom => LayoutMode::Custom(CustomLayout),
-        other => other.next(),
+/// The automatic cycle is `Bsp -> Master -> Monocle -> Grid -> Columns -> Rows
+/// -> Bsp`, skipping whatever `enabled` excludes. Two custom-aware detours ride
+/// on top: leaving `Custom` starts the automatic cycle at the first enabled
+/// mode, and leaving the last enabled mode returns to `Custom` when a
+/// restorable custom layout was remembered (`has_saved_custom`).
+fn next_layout_mode(
+    current: &LayoutMode,
+    has_saved_custom: bool,
+    enabled: &EnabledLayouts,
+) -> LayoutMode {
+    if has_saved_custom && current.is_last_enabled(enabled) {
+        return LayoutMode::Custom(CustomLayout);
     }
+    current.next_enabled(enabled)
 }
 
 /// Return true if `saved` can be restored as the current custom layout, i.e.
@@ -6615,7 +6622,8 @@ async fn create_tab_in_session(
             }
         };
         let tab_name = format!("Tab {}", tab_count + 1);
-        match st.create_tab(session_name, &tab_name, LayoutMode::default()) {
+        let layout_mode = config.new_tab_layout();
+        match st.create_tab(session_name, &tab_name, layout_mode) {
             Ok(pid) => (pid, source_pane_id),
             Err(e) => {
                 log::info!("create_tab_in_session: {e}");
@@ -9953,7 +9961,8 @@ mod tests {
     use crate::protocol::RenderCell;
     use crate::screen::Screen;
     use crate::server::layout::{
-        BspLayout, CustomLayout, GridLayout, LayoutMode, LayoutNode, MasterLayout, MonocleLayout,
+        BspLayout, ColumnsLayout, CustomLayout, EnabledLayouts, GridLayout, LayoutMode, LayoutNode,
+        MasterLayout, MonocleLayout, RowsLayout,
     };
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
@@ -10292,46 +10301,123 @@ mod tests {
 
     #[test]
     fn next_layout_mode_automatic_cycle() {
-        // Bsp -> Master -> Monocle -> Grid regardless of the saved-custom flag.
+        // Bsp -> Master -> Monocle -> Grid -> Columns -> Rows regardless of the
+        // saved-custom flag.
+        let all = EnabledLayouts::default();
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Bsp(BspLayout), false),
+            next_layout_mode(&LayoutMode::Bsp(BspLayout), false, &all),
             LayoutMode::Master(_)
         ));
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Master(MasterLayout::default()), false),
+            next_layout_mode(&LayoutMode::Master(MasterLayout::default()), false, &all),
             LayoutMode::Monocle(_)
         ));
         // Monocle now always advances to Grid, even with a saved custom layout.
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), false),
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), false, &all),
             LayoutMode::Grid(_)
         ));
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), true),
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), true, &all),
             LayoutMode::Grid(_)
         ));
+        for saved in [false, true] {
+            assert!(matches!(
+                next_layout_mode(&LayoutMode::Grid(GridLayout), saved, &all),
+                LayoutMode::Columns(_)
+            ));
+            assert!(matches!(
+                next_layout_mode(&LayoutMode::Columns(ColumnsLayout), saved, &all),
+                LayoutMode::Rows(_)
+            ));
+        }
     }
 
     #[test]
     fn next_layout_mode_custom_starts_cycle_at_bsp() {
+        let all = EnabledLayouts::default();
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Custom(CustomLayout), false),
+            next_layout_mode(&LayoutMode::Custom(CustomLayout), false, &all),
             LayoutMode::Bsp(_)
         ));
     }
 
     #[test]
-    fn next_layout_mode_grid_returns_to_custom_only_when_saved() {
-        // Grid is the last automatic before wrap. With a restorable saved custom
+    fn next_layout_mode_rows_returns_to_custom_only_when_saved() {
+        let all = EnabledLayouts::default();
+        // Rows is the last automatic before wrap. With a restorable saved custom
         // layout, it wraps back to Custom.
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Grid(GridLayout), true),
+            next_layout_mode(&LayoutMode::Rows(RowsLayout), true, &all),
             LayoutMode::Custom(_)
         ));
-        // Without one, Grid wraps to Bsp as usual.
+        // Without one, Rows wraps to Bsp as usual.
         assert!(matches!(
-            next_layout_mode(&LayoutMode::Grid(GridLayout), false),
+            next_layout_mode(&LayoutMode::Rows(RowsLayout), false, &all),
             LayoutMode::Bsp(_)
+        ));
+    }
+
+    #[test]
+    fn next_layout_mode_returns_to_custom_after_the_last_enabled_mode() {
+        let enabled = EnabledLayouts {
+            columns: false,
+            rows: false,
+            ..EnabledLayouts::default()
+        };
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Grid(GridLayout), true, &enabled),
+            LayoutMode::Custom(_)
+        ));
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Grid(GridLayout), false, &enabled),
+            LayoutMode::Bsp(_)
+        ));
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Monocle(MonocleLayout), true, &enabled),
+            LayoutMode::Grid(_)
+        ));
+        // A tab left on a mode disabled since is past the last enabled one too.
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Rows(RowsLayout), true, &enabled),
+            LayoutMode::Custom(_)
+        ));
+    }
+
+    #[test]
+    fn next_layout_mode_custom_starts_at_the_first_enabled_mode() {
+        let enabled = EnabledLayouts {
+            bsp: false,
+            ..EnabledLayouts::default()
+        };
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Custom(CustomLayout), false, &enabled),
+            LayoutMode::Master(_)
+        ));
+    }
+
+    #[test]
+    fn next_layout_mode_with_one_enabled_mode_toggles_with_custom() {
+        let enabled = EnabledLayouts {
+            bsp: false,
+            master: false,
+            monocle: false,
+            grid: false,
+            columns: true,
+            rows: false,
+        };
+        let columns = LayoutMode::Columns(ColumnsLayout);
+        assert!(matches!(
+            next_layout_mode(&columns, false, &enabled),
+            LayoutMode::Columns(_)
+        ));
+        assert!(matches!(
+            next_layout_mode(&columns, true, &enabled),
+            LayoutMode::Custom(_)
+        ));
+        assert!(matches!(
+            next_layout_mode(&LayoutMode::Custom(CustomLayout), true, &enabled),
+            LayoutMode::Columns(_)
         ));
     }
 

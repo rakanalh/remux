@@ -106,7 +106,11 @@ pub enum ConnDescriptor {
 /// the decode error ends that client's connection: `read_message` returns
 /// `Err`, and the server disconnects the client instead of skipping the
 /// message. Both sides report 13, so the handshake cannot catch this skew.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// 13 -> 14: the `Columns` and `Rows` automatic layouts. Adds
+/// `LayoutMode::Columns` and `LayoutMode::Rows`, which travel in
+/// [`ViewInfo::layout`]; an old peer cannot decode a view carrying one.
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to

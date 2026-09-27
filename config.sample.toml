@@ -67,8 +67,11 @@
 # "tmux_style" (minimal dividers) (default: "zellij_style").
 # border_style = "zellij_style"
 
-# Default layout mode for new tabs: "bsp" | "master" | "monocle" | "custom"
-# (default: "bsp").
+# Layout every new tab starts in (a new session's first tab, TabNew,
+# `remux new-tab`, and moving a pane to a new tab): "bsp" | "master" |
+# "monocle" | "grid" | "columns" | "rows" | "custom" (default: "bsp"). A layout
+# disabled under [layouts] is replaced by the first enabled one, with a warning
+# in the log.
 # default_layout = "bsp"
 
 # Which-key popup placement: "anchored" (bordered box centered horizontally,
@@ -111,6 +114,28 @@
 # reload. On a remote, the borders obey the REMOTE machine's config and {host}
 # is empty there.
 # pane_title = "{command}: {title}"
+
+# -----------------------------------------------------------------------------
+# LAYOUTS
+# -----------------------------------------------------------------------------
+# Which automatic layouts `LayoutNext` (Alt+Space / Ctrl-a Space) cycles
+# through, for tabs and Views alike. The order is fixed:
+# bsp -> master -> monocle -> grid -> columns -> rows. A missing key means
+# enabled. Custom is manual and always reachable by splitting.
+#
+# A new tab (`default_layout`) or View (grid) whose layout is disabled starts in
+# the first enabled one instead. Disabling every layout is treated as enabling them all,
+# with a warning in the log. Read by the server at startup: `remux restart`
+# after a change. A tab already in a layout you disable keeps it until the
+# next cycle.
+#
+# [layouts]
+# bsp = true
+# master = true
+# monocle = true
+# grid = true
+# columns = true
+# rows = true
 
 # -----------------------------------------------------------------------------
 # APPEARANCE - THEME

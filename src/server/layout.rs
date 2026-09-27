@@ -229,26 +229,6 @@ impl LayoutAlgorithm for GridLayout {
             return LayoutNode::new_stack(panes[0]);
         }
 
-        // Fold a non-empty list of nodes into equal-size splits along
-        // `direction`, using the same right-folded `1.0 / remaining` ratios as
-        // MasterLayout's `build_col` so ratios match the codebase convention.
-        let fold_equal = |mut nodes: Vec<LayoutNode>, direction: Direction| -> LayoutNode {
-            let mut node = nodes
-                .pop()
-                .expect("fold_equal requires a non-empty node list");
-            let mut remaining = 1usize;
-            while let Some(first) = nodes.pop() {
-                remaining += 1;
-                node = LayoutNode::Split {
-                    direction: direction.clone(),
-                    ratio: 1.0 / remaining as f32,
-                    first: Box::new(first),
-                    second: Box::new(node),
-                };
-            }
-            node
-        };
-
         // cols = ceil(sqrt(n)); rows follow from row-major chunking below.
         let cols = (panes.len() as f64).sqrt().ceil() as usize;
 
@@ -265,6 +245,63 @@ impl LayoutAlgorithm for GridLayout {
             })
             .collect();
         fold_equal(rows, Direction::Horizontal)
+    }
+}
+
+/// Fold a non-empty list of nodes into equal-size splits along `direction`,
+/// using the same right-folded `1.0 / remaining` ratios as MasterLayout's
+/// `build_col` so ratios match the codebase convention.
+fn fold_equal(mut nodes: Vec<LayoutNode>, direction: Direction) -> LayoutNode {
+    let mut node = nodes
+        .pop()
+        .expect("fold_equal requires a non-empty node list");
+    let mut remaining = 1usize;
+    while let Some(first) = nodes.pop() {
+        remaining += 1;
+        node = LayoutNode::Split {
+            direction: direction.clone(),
+            ratio: 1.0 / remaining as f32,
+            first: Box::new(first),
+            second: Box::new(node),
+        };
+    }
+    node
+}
+
+/// Lay every pane out along one axis in equal slices, in `panes` order.
+fn build_line(panes: &[PaneId], active_pane: PaneId, direction: Direction) -> LayoutNode {
+    if panes.is_empty() {
+        return LayoutNode::new_stack(active_pane);
+    }
+    let cells: Vec<LayoutNode> = panes.iter().map(|&p| LayoutNode::new_stack(p)).collect();
+    fold_equal(cells, direction)
+}
+
+/// Columns layout: all panes side by side, left to right, in equal widths.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnsLayout;
+
+impl LayoutAlgorithm for ColumnsLayout {
+    fn name(&self) -> &str {
+        "columns"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        build_line(panes, active_pane, Direction::Vertical)
+    }
+}
+
+/// Rows layout: all panes stacked top to bottom, in equal heights.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RowsLayout;
+
+impl LayoutAlgorithm for RowsLayout {
+    fn name(&self) -> &str {
+        "rows"
+    }
+
+    fn build_tree(&self, panes: &[PaneId], active_pane: PaneId) -> LayoutNode {
+        build_line(panes, active_pane, Direction::Horizontal)
     }
 }
 
@@ -307,6 +344,10 @@ pub enum LayoutMode {
     Monocle(MonocleLayout),
     /// Grid: all panes in a balanced grid of equal-size cells.
     Grid(GridLayout),
+    /// Columns: all panes side by side in equal widths.
+    Columns(ColumnsLayout),
+    /// Rows: all panes stacked top to bottom in equal heights.
+    Rows(RowsLayout),
     /// Custom: the user has manually arranged splits; no automatic rebuild.
     Custom(CustomLayout),
 }
@@ -320,6 +361,8 @@ impl LayoutMode {
             LayoutMode::Master(l) => l.build_tree(panes, active_pane),
             LayoutMode::Monocle(l) => l.build_tree(panes, active_pane),
             LayoutMode::Grid(l) => l.build_tree(panes, active_pane),
+            LayoutMode::Columns(l) => l.build_tree(panes, active_pane),
+            LayoutMode::Rows(l) => l.build_tree(panes, active_pane),
             LayoutMode::Custom(l) => l.build_tree(panes, active_pane),
         }
     }
@@ -331,25 +374,119 @@ impl LayoutMode {
             LayoutMode::Master(l) => l.name(),
             LayoutMode::Monocle(l) => l.name(),
             LayoutMode::Grid(l) => l.name(),
+            LayoutMode::Columns(l) => l.name(),
+            LayoutMode::Rows(l) => l.name(),
             LayoutMode::Custom(l) => l.name(),
         }
     }
 
     /// Cycle to the next automatic layout mode.
-    /// Order: Bsp -> Master -> Monocle -> Grid -> Bsp (Custom also goes to Bsp).
+    /// Order: Bsp -> Master -> Monocle -> Grid -> Columns -> Rows -> Bsp
+    /// (Custom also goes to Bsp).
     pub fn next(&self) -> LayoutMode {
         match self {
             LayoutMode::Bsp(_) => LayoutMode::Master(MasterLayout::default()),
             LayoutMode::Master(_) => LayoutMode::Monocle(MonocleLayout),
             LayoutMode::Monocle(_) => LayoutMode::Grid(GridLayout),
-            LayoutMode::Grid(_) => LayoutMode::Bsp(BspLayout),
+            LayoutMode::Grid(_) => LayoutMode::Columns(ColumnsLayout),
+            LayoutMode::Columns(_) => LayoutMode::Rows(RowsLayout),
+            LayoutMode::Rows(_) => LayoutMode::Bsp(BspLayout),
             LayoutMode::Custom(_) => LayoutMode::Bsp(BspLayout),
+        }
+    }
+
+    /// Cycle to the next automatic layout mode that `enabled` allows, in the
+    /// order of [`LayoutMode::next`].
+    pub fn next_enabled(&self, enabled: &EnabledLayouts) -> LayoutMode {
+        let mut mode = self.next();
+        while !enabled.allows(&mode) {
+            mode = mode.next();
+        }
+        mode
+    }
+
+    /// Whether [`LayoutMode::next_enabled`] wraps back to the start of the
+    /// cycle from here: `self` is the last enabled mode, or past it.
+    pub fn is_last_enabled(&self, enabled: &EnabledLayouts) -> bool {
+        match (self.cycle_index(), self.next_enabled(enabled).cycle_index()) {
+            (Some(current), Some(next)) => next <= current,
+            _ => false,
+        }
+    }
+
+    fn cycle_index(&self) -> Option<usize> {
+        match self {
+            LayoutMode::Bsp(_) => Some(0),
+            LayoutMode::Master(_) => Some(1),
+            LayoutMode::Monocle(_) => Some(2),
+            LayoutMode::Grid(_) => Some(3),
+            LayoutMode::Columns(_) => Some(4),
+            LayoutMode::Rows(_) => Some(5),
+            LayoutMode::Custom(_) => None,
         }
     }
 
     /// Returns `true` if this mode automatically rebuilds the layout tree.
     pub fn is_automatic(&self) -> bool {
         !matches!(self, LayoutMode::Custom(_))
+    }
+}
+
+/// Which automatic layouts the cycle visits, from the `[layouts]` config
+/// section. Custom is manual, so it is not listed and always allowed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct EnabledLayouts {
+    pub bsp: bool,
+    pub master: bool,
+    pub monocle: bool,
+    pub grid: bool,
+    pub columns: bool,
+    pub rows: bool,
+}
+
+impl Default for EnabledLayouts {
+    fn default() -> Self {
+        Self {
+            bsp: true,
+            master: true,
+            monocle: true,
+            grid: true,
+            columns: true,
+            rows: true,
+        }
+    }
+}
+
+impl EnabledLayouts {
+    /// True when every automatic layout is switched off, which is treated as
+    /// all of them on so the cycle is never empty.
+    pub fn none_enabled(&self) -> bool {
+        !(self.bsp || self.master || self.monocle || self.grid || self.columns || self.rows)
+    }
+
+    pub fn allows(&self, mode: &LayoutMode) -> bool {
+        if self.none_enabled() {
+            return true;
+        }
+        match mode {
+            LayoutMode::Bsp(_) => self.bsp,
+            LayoutMode::Master(_) => self.master,
+            LayoutMode::Monocle(_) => self.monocle,
+            LayoutMode::Grid(_) => self.grid,
+            LayoutMode::Columns(_) => self.columns,
+            LayoutMode::Rows(_) => self.rows,
+            LayoutMode::Custom(_) => true,
+        }
+    }
+
+    /// `mode` if it is allowed, else the first enabled mode in cycle order.
+    pub fn or_first(&self, mode: LayoutMode) -> LayoutMode {
+        if self.allows(&mode) {
+            mode
+        } else {
+            LayoutMode::Custom(CustomLayout).next_enabled(self)
+        }
     }
 }
 
@@ -2352,6 +2489,12 @@ mod tests {
         assert!(matches!(mode, LayoutMode::Grid(_)));
 
         let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Columns(_)));
+
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Rows(_)));
+
+        let mode = mode.next();
         assert!(matches!(mode, LayoutMode::Bsp(_)));
     }
 
@@ -2506,11 +2649,229 @@ mod tests {
 
     #[test]
     fn test_layout_next_includes_grid() {
-        // Cycling forward from Monocle reaches Grid, and Grid returns to Bsp.
         let mode = LayoutMode::Monocle(MonocleLayout).next();
         assert!(matches!(mode, LayoutMode::Grid(_)));
         let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Columns(_)));
+    }
+
+    #[test]
+    fn test_layout_next_columns_then_rows_then_bsp() {
+        let mode = LayoutMode::Grid(GridLayout).next();
+        assert!(matches!(mode, LayoutMode::Columns(_)));
+        let mode = mode.next();
+        assert!(matches!(mode, LayoutMode::Rows(_)));
+        let mode = mode.next();
         assert!(matches!(mode, LayoutMode::Bsp(_)));
+        assert!(LayoutMode::Columns(ColumnsLayout).is_automatic());
+        assert!(LayoutMode::Rows(RowsLayout).is_automatic());
+    }
+
+    fn split_directions(node: &LayoutNode, out: &mut Vec<Direction>) {
+        if let LayoutNode::Split {
+            direction,
+            first,
+            second,
+            ..
+        } = node
+        {
+            out.push(direction.clone());
+            split_directions(first, out);
+            split_directions(second, out);
+        }
+    }
+
+    fn assert_line_layout(mode: &LayoutMode, direction: Direction) {
+        for n in [1u64, 2, 3, 5] {
+            let panes: Vec<PaneId> = (1..=n).collect();
+            let node = mode.build_tree(&panes, 1);
+            assert_eq!(
+                all_pane_ids(&node),
+                panes,
+                "{} n={n}: leaf order",
+                mode.name()
+            );
+            let mut dirs = Vec::new();
+            split_directions(&node, &mut dirs);
+            assert_eq!(
+                dirs.len() as u64,
+                n - 1,
+                "{} n={n}: split count",
+                mode.name()
+            );
+            assert!(
+                dirs.iter().all(|d| *d == direction),
+                "{} n={n}: every split must be {direction:?}, got {dirs:?}",
+                mode.name()
+            );
+
+            // 120x60 divides evenly by every n; 101x47 does not. Gap 0 is what
+            // `build_composite` passes.
+            for (w, h) in [(120u16, 60u16), (101, 47)] {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                };
+                let rects = compute_layout(&node, area, 0);
+                let ids: Vec<PaneId> = rects.iter().map(|(id, _)| *id).collect();
+                assert_eq!(ids, panes);
+                let (along, across, full_along, full_across) = match direction {
+                    Direction::Vertical => (
+                        rects.iter().map(|(_, r)| r.width).collect::<Vec<_>>(),
+                        rects.iter().map(|(_, r)| r.height).collect::<Vec<_>>(),
+                        w,
+                        h,
+                    ),
+                    Direction::Horizontal => (
+                        rects.iter().map(|(_, r)| r.height).collect(),
+                        rects.iter().map(|(_, r)| r.width).collect(),
+                        h,
+                        w,
+                    ),
+                };
+                assert!(
+                    across.iter().all(|&a| a == full_across),
+                    "{} n={n} {w}x{h}: every pane spans the full cross axis, got {across:?}",
+                    mode.name()
+                );
+                let min = *along.iter().min().unwrap();
+                let max = *along.iter().max().unwrap();
+                assert!(
+                    max - min <= 1,
+                    "{} n={n} {w}x{h}: sizes must be equal within 1, got {along:?}",
+                    mode.name()
+                );
+                assert_eq!(
+                    along.iter().sum::<u16>(),
+                    full_along,
+                    "{} n={n} {w}x{h}: panes must fill the axis",
+                    mode.name()
+                );
+            }
+        }
+    }
+
+    fn cycle_names(enabled: &EnabledLayouts, from: LayoutMode, steps: usize) -> Vec<String> {
+        let mut mode = from;
+        (0..steps)
+            .map(|_| {
+                mode = mode.next_enabled(enabled);
+                mode.name().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_next_enabled_with_everything_enabled_is_next() {
+        assert_eq!(
+            cycle_names(&EnabledLayouts::default(), LayoutMode::default(), 6),
+            ["master", "monocle", "grid", "columns", "rows", "bsp"]
+        );
+    }
+
+    #[test]
+    fn test_next_enabled_skips_disabled_layouts() {
+        let enabled = EnabledLayouts {
+            master: false,
+            grid: false,
+            ..EnabledLayouts::default()
+        };
+        assert_eq!(
+            cycle_names(&enabled, LayoutMode::default(), 4),
+            ["monocle", "columns", "rows", "bsp"]
+        );
+        assert_eq!(
+            cycle_names(&enabled, LayoutMode::Custom(CustomLayout), 1),
+            ["bsp"]
+        );
+        // A mode that is itself disabled still moves on to the next enabled one.
+        assert_eq!(
+            cycle_names(&enabled, LayoutMode::Grid(GridLayout), 1),
+            ["columns"]
+        );
+    }
+
+    #[test]
+    fn test_next_enabled_with_one_layout_stays_on_it() {
+        let enabled = EnabledLayouts {
+            bsp: false,
+            master: false,
+            monocle: false,
+            grid: false,
+            columns: false,
+            rows: true,
+        };
+        assert_eq!(
+            cycle_names(&enabled, LayoutMode::default(), 3),
+            ["rows", "rows", "rows"]
+        );
+        assert!(LayoutMode::Rows(RowsLayout).is_last_enabled(&enabled));
+    }
+
+    #[test]
+    fn test_next_enabled_with_everything_disabled_cycles_everything() {
+        let none = EnabledLayouts {
+            bsp: false,
+            master: false,
+            monocle: false,
+            grid: false,
+            columns: false,
+            rows: false,
+        };
+        assert!(none.none_enabled());
+        assert_eq!(
+            cycle_names(&none, LayoutMode::default(), 6),
+            ["master", "monocle", "grid", "columns", "rows", "bsp"]
+        );
+        assert!(matches!(
+            none.or_first(LayoutMode::default()),
+            LayoutMode::Bsp(_)
+        ));
+    }
+
+    #[test]
+    fn test_is_last_enabled_follows_the_last_enabled_layout() {
+        let all = EnabledLayouts::default();
+        assert!(LayoutMode::Rows(RowsLayout).is_last_enabled(&all));
+        assert!(!LayoutMode::Grid(GridLayout).is_last_enabled(&all));
+        assert!(!LayoutMode::Custom(CustomLayout).is_last_enabled(&all));
+        let no_rows = EnabledLayouts { rows: false, ..all };
+        assert!(LayoutMode::Columns(ColumnsLayout).is_last_enabled(&no_rows));
+        assert!(!LayoutMode::Grid(GridLayout).is_last_enabled(&no_rows));
+    }
+
+    #[test]
+    fn test_or_first_falls_back_to_the_first_enabled_layout() {
+        let no_bsp = EnabledLayouts {
+            bsp: false,
+            ..EnabledLayouts::default()
+        };
+        assert!(matches!(
+            no_bsp.or_first(LayoutMode::default()),
+            LayoutMode::Master(_)
+        ));
+        assert!(matches!(
+            no_bsp.or_first(LayoutMode::Grid(GridLayout)),
+            LayoutMode::Grid(_)
+        ));
+        assert!(matches!(
+            no_bsp.or_first(LayoutMode::Custom(CustomLayout)),
+            LayoutMode::Custom(_)
+        ));
+    }
+
+    #[test]
+    fn test_columns_layout_equal_widths_side_by_side() {
+        assert_line_layout(&LayoutMode::Columns(ColumnsLayout), Direction::Vertical);
+        assert_eq!(LayoutMode::Columns(ColumnsLayout).name(), "columns");
+    }
+
+    #[test]
+    fn test_rows_layout_equal_heights_stacked() {
+        assert_line_layout(&LayoutMode::Rows(RowsLayout), Direction::Horizontal);
+        assert_eq!(LayoutMode::Rows(RowsLayout).name(), "rows");
     }
 
     // -----------------------------------------------------------------------
