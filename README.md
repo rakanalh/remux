@@ -27,7 +27,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 
 - **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
 - **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting.
-- **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, and `stack into` to fold an existing pane into a neighbour's stack).
+- **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, `stack into` to fold an existing pane into a neighbour's stack, and `unstack` to give a stacked pane its own slot again).
 - **Move to tab** — `Ctrl-a p t` opens a picker of the session's other tabs plus `+ new tab`; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it. A tab left empty closes.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
@@ -258,6 +258,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `]` | Next pane in stack *(→ Normal)* |
 | `[` | Previous pane in stack *(→ Normal)* |
 | `S` | Open the **Stack into** sub-group |
+| `U` | Open the **Unstack** sub-group |
 | `R` | Open the **Resize** sub-group |
 
 #### Pane → Stack into (`p S`)
@@ -265,6 +266,14 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | Key | Action |
 |-----|--------|
 | `h` / `j` / `k` / `l` | Move the focused pane into the stack of its left / down / up / right neighbour *(→ Normal)* |
+
+#### Pane → Unstack (`p U`)
+
+The focused pane must share a stack with at least one other pane; alone in its stack, the key does nothing.
+
+| Key | Action |
+|-----|--------|
+| `h` / `j` / `k` / `l` | Take the focused pane out of its stack into its own slot, split off to the left / below / above / right of the stack *(→ Normal)* |
 
 #### Pane → Resize (`p R`)
 
@@ -420,6 +429,10 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneStackIntoRight` | — | Move the focused pane into its right neighbour's stack. |
 | `PaneStackIntoUp` | — | Move the focused pane into the stack above. |
 | `PaneStackIntoDown` | — | Move the focused pane into the stack below. |
+| `PaneUnstackLeft` | — | Take the focused pane out of its stack into a new slot on the stack's left. |
+| `PaneUnstackRight` | — | Take the focused pane out of its stack into a new slot on the stack's right. |
+| `PaneUnstackUp` | — | Take the focused pane out of its stack into a new slot above the stack. |
+| `PaneUnstackDown` | — | Take the focused pane out of its stack into a new slot below the stack. |
 | `PaneMoveLeft` | — | Swap the focused pane with its left neighbour. |
 | `PaneMoveRight` | — | Swap the focused pane with its right neighbour. |
 | `PaneMoveUp` | — | Swap the focused pane with the pane above. |

@@ -332,6 +332,12 @@
 # j = "PaneStackIntoDown; EnterNormal"
 # k = "PaneStackIntoUp; EnterNormal"
 # l = "PaneStackIntoRight; EnterNormal"
+#
+# [keybindings.command.p.U]
+# h = "PaneUnstackLeft; EnterNormal"
+# j = "PaneUnstackDown; EnterNormal"
+# k = "PaneUnstackUp; EnterNormal"
+# l = "PaneUnstackRight; EnterNormal"
 
 # Unbind a default key by mapping it to an empty string:
 # [keybindings.command.p]
@@ -519,6 +525,10 @@
 #   PaneStackIntoRight              — Move focused pane into the right neighbour's stack
 #   PaneStackIntoUp                 — Move focused pane into the stack above
 #   PaneStackIntoDown               — Move focused pane into the stack below
+#   PaneUnstackLeft                 — Take focused pane out of its stack, to the left of it
+#   PaneUnstackRight                — Take focused pane out of its stack, to the right of it
+#   PaneUnstackUp                   — Take focused pane out of its stack, above it
+#   PaneUnstackDown                 — Take focused pane out of its stack, below it
 #   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
 #   PaneRename <name>               — Rename the focused pane
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)

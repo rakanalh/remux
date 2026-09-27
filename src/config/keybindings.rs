@@ -167,6 +167,21 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                     ),
                 ),
                 (
+                    'U',
+                    group(
+                        "Unstack",
+                        vec![
+                            ('h', leaf_chain("left", &["PaneUnstackLeft", "EnterNormal"])),
+                            ('j', leaf_chain("down", &["PaneUnstackDown", "EnterNormal"])),
+                            ('k', leaf_chain("up", &["PaneUnstackUp", "EnterNormal"])),
+                            (
+                                'l',
+                                leaf_chain("right", &["PaneUnstackRight", "EnterNormal"]),
+                            ),
+                        ],
+                    ),
+                ),
+                (
                     'R',
                     group_sticky(
                         "Resize",
@@ -1055,6 +1070,10 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "PaneStackIntoRight" => Some(RemuxCommand::PaneStackIntoRight),
         "PaneStackIntoUp" => Some(RemuxCommand::PaneStackIntoUp),
         "PaneStackIntoDown" => Some(RemuxCommand::PaneStackIntoDown),
+        "PaneUnstackLeft" => Some(RemuxCommand::PaneUnstackLeft),
+        "PaneUnstackRight" => Some(RemuxCommand::PaneUnstackRight),
+        "PaneUnstackUp" => Some(RemuxCommand::PaneUnstackUp),
+        "PaneUnstackDown" => Some(RemuxCommand::PaneUnstackDown),
         "SessionDetach" => Some(RemuxCommand::SessionDetach),
         "SessionList" => Some(RemuxCommand::SessionList),
         "FolderList" => Some(RemuxCommand::FolderList),

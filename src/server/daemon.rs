@@ -2762,6 +2762,10 @@ async fn handle_command(
                 | RemuxCommand::PaneStackIntoRight
                 | RemuxCommand::PaneStackIntoUp
                 | RemuxCommand::PaneStackIntoDown
+                | RemuxCommand::PaneUnstackLeft
+                | RemuxCommand::PaneUnstackRight
+                | RemuxCommand::PaneUnstackUp
+                | RemuxCommand::PaneUnstackDown
                 | RemuxCommand::PaneMoveToTabTarget { .. }
                 | RemuxCommand::PaneToggleZoom
                 | RemuxCommand::LayoutNext
@@ -3244,6 +3248,40 @@ async fn handle_command(
                     tab.layout_mode = LayoutMode::Custom(CustomLayout);
                     tab.zoomed_pane = None;
                     session::debug_check_invariant(sess, "PaneStackInto");
+                }
+            }
+            resize_session_panes(&session_name, state, panes, clients, config).await?;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        }
+        RemuxCommand::PaneUnstackLeft
+        | RemuxCommand::PaneUnstackRight
+        | RemuxCommand::PaneUnstackUp
+        | RemuxCommand::PaneUnstackDown => {
+            let direction = match cmd {
+                RemuxCommand::PaneUnstackLeft => layout::FocusDirection::Left,
+                RemuxCommand::PaneUnstackRight => layout::FocusDirection::Right,
+                RemuxCommand::PaneUnstackUp => layout::FocusDirection::Up,
+                RemuxCommand::PaneUnstackDown => layout::FocusDirection::Down,
+                _ => unreachable!(),
+            };
+            log::debug!("server: PaneUnstack direction={direction:?}");
+            {
+                let mut st = state.lock().await;
+                let sess = match st.sessions.get_mut(&session_name) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let tab = match sess.tabs.get_mut(sess.active_tab) {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                // Custom for the reason `PaneStackInto*` gives: the next
+                // automatic rebuild would otherwise re-stack or re-flow the
+                // panes and undo the split.
+                if layout::unstack_pane(&mut tab.layout, tab.focused_pane, direction) {
+                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                    tab.zoomed_pane = None;
+                    session::debug_check_invariant(sess, "PaneUnstack");
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;

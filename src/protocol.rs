@@ -98,6 +98,14 @@ pub enum ConnDescriptor {
 /// `feat/subagent-panes` also branched from master at 12 with its own message
 /// changes, so whichever of the two merges second takes the next free number
 /// instead of 13, for the reason the 4 -> 6 entry gives.
+///
+/// 13 also carries taking a pane out of its stack: [`RemuxCommand::PaneUnstackLeft`],
+/// [`RemuxCommand::PaneUnstackRight`], [`RemuxCommand::PaneUnstackUp`] and
+/// [`RemuxCommand::PaneUnstackDown`], added without a bump of their own. A
+/// server built at 13 before them cannot decode a `Command` carrying one, and
+/// the decode error ends that client's connection: `read_message` returns
+/// `Err`, and the server disconnects the client instead of skipping the
+/// message. Both sides report 13, so the handshake cannot catch this skew.
 pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -1182,6 +1190,12 @@ pub enum RemuxCommand {
     PaneStackIntoRight,
     PaneStackIntoUp,
     PaneStackIntoDown,
+    /// Take the focused pane out of its stack into its own slot, split off
+    /// the stack's slot on that side.
+    PaneUnstackLeft,
+    PaneUnstackRight,
+    PaneUnstackUp,
+    PaneUnstackDown,
     /// Move the attached session's focused pane, PTY and all, into the tab
     /// with this id, or into a new tab when `tab_id` is `None`. By id rather
     /// than index so that a tab closed or reordered by another client makes the
@@ -1370,6 +1384,10 @@ impl RemuxCommand {
             | RemuxCommand::PaneStackIntoRight
             | RemuxCommand::PaneStackIntoUp
             | RemuxCommand::PaneStackIntoDown
+            | RemuxCommand::PaneUnstackLeft
+            | RemuxCommand::PaneUnstackRight
+            | RemuxCommand::PaneUnstackUp
+            | RemuxCommand::PaneUnstackDown
             | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
             | RemuxCommand::PopupToggle
@@ -1661,6 +1679,10 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneStackIntoRight"),
             ActionSpec::server("PaneStackIntoUp"),
             ActionSpec::server("PaneStackIntoDown"),
+            ActionSpec::server("PaneUnstackLeft"),
+            ActionSpec::server("PaneUnstackRight"),
+            ActionSpec::server("PaneUnstackUp"),
+            ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
             ActionSpec::server("PopupToggle"),
@@ -2514,6 +2536,10 @@ mod tests {
             RemuxCommand::PaneStackIntoRight => Some("PaneStackIntoRight"),
             RemuxCommand::PaneStackIntoUp => Some("PaneStackIntoUp"),
             RemuxCommand::PaneStackIntoDown => Some("PaneStackIntoDown"),
+            RemuxCommand::PaneUnstackLeft => Some("PaneUnstackLeft"),
+            RemuxCommand::PaneUnstackRight => Some("PaneUnstackRight"),
+            RemuxCommand::PaneUnstackUp => Some("PaneUnstackUp"),
+            RemuxCommand::PaneUnstackDown => Some("PaneUnstackDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
             RemuxCommand::PopupToggle => Some("PopupToggle"),
