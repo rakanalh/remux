@@ -173,35 +173,6 @@ pub fn attribute(
     Err(Unverified::NoPaneAncestor)
 }
 
-/// The fields of a `/proc/<pid>/stat` line that attribution reads.
-#[cfg(target_os = "linux")]
-#[derive(Debug, PartialEq, Eq)]
-pub struct StatFields {
-    pub ppid: i32,
-    pub sid: i32,
-    pub tty_nr: u32,
-}
-
-/// Parsed from the LAST `)`, for the reason `daemon::pgid_from_stat` gives:
-/// `comm` may contain spaces and parentheses. After it the fields run
-/// `state ppid pgrp session tty_nr`.
-///
-/// Taken as bytes because `comm` is whatever the process named itself,
-/// truncated to 15 bytes, which can cut a multi-byte character in half. Only
-/// the numeric tail after the `)` is decoded.
-#[cfg(target_os = "linux")]
-pub fn proc_stat(line: &[u8]) -> Option<StatFields> {
-    let close = line.iter().rposition(|&b| b == b')')?;
-    let tail = std::str::from_utf8(&line[close + 1..]).ok()?;
-    let mut fields = tail.split_whitespace();
-    let _state = fields.next()?;
-    let ppid = fields.next()?.parse().ok()?;
-    let _pgrp = fields.next()?;
-    let sid = fields.next()?.parse().ok()?;
-    let tty_nr = fields.next()?.parse::<i32>().ok()? as u32;
-    Some(StatFields { ppid, sid, tty_nr })
-}
-
 #[cfg(target_os = "linux")]
 pub struct Procfs;
 
@@ -211,7 +182,8 @@ impl ProcTable for Procfs {
         if pid <= 0 {
             return None;
         }
-        let stat = proc_stat(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)?;
+        let stat =
+            crate::server::procfs::proc_stat(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)?;
         Some(ProcInfo {
             ppid: stat.ppid,
             sid: Some(stat.sid),
@@ -456,50 +428,6 @@ mod tests {
         };
         assert_eq!(verdict(&sid_table(Some(PTS1))), Ok((How::Sid, true)));
         assert_eq!(verdict(&sid_table(Some(PTS0))), Ok((How::Sid, false)));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_stat_parses_from_the_last_paren() {
-        let line = b"1234 (a) b) c) S 1000 1234 1001 34816 1234 4194560 0 0";
-        assert_eq!(
-            proc_stat(line.as_slice()),
-            Some(StatFields {
-                ppid: 1000,
-                sid: 1001,
-                tty_nr: 34816
-            })
-        );
-        let spaced = b"77 (Web Content) S 2 77 3 0 -1";
-        assert_eq!(
-            proc_stat(spaced.as_slice()),
-            Some(StatFields {
-                ppid: 2,
-                sid: 3,
-                tty_nr: 0
-            })
-        );
-        assert_eq!(proc_stat(b"1234 no paren S 1 2 3 4"), None);
-        assert_eq!(proc_stat(b"1234 (short) S 1 2 3 x"), None);
-        assert_eq!(proc_stat(b"1234 (short) S 1 2"), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_stat_reads_a_comm_that_is_not_utf8() {
-        // A 15-byte `comm` truncated inside a three-byte character.
-        let mut line = b"4321 (build-\xe2\x82 x) S 10 4321 11 34816 1".to_vec();
-        assert!(std::str::from_utf8(&line).is_err());
-        assert_eq!(
-            proc_stat(&line),
-            Some(StatFields {
-                ppid: 10,
-                sid: 11,
-                tty_nr: 34816
-            })
-        );
-        line.extend_from_slice(b" \xff");
-        assert_eq!(proc_stat(&line), None);
     }
 
     #[cfg(target_os = "linux")]

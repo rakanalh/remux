@@ -40,6 +40,10 @@ notify = "7"
 # promoting it to a direct dependency adds no new crate to the build.
 regex = "1"
 
+[dev-dependencies]
+# `start_paused` for tests that cross a timeout without waiting it out.
+tokio = { version = "1", features = ["test-util"] }
+
 # macOS has no /proc, so we read a foreign process's cwd via sysinfo. Scoped to
 # macOS targets only so Linux builds don't pull it in.
 [target.'cfg(target_os = "macos")'.dependencies]

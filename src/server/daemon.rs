@@ -447,25 +447,8 @@ pub(crate) fn process_pgid(pid: i32) -> Option<i32> {
     if pid <= 0 {
         return None;
     }
-    pgid_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
-/// The `pgrp` field of a `/proc/<pid>/stat` line: `pid (comm) state ppid pgrp`.
-///
-/// **Parsed from the LAST `)`, never by splitting the line.** `comm` is up to
-/// 15 bytes of whatever the process last called itself, written raw and
-/// unescaped -- it may contain spaces, parentheses or both, and a Node worker
-/// thread or a browser helper routinely does. Counting whitespace fields from
-/// the start, or stopping at the first `)`, reads some byte of the NAME as the
-/// pgid; that answer matches no real group, so every descendant would be
-/// filtered out and the walk would quietly stop finding anything. A line that
-/// does not have the shape is refused rather than guessed at.
-#[cfg(target_os = "linux")]
-fn pgid_from_stat(line: &str) -> Option<i32> {
-    let mut fields = line[line.rfind(')')? + 1..].split_whitespace();
-    let _state = fields.next()?;
-    let _ppid = fields.next()?;
-    fields.next()?.parse().ok()
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    Some(crate::server::procfs::proc_stat(&stat)?.pgrp)
 }
 
 /// See the Linux variant. macOS answers from `libproc`'s BSD info block.
@@ -509,6 +492,11 @@ fn proc_index(ps: &HashMap<PaneId, PaneData>) -> identity::ProcIndex {
     }))
 }
 
+/// How long the per-connection identity line may hold up the connection's
+/// reader. Past it the peer is logged as unattributed; the line is diagnostic,
+/// so a wedged `panes` lock or a slow `/proc` must never cost a connection.
+const ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Log which pane a new connection's peer runs in, once per connection.
 ///
 /// Diagnostic only. A message's sender is attributed again for each message,
@@ -519,11 +507,20 @@ async fn log_peer_identity(
     peer_pid: Option<i32>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) {
-    let index = proc_index(&*panes.lock().await);
-    let verdict = tokio::task::spawn_blocking(move || {
-        identity::attribute(peer_pid, &index, &identity::system_table())
+    let verdict = tokio::time::timeout(ATTRIBUTION_TIMEOUT, async {
+        let index = proc_index(&*panes.lock().await);
+        tokio::task::spawn_blocking(move || {
+            identity::attribute(peer_pid, &index, &identity::system_table())
+        })
+        .await
     })
     .await;
+    let Ok(verdict) = verdict else {
+        log::warn!(
+            "identity: client_id={client_id} peer={peer_pid:?} not attributed: timed out after {ATTRIBUTION_TIMEOUT:?}"
+        );
+        return;
+    };
     match verdict {
         Ok(Ok(a)) if a.tty_differs => log::info!(
             "identity: client_id={client_id} peer={peer_pid:?} -> pane %{} by {:?}; its tty differs (nested pty?)",
@@ -1095,6 +1092,7 @@ impl ClientConnection {
 }
 
 /// The Remux server.
+#[derive(Clone)]
 pub struct RemuxServer {
     state: Arc<Mutex<ServerState>>,
     panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
@@ -1267,7 +1265,13 @@ impl RemuxServer {
                     match result {
                         Ok((stream, _addr)) => match stream.peer_cred() {
                             Ok(cred) if peer_allowed(cred.uid(), own_uid) => {
-                                server.handle_new_connection(stream, cred.pid()).await;
+                                // Spawned so that a peer that never sends its Hello
+                                // holds only its own task for the handshake timeout,
+                                // not the accept loop, the tick or SIGTERM.
+                                let server = server.clone();
+                                tokio::spawn(async move {
+                                    server.handle_new_connection(stream, cred.pid()).await;
+                                });
                             }
                             Ok(cred) => {
                                 log::warn!(
@@ -11181,41 +11185,75 @@ mod tests {
         assert!(!saved_custom_is_restorable(&None, &[1, 2]));
     }
 
-    /// The `/proc` parser, which only exists on Linux.
+    mod identity_line {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use super::super::{log_peer_identity, ATTRIBUTION_TIMEOUT};
+
+        #[tokio::test(start_paused = true)]
+        async fn a_wedged_panes_lock_does_not_hold_up_the_connection() {
+            let panes = Arc::new(Mutex::new(HashMap::new()));
+            let _wedged = panes.lock().await;
+            let done = tokio::time::timeout(
+                ATTRIBUTION_TIMEOUT * 2,
+                log_peer_identity(0, Some(1), &panes),
+            )
+            .await;
+            assert!(done.is_ok(), "the identity line waited on the panes lock");
+        }
+    }
+
+    /// `process_pgid` through the real `/proc` read, which only exists on Linux.
     #[cfg(target_os = "linux")]
     mod stat {
-        use super::super::pgid_from_stat;
-
-        /// `/proc/<pid>/stat`, as the kernel writes it: pid, comm in parentheses,
-        /// then state, ppid and pgrp.
+        /// The kernel sets `comm` to the exec'd file's basename cut at 15
+        /// bytes, which here ends one byte into a three-byte character. The
+        /// copy sits beside the test binary because a temp dir can be noexec.
         #[test]
-        fn the_stat_line_gives_up_its_process_group() {
-            // state R, ppid 693892, pgrp 693891 -- the THIRD field after the
-            // comm, checked against `ps -o pgid=` on a live process.
-            let line = "693899 (rtk) R 693892 693891 693890 0 -1 4194304 501 0";
-            assert_eq!(pgid_from_stat(line), Some(693891));
-        }
+        fn a_live_process_whose_comm_is_not_utf8_reports_its_group() {
+            let dir = std::env::current_exe()
+                .unwrap()
+                .with_file_name(format!("remux-comm-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join("aaaaaaaaaaaaaa\u{65e5}");
+            std::fs::copy("/bin/sleep", &exe).unwrap();
+            // A raw fork, because `Command::spawn` holds std's environment lock
+            // across its fork, and a pty test forking at the same moment would
+            // copy that held lock into a child that then calls `set_var`.
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(exe.as_os_str().as_bytes()).unwrap();
+            let argv = [path.clone(), std::ffi::CString::new("5").unwrap()];
+            let child = match unsafe { nix::unistd::fork() }.unwrap() {
+                nix::unistd::ForkResult::Child => {
+                    let _ = nix::unistd::execv(&path, &argv);
+                    unsafe { libc::_exit(127) }
+                }
+                nix::unistd::ForkResult::Parent { child } => child,
+            };
+            let pid = child.as_raw();
 
-        /// **The parse starts at the LAST `)`, and that is the whole of it.**
-        ///
-        /// `comm` is up to 15 bytes of whatever the process called itself, and it
-        /// is not escaped or quoted: a Node worker thread, a browser tab or
-        /// anything else may put a space, a parenthesis or both in there. Splitting
-        /// on whitespace, or on the FIRST `)`, reads the wrong field -- and the
-        /// wrong field is a pgid that matches nothing, so every descendant is
-        /// filtered out and the walk silently stops finding anything.
-        #[test]
-        fn a_comm_containing_spaces_and_a_paren_does_not_move_the_fields() {
-            let line = "42 (we ) ird) S 7 1234 99 0 -1 0 0 0";
-            assert_eq!(pgid_from_stat(line), Some(1234));
-        }
+            // Until the exec, `comm` is still the forking test thread's name.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let comm = loop {
+                let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap_or_default();
+                if comm.starts_with(b"aaaaaaaaaaaaaa") || std::time::Instant::now() > deadline {
+                    break comm;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let pgid = super::super::process_pgid(pid);
+            let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(child, None);
+            let _ = std::fs::remove_dir_all(&dir);
 
-        #[test]
-        fn a_stat_line_that_is_not_one_is_refused_rather_than_guessed() {
-            assert_eq!(pgid_from_stat(""), None);
-            assert_eq!(pgid_from_stat("42 (sh"), None);
-            assert_eq!(pgid_from_stat("42 (sh) S 7"), None);
-            assert_eq!(pgid_from_stat("42 (sh) S 7 notanumber"), None);
+            assert!(
+                comm.starts_with(b"aaaaaaaaaaaaaa") && std::str::from_utf8(&comm).is_err(),
+                "the fixture's comm is not the truncated name, so it tests nothing: {comm:?}"
+            );
+            assert_eq!(pgid, Some(nix::unistd::getpgrp().as_raw()));
         }
     }
 }

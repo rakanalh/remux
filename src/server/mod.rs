@@ -5,6 +5,8 @@ pub mod daemon;
 pub mod identity;
 pub mod layout;
 pub mod persistence;
+#[cfg(target_os = "linux")]
+pub mod procfs;
 pub mod pty;
 pub mod session;
 pub mod title;
