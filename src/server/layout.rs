@@ -1615,6 +1615,71 @@ pub fn unstack_pane(root: &mut LayoutNode, pane: PaneId, direction: FocusDirecti
     true
 }
 
+/// What [`shift_in_stack`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StackShift {
+    /// The pane traded places with this pane of its stack.
+    Moved(PaneId),
+    /// The pane is already at that end of its stack.
+    AtEdge,
+    /// The pane is missing or alone in its stack.
+    NotStacked,
+}
+
+/// Move `pane` one place within its stack: toward the start for `Left`,
+/// toward the end for `Right`. Its display and custom names move with it, and
+/// it stays the stack's active pane. A stack has no vertical order, so `Up`
+/// and `Down` always report [`StackShift::AtEdge`] for a stacked pane.
+///
+/// Leaves the tree untouched unless it returns [`StackShift::Moved`].
+pub fn shift_in_stack(
+    root: &mut LayoutNode,
+    pane: PaneId,
+    direction: FocusDirection,
+) -> StackShift {
+    match root {
+        LayoutNode::Stack {
+            panes,
+            names,
+            custom_names,
+            active,
+        } => {
+            let Some(pos) = panes.iter().position(|&p| p == pane) else {
+                return StackShift::NotStacked;
+            };
+            if panes.len() < 2 {
+                return StackShift::NotStacked;
+            }
+            let target = match direction {
+                FocusDirection::Left => pos.checked_sub(1),
+                FocusDirection::Right => Some(pos + 1).filter(|&i| i < panes.len()),
+                FocusDirection::Up | FocusDirection::Down => None,
+            };
+            let Some(target) = target else {
+                return StackShift::AtEdge;
+            };
+            // `names`/`custom_names` may be shorter than `panes` in a state
+            // file written before they existed. Pad them so the swap below
+            // cannot index past their end.
+            names.resize(panes.len(), String::new());
+            custom_names.resize(panes.len(), None);
+            panes.swap(pos, target);
+            names.swap(pos, target);
+            custom_names.swap(pos, target);
+            *active = target;
+            log::debug!("layout: shift_in_stack pane={pane} {pos} -> {target}");
+            StackShift::Moved(panes[pos])
+        }
+        LayoutNode::Split { first, second, .. } => {
+            if contains_pane(first, pane) {
+                shift_in_stack(first, pane, direction)
+            } else {
+                shift_in_stack(second, pane, direction)
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Automatic layout builders
 // ---------------------------------------------------------------------------
@@ -3747,6 +3812,152 @@ mod tests {
         assert!(unstack_pane(&mut node, 3, FocusDirection::Down));
         assert_eq!(rect_of(&node, 2), rect_of(&left_and_right_column(), 2));
         assert_eq!(rect_of(&node, 3), rect_of(&left_and_right_column(), 3));
+    }
+
+    /// | 1 | 2,3,4 |  named `two`/`three`/`four`, with 3 custom-named `mine`
+    /// and showing.
+    fn left_and_three_stack() -> LayoutNode {
+        let mut node = left_and_right_stack();
+        node.add_to_stack(3, 4);
+        set_pane_name(&mut node, 2, "two");
+        set_pane_name(&mut node, 3, "three");
+        set_pane_name(&mut node, 4, "four");
+        set_pane_custom_name(&mut node, 3, "mine");
+        assert_eq!(node.stack_prev(4), Some(3));
+        node
+    }
+
+    fn stack_state(node: &LayoutNode) -> (Vec<PaneId>, Vec<String>, Vec<Option<String>>, usize) {
+        match right_child(node) {
+            LayoutNode::Stack {
+                panes,
+                names,
+                custom_names,
+                active,
+            } => (panes.clone(), names.clone(), custom_names.clone(), *active),
+            other => panic!("expected the right stack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_left_moves_the_pane_and_its_names_one_place() {
+        let mut node = left_and_three_stack();
+        assert_eq!(
+            shift_in_stack(&mut node, 3, FocusDirection::Left),
+            StackShift::Moved(2)
+        );
+        let (panes, names, custom, active) = stack_state(&node);
+        assert_eq!(panes, vec![3, 2, 4]);
+        assert_eq!(names, vec!["three", "two", "four"]);
+        assert_eq!(custom, vec![Some("mine".to_string()), None, None]);
+        assert_eq!(panes[active], 3);
+    }
+
+    #[test]
+    fn shift_right_moves_the_pane_and_its_names_one_place() {
+        let mut node = left_and_three_stack();
+        assert_eq!(
+            shift_in_stack(&mut node, 3, FocusDirection::Right),
+            StackShift::Moved(4)
+        );
+        let (panes, names, custom, active) = stack_state(&node);
+        assert_eq!(panes, vec![2, 4, 3]);
+        assert_eq!(names, vec!["two", "four", "three"]);
+        assert_eq!(custom, vec![None, None, Some("mine".to_string())]);
+        assert_eq!(panes[active], 3);
+    }
+
+    #[test]
+    fn shift_at_either_end_reports_the_edge_and_changes_nothing() {
+        let mut node = left_and_three_stack();
+        assert_eq!(
+            shift_in_stack(&mut node, 3, FocusDirection::Left),
+            StackShift::Moved(2)
+        );
+        let before = format!("{node:?}");
+        assert_eq!(
+            shift_in_stack(&mut node, 3, FocusDirection::Left),
+            StackShift::AtEdge
+        );
+        assert_eq!(format!("{node:?}"), before);
+
+        let mut node = left_and_three_stack();
+        assert_eq!(
+            shift_in_stack(&mut node, 3, FocusDirection::Right),
+            StackShift::Moved(4)
+        );
+        let before = format!("{node:?}");
+        assert_eq!(
+            shift_in_stack(&mut node, 3, FocusDirection::Right),
+            StackShift::AtEdge
+        );
+        assert_eq!(format!("{node:?}"), before);
+    }
+
+    #[test]
+    fn shift_up_or_down_reports_the_edge_from_any_place_in_the_stack() {
+        for pane in [2, 3, 4] {
+            for dir in [FocusDirection::Up, FocusDirection::Down] {
+                let mut node = left_and_three_stack();
+                let before = format!("{node:?}");
+                assert_eq!(
+                    shift_in_stack(&mut node, pane, dir.clone()),
+                    StackShift::AtEdge,
+                    "pane {pane} {dir:?}"
+                );
+                assert_eq!(format!("{node:?}"), before, "pane {pane} {dir:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shift_of_a_lone_or_missing_pane_changes_nothing() {
+        let mut node = left_and_three_stack();
+        let before = format!("{node:?}");
+        for dir in [
+            FocusDirection::Left,
+            FocusDirection::Right,
+            FocusDirection::Up,
+            FocusDirection::Down,
+        ] {
+            assert_eq!(
+                shift_in_stack(&mut node, 1, dir.clone()),
+                StackShift::NotStacked
+            );
+            assert_eq!(
+                shift_in_stack(&mut node, 99, dir.clone()),
+                StackShift::NotStacked
+            );
+        }
+        assert_eq!(format!("{node:?}"), before);
+    }
+
+    #[test]
+    fn shift_pads_short_name_vectors_instead_of_panicking() {
+        let mut node = LayoutNode::Stack {
+            panes: vec![1, 2, 3],
+            names: vec![],
+            custom_names: vec![],
+            active: 1,
+        };
+        assert_eq!(
+            shift_in_stack(&mut node, 2, FocusDirection::Right),
+            StackShift::Moved(3)
+        );
+        match node {
+            LayoutNode::Stack {
+                panes,
+                names,
+                custom_names,
+                active,
+            } => {
+                assert_eq!(panes, vec![1, 3, 2]);
+                assert_eq!(names.len(), 3);
+                assert_eq!(custom_names.len(), 3);
+                assert_eq!(active, 2);
+            }
+            other => panic!("expected Stack, got {other:?}"),
+        }
     }
 }
 

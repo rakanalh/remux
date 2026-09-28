@@ -26,7 +26,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 ### Panes & layouts
 
 - **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
-- **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting.
+- **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting. Inside a stack of several panes, `PaneMoveLeft`/`PaneMoveRight` move the pane one place along the stack instead, and at the stack's end take it out into its own slot on that side; `PaneMoveUp`/`PaneMoveDown` take it out above or below at once.
 - **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, `stack into` to fold an existing pane into a neighbour's stack, and `unstack` to give a stacked pane its own slot again).
 - **Move to tab** — `Ctrl-a p t` opens a picker of the session's other tabs plus `+ new tab`; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it. A tab left empty closes.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
@@ -257,7 +257,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `v` | Split vertical *(→ Normal)* |
 | `s` | Split horizontal *(→ Normal)* |
 | `h` / `j` / `k` / `l` | Focus left / down / up / right *(→ Normal)* |
-| `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right *(→ Normal)* |
+| `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right; in a stack, `H` / `L` move it along the stack, then out of it at the end, and `J` / `K` take it out below / above *(→ Normal)* |
 | `z` | Toggle zoom *(→ Normal)* |
 | `o` | Toggle the popup terminal *(→ Normal)* |
 | `r` | Rename pane |
@@ -441,10 +441,10 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneUnstackRight` | — | Take the focused pane out of its stack into a new slot on the stack's right. |
 | `PaneUnstackUp` | — | Take the focused pane out of its stack into a new slot above the stack. |
 | `PaneUnstackDown` | — | Take the focused pane out of its stack into a new slot below the stack. |
-| `PaneMoveLeft` | — | Swap the focused pane with its left neighbour. |
-| `PaneMoveRight` | — | Swap the focused pane with its right neighbour. |
-| `PaneMoveUp` | — | Swap the focused pane with the pane above. |
-| `PaneMoveDown` | — | Swap the focused pane with the pane below. |
+| `PaneMoveLeft` | — | Swap the focused pane with its left neighbour. In a stack of several panes, move it one place toward the stack's start; at the start, take it out of the stack into a new slot on the left. |
+| `PaneMoveRight` | — | Swap the focused pane with its right neighbour. In a stack of several panes, move it one place toward the stack's end; at the end, take it out of the stack into a new slot on the right. |
+| `PaneMoveUp` | — | Swap the focused pane with the pane above. In a stack of several panes, take it out of the stack into a new slot above. |
+| `PaneMoveDown` | — | Swap the focused pane with the pane below. In a stack of several panes, take it out of the stack into a new slot below. |
 | `PaneRename` | `<name>` | Rename the focused pane. |
 | `PaneMoveToTab` | — | Pick another tab of the session (or `+ new tab`) and move the focused pane there. |
 | `PaneToggleZoom` | — | Toggle fullscreen zoom for the focused pane. |

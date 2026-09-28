@@ -117,16 +117,19 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ),
                 (
                     'H',
-                    leaf_chain("move left", &["PaneMoveLeft", "EnterNormal"]),
+                    leaf_chain("move/eject left", &["PaneMoveLeft", "EnterNormal"]),
                 ),
                 (
                     'J',
-                    leaf_chain("move down", &["PaneMoveDown", "EnterNormal"]),
+                    leaf_chain("move/eject down", &["PaneMoveDown", "EnterNormal"]),
                 ),
-                ('K', leaf_chain("move up", &["PaneMoveUp", "EnterNormal"])),
+                (
+                    'K',
+                    leaf_chain("move/eject up", &["PaneMoveUp", "EnterNormal"]),
+                ),
                 (
                     'L',
-                    leaf_chain("move right", &["PaneMoveRight", "EnterNormal"]),
+                    leaf_chain("move/eject right", &["PaneMoveRight", "EnterNormal"]),
                 ),
                 ('z', leaf_chain("zoom", &["PaneToggleZoom", "EnterNormal"])),
                 ('o', leaf_chain("popup", &["PopupToggle", "EnterNormal"])),
@@ -2007,7 +2010,7 @@ mod tests {
         match mv {
             KeyNode::Leaf { action, label, .. } => {
                 assert!(action.contains(&"PaneMoveLeft".to_string()));
-                assert_eq!(label, "move left");
+                assert_eq!(label, "move/eject left");
             }
             other => panic!("expected leaf for 'p' -> 'H', got {other:?}"),
         }

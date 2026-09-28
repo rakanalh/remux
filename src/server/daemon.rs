@@ -3318,28 +3318,55 @@ async fn handle_command(
                     width: cols,
                     height: rows.saturating_sub(1),
                 };
-                // Swap the focused pane with its spatial neighbor in `direction`.
-                // Focus stays on the moved pane (its id is unchanged; only its
-                // slot in the tree changes).
-                if let Some(neighbor) =
-                    layout::find_neighbor(&tab.layout, area, tab.focused_pane, direction.clone(), 0)
-                {
-                    // Adjacent reorder: swap with the neighbor in `direction`.
-                    if layout::swap_panes(&mut tab.layout, tab.focused_pane, neighbor)
-                        && tab.layout_mode.is_automatic()
-                    {
-                        // A manual move ejects to Custom so an automatic rebuild
-                        // from `pane_order` doesn't revert the swap.
-                        tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                // Inside a stack of several panes, Left/Right reorder the stack
+                // and, at its end, take the pane out on that side. Up/Down
+                // take it out at once, because a stack has no vertical order.
+                let shift =
+                    layout::shift_in_stack(&mut tab.layout, tab.focused_pane, direction.clone());
+                match shift {
+                    layout::StackShift::Moved(other) => {
+                        // The tab stays automatic: Monocle is the only automatic
+                        // layout that stacks, and it copies `pane_order` into its
+                        // stack verbatim, so the same swap in `pane_order` keeps a
+                        // rebuild from undoing the move.
+                        if tab.layout_mode.is_automatic() {
+                            let focused = tab.focused_pane;
+                            let a = tab.pane_order.iter().position(|&p| p == focused);
+                            let b = tab.pane_order.iter().position(|&p| p == other);
+                            if let (Some(a), Some(b)) = (a, b) {
+                                tab.pane_order.swap(a, b);
+                            }
+                        }
                     }
-                } else if let Some(new_tree) =
-                    layout::relocate_pane_to_edge(&tab.layout, tab.focused_pane, direction)
-                {
-                    // No neighbor in `direction`: the focused pane is at that
-                    // edge. Relocate it, restructuring the layout, and always
-                    // eject to Custom so it isn't rebuilt away.
-                    tab.layout = new_tree;
-                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                    layout::StackShift::AtEdge => unstack_focused(sess, direction, "PaneMove"),
+                    layout::StackShift::NotStacked => {
+                        if let Some(neighbor) = layout::find_neighbor(
+                            &tab.layout,
+                            area,
+                            tab.focused_pane,
+                            direction.clone(),
+                            0,
+                        ) {
+                            // Swap the focused pane with its spatial neighbor in `direction`.
+                            // Focus stays on the moved pane (its id is unchanged; only its
+                            // slot in the tree changes).
+                            if layout::swap_panes(&mut tab.layout, tab.focused_pane, neighbor)
+                                && tab.layout_mode.is_automatic()
+                            {
+                                // A manual move ejects to Custom so an automatic rebuild
+                                // from `pane_order` doesn't revert the swap.
+                                tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                            }
+                        } else if let Some(new_tree) =
+                            layout::relocate_pane_to_edge(&tab.layout, tab.focused_pane, direction)
+                        {
+                            // No neighbor in `direction`: the focused pane is at that
+                            // edge. Relocate it, restructuring the layout, and always
+                            // eject to Custom so it isn't rebuilt away.
+                            tab.layout = new_tree;
+                            tab.layout_mode = LayoutMode::Custom(CustomLayout);
+                        }
+                    }
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
@@ -3411,18 +3438,7 @@ async fn handle_command(
                     Some(s) => s,
                     None => return Ok(()),
                 };
-                let tab = match sess.tabs.get_mut(sess.active_tab) {
-                    Some(t) => t,
-                    None => return Ok(()),
-                };
-                // Custom for the reason `PaneStackInto*` gives: the next
-                // automatic rebuild would otherwise re-stack or re-flow the
-                // panes and undo the split.
-                if layout::unstack_pane(&mut tab.layout, tab.focused_pane, direction) {
-                    tab.layout_mode = LayoutMode::Custom(CustomLayout);
-                    tab.zoomed_pane = None;
-                    session::debug_check_invariant(sess, "PaneUnstack");
-                }
+                unstack_focused(sess, direction, "PaneUnstack");
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
@@ -9239,6 +9255,24 @@ async fn notify_if_close_declined(
         // to SIGHUP -- and `get_pane_cwd` to read /proc for -- a pid the OS may
         // have recycled by then. Nothing consumes the code.
         notify_panes_exited(&[(pane_id, EXIT_CODE_UNKNOWN)], clients).await;
+    }
+}
+
+/// Take the focused pane of `sess`'s active tab out of its stack into its own
+/// slot on the `direction` side. `PaneUnstack*` and a `PaneMoveLeft`/`Right`
+/// that reaches the end of its stack both come here, so they leave the tab in
+/// the same state.
+fn unstack_focused(sess: &mut Session, direction: layout::FocusDirection, context: &str) {
+    let Some(tab) = sess.tabs.get_mut(sess.active_tab) else {
+        return;
+    };
+    // Custom for the reason `PaneStackInto*` gives: the next
+    // automatic rebuild would otherwise re-stack or re-flow the
+    // panes and undo the split.
+    if layout::unstack_pane(&mut tab.layout, tab.focused_pane, direction) {
+        tab.layout_mode = LayoutMode::Custom(CustomLayout);
+        tab.zoomed_pane = None;
+        session::debug_check_invariant(sess, context);
     }
 }
 

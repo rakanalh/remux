@@ -557,10 +557,10 @@
 #   PaneFocusRight                  — Focus pane to the right
 #   PaneFocusUp                     — Focus pane above
 #   PaneFocusDown                   — Focus pane below
-#   PaneMoveLeft                    — Move focused pane left
-#   PaneMoveRight                   — Move focused pane right
-#   PaneMoveUp                      — Move focused pane up
-#   PaneMoveDown                    — Move focused pane down
+#   PaneMoveLeft                    — Move focused pane left (in a stack: along it, then out of it)
+#   PaneMoveRight                   — Move focused pane right (in a stack: along it, then out of it)
+#   PaneMoveUp                      — Move focused pane up (in a stack: out of it, above)
+#   PaneMoveDown                    — Move focused pane down (in a stack: out of it, below)
 #   PaneStackAdd                    — Add focused pane to a stack
 #   PaneStackNext                   — Focus next pane in stack
 #   PaneStackPrev                   — Focus previous pane in stack
