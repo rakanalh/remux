@@ -341,8 +341,8 @@ impl Tab {
     /// Focus a pane that was just added to this tab. This releases the zoom,
     /// because a zoom would hide the new arrangement behind one pane.
     pub fn focus_new_pane(&mut self, pane: PaneId) {
-        self.focused_pane = pane;
         self.zoomed_pane = None;
+        self.focus_pane(pane);
     }
 
     /// **The one answer to "which panes does this tab own".**
@@ -405,8 +405,15 @@ impl Tab {
     /// showing the pane you are typing into. Every focus change *within* a
     /// zoomed tab goes through here so the id can never go stale behind the
     /// zoom.
+    ///
+    /// The stack's `active` index follows focus for the same reason. Input goes
+    /// to `focused_pane`, but the compositor paints each stack's `active` pane.
+    /// If only `focused_pane` moved, a jump by id into a stack (for example a
+    /// `SessionSwitchPane` in Monocle) would type into a pane that the user
+    /// cannot see. [`check_structural_invariant`] asserts the two agree.
     pub fn focus_pane(&mut self, pane_id: PaneId) {
         self.focused_pane = pane_id;
+        self.layout.activate(pane_id);
         if self.zoomed_pane.is_some() {
             self.zoomed_pane = Some(pane_id);
         }
@@ -449,6 +456,9 @@ impl Tab {
                 self.zoomed_pane = None;
             }
         }
+        // A state file written before `focus_pane` moved the stack's active
+        // index can restore a focused pane hidden behind another in its stack.
+        self.layout.activate(self.focused_pane);
     }
 }
 
@@ -494,6 +504,12 @@ fn default_border_style() -> BorderStyle {
 /// 5. `tab.zoomed_pane`, when set, names a pane the tab still owns -- the id is
 ///    honoured by the render/sizing paths, so a stale one would paint a dead
 ///    pane full-screen.
+///
+/// 6. `tab.focused_pane`, when the tree holds it, is the active (painted) pane
+///    of its stack. Input goes to the focused pane, so a hidden focused pane
+///    takes keystrokes the user cannot see (see [`Tab::focus_pane`]). A focused
+///    pane missing from the tree is not a violation here: `Tab::can_place_auto`
+///    already treats that state as reachable.
 ///
 /// Returns the first violation as a message rather than panicking, so
 /// production code can `debug_assert` on it (see [`debug_check_invariant`]) and
@@ -545,6 +561,13 @@ pub fn check_structural_invariant(sess: &Session) -> Result<(), String> {
                     tab.pane_order
                 ));
             }
+        }
+        let visible = layout::active_pane_ids(&tab.layout);
+        if tree_set.contains(&tab.focused_pane) && !visible.contains(&tab.focused_pane) {
+            return Err(format!(
+                "tab {i} focused_pane {} is hidden in its stack (visible: {visible:?})",
+                tab.focused_pane
+            ));
         }
     }
     Ok(())
@@ -3317,6 +3340,49 @@ mod popup_invariant_tests {
         st.sessions.get_mut(&name).expect("session").tabs[0].zoomed_pane = Some(9999);
         let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
         assert!(err.contains("zoomed_pane"), "{err}");
+    }
+
+    fn monocle_of_three() -> (ServerState, String) {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.layout_mode = LayoutMode::Monocle(MonocleLayout);
+        tab.rebuild_if_automatic();
+        (st, name)
+    }
+
+    #[test]
+    fn focus_pane_shows_the_focused_pane_of_a_monocle_stack() {
+        let (mut st, name) = monocle_of_three();
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let first = tab.pane_order[0];
+        assert_ne!(tab.focused_pane, first, "fixture focuses the last pane");
+
+        tab.focus_pane(first);
+
+        assert_eq!(layout::active_pane_ids(&tab.layout), vec![first]);
+        assert_popup_invariant(sess_of(&st, &name), "after focus_pane");
+    }
+
+    #[test]
+    fn invariant_catches_a_focused_pane_hidden_in_its_stack() {
+        let (mut st, name) = monocle_of_three();
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.focused_pane = tab.pane_order[0];
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("must be caught");
+        assert!(err.contains("hidden in its stack"), "{err}");
+    }
+
+    #[test]
+    fn reconcile_shows_a_restored_focused_pane_hidden_in_its_stack() {
+        let (mut st, name) = monocle_of_three();
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let first = tab.pane_order[0];
+        tab.focused_pane = first;
+
+        tab.reconcile_pane_order();
+
+        assert_eq!(layout::active_pane_ids(&tab.layout), vec![first]);
+        assert_popup_invariant(sess_of(&st, &name), "after reconcile");
     }
 
     #[test]

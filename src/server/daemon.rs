@@ -3806,6 +3806,7 @@ async fn handle_command(
                     if let Some(tab) = sess.tabs.get_mut(sess.active_tab) {
                         tab.focus_pane(pane_id);
                     }
+                    session::debug_check_invariant(sess, "SessionSwitchPane");
                 }
             }
             start_pty_forwarding(
@@ -5925,8 +5926,6 @@ async fn handle_mouse_click(
                 Some(t) => t,
                 None => return Ok(()),
             };
-            // Walk layout to find the stack containing pane_id and set it active.
-            activate_pane_in_stack(&mut tab.layout, pane_id);
             tab.focus_pane(pane_id);
             drop(st);
             // Changes both the stack's active pane and `is_focused`; both are
@@ -5974,21 +5973,6 @@ fn saved_custom_is_restorable(saved: &Option<LayoutNode>, pane_order: &[PaneId])
     let mut live_ids = pane_order.to_vec();
     live_ids.sort_unstable();
     saved_ids == live_ids
-}
-
-/// Activate a specific pane within its stack in the layout tree.
-fn activate_pane_in_stack(node: &mut layout::LayoutNode, pane_id: PaneId) {
-    match node {
-        layout::LayoutNode::Stack { panes, active, .. } => {
-            if let Some(pos) = panes.iter().position(|&p| p == pane_id) {
-                *active = pos;
-            }
-        }
-        layout::LayoutNode::Split { first, second, .. } => {
-            activate_pane_in_stack(first, pane_id);
-            activate_pane_in_stack(second, pane_id);
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
