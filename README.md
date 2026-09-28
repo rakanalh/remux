@@ -122,9 +122,9 @@ A view over four panes from three local sessions and a `devbox` remote, in Grid 
 - **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell — and looks through a launcher such as an npm shim, `npx` or `bunx` to the agent it started; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
 - **Agent switcher** — `Alt-a` (or `Ctrl-a x a`) lists every pane running an AI agent, on local **and** connected remote servers, with the same state colours as the agents panel. `j`/`k` (or the arrows) and `g`/`G` move, `Enter` jumps to the pane, `Esc` closes. It works with no agents sidebar configured.
 
-The `agents` panel docked on the right, and the `Alt-a` switcher over the same four agents:
+The `agents` panel docked in a sidebar, and the `Alt-a` switcher over the same four agents:
 
-![Agents sidebar panel docked on the right](docs/screenshots/sidebar-agents.png)
+<img src="docs/screenshots/sidebar-agents.png" width="360" alt="Agents sidebar panel docked beside the panes">
 
 ![Agent switcher listing agents on the local server and a remote, coloured by state](docs/screenshots/agent-switcher.png)
 
@@ -139,9 +139,7 @@ All three at once: `sessions` on the left, `agents` on the right, `files` along 
 
 The `sessions` panel with a remote connected, and the `files` panel:
 
-![Sessions sidebar with local and remote sessions](docs/screenshots/sidebar-sessions.png)
-
-![Files sidebar panel](docs/screenshots/sidebar-files.png)
+<img src="docs/screenshots/sidebar-sessions.png" width="360" alt="Sessions sidebar with local and remote sessions"> <img src="docs/screenshots/sidebar-files.png" width="360" alt="Files sidebar panel">
 
 ### Mouse
 

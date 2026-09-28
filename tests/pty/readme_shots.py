@@ -1382,13 +1382,22 @@ visible = true
         env_, tui = busy_workspace(env, cfg, remote, views=False, cols=cols, rows=rows,
                                    needles=["Do you want to proceed?", *ready])
         tui.pump(1.0)
-        screenshot(tui.screen, out)
+        screenshot(tui.screen, out, crop=sidebar_crop(edge, size))
         return tui
     return run
 
 
+def sidebar_crop(edge, size, neighbour=30):
+    """The sidebar's full height, status bar included, plus a slice of the pane beside it."""
+    if edge == "left":
+        return (0, 0, size + neighbour, ROWS)
+    return (COLS - size - neighbour, 0, COLS, ROWS)
+
+
 shot("sidebar-sessions")(sidebar_shot("left", "sessions", 30, remote=True, ready=("training",)))
-shot("sidebar-agents")(sidebar_shot("right", "agents", 30, remote=True, ready=("training",)))
+# Docked left like the other two, so the neighbouring slice is the start of a
+# pane's lines rather than their cut-off ends. `sidebars` shows it on the right.
+shot("sidebar-agents")(sidebar_shot("left", "agents", 30, remote=True, ready=("training",)))
 shot("sidebar-files")(sidebar_shot("left", "files", 30, ready=("Cargo.toml",)))
 
 
