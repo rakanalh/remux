@@ -9,7 +9,8 @@ Highlights are painted by the CLIENT straight onto the terminal, so only a
 real PTY can see them. Each case asserts, after the first Enter and nothing
 else, that every on-screen occurrence of the query carries a highlight
 background and that exactly one of them -- the current match -- carries the
-distinct current-match background.
+distinct current-match background. It then presses n and N and checks that
+the prompt's (current/total) counter follows the current highlight.
 
     python3 tests/pty/search_first_highlight.py [no-scrollback|scrollback|all]
 """
@@ -61,6 +62,43 @@ def cell_bg(tui, y, x):
     return tui.screen.buffer[y][x].bg
 
 
+def counter(tui):
+    """The (current, total) the search prompt shows, or None."""
+    m = re.search(re.escape(f"/{QUERY} (") + r"(\d+)/(\d+)\)", tui.rows_text()[-2])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def current_hits(tui):
+    return [(y, x) for y, x in occurrences(tui) if cell_bg(tui, y, x) == CURRENT_BG]
+
+
+def navigate(tui, name, results, hits):
+    """Press n/N and check the counter and the current highlight move together.
+
+    Each on-screen step is painted by the client without a server frame, so
+    it is the path where a stale counter shows.
+    """
+    ordered = sorted(hits)
+    steps = [
+        ("n", results - 1, ordered[-2]),
+        ("n", results - 2, ordered[-3]),
+        ("N", results - 1, ordered[-2]),
+        ("N", results, ordered[-1]),
+        # Wraps to the first match. With scrollback it is off screen, so this
+        # step also covers the scroll path.
+        ("N", 1, ordered[0] if results == len(hits) else None),
+    ]
+    for key, want, at in steps:
+        tui.send(key, 0.8)
+        got = counter(tui)
+        check(got == (want, results),
+              f"{name}: after {key!r} the prompt reads ({want}/{results}) (got {got})")
+        cur = current_hits(tui)
+        check(len(cur) == 1, f"{name}: after {key!r} exactly one current highlight ({cur})")
+        if at is not None:
+            check(cur == [at], f"{name}: after {key!r} the current highlight is at {at} ({cur})")
+
+
 def run_case(name, filler, results, entry):
     name = f"{name}/{entry}"
     print(f"=== {name} ===")
@@ -109,6 +147,9 @@ def run_case(name, filler, results, entry):
         if current:
             check(current[0] == max(hits),
                   f"{name}: the current match is the bottom-most one ({current[0]} vs {max(hits)})")
+        check(counter(tui) == (results, results),
+              f"{name}: the prompt reads ({results}/{results}) after Enter (got {counter(tui)})")
+        navigate(tui, name, results, hits)
         if failures:
             tui.dump(name)
         check(tui.alive(), f"{name}: client still alive")

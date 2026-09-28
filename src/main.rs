@@ -1389,6 +1389,36 @@ fn paint_server_status_bar(
     })
 }
 
+/// Paint the match highlights and the `/query (x/y)` prompt together.
+///
+/// Every site that moves `current_match` without waiting for a server frame
+/// must repaint both, because the prompt carries the match counter. Painting
+/// only the highlights leaves the counter at its old value.
+fn paint_search_overlay(
+    renderer: &Renderer,
+    ss: &crate::client::input::SearchState,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    theme: &crate::config::theme::Theme,
+) -> Result<()> {
+    let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
+    let match_info = if ss.matches.is_empty() {
+        None
+    } else {
+        Some((ss.current_match, ss.matches.len()))
+    };
+    let (c, r) = crossterm::terminal::size()?;
+    renderer.render_search_highlight(
+        &ss.matches,
+        ss.current_match,
+        query.len(),
+        viewport_top,
+        focused_pane_rect,
+        theme,
+    )?;
+    renderer.render_search_prompt(query, ss.phase, match_info, c, r)
+}
+
 /// Re-render whichever transient overlay is currently active on top of the
 /// freshly-painted base frame. Extracted from the (previously triplicated)
 /// FullRender/RenderDiff/ScrollRender arms so the View compositor (PaneContent
@@ -1436,22 +1466,7 @@ fn relay_overlays(
     }
     // Re-render search prompt and highlights on top if in search mode
     else if let Some(ref ss) = input.search_state {
-        let query = ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
-        let match_info = if ss.matches.is_empty() {
-            None
-        } else {
-            Some((ss.current_match, ss.matches.len()))
-        };
-        let (c, r) = crossterm::terminal::size()?;
-        renderer.render_search_highlight(
-            &ss.matches,
-            ss.current_match,
-            query.len(),
-            viewport_top,
-            focused_pane_rect,
-            theme,
-        )?;
-        renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
+        paint_search_overlay(renderer, ss, viewport_top, focused_pane_rect, theme)?;
     }
     // Re-render session switch overlay on top if active
     else if let Some(ref ss) = input.session_switch {
@@ -3913,12 +3928,9 @@ async fn run_client_loop(
                                     // highlights (they are drawn on top). Redraw them
                                     // so they survive an in-view cursor move.
                                     if let Some(ref ss) = input.search_state {
-                                        let query =
-                                            ss.confirmed_query.as_deref().unwrap_or(&ss.query_buffer);
-                                        renderer.render_search_highlight(
-                                            &ss.matches,
-                                            ss.current_match,
-                                            query.len(),
+                                        paint_search_overlay(
+                                            &renderer,
+                                            ss,
                                             viewport_top,
                                             focused_pane_rect.as_ref(),
                                             &theme,
@@ -3996,14 +4008,9 @@ async fn run_client_loop(
                                             // Redraw the match highlights on top of the
                                             // pane repaint (see the VisualScroll arm).
                                             if let Some(ref ss) = input.search_state {
-                                                let query = ss
-                                                    .confirmed_query
-                                                    .as_deref()
-                                                    .unwrap_or(&ss.query_buffer);
-                                                renderer.render_search_highlight(
-                                                    &ss.matches,
-                                                    ss.current_match,
-                                                    query.len(),
+                                                paint_search_overlay(
+                                                    &renderer,
+                                                    ss,
                                                     viewport_top,
                                                     focused_pane_rect.as_ref(),
                                                     &theme,
@@ -4121,19 +4128,9 @@ async fn run_client_loop(
                                         current: ss.current_match,
                                         total: ss.matches.len(),
                                     }).await?;
-                                    let match_info = if ss.matches.is_empty() {
-                                        None
-                                    } else {
-                                        Some((ss.current_match, ss.matches.len()))
-                                    };
-                                    let query = ss.confirmed_query.as_deref().unwrap_or("");
-                                    let (c, r) = crossterm::terminal::size()?;
-                                    renderer.render_search_prompt(query, ss.phase, match_info, c, r)?;
-                                    // Re-render highlights with updated current match.
-                                    renderer.render_search_highlight(
-                                        &ss.matches,
-                                        ss.current_match,
-                                        query.len(),
+                                    paint_search_overlay(
+                                        &renderer,
+                                        ss,
                                         viewport_top,
                                         focused_pane_rect.as_ref(),
                                         &theme,
