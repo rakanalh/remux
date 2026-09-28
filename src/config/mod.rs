@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod keybindings;
+pub mod messaging;
 pub mod pane_title;
 pub mod sidebar;
 pub mod theme;
@@ -34,6 +35,10 @@ pub struct Config {
     /// which owns every tab's and view's layout.
     #[serde(default)]
     pub layouts: crate::server::layout::EnabledLayouts,
+    /// Mailbox lifetime and bounds for agent messaging. Read by the SERVER,
+    /// which owns every mailbox.
+    #[serde(default)]
+    pub messaging: messaging::MessagingConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +327,7 @@ impl Default for Config {
             sidebar: Vec::new(),
             agents: agents::AgentsConfig::default(),
             layouts: crate::server::layout::EnabledLayouts::default(),
+            messaging: messaging::MessagingConfig::default(),
         }
     }
 }
@@ -348,6 +354,9 @@ impl Config {
         let contents = std::fs::read_to_string(&config_path)?;
         let config: Config = toml::from_str(&contents)?;
         config.warn_unknown_pane_title_placeholders();
+        for problem in config.messaging.problems() {
+            log::warn!("{problem}");
+        }
         if config.layouts.none_enabled() {
             log::warn!("[layouts]: every layout is disabled; cycling through all of them");
         }

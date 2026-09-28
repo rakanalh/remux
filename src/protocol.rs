@@ -1017,6 +1017,128 @@ pub struct AgentEntry {
     pub cwd: Option<String>,
 }
 
+/// A message's id: minted by one server, monotonic, never reused.
+pub type MsgId = u64;
+
+/// What an [`Address`] names on its server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    Name(String),
+    Pane(PaneId),
+}
+
+/// `[<host>:](<name> | %<pane_id>)`. `%` is the pane sigil because it is inert
+/// in every shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Address {
+    pub host: Option<String>,
+    pub target: Target,
+}
+
+impl std::str::FromStr for Address {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (host, rest) = match s.split_once(':') {
+            Some((host, rest)) => (Some(host), rest),
+            None => (None, s),
+        };
+        if let Some(host) = host {
+            let host_ok = !host.is_empty()
+                && !host.starts_with('.')
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !host_ok {
+                return Err(format!("bad host in address {s:?}"));
+            }
+        }
+        let target = match rest.strip_prefix('%') {
+            Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                Target::Pane(
+                    digits
+                        .parse()
+                        .map_err(|_| format!("pane id out of range in {s:?}"))?,
+                )
+            }
+            Some(_) => return Err(format!("bad pane id in address {s:?}")),
+            None if valid_name(rest) => Target::Name(rest.to_string()),
+            None => return Err(format!("bad name in address {s:?}")),
+        };
+        Ok(Address {
+            host: host.map(str::to_string),
+            target,
+        })
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(host) = &self.host {
+            write!(f, "{host}:")?;
+        }
+        match &self.target {
+            Target::Name(name) => f.write_str(name),
+            Target::Pane(id) => write!(f, "%{id}"),
+        }
+    }
+}
+
+/// An agent name: `[a-z][a-z0-9_-]{0,31}`. A grammar rather than free text,
+/// because a name is an address and must survive a shell unquoted.
+pub fn valid_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && s.len() <= 32
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// The message a reply answers. `host` is `None` for this server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgRef {
+    pub host: Option<String>,
+    pub id: MsgId,
+}
+
+/// `Submitted` is not `Read`: a submitted message was typed into the pane, and
+/// whether the agent processed it is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MsgState {
+    Queued,
+    Submitted,
+    Read,
+}
+
+/// Who sent a message, as the SERVER established it. Never client-supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sender {
+    /// A pane on this server, verified from the connecting process.
+    Pane {
+        pane_id: PaneId,
+        name: Option<String>,
+        session: String,
+    },
+    /// A pane on another server, as that server asserted it over a peer link.
+    Remote {
+        host: String,
+        pane_id: PaneId,
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: MsgId,
+    pub from: Sender,
+    pub to: PaneId,
+    pub body: String,
+    /// Unix milliseconds on the server's clock.
+    pub created_ms: u64,
+    pub expires_ms: u64,
+    pub state: MsgState,
+    pub reply_to: Option<MsgRef>,
+}
+
 /// What a client needs to name a pane with its own `[appearance] pane_title`
 /// template. The client renders it rather than the server because only the
 /// client knows the remote's name (`{host}`).
@@ -1909,6 +2031,90 @@ pub fn decode_message_length(header: &[u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn addr(host: Option<&str>, target: Target) -> Address {
+        Address {
+            host: host.map(str::to_string),
+            target,
+        }
+    }
+
+    #[test]
+    fn address_parses_every_spelling() {
+        let name = || Target::Name("alpha".into());
+        assert_eq!("alpha".parse(), Ok(addr(None, name())));
+        assert_eq!("%7".parse(), Ok(addr(None, Target::Pane(7))));
+        assert_eq!("mini:alpha".parse(), Ok(addr(Some("mini"), name())));
+        assert_eq!("mini:%7".parse(), Ok(addr(Some("mini"), Target::Pane(7))));
+        assert_eq!(
+            "a-b_9".parse(),
+            Ok(addr(None, Target::Name("a-b_9".into())))
+        );
+    }
+
+    #[test]
+    fn address_rejects_the_malformed() {
+        let too_long = format!("a{}", "b".repeat(32));
+        for bad in [
+            "",
+            "%x",
+            "%",
+            "%-1",
+            "a:b:c",
+            "Alpha",
+            "-a",
+            "9a",
+            "a b",
+            &too_long,
+            "mini:",
+            ":alpha",
+            "mi ni:alpha",
+            ".mini:alpha",
+            "..:%1",
+        ] {
+            assert!(bad.parse::<Address>().is_err(), "{bad:?} parsed");
+        }
+        assert!(format!("a{}", "b".repeat(31)).parse::<Address>().is_ok());
+    }
+
+    #[test]
+    fn address_display_is_the_inverse_of_parse() {
+        for s in ["alpha", "%7", "mini:alpha", "mini:%7", "lab-2.local:%0"] {
+            assert_eq!(s.parse::<Address>().unwrap().to_string(), s);
+        }
+    }
+
+    #[test]
+    fn a_message_round_trips_through_json_from_either_sender() {
+        for from in [
+            Sender::Pane {
+                pane_id: 3,
+                name: Some("lead".into()),
+                session: "main".into(),
+            },
+            Sender::Remote {
+                host: "mini".into(),
+                pane_id: 9,
+                name: None,
+            },
+        ] {
+            let msg = Message {
+                id: 42,
+                from,
+                to: 7,
+                body: "hello\nworld".into(),
+                created_ms: 1_000,
+                expires_ms: 2_000,
+                state: MsgState::Submitted,
+                reply_to: Some(MsgRef {
+                    host: Some("mini".into()),
+                    id: 5,
+                }),
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+        }
+    }
 
     #[test]
     fn round_trip_client_message() {

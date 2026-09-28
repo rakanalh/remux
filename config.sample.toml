@@ -1052,6 +1052,38 @@
 # the price of matching a prompt that never leaves the screen.
 
 # -----------------------------------------------------------------------------
+# AGENT MESSAGING
+# -----------------------------------------------------------------------------
+
+# Mailboxes that let a process in one pane leave a message for another pane
+# (`remux msg send`, `remux msg read`). The server attributes every message to
+# the pane the SENDING process runs in, never to `$REMUX_PANE`.
+#
+# ttl_hours            how long a message lives before it is dropped unread.
+#                      A fraction is fine (0.5 = 30 minutes).
+# mailbox_max_messages  a mailbox this full makes room by dropping its oldest
+# mailbox_max_bytes    READ messages; unread mail is never dropped, so if that
+#                      is not enough the SENDER is refused (`mailbox_full`).
+# max_body_bytes       one message larger than this is refused
+#                      (`message_too_large`).
+# rate_per_10s         sends one pane may make in any 10 seconds
+#                      (`rate_limited`), so a looping agent cannot flood a peer.
+# persist              keep mailboxes and names across `remux restart`, in
+#                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
+#                      bodies are then stored on disk; `false` keeps them in
+#                      memory only.
+#
+# Read by the SERVER at startup, so an edit needs `remux restart`.
+#
+# [messaging]
+# ttl_hours = 24.0
+# mailbox_max_messages = 256
+# mailbox_max_bytes = 4194304
+# max_body_bytes = 65536
+# rate_per_10s = 20
+# persist = true
+
+# -----------------------------------------------------------------------------
 # REMOTES
 # -----------------------------------------------------------------------------
 # Named remote Remux servers reachable over SSH. Each `[remotes.<name>]` table
