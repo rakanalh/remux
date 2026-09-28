@@ -23,6 +23,10 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Last session toggle** — `Alt-o` (or `Ctrl-a x o`) flips back to the previously-attached session, like tmux's last-session.
 - **Session manager** — a tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — across both local and remote servers.
 
+![Session switcher listing Views, local sessions and a remote's sessions](docs/screenshots/session-switcher.png)
+
+![Agent switcher listing agents on the local server and a remote, coloured by state](docs/screenshots/agent-switcher.png)
+
 ### Panes & layouts
 
 - **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
@@ -36,6 +40,26 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
 
+A stack of three panes, with `tab_style = "rounded"` chips, and the same stack with the default `plain` style:
+
+![A pane stack with rounded tab chips](docs/screenshots/stack-rounded.png)
+
+![A pane stack with plain tab labels](docs/screenshots/stack-plain.png)
+
+A zoomed pane; the tab gets a `Z` on the status bar:
+
+![A zoomed pane with the Z flag on the status bar](docs/screenshots/pane-zoom.png)
+
+The move-to-tab picker (`Ctrl-a p t`) and the popup terminal (`Alt-p`):
+
+![Move pane to tab picker](docs/screenshots/move-to-tab.png)
+
+![Popup terminal floating over the layout](docs/screenshots/popup.png)
+
+Tmux style borders (the Zellij style is what every other screenshot shows):
+
+![Tmux style borders](docs/screenshots/border-tmux.png)
+
 ### Tabs & activity monitoring
 
 - **Tabs** — each session holds multiple tabs; create, close, rename, reorder, and jump to tabs by index.
@@ -43,6 +67,8 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
   - `!` (red) — a **bell** fired in the tab.
   - `●` (yellow) — new **output/activity** appeared.
   - `✓` (green) — a previously-busy tab went **silent/finished**.
+
+![Tab bar with finished, bell and activity markers on background tabs](docs/screenshots/tabs-activity.png)
 
 ### Modal input & which-key
 
@@ -59,6 +85,10 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Search** — `/` from Visual mode (or the Search leader binding) searches scrollback with highlighted matches; navigate with `n` (previous) / `N` (next), landing back in Visual mode on a match.
 - **External editor** — open a pane's full scrollback in `$EDITOR` for review, copy, or piping.
 
+![Line-wise Visual selection in a pane](docs/screenshots/visual-select.png)
+
+![Search matches highlighted in scrollback, current match in orange](docs/screenshots/search.png)
+
 ### Remote sessions (SSH)
 
 - **Remote attach over SSH** — declare servers in `[remotes.<name>]` (or connect ad-hoc with `RemoteConnect user@host`). Each remote is a top-level node in the session manager tree.
@@ -73,6 +103,12 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Real layouts** — views use the same layout engine as normal tabs (Grid by default, or the first enabled layout if `[layouts]` disables Grid; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
 - **Re-entry via the switcher** — the quick switcher (`Alt-s`) lists views alongside sessions; selecting one enters it.
 
+A view over four panes from three local sessions and a `devbox` remote, in Grid and in Monocle with its title strip:
+
+![A view in Grid layout with cells from local sessions and a remote](docs/screenshots/view-grid.png)
+
+![A view in Monocle layout with its title strip](docs/screenshots/view-monocle.png)
+
 ### Sidebars & plugins
 
 - **Sidebars** — client-side panels docked to the **left**, **right**, and/or **bottom** edge; one sidebar per edge, up to three at once, each stacking one or more plugin **panels**. They are chrome, not panes: the server never sees them, they take their slice of the terminal and hand the panes what is left. There are none by default — declare `[[sidebar]]` / `[[sidebar.panel]]` to opt in.
@@ -83,6 +119,18 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` walks focus through every visible panel and then back to the panes. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
 - **The `files` panel follows the focused pane** — it shows the directory of the pane you are focused **on**, and it moves when **focus** moves, *not* when you `cd`. That is the one thing that looks broken by hand: typing `cd ~/project` in a pane does not move the panel. Navigate the panel yourself with `h`/`l` and it stays where you put it, resuming its following once it is back on the pane's own directory. It follows the pane's **machine** too — focus a pane on a remote and it lists that remote's filesystem.
 - **Config edits apply live**, with one visible cost: reloading rebuilds the panels, so a `sessions` tree loses its expansion and selection. The alternative was a `[[sidebar]]` block that needed a client restart to appear.
+
+All three at once: `sessions` on the left, `agents` on the right, `files` along the bottom:
+
+![Sessions, agents and files sidebars docked together](docs/screenshots/sidebars.png)
+
+The `sessions` panel with a remote connected, the `agents` panel (red needs input, yellow working, grey idle), and the `files` panel:
+
+![Sessions sidebar with local and remote sessions](docs/screenshots/sidebar-sessions.png)
+
+![Agents sidebar panel](docs/screenshots/sidebar-agents.png)
+
+![Files sidebar panel](docs/screenshots/sidebar-files.png)
 
 ### Mouse
 
@@ -97,11 +145,21 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Hot-reload** — a file watcher reloads `~/.config/remux/config.toml` on save and the client applies new **keybindings, theme, and remotes** live. Server-side settings — `[agents]`, and the general/persistence options the daemon reads at startup — need `remux restart`.
 - **Fully configurable keybindings** — override or unbind any leader-tree key or Alt shortcut, remap the leader, and chain commands. See [Keybindings](#keybindings) and [Chaining commands](#chaining-commands).
 
+Pane borders named by `pane_title = "{session}:{tab} {command} ({cwd})"`:
+
+![Pane borders named by a pane_title template](docs/screenshots/pane-titles.png)
+
 ## Which-key
 
 After pressing the leader key, a popup shows the available keybindings at each tree level, plus the global Alt shortcuts. The delay before it appears is configurable (`timeout_ms`).
 
 ![Which-key popup](docs/screenshots/whichkey.png)
+
+`which_key_position = "centered"` and `"full_width"`:
+
+![Which-key centered](docs/screenshots/whichkey-centered.png)
+
+![Which-key full width](docs/screenshots/whichkey-full-width.png)
 
 ## Command palette
 
@@ -112,6 +170,8 @@ After pressing the leader key, a popup shows the available keybindings at each t
 ## Session manager
 
 Tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — local and remote. It opens with the current session highlighted; `/` searches.
+
+Here with a `services` folder and a `devbox` remote expanded:
 
 ![Session manager](docs/screenshots/session-manager.png)
 
@@ -139,17 +199,25 @@ Full-screen single pane — only the active pane is visible. Cycle through panes
 
 Equal-size cells in a `ceil(sqrt(n))`-column grid, filled row-major. Every pane gets the same amount of space, which makes it the default for Views (and it works for normal tabs too). With `grid = false` under `[layouts]`, a new View starts in the first enabled layout instead.
 
+![Grid layout](docs/screenshots/layout-grid.png)
+
 ### Columns
 
 Every pane side by side, left to right in pane order, each the full height and an equal share of the width.
+
+![Columns layout](docs/screenshots/layout-columns.png)
 
 ### Rows
 
 Every pane stacked top to bottom in pane order, each the full width and an equal share of the height.
 
+![Rows layout](docs/screenshots/layout-rows.png)
+
 ### Custom
 
 Manual splits created by you. No automatic redistribution — your exact arrangement is preserved.
+
+![Custom layout](docs/screenshots/layout-custom.png)
 
 ## Install / build / run
 
