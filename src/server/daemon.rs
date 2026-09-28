@@ -26,6 +26,7 @@ use crate::server::compositor::{
     composite, fits_zellij_border, hit_test, is_multi_stack, pane_content_rect, ClickTarget,
     HitRegions, MouseSelection, StatusInfo,
 };
+use crate::server::identity;
 use crate::server::layout::{
     self, CustomLayout, EnabledLayouts, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
@@ -496,6 +497,50 @@ pub(crate) fn process_pgid(pid: i32) -> Option<i32> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn process_pgid(_pid: i32) -> Option<i32> {
     None
+}
+
+fn proc_index(ps: &HashMap<PaneId, PaneData>) -> identity::ProcIndex {
+    identity::ProcIndex::new(ps.iter().map(|(&id, pd)| {
+        (
+            pd.pty.child_pid.as_raw(),
+            id,
+            pd.pty.slave_dev.map(identity::Tty::from_dev_t),
+        )
+    }))
+}
+
+/// Log which pane a new connection's peer runs in, once per connection.
+///
+/// Diagnostic only. A message's sender is attributed again for each message,
+/// because a pane can close between two messages on one connection. The
+/// process table is read with no lock held.
+async fn log_peer_identity(
+    client_id: u64,
+    peer_pid: Option<i32>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) {
+    let index = proc_index(&*panes.lock().await);
+    let verdict = tokio::task::spawn_blocking(move || {
+        identity::attribute(peer_pid, &index, &identity::system_table())
+    })
+    .await;
+    match verdict {
+        Ok(Ok(a)) if a.tty_differs => log::info!(
+            "identity: client_id={client_id} peer={peer_pid:?} -> pane %{} by {:?}; its tty differs (nested pty?)",
+            a.pane,
+            a.how
+        ),
+        Ok(Ok(a)) => log::debug!(
+            "identity: client_id={client_id} peer={peer_pid:?} -> pane %{} by {:?}",
+            a.pane,
+            a.how
+        ),
+        Ok(Err(e)) => log::debug!(
+            "identity: client_id={client_id} peer={peer_pid:?} not a pane: {}",
+            e.reason()
+        ),
+        Err(e) => log::warn!("identity: client_id={client_id} attribution task failed: {e}"),
+    }
 }
 
 /// Return the runtime directory used for the socket and pid files.
@@ -1222,7 +1267,7 @@ impl RemuxServer {
                     match result {
                         Ok((stream, _addr)) => match stream.peer_cred() {
                             Ok(cred) if peer_allowed(cred.uid(), own_uid) => {
-                                server.handle_new_connection(stream).await;
+                                server.handle_new_connection(stream, cred.pid()).await;
                             }
                             Ok(cred) => {
                                 log::warn!(
@@ -1327,7 +1372,7 @@ impl RemuxServer {
     }
 
     /// Handle a newly accepted client connection.
-    async fn handle_new_connection(&self, stream: tokio::net::UnixStream) {
+    async fn handle_new_connection(&self, stream: tokio::net::UnixStream, peer_pid: Option<i32>) {
         let (mut read_half, mut write_half) = stream.into_split();
 
         // Version handshake: exchange Hello/Welcome as the first frames, directly
@@ -1406,6 +1451,10 @@ impl RemuxServer {
             log::debug!("server: new client connection, assigned client_id={id}");
             id
         };
+
+        // Before the reader task exists, so a one-shot CLI peer cannot have
+        // had its reply and exited while its process is being read.
+        log_peer_identity(client_id, peer_pid, &self.panes).await;
 
         // Spawn writer task.
         let mut writer = write_half;

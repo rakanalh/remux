@@ -17,6 +17,10 @@ pub struct Pty {
     pub master_fd: OwnedFd,
     /// The PID of the child process running in the PTY.
     pub child_pid: Pid,
+    /// The slave's device number, which is the controlling terminal of every
+    /// process in the pane that has not moved to another one. Read before the
+    /// fork because both sides close the slave straight after it.
+    pub slave_dev: Option<libc::dev_t>,
 }
 
 /// Who the pane about to be spawned IS, as the child is told it.
@@ -147,6 +151,16 @@ impl Pty {
             fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
                 .context("failed to set FD_CLOEXEC on the PTY pair")?;
         }
+
+        // A pane without a recorded slave only loses a diagnostic in sender
+        // attribution, so a failed `fstat` does not refuse the spawn.
+        let slave_dev = match nix::sys::stat::fstat(slave.as_raw_fd()) {
+            Ok(st) => Some(st.st_rdev),
+            Err(e) => {
+                log::warn!("pty: fstat of the slave failed: {e}");
+                None
+            }
+        };
 
         // SAFETY: We are about to fork. The child process will exec immediately,
         // so we avoid calling any async-signal-unsafe functions beyond what is
@@ -305,6 +319,7 @@ impl Pty {
                 Ok(Pty {
                     master_fd: master,
                     child_pid: child,
+                    slave_dev,
                 })
             }
         }
@@ -1016,6 +1031,23 @@ mod tests {
             FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC),
             "the PTY master is inheritable across exec (F_GETFD = {flags:#x})"
         );
+    }
+
+    #[test]
+    fn pty_records_its_slave_device() {
+        let pty =
+            Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
+        let dev = pty.slave_dev.expect("the slave device was not recorded");
+        let pty_majors = if cfg!(target_os = "macos") {
+            16..=16
+        } else {
+            136..=143
+        };
+        assert!(
+            pty_majors.contains(&crate::server::identity::Tty::from_dev_t(dev).major),
+            "the slave is not a pty: {dev:#x}"
+        );
+        pty.write_input(b"exit\n").unwrap();
     }
 
     #[test]
