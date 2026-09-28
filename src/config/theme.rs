@@ -1,6 +1,6 @@
 use crossterm::style::Color;
 use serde::de::{self, MapAccess, Visitor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::CellColor;
 
@@ -158,6 +158,37 @@ fn named_to_cell_color(name: &str) -> CellColor {
 }
 
 // ---------------------------------------------------------------------------
+// TabStyle
+// ---------------------------------------------------------------------------
+
+/// The end caps drawn around each tab chip in a pane's tab strip.
+///
+/// `Plain` is the default because `Rounded` and `Slanted` draw Powerline glyphs
+/// from the Private Use Area, which render as boxes without a Nerd Font.
+/// `Square` uses block elements that every monospace font carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabStyle {
+    #[default]
+    Plain,
+    Rounded,
+    Slanted,
+    Square,
+}
+
+impl TabStyle {
+    /// The `(left, right)` cap glyphs, or `None` for `Plain`.
+    pub fn caps(self) -> Option<(char, char)> {
+        match self {
+            TabStyle::Plain => None,
+            TabStyle::Rounded => Some(('\u{E0B6}', '\u{E0B4}')),
+            TabStyle::Slanted => Some(('\u{E0BA}', '\u{E0BC}')),
+            TabStyle::Square => Some(('\u{2590}', '\u{258C}')),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ThemeConfig (deserializable from TOML)
 // ---------------------------------------------------------------------------
 
@@ -192,6 +223,9 @@ pub struct ThemeConfig {
     /// inheriting `status_bar_bg`: they sit flat on the bar rather than reading
     /// as a raised block.
     pub tab_inactive_bg: ThemeColor,
+    /// End caps around the chips of a pane's tab strip. Not a color, but it
+    /// lives here beside the chip colors it shapes.
+    pub tab_style: TabStyle,
     /// Background of the full-width bar on the agents panel row whose pane the
     /// user is currently in. Must stay distinct from BOTH selection bars
     /// (`tab_active_bg` while the panel has focus, `tab_inactive_bg` while it
@@ -274,6 +308,7 @@ impl Default for ThemeConfig {
             tab_active_bg: ThemeColor::Rgb(137, 180, 250), // blue
             tab_inactive_fg: ThemeColor::Rgb(147, 153, 178), // overlay2
             tab_inactive_bg: ThemeColor::Indexed(237),  // the historical literal
+            tab_style: TabStyle::Plain,
             // A dim violet: a different HUE from the neutral grey of 237 and far
             // darker than the blue focused bar, so the state markers and the
             // label stay readable on it.
@@ -447,6 +482,7 @@ pub struct CompositorTheme {
     pub tab_active_bg: CellColor,
     pub tab_inactive_fg: CellColor,
     pub tab_inactive_bg: CellColor,
+    pub tab_style: TabStyle,
     pub sidebar_current_bg: CellColor,
     pub whichkey_fg: CellColor,
     pub whichkey_bg: CellColor,
@@ -489,6 +525,7 @@ impl CompositorTheme {
             tab_active_bg: config.tab_active_bg.to_cell_color(),
             tab_inactive_fg: config.tab_inactive_fg.to_cell_color(),
             tab_inactive_bg: config.tab_inactive_bg.to_cell_color(),
+            tab_style: config.tab_style,
             sidebar_current_bg: config.sidebar_current_bg.to_cell_color(),
             whichkey_fg: config.whichkey_fg.to_cell_color(),
             whichkey_bg: config.whichkey_bg.to_cell_color(),
@@ -730,6 +767,23 @@ mod tests {
         let (fg, bg) = ct.mode_colors("SEARCH");
         assert_eq!(fg, CellColor::Rgb(30, 30, 46));
         assert_eq!(bg, CellColor::Rgb(249, 226, 175));
+    }
+
+    #[test]
+    fn tab_style_parses_from_the_appearance_theme_table() {
+        let config: crate::config::Config =
+            toml::from_str("[appearance.theme]\ntab_style = \"rounded\"\n").unwrap();
+        assert_eq!(config.compositor_theme().tab_style, TabStyle::Rounded);
+        for (name, style) in [
+            ("plain", TabStyle::Plain),
+            ("slanted", TabStyle::Slanted),
+            ("square", TabStyle::Square),
+        ] {
+            let t: ThemeConfig = toml::from_str(&format!("tab_style = \"{name}\"")).unwrap();
+            assert_eq!(t.tab_style, style);
+        }
+        assert_eq!(ThemeConfig::default().tab_style, TabStyle::Plain);
+        assert!(toml::from_str::<ThemeConfig>("tab_style = \"round\"").is_err());
     }
 
     #[test]

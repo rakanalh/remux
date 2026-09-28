@@ -607,6 +607,7 @@ frame_bg = "#1e1e2e"                # unset by default: borders keep the termina
 pane_label_fg = "#cdd6f4"           # unset by default: the label takes the border color
 status_bar_bg = { rgb = [40, 40, 40] }
 tab_inactive_bg = { ansi = 237 }    # the block behind an inactive tab in a pane's tab strip
+tab_style = "rounded"               # plain (default) | rounded | slanted | square chip caps
 sidebar_current_bg = "#3e385e"      # the agents panel row for the pane you are in
 layout_indicator_bg = { ansi = 245 }  # the bsp/grid/… indicator, in views too
 session_name_fg = "#94e2d5"
@@ -616,6 +617,12 @@ See [`config.sample.toml`](config.sample.toml) for the full list of roles.
 `frame_bg`, `pane_label_fg` and `pane_label_bg` are optional: leaving them unset
 keeps the historical appearance (borders and labels on the terminal's own
 background, the label in the border's focus-tracking color).
+
+`tab_style` puts end caps on the chips of a pane's tab strip. `rounded` and
+`slanted` draw Powerline glyphs and need a Nerd Font; `square` uses half blocks
+that any font has. It is a client setting, like `pane_title`: the client sends
+it to every server it views, local and remote, and a config edit takes effect on
+reload without `remux restart`.
 
 ## License
 

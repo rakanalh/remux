@@ -113,7 +113,10 @@ pub enum ConnDescriptor {
 ///
 /// 14 -> 15: [`ClientMessage::PaneTitle`], the client's naming template. An
 /// old server cannot decode it and would drop the connection.
-pub const PROTOCOL_VERSION: u32 = 15;
+///
+/// 15 -> 16: [`ClientMessage::TabStyle`], the client's tab chip caps. An old
+/// server cannot decode it and would drop the connection.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -336,6 +339,16 @@ pub enum ClientMessage {
     PaneTitle {
         template: Option<String>,
         host: String,
+    },
+    /// How this client wants tab chips capped: its `[appearance.theme]
+    /// tab_style`.
+    ///
+    /// Like [`ClientMessage::PaneTitle`], it governs the frames this server
+    /// renders for this client, including which columns a click on a tab
+    /// strip selects. A client that never sends this is drawn with the
+    /// server's own `tab_style`.
+    TabStyle {
+        style: crate::config::theme::TabStyle,
     },
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the

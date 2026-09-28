@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+use crate::config::theme::{CompositorTheme, TabStyle};
 use crate::config::{BorderStyle, Config};
 use crate::protocol;
 use crate::protocol::*;
@@ -894,6 +895,10 @@ struct ClientConnection {
     /// How this client wants panes named, from [`ClientMessage::PaneTitle`].
     /// `None` until it says, and for ever for an older client or the CLI.
     naming: Option<Naming>,
+    /// How this client wants tab chips capped, from
+    /// [`ClientMessage::TabStyle`]. `None` until it says, and for ever for an
+    /// older client or the CLI.
+    tab_style: Option<TabStyle>,
 }
 
 impl ClientConnection {
@@ -901,6 +906,20 @@ impl ClientConnection {
     /// template, or this server's for a client that never sent one.
     fn naming(&self) -> Naming {
         self.naming.clone().unwrap_or_else(Naming::server)
+    }
+
+    /// The tab style this client is drawn with: its own, or this server's for
+    /// a client that never sent one.
+    fn tab_style(&self, config: &Config) -> TabStyle {
+        self.tab_style.unwrap_or(config.appearance.theme.tab_style)
+    }
+
+    /// The theme to composite this client's frames with.
+    fn theme(&self, config: &Config) -> CompositorTheme {
+        CompositorTheme {
+            tab_style: self.tab_style(config),
+            ..config.compositor_theme()
+        }
     }
 
     /// This client's scroll offset into `pane_id`, unclamped.
@@ -1256,6 +1275,7 @@ impl RemuxServer {
                     session_tree_subscribed: false,
                     agents_subscribed: false,
                     naming: None,
+                    tab_style: None,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -1751,6 +1771,38 @@ async fn handle_client_message(
             }
             if tree_subscribed {
                 send_session_tree_to(&[client_id], state, panes, clients, dormant).await;
+            }
+            Ok(())
+        }
+        ClientMessage::TabStyle { style } => {
+            let session = {
+                let mut cls = clients.lock().await;
+                let Some(conn) = cls.get_mut(&client_id) else {
+                    return Ok(());
+                };
+                if conn.tab_style == Some(style) {
+                    return Ok(());
+                }
+                conn.tab_style = Some(style);
+                conn.session_name.clone()
+            };
+            // Everything already sent to this client was capped the old way.
+            if let Some(session) = session {
+                send_full_render_to_client(
+                    client_id,
+                    &session,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    RenderCtx {
+                        diff_against_baseline: false,
+                        names_are_fresh: false,
+                        force_full: true,
+                    },
+                )
+                .await;
             }
             Ok(())
         }
@@ -5527,7 +5579,7 @@ async fn handle_mouse_scroll(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode, naming) = {
+    let (session_name, cols, rows, mode, naming, theme) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -5539,6 +5591,7 @@ async fn handle_mouse_scroll(
             client.rows,
             client.mode.clone(),
             client.naming(),
+            client.theme(config),
         )
     };
     let session_name = match session_name {
@@ -5560,7 +5613,7 @@ async fn handle_mouse_scroll(
             None,
             None,
             &HashMap::new(),
-            &config.compositor_theme(),
+            &theme,
             &naming,
         )
         .await;
@@ -5715,7 +5768,7 @@ async fn handle_mouse_click(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode, naming) = {
+    let (session_name, cols, rows, mode, naming, theme) = {
         let mut cls = clients.lock().await;
         let client = match cls.get_mut(&client_id) {
             Some(c) => c,
@@ -5738,6 +5791,7 @@ async fn handle_mouse_click(
             client.rows,
             client.mode.clone(),
             client.naming(),
+            client.theme(config),
         )
     };
     let session_name = match session_name {
@@ -5759,7 +5813,7 @@ async fn handle_mouse_click(
             None,
             None,
             &HashMap::new(),
-            &config.compositor_theme(),
+            &theme,
             &naming,
         )
         .await;
@@ -5938,7 +5992,7 @@ async fn handle_mouse_drag(
     log::debug!(
         "server: MouseDrag client_id={client_id} start=({start_x},{start_y}) end=({end_x},{end_y}) is_final={is_final}"
     );
-    let (session_name, cols, rows, mode, naming) = {
+    let (session_name, cols, rows, mode, naming, theme) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -5950,6 +6004,7 @@ async fn handle_mouse_drag(
             client.rows,
             client.mode.clone(),
             client.naming(),
+            client.theme(config),
         )
     };
     let session_name = match session_name {
@@ -5974,7 +6029,7 @@ async fn handle_mouse_drag(
             None,
             None,
             &HashMap::new(),
-            &config.compositor_theme(),
+            &theme,
             &naming,
         )
         .await;
@@ -7972,7 +8027,7 @@ async fn send_full_render_to_client(
     log::debug!(
         "server: send_full_render_to_client client_id={client_id} session={session_name:?} dims={cols}x{rows}"
     );
-    let (mode, selection, client_search_info, client_scroll, naming) = {
+    let (mode, selection, client_search_info, client_scroll, naming, theme) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
         let mode = client
@@ -7984,7 +8039,10 @@ async fn send_full_render_to_client(
         let naming = client
             .map(ClientConnection::naming)
             .unwrap_or_else(Naming::server);
-        (mode, selection, si, scroll, naming)
+        let theme = client
+            .map(|c| c.theme(config))
+            .unwrap_or_else(|| config.compositor_theme());
+        (mode, selection, si, scroll, naming, theme)
     };
     // The pane that owns input is the one the wire's single `scroll_offset`
     // describes: the client gates its `ScrollReset` on that field, and the
@@ -8038,7 +8096,7 @@ async fn send_full_render_to_client(
         selection.as_ref(),
         client_search_info,
         &client_scroll,
-        &config.compositor_theme(),
+        &theme,
         &naming,
     )
     .await;
@@ -8260,7 +8318,7 @@ async fn broadcast_full_render(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
-    let (cols, rows, mode, selection, si, client_count, naming) = {
+    let (cols, rows, mode, selection, si, client_count, naming, theme) = {
         let cls = clients.lock().await;
         let attached: Vec<_> = cls
             .values()
@@ -8279,10 +8337,13 @@ async fn broadcast_full_render(
             .unwrap_or_else(|| "NORMAL".to_string());
         let selection = first.and_then(|c| c.mouse_selection.clone());
         let si = first.and_then(|c| c.search_info);
-        // The shared frame names panes the way the first client does. A client
-        // that names them differently is composited on its own, below.
+        // The shared frame names panes and caps tabs the way the first client
+        // does. A client that differs in either is composited on its own, below.
         let naming = first.map(|c| c.naming()).unwrap_or_else(Naming::server);
-        (cols, rows, mode, selection, si, count, naming)
+        let theme = first
+            .map(|c| c.theme(config))
+            .unwrap_or_else(|| config.compositor_theme());
+        (cols, rows, mode, selection, si, count, naming, theme)
     };
 
     log::debug!("server: broadcast_full_render session={session_name:?} clients={client_count}");
@@ -8314,7 +8375,7 @@ async fn broadcast_full_render(
         selection.as_ref(),
         si,
         &HashMap::new(),
-        &config.compositor_theme(),
+        &theme,
         &naming,
     )
     .await;
@@ -8424,7 +8485,10 @@ async fn broadcast_full_render(
             }
             let force_full = c.needs_full_render;
             c.needs_full_render = false; // consume it
-            if visible_panes.iter().any(|p| clamped_scroll(c, *p) != 0) || c.naming() != naming {
+            if visible_panes.iter().any(|p| clamped_scroll(c, *p) != 0)
+                || c.naming() != naming
+                || c.tab_style(config) != theme.tab_style
+            {
                 per_client.push((*id, force_full));
             } else {
                 shared.push((*id, c.tx.clone(), force_full));

@@ -18,7 +18,7 @@ use tokio::io::AsyncWrite;
 use tokio::process::Child;
 use tokio::sync::mpsc;
 
-use crate::client::terminal::RemuxClient;
+use crate::client::terminal::{Look, RemuxClient};
 use crate::config::RemoteConfig;
 use crate::protocol::{ClientMessage, ServerMessage};
 use crate::server::daemon::{read_message, write_message};
@@ -151,11 +151,11 @@ pub struct ConnectionManager {
     /// a terminal that connects after a shared view already exists lists it
     /// immediately. `None` once taken (or when nothing was captured).
     initial_view_infos: Option<Vec<crate::protocol::ViewInfo>>,
-    /// This client's `[appearance] pane_title`, sent to every remote straight
-    /// after its handshake. See [`RemuxClient::announce_naming`]. Shared with
-    /// background dials, which read it when their handshake completes, so a
-    /// config reload during a dial still reaches that remote.
-    pane_title: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// This client's [`Look`], sent to every remote straight after its
+    /// handshake. See [`RemuxClient::announce`]. Shared with background dials,
+    /// which read it when their handshake completes, so a config reload during
+    /// a dial still reaches that remote.
+    look: std::sync::Arc<std::sync::Mutex<Look>>,
 }
 
 impl ConnectionManager {
@@ -229,7 +229,7 @@ impl ConnectionManager {
             rx,
             local_server_version: None,
             initial_view_infos: None,
-            pane_title: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            look: std::sync::Arc::new(std::sync::Mutex::new(Look::default())),
         }
     }
 
@@ -386,9 +386,9 @@ impl ConnectionManager {
 
         match result {
             Ok(Ok(mut client)) => {
-                let template = self.pane_title();
-                if let Err(e) = client.announce_naming(template.as_deref(), name).await {
-                    log::warn!("registry: telling remote '{name}' its pane_title failed: {e:#}");
+                let look = self.look();
+                if let Err(e) = client.announce(&look, name).await {
+                    log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
                 }
                 self.install_remote(name, client);
                 Ok(())
@@ -459,7 +459,7 @@ impl ConnectionManager {
         );
         let tx = self.tx.clone();
         let name = name.to_string();
-        let pane_title = std::sync::Arc::clone(&self.pane_title);
+        let look = std::sync::Arc::clone(&self.look);
         tokio::spawn(async move {
             let connect = RemuxClient::connect_ssh(
                 &config.ssh,
@@ -471,14 +471,12 @@ impl ConnectionManager {
             let result =
                 match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
                     Ok(Ok(mut client)) => {
-                        let template = pane_title
+                        let look = look
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
-                        if let Err(e) = client.announce_naming(template.as_deref(), &name).await {
-                            log::warn!(
-                                "registry: telling remote '{name}' its pane_title failed: {e:#}"
-                            );
+                        if let Err(e) = client.announce(&look, &name).await {
+                            log::warn!("registry: telling remote '{name}' its look failed: {e:#}");
                         }
                         Ok(Box::new(client))
                     }
@@ -526,33 +524,34 @@ impl ConnectionManager {
         }
     }
 
-    /// Record this client's `pane_title`, for the remotes dialled from now on.
-    pub fn set_pane_title(&mut self, template: Option<String>) {
+    /// Record this client's [`Look`], for the remotes dialled from now on.
+    pub fn set_look(&mut self, look: Look) {
         *self
-            .pane_title
+            .look
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = template;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = look;
     }
 
-    fn pane_title(&self) -> Option<String> {
-        self.pane_title
+    fn look(&self) -> Look {
+        self.look
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    /// Tell every live connection this client's `pane_title` again, after a
-    /// config reload changed it.
-    pub async fn announce_pane_title(&mut self) {
-        let template = self.pane_title();
+    /// Tell every live connection this client's [`Look`] again, after a config
+    /// reload changed it.
+    pub async fn announce_look(&mut self) {
+        let look = self.look();
         for id in self.connected_ids() {
             let host = match &id {
                 ConnId::Local => String::new(),
                 ConnId::Remote(name) => name.clone(),
             };
-            let msg = crate::client::terminal::pane_title_message(template.as_deref(), &host);
-            if let Err(e) = self.send(&id, msg).await {
-                log::warn!("registry: telling {id:?} its pane_title failed: {e:#}");
+            for msg in look.messages(&host) {
+                if let Err(e) = self.send(&id, msg).await {
+                    log::warn!("registry: telling {id:?} its look failed: {e:#}");
+                }
             }
         }
     }

@@ -25,7 +25,7 @@ use crate::client::input::{
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
-use crate::client::terminal::{restore_terminal, setup_terminal, RemuxClient};
+use crate::client::terminal::{restore_terminal, setup_terminal, Look, RemuxClient};
 use crate::client::tree_model::JumpTarget;
 use crate::client::whichkey::WhichKeyPopup;
 use crate::config::{Config, RemoteConfig};
@@ -345,9 +345,7 @@ async fn main() -> Result<()> {
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
-            client
-                .announce_naming(config.appearance.pane_title.as_deref(), "")
-                .await?;
+            client.announce(&Look::from_config(&config), "").await?;
 
             // Create a default session or attach to existing one
             // First, ask the server for existing sessions
@@ -399,9 +397,7 @@ async fn main() -> Result<()> {
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
-            client
-                .announce_naming(config.appearance.pane_title.as_deref(), "")
-                .await?;
+            client.announce(&Look::from_config(&config), "").await?;
 
             client
                 .send(ClientMessage::CreateSession {
@@ -425,9 +421,7 @@ async fn main() -> Result<()> {
             ensure_server_running().await?;
             let mut client = RemuxClient::connect().await?;
             let config = Config::load()?;
-            client
-                .announce_naming(config.appearance.pane_title.as_deref(), "")
-                .await?;
+            client.announce(&Look::from_config(&config), "").await?;
 
             client
                 .send(ClientMessage::Attach {
@@ -491,9 +485,7 @@ async fn main() -> Result<()> {
             // so we deliberately do NOT call ensure_server_running() locally.
             let mut client = RemuxClient::connect_ssh(&dest, None, None, &[], &remux_path).await?;
             let config = Config::load()?;
-            client
-                .announce_naming(config.appearance.pane_title.as_deref(), &dest)
-                .await?;
+            client.announce(&Look::from_config(&config), &dest).await?;
 
             client
                 .send(ClientMessage::Attach { session_name: name })
@@ -808,7 +800,7 @@ async fn client_event_loop(
     // Auto-connect any remotes flagged `auto_connect` before entering raw mode,
     // so SSH host-key/password prompts render normally.
     // Before any remote is dialled: each one is told this at its handshake.
-    mgr.set_pane_title(config.appearance.pane_title.clone());
+    mgr.set_look(Look::from_config(config));
     connect_auto_remotes(mgr, config).await;
 
     log::debug!("client_event_loop: setting up terminal");
@@ -5639,6 +5631,7 @@ async fn run_client_loop(
                                     mx,
                                     my,
                                     &view_border_style,
+                                    &compositor_theme,
                                 ) {
                                     // Clicking a cell focuses it for EVERY terminal:
                                     // intent the shared focus change; the resync
@@ -5766,6 +5759,7 @@ async fn run_client_loop(
                                         mx,
                                         my,
                                         &view_border_style,
+                                        &compositor_theme,
                                     )
                                     .unwrap_or(views[av].focused)
                                 } else {
@@ -7586,8 +7580,8 @@ async fn run_client_loop(
                     // Update which-key placement so it changes live too.
                     which_key_position = new_config.appearance.which_key_position.clone();
                     pane_title = new_config.appearance.pane_title.clone();
-                    mgr.set_pane_title(pane_title.clone());
-                    mgr.announce_pane_title().await;
+                    mgr.set_look(Look::from_config(&new_config));
+                    mgr.announce_look().await;
                     agent_roster.set_pane_title(pane_title.clone());
 
                     // Reconcile the remotes roster (update in place / add new /

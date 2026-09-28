@@ -184,6 +184,21 @@
 # tab_inactive_fg = "#9399b2"
 # tab_inactive_bg = { ansi = 237 }
 
+# End caps around each tab chip in a pane's tab strip (the zellij top-border
+# tabs, the tmux tab bar, and a Monocle view's title strip):
+#   "plain"   - no caps, chips separated by ` | ` (the default)
+#   "rounded" - Powerline half circles U+E0B6 / U+E0B4 (needs a Nerd Font)
+#   "slanted" - Powerline slants U+E0BA / U+E0BC (needs a Nerd Font)
+#   "square"  - half blocks U+2590 / U+258C (any font)
+# Capped chips are separated by one space instead of ` | `. A strip too narrow
+# for one capped chip falls back to plain. A lone pane-name label gets caps only
+# when `pane_label_bg` gives it a background of its own. This is a CLIENT
+# setting: the client sends it to every server it views, local and remote, so
+# one config caps tabs the same way everywhere, and an edit applies on the next
+# config reload with no `remux restart`. A server's own `tab_style` only draws
+# for a client that never sent one (an older client).
+# tab_style = "plain"
+
 # The agents sidebar panel paints the row of the pane you are currently in as a
 # full-width bar in this colour. Keep it distinct from `tab_active_bg` and
 # `tab_inactive_bg`, which the panel uses for its j/k selection (focused and

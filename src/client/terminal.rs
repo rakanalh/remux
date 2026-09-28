@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
+use crate::config::theme::TabStyle;
+use crate::config::Config;
 use crate::protocol::{ClientMessage, Hello, ServerMessage, ViewInfo, Welcome, PROTOCOL_VERSION};
 use crate::server::daemon::{read_message, socket_path, write_message};
 
@@ -176,12 +178,15 @@ impl RemuxClient {
         write_message(&mut self.writer, &msg).await
     }
 
-    /// Tell the server how this client names panes: its `pane_title` template,
-    /// and `host`, the name it knows this server by (empty for the local
-    /// one). Sent straight after the handshake, before anything is attached,
-    /// so that even the first frame is named this client's way.
-    pub async fn announce_naming(&mut self, template: Option<&str>, host: &str) -> Result<()> {
-        self.send(pane_title_message(template, host)).await
+    /// Tell the server how this client wants its frames drawn, and `host`,
+    /// the name it knows this server by (empty for the local one). Sent
+    /// straight after the handshake, before anything is attached, so that
+    /// even the first frame is drawn this client's way.
+    pub async fn announce(&mut self, look: &Look, host: &str) -> Result<()> {
+        for msg in look.messages(host) {
+            self.send(msg).await?;
+        }
+        Ok(())
     }
 
     /// The `remux_version` the server reported during the handshake. Compared
@@ -255,12 +260,35 @@ impl RemuxClient {
     }
 }
 
-/// The [`ClientMessage::PaneTitle`] that tells a server how this client names
-/// panes.
-pub fn pane_title_message(template: Option<&str>, host: &str) -> ClientMessage {
-    ClientMessage::PaneTitle {
-        template: template.map(str::to_string),
-        host: host.to_string(),
+/// The client settings every server it views draws with, whichever machine
+/// that server is on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Look {
+    /// `[appearance] pane_title`.
+    pub pane_title: Option<String>,
+    /// `[appearance.theme] tab_style`.
+    pub tab_style: TabStyle,
+}
+
+impl Look {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            pane_title: config.appearance.pane_title.clone(),
+            tab_style: config.appearance.theme.tab_style,
+        }
+    }
+
+    /// The messages that tell a server known as `host` this look.
+    pub fn messages(&self, host: &str) -> [ClientMessage; 2] {
+        [
+            ClientMessage::PaneTitle {
+                template: self.pane_title.clone(),
+                host: host.to_string(),
+            },
+            ClientMessage::TabStyle {
+                style: self.tab_style,
+            },
+        ]
     }
 }
 

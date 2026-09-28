@@ -633,6 +633,7 @@ pub fn cell_at(
     x: u16,
     y: u16,
     style: &BorderStyle,
+    theme: &CompositorTheme,
 ) -> Option<usize> {
     if view.cells.is_empty() {
         return None;
@@ -644,7 +645,7 @@ pub fn cell_at(
         if y == strip.y && x >= strip.x && x < strip.x + strip.width {
             let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
             let rel = (x - strip.x) as usize;
-            if let Some(entry) = tab_strip_layout(&titles, strip.width as usize, style)
+            if let Some(entry) = tab_strip_layout(&titles, strip.width as usize, style, theme)
                 .into_iter()
                 .find(|e| rel >= e.start && rel < e.end)
             {
@@ -1121,10 +1122,10 @@ pub fn cell_label(
 /// pixel-identical to a normal Monocle tab's —
 /// [`build_top_border_content`](crate::server::compositor::build_top_border_content)
 /// for `ZellijStyle` (top-border tabs: fixed tab width, the active tab filled
-/// with `theme.mode_colors(mode)`, inactive tabs on `tab_inactive_bg`,
-/// `" | "` separators) and
+/// with `theme.mode_colors(mode)`, inactive tabs on `tab_inactive_bg`) and
 /// [`draw_tmux_tab_bar`](crate::server::compositor::draw_tmux_tab_bar) for
-/// `TmuxStyle` (status-bar-colored bar, `separator_fg` separators).
+/// `TmuxStyle` (status-bar-colored bar). Tabs are separated by `" | "`, or by a
+/// one-space gap when `tab_style` caps the strip.
 ///
 /// The cells' [`ViewCell::id`]s serve as the pseudo-pane ids and the focused
 /// cell index as the active index. In zellij style the strip is drawn in the
@@ -1945,7 +1946,7 @@ mod tests {
         let strip = monocle_strip_rect(&view, a).unwrap();
         let width = strip.width as usize;
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let segs = tab_strip_layout(&titles, width, &zj());
+        let segs = tab_strip_layout(&titles, width, &zj(), &tt());
         assert_eq!(segs.len(), 3, "three visible tabs");
         let (_, mode_bg) = theme.mode_colors("NORMAL");
         for TabStripEntry {
@@ -2208,12 +2209,46 @@ mod tests {
         // draw it, then hit-test its middle column.
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
         let strip = monocle_strip_rect(&view, a).unwrap();
-        let segs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        let segs = tab_strip_layout(&titles, strip.width as usize, &zj(), &tt());
         let beta = segs.iter().find(|e| e.index == 1).unwrap();
         let mid = strip.x + ((beta.start + beta.end) / 2) as u16;
-        assert_eq!(cell_at(&view, a, mid, strip.y, &zj()), Some(1));
+        assert_eq!(cell_at(&view, a, mid, strip.y, &zj(), &tt()), Some(1));
         // A click below the strip resolves to the focused cell (0).
-        assert_eq!(cell_at(&view, a, 5, 5, &zj()), Some(0));
+        assert_eq!(cell_at(&view, a, 5, 5, &zj(), &tt()), Some(0));
+    }
+
+    #[test]
+    fn capped_monocle_strip_draws_caps_where_cell_at_hits() {
+        let theme = CompositorTheme {
+            tab_style: crate::config::theme::TabStyle::Rounded,
+            ..tt()
+        };
+        let mut cells: Vec<ViewCell> = (0..3).map(|id| cell_with(id, None)).collect();
+        cells[0].title = Some("alpha".into());
+        cells[1].title = Some("bb".into());
+        cells[2].title = Some("gamma".into());
+        let view = view_of(cells, monoclev(), 1);
+        let a = area(80, 24);
+        let strip = monocle_strip_rect(&view, a).unwrap();
+        let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
+        for style in [zj(), tmx()] {
+            let buf = composite(&view, a, &theme, "NORMAL", &style);
+            let row = &buf[(strip.y - a.y) as usize];
+            let segs = tab_strip_layout(&titles, strip.width as usize, &style, &theme);
+            assert_eq!(segs.len(), 3, "{style:?}");
+            for seg in &segs {
+                let (l, r) = (strip.x as usize + seg.start, strip.x as usize + seg.end - 1);
+                assert_eq!((row[l].c, row[r].c), ('\u{E0B6}', '\u{E0B4}'), "{style:?}");
+                assert_eq!(row[l].fg, row[l + 1].bg, "cap takes the chip bg");
+                for col in [l, r] {
+                    assert_eq!(
+                        cell_at(&view, a, col as u16, strip.y, &style, &theme),
+                        Some(seg.index),
+                        "a click on a cap selects its tab ({style:?})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2231,14 +2266,14 @@ mod tests {
         let a = area(80, 24);
         let strip = monocle_strip_rect(&view, a).unwrap();
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let segs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        let segs = tab_strip_layout(&titles, strip.width as usize, &zj(), &tt());
         assert_eq!(segs[0].start, 0, "a lone chip is flush at the strip start");
 
         // Every column of the painted chip resolves to cell 0 -- including the
         // FIRST, which is what used to miss.
         for rel in segs[0].start..segs[0].end {
             assert_eq!(
-                cell_at(&view, a, strip.x + rel as u16, strip.y, &zj()),
+                cell_at(&view, a, strip.x + rel as u16, strip.y, &zj(), &tt()),
                 Some(0),
                 "strip column {rel} did not hit the only cell"
             );
@@ -2264,13 +2299,13 @@ mod tests {
         let a = area(80, 24);
         let strip = monocle_strip_rect(&view, a).unwrap();
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let segs = tab_strip_layout(&titles, strip.width as usize, &zj());
+        let segs = tab_strip_layout(&titles, strip.width as usize, &zj(), &tt());
         // 3 CHARS + 2 padding = 5-wide tabs, not 9 bytes + 2.
         assert_eq!(segs[0].end - segs[0].start, 5);
         for entry in &segs {
             let mid = strip.x + ((entry.start + entry.end) / 2) as u16;
             assert_eq!(
-                cell_at(&view, a, mid, strip.y, &zj()),
+                cell_at(&view, a, mid, strip.y, &zj(), &tt()),
                 Some(entry.index),
                 "tab {} mid column resolved elsewhere",
                 entry.index
@@ -2682,13 +2717,13 @@ mod tests {
             let r = r.unwrap();
             let x = r.x + r.width / 2;
             let y = r.y + r.height / 2;
-            assert_eq!(cell_at(&view, a, x, y, &zj()), Some(i));
+            assert_eq!(cell_at(&view, a, x, y, &zj(), &tt()), Some(i));
         }
         // A click on the reserved status row hits nothing.
-        assert_eq!(cell_at(&view, a, 10, a.height - 1, &zj()), None);
+        assert_eq!(cell_at(&view, a, 10, a.height - 1, &zj(), &tt()), None);
         // Empty view: no hit.
         let empty = ClientView::new("e".into());
-        assert_eq!(cell_at(&empty, a, 10, 10, &zj()), None);
+        assert_eq!(cell_at(&empty, a, 10, 10, &zj(), &tt()), None);
     }
 
     #[test]
@@ -2702,7 +2737,7 @@ mod tests {
             custom_tree: None,
             zoomed: false,
         };
-        assert_eq!(cell_at(&view, area(80, 24), 5, 5, &zj()), Some(1));
+        assert_eq!(cell_at(&view, area(80, 24), 5, 5, &zj(), &tt()), Some(1));
     }
 
     #[test]
@@ -3184,14 +3219,14 @@ mod tests {
         assert!(text.contains("pane 1"), "titles missing: {text:?}");
 
         let titles: Vec<String> = view.cells.iter().map(cell_title).collect();
-        let zsegs = tab_strip_layout(&titles, strip.width as usize, &zj());
-        let tsegs = tab_strip_layout(&titles, strip.width as usize, &tmx());
+        let zsegs = tab_strip_layout(&titles, strip.width as usize, &zj(), &tt());
+        let tsegs = tab_strip_layout(&titles, strip.width as usize, &tmx(), &tt());
         assert_eq!(
             zsegs[0].start, 1,
             "zellij strip starts after a leading space"
         );
         assert_eq!(tsegs[0].start, 0, "tmux tab bar starts flush left");
         // A click on the first tab still resolves to cell 0 in tmux style.
-        assert_eq!(cell_at(&view, a, strip.x, strip.y, &tmx()), Some(0));
+        assert_eq!(cell_at(&view, a, strip.x, strip.y, &tmx(), &tt()), Some(0));
     }
 }
