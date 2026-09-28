@@ -16,11 +16,15 @@ string, so the check holds on any platform and any `/bin/sh`.
      shell
   4. a pane whose program execs another (`sh -c 'sleep 1; exec sleep 30'`) is
      renamed by what it became
+  5. a copy of `sleep` named `2.1.283`, run as `claude` through a symlink and
+     (on macOS) through an exec with argv[0] `claude`, is named `claude`, as
+     Claude Code is
 
 Run: python3 tests/frame/pane_shell_name.py
 """
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -191,6 +195,49 @@ def main():
         after = pane_names(c)
         check("sleep" in after.values(),
               f"4 a pane that execs is renamed by what it became ({sorted(before)} -> {after})")
+
+        # 5. A program whose executable has a version for a name, run as
+        # `claude`, the way Claude Code's launcher runs it: a symlink named
+        # `claude` to `versions/<version>`, and an exec with argv[0] set to
+        # `claude`. macOS reports the executable's real path, so a name read
+        # from it says the version.
+        versions = f"{RUNDIR}/v"
+        os.makedirs(versions, exist_ok=True)
+        real = f"{versions}/2.1.283"
+        shutil.copy("/bin/sleep", real)
+        os.chmod(real, 0o755)
+        if sys.platform == "darwin":
+            # A copied system binary keeps a signature that no longer matches
+            # its path, and macOS kills it on exec. Re-sign it ad hoc.
+            subprocess.run(["codesign", "--force", "-s", "-", real],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        link = f"{RUNDIR}/claude"
+        os.symlink(real, link)
+        launches = {
+            "a symlink named claude": [link, "30"],
+            "an exec with argv[0] claude": [
+                sys.executable, "-c",
+                f"import os; os.execv({real!r}, ['claude', '30'])",
+            ],
+        }
+        for how, argv in launches.items():
+            if how.startswith("an exec") and sys.platform != "darwin":
+                # Linux names a process by its `comm`, which an exec sets from
+                # the file's name and not from argv[0]. Real launches go
+                # through the symlink, which the first case covers.
+                continue
+            before_ids = set(pane_names(c))
+            cli = Client(srv.sock)
+            cli.hello()
+            cli.send({"CliSpawn": {"session": "main", "placement": "SplitBelow",
+                                   "argv": argv, "cwd": None}})
+            cli.drain(0.5)
+            cli.close()
+            time.sleep(2.5)
+            names = pane_names(c)
+            new = [n for pid, n in names.items() if pid not in before_ids]
+            check(new == ["claude"],
+                  f"5 a versioned executable run through {how} is named claude ({new})")
 
         # Enough panes that a restore starts a burst of shells.
         for _ in range(3):

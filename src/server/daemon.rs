@@ -70,32 +70,21 @@ pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
 #[cfg(target_os = "linux")]
 pub(crate) fn get_process_name(pid: i32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|s| s.trim().to_string())
+        .map(|s| crate::config::pane_title::sanitize_label(s.trim()))
         .unwrap_or_else(|_| "shell".to_string())
 }
 
-/// The one `sysinfo::System` this module owns, built on first use, for
-/// [`get_process_names`]' `argv[0]`.
+/// See the Linux variant for documentation. macOS has no `/proc` and no
+/// `comm` a program sets for itself, so a process is named by its current
+/// `argv[0]` ([`command_name_from_argv0`]), and by the basename of its
+/// executable's path only when `argv[0]` is missing or empty. Both are read
+/// on every call.
 ///
-/// Built once because on macOS `System::new()` calls `mach_host_self()`, reads
-/// the host clock info, enumerates CPUs and allocates a 200-slot process map
-/// before the refresh that does the work, and the caller runs per candidate
-/// pane at up to 10 Hz.
-///
-/// Still a different one from [`crate::server::persistence::get_pane_cwd`]'s:
-/// that one is private to its function, refreshes a different field (`cwd`) and
-/// is driven by a different push. Sharing across modules would couple two
-/// cadences for no gain.
-#[cfg(target_os = "macos")]
-fn proc_system() -> &'static std::sync::Mutex<sysinfo::System> {
-    use std::sync::{Mutex, OnceLock};
-    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
-    SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()))
-}
-
-/// See the Linux variant for documentation. macOS has no `/proc`, so the name
-/// is the basename of the executable's path, read with `proc_pidpath` on every
-/// call.
+/// `argv[0]` first because the executable's path names what is on disk, not
+/// what was run. Claude Code's launcher is a symlink named `claude` to
+/// `versions/<version>`, and `proc_pidpath` resolves it, so a pane named from
+/// the path read `2.1.283`. Linux reports `claude` there, because `comm` is
+/// taken from the name the program was run by.
 ///
 /// **Not through `sysinfo`, which is what this used to do.** `sysinfo` sets a
 /// process's name once, when it first sees the pid (`if process.name.is_empty()`
@@ -103,12 +92,97 @@ fn proc_system() -> &'static std::sync::Mutex<sysinfo::System> {
 /// neither the pid nor its start time, so the entry is never replaced. A new
 /// pane's shell looked at in the instant between the server's fork and the
 /// shell's exec was therefore named `remux` for the rest of its life, and a
-/// program that execs another kept its first name. `proc_pidpath` reads the
-/// kernel's current answer, and costs one syscall where the refresh cost the
-/// `KERN_PROCARGS2` pair.
+/// program that execs another kept its first name. Both reads here are the
+/// kernel's current answer.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_process_name(pid: i32) -> String {
-    executable_name(pid).unwrap_or_else(|| "shell".to_string())
+    process_argv0(pid)
+        .as_deref()
+        .and_then(command_name_from_argv0)
+        .or_else(|| executable_name(pid))
+        .unwrap_or_else(|| "shell".to_string())
+}
+
+/// The name a process's `argv[0]` gives it: the basename of a path, without
+/// the leading `-` a login shell is run with. `None` for an empty one.
+#[cfg(any(target_os = "macos", test))]
+fn command_name_from_argv0(argv0: &str) -> Option<String> {
+    let base = argv0.rsplit('/').next().unwrap_or(argv0);
+    let name = crate::config::pane_title::sanitize_label(base.strip_prefix('-').unwrap_or(base));
+    (!name.is_empty()).then_some(name)
+}
+
+/// `pid`'s current `argv[0]`, read with the `KERN_PROCARGS2` sysctl.
+#[cfg(target_os = "macos")]
+fn process_argv0(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a size query; no buffer is written.
+    let queried = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if queried == -1 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` is writable for `size` bytes, and the kernel lowers `size`
+    // to what it wrote.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read == -1 {
+        return None;
+    }
+    buf.truncate(size);
+    argv0_from_procargs(&buf)
+}
+
+/// `argv[0]` out of a `KERN_PROCARGS2` buffer: a native-endian `int argc`,
+/// then the executable's path, NUL-padded to the next multiple of 8 bytes
+/// after its terminator, then `argv` as NUL-terminated strings.
+///
+/// `argv[0]` is read at exactly that offset, so an EMPTY `argv[0]` comes back
+/// empty. Skipping every NUL after the path instead, as `ps` does, takes the
+/// next non-empty string for it: `argv[1]`, or with `argc` 1 the first
+/// `KEY=VALUE` of the environment, which would then name the pane and be
+/// saved to `state.json`. The padding rule was measured on macOS 27 for paths
+/// of every length modulo 8. Should the bytes before that offset not all be
+/// NUL, the padding is shorter than the rule says, `argv[0]` is not empty,
+/// and the first non-NUL byte starts it.
+#[cfg(any(target_os = "macos", test))]
+fn argv0_from_procargs(buf: &[u8]) -> Option<String> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    if argc < 1 {
+        return None;
+    }
+    let area = &buf[4..];
+    let path_end = area.iter().position(|&b| b == 0)?;
+    let aligned = (path_end + 1).div_ceil(8) * 8;
+    let padding = area.get(path_end..aligned.min(area.len()))?;
+    let start = match padding.iter().position(|&b| b != 0) {
+        Some(early) => path_end + early,
+        None => aligned,
+    };
+    let args = area.get(start..)?;
+    let end = args.iter().position(|&b| b == 0)?;
+    Some(String::from_utf8_lossy(&args[..end]).into_owned())
 }
 
 /// The basename of `pid`'s executable, as the kernel reports it now.
@@ -127,7 +201,9 @@ fn executable_name(pid: i32) -> Option<String> {
         return None;
     }
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&buf[..n as usize]));
-    path.file_name().map(|f| f.to_string_lossy().into_owned())
+    path.file_name()
+        .map(|f| crate::config::pane_title::sanitize_label(&f.to_string_lossy()))
+        .filter(|name| !name.is_empty())
 }
 
 /// Fallback for platforms with no known way to name a foreign process. Always
@@ -149,10 +225,9 @@ pub(crate) fn get_process_name(_pid: i32) -> String {
 ///   basename, and a process may then set it to whatever it likes
 ///   (`prctl(PR_SET_NAME)`, which is what `process.title =` compiles down to in
 ///   every Node/Bun-shaped runtime).
-/// * macOS `sysinfo` reports `exe.file_name()` -- the EXECUTABLE PATH's
-///   basename, from `KERN_PROCARGS2`'s `exec_path` or `proc_pidpath`
-///   (`sysinfo-0.35.2/src/unix/apple/macos/process.rs:574` and `:439`). It never
-///   reads `p_comm`, and no title a process sets for itself can move it.
+/// * macOS names it by the EXECUTABLE PATH's basename (`proc_pidpath`), which
+///   resolves symlinks. It never reads `p_comm`, and no title a process sets
+///   for itself can move it.
 ///
 /// Claude Code is exactly the program that falls in the gap. Its installer
 /// execs a VERSIONED path with `argv[0] = "claude"`:
@@ -168,12 +243,14 @@ pub(crate) fn get_process_name(_pid: i32) -> String {
 /// on my Mac" report. `argv[0]` is the name both platforms agree on, so it is
 /// carried alongside as the second candidate.
 ///
-/// **This is deliberately NOT [`get_process_name`].** Pane names keep reading
-/// `comm` alone: that runs per live pane from the session-tree push while three
-/// locks are held, and it has no naming problem to fix.
+/// `name` is the kernel's name, deliberately not [`get_process_name`]'s: on
+/// macOS that prefers `argv[0]` for pane names, and detection tries the
+/// kernel's name first so that its outcome, and every harness pinning it, is
+/// unchanged.
 pub(crate) struct ProcessNames {
-    /// Whatever [`get_process_name`] reports. Never empty -- `"shell"` when the
-    /// process cannot be read at all.
+    /// The kernel's name for the process: `comm` on Linux, the executable's
+    /// basename on macOS. Never empty -- `"shell"` when the process cannot be
+    /// read at all.
     pub name: String,
     /// The process's `argv[0]`, VERBATIM: a bare word (`claude`), a path
     /// (`/usr/local/bin/claude`), or a login shell's leading-dash convention
@@ -190,9 +267,8 @@ pub(crate) struct ProcessNames {
 /// to match, and that is a deliberate trade. Making it lazy would save one small
 /// procfs read per non-agent pane per sample (single-digit microseconds, against
 /// a `tcgetpgrp` syscall and a `comm` read already paid on the same pass) and
-/// would cost the macOS arm a SECOND `KERN_PROCARGS2` round trip, because
-/// `sysinfo` re-runs it on every `refresh_processes_specifics` regardless of the
-/// refresh kind. Cheap where it is paid, avoided where it is dear.
+/// would save the macOS arm nothing, since its name read does not give
+/// `argv[0]`. Cheap where it is paid.
 #[cfg(target_os = "linux")]
 pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
     ProcessNames {
@@ -201,45 +277,24 @@ pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
             .ok()
             .and_then(|raw| {
                 let first = raw.split(|b| *b == 0).next()?;
-                (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
+                let argv0 =
+                    crate::config::pane_title::strip_unprintable(&String::from_utf8_lossy(first));
+                (!argv0.is_empty()).then_some(argv0)
             }),
     }
 }
 
-/// See the Linux variant for documentation. macOS reads `argv[0]` through
-/// `sysinfo`, whose refresh runs the `KERN_PROCARGS2` sysctl pair and parses
-/// the arguments out of it.
-///
-/// The name comes from [`get_process_name`], not from `sysinfo`, for the
-/// reason given there. `argv[0]` is re-parsed on every call
-/// (`UpdateKind::Always`) for the same reason: an `exec` replaces it, and a
-/// parse cached from before one names the program that was replaced.
+/// See the Linux variant for documentation. On macOS the name is the
+/// executable's basename, which is what agent detection matches first, and
+/// `argv[0]` is read fresh with the `KERN_PROCARGS2` sysctl on every call, as
+/// an `exec` replaces it.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_process_names(pid: i32) -> ProcessNames {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
-
-    let unknown = || ProcessNames {
-        name: "shell".to_string(),
-        argv0: None,
-    };
-    if pid <= 0 {
-        return unknown();
-    }
-    let spid = Pid::from_u32(pid as u32);
-    let mut system = proc_system()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[spid]),
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let argv0 = system
-        .process(spid)
-        .and_then(|p| p.cmd().first().map(|a| a.to_string_lossy().to_string()));
-    match executable_name(pid) {
-        Some(name) => ProcessNames { name, argv0 },
-        None => unknown(),
+    ProcessNames {
+        name: executable_name(pid).unwrap_or_else(|| "shell".to_string()),
+        argv0: process_argv0(pid)
+            .map(|a| crate::config::pane_title::strip_unprintable(&a))
+            .filter(|a| !a.is_empty()),
     }
 }
 
@@ -3479,6 +3534,7 @@ async fn handle_command(
             }
         }
         RemuxCommand::PaneRename(name) => {
+            let name = crate::config::pane_title::sanitize_label(&name);
             log::debug!("server: PaneRename new_name={name:?}");
             {
                 let mut st = state.lock().await;
@@ -4048,6 +4104,7 @@ async fn handle_command(
             pane_id,
             name,
         } => {
+            let name = crate::config::pane_title::sanitize_label(&name);
             log::debug!(
                 "server: PaneRenameById session={session:?} pane_id={pane_id} name={name:?}"
             );
@@ -10093,6 +10150,107 @@ mod tests {
             Naming::new(None, "mini".into()),
             Naming::new(None, String::new())
         );
+    }
+
+    #[test]
+    fn argv0_names_a_process_by_its_basename_without_a_login_dash() {
+        use super::command_name_from_argv0 as name;
+        assert_eq!(name("claude").as_deref(), Some("claude"));
+        assert_eq!(
+            name("/Users/u/.local/bin/claude").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(name("-zsh").as_deref(), Some("zsh"));
+        assert_eq!(name("/bin/-weird").as_deref(), Some("weird"));
+        assert_eq!(name("--x").as_deref(), Some("-x"), "only one login dash");
+        assert_eq!(name(""), None);
+        assert_eq!(name("-"), None);
+        assert_eq!(name("/usr/bin/"), None);
+    }
+
+    #[test]
+    fn argv0_is_read_out_of_a_procargs_buffer() {
+        use super::argv0_from_procargs as argv0;
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/Users/u/.local/share/claude/versions/2.1.283\0\0\0");
+        buf.extend_from_slice(b"claude\0--resume\0HOME=/Users/u\0");
+        assert_eq!(argv0(&buf).as_deref(), Some("claude"));
+        let mut none = 0i32.to_ne_bytes().to_vec();
+        none.extend_from_slice(b"/bin/x\0\0");
+        assert_eq!(argv0(&none), None, "argc 0");
+        assert_eq!(argv0(&[1, 0]), None, "too short");
+    }
+
+    #[test]
+    fn an_empty_argv0_is_read_as_empty_not_as_the_next_string() {
+        use super::argv0_from_procargs as argv0;
+        // A 12-byte path, its NUL and three bytes of padding reach offset 16,
+        // where argv[0] starts: here an empty one, so its NUL is at 16.
+        let buf = |argc: i32, after: &[u8]| {
+            let mut b = argc.to_ne_bytes().to_vec();
+            b.extend_from_slice(b"/tmp/x/sssss\0\0\0\0");
+            b.extend_from_slice(after);
+            b
+        };
+        assert_eq!(argv0(&buf(1, b"\0SECRET=hunter2\0")).as_deref(), Some(""));
+        assert_eq!(argv0(&buf(2, b"\x005\0USER=u\0")).as_deref(), Some(""));
+        assert_eq!(argv0(&buf(2, b"x\x005\0")).as_deref(), Some("x"));
+        // A path whose NUL lands on a multiple of 8 is padded by a whole 8.
+        let mut b = 1i32.to_ne_bytes().to_vec();
+        b.extend_from_slice(b"/tmp/x/sssssssss\0\0\0\0\0\0\0\0");
+        b.extend_from_slice(b"\0HOME=/Users/u\0");
+        assert_eq!(argv0(&b).as_deref(), Some(""));
+        // Shorter padding than the rule: the first non-NUL byte is argv[0].
+        let mut short = 1i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/tmp/x/sssss\0claude\0");
+        assert_eq!(argv0(&short).as_deref(), Some("claude"));
+    }
+
+    /// On macOS a pane is named by `argv[0]`: the `KERN_PROCARGS2` read must
+    /// succeed and name the process, not fall back to the executable's path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_names_a_process_by_its_argv0() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0("claude")
+            .arg("5")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let argv0 = super::process_argv0(pid);
+        let name = super::get_process_name(pid);
+        let exe = super::executable_name(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(argv0.as_deref(), Some("claude"), "the sysctl read argv[0]");
+        assert_eq!(
+            exe.as_deref(),
+            Some("sleep"),
+            "the path would have said sleep"
+        );
+        assert_eq!(name, "claude");
+    }
+
+    /// A long `argv[0]` keeps its basename: detection and naming take the
+    /// basename of it, so it must not be cut to a label's length first.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_long_argv0_path_keeps_its_basename() {
+        use std::os::unix::process::CommandExt;
+        let long = format!("/{}/claude", "d".repeat(300));
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0(&long)
+            .arg("5")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let names = super::get_process_names(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(names.argv0.as_deref(), Some(long.as_str()));
     }
 
     /// A process first looked at before an `exec` is named by what it became

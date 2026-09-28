@@ -12,6 +12,27 @@ use crossterm::style::{
 };
 use crossterm::{cursor, queue, terminal};
 
+/// `c`, or a space in its place when it is a control character.
+///
+/// Every character the client prints goes through this. Cells arrive from a
+/// server, and names inside them (session, tab, pane, view) are whatever a
+/// client or a program chose; a control character among them would start an
+/// escape sequence in the user's OUTER terminal, where remux's emulator and
+/// its OSC 52 policy cannot see it. A space keeps the cell's width.
+fn printable(c: char) -> char {
+    if c.is_control() {
+        ' '
+    } else {
+        c
+    }
+}
+
+/// `text` with its control characters dropped, for text that is framed inside
+/// an escape sequence the client writes itself, such as a hyperlink's URI.
+fn printable_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 use crate::client::input::{SelectionMode, VisualState};
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
@@ -343,17 +364,20 @@ impl Renderer {
                 }
                 if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
                     match &cell.hyperlink {
-                        Some(uri) => queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        Some(uri) => queue!(
+                            stdout,
+                            Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri)))
+                        )?,
                         None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
                     }
                     last_hyperlink = cell.hyperlink.clone();
                 }
 
-                queue!(stdout, Print(cell.c))?;
+                queue!(stdout, Print(printable(cell.c)))?;
                 // Combining marks are zero-width; the terminal composes them onto
                 // the base glyph just printed without advancing the cursor.
                 for m in &cell.combining {
-                    queue!(stdout, Print(*m))?;
+                    queue!(stdout, Print(printable(*m)))?;
                 }
             }
 
@@ -513,13 +537,16 @@ impl Renderer {
                 // link before Print and close it after so it can't leak to the
                 // next moved-cursor position.
                 if let Some(uri) = &change.cell.hyperlink {
-                    queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?;
+                    queue!(
+                        stdout,
+                        Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri)))
+                    )?;
                 }
 
-                queue!(stdout, Print(change.cell.c))?;
+                queue!(stdout, Print(printable(change.cell.c)))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &change.cell.combining {
-                    queue!(stdout, Print(*m))?;
+                    queue!(stdout, Print(printable(*m)))?;
                 }
                 if change.cell.hyperlink.is_some() {
                     queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
@@ -746,15 +773,18 @@ impl Renderer {
                 }
                 if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
                     match &cell.hyperlink {
-                        Some(uri) => queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        Some(uri) => queue!(
+                            stdout,
+                            Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri)))
+                        )?,
                         None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
                     }
                     last_hyperlink = cell.hyperlink.clone();
                 }
-                queue!(stdout, Print(cell.c))?;
+                queue!(stdout, Print(printable(cell.c)))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &cell.combining {
-                    queue!(stdout, Print(*m))?;
+                    queue!(stdout, Print(printable(*m)))?;
                 }
             }
 
@@ -872,16 +902,18 @@ impl Renderer {
                 }
                 if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
                     match &cell.hyperlink {
-                        Some(uri) => queue!(out, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        Some(uri) => {
+                            queue!(out, Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri))))?
+                        }
                         None => queue!(out, Print("\x1b]8;;\x1b\\"))?,
                     }
                     last_hyperlink = cell.hyperlink.clone();
                 }
-                queue!(out, Print(cell.c))?;
+                queue!(out, Print(printable(cell.c)))?;
                 // Combining marks are zero-width; they compose onto the base
                 // glyph just printed.
                 for m in &cell.combining {
-                    queue!(out, Print(*m))?;
+                    queue!(out, Print(printable(*m)))?;
                 }
                 self.front[sy][sx] = cell.clone();
             }
@@ -993,7 +1025,7 @@ impl Renderer {
             )?;
             // Truncate text to not exceed screen width.
             let max_chars = (self.cols - cmd.x) as usize;
-            let text: String = cmd.text.chars().take(max_chars).collect();
+            let text: String = cmd.text.chars().take(max_chars).map(printable).collect();
             queue!(stdout, Print(text), ResetColor)?;
         }
 
@@ -1087,15 +1119,18 @@ impl Renderer {
                 }
                 if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
                     match &cell.hyperlink {
-                        Some(uri) => queue!(stdout, Print(format!("\x1b]8;;{}\x1b\\", uri)))?,
+                        Some(uri) => queue!(
+                            stdout,
+                            Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri)))
+                        )?,
                         None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
                     }
                     last_hyperlink = cell.hyperlink.clone();
                 }
-                queue!(stdout, Print(cell.c))?;
+                queue!(stdout, Print(printable(cell.c)))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &cell.combining {
-                    queue!(stdout, Print(*m))?;
+                    queue!(stdout, Print(printable(*m)))?;
                 }
             }
             // Close any open hyperlink so links never span rows on the wire.
@@ -1175,10 +1210,10 @@ impl Renderer {
                     if cell.bold {
                         queue!(stdout, SetAttribute(Attribute::Bold))?;
                     }
-                    queue!(stdout, Print(cell.c))?;
+                    queue!(stdout, Print(printable(cell.c)))?;
                     // Combining marks compose onto the base glyph just printed.
                     for m in &cell.combining {
-                        queue!(stdout, Print(*m))?;
+                        queue!(stdout, Print(printable(*m)))?;
                     }
                     queue!(stdout, ResetColor)?;
                 }
@@ -1212,11 +1247,11 @@ impl Renderer {
                         MoveTo(cursor_screen_col, cursor_screen_row),
                         SetForegroundColor(fg),
                         SetBackgroundColor(bg),
-                        Print(cell.c),
+                        Print(printable(cell.c)),
                     )?;
                     // Combining marks compose onto the base glyph just printed.
                     for m in &cell.combining {
-                        queue!(stdout, Print(*m))?;
+                        queue!(stdout, Print(printable(*m)))?;
                     }
                     queue!(stdout, ResetColor)?;
                 }
@@ -1371,7 +1406,7 @@ impl Renderer {
             stdout,
             Print(format!(
                 "{BOX_VERTICAL} {}{} {BOX_VERTICAL}",
-                display_text,
+                printable_text(display_text),
                 " ".repeat(padding)
             ))
         )?;
@@ -1432,7 +1467,7 @@ impl Renderer {
         };
 
         let max_len = cols as usize;
-        let display: String = prompt.chars().take(max_len).collect();
+        let display: String = prompt.chars().take(max_len).map(printable).collect();
         let padding = max_len.saturating_sub(display.len());
 
         queue!(stdout, cursor::Hide)?;
@@ -1540,7 +1575,7 @@ impl Renderer {
                     MoveTo(screen_x as u16, screen_y as u16),
                     SetForegroundColor(hl_fg),
                     SetBackgroundColor(hl_bg),
-                    Print(cell_char),
+                    Print(printable(cell_char)),
                     ResetColor,
                 )?;
             }
@@ -1633,6 +1668,18 @@ pub(crate) fn cell_color_to_crossterm(color: &CellColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_control_character_is_never_printed() {
+        assert_eq!(super::printable('\u{1b}'), ' ');
+        assert_eq!(super::printable('\u{7}'), ' ');
+        assert_eq!(super::printable('\u{9b}'), ' ', "C1 CSI");
+        assert_eq!(super::printable('a'), 'a');
+        assert_eq!(
+            super::printable_text("h\u{1b}]52;c;AA==\u{7}i"),
+            "h]52;c;AA==i"
+        );
+    }
 
     #[test]
     fn test_new_renderer() {

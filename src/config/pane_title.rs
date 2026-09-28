@@ -10,6 +10,69 @@
 /// the output literally.
 pub const PLACEHOLDERS: [&str; 6] = ["title", "command", "session", "tab", "cwd", "host"];
 
+/// Longest label kept, in characters: a window title, a process name, or a
+/// name the user gave a pane. The text comes from programs and users, and one
+/// of them must not make every name on every surface arbitrarily long.
+pub const MAX_LABEL_CHARS: usize = 256;
+
+/// `raw` without control or invisible format characters, cut to
+/// [`MAX_LABEL_CHARS`].
+///
+/// Every name that ends up in a border cell or the session tree goes through
+/// this: a window title, a process name (a program sets its own `comm`, or on
+/// macOS its `argv[0]`) and a name the user typed. The client prints cells
+/// verbatim, so an escape sequence left in a name would reach the user's outer
+/// terminal and bypass remux's emulator, its OSC 52 policy included. A bidi
+/// override would show a different name from the one stored.
+pub fn sanitize_label(raw: &str) -> String {
+    printable_chars(raw).take(MAX_LABEL_CHARS).collect()
+}
+
+/// `raw` without control or invisible format characters, at any length. For
+/// text something else takes a part of before it is shown, such as an
+/// `argv[0]` path whose basename names a process: cut to a label's length
+/// first, a long path would lose the basename.
+pub fn strip_unprintable(raw: &str) -> String {
+    printable_chars(raw).collect()
+}
+
+fn printable_chars(raw: &str) -> impl Iterator<Item = char> + '_ {
+    raw.chars()
+        .filter(|&c| !c.is_control() && !is_hidden_format(c))
+}
+
+/// Whether `c` is in Unicode category Cf (format), except the zero-width
+/// joiner and non-joiner. Those two shape visible text: the joiner builds
+/// emoji sequences and the non-joiner is required by Persian and other
+/// scripts, so dropping them would change what a title says.
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
 /// What a template is rendered from.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NameParts<'a> {
@@ -99,6 +162,12 @@ const SEPARATORS: &[char] = &[':', '-', '|', '·', '/', ',', '–', '—', '•'
 /// is shown as it is. A result that is empty (`"{title}"` on a pane with no
 /// title) falls back to the command, so that a pane is never unnamed.
 pub fn display_name(template: Option<&str>, parts: &NameParts<'_>) -> String {
+    sanitize_label(&unsanitized_display_name(template, parts))
+}
+
+/// [`display_name`] before [`sanitize_label`]. The parts are sanitised where
+/// they are read, and this is the last line of defence for template text.
+fn unsanitized_display_name(template: Option<&str>, parts: &NameParts<'_>) -> String {
     match template {
         None => parts
             .title
@@ -255,6 +324,26 @@ mod tests {
             "claude  padded ",
             "the value keeps its own spaces"
         );
+    }
+
+    #[test]
+    fn a_name_never_carries_a_control_character() {
+        let hostile = NameParts {
+            title: Some("t\u{1b}]0;x\u{7}"),
+            command: "c\u{9b}d",
+            ..parts()
+        };
+        for template in [
+            None,
+            Some("{command}: {title}"),
+            Some("\u{1b}]52;c;AA==\u{7}{title}"),
+        ] {
+            let name = display_name(template, &hostile);
+            assert!(
+                !name.chars().any(char::is_control),
+                "{template:?} -> {name:?}"
+            );
+        }
     }
 
     #[test]

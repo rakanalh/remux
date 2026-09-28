@@ -1763,52 +1763,12 @@ impl vte::Perform for Screen {
     }
 }
 
-/// Longest window title kept, in characters. A title is a label, and the
-/// bytes come straight off a PTY, so one program cannot make every name on
-/// every surface arbitrarily long.
-const MAX_TITLE_CHARS: usize = 256;
-
-/// `raw` without control or invisible format characters, cut to
-/// [`MAX_TITLE_CHARS`]. An escape sequence inside a title would otherwise reach
-/// every client that draws the pane's name, and a bidi override would show a
-/// different name from the one stored.
+/// `raw` without control or invisible format characters, cut to a label's
+/// length. An escape sequence inside a title would otherwise reach every
+/// client that draws the pane's name. See
+/// [`crate::config::pane_title::sanitize_label`].
 fn sanitize_title(raw: &str) -> String {
-    raw.chars()
-        .filter(|&c| !c.is_control() && !is_hidden_format(c))
-        .take(MAX_TITLE_CHARS)
-        .collect()
-}
-
-/// Whether `c` is in Unicode category Cf (format), except the zero-width
-/// joiner and non-joiner. Those two shape visible text: the joiner builds
-/// emoji sequences and the non-joiner is required by Persian and other
-/// scripts, so dropping them would change what a title says.
-fn is_hidden_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}'
-            | '\u{600}'..='\u{605}'
-            | '\u{61c}'
-            | '\u{6dd}'
-            | '\u{70f}'
-            | '\u{890}'..='\u{891}'
-            | '\u{8e2}'
-            | '\u{180e}'
-            | '\u{200b}'
-            | '\u{200e}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{110bd}'
-            | '\u{110cd}'
-            | '\u{13430}'..='\u{1343f}'
-            | '\u{1bca0}'..='\u{1bca3}'
-            | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0001}'
-            | '\u{e0020}'..='\u{e007f}'
-    )
+    crate::config::pane_title::sanitize_label(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -2145,8 +2105,9 @@ mod tests {
             "bidi controls and zero-width characters go"
         );
         assert_eq!(sanitize_title("a\u{200d}b\u{200c}c"), "a\u{200d}b\u{200c}c");
-        let long = "x".repeat(MAX_TITLE_CHARS + 10);
-        assert_eq!(sanitize_title(&long).chars().count(), MAX_TITLE_CHARS);
+        let max = crate::config::pane_title::MAX_LABEL_CHARS;
+        let long = "x".repeat(max + 10);
+        assert_eq!(sanitize_title(&long).chars().count(), max);
     }
 
     #[test]
