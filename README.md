@@ -19,13 +19,10 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Dormant "resurrect" sessions** — with `save_sessions = true` and `automatic_restore = false`, saved sessions load as dormant entries instead of coming live. They appear in the session manager and are materialized on demand when you switch to one.
 - **Folder organization** — group sessions into named folders in the session tree for tidy management.
 - **Session switcher** — a quick switcher (`Alt-s`) that aggregates local **and** remote sessions into one list so you can jump anywhere without opening the full manager.
-- **Agent switcher** — `Alt-a` (or `Ctrl-a x a`) lists every pane running an AI agent, on local **and** connected remote servers, with the same state colours as the agents panel. `j`/`k` (or the arrows) and `g`/`G` move, `Enter` jumps to the pane, `Esc` closes. It works with no agents sidebar configured.
 - **Last session toggle** — `Alt-o` (or `Ctrl-a x o`) flips back to the previously-attached session, like tmux's last-session.
 - **Session manager** — a tree-view overlay for browsing, creating, deleting, renaming, moving, and switching sessions, folders, tabs, and panes — across both local and remote servers.
 
 ![Session switcher listing Views, local sessions and a remote's sessions](docs/screenshots/session-switcher.png)
-
-![Agent switcher listing agents on the local server and a remote, coloured by state](docs/screenshots/agent-switcher.png)
 
 ### Panes & layouts
 
@@ -79,6 +76,14 @@ Tmux style borders (the Zellij style is what every other screenshot shows):
 - **Instant Alt shortcuts** — a set of `Alt-…` shortcuts act immediately in Normal mode without pressing the leader first.
 - **Command palette** — `Ctrl-a :` opens a searchable list of every command.
 
+The which-key popup after the leader, then `which_key_position = "centered"` and `"full_width"`:
+
+![Which-key popup](docs/screenshots/whichkey.png)
+
+![Which-key centered](docs/screenshots/whichkey-centered.png)
+
+![Which-key full width](docs/screenshots/whichkey-full-width.png)
+
 ### Visual / copy mode & search
 
 - **Visual (copy) mode** — vim-style scrollback navigation with `h/j/k/l` cursor movement, `Ctrl-d`/`Ctrl-u` half-page scroll, `gg`/`G` to jump, character-wise (`v` or `Space`) and line-wise (`V`) selection, and `y` to yank the selection to the system clipboard (via OSC 52).
@@ -115,6 +120,14 @@ A view over four panes from three local sessions and a `devbox` remote, in Grid 
 - **`sessions` panel** — the session-manager tree, live in a sidebar instead of an overlay: every session, tab, and pane across the local server and every connected remote, refreshed by the server as things change. `j`/`k` (or the arrows) move and `g`/`G` jump to the ends, `l`/`h` (or Right/Left) expand and collapse a node, `Space` toggles one, and `Enter` jumps to whatever is selected. (`Space` *marks* panes for a view in the session-manager overlay; in the panel it only opens and closes nodes.)
 - **`files` panel** — a built-in file browser with **nothing you must configure**, following the focused pane's directory. `j`/`k` move and `g`/`G` jump to the ends, `l`/`h` (or the arrows) descend and go up, `.` toggles hidden entries, `r` re-lists now, and **`Enter` on a file opens it in a split running an editor** — taking the keyboard with it, so you land in the editor rather than in the sidebar. The listing and the editor both come from the **server**, so pointing it at a pane on a remote browses and edits *that* machine. It **re-lists itself** every couple of seconds while it is on screen, so files created or removed by anything else appear and disappear with no keystroke — and the cursor stays on the entry it was on, by name. A hidden or closed sidebar polls nothing. (It was called `browser` until the two file panels merged; the old name still loads, with a warning. See [Migrating](#migrating-from-browser--the-old-files).)
 - **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell — and looks through a launcher such as an npm shim, `npx` or `bunx` to the agent it started; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
+- **Agent switcher** — `Alt-a` (or `Ctrl-a x a`) lists every pane running an AI agent, on local **and** connected remote servers, with the same state colours as the agents panel. `j`/`k` (or the arrows) and `g`/`G` move, `Enter` jumps to the pane, `Esc` closes. It works with no agents sidebar configured.
+
+The `agents` panel docked on the right, and the `Alt-a` switcher over the same four agents:
+
+![Agents sidebar panel docked on the right](docs/screenshots/sidebar-agents.png)
+
+![Agent switcher listing agents on the local server and a remote, coloured by state](docs/screenshots/agent-switcher.png)
+
 - **`placeholder` panel** — a test fixture that paints its own name and size. It exists for checking sidebar geometry; there is nothing to configure and no reason to dock one day to day.
 - **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` walks focus through every visible panel and then back to the panes. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
 - **The `files` panel follows the focused pane** — it shows the directory of the pane you are focused **on**, and it moves when **focus** moves, *not* when you `cd`. That is the one thing that looks broken by hand: typing `cd ~/project` in a pane does not move the panel. Navigate the panel yourself with `h`/`l` and it stays where you put it, resuming its following once it is back on the pane's own directory. It follows the pane's **machine** too — focus a pane on a remote and it lists that remote's filesystem.
@@ -124,11 +137,9 @@ All three at once: `sessions` on the left, `agents` on the right, `files` along 
 
 ![Sessions, agents and files sidebars docked together](docs/screenshots/sidebars.png)
 
-The `sessions` panel with a remote connected, the `agents` panel (red needs input, yellow working, grey idle), and the `files` panel:
+The `sessions` panel with a remote connected, and the `files` panel:
 
 ![Sessions sidebar with local and remote sessions](docs/screenshots/sidebar-sessions.png)
-
-![Agents sidebar panel](docs/screenshots/sidebar-agents.png)
 
 ![Files sidebar panel](docs/screenshots/sidebar-files.png)
 
@@ -148,18 +159,6 @@ The `sessions` panel with a remote connected, the `agents` panel (red needs inpu
 Pane borders named by `pane_title = "{session}:{tab} {command} ({cwd})"`:
 
 ![Pane borders named by a pane_title template](docs/screenshots/pane-titles.png)
-
-## Which-key
-
-After pressing the leader key, a popup shows the available keybindings at each tree level, plus the global Alt shortcuts. The delay before it appears is configurable (`timeout_ms`).
-
-![Which-key popup](docs/screenshots/whichkey.png)
-
-`which_key_position = "centered"` and `"full_width"`:
-
-![Which-key centered](docs/screenshots/whichkey-centered.png)
-
-![Which-key full width](docs/screenshots/whichkey-full-width.png)
 
 ## Command palette
 

@@ -1365,7 +1365,7 @@ shot("view-grid")(view_shot())
 shot("view-monocle")(view_shot(cycles=5, layout="monocle", ready=("devbox: training",)))
 
 
-def sidebar_shot(edge, plugin, size, remote=False, ready=(), crop=None):
+def sidebar_shot(edge, plugin, size, remote=False, ready=()):
     """One sidebar alone, docked to `edge`, over the busy workspace."""
     def run(env, out):
         cfg = config() + f"""
@@ -1382,14 +1382,13 @@ visible = true
         env_, tui = busy_workspace(env, cfg, remote, views=False, cols=cols, rows=rows,
                                    needles=["Do you want to proceed?", *ready])
         tui.pump(1.0)
-        screenshot(tui.screen, out, crop=crop)
+        screenshot(tui.screen, out)
         return tui
     return run
 
 
 shot("sidebar-sessions")(sidebar_shot("left", "sessions", 30, remote=True, ready=("training",)))
-shot("sidebar-agents")(sidebar_shot("right", "agents", 34, remote=True, ready=("training",),
-                                    crop=(COLS - 34, 0, COLS, 8)))
+shot("sidebar-agents")(sidebar_shot("right", "agents", 30, remote=True, ready=("training",)))
 shot("sidebar-files")(sidebar_shot("left", "files", 30, ready=("Cargo.toml",)))
 
 
