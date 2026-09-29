@@ -118,7 +118,12 @@ def main():
         # appears only in the shell's OUTPUT, never in the terminal-echoed
         # command line -- otherwise every assertion below would match the
         # typed text and pass without the signal ever arriving.
-        type_line(b, pane, "trap 'echo WIN\"\"CH_OK; stty size' WINCH\n")
+        # The leading bare `echo` matters as much: the trap fires while the
+        # shell sits at its prompt, so the sentinel is written right after the
+        # prompt text. A long prompt (the system profile's includes the cwd)
+        # then wraps it across two rows of a narrow pane, and a row-joined
+        # search no longer finds it although the signal arrived.
+        type_line(b, pane, "trap 'echo; echo WIN\"\"CH_OK; stty size' WINCH\n")
         time.sleep(0.6)
         pump(b, watch, 0.5)
         assert "WINCH_OK" not in watch.text.get(pane, ""), \
@@ -157,7 +162,7 @@ def main():
         pump(b, watch, 0.6)
         assert "ALT_8" in watch.text.get(pane, ""), \
             f"the stand-in never painted the alt screen: {watch.text.get(pane)!r}"
-        type_line(b, pane, "trap 'echo ALTWIN\"\"CH_OK' WINCH\n")
+        type_line(b, pane, "trap 'echo; echo ALTWIN\"\"CH_OK' WINCH\n")
         time.sleep(0.5)
         pump(b, watch, 0.4)
         subscribe(b, pane, 30, 12)
