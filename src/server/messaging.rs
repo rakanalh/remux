@@ -1449,7 +1449,7 @@ mod tests {
         assert!(send(&mut m, emoji, t0).is_ok());
         assert_eq!(bodies(&m.read(2, true, false, 0)), [emoji]);
         for attached in [
-            "hy\u{AD}phen",
+            "\u{43F}\u{435}\u{440}\u{435}\u{AD}\u{43D}\u{43E}\u{441}",
             "\u{645}\u{6CC}\u{200C}\u{62E}",
             "\u{2764}\u{FE0F}",
         ] {

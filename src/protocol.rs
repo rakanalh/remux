@@ -1280,23 +1280,27 @@ fn is_wide_base(c: Option<char>) -> bool {
 ///
 /// - a zero width joiner or non-joiner between two non-ASCII base
 ///   characters;
-/// - a soft hyphen between two letters;
-/// - a text or emoji variation selector after a non-ASCII base character,
-///   or U+FE0F in a keycap (`#`, `*` or a digit, U+FE0F, U+20E3);
+/// - a soft hyphen between two non-ASCII letters;
+/// - a text or emoji variation selector after a non-ASCII base character
+///   that is not a letter (emoji are symbols), or U+FE0F in a keycap (`#`,
+///   `*` or a digit, U+FE0F, U+20E3);
 /// - a variation selector then a zero width joiner, between two non-ASCII
 ///   base characters, because the emoji sequences for the rainbow flag or
 ///   the heart on fire need it.
 ///
-/// So plain ASCII text can hide nothing (a soft hyphen needs letters on both
-/// sides and shows as a hyphen where a line breaks), and elsewhere each
-/// allowed character carries at most about a bit.
+/// So plain ASCII text hides nothing. Between two non-ASCII characters at
+/// most 3 bits can hide: a ZWJ or ZWNJ, alone or after a selector. Combining
+/// marks, private-use and unassigned code points count as base characters,
+/// so they can anchor a chain of such characters, but each one takes a
+/// visible cell.
 fn allowed_invisible(chars: &[char], at: usize) -> bool {
     let near = |offset: isize| {
         at.checked_add_signed(offset)
             .and_then(|i| chars.get(i).copied())
     };
     let selector = |c: Option<char>| matches!(c, Some('\u{FE0E}' | '\u{FE0F}'));
-    let letter = |c: Option<char>| is_base(c) && c.is_some_and(char::is_alphabetic);
+    let letter = |c: Option<char>| is_wide_base(c) && c.is_some_and(char::is_alphabetic);
+    let symbol = |c: Option<char>| is_wide_base(c) && !c.is_some_and(char::is_alphabetic);
     match chars[at] {
         '\u{200D}' => {
             is_wide_base(near(1))
@@ -1310,7 +1314,7 @@ fn allowed_invisible(chars: &[char], at: usize) -> bool {
             true
         }
         '\u{FE0E}' | '\u{FE0F}' => {
-            is_wide_base(near(-1))
+            symbol(near(-1))
                 && (!near(1).is_some_and(is_invisible)
                     || (near(1) == Some('\u{200D}') && is_wide_base(near(2))))
         }
@@ -2514,7 +2518,7 @@ mod tests {
             "dev \u{1F469}\u{200D}\u{1F4BB}",
             "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
             "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
-            "hy\u{AD}phen",
+            "\u{43F}\u{435}\u{440}\u{435}\u{AD}\u{43D}\u{43E}\u{441}",
         ] {
             assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
         }
@@ -2544,6 +2548,7 @@ mod tests {
             ("a \u{AD} b", vec!['\u{AD}']),
             ("1\u{FE0F}", vec!['\u{FE0F}']),
             ("x\u{FE0F}\u{20E3}", vec!['\u{FE0F}']),
+            ("Silben\u{AD}trennung", vec!['\u{AD}']),
         ] {
             assert_eq!(hidden(bad), want, "{bad:?}");
         }
@@ -2556,11 +2561,14 @@ mod tests {
             "\u{1F1FA}\u{1F1F8}",
             "\u{1F926}\u{200D}\u{2642}\u{FE0F}",
             "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
-            "Silben\u{AD}trennung",
+            "\u{43F}\u{435}\u{440}\u{435}\u{AD}\u{43D}\u{43E}\u{441}",
             "\u{2764}\u{FE0F}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
         ] {
             assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
         }
+        assert_eq!(hidden("\u{4E2D}\u{FE0F}\u{6587}"), ['\u{FE0F}']);
+        assert_eq!(hidden("\u{645}\u{FE0E}\u{6CC}"), ['\u{FE0E}']);
         assert_eq!(hidden("\u{13000}\u{13430}\u{13001}"), ['\u{13430}']);
         assert_eq!(hidden("\u{600}12"), ['\u{600}']);
     }
