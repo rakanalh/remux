@@ -4,6 +4,7 @@
 //! is partway through a multi-key sequence in Command mode.
 
 use crossterm::style::Color;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::theme::Theme;
 use crate::config::WhichKeyPosition;
@@ -32,11 +33,27 @@ struct Columns {
 
 /// The cell width that holds every cell in `texts` whole, plus the one-column
 /// gap that keeps a label from running into the next column or the border.
+///
+/// Every width in this module is in terminal COLUMNS, not characters: a CJK
+/// ideograph or an emoji is one character and two columns, so sizing by
+/// character count let such a label overrun its column.
 fn natural_width<'a>(texts: impl IntoIterator<Item = &'a str>, min: usize) -> usize {
     texts
         .into_iter()
-        .map(|t| t.chars().count() + 1)
+        .map(|t| t.width() + 1)
         .fold(min, usize::max)
+}
+
+/// The longest prefix of `text` that fits in `cols` columns. A wide character
+/// that would straddle the limit is dropped whole, never split.
+fn prefix_within(text: &str, cols: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= cols
+        })
+        .collect()
 }
 
 /// Choose the box's columns. Two columns at the natural width are preferred;
@@ -84,28 +101,36 @@ fn full_width_columns(natural: usize, inner_cols: usize) -> Columns {
     }
 }
 
-/// How many leading characters of a `len`-character cell text survive in a
-/// cell `width` wide. The last column of every cell is the gap, so text that
-/// needs it is truncated and the column before the gap holds the ellipsis.
-fn kept_chars(len: usize, width: usize) -> usize {
+/// How many leading columns of a cell text `text_cols` wide survive in a cell
+/// `width` wide. The last column of every cell is the gap, so text that needs
+/// it is truncated and the column before the gap holds the ellipsis.
+fn kept_cols(text_cols: usize, width: usize) -> usize {
     let budget = width.saturating_sub(1);
-    if len <= budget {
-        len
+    if text_cols <= budget {
+        text_cols
     } else {
         budget.saturating_sub(1)
     }
 }
 
+/// Whether a cell that keeps `kept` columns still shows the whole key, which
+/// is drawn after the cell's one leading space.
+fn key_survives(kept: usize, key: char) -> bool {
+    kept > key.width().unwrap_or(1)
+}
+
 /// `text` fitted to exactly `width` columns: padded when it fits, otherwise cut
 /// and ended with an ellipsis so the reader can see it was cut.
 fn fit_cell(text: &str, width: usize) -> String {
-    let len = text.chars().count();
-    let kept = kept_chars(len, width);
-    let mut out: String = text.chars().take(kept).collect();
-    if kept < len && width >= 2 {
+    let text_cols = text.width();
+    let kept = kept_cols(text_cols, width);
+    let mut out = prefix_within(text, kept);
+    if kept < text_cols && width >= 2 {
         out.push('\u{2026}');
     }
-    format!("{out:<width$}")
+    let pad = width.saturating_sub(out.width());
+    out.extend(std::iter::repeat_n(' ', pad));
+    out
 }
 
 fn box_entry_text(key: char, label: &str) -> String {
@@ -314,8 +339,8 @@ impl WhichKeyPopup {
             // Separate draw commands for the key chars, for highlight color.
             for (c, entry) in cells.iter().enumerate() {
                 if let Some((key, label)) = entry {
-                    let len = box_entry_text(*key, label).chars().count();
-                    if kept_chars(len, columns.width) >= 2 {
+                    let text_cols = box_entry_text(*key, label).width();
+                    if key_survives(kept_cols(text_cols, columns.width), *key) {
                         commands.push(DrawCommand {
                             x: start_x + 2 + c as u16 * col_width,
                             y,
@@ -379,13 +404,13 @@ impl WhichKeyPopup {
                 // Highlight the key notation (drawn after the leading space).
                 for (c, entry) in cells.iter().enumerate() {
                     if let Some((notation, label)) = entry {
-                        let len = shortcut_text(notation, label).chars().count();
+                        let text_cols = shortcut_text(notation, label).width();
                         push_notation_highlight(
                             &mut commands,
                             start_x + 1 + c as u16 * col_width,
                             y,
                             notation,
-                            kept_chars(len, columns.width),
+                            kept_cols(text_cols, columns.width),
                             key_fg,
                             bg,
                         );
@@ -534,10 +559,7 @@ impl WhichKeyPopup {
         } else {
             format!(" {} ", self.group_label)
         };
-        let label_text = label_text
-            .chars()
-            .take(inner_cols as usize)
-            .collect::<String>();
+        let label_text = prefix_within(&label_text, inner_cols as usize);
         commands.push(DrawCommand {
             x: 1,
             y: content_y0,
@@ -557,7 +579,7 @@ impl WhichKeyPopup {
             // content width (matters on very narrow screens).
             let width = columns.width.min(avail_at(x));
             let entry_str = full_width_entry_text(*key, label);
-            let kept = kept_chars(entry_str.chars().count(), width);
+            let kept = kept_cols(entry_str.width(), width);
             commands.push(DrawCommand {
                 x,
                 y,
@@ -568,7 +590,7 @@ impl WhichKeyPopup {
 
             // Highlight the key char (drawn after the leading space), unless
             // truncation cut it off.
-            if kept >= 2 {
+            if key_survives(kept, *key) {
                 commands.push(DrawCommand {
                     x: x + 1,
                     y,
@@ -618,7 +640,7 @@ impl WhichKeyPopup {
 
                 let width = columns.width.min(avail_at(x));
                 let cell_str = shortcut_text(notation, label);
-                let kept = kept_chars(cell_str.chars().count(), width);
+                let kept = kept_cols(cell_str.width(), width);
                 commands.push(DrawCommand {
                     x,
                     y,
@@ -638,7 +660,7 @@ impl WhichKeyPopup {
 /// Build a bordered separator/subheading line, e.g. `│──── Alt ────│`, sized to
 /// `inner_width` (the box width excluding the two border columns).
 fn separator_line(title: &str, inner_width: usize) -> String {
-    let title_len = title.chars().count();
+    let title_len = title.width();
     let dashes = inner_width.saturating_sub(title_len);
     let left = dashes / 2;
     let right = dashes - left;
@@ -651,8 +673,8 @@ fn separator_line(title: &str, inner_width: usize) -> String {
 }
 
 /// Push a highlight draw command for a multi-char key notation in the cell at
-/// `cell_x`. Only the part of the notation among the cell's `kept` characters
-/// is highlighted, so the colour never covers a truncation ellipsis.
+/// `cell_x`. Only the part of the notation among the cell's `kept` columns is
+/// highlighted, so the colour never covers a truncation ellipsis.
 fn push_notation_highlight(
     commands: &mut Vec<DrawCommand>,
     cell_x: u16,
@@ -662,7 +684,7 @@ fn push_notation_highlight(
     fg: Color,
     bg: Color,
 ) {
-    let text: String = notation.chars().take(kept.saturating_sub(1)).collect();
+    let text = prefix_within(notation, kept.saturating_sub(1));
     if !text.is_empty() {
         commands.push(DrawCommand {
             x: cell_x + 1,
@@ -1104,6 +1126,25 @@ mod tests {
                 width: 10
             }
         );
+    }
+
+    #[test]
+    fn wide_glyph_labels_are_sized_padded_and_cut_by_columns() {
+        use unicode_width::UnicodeWidthStr;
+        // Six characters, eleven columns: five ideographs at two each.
+        let label = " \u{8a2d}\u{5b9a}\u{3092}\u{958b}\u{304f}";
+        assert_eq!(label.width(), 11);
+        assert_eq!(natural_width([label], 0), 12);
+
+        let whole = fit_cell(label, 14);
+        assert_eq!(whole.width(), 14, "padded to the column width: {whole:?}");
+        assert!(whole.starts_with(label));
+
+        // Budget 8 columns, 7 for text before the ellipsis: three ideographs
+        // and the leading space (7 columns), since a fourth would straddle it.
+        let cut = fit_cell(label, 9);
+        assert_eq!(cut, " \u{8a2d}\u{5b9a}\u{3092}\u{2026} ");
+        assert_eq!(cut.width(), 9, "never wider than its cell: {cut:?}");
     }
 
     #[test]
