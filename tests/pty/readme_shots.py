@@ -1327,11 +1327,10 @@ def highlighted_matches(tui, needle):
 
 shot("visual-select")(visual_shot([("k" * 3, None), ("V", None), ("k" * 6, None)]))
 # `cat` pushes the cargo output into scrollback, so the search runs over real
-# scrollback. Only the current match is highlighted until the first `n`, and
-# a search whose matches all sit on screen with no scrollback highlighted none.
+# scrollback.
 shot("search")(visual_shot(
-    [("/", lambda t: "SEARCH" in t.rows()[-1]), ("/api/users", None), ("\r", None),
-     ("n", lambda t: highlighted_matches(t, "/api/users") >= 4)],
+    [("/", lambda t: "SEARCH" in t.rows()[-1]), ("/api/users", None),
+     ("\r", lambda t: highlighted_matches(t, "/api/users") >= 4)],
     prep="cat logs/access.log\r"))
 
 
