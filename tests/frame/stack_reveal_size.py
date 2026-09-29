@@ -1,10 +1,10 @@
 """A pane revealed in its stack runs at the size it is painted at.
 
-A stack paints only its active pane, and the PTY sizing used to follow the same
-rects, so a hidden pane kept whatever size it had when it was last visible.
-Revealing it (stack step, chip click, focus by id, a zoom following focus) moved
-the pane on screen without a resize: the program inside kept wrapping at its old
-width until an unrelated resize came along.
+A stack paints only its active pane. If the PTY sizing followed the same
+rects, a hidden pane would keep whatever size it had when it was last visible,
+and revealing it (stack step, chip click, focus by id, a zoom following focus)
+would show it without a resize: the program inside would keep wrapping at its
+old width until an unrelated resize came along.
 
 Every size here is read from INSIDE the pane, by `stty size`, never from the
 frame. The reference is a pane that was painted at the stack's size all along.

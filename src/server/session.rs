@@ -456,8 +456,9 @@ impl Tab {
                 self.zoomed_pane = None;
             }
         }
-        // A state file written before `focus_pane` moved the stack's active
-        // index can restore a focused pane hidden behind another in its stack.
+        // A restored state file can hold a focused pane hidden behind another
+        // in its stack. Showing it here makes the invariant hold from the
+        // first frame instead of from the first focus change.
         self.layout.activate(self.focused_pane);
     }
 }

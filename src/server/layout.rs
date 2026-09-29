@@ -916,22 +916,21 @@ impl LayoutNode {
         }
     }
 
-    /// Make `pane_id` the visible pane of the stack that holds it.
-    ///
-    /// Returns `false` when no stack holds `pane_id`, leaving the tree as it was.
-    pub fn activate(&mut self, pane_id: PaneId) -> bool {
+    /// Make `pane_id` the visible pane of the stack that holds it. The tree is
+    /// left as it was when no stack holds `pane_id`.
+    pub fn activate(&mut self, pane_id: PaneId) {
         match self {
             LayoutNode::Stack { panes, active, .. } => {
-                match panes.iter().position(|&p| p == pane_id) {
-                    Some(pos) => {
-                        *active = pos;
-                        true
-                    }
-                    None => false,
+                if let Some(pos) = panes.iter().position(|&p| p == pane_id) {
+                    *active = pos;
                 }
             }
             LayoutNode::Split { first, second, .. } => {
-                first.activate(pane_id) || second.activate(pane_id)
+                if contains_pane(first, pane_id) {
+                    first.activate(pane_id);
+                } else {
+                    second.activate(pane_id);
+                }
             }
         }
     }
