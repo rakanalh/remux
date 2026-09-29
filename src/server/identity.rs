@@ -123,8 +123,13 @@ pub struct Attribution {
 pub enum Unverified {
     /// The platform gave no peer pid for the socket.
     NoPeerPid,
-    /// Neither the session id nor the parent chain reaches a pane shell.
+    /// The parent chain reached pid 1 without passing a pane shell, and the
+    /// session id names none either: a definite answer.
     NoPaneAncestor,
+    /// The walk stopped before it could answer: an ancestor exited while it
+    /// was being read, or the chain was longer than [`MAX_GENERATIONS`]. It
+    /// says nothing about where the caller is.
+    AncestorUnreadable,
     /// The peer itself could not be read: it exited, or a pid namespace hides
     /// it from the server.
     Unreadable,
@@ -149,7 +154,9 @@ impl Unverified {
             Unverified::NoPaneAncestor => "not a descendant of any pane",
             Unverified::Unreadable => "the peer process could not be read",
             Unverified::PeerExited => "the sending process exited before it was checked",
-            Unverified::PeerChanged => "the process tree changed while the sender was checked",
+            Unverified::PeerChanged | Unverified::AncestorUnreadable => {
+                "the process tree changed while the sender was checked"
+            }
             Unverified::CheckFailed => "the sending process could not be checked",
             Unverified::TimedOut => "the sender could not be checked in time",
         }
@@ -176,7 +183,10 @@ impl Unverified {
             Unverified::PeerExited => {
                 "keep the sender running until its reply; do not hand the socket to another process"
             }
-            Unverified::PeerChanged | Unverified::CheckFailed | Unverified::TimedOut => "retry",
+            Unverified::PeerChanged
+            | Unverified::AncestorUnreadable
+            | Unverified::CheckFailed
+            | Unverified::TimedOut => "retry",
         }
     }
 }
@@ -254,13 +264,13 @@ pub fn attribute(
             return Ok(attributed(pane, pane_tty, How::Walk { depth }));
         }
         if depth == MAX_GENERATIONS {
-            break;
+            return Err(Unverified::AncestorUnreadable);
         }
         let parent = current.ppid;
         // A pane shell is never read: its pid belongs to an unreaped child of
         // the server, so it cannot have been reused.
         if parent > 1 && procs.get(parent).is_none() {
-            let above = table.info(parent).ok_or(Unverified::NoPaneAncestor)?;
+            let above = table.info(parent).ok_or(Unverified::AncestorUnreadable)?;
             // A parent exists before its child, so a "parent" that started
             // later is a reused pid. Equal is fine: a fork within one clock
             // tick is normal.
@@ -806,7 +816,8 @@ mod tests {
                 &procs,
                 &chain(MAX_GENERATIONS as i32 + 1, 100)
             ),
-            Err(Unverified::NoPaneAncestor)
+            Err(Unverified::AncestorUnreadable),
+            "a walk stopped by the cap never reached pid 1, so it proves nothing"
         );
     }
 
@@ -821,17 +832,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_peer_is_unreadable_and_an_unreadable_ancestor_is_no_pane_ancestor() {
+    fn an_unreadable_peer_is_unreadable_and_an_unreadable_ancestor_is_not_a_verdict() {
         let procs = ProcIndex::new([(100, 1, None)]);
         let empty = FakeTable(HashMap::new());
         assert_eq!(
             attribute(Some(500), &procs, &empty),
             Err(Unverified::Unreadable)
         );
+        // 501 exited during the check: whether a pane was above it is unknown.
         let broken = FakeTable(HashMap::from([(500, proc(501, Some(4242), None))]));
         assert_eq!(
             attribute(Some(500), &procs, &broken),
-            Err(Unverified::NoPaneAncestor)
+            Err(Unverified::AncestorUnreadable)
         );
     }
 
@@ -986,6 +998,7 @@ mod tests {
         for (why, outside) in [
             (Unverified::NoPaneAncestor, true),
             (Unverified::NoPeerPid, true),
+            (Unverified::AncestorUnreadable, false),
             (Unverified::Unreadable, false),
             (Unverified::PeerExited, false),
             (Unverified::PeerChanged, false),
