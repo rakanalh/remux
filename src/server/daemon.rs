@@ -586,6 +586,14 @@ struct OutgoingMessage {
     pane_hint: Option<PaneId>,
 }
 
+/// A [`ClientMessage::MsgAck`], unpacked.
+struct MailboxAck {
+    pane: Option<PaneId>,
+    ids: Vec<MsgId>,
+    all: bool,
+    pane_hint: Option<PaneId>,
+}
+
 /// A [`ClientMessage::MsgRead`], unpacked.
 struct MailboxRead {
     pane: Option<PaneId>,
@@ -717,10 +725,10 @@ async fn handle_msg_send(
     }
 
     let bytes = msg.body.len();
-    let sent = {
+    let (sent, swept) = {
         let mut store = store.lock().await;
         let to_name = store.name_of(to).map(str::to_string);
-        store
+        let sent = store
             .send(
                 Sender::Pane {
                     pane_id: from.pane,
@@ -733,8 +741,12 @@ async fn handle_msg_send(
                 now_ms(),
                 std::time::Instant::now(),
             )
-            .map(|id| (id, to_name))
+            .map(|id| (id, to_name));
+        (sent, store.take_swept())
     };
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
     match sent {
         Ok((id, to_name)) => {
             log::info!(
@@ -767,6 +779,54 @@ async fn handle_msg_send(
     }
 }
 
+/// The mailbox a read or an ack is about, and the caller's own pane, if it is
+/// in one.
+///
+/// `pane` when given, else the caller's own pane. A caller outside any pane
+/// must name one. A pane that is not live, is in no tab, or is a popup is
+/// `no_such_target`; a closed pane is not live, so this also refuses the
+/// tombstoned ones.
+async fn mailbox_of(
+    client_id: u64,
+    verb: &str,
+    pane: Option<PaneId>,
+    pane_hint: Option<PaneId>,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(PaneId, Option<PaneId>), ServerMessage> {
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, verb, found);
+        log_hint(pane_hint, found.pane);
+    }
+    let pane = match (pane, &caller) {
+        (Some(pane), _) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return Err(ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            ))
+        }
+    };
+    let live = live_panes(panes).await.contains(&pane);
+    let (in_a_tab, popup) = {
+        let st = state.lock().await;
+        (st.locate_pane(pane).is_some(), st.is_popup(pane))
+    };
+    if popup {
+        return Err(ServerMessage::refused("no_such_target", POPUP_REFUSED));
+    }
+    if !live || !in_a_tab {
+        return Err(ServerMessage::refused(
+            "no_such_target",
+            format!("no such target: %{pane}"),
+        ));
+    }
+    Ok((pane, caller.ok().map(|found| found.pane)))
+}
+
 /// List a mailbox. Only the caller's own mailbox is ever marked read: a read
 /// of anyone else's, or from outside any pane, is a peek whatever it asked.
 async fn handle_msg_read(
@@ -777,38 +837,32 @@ async fn handle_msg_read(
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     store: &Mutex<Messaging>,
 ) -> ServerMessage {
-    let caller = attribute_frame_caller(peer, panes).await;
-    if let Ok(found) = &caller {
-        log_caller(client_id, "MsgRead", found);
-        log_hint(msg.pane_hint, found.pane);
-    }
-    let pane = match (msg.pane, &caller) {
-        (Some(pane), _) => pane,
-        (None, Ok(found)) => found.pane,
-        (None, Err(why)) => {
-            return ServerMessage::refused(
-                "not_in_pane",
-                format!("not in a pane ({}): pass --pane %N", why.reason()),
-            )
-        }
+    let (pane, caller) = match mailbox_of(
+        client_id,
+        "MsgRead",
+        msg.pane,
+        msg.pane_hint,
+        peer,
+        state,
+        panes,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
-    let live = live_panes(panes).await.contains(&pane);
-    let (in_a_tab, popup) = {
-        let st = state.lock().await;
-        (st.locate_pane(pane).is_some(), st.is_popup(pane))
-    };
-    if popup {
-        return ServerMessage::refused("no_such_target", POPUP_REFUSED);
-    }
-    if !live || !in_a_tab {
-        return ServerMessage::refused("no_such_target", format!("no such target: %{pane}"));
-    }
-    let own = caller.as_ref().is_ok_and(|found| found.pane == pane);
-    let mark = own && !msg.peek;
+    let mark = caller == Some(pane) && !msg.peek;
     if let Some(wait_ms) = msg.wait_ms {
         log::debug!("msg: read wait_ms={wait_ms} is not supported yet; answering at once");
     }
-    let messages = store.lock().await.read(pane, msg.all, mark, now_ms());
+    let (messages, swept) = {
+        let mut store = store.lock().await;
+        let messages = store.read(pane, msg.all, mark, now_ms());
+        (messages, store.take_swept())
+    };
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
     if !messages.is_empty() {
         log::info!("msg: read pane=%{pane} n={} marked={mark}", messages.len());
     }
@@ -817,6 +871,53 @@ async fn handle_msg_read(
         messages,
         timed_out: false,
     }
+}
+
+/// Mark messages Read without returning them. Naming another pane's mailbox
+/// does mark it, unlike a read: an ack exists to clear mail on purpose.
+async fn handle_msg_ack(
+    client_id: u64,
+    ack: MailboxAck,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    if ack.all && !ack.ids.is_empty() {
+        return ServerMessage::refused(
+            "bad_request",
+            "an ack names ids or asks for all of them, not both",
+        );
+    }
+    let (pane, caller) = match mailbox_of(
+        client_id,
+        "MsgAck",
+        ack.pane,
+        ack.pane_hint,
+        peer,
+        state,
+        panes,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    let count = {
+        let mut store = store.lock().await;
+        if ack.all {
+            store.ack_all(pane)
+        } else {
+            store.ack(pane, &ack.ids)
+        }
+    };
+    if count > 0 {
+        log::info!(
+            "msg: acked pane=%{pane} n={count} by={}",
+            caller.map_or("outside".to_string(), |by| format!("%{by}"))
+        );
+    }
+    ServerMessage::MsgAcked { pane, count }
 }
 
 /// Log which pane a new connection's peer runs in, once per connection.
@@ -2127,6 +2228,18 @@ async fn handle_client_message(
                     .map_or("None".to_string(), |r| loggable(&format!("{r:?}")))
             );
         }
+        ClientMessage::MsgAck {
+            pane,
+            ids,
+            all,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=MsgAck(pane={pane:?}, {} id(s), all={all}, \
+                 pane_hint={pane_hint:?})",
+                ids.len()
+            );
+        }
         ClientMessage::MsgRead {
             pane,
             all,
@@ -2193,6 +2306,29 @@ async fn handle_client_message(
                     all,
                     peek,
                     wait_ms,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::MsgAck {
+            pane,
+            ids,
+            all,
+            pane_hint,
+        } => {
+            let answer = handle_msg_ack(
+                client_id,
+                MailboxAck {
+                    pane,
+                    ids,
+                    all,
                     pane_hint,
                 },
                 peer,

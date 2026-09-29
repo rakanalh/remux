@@ -48,6 +48,25 @@ or as a pane's own program (`spawn_sender`, the session leader itself).
 3p. A host carrying a newline is refused `bad_address` and cannot forge a
     line in the server log.
 
+Acks, bounds and closing. These run in a tab of their own, and every case
+that depends on a cap or the rate sends from a FRESH pane as one batch on one
+connection, so no earlier case's sends share its rate window.
+
+4a. An ack naming nothing marks nothing; `all` marks every Queued message
+    of the named mailbox; `all` with ids is bad_request; the log names who
+    acked.
+4b. An ack by id marks that one; an unknown id marks nothing; a pane acking
+    its own mailbox needs no --pane.
+4c. max_body_bytes=64: 65 bytes is message_too_large, 64 is stored.
+4d. mailbox_max_messages=3: the 4th is mailbox_full and the first three are
+    all still there, in order.
+4e. rate_per_10s=4: a sender's 5th send in the window is rate_limited; a
+    different sender in the same window is not.
+4g. A pane that closes takes its mail with it, logged with the count; it
+    cannot be read, acked or sent to afterwards.
+4h. A pane closing with no mail and no name writes no such line.
+(Expiry over the wire is tests/frame/msg_ttl.py, on a server of its own.)
+
 1z/3z. No panic in the server log.
 
 Run: python3 tests/frame/msg_mailbox.py   (RMX_RUNDIR overrides the run dir)
@@ -189,7 +208,8 @@ def type_send(pane_id, msg):
 
 
 def spawn_sender(msg):
-    """Run one wire request as a NEW pane's own program: (pane_id, reply)."""
+    """Run one wire request, or a list of them on one connection, as a NEW
+    pane's own program: (pane_id, reply or list of replies)."""
     requests[0] += 1
     n = requests[0]
     in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
@@ -402,16 +422,20 @@ try:
           f"3d ...and both reads left it Queued (got {msgs})")
 
     # --- 3e ---------------------------------------------------------------
+    # Two queued, so that a read marking only the first is caught.
+    r = type_send(A, send_to({"Pane": B}, "MSG:one-b"))
+    check(name_of(r) == "MsgSent", f"3e a second message waits for B (got {r})")
     own = listed(type_send(B, {"MsgRead": {}}))
-    check(own is not None and [m["body"] for m in own] == ["MSG:one"],
-          f"3e B reads its own mailbox (got {own})")
+    check(own is not None and [m["body"] for m in own] == ["MSG:one", "MSG:one-b"],
+          f"3e B reads both from its own mailbox (got {own})")
     msgs = listed(read_box(B))
-    check(msgs == [] , f"3e ...and it is no longer Queued (got {msgs})")
+    check(msgs == [], f"3e ...and neither is still Queued (got {msgs})")
     again = listed(type_send(B, {"MsgRead": {}}))
     check(again == [], f"3e a second read is empty (got {again})")
     everything = listed(type_send(B, {"MsgRead": {"all": True}}))
     check(everything is not None and [(m["body"], m["state"]) for m in everything]
-          == [("MSG:one", "Read")], f"3e --all still lists it, Read (got {everything})")
+          == [("MSG:one", "Read"), ("MSG:one-b", "Read")],
+          f"3e --all still lists both, Read (got {everything})")
 
     # --- 3f ---------------------------------------------------------------
     r = type_send(A, {"MsgSend": {"to": {"host": None, "target": {"Pane": B}},
@@ -504,6 +528,100 @@ try:
     check(re.search(r"^\s*" + re.escape("[2026] DEBUG " + forged), srv.log(), re.M) is None,
           "3p the host did not start a forged line in the server log")
 
+    # === 4: acks, bounds and closing =======================================
+    T = cli_spawn("NewTab")["CliSpawned"]["pane_id"]
+    U = cli_spawn("SplitRight")["CliSpawned"]["pane_id"]
+    V = cli_spawn("SplitBelow")["CliSpawned"]["pane_id"]
+    W = cli_spawn("SplitBelow")["CliSpawned"]["pane_id"]
+    time.sleep(0.5)
+
+    def names(replies):
+        return [code_of(r) or name_of(r) for r in replies or []]
+
+    # --- 4a ---------------------------------------------------------------
+    _, rs = spawn_sender([send_to({"Pane": T}, "ACK:1"), send_to({"Pane": T}, "ACK:2")])
+    check(names(rs) == ["MsgSent", "MsgSent"], f"4a two messages sent to %{T} (got {rs})")
+    r = ask({"MsgAck": {"pane": T}})
+    check(r == {"MsgAcked": {"pane": T, "count": 0}},
+          f"4a an ack naming nothing, of another pane, marks nothing (got {r})")
+    r = ask({"MsgAck": {"pane": T, "all": True, "ids": [1]}})
+    check(code_of(r) == "bad_request", f"4a all together with ids is bad_request (got {r})")
+    r = ask({"MsgAck": {"pane": T, "all": True}})
+    check(r == {"MsgAcked": {"pane": T, "count": 2}}, f"4a an ack with all marks both (got {r})")
+    check(f"msg: acked pane=%{T} n=2 by=outside" in srv.log(),
+          "4a the ack is logged, naming a caller outside any pane")
+    box = listed(read_box(T, all=True)) or []
+    check([(m["body"], m["state"]) for m in box] == [("ACK:1", "Read"), ("ACK:2", "Read")],
+          f"4a ...and both are Read (got {box})")
+
+    # --- 4b ---------------------------------------------------------------
+    # Two Queued, so that "that id" and "everything Queued" give different
+    # answers; with one, an ack that ignored its ids would pass.
+    _, rs = spawn_sender([send_to({"Pane": T}, "ACK:3"), send_to({"Pane": T}, "ACK:4")])
+    id3 = rs[0]["MsgSent"]["id"] if names(rs) == ["MsgSent", "MsgSent"] else None
+    r = ask({"MsgAck": {"pane": T, "ids": [id3]}})
+    check(r == {"MsgAcked": {"pane": T, "count": 1}}, f"4b an ack of id {id3} marks one (got {r})")
+    r = ask({"MsgAck": {"pane": T, "ids": [999999]}})
+    check(r == {"MsgAcked": {"pane": T, "count": 0}}, f"4b an unknown id marks nothing (got {r})")
+    still = [m["body"] for m in listed(read_box(T)) or []]
+    check(still == ["ACK:4"], f"4b the message not named is still Queued (got {still})")
+    queued = len(listed(read_box(B)) or [])
+    r = type_send(B, {"MsgAck": {"all": True}})
+    check(queued > 0 and r == {"MsgAcked": {"pane": B, "count": queued}},
+          f"4b B acks its own {queued} queued message(s) without naming itself (got {r})")
+    check(f"msg: acked pane=%{B} n={queued} by=%{B}" in srv.log(),
+          "4b the ack is logged, naming B as the caller")
+
+    # --- 4c ---------------------------------------------------------------
+    _, rs = spawn_sender([send_to({"Pane": U}, "x" * 65), send_to({"Pane": U}, "y" * 64)])
+    check(names(rs) == ["message_too_large", "MsgSent"],
+          f"4c max_body_bytes=64: 65 bytes refused, 64 stored (got {names(rs)})")
+
+    # --- 4d ---------------------------------------------------------------
+    _, rs = spawn_sender([send_to({"Pane": V}, f"CAP:{n}") for n in (1, 2, 3, 4)])
+    check(names(rs) == ["MsgSent", "MsgSent", "MsgSent", "mailbox_full"],
+          f"4d mailbox_max_messages=3: the 4th send is mailbox_full (got {names(rs)})")
+    box = listed(read_box(V, all=True)) or []
+    check([m["body"] for m in box] == ["CAP:1", "CAP:2", "CAP:3"],
+          f"4d mailbox_max_messages=3: the first three are all there, in order (got {box})")
+
+    # --- 4e ---------------------------------------------------------------
+    burst = [send_to({"Pane": W}, "RATE:1"), send_to({"Pane": W}, "RATE:2"),
+             send_to({"Pane": U}, "RATE:3"), send_to({"Pane": U}, "RATE:4"),
+             send_to({"Pane": W}, "RATE:5")]
+    _, rs = spawn_sender(burst)
+    check(names(rs) == ["MsgSent"] * 4 + ["rate_limited"],
+          f"4e rate_per_10s=4: the 5th send in the window is rate_limited (got {names(rs)})")
+    _, rs = spawn_sender([send_to({"Pane": W}, "RATE:other")])
+    check(names(rs) == ["MsgSent"], f"4e rate_per_10s=4: another sender is not limited (got {rs})")
+
+    # --- 4g ---------------------------------------------------------------
+    def closable(tag):
+        release = f"{RUNDIR}/release-{tag}"
+        r = cli_spawn("SplitRight", argv=["/bin/sh", "-c", f"while [ ! -e {release} ]; do sleep 0.1; done"])
+        return r["CliSpawned"]["pane_id"], release
+
+    D, release_d = closable("4g")
+    _, rs = spawn_sender([send_to({"Pane": D}, "GONE:1"), send_to({"Pane": D}, "GONE:3")])
+    check(names(rs) == ["MsgSent", "MsgSent"], f"4g two messages wait in %{D} (got {rs})")
+    open(release_d, "w").close()
+    line = log_has(rf"msg: pane %{D} closed; dropped 2 message\(s\)$")
+    check(line is not None, f"4g closing %{D} dropped both its messages, and the log says so")
+    r = read_box(D)
+    check(code_of(r) == "no_such_target", f"4g the closed pane's mailbox cannot be read (got {r})")
+    r = ask({"MsgAck": {"pane": D}})
+    check(code_of(r) == "no_such_target", f"4g ...or acked (got {r})")
+    r = type_send(A, send_to({"Pane": D}, "GONE:2"))
+    check(code_of(r) == "no_such_target", f"4g ...or sent to (got {r})")
+
+    # --- 4h ---------------------------------------------------------------
+    E, release_e = closable("4h")
+    open(release_e, "w").close()
+    closed = log_has(rf"layout: close_pane pane_id={E}$")
+    time.sleep(0.5)
+    check(closed is not None and f"pane %{E} closed" not in srv.log(),
+          f"4h %{E} closed with no mail and wrote no drop line")
+
     # --- 3i ---------------------------------------------------------------
     log = srv.log()
     check(re.search(rf"msg: id=1 from=%{A}\(-\) to=%{B} bytes=7 deliver=Auto -> mailbox", log) is not None,
@@ -511,7 +629,8 @@ try:
     check(re.search(rf"identity: client_id=\d+ MsgSend caller -> pane %{A} by Sid$", log, re.M) is not None,
           "3i the send's attribution is logged, by Sid")
     bodies = [b for b in ("MSG:one", "MSG:two", "MSG:leader", "MSG:outside", "MSG:inherited",
-                          "MSG:to-popup", "MSG:from-popup", "MSG:paste", "MSG:forged")
+                          "MSG:to-popup", "MSG:from-popup", "MSG:paste", "MSG:forged",
+                          "ACK:1", "CAP:1", "RATE:1", "GONE:1")
               if b in log]
     check(bodies == [], f"3i no message body is in the server log (found {bodies})")
 

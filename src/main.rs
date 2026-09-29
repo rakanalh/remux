@@ -7299,7 +7299,9 @@ async fn run_client_loop(
                     // The interactive client sends neither `MsgSend` nor
                     // `MsgRead`. The variant NAME only: a `MsgList` carries
                     // message bodies, which never go to a log.
-                    Some(ServerMessage::MsgSent { .. }) | Some(ServerMessage::MsgList { .. }) => {
+                    Some(ServerMessage::MsgSent { .. })
+                    | Some(ServerMessage::MsgList { .. })
+                    | Some(ServerMessage::MsgAcked { .. }) => {
                         log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {

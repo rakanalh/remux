@@ -25,9 +25,11 @@ be PRESENT, naming the message and the byte/argument count.
 
 Run: python3 tests/frame/log_redaction.py
 """
+import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Client, Server, name_of  # noqa: E402
@@ -50,6 +52,11 @@ CLIP_SECRET = CLIP_HEAD + "-" + CLIP_TAIL
 # it. Assembled by `printf` in the pane for the same reason as the clipboard.
 TITLE_HEAD, TITLE_TAIL = "rotate", "prod-credentials-TITLE"
 TITLE_SECRET = TITLE_HEAD + "-" + TITLE_TAIL
+# A message body. It travels in a request FILE read by wire_send.py inside the
+# pane, so it is in no typed bytes and on no command line: the only way into
+# the log is the server writing it.
+MSG_SECRET = "the-deploy-token-is-swordfish-BODY"
+WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.py")
 
 
 def check(cond, msg):
@@ -187,6 +194,29 @@ def run(srv, result):
     grid.pump(c, 2.0)
     result["title_named"] = first_pane_name(c) == TITLE_SECRET
     grid.pump(c, 2.0)
+
+    # 7. A message body, sent by a process INSIDE the pane (the harness's own
+    #    connection is never a pane, so it could not send at all). Before 1,
+    #    whose typed bytes are left on the pane's command line.
+    in_file, out_file = f"{RUNDIR}/msg-in.json", f"{RUNDIR}/msg-out.json"
+    with open(in_file, "w") as f:
+        json.dump({"MsgSend": {"to": {"host": None, "target": {"Pane": pane_id}},
+                               "body": MSG_SECRET, "deliver": "Mailbox"}}, f)
+    line = f"python3 {WIRE_SEND} {srv.sock} {in_file} {out_file}\n"
+    c.send({"InputToPane": {"pane_id": pane_id, "data": list(line.encode())}})
+    end = time.time() + 6.0
+    while not os.path.exists(out_file) and time.time() < end:
+        grid.pump(c, 0.1)
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            result["msg_sent"] = name_of(json.loads(f.read()))
+    reader = Client(srv.sock)
+    reader.hello()
+    reader.send({"MsgRead": {"pane": pane_id, "peek": True}})
+    for m in reader.drain(1.0):
+        if name_of(m) == "MsgList":
+            result["msg_read"] = [x["body"] for x in m["MsgList"]["messages"]]
+    reader.close()
 
     # 1. A keystroke into a view cell. No trailing newline: nothing is RUN, the
     #    bytes just reach the PTY -- which is exactly the shape of typing a
@@ -356,6 +386,19 @@ def main():
     check(
         "is now named by its foreground job" in log,
         "6 while the change of who names the pane IS logged",
+    )
+
+    # 7. A message body.
+    check(
+        result.get("msg_sent") == "MsgSent" and result.get("msg_read") == [MSG_SECRET],
+        f"7 the message really was sent and stored (sent={result.get('msg_sent')}, "
+        f"read={result.get('msg_read')})",
+    )
+    check(MSG_SECRET not in log, "7 a message body is never in the server log")
+    send_lines = [ln for ln in log.splitlines() if "msg=MsgSend(" in ln]
+    check(
+        any(f"{len(MSG_SECRET)} bytes" in ln for ln in send_lines) and "msg: id=" in log,
+        "7 ...but the redacted line naming the id and byte count is present",
     )
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.

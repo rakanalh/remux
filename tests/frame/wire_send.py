@@ -12,6 +12,11 @@ usage: wire_send.py <socket> <in-file> <out-file>
 
 Writes the first reply that is not a `ViewList` to <out-file> as one JSON
 line, by rename so a poller never reads half of it, and exits 0.
+
+A JSON LIST in <in-file> is sent request by request on the one connection,
+each answered before the next goes, and the replies are written as a list.
+That is how a case puts several sends inside one rate window without
+depending on how fast a shell starts python.
 """
 import json
 import os
@@ -28,15 +33,19 @@ def main():
     client = Client(sock)
     client.s.settimeout(10)
     client.hello()
-    client.send(request)
-    while True:
-        reply = client.recv()
-        if name_of(reply) != "ViewList":
-            break
+    replies = []
+    for one in request if isinstance(request, list) else [request]:
+        client.send(one)
+        while True:
+            reply = client.recv()
+            if name_of(reply) != "ViewList":
+                break
+        replies.append(reply)
     client.close()
+    out = replies if isinstance(request, list) else replies[0]
     tmp = out_file + ".tmp"
     with open(tmp, "w") as f:
-        f.write(json.dumps(reply) + "\n")
+        f.write(json.dumps(out) + "\n")
     os.rename(tmp, out_file)
     return 0
 

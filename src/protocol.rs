@@ -132,9 +132,10 @@ pub enum ConnDescriptor {
 ///
 /// 17 -> 18: agent messaging. Adds [`ClientMessage::MsgSend`] and
 /// [`ClientMessage::MsgRead`] with their replies [`ServerMessage::MsgSent`] and
-/// [`ServerMessage::MsgList`], and the additive `code` on
-/// [`ServerMessage::Error`]. Later tasks add `MsgAck`, `AgentName` and
-/// `AgentStatus` under the same number. An old server cannot decode any of
+/// [`ServerMessage::MsgList`], [`ClientMessage::MsgAck`] with
+/// [`ServerMessage::MsgAcked`], and the additive `code` on
+/// [`ServerMessage::Error`]. Later tasks add `AgentName` and `AgentStatus`
+/// under the same number. An old server cannot decode any of
 /// them and would drop the connection.
 pub const PROTOCOL_VERSION: u32 = 18;
 
@@ -613,6 +614,25 @@ pub enum ClientMessage {
         #[serde(default)]
         pane_hint: Option<PaneId>,
     },
+    /// Mark messages Read without returning their bodies, in `pane`'s
+    /// mailbox or the caller's own: the messages named by `ids`, or every
+    /// Queued one when `all` is set. Naming nothing marks nothing, so a
+    /// dropped argument never clears a mailbox, and `all` with `ids` is
+    /// refused `bad_request`. Unlike a read, naming another pane DOES mark:
+    /// this is the one explicit way to clear mail that is not yours.
+    ///
+    /// Answered with [`ServerMessage::MsgAcked`], or [`ServerMessage::Error`].
+    MsgAck {
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        ids: Vec<MsgId>,
+        #[serde(default)]
+        all: bool,
+        /// See [`ClientMessage::MsgSend::pane_hint`].
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +847,8 @@ pub enum ServerMessage {
         #[serde(default)]
         timed_out: bool,
     },
+    /// The answer to a [`ClientMessage::MsgAck`]: how many messages it marked.
+    MsgAcked { pane: PaneId, count: usize },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -2227,6 +2249,27 @@ mod tests {
                 delivery: Delivery::Mailbox,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn msg_ack_defaults_to_naming_nothing_in_the_callers_own_mailbox() {
+        let ack: ClientMessage = serde_json::from_str(r#"{"MsgAck":{}}"#).unwrap();
+        assert!(matches!(
+            ack,
+            ClientMessage::MsgAck {
+                pane: None,
+                ref ids,
+                all: false,
+                pane_hint: None
+            } if ids.is_empty()
+        ));
+        let acked = ServerMessage::MsgAcked { pane: 4, count: 2 };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&acked).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::MsgAcked { pane: 4, count: 2 }
         ));
     }
 

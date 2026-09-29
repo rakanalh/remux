@@ -375,6 +375,15 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             body.len(),
             reply_to.as_ref().map(|r| r.id)
         ),
+        ClientMessage::MsgAck {
+            pane,
+            ids,
+            all,
+            pane_hint,
+        } => format!(
+            "MsgAck(pane={pane:?}, {} id(s), all={all}, pane_hint={pane_hint:?})",
+            ids.len()
+        ),
         ClientMessage::MsgRead {
             pane,
             all,

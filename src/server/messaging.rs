@@ -203,6 +203,9 @@ pub struct Messaging {
     /// ids are never reused, so this only grows, and it is not persisted: a
     /// restart starts from the restored panes.
     closed: HashSet<PaneId>,
+    /// Expired messages dropped since [`Messaging::take_swept`] last asked,
+    /// by any path, so the caller can log them once.
+    swept: usize,
 }
 
 impl Messaging {
@@ -214,7 +217,13 @@ impl Messaging {
             next_id: 1,
             rate: HashMap::new(),
             closed: HashSet::new(),
+            swept: 0,
         }
+    }
+
+    /// How many expired messages were dropped since the last call.
+    pub fn take_swept(&mut self) -> usize {
+        std::mem::take(&mut self.swept)
     }
 
     pub fn send(
@@ -261,7 +270,7 @@ impl Messaging {
         }
 
         let mailbox = self.mailboxes.entry(to).or_default();
-        mailbox.drop_expired(now_ms);
+        self.swept += mailbox.drop_expired(now_ms);
         mailbox
             .make_room(body.len(), limits)
             .map_err(|full| Refusal::MailboxFull { pane: to, full })?;
@@ -301,21 +310,27 @@ impl Messaging {
         listed
     }
 
+    /// Mark the messages named by `ids` Read. Naming none marks none: "all of
+    /// them" is [`Messaging::ack_all`], asked for on purpose.
     pub fn ack(&mut self, pane: PaneId, ids: &[MsgId]) -> usize {
+        self.mark_read(pane, |msg| {
+            msg.state != MsgState::Read && ids.contains(&msg.id)
+        })
+    }
+
+    /// Mark every Queued message Read.
+    pub fn ack_all(&mut self, pane: PaneId) -> usize {
+        self.mark_read(pane, |msg| msg.state == MsgState::Queued)
+    }
+
+    fn mark_read(&mut self, pane: PaneId, wanted: impl Fn(&Message) -> bool) -> usize {
         let Some(mailbox) = self.mailboxes.get_mut(&pane) else {
             return 0;
         };
         let mut acked = 0;
-        for msg in mailbox.messages.iter_mut() {
-            let wanted = if ids.is_empty() {
-                msg.state == MsgState::Queued
-            } else {
-                msg.state != MsgState::Read && ids.contains(&msg.id)
-            };
-            if wanted {
-                msg.state = MsgState::Read;
-                acked += 1;
-            }
+        for msg in mailbox.messages.iter_mut().filter(|msg| wanted(msg)) {
+            msg.state = MsgState::Read;
+            acked += 1;
         }
         acked
     }
@@ -391,6 +406,7 @@ impl Messaging {
         for mailbox in self.mailboxes.values_mut() {
             dropped += mailbox.drop_expired(now_ms);
         }
+        self.swept += dropped;
         self.mailboxes.retain(|_, mb| !mb.messages.is_empty());
         dropped
     }
@@ -759,6 +775,26 @@ mod tests {
     }
 
     #[test]
+    fn every_expired_message_dropped_is_counted_once() {
+        let lim = Limits {
+            ttl_ms: 1_000,
+            max_messages: 1,
+            ..limits()
+        };
+        let mut m = Messaging::new(lim);
+        let t0 = Instant::now();
+        m.send(pane(1), 2, "a".into(), None, 0, t0).unwrap();
+        m.send(pane(1), 3, "b".into(), None, 0, t0).unwrap();
+        assert_eq!(m.take_swept(), 0);
+        assert!(m.read(2, true, false, 1_000).is_empty());
+        assert_eq!(m.take_swept(), 2, "read's sweep covers every mailbox");
+        assert_eq!(m.take_swept(), 0, "a count was reported twice");
+        m.send(pane(1), 2, "c".into(), None, 1_000, t0).unwrap();
+        m.send(pane(1), 2, "d".into(), None, 2_000, t0).unwrap();
+        assert_eq!(m.take_swept(), 1, "send's own expiry drop is counted too");
+    }
+
+    #[test]
     fn expiry_frees_room_in_a_full_mailbox() {
         let lim = Limits {
             max_messages: 1,
@@ -871,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_with_no_ids_acks_everything_queued() {
+    fn ack_marks_exactly_the_ids_it_is_given() {
         let mut m = Messaging::new(limits());
         let t0 = Instant::now();
         let a = send(&mut m, "a", t0).unwrap();
@@ -881,10 +917,25 @@ mod tests {
         assert_eq!(m.ack(2, &[b, 999]), 1);
         assert_eq!(bodies(&m.read(2, false, false, 0)), ["a", "c"]);
         assert_eq!(m.ack(2, &[b]), 0, "acking twice counted twice");
-        assert_eq!(m.ack(2, &[]), 2);
+        assert_eq!(m.ack(2, &[]), 0, "an ack naming nothing marked something");
+        assert_eq!(m.unread(2, 0), 2);
+        assert_eq!(m.ack(2, &[a]), 1);
+        assert_eq!(m.ack(7, &[a]), 0);
+    }
+
+    #[test]
+    fn ack_all_marks_every_queued_message_and_nothing_else() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        let a = send(&mut m, "a", t0).unwrap();
+        send(&mut m, "b", t0).unwrap();
+        send(&mut m, "c", t0).unwrap();
+        m.set_state(2, a, MsgState::Submitted);
+
+        assert_eq!(m.ack_all(2), 2, "a Submitted message is not Queued");
         assert_eq!(m.unread(2, 0), 0);
-        assert_eq!(m.ack(2, &[a]), 0);
-        assert_eq!(m.ack(7, &[]), 0);
+        assert_eq!(m.ack_all(2), 0);
+        assert_eq!(m.ack_all(7), 0);
     }
 
     #[test]
