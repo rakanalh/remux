@@ -33,6 +33,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Client, Server, name_of  # noqa: E402
+import fakeagent  # noqa: E402
 
 RUNDIR = "/tmp/rmx-logredact"
 FAILURES = []
@@ -59,6 +60,16 @@ MSG_SECRET = "the-deploy-token-is-swordfish-BODY"
 # A body given to `remux msg send` on its command line, which writes the
 # CLIENT log. Distinct from MSG_SECRET so a hit names which half leaked.
 CLI_MSG_SECRET = "the-vault-pin-is-8812-CLI-BODY"
+# A body TYPED into an agent's pane by the server (`deliver: Submit`). The
+# bytes the server writes into the pane are the body, framed, so logging them
+# in any form (raw, escaped or as hex) is the leak this case looks for.
+SUBMIT_SECRET = "the-signing-key-is-lobster-SUBMIT"
+# Outside the run dir, which `Server.start` wipes.
+FAKEAGENT = f"{RUNDIR}-bin/fakeagent"
+CONFIG = """
+[agents]
+commands = ["fakeagent"]
+"""
 WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.py")
 
 
@@ -328,16 +339,72 @@ def run_msg_cli(srv, result):
         time.sleep(0.2)
 
 
+def leak_forms(secret):
+    """Every form a body has leaked into a log in: as text, as hex, and as
+    the Debug print of a byte list (`[99, 111, 114, ...]`, how InputToPane
+    once leaked), searched without its bracket because in a framed write the
+    body's bytes sit in the middle of the list."""
+    data = secret.encode()
+    return [secret, data.hex(), str(list(data[:6]))[1:-1]]
+
+
+def run_submit(srv, result):
+    """9. A body the server TYPES into a fakeagent pane. The sender is a fresh
+    shell pane: the first pane's command line still holds case 1's bytes."""
+    log_path, ctl = f"{RUNDIR}/agent.log", f"{RUNDIR}/agent.ctl"
+    spawner = Client(srv.sock)
+    spawner.hello()
+    spawned = {}
+    for argv in ([FAKEAGENT, log_path, ctl], None):
+        body = {"session": "main", "placement": "SplitBelow"}
+        if argv is not None:
+            body["argv"] = argv
+        spawner.send({"CliSpawn": body})
+        for m in spawner.drain(3.0):
+            if name_of(m) == "CliSpawned":
+                spawned["agent" if argv else "sender"] = m["CliSpawned"]["pane_id"]
+                break
+    time.sleep(1.0)
+    agent, sender = spawned.get("agent"), spawned.get("sender")
+    if agent is None or sender is None:
+        spawner.close()
+        return
+    result["submit_agent"] = agent
+    in_file, out_file = f"{RUNDIR}/submit-in.json", f"{RUNDIR}/submit-out.json"
+    with open(in_file, "w") as f:
+        json.dump({"MsgSend": {"to": {"host": None, "target": {"Pane": agent}},
+                               "body": SUBMIT_SECRET, "deliver": "Submit"}}, f)
+    line = f"python3 {WIRE_SEND} {srv.sock} {in_file} {out_file}\n"
+    spawner.send({"InputToPane": {"pane_id": sender, "data": list(line.encode())}})
+    end = time.time() + 8.0
+    while not os.path.exists(out_file) and time.time() < end:
+        time.sleep(0.1)
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            reply = json.loads(f.read())
+        result["submit_reply"] = reply
+    end = time.time() + 4.0
+    while time.time() < end:
+        if os.path.exists(log_path) and SUBMIT_SECRET.encode().hex() in open(log_path).read():
+            result["submit_typed"] = True
+            break
+        time.sleep(0.1)
+    spawner.close()
+
+
 def main():
     # Findings that come from the WIRE rather than from the log, carried out of
     # `run` so the checks can be made after the server is stopped.
     result = {}
-    srv = Server(RUNDIR).start()
+    os.makedirs(os.path.dirname(FAKEAGENT), exist_ok=True)
+    fakeagent.install(FAKEAGENT)
+    srv = Server(RUNDIR).start(config=CONFIG)
     try:
         try:
             run(srv, result)
             run_cli(srv)
             run_msg_cli(srv, result)
+            run_submit(srv, result)
         except Exception as e:  # noqa: BLE001 -- the log is the point; reach it
             check(False, f"the run completed without an exception ({e!r})")
     finally:
@@ -464,6 +531,25 @@ def main():
     check(
         "cmd: msg read answered MsgList(" in client_log and "message(s))" in client_log,
         "8 ...and names the read's answer by its count",
+    )
+
+    # 9. A body typed into an agent's pane: in no form in the server log,
+    #    while the line naming the submit, its pane and its size is present.
+    reply = result.get("submit_reply") or {}
+    check(
+        (reply.get("MsgSent") or {}).get("delivery") == "Submitted"
+        and result.get("submit_typed") is True,
+        f"9 the body really was typed into the agent's pane (reply {reply})",
+    )
+    leaked = [form for form in leak_forms(SUBMIT_SECRET) if form in log]
+    check(
+        not leaked,
+        f"9 a submitted body is in the server log as neither text, hex nor a byte list (found {leaked})",
+    )
+    sent_id = (reply.get("MsgSent") or {}).get("id")
+    check(
+        f"msg: id={sent_id} submitted to %{result.get('submit_agent')} (bracketed=" in log,
+        "9 ...but the line naming the submit is present",
     )
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.

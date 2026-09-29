@@ -2661,8 +2661,8 @@ mod tests {
                 pane_id: 7,
                 name: Some("beta".into()),
             },
-            delivery: Delivery::Mailbox,
-            reason: Some("submit_unavailable".into()),
+            delivery: Delivery::Submitted,
+            reason: None,
         };
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
@@ -2670,7 +2670,8 @@ mod tests {
             back,
             ServerMessage::MsgSent {
                 id: 1,
-                delivery: Delivery::Mailbox,
+                delivery: Delivery::Submitted,
+                reason: None,
                 ..
             }
         ));

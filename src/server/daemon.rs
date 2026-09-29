@@ -658,7 +658,8 @@ async fn handle_msg_send(
     peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    store: &Mutex<Messaging>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
 ) -> ServerMessage {
     use crate::server::messaging::Refusal;
 
@@ -747,6 +748,7 @@ async fn handle_msg_send(
     }
 
     let bytes = msg.body.len();
+    let submit_body = (msg.deliver != Deliver::Mailbox).then(|| msg.body.clone());
     let (sent, swept, answered) = {
         let mut store = store.lock().await;
         let to_name = store.name_of(to).map(str::to_string);
@@ -795,17 +797,33 @@ async fn handle_msg_send(
                 from_name.as_deref().unwrap_or("-"),
                 msg.deliver
             );
-            ServerMessage::MsgSent {
-                id,
-                to: Resolved {
-                    host: None,
-                    pane_id: to,
-                    name: to_name,
+            let resolved = Resolved {
+                host: None,
+                pane_id: to,
+                name: to_name,
+            };
+            match submit_body {
+                None => ServerMessage::MsgSent {
+                    id,
+                    to: resolved,
+                    delivery: Delivery::Mailbox,
+                    reason: None,
                 },
-                delivery: Delivery::Mailbox,
-                // Every message is stored. Typing it into the pane is a later
-                // release, so a request for that is answered, not refused.
-                reason: (msg.deliver != Deliver::Mailbox).then(|| "submit_unavailable".to_string()),
+                Some(body) => {
+                    submit(
+                        id,
+                        to,
+                        resolved,
+                        &body,
+                        (from.pane, from_name.as_deref()),
+                        msg.deliver,
+                        state,
+                        panes,
+                        config,
+                        store,
+                    )
+                    .await
+                }
             }
         }
         Err(refusal) => {
@@ -817,6 +835,241 @@ async fn handle_msg_send(
             ServerMessage::refused(refusal.code(), refusal.message())
         }
     }
+}
+
+/// How long after the text the Enter is written. An agent that reads a paste
+/// and its Enter in one read can take the Enter as part of the paste.
+const ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Type stored message `id` into `to`, whose foreground must be a configured
+/// agent that is reading. The message is already in the mailbox, so every
+/// outcome but `Submitted` leaves it there: see [`submit_outcome`].
+///
+/// The steps take their locks one at a time and never nest them: the sample,
+/// the claim (store), the text (`panes`), then, with nothing held, the Enter
+/// delay, and the Enter (`panes`). The reply waits for the Enter, so what it
+/// says is what happened.
+#[allow(clippy::too_many_arguments)]
+async fn submit(
+    id: MsgId,
+    to: PaneId,
+    resolved: Resolved,
+    body: &str,
+    from: (PaneId, Option<&str>),
+    deliver: Deliver,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) -> ServerMessage {
+    use crate::server::submit::SubmitRefusal;
+
+    let sample = sample_pane(to, state, panes, config).await;
+    let refusal = if !sample.live {
+        Some(pane_closed(to))
+    } else if sample.command.is_none() {
+        Some(SubmitRefusal::not_ready(to))
+    } else if sample
+        .verdict
+        .as_ref()
+        .is_some_and(|v| v.state == AgentState::NeedsInput)
+    {
+        Some(SubmitRefusal {
+            code: "agent_blocked",
+            message: format!(
+                "%{to} is waiting on its user's answer: its message is in the mailbox"
+            ),
+        })
+    } else {
+        None
+    };
+    if let Some(refusal) = refusal {
+        return submit_outcome(id, resolved, deliver, refusal);
+    }
+    // Claimed before anything is typed, so a read that took the message first
+    // (a waiter answered by this very send) wins and it is delivered once.
+    if !store.lock().await.mark_submitted(to, id) {
+        let refusal = SubmitRefusal {
+            code: "already_read",
+            message: format!("%{to} already read message #{id}"),
+        };
+        return submit_outcome(id, resolved, deliver, refusal);
+    }
+    let envelope = config
+        .messaging
+        .envelope
+        .then(|| crate::server::submit::envelope(id, from.0, from.1));
+    let typed = type_text(to, sample.pgid, body, envelope.as_deref(), panes).await;
+    let (bracketed, bytes, enter) = match typed {
+        Ok(typed) => typed,
+        Err(refusal) => {
+            store.lock().await.unsubmit(to, id);
+            return submit_outcome(id, resolved, deliver, refusal);
+        }
+    };
+    tokio::time::sleep(ENTER_DELAY).await;
+    match type_enter(to, sample.pgid, &enter, panes).await {
+        Ok(()) => {
+            log::info!(
+                "msg: id={id} submitted to %{to} (bracketed={}, {bytes} bytes)",
+                if bracketed { "on" } else { "off" }
+            );
+            ServerMessage::MsgSent {
+                id,
+                to: resolved,
+                delivery: Delivery::Submitted,
+                reason: None,
+            }
+        }
+        Err(refusal) => {
+            store.lock().await.unsubmit(to, id);
+            if refusal.code == "agent_did_not_read" {
+                log::info!(
+                    "msg: id={id} not read by %{to}; typed text discarded, left in the mailbox"
+                );
+            }
+            submit_outcome(id, resolved, deliver, refusal)
+        }
+    }
+}
+
+fn pane_closed(pane: PaneId) -> crate::server::submit::SubmitRefusal {
+    crate::server::submit::SubmitRefusal {
+        code: "no_such_target",
+        message: format!("pane %{pane} closed"),
+    }
+}
+
+/// The answer to a submit that did not type the message. `Submit` asked to
+/// be told, so it gets the refusal; `Auto` gets the mailbox, where the
+/// message is, with the refusal as its reason. A pane that closed is an
+/// address refusal under both.
+fn submit_outcome(
+    id: MsgId,
+    resolved: Resolved,
+    deliver: Deliver,
+    refusal: crate::server::submit::SubmitRefusal,
+) -> ServerMessage {
+    if deliver == Deliver::Submit || refusal.code == "no_such_target" {
+        log::info!("msg: id={id} submit refused ({})", refusal.code);
+        ServerMessage::refused(refusal.code, refusal.message)
+    } else {
+        log::info!("msg: id={id} submit -> mailbox ({})", refusal.code);
+        ServerMessage::MsgSent {
+            id,
+            to: resolved,
+            delivery: Delivery::Mailbox,
+            reason: Some(refusal.code.to_string()),
+        }
+    }
+}
+
+/// Write the framed text into `pane`, if the program there is still the one
+/// sampled (`pgid`) and reads its input unbuffered. Returns whether it was
+/// wrapped, its length and the Enter to write after it. Every check and the
+/// write happen in one `panes` section, so nothing can change between them.
+/// The bytes are never logged: they are the message.
+async fn type_text(
+    pane: PaneId,
+    pgid: Option<nix::unistd::Pid>,
+    body: &str,
+    envelope: Option<&str>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(bool, usize, Vec<u8>), crate::server::submit::SubmitRefusal> {
+    use crate::server::submit::{encode, plain_refusal, Framing, SubmitRefusal};
+    use nix::sys::termios::{tcgetattr, LocalFlags};
+
+    let ps = panes.lock().await;
+    let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+        return Err(pane_closed(pane));
+    };
+    let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+    if pgid.is_none() || nix::unistd::tcgetpgrp(master).ok() != pgid {
+        return Err(SubmitRefusal::not_ready(pane));
+    }
+    // On a pty the master's termios requests reach the slave's settings. A
+    // line-buffered terminal means a shell, `read` or a password prompt is
+    // reading: it would take the text as a line of its own the moment the
+    // envelope's newline arrives.
+    match tcgetattr(master) {
+        Ok(termios) if !termios.local_flags.contains(LocalFlags::ICANON) => {}
+        _ => {
+            return Err(SubmitRefusal {
+                code: "agent_not_reading",
+                message: format!(
+                    "%{pane}'s terminal is line-buffered, so its agent is not the one reading: its message is in the mailbox"
+                ),
+            })
+        }
+    }
+    let framing = if pd.screen.bracketed_paste {
+        Framing::Bracketed
+    } else {
+        Framing::Plain
+    };
+    if framing == Framing::Plain {
+        if let Some(refusal) = plain_refusal(body) {
+            return Err(refusal);
+        }
+    }
+    let (text, enter) = encode(body, framing, false, b"\r", envelope);
+    pd.send_input(&text);
+    Ok((framing == Framing::Bracketed, text.len(), enter))
+}
+
+/// Write the Enter into `pane`, if the program sampled is still there and has
+/// READ the text: bytes left in the terminal's input queue would be read by
+/// whatever runs next, and after the agent exits that is the shell, which the
+/// Enter would make run them. Unread text is flushed instead, so nothing ever
+/// reads it. A slave that cannot be opened to ask counts as unread.
+async fn type_enter(
+    pane: PaneId,
+    pgid: Option<nix::unistd::Pid>,
+    enter: &[u8],
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(), crate::server::submit::SubmitRefusal> {
+    let ps = panes.lock().await;
+    let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+        return Err(pane_closed(pane));
+    };
+    let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+    let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
+    let slave = pd.pty.slave_path.as_deref().and_then(open_slave);
+    let unread = slave.as_ref().and_then(unread_input);
+    if same && unread == Some(0) {
+        pd.send_input(enter);
+        return Ok(());
+    }
+    if let Some(slave) = &slave {
+        if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
+            log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
+        }
+    }
+    Err(crate::server::submit::SubmitRefusal {
+        code: "agent_did_not_read",
+        message: format!(
+            "%{pane}'s agent did not read the message, so it was not submitted: it is in the mailbox"
+        ),
+    })
+}
+
+/// The pane's terminal from the slave side, where its input queue is. Opened
+/// without becoming the server's controlling terminal and without blocking.
+fn open_slave(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)
+        .ok()
+}
+
+/// Bytes in the slave's input queue: typed, and not yet read by the program.
+fn unread_input(slave: &std::fs::File) -> Option<usize> {
+    let mut queued: libc::c_int = 0;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(slave);
+    (unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } == 0).then(|| queued.max(0) as usize)
 }
 
 /// The mailbox a read or an ack is about, and the caller's own pane, if it is
@@ -2645,7 +2898,7 @@ async fn handle_client_message(
                 pane_hint,
             };
             let answer =
-                handle_msg_send(client_id, outgoing, peer, state, panes, messaging()).await;
+                handle_msg_send(client_id, outgoing, peer, state, panes, config, messaging()).await;
             reply(client_id, clients, answer).await;
             Ok(())
         }
@@ -6143,6 +6396,94 @@ fn agent_rules(config: &Config) -> &'static crate::server::agents::AgentRules {
     AGENT_RULES.get_or_init(|| crate::server::agents::AgentRules::from_config(&config.agents))
 }
 
+/// The classifier's verdict on `pd` running `command`, as of `now`. The one
+/// place a pane's screen is classified, for the agents list and for submit.
+fn pane_verdict(
+    pd: &PaneData,
+    command: &str,
+    rules: &crate::server::agents::AgentRules,
+    now: std::time::Instant,
+) -> crate::server::agents::Verdict {
+    let bottom = rules.visible_bottom(&pd.screen);
+    rules.classify(
+        command,
+        &bottom,
+        now.saturating_duration_since(pd.last_output),
+    )
+}
+
+/// One pane, as a submit needs it.
+struct PaneSample {
+    /// In the table, not exited, in a tab and not a popup.
+    live: bool,
+    /// The foreground's configured command, or `None` when it is no agent.
+    command: Option<String>,
+    /// The classifier's verdict, when `command` is an agent.
+    verdict: Option<crate::server::agents::Verdict>,
+    /// Whether the program in the pane has bracketed paste on, as of now.
+    bracketed_paste: bool,
+    /// The terminal's foreground process group, read before `command`, so a
+    /// later write can check the program it was meant for is still there.
+    pgid: Option<nix::unistd::Pid>,
+}
+
+/// One pane, sampled the way [`collect_agents`] samples every pane: the
+/// master dup'd under `panes`, the foreground syscalls with no lock held, the
+/// tree under `state`, then the screen and clocks under `panes` again. It
+/// logs nothing, so a submit re-sampling a pane never logs a classification.
+async fn sample_pane(
+    pane_id: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+) -> PaneSample {
+    let gone = PaneSample {
+        live: false,
+        command: None,
+        verdict: None,
+        bracketed_paste: false,
+        pgid: None,
+    };
+    let rules = agent_rules(config);
+    let master = {
+        let ps = panes.lock().await;
+        ps.get(&pane_id)
+            .filter(|pd| !pd.exited)
+            .and_then(|pd| pd.pty.master_fd.try_clone().ok())
+    };
+    let Some(master) = master else {
+        return gone;
+    };
+    let pgid = nix::unistd::tcgetpgrp(std::os::fd::AsFd::as_fd(&master)).ok();
+    let command = if rules.is_empty() {
+        None
+    } else {
+        crate::server::agents::foreground_command(std::os::fd::AsFd::as_fd(&master), rules)
+    };
+    drop(master);
+    let placed = {
+        let st = state.lock().await;
+        st.locate_pane(pane_id).is_some() && !st.is_popup(pane_id)
+    };
+    if !placed {
+        return gone;
+    }
+    let ps = panes.lock().await;
+    let Some(pd) = ps.get(&pane_id).filter(|pd| !pd.exited) else {
+        return gone;
+    };
+    let now = std::time::Instant::now();
+    PaneSample {
+        live: true,
+        verdict: command
+            .as_deref()
+            .map(|command| pane_verdict(pd, command, rules, now)),
+        command,
+        bracketed_paste: pd.screen.bracketed_paste,
+        pgid,
+    }
+}
+
 /// Every pane running a configured agent command, with its state.
 ///
 /// Sampled in three phases so no `/proc` read or `tcgetpgrp` syscall ever
@@ -6222,12 +6563,7 @@ async fn collect_agents(
             let Some(pd) = ps.get_mut(&pane_id) else {
                 continue;
             };
-            let bottom = rules.visible_bottom(&pd.screen);
-            let verdict = rules.classify(
-                &command,
-                &bottom,
-                now.saturating_duration_since(pd.last_output),
-            );
+            let verdict = pane_verdict(pd, &command, rules, now);
             // The explain path: say WHY, but only on a TRANSITION -- keyed on
             // the state and the sample-independent reason, never on `why`.
             let key = (verdict.state, verdict.reason.clone());

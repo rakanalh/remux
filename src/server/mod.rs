@@ -10,4 +10,5 @@ pub mod persistence;
 pub mod procfs;
 pub mod pty;
 pub mod session;
+pub mod submit;
 pub mod title;

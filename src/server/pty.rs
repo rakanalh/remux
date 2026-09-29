@@ -21,6 +21,11 @@ pub struct Pty {
     /// process in the pane that has not moved to another one. Read before the
     /// fork because both sides close the slave straight after it.
     pub slave_dev: Option<libc::dev_t>,
+    /// The slave's path, read before the fork like `slave_dev`. The server
+    /// reopens the slave by it to see whether the pane's program has read
+    /// what the server typed: that queue is the slave's input queue, which
+    /// the master cannot see.
+    pub slave_path: Option<std::path::PathBuf>,
 }
 
 /// Who the pane about to be spawned IS, as the child is told it.
@@ -158,6 +163,14 @@ impl Pty {
             Ok(st) => Some(st.st_rdev),
             Err(e) => {
                 log::warn!("pty: fstat of the slave failed: {e}");
+                None
+            }
+        };
+
+        let slave_path = match nix::unistd::ttyname(&slave) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                log::warn!("pty: ttyname of the slave failed: {e}");
                 None
             }
         };
@@ -320,6 +333,7 @@ impl Pty {
                     master_fd: master,
                     child_pid: child,
                     slave_dev,
+                    slave_path,
                 })
             }
         }

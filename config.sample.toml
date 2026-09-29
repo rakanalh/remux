@@ -1072,6 +1072,10 @@
 #                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
 #                      bodies are then stored on disk; `false` keeps them in
 #                      memory only.
+# envelope             a message TYPED into an agent's pane opens with a line
+#                      naming it and its sender ("[remux message #7 from lead
+#                      (%1); reply: ...]"), so the agent can tell another
+#                      agent's message from its user's.
 #
 # Read by the SERVER at startup, so an edit needs `remux restart`.
 #
@@ -1082,6 +1086,7 @@
 # max_body_bytes = 65536
 # rate_per_10s = 20
 # persist = true
+# envelope = true
 
 # -----------------------------------------------------------------------------
 # REMOTES

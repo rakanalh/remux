@@ -25,8 +25,9 @@ interactive shell (`type_send`, the same pane every time, the session-id path)
 or as a pane's own program (`spawn_sender`, the session leader itself).
 
 3a. A send from outside any pane is refused `sender_unverified`.
-3b. A send from pane A to %B is stored and answered `MsgSent`; a request to
-    type it into the pane is answered `submit_unavailable`, not refused.
+3b. A send from pane A to %B is stored and answered `MsgSent`; `Auto` into a
+    pane running no agent is answered `Mailbox`, reason `agent_not_ready`,
+    not refused.
 3c. B's mailbox holds it, from A in session main, Queued.
 3d. A read of B's mailbox by anyone but B is a peek, whatever it asks.
 3e. B reading its own mailbox marks it Read; a second read is empty; --all
@@ -469,8 +470,8 @@ try:
                                   "body": "MSG:one", "deliver": "Auto"}})
     sent = r.get("MsgSent") if r else None
     check(sent is not None and sent["id"] == 1 and sent["to"]["pane_id"] == B
-          and sent["delivery"] == "Mailbox" and sent["reason"] == "submit_unavailable",
-          f"3b A's send to %{B} is stored as id 1, submit_unavailable (got {r})")
+          and sent["delivery"] == "Mailbox" and sent["reason"] == "agent_not_ready",
+          f"3b A's send to %{B} is stored as id 1, agent_not_ready (got {r})")
 
     # --- 3c ---------------------------------------------------------------
     msgs = listed(read_box(B))

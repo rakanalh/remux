@@ -19,6 +19,9 @@ pub struct MessagingConfig {
     /// `false` keeps mailboxes and names in memory only, so they do not
     /// survive `remux restart`.
     pub persist: bool,
+    /// Type an envelope line naming the message and its sender before a
+    /// message typed into an agent's pane.
+    pub envelope: bool,
 }
 
 impl Default for MessagingConfig {
@@ -30,6 +33,7 @@ impl Default for MessagingConfig {
             max_body_bytes: 64 * 1024,
             rate_per_10s: 20,
             persist: true,
+            envelope: true,
         }
     }
 }
@@ -149,7 +153,7 @@ mod tests {
             .map(|l| format!("{}\n", &l[2..]))
             .collect();
         assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
-        assert_eq!(block.lines().count(), 7, "the block is not all six keys");
+        assert_eq!(block.lines().count(), 8, "the block is not all seven keys");
         assert_eq!(parse(&block), MessagingConfig::default());
     }
 

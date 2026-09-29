@@ -713,6 +713,45 @@ impl Messaging {
         })
     }
 
+    /// Mark message `id` Submitted once it has been typed into `pane`. Only a
+    /// Queued message moves: one the pane already read, or that is gone, has
+    /// reached its reader, and marking it would say it was typed when it was
+    /// not.
+    pub fn mark_submitted(&mut self, pane: PaneId, id: MsgId) -> bool {
+        let Some(msg) = self
+            .mailboxes
+            .get_mut(&pane)
+            .and_then(|mb| mb.messages.iter_mut().find(|m| m.id == id))
+        else {
+            return false;
+        };
+        if msg.state != MsgState::Queued {
+            return false;
+        }
+        msg.state = MsgState::Submitted;
+        self.touched();
+        true
+    }
+
+    /// Undo [`Self::mark_submitted`] when the typing it claimed did not
+    /// happen, so the message waits in the mailbox again. Only a message that
+    /// is still Submitted moves back.
+    pub fn unsubmit(&mut self, pane: PaneId, id: MsgId) -> bool {
+        let Some(msg) = self
+            .mailboxes
+            .get_mut(&pane)
+            .and_then(|mb| mb.messages.iter_mut().find(|m| m.id == id))
+        else {
+            return false;
+        };
+        if msg.state != MsgState::Submitted {
+            return false;
+        }
+        msg.state = MsgState::Queued;
+        self.touched();
+        true
+    }
+
     /// Mark every Queued message Read.
     pub fn ack_all(&mut self, pane: PaneId) -> usize {
         self.mark_read(pane, |msg| msg.state == MsgState::Queued)
@@ -1462,6 +1501,48 @@ mod tests {
                 at_byte: 1
             })
         );
+    }
+
+    #[test]
+    fn mark_submitted_moves_queued_to_submitted_once() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        let typed = send(&mut m, "typed", t0).unwrap();
+        let read = send(&mut m, "read", t0).unwrap();
+        m.ack(2, &[read]);
+        assert!(m.mark_submitted(2, typed));
+        assert!(!m.mark_submitted(2, typed), "a second mark");
+        assert!(!m.mark_submitted(2, read), "a Read message");
+        assert!(!m.mark_submitted(2, 999), "no such id");
+        assert!(!m.mark_submitted(3, typed), "another pane");
+        let states: Vec<MsgState> = m.read(2, true, false, 0).iter().map(|m| m.state).collect();
+        assert_eq!(states, [MsgState::Submitted, MsgState::Read]);
+    }
+
+    #[test]
+    fn unsubmit_moves_only_a_submitted_message_back() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        let typed = send(&mut m, "typed", t0).unwrap();
+        assert!(!m.unsubmit(2, typed), "a Queued message");
+        m.mark_submitted(2, typed);
+        m.ack_all(2);
+        assert!(m.unsubmit(2, typed));
+        assert_eq!(m.read(2, false, false, 0).len(), 1, "Queued again");
+        m.ack(2, &[typed]);
+        assert!(!m.unsubmit(2, typed), "a Read message");
+    }
+
+    #[test]
+    fn a_submitted_message_is_hidden_from_a_plain_read_and_not_unread() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        let typed = send(&mut m, "typed", t0).unwrap();
+        send(&mut m, "waiting", t0).unwrap();
+        m.mark_submitted(2, typed);
+        assert_eq!(bodies(&m.read(2, false, false, 0)), ["waiting"]);
+        assert_eq!(m.unread(2, 0), 1);
+        assert_eq!(bodies(&m.read(2, true, false, 0)), ["typed", "waiting"]);
     }
 
     #[test]
