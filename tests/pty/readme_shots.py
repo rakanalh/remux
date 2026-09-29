@@ -238,11 +238,16 @@ class Wire:
         raise SystemExit("no SessionTree reply")
 
     def panes(self, session):
-        """Pane ids of `session`, tab by tab, in pane order."""
+        """Pane ids of `session` in creation order.
+
+        The tree lists a tab's panes in screen order, which in Master or after
+        a split differs from the order the seeder made them in. Pane ids are
+        allocated in creation order, so sorting by id recovers it.
+        """
         t = self.tree()
         for s in t["unfiled"] + [s for f in t["folders"] for s in f["sessions"]]:
             if s["name"] == session:
-                return [p["id"] for tab in s["tabs"] for p in tab["panes"]]
+                return sorted(p["id"] for tab in s["tabs"] for p in tab["panes"])
         raise SystemExit(f"no session {session!r} in the tree")
 
     def close(self):
@@ -735,12 +740,10 @@ def at(dir_):
 
 
 def seed_api(w, n=4, cols=COLS, rows=ROWS, name="api", tabs=("build", "logs"), focus=0,
-             panes=None, before_typing=None):
+             panes=None):
     """Session `name` whose first tab runs `panes` (default: the first `n` of API_PANES).
 
     Focus ends on pane `focus` of that tab (`None` leaves it on the last one made).
-    `before_typing(w, pane_ids)` runs once the panes exist and before any output,
-    for layout changes that would otherwise re-wrap what the panes print.
     """
     panes = panes or API_PANES[:n]
     n = len(panes)
@@ -752,10 +755,7 @@ def seed_api(w, n=4, cols=COLS, rows=ROWS, name="api", tabs=("build", "logs"), f
         w.type(at("api"), 0.3)
     # Typed only once every pane exists: output printed before a later split
     # shrinks its pane gets re-wrapped by reflow into ragged lines.
-    ids = w.panes(name)
-    if before_typing:
-        before_typing(w, ids)
-    run_in_panes(w, name, ids, panes)
+    run_in_panes(w, name, w.panes(name), panes)
     for t in tabs:
         w.cmd("TabNew")
         w.cmd({"TabRename": t})
@@ -992,23 +992,10 @@ MASTER_PANES = [
 ]
 
 
-def seed_master(w):
-    def claude_to_master(w, ids):
-        w.cmd({"SessionSwitchPane": {"session": "api", "tab_index": 0, "pane_id": ids[0]}})
-        w.cmd("SetMaster")
-    seed_api(w, panes=MASTER_PANES, before_typing=claude_to_master)
-
-
-def seed_monocle(w):
-    # Monocle shows the pane made last. SessionSwitchPane cannot pick another:
-    # in a Monocle tab it moves focus but not the displayed pane.
-    seed_api(w, panes=API_PANES[1:4] + API_PANES[:1], focus=None)
-
-
-shot("layout-master")(layout_shot("master", 5, seed=seed_master,
+# The master is the first pane made, so claude lands in it.
+shot("layout-master")(layout_shot("master", 5, seed=lambda w: seed_api(w, panes=MASTER_PANES),
                                   visible=[seen for _, seen in MASTER_PANES]))
-shot("layout-monocle")(layout_shot("monocle", 4, visible=["Do you want to proceed?"],
-                                   seed=seed_monocle))
+shot("layout-monocle")(layout_shot("monocle", 4, visible=["Do you want to proceed?"]))
 shot("layout-grid")(layout_shot("grid", 6))
 shot("layout-columns")(layout_shot("columns", 3))
 shot("layout-rows")(layout_shot("rows", 3))
@@ -1254,9 +1241,7 @@ shot("whichkey-full-width")(overlay_shot(
     "\x01", "command palette", cfg=config(extra='which_key_position = "full_width"'), full=True))
 shot("command-pallet")(overlay_shot("\x01:", "PaneSplit", then=[("split", "Vertical")]))
 shot("session-switcher")(overlay_shot("\x1bs", "training", remote=True))
-# `jj` puts the cursor on a row other than the current pane's, whose own
-# highlight would otherwise hide it.
-shot("agent-switcher")(overlay_shot("\x1ba", "training", then=[("jj", "training")], remote=True))
+shot("agent-switcher")(overlay_shot("\x1ba", "training", remote=True))
 @shot("session-manager")
 def shot_session_manager(env, out):
     """The tree: a folder, local sessions, and the `devbox` remote expanded."""
