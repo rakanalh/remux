@@ -38,7 +38,130 @@ pub const PASTE_OPEN: &[u8] = b"\x1b[200~";
 pub const PASTE_CLOSE: &[u8] = b"\x1b[201~";
 pub const FOCUS_IN: &[u8] = b"\x1b[I";
 
-use crate::protocol::PaneId;
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use crate::config::messaging::{
+    shipped_rows, valid_enter, Bracketed, MessagingConfig, SubmitRow, WhileWorking,
+    MAX_ENTER_DELAY_MS, MIN_ENTER_DELAY_MS,
+};
+use crate::protocol::{AgentState, Deliver, PaneId};
+
+/// How to type into one agent: its `[messaging.submit.<command>]` row,
+/// merged over the shipped row and the defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitRule {
+    pub bracketed: Bracketed,
+    pub enter: Vec<u8>,
+    pub enter_delay: Duration,
+    pub focus_in: bool,
+    pub while_working: WhileWorking,
+    pub envelope: bool,
+}
+
+impl Default for SubmitRule {
+    fn default() -> Self {
+        SubmitRule {
+            bracketed: Bracketed::Auto,
+            enter: b"\r".to_vec(),
+            enter_delay: Duration::from_millis(300),
+            focus_in: false,
+            while_working: WhileWorking::Mailbox,
+            envelope: true,
+        }
+    }
+}
+
+/// Every command's row: the shipped ones with the user's merged over them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitPolicy {
+    rows: BTreeMap<String, SubmitRow>,
+}
+
+impl SubmitPolicy {
+    pub fn from_config(cfg: &MessagingConfig) -> Self {
+        let mut rows = shipped_rows();
+        for (command, row) in &cfg.submit {
+            let merged = rows.get(command).cloned().unwrap_or_default().merged(row);
+            rows.insert(command.clone(), merged);
+        }
+        SubmitPolicy { rows }
+    }
+
+    /// The rule for `command`, as `[agents] commands` spells it. A field no
+    /// row sets, and an `enter` that could not submit (reported at load),
+    /// take the default.
+    pub fn rule_for(&self, command: &str) -> SubmitRule {
+        let default = SubmitRule::default();
+        let Some(row) = self.rows.get(command) else {
+            return default;
+        };
+        SubmitRule {
+            bracketed: row.bracketed.unwrap_or(default.bracketed),
+            enter: row
+                .enter
+                .as_deref()
+                .filter(|e| valid_enter(e))
+                .map_or(default.enter, |e| e.as_bytes().to_vec()),
+            enter_delay: row.enter_delay_ms.map_or(default.enter_delay, |ms| {
+                Duration::from_millis(ms.clamp(MIN_ENTER_DELAY_MS, MAX_ENTER_DELAY_MS))
+            }),
+            focus_in: row.focus_in.unwrap_or(default.focus_in),
+            while_working: row.while_working.unwrap_or(default.while_working),
+            envelope: row.envelope.unwrap_or(default.envelope),
+        }
+    }
+}
+
+/// The answer to a submit that does not type the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Leave it in the mailbox and say so, under either mode: the reason is a
+    /// delivery choice, not a refusal.
+    Mailbox(&'static str),
+    /// Refuse the send.
+    Refuse(SubmitRefusal),
+}
+
+/// How `refusal` is answered under `deliver`. `Submit` asked to be told, so
+/// it is refused; `Auto` never errors on a policy outcome, so the message is
+/// reported in the mailbox, where it is, with the refusal as its reason. A
+/// pane that closed is an address refusal under both.
+pub fn settle(deliver: Deliver, refusal: SubmitRefusal) -> Answer {
+    if deliver == Deliver::Submit || refusal.code == "no_such_target" {
+        Answer::Refuse(refusal)
+    } else {
+        Answer::Mailbox(refusal.code)
+    }
+}
+
+/// The checks made before anything is typed, in order: the pane is there,
+/// its foreground is an agent, the agent is not waiting on its user, and
+/// what its row says to do while it works. `None` means type it.
+pub fn decide(
+    pane: PaneId,
+    live: bool,
+    agent: bool,
+    state: Option<AgentState>,
+    rule: &SubmitRule,
+    deliver: Deliver,
+) -> Option<Answer> {
+    if !live {
+        return Some(settle(deliver, SubmitRefusal::closed(pane)));
+    }
+    if !agent {
+        return Some(settle(deliver, SubmitRefusal::not_ready(pane)));
+    }
+    match state {
+        Some(AgentState::NeedsInput) => Some(settle(deliver, SubmitRefusal::blocked(pane))),
+        Some(AgentState::Working) => match rule.while_working {
+            WhileWorking::Queue => None,
+            WhileWorking::Mailbox => Some(Answer::Mailbox("agent_working")),
+            WhileWorking::Refuse => Some(settle(deliver, SubmitRefusal::working(pane))),
+        },
+        _ => None,
+    }
+}
 
 /// How the body is wrapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +186,31 @@ impl SubmitRefusal {
             ),
         }
     }
+
+    pub fn closed(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "no_such_target",
+            message: format!("pane %{pane} closed"),
+        }
+    }
+
+    pub fn blocked(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "agent_blocked",
+            message: format!(
+                "%{pane} is waiting on its user's answer: its message is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn working(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "agent_working",
+            message: format!(
+                "%{pane} is working and its policy refuses to type into it: its message is in the mailbox"
+            ),
+        }
+    }
 }
 
 /// The line typed before a message's body: which message it is, who sent it
@@ -76,14 +224,23 @@ pub fn envelope(id: crate::protocol::MsgId, from_pane: PaneId, from_name: Option
     format!("[remux message #{id} from {from}; reply: remux msg send %{from_pane} --reply-to {id}]")
 }
 
+/// Whether a newline typed into the pane stays inside the message: only when
+/// it is wrapped AND the program asked for bracketed paste. A wrap forced on
+/// a program that never enabled it is just more bytes to that program, and
+/// each newline submits a line of its own.
+pub fn newlines_safe(framing: Framing, paste_live: bool) -> bool {
+    framing == Framing::Bracketed && paste_live
+}
+
 /// The two writes for `body`: the text, with its wrap and `focus_in` first
 /// when asked, and the Enter, which the caller writes separately after its
-/// delay. The envelope opens the text: on a line of its own inside a wrap,
-/// and before the body on the same line when plain, where a newline would
-/// submit the envelope alone.
+/// delay. The envelope opens the text, on a line of its own when newlines
+/// are safe (see [`newlines_safe`]) and before the body on the same line
+/// otherwise, where a newline would submit the envelope alone.
 pub fn encode(
     body: &str,
     framing: Framing,
+    paste_live: bool,
     focus_in: bool,
     enter: &[u8],
     envelope: Option<&str>,
@@ -92,33 +249,30 @@ pub fn encode(
     if focus_in {
         text.extend_from_slice(FOCUS_IN);
     }
-    match framing {
-        Framing::Bracketed => {
-            text.extend_from_slice(PASTE_OPEN);
-            if let Some(line) = envelope {
-                text.extend_from_slice(line.as_bytes());
-                text.push(b'\n');
-            }
-            text.extend_from_slice(body.as_bytes());
-            text.extend_from_slice(PASTE_CLOSE);
+    if framing == Framing::Bracketed {
+        text.extend_from_slice(PASTE_OPEN);
+    }
+    if let Some(line) = envelope {
+        text.extend_from_slice(line.as_bytes());
+        if newlines_safe(framing, paste_live) {
+            text.push(b'\n');
+        } else {
+            text.extend_from_slice(" \u{2014} ".as_bytes());
         }
-        Framing::Plain => {
-            if let Some(line) = envelope {
-                text.extend_from_slice(line.as_bytes());
-                text.extend_from_slice(" \u{2014} ".as_bytes());
-            }
-            text.extend_from_slice(body.as_bytes());
-        }
+    }
+    text.extend_from_slice(body.as_bytes());
+    if framing == Framing::Bracketed {
+        text.extend_from_slice(PASTE_CLOSE);
     }
     (text, enter.to_vec())
 }
 
-/// Why `body` cannot be typed unwrapped: each newline would submit a line of
-/// it on its own.
-pub fn plain_refusal(body: &str) -> Option<SubmitRefusal> {
+/// Why `body` cannot be typed where newlines are not safe (see
+/// [`newlines_safe`]): each newline would submit a line of it on its own.
+pub fn multi_line_refusal(body: &str) -> Option<SubmitRefusal> {
     body.contains('\n').then(|| SubmitRefusal {
         code: "bad_body",
-        message: "the pane has bracketed paste off, so a message of more than one line cannot be typed into it; it is in the mailbox".to_string(),
+        message: "the pane's program cannot take a pasted block, so a message of more than one line cannot be typed into it; it is in the mailbox".to_string(),
     })
 }
 
@@ -128,7 +282,7 @@ mod tests {
 
     #[test]
     fn bracketed_encoding_wraps_the_body_and_keeps_enter_outside() {
-        let (text, enter) = encode("hi\nthere", Framing::Bracketed, false, b"\r", None);
+        let (text, enter) = encode("hi\nthere", Framing::Bracketed, true, false, b"\r", None);
         assert_eq!(text, b"\x1b[200~hi\nthere\x1b[201~");
         assert_eq!(enter, b"\r");
         assert!(!text.ends_with(b"\r"));
@@ -136,20 +290,20 @@ mod tests {
 
     #[test]
     fn plain_encoding_is_the_body_alone() {
-        let (text, enter) = encode("hi", Framing::Plain, false, b"\r", None);
+        let (text, enter) = encode("hi", Framing::Plain, true, false, b"\r", None);
         assert_eq!(text, b"hi");
         assert_eq!(enter, b"\r");
     }
 
     #[test]
     fn focus_in_precedes_the_text() {
-        let (text, _) = encode("hi", Framing::Bracketed, true, b"\r", None);
+        let (text, _) = encode("hi", Framing::Bracketed, true, true, b"\r", None);
         assert_eq!(text, b"\x1b[I\x1b[200~hi\x1b[201~");
     }
 
     #[test]
     fn a_custom_enter_is_used_verbatim() {
-        let (_, enter) = encode("hi", Framing::Plain, false, b"\n", None);
+        let (_, enter) = encode("hi", Framing::Plain, true, false, b"\n", None);
         assert_eq!(enter, b"\n");
     }
 
@@ -171,20 +325,180 @@ mod tests {
 
     #[test]
     fn the_envelope_opens_the_paste_on_a_line_of_its_own() {
-        let (text, _) = encode("hi", Framing::Bracketed, false, b"\r", Some("[env]"));
+        let (text, _) = encode("hi", Framing::Bracketed, true, false, b"\r", Some("[env]"));
         assert_eq!(text, b"\x1b[200~[env]\nhi\x1b[201~");
     }
 
     #[test]
+    fn a_forced_wrap_keeps_the_envelope_on_the_bodys_line() {
+        let (text, _) = encode("hi", Framing::Bracketed, false, false, b"\r", Some("[env]"));
+        assert_eq!(text, "\x1b[200~[env] \u{2014} hi\x1b[201~".as_bytes());
+    }
+
+    #[test]
     fn plain_text_keeps_the_envelope_on_the_bodys_line() {
-        let (text, _) = encode("hi", Framing::Plain, false, b"\r", Some("[env]"));
+        let (text, _) = encode("hi", Framing::Plain, true, false, b"\r", Some("[env]"));
         assert_eq!(text, "[env] \u{2014} hi".as_bytes());
         assert!(!text.contains(&b'\n'));
     }
 
+    fn policy(toml: &str) -> SubmitPolicy {
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        SubmitPolicy::from_config(&cfg.messaging)
+    }
+
+    #[test]
+    fn shipped_rows_match_the_spec_table() {
+        let p = policy("");
+        assert_eq!(p.rule_for("claude").while_working, WhileWorking::Queue);
+        assert!(p.rule_for("copilot").focus_in);
+        assert_eq!(p.rule_for("copilot").while_working, WhileWorking::Mailbox);
+        assert_eq!(p.rule_for("codex").while_working, WhileWorking::Mailbox);
+        assert_eq!(p.rule_for("anything-else"), SubmitRule::default());
+        assert_eq!(
+            SubmitRule::default(),
+            SubmitRule {
+                bracketed: Bracketed::Auto,
+                enter: b"\r".to_vec(),
+                enter_delay: Duration::from_millis(300),
+                focus_in: false,
+                while_working: WhileWorking::Mailbox,
+                envelope: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_user_row_keeps_the_shipped_fields() {
+        let p = policy("[messaging.submit.claude]\nenter_delay_ms = 500\nenvelope = false");
+        let claude = p.rule_for("claude");
+        assert_eq!(claude.while_working, WhileWorking::Queue);
+        assert_eq!(claude.enter_delay, Duration::from_millis(500));
+        assert!(!claude.envelope);
+        assert!(p.rule_for("codex").envelope, "another row changed");
+    }
+
+    #[test]
+    fn the_enter_delay_is_clamped_to_its_range() {
+        let p = policy(
+            "[messaging.submit.a]\nenter_delay_ms = 12000\n[messaging.submit.b]\nenter_delay_ms = 0\n[messaging.submit.c]\nenter_delay_ms = 700",
+        );
+        assert_eq!(p.rule_for("a").enter_delay, Duration::from_millis(5000));
+        assert_eq!(p.rule_for("b").enter_delay, Duration::from_millis(50));
+        assert_eq!(p.rule_for("c").enter_delay, Duration::from_millis(700));
+    }
+
+    #[test]
+    fn a_bad_enter_falls_back_to_the_default() {
+        let p = policy("[messaging.submit.a]\nenter = \"\"\n[messaging.submit.b]\nenter = \"\\n\"");
+        assert_eq!(p.rule_for("a").enter, b"\r");
+        assert_eq!(p.rule_for("b").enter, b"\n");
+    }
+
+    #[test]
+    fn decide_orders_foreground_blocked_working() {
+        use AgentState::{Idle, NeedsInput, Working};
+        use Deliver::{Auto, Submit};
+        let rule = |while_working| SubmitRule {
+            while_working,
+            ..SubmitRule::default()
+        };
+        let queue = rule(WhileWorking::Queue);
+        let mailbox = rule(WhileWorking::Mailbox);
+        let refuse = rule(WhileWorking::Refuse);
+        let code = |d: Option<Answer>| match d {
+            None => "inject".to_string(),
+            Some(Answer::Mailbox(reason)) => format!("mailbox:{reason}"),
+            Some(Answer::Refuse(r)) => format!("refuse:{}", r.code),
+        };
+        for (live, agent, state, rule, deliver, want) in [
+            (
+                false,
+                true,
+                Some(Idle),
+                &queue,
+                Auto,
+                "refuse:no_such_target",
+            ),
+            (
+                false,
+                true,
+                Some(Idle),
+                &queue,
+                Submit,
+                "refuse:no_such_target",
+            ),
+            (true, false, None, &queue, Submit, "refuse:agent_not_ready"),
+            (true, false, None, &queue, Auto, "mailbox:agent_not_ready"),
+            (
+                true,
+                true,
+                Some(NeedsInput),
+                &queue,
+                Submit,
+                "refuse:agent_blocked",
+            ),
+            (
+                true,
+                true,
+                Some(NeedsInput),
+                &queue,
+                Auto,
+                "mailbox:agent_blocked",
+            ),
+            (true, true, Some(Working), &queue, Submit, "inject"),
+            (
+                true,
+                true,
+                Some(Working),
+                &mailbox,
+                Submit,
+                "mailbox:agent_working",
+            ),
+            (
+                true,
+                true,
+                Some(Working),
+                &mailbox,
+                Auto,
+                "mailbox:agent_working",
+            ),
+            (
+                true,
+                true,
+                Some(Working),
+                &refuse,
+                Submit,
+                "refuse:agent_working",
+            ),
+            (
+                true,
+                true,
+                Some(Working),
+                &refuse,
+                Auto,
+                "mailbox:agent_working",
+            ),
+            (true, true, Some(Idle), &refuse, Submit, "inject"),
+        ] {
+            assert_eq!(
+                code(decide(5, live, agent, state, rule, deliver)),
+                want,
+                "{live} {agent} {state:?} {:?} {deliver:?}",
+                rule.while_working
+            );
+        }
+    }
+
     #[test]
     fn a_multi_line_body_is_refused_plain() {
-        assert_eq!(plain_refusal("one\ntwo").map(|r| r.code), Some("bad_body"));
-        assert_eq!(plain_refusal("one line"), None);
+        assert_eq!(
+            multi_line_refusal("one\ntwo").map(|r| r.code),
+            Some("bad_body")
+        );
+        assert_eq!(multi_line_refusal("one line"), None);
+        assert!(newlines_safe(Framing::Bracketed, true));
+        assert!(!newlines_safe(Framing::Bracketed, false));
+        assert!(!newlines_safe(Framing::Plain, true));
     }
 }

@@ -837,13 +837,10 @@ async fn handle_msg_send(
     }
 }
 
-/// How long after the text the Enter is written. An agent that reads a paste
-/// and its Enter in one read can take the Enter as part of the paste.
-const ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// Type stored message `id` into `to`, whose foreground must be a configured
-/// agent that is reading. The message is already in the mailbox, so every
-/// outcome but `Submitted` leaves it there: see [`submit_outcome`].
+/// Type stored message `id` into `to`, if its foreground is a configured
+/// agent that is reading and its row allows it now. The message is already
+/// in the mailbox, so every outcome but `Submitted` leaves it there: see
+/// [`crate::server::submit::settle`].
 ///
 /// The steps take their locks one at a time and never nest them: the sample,
 /// the claim (store), the text (`panes`), then, with nothing held, the Enter
@@ -862,29 +859,23 @@ async fn submit(
     config: &Arc<Config>,
     store: &'static Mutex<Messaging>,
 ) -> ServerMessage {
-    use crate::server::submit::SubmitRefusal;
+    use crate::server::submit::{decide, settle, SubmitRefusal};
 
     let sample = sample_pane(to, state, panes, config).await;
-    let refusal = if !sample.live {
-        Some(pane_closed(to))
-    } else if sample.command.is_none() {
-        Some(SubmitRefusal::not_ready(to))
-    } else if sample
-        .verdict
-        .as_ref()
-        .is_some_and(|v| v.state == AgentState::NeedsInput)
-    {
-        Some(SubmitRefusal {
-            code: "agent_blocked",
-            message: format!(
-                "%{to} is waiting on its user's answer: its message is in the mailbox"
-            ),
-        })
-    } else {
-        None
-    };
-    if let Some(refusal) = refusal {
-        return submit_outcome(id, resolved, deliver, refusal);
+    let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
+    let agent_state = sample.verdict.as_ref().map(|v| v.state);
+    let decision = decide(
+        to,
+        sample.live,
+        sample.command.is_some(),
+        agent_state,
+        &rule,
+        deliver,
+    );
+    if let Some(answer) = decision {
+        let policy = (agent_state == Some(AgentState::Working))
+            .then(|| format!("while_working={:?}", rule.while_working).to_lowercase());
+        return answer_submit(id, resolved, answer, policy);
     }
     // Claimed before anything is typed, so a read that took the message first
     // (a waiter answered by this very send) wins and it is delivered once.
@@ -893,21 +884,20 @@ async fn submit(
             code: "already_read",
             message: format!("%{to} already read message #{id}"),
         };
-        return submit_outcome(id, resolved, deliver, refusal);
+        return answer_submit(id, resolved, settle(deliver, refusal), None);
     }
-    let envelope = config
-        .messaging
+    let envelope = rule
         .envelope
         .then(|| crate::server::submit::envelope(id, from.0, from.1));
-    let typed = type_text(to, sample.pgid, body, envelope.as_deref(), panes).await;
+    let typed = type_text(to, sample.pgid, body, envelope.as_deref(), &rule, panes).await;
     let (bracketed, bytes, enter) = match typed {
         Ok(typed) => typed,
         Err(refusal) => {
             store.lock().await.unsubmit(to, id);
-            return submit_outcome(id, resolved, deliver, refusal);
+            return answer_submit(id, resolved, settle(deliver, refusal), None);
         }
     };
-    tokio::time::sleep(ENTER_DELAY).await;
+    tokio::time::sleep(rule.enter_delay).await;
     match type_enter(to, sample.pgid, &enter, panes).await {
         Ok(()) => {
             log::info!(
@@ -928,38 +918,47 @@ async fn submit(
                     "msg: id={id} not read by %{to}; typed text discarded, left in the mailbox"
                 );
             }
-            submit_outcome(id, resolved, deliver, refusal)
+            answer_submit(id, resolved, settle(deliver, refusal), None)
         }
     }
 }
 
-fn pane_closed(pane: PaneId) -> crate::server::submit::SubmitRefusal {
-    crate::server::submit::SubmitRefusal {
-        code: "no_such_target",
-        message: format!("pane %{pane} closed"),
-    }
+/// The server's submit policy, read from the config once like
+/// [`agent_rules`], and for the same reason: an edit needs `remux restart`.
+static SUBMIT_POLICY: std::sync::OnceLock<crate::server::submit::SubmitPolicy> =
+    std::sync::OnceLock::new();
+
+fn submit_policy(config: &Config) -> &'static crate::server::submit::SubmitPolicy {
+    SUBMIT_POLICY
+        .get_or_init(|| crate::server::submit::SubmitPolicy::from_config(&config.messaging))
 }
 
-/// The answer to a submit that did not type the message. `Submit` asked to
-/// be told, so it gets the refusal; `Auto` gets the mailbox, where the
-/// message is, with the refusal as its reason. A pane that closed is an
-/// address refusal under both.
-fn submit_outcome(
+/// The reply to a submit that did not type the message, logged once. `policy`
+/// names the row setting that decided, when one did.
+fn answer_submit(
     id: MsgId,
     resolved: Resolved,
-    deliver: Deliver,
-    refusal: crate::server::submit::SubmitRefusal,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
 ) -> ServerMessage {
-    if deliver == Deliver::Submit || refusal.code == "no_such_target" {
-        log::info!("msg: id={id} submit refused ({})", refusal.code);
-        ServerMessage::refused(refusal.code, refusal.message)
-    } else {
-        log::info!("msg: id={id} submit -> mailbox ({})", refusal.code);
-        ServerMessage::MsgSent {
-            id,
-            to: resolved,
-            delivery: Delivery::Mailbox,
-            reason: Some(refusal.code.to_string()),
+    use crate::server::submit::Answer;
+    let why = |code: &str| match &policy {
+        Some(policy) => format!("{code}, {policy}"),
+        None => code.to_string(),
+    };
+    match answer {
+        Answer::Refuse(refusal) => {
+            log::info!("msg: id={id} submit refused ({})", why(refusal.code));
+            ServerMessage::refused(refusal.code, refusal.message)
+        }
+        Answer::Mailbox(reason) => {
+            log::info!("msg: id={id} submit -> mailbox ({})", why(reason));
+            ServerMessage::MsgSent {
+                id,
+                to: resolved,
+                delivery: Delivery::Mailbox,
+                reason: Some(reason.to_string()),
+            }
         }
     }
 }
@@ -974,14 +973,18 @@ async fn type_text(
     pgid: Option<nix::unistd::Pid>,
     body: &str,
     envelope: Option<&str>,
+    rule: &crate::server::submit::SubmitRule,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) -> Result<(bool, usize, Vec<u8>), crate::server::submit::SubmitRefusal> {
-    use crate::server::submit::{encode, plain_refusal, Framing, SubmitRefusal};
+    use crate::config::messaging::Bracketed;
+    use crate::server::submit::{
+        encode, multi_line_refusal, newlines_safe, Framing, SubmitRefusal,
+    };
     use nix::sys::termios::{tcgetattr, LocalFlags};
 
     let ps = panes.lock().await;
     let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
-        return Err(pane_closed(pane));
+        return Err(crate::server::submit::SubmitRefusal::closed(pane));
     };
     let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
     if pgid.is_none() || nix::unistd::tcgetpgrp(master).ok() != pgid {
@@ -1002,17 +1005,26 @@ async fn type_text(
             })
         }
     }
-    let framing = if pd.screen.bracketed_paste {
-        Framing::Bracketed
-    } else {
-        Framing::Plain
+    let framing = match rule.bracketed {
+        Bracketed::On => Framing::Bracketed,
+        Bracketed::Off => Framing::Plain,
+        Bracketed::Auto if pd.screen.bracketed_paste => Framing::Bracketed,
+        Bracketed::Auto => Framing::Plain,
     };
-    if framing == Framing::Plain {
-        if let Some(refusal) = plain_refusal(body) {
+    let paste_live = pd.screen.bracketed_paste;
+    if !newlines_safe(framing, paste_live) {
+        if let Some(refusal) = multi_line_refusal(body) {
             return Err(refusal);
         }
     }
-    let (text, enter) = encode(body, framing, false, b"\r", envelope);
+    let (text, enter) = encode(
+        body,
+        framing,
+        paste_live,
+        rule.focus_in,
+        &rule.enter,
+        envelope,
+    );
     pd.send_input(&text);
     Ok((framing == Framing::Bracketed, text.len(), enter))
 }
@@ -1030,7 +1042,7 @@ async fn type_enter(
 ) -> Result<(), crate::server::submit::SubmitRefusal> {
     let ps = panes.lock().await;
     let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
-        return Err(pane_closed(pane));
+        return Err(crate::server::submit::SubmitRefusal::closed(pane));
     };
     let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
     let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;

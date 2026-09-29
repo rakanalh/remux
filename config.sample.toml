@@ -1072,10 +1072,6 @@
 #                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
 #                      bodies are then stored on disk; `false` keeps them in
 #                      memory only.
-# envelope             a message TYPED into an agent's pane opens with a line
-#                      naming it and its sender ("[remux message #7 from lead
-#                      (%1); reply: ...]"), so the agent can tell another
-#                      agent's message from its user's.
 #
 # Read by the SERVER at startup, so an edit needs `remux restart`.
 #
@@ -1086,7 +1082,34 @@
 # max_body_bytes = 65536
 # rate_per_10s = 20
 # persist = true
-# envelope = true
+#
+# How a message is TYPED into an agent's pane (`remux msg send --deliver
+# submit`, or `auto`, the default), one row per `[agents] commands` spelling.
+# A row changes only the fields it names; the rest keep the shipped row, or
+# the default below for a command with none.
+#
+# bracketed        "auto" (as the agent asked, read when typing), "on", "off".
+#                  With it off, a message of more than one line is refused.
+# enter            the bytes that submit the text (default "\r"), written
+# enter_delay_ms   this long after it (default 300), outside the paste.
+# focus_in         report focus (ESC[I) before the text (default false).
+# while_working    "queue" types it anyway, "mailbox" (default) leaves it
+#                  for the agent's hook, "refuse" refuses `--deliver submit`.
+# envelope         open the text with a line naming the message and its
+#                  sender, "[remux message #7 from lead (%1); reply: ...]",
+#                  so the agent can tell another agent's message from its
+#                  user's (default true).
+#
+# The shipped rows:
+#
+# [messaging.submit.claude]
+# while_working = "queue"
+#
+# [messaging.submit.codex]
+# while_working = "mailbox"
+#
+# [messaging.submit.copilot]
+# focus_in = true
 
 # -----------------------------------------------------------------------------
 # REMOTES

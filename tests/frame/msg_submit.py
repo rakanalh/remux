@@ -47,6 +47,27 @@ own, or before the body on the same line when the pane has paste off.
     submit is no_such_target.
 1z. No panic.
 
+Task 2, the per-agent rows ([messaging.submit.<command>]). The policy is read
+by the server at startup, so each variant is a fresh server with its config:
+
+2a. Default row: a blocked agent is refused (Submit) or left in the mailbox
+    (Auto), nothing typed; once it is cleared, a Submit is typed.
+2b. Default row (while_working = mailbox): a working agent's message stays
+    in the mailbox under Submit AND Auto (a delivery choice, not a refusal),
+    nothing typed, and the log names the setting.
+2c. while_working = "queue": a working agent is typed into, while it works.
+2d. while_working = "refuse": Submit is refused agent_working, Auto is
+    Mailbox/agent_working; the log names the setting.
+2e. bracketed = "off" with paste on: no wrap. bracketed = "on" with paste
+    off: wrapped.
+2f. enter = "\\n", enter_delay_ms = 50: the Enter is 0a, under 200 ms later.
+2g. focus_in = true: the text starts with ESC[I, then the wrap.
+2h. envelope = false: no envelope line (with 2e's off half).
+2i. bracketed = "on" over a program with paste off: a multi-line body is
+    refused bad_body, and the envelope shares the body's line (2e's on half),
+    because the program never asked for a paste and each newline submits.
+2z. No panic under any variant.
+
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
 """
 import json
@@ -173,6 +194,7 @@ def spawn_agent(paste):
         time.sleep(0.05)
     if paste:
         tell(ctl, log, "paste-on")
+    check(wait_idle(pane), f"...the agent in %{pane} settled Idle before the next send")
     return pane, log, ctl
 
 
@@ -187,6 +209,19 @@ def tell(ctl, log, command, timeout=5.0):
     while time.time() < end and ctl_count(log, command) == before:
         time.sleep(0.05)
     time.sleep(0.4)
+
+
+def wait_idle(pane, timeout=5.0):
+    """Wait until the server classifies `pane`'s agent Idle. The fakeagent's
+    own output (a mode switch, a prompt) counts as work for `working_ms`, and
+    while an agent works its row, not the case, decides what a submit does."""
+    end = time.time() + timeout
+    while time.time() < end:
+        entries = status_of(pane)
+        if isinstance(entries, list) and entries and entries[0]["state"] == "Idle":
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def ctl_count(log, command):
@@ -320,6 +355,7 @@ try:
 
     # --- 1d -----------------------------------------------------------------
     tell(F_CTL, F_LOG, "paste-off")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
     start = len(rx_chunks(F_LOG))
     r = type_send(A, send(F, "MSG:three", "Submit"))
     at = wait_rx(F_LOG, envelope(sent_id(r), A) + " \u2014 MSG:three".encode(), start)
@@ -328,6 +364,7 @@ try:
 
     # --- 1e -----------------------------------------------------------------
     tell(F_CTL, F_LOG, "paste-on")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
     start = len(rx_chunks(F_LOG))
     r = type_send(A, send(F, "MSG:four\nline two", "Submit"))
     at = wait_rx(F_LOG, OPEN + envelope(sent_id(r), A) + b"\nMSG:four\nline two" + CLOSE, start)
@@ -384,6 +421,7 @@ try:
           and len(rx_chunks(F_LOG)) == start,
           f"1k a blocked agent is not typed into (submit {r_sub}, auto {r_auto}, chunks {rx_chunks(F_LOG)[start:]})")
     tell(F_CTL, F_LOG, "clear")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
 
     # --- 1l -----------------------------------------------------------------
     start = len(rx_chunks(F2_LOG))
@@ -420,13 +458,14 @@ try:
     while time.time() < end and not os.path.exists(p_log):
         time.sleep(0.05)
     tell(p_ctl, p_log, "paste-on")
-    tell(p_ctl, p_log, "deaf:1500")
+    tell(p_ctl, p_log, "deaf:3000")
+    check(wait_idle(P), f"...the agent in %{P} settled Idle before the next send")
     r = type_send(A, send(P, f"touch {marker}", "Submit"))
     # Once the agent has exited, the shell runs whatever is queued in the
     # terminal, in order. A sentinel typed after that point exists only once
     # everything queued before it has run, however slowly (a command-not-found
     # handler can take seconds over the envelope line).
-    time.sleep(2.0)
+    time.sleep(3.0)
     sentinel = f"{RUNDIR}/sentinel"
     cli.send({"InputToPane": {"pane_id": P, "data": list(f"touch {sentinel}\n".encode())}})
     end = time.time() + 20
@@ -456,6 +495,7 @@ try:
     while time.time() < end and not os.path.exists(q_log):
         time.sleep(0.05)
     tell(q_ctl, q_log, "paste-on")
+    check(wait_idle(Q), f"...the agent in %{Q} settled Idle before the next send")
     time.sleep(0.5)
     r = type_send(A, send(Q, "DUP:one", "Submit"))
     waited = wait_file(w_out, timeout=5.0) or {}
@@ -468,6 +508,7 @@ try:
     # --- 1p -----------------------------------------------------------------
     X, X_LOG, X_CTL = spawn_agent(paste=True)
     tell(X_CTL, X_LOG, "exit-on-rx")
+    check(wait_idle(X), f"...the agent in %{X} settled Idle before the next send")
     r = type_send(A, send(X, "EXIT:now", "Submit"))
     time.sleep(0.5)
     chunks = [c for _, c in rx_chunks(X_LOG)]
@@ -483,6 +524,152 @@ try:
 
     # --- 1z -----------------------------------------------------------------
     check("panicked at" not in srv.log(), "1z no panic in server.log")
+finally:
+    srv.kill()
+
+
+
+# === Task 2: the per-agent rows ============================================
+def start_variant(rows):
+    """A fresh server whose config adds `rows`, with the sender pane A."""
+    global srv, cli
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + rows)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 160, "rows": 50}})
+    cli.drain(0.8)
+    pane = cli_spawn("SplitRight")
+    time.sleep(0.8)
+    return pane
+
+
+def wait_state(pane, want, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        entries = status_of(pane)
+        if isinstance(entries, list) and entries and entries[0]["state"] == want:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def no_new_chunks(log, start, wait=1.5):
+    time.sleep(wait)
+    return len(rx_chunks(log)) == start
+
+
+FOCUS = b"\x1b[I"
+
+# --- V1: the default row ------------------------------------------------------
+try:
+    A = start_variant("")
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+
+    # 2a
+    tell(F_CTL, F_LOG, "block")
+    start = len(rx_chunks(F_LOG))
+    r_sub = type_send(A, send(F, "BLK:one", "Submit"))
+    r_auto = type_send(A, send(F, "BLK:two", "Auto"))
+    check(outcome(r_sub) == ("Error", "agent_blocked") and outcome(r_auto) == ("Mailbox", "agent_blocked")
+          and no_new_chunks(F_LOG, start),
+          f"2a a blocked agent: Submit refused, Auto in the mailbox, nothing typed (submit {r_sub}, auto {r_auto})")
+    tell(F_CTL, F_LOG, "clear")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    r = type_send(A, send(F, "BLK:three", "Submit"))
+    check(submitted(r) and wait_rx(F_LOG, OPEN + envelope(sent_id(r), A) + b"\nBLK:three" + CLOSE, start) is not None,
+          f"2a ...and once it is cleared a Submit is typed (got {r})")
+
+    # 2b
+    tell(F_CTL, F_LOG, "work:4000")
+    working = wait_state(F, "Working")
+    start = len(rx_chunks(F_LOG))
+    r_sub = type_send(A, send(F, "WORK:one", "Submit"))
+    r_auto = type_send(A, send(F, "WORK:two", "Auto"))
+    check(working and outcome(r_sub) == ("Mailbox", "agent_working") and outcome(r_auto) == ("Mailbox", "agent_working")
+          and no_new_chunks(F_LOG, start, 0.5),
+          f"2b the default row leaves a working agent's message in the mailbox under both modes "
+          f"(working {working}, submit {r_sub}, auto {r_auto})")
+    check(f"msg: id={sent_id(r_sub)} submit -> mailbox (agent_working, while_working=mailbox)" in srv.log(),
+          "2b ...and the log names the setting that decided")
+    check("panicked at" not in srv.log(), "2z no panic under the default row")
+finally:
+    srv.kill()
+
+# --- V2: queue, "\n", 50 ms, focus_in -----------------------------------------
+try:
+    A = start_variant("""
+[messaging.submit.fakeagent]
+while_working = "queue"
+enter = "\\n"
+enter_delay_ms = 50
+focus_in = true
+""")
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    tell(F_CTL, F_LOG, "work:4000")
+    working = wait_state(F, "Working")
+    r = type_send(A, send(F, "QUEUE:one", "Submit"))
+    still = wait_state(F, "Working", timeout=0.5)
+    at = wait_rx(F_LOG, FOCUS + OPEN + envelope(sent_id(r), A) + b"\nQUEUE:one" + CLOSE)
+    gap, enter = enter_after(F_LOG, at) if at is not None else (None, None)
+    check(working and submitted(r) and still,
+          f"2c while_working=queue types into a working agent, while it works (working {working}, reply {r}, still {still})")
+    check(at is not None, f"2g focus_in: the text starts with ESC[I, then the wrap (got {rx_chunks(F_LOG)})")
+    check(enter == b"\n" and gap is not None and gap < 200,
+          f"2f enter and enter_delay_ms: the Enter is 0a, {gap} ms later (got {enter!r})")
+    check("panicked at" not in srv.log(), "2z no panic under the queue row")
+finally:
+    srv.kill()
+
+# --- V3: refuse, bracketed off, envelope off ---------------------------------
+try:
+    A = start_variant("""
+[messaging.submit.fakeagent]
+while_working = "refuse"
+bracketed = "off"
+envelope = false
+""")
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    r = type_send(A, send(F, "BR:off", "Submit"))
+    at = wait_rx(F_LOG, b"BR:off")
+    check(submitted(r) and at is not None,
+          f"2e bracketed=off with paste on: no wrap; 2h envelope=false: no envelope (reply {r}, got {rx_chunks(F_LOG)})")
+    tell(F_CTL, F_LOG, "work:4000")
+    working = wait_state(F, "Working")
+    start = len(rx_chunks(F_LOG))
+    r_sub = type_send(A, send(F, "REF:one", "Submit"))
+    r_auto = type_send(A, send(F, "REF:two", "Auto"))
+    check(working and outcome(r_sub) == ("Error", "agent_working") and outcome(r_auto) == ("Mailbox", "agent_working")
+          and no_new_chunks(F_LOG, start, 0.5),
+          f"2d while_working=refuse: Submit refused, Auto in the mailbox (submit {r_sub}, auto {r_auto})")
+    check(f"msg: id={sent_id(r_auto)} submit -> mailbox (agent_working, while_working=refuse)" in srv.log()
+          and "submit refused (agent_working, while_working=refuse)" in srv.log(),
+          "2d ...and the log names the setting that decided")
+    check("panicked at" not in srv.log(), "2z no panic under the refuse row")
+finally:
+    srv.kill()
+
+# --- V4: bracketed on ----------------------------------------------------------
+try:
+    A = start_variant("""
+[messaging.submit.fakeagent]
+bracketed = "on"
+""")
+    F, F_LOG, F_CTL = spawn_agent(paste=False)
+    r = type_send(A, send(F, "BR:on", "Submit"))
+    at = wait_rx(F_LOG, OPEN + envelope(sent_id(r), A) + " \u2014 BR:on".encode() + CLOSE)
+    check(submitted(r) and at is not None,
+          f"2e bracketed=on with paste off: wrapped, the envelope on the body's line (reply {r}, got {rx_chunks(F_LOG)})")
+
+    # 2i
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    start = len(rx_chunks(F_LOG))
+    r = type_send(A, send(F, "BR:one\ntwo", "Submit"))
+    check(outcome(r) == ("Error", "bad_body") and no_new_chunks(F_LOG, start, 0.8),
+          f"2i bracketed=on over paste off refuses a multi-line body: a forced wrap would submit it line by line (got {r})")
+    check("panicked at" not in srv.log(), "2z no panic under the bracketed row")
 finally:
     srv.kill()
 

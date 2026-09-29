@@ -357,6 +357,9 @@ impl Config {
         for problem in config.messaging.problems() {
             log::warn!("{problem}");
         }
+        for problem in config.submit_rows_without_an_agent() {
+            log::warn!("{problem}");
+        }
         if config.layouts.none_enabled() {
             log::warn!("[layouts]: every layout is disabled; cycling through all of them");
         }
@@ -369,6 +372,22 @@ impl Config {
             );
         }
         Ok(config)
+    }
+
+    /// One line per `[messaging.submit.<command>]` row whose command is not in
+    /// `[agents] commands`: no pane is ever that agent, so the row is never
+    /// used, which is usually a misspelling.
+    pub fn submit_rows_without_an_agent(&self) -> Vec<String> {
+        self.messaging
+            .submit
+            .keys()
+            .filter(|command| !self.agents.commands.contains(command))
+            .map(|command| {
+                format!(
+                    "[messaging.submit.{command}] names no command in [agents] commands, so it is never used"
+                )
+            })
+            .collect()
     }
 
     /// The layout every new tab starts in: `default_layout`, or the first

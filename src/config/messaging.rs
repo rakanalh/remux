@@ -1,7 +1,10 @@
 //! `[messaging]` configuration: how long mail lives and how much of it a
-//! mailbox and a sender may hold.
+//! mailbox and a sender may hold, and how a message is typed into each kind
+//! of agent (`[messaging.submit.<command>]`).
 //!
 //! The server reads this at startup, so an edit needs `remux restart`.
+
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
@@ -19,9 +22,114 @@ pub struct MessagingConfig {
     /// `false` keeps mailboxes and names in memory only, so they do not
     /// survive `remux restart`.
     pub persist: bool,
-    /// Type an envelope line naming the message and its sender before a
-    /// message typed into an agent's pane.
-    pub envelope: bool,
+    /// How to type into each agent, by its `[agents] commands` spelling.
+    /// Merged field by field over [`shipped_rows`].
+    pub submit: BTreeMap<String, SubmitRow>,
+}
+
+/// Whether a typed message is wrapped in bracketed paste.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Bracketed {
+    /// As the pane's program asked (mode 2004), read when the text is typed.
+    Auto,
+    On,
+    Off,
+}
+
+/// What a submit does while the agent is working.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WhileWorking {
+    /// Type it now: the agent takes typed input as its next prompt.
+    Queue,
+    /// Leave it in the mailbox, for the agent's hook to deliver.
+    Mailbox,
+    /// Refuse a `Submit`; an `Auto` leaves it in the mailbox.
+    Refuse,
+}
+
+/// One `[messaging.submit.<command>]` row. Every field is optional, so a
+/// user's row changes only the fields it names and keeps the shipped value
+/// of the rest.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SubmitRow {
+    pub bracketed: Option<Bracketed>,
+    /// The bytes that submit the typed text, `"\r"` unless set.
+    pub enter: Option<String>,
+    pub enter_delay_ms: Option<u64>,
+    /// Report focus (`ESC[I`) before the text, for an agent that ignores
+    /// input it believes is not for it.
+    pub focus_in: Option<bool>,
+    pub while_working: Option<WhileWorking>,
+    /// Open the typed text with a line naming the message and its sender.
+    pub envelope: Option<bool>,
+}
+
+impl SubmitRow {
+    /// `self`, with each field `over` sets replaced by `over`'s.
+    pub fn merged(&self, over: &SubmitRow) -> SubmitRow {
+        SubmitRow {
+            bracketed: over.bracketed.or(self.bracketed),
+            enter: over.enter.clone().or_else(|| self.enter.clone()),
+            enter_delay_ms: over.enter_delay_ms.or(self.enter_delay_ms),
+            focus_in: over.focus_in.or(self.focus_in),
+            while_working: over.while_working.or(self.while_working),
+            envelope: over.envelope.or(self.envelope),
+        }
+    }
+}
+
+/// The rows that ship: Claude Code takes typed input while it works as its
+/// next prompt, so `queue`; Copilot's CLI ignores input until it has focus,
+/// so `focus_in`; Codex's behaviour while working is inferred rather than
+/// verified, so it waits in the `mailbox`. Every other command gets the
+/// generic default.
+pub fn shipped_rows() -> BTreeMap<String, SubmitRow> {
+    BTreeMap::from([
+        (
+            "claude".to_string(),
+            SubmitRow {
+                while_working: Some(WhileWorking::Queue),
+                ..SubmitRow::default()
+            },
+        ),
+        (
+            "copilot".to_string(),
+            SubmitRow {
+                focus_in: Some(true),
+                ..SubmitRow::default()
+            },
+        ),
+        (
+            "codex".to_string(),
+            SubmitRow {
+                while_working: Some(WhileWorking::Mailbox),
+                ..SubmitRow::default()
+            },
+        ),
+    ])
+}
+
+/// The shortest `enter_delay_ms`: with no delay the paste and its Enter can
+/// arrive in one read, which an agent can take as part of the paste.
+pub const MIN_ENTER_DELAY_MS: u64 = 50;
+
+/// The longest `enter_delay_ms`. The reply to a send waits for the Enter, so
+/// this must stay well inside the CLI's reply deadline (10 s,
+/// `cli_common::REPLY_DEADLINE`): a CLI that gives up first leaves a message
+/// that is typed after all, and a retry then delivers it twice.
+pub const MAX_ENTER_DELAY_MS: u64 = 5000;
+
+/// The most bytes an `enter` may be.
+pub const MAX_ENTER_BYTES: usize = 4;
+
+/// Whether `enter` can submit a typed message: one to four control bytes
+/// (`"\r"`, `"\n"`, `"\r\n"`), so it can neither type text of its own nor
+/// end a bracketed paste early.
+pub fn valid_enter(enter: &str) -> bool {
+    (1..=MAX_ENTER_BYTES).contains(&enter.len()) && enter.bytes().all(|b| b < 0x20 || b == 0x7f)
 }
 
 impl Default for MessagingConfig {
@@ -33,7 +141,7 @@ impl Default for MessagingConfig {
             max_body_bytes: 64 * 1024,
             rate_per_10s: 20,
             persist: true,
-            envelope: true,
+            submit: BTreeMap::new(),
         }
     }
 }
@@ -100,6 +208,24 @@ impl MessagingConfig {
                 self.max_body_bytes
             ));
         }
+        for (command, row) in &self.submit {
+            if let Some(enter) = row.enter.as_deref().filter(|e| !valid_enter(e)) {
+                out.push(format!(
+                    "[messaging.submit.{command}] enter = {enter:?} is not 1 to {MAX_ENTER_BYTES} control bytes; using \"\\r\""
+                ));
+            }
+            if let Some(ms) = row.enter_delay_ms {
+                if ms > MAX_ENTER_DELAY_MS {
+                    out.push(format!(
+                        "[messaging.submit.{command}] enter_delay_ms = {ms} is capped at {MAX_ENTER_DELAY_MS}"
+                    ));
+                } else if ms < MIN_ENTER_DELAY_MS {
+                    out.push(format!(
+                        "[messaging.submit.{command}] enter_delay_ms = {ms} is raised to {MIN_ENTER_DELAY_MS}"
+                    ));
+                }
+            }
+        }
         out
     }
 }
@@ -153,8 +279,77 @@ mod tests {
             .map(|l| format!("{}\n", &l[2..]))
             .collect();
         assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
-        assert_eq!(block.lines().count(), 8, "the block is not all seven keys");
+        assert_eq!(block.lines().count(), 7, "the block is not all six keys");
         assert_eq!(parse(&block), MessagingConfig::default());
+    }
+
+    #[test]
+    fn the_sample_submit_rows_are_the_shipped_rows() {
+        let sample = include_str!("../../config.sample.toml");
+        let block: String = sample
+            .lines()
+            .skip_while(|l| *l != "# [messaging.submit.claude]")
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or("")))
+            .collect();
+        assert!(!block.is_empty(), "no [messaging.submit.claude] block");
+        assert_eq!(parse(&block).submit, shipped_rows());
+    }
+
+    #[test]
+    fn a_submit_row_parses_every_field() {
+        let m = parse(
+            "[messaging.submit.aider]\nbracketed = \"off\"\nenter = \"\\n\"\nenter_delay_ms = 50\nfocus_in = true\nwhile_working = \"refuse\"\nenvelope = false",
+        );
+        assert_eq!(
+            m.submit["aider"],
+            SubmitRow {
+                bracketed: Some(Bracketed::Off),
+                enter: Some("\n".into()),
+                enter_delay_ms: Some(50),
+                focus_in: Some(true),
+                while_working: Some(WhileWorking::Refuse),
+                envelope: Some(false),
+            }
+        );
+        assert!(m.problems().is_empty(), "{:?}", m.problems());
+    }
+
+    #[test]
+    fn a_bad_enter_and_a_delay_out_of_range_are_reported() {
+        let m = parse(
+            "[messaging.submit.a]\nenter = \"\"\n[messaging.submit.b]\nenter = \"\\u001b[201~\"\n[messaging.submit.c]\nenter_delay_ms = 9000\n[messaging.submit.d]\nenter = \"ok\"\n[messaging.submit.e]\nenter = \"\\r\\r\\r\\r\\r\"\nenter_delay_ms = 0",
+        );
+        let problems = m.problems();
+        assert_eq!(problems.len(), 6, "{problems:?}");
+        assert!(problems[0].starts_with("[messaging.submit.a] enter"));
+        assert!(problems[1].starts_with("[messaging.submit.b] enter"));
+        assert!(problems[2].contains("is capped at 5000"));
+        assert!(problems[3].starts_with("[messaging.submit.d] enter"));
+        assert!(problems[4].starts_with("[messaging.submit.e] enter "));
+        assert!(problems[5].contains("is raised to 50"));
+    }
+
+    #[test]
+    fn a_row_for_a_command_that_is_no_agent_is_reported() {
+        let cfg: Config = toml::from_str(
+            "[agents]\ncommands = [\"claude\"]\n[messaging.submit.claude]\nfocus_in = true\n[messaging.submit.clade]\nfocus_in = true",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.submit_rows_without_an_agent(),
+            ["[messaging.submit.clade] names no command in [agents] commands, so it is never used"]
+        );
+    }
+
+    #[test]
+    fn an_enter_is_one_to_four_control_bytes() {
+        for ok in ["\r", "\n", "\r\n", "\u{1b}\r", "\r\r\r\r"] {
+            assert!(valid_enter(ok), "{ok:?}");
+        }
+        for bad in ["", "x", "\ry", "\u{1b}[201~", "\r\r\r\r\r"] {
+            assert!(!valid_enter(bad), "{bad:?}");
+        }
     }
 
     #[test]
