@@ -8,19 +8,25 @@
 //! known.
 //!
 //! Whatever a message carries is shown, never obeyed: every field printed in
-//! the text and context formats has its control and format characters shown
-//! visibly, every body line is indented under its own header, and a trailer
-//! closes each body, so a body cannot forge a header of its own or reach the
-//! terminal as an escape sequence. A server refuses such bodies already; the
-//! CLI does not rely on that, because the server it talks to may be older, or
-//! another machine's.
+//! the text and context formats has its control and invisible characters
+//! shown visibly, every body line is indented under its own header, and a
+//! trailer closes each body, so a body cannot forge a header of its own or
+//! reach the terminal as an escape sequence. Each header and trailer carries
+//! a mark drawn at random for the one render, which a body cannot know in
+//! advance, so a trailer that does not repeat its header's mark is part of a
+//! body. A server refuses such bodies already; the CLI does not rely on
+//! that, because the server it talks to may be older, or another machine's.
+//!
+//! `--format json` is the exception: it carries each body exactly, escaped
+//! only as JSON is. A program that decodes it and prints a body prints what
+//! the sender sent, so it must escape the body itself before showing it.
 
 use std::io::Read;
 use std::time::Duration;
 
 use crate::client::cli_common::{
-    ask, escape, json_line, pane_hint, parse_pane, parse_wait, run_verb, unexpected, CliError,
-    REPLY_DEADLINE,
+    ask, escape, escape_keeping_tabs, json_line, pane_hint, parse_pane, parse_wait, run_verb,
+    unexpected, CliError, REPLY_DEADLINE,
 };
 use crate::protocol::{
     valid_host, Address, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef, PaneId, Sender,
@@ -44,10 +50,12 @@ pub enum MsgCmd {
         /// The message
         text: Option<String>,
         /// Read the message from standard input, which must be a pipe or a
-        /// file: the send waits for its end
+        /// file: the send waits for its end. One leading byte-order mark is
+        /// dropped
         #[arg(long)]
         stdin: bool,
-        /// Read the message from a file
+        /// Read the message from a file. One leading byte-order mark is
+        /// dropped. A pipe or a terminal is refused: use --stdin for a pipe
         #[arg(short = 'f', long = "file", value_name = "FILE")]
         file: Option<std::path::PathBuf>,
         #[arg(long, value_enum, default_value_t = DeliverArg::Auto)]
@@ -75,6 +83,8 @@ pub enum MsgCmd {
         /// reports timed_out
         #[arg(long, value_parser = parse_wait, value_name = "DUR")]
         wait: Option<Duration>,
+        /// `json` carries each body exactly: a program that prints a body
+        /// from it must escape the body first
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
@@ -235,8 +245,10 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                                 "timed_out": timed_out, "marked": marked
                             }))
                         ),
-                        Format::Text => print!("{}", render_text(&messages)),
-                        Format::Context => print!("{}", render_context(&messages)),
+                        Format::Text => print!("{}", render_text(&messages, &render_mark())),
+                        Format::Context => {
+                            print!("{}", render_context(&messages, &render_mark()))
+                        }
                     }
                     Ok(())
                 }
@@ -279,30 +291,64 @@ fn read_body(
     stdin: bool,
     file: Option<std::path::PathBuf>,
 ) -> Result<String, CliError> {
-    let raw =
-        match (text, stdin, file) {
-            (Some(text), false, None) => text.into_bytes(),
-            (None, true, None) => {
-                // A terminal on stdin would wait for a Ctrl-D nobody knows to
-                // type, which reads as a hang.
-                if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-                    return Err(CliError::usage(
-                        "usage",
-                        "--stdin reads a pipe or a file, not a terminal",
-                    ));
-                }
-                read_bounded(std::io::stdin().lock()).map_err(|e| {
-                    CliError::usage("bad_body", format!("cannot read standard input: {e}"))
-                })?
+    let raw = match (text, stdin, file) {
+        (Some(text), false, None) => text.into_bytes(),
+        (None, true, None) => {
+            // A terminal on stdin would wait for a Ctrl-D nobody knows to
+            // type, which reads as a hang.
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+                return Err(CliError::usage(
+                    "usage",
+                    "--stdin reads a pipe or a file, not a terminal",
+                ));
             }
-            (None, false, Some(path)) => std::fs::File::open(&path)
-                .and_then(read_bounded)
-                .map_err(|e| {
-                    CliError::usage("bad_body", format!("cannot read {}: {e}", path.display()))
-                })?,
-            _ => return Err(CliError::usage("usage", "give the message once")),
-        };
+            without_bom(read_bounded(std::io::stdin().lock()).map_err(|e| {
+                CliError::usage("bad_body", format!("cannot read standard input: {e}"))
+            })?)
+        }
+        (None, false, Some(path)) => without_bom(read_file(&path)?),
+        _ => return Err(CliError::usage("usage", "give the message once")),
+    };
     body_of(raw)
+}
+
+/// `raw` less one leading byte-order mark, which an editor may write at the
+/// start of a file and the server would refuse as an invisible character.
+fn without_bom(raw: Vec<u8>) -> Vec<u8> {
+    match raw.strip_prefix("\u{FEFF}".as_bytes()) {
+        Some(rest) => rest.to_vec(),
+        None => raw,
+    }
+}
+
+/// The file at `path`, read through [`read_bounded`]. A FIFO or a terminal
+/// is refused: either would wait for an end nobody sends. The file is opened
+/// without blocking, because opening a FIFO for reading otherwise waits for
+/// a writer before anything can be checked.
+fn read_file(path: &std::path::Path) -> Result<Vec<u8>, CliError> {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let cannot = |e: std::io::Error| {
+        CliError::usage("bad_body", format!("cannot read {}: {e}", path.display()))
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(cannot)?;
+    let fd = file.as_raw_fd();
+    if file.metadata().map_err(cannot)?.file_type().is_fifo() || unsafe { libc::isatty(fd) } == 1 {
+        return Err(CliError::usage(
+            "usage",
+            "-f reads a file, not a pipe or a terminal: use --stdin for a pipe",
+        ));
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(cannot(std::io::Error::last_os_error()));
+    }
+    read_bounded(file).map_err(cannot)
 }
 
 /// Up to one byte more than [`MAX_BODY_READ`], which is enough for
@@ -354,22 +400,28 @@ fn sent_line(
 }
 
 /// The body under its header: every line indented and escaped, so no line of
-/// a body can start where a header would, then a trailer naming the message,
-/// so where the body ends is stated rather than inferred.
-fn body_block(msg: &Message) -> String {
+/// a body can start where a header would, then a trailer naming the message
+/// and repeating the header's `mark`, so where the body ends is stated rather
+/// than inferred.
+fn body_block(msg: &Message, mark: &str) -> String {
     let mut out: String = msg
         .body
         .split('\n')
         .map(|line| format!("    {}\n", escape_keeping_tabs(line)))
         .collect();
-    out.push_str(&format!("(end of message {})\n", msg.id));
+    out.push_str(&format!("(end of message {}, mark {mark})\n", msg.id));
     out
 }
 
-/// A tab moves the cursor but cannot start a line, and the indentation is
-/// what stops a body forging a header, so a tab is shown as a tab.
-fn escape_keeping_tabs(line: &str) -> String {
-    line.split('\t').map(escape).collect::<Vec<_>>().join("\t")
+/// A mark for one render: 64 bits from the standard library's randomly
+/// keyed hasher, which the OS seeds. It only has to be unguessable by
+/// whoever wrote a body before the render.
+fn render_mark() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let hash = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("{hash:016x}")
 }
 
 fn sender(msg: &Message) -> (String, String) {
@@ -414,23 +466,23 @@ fn reply_command(msg: &Message) -> Option<String> {
     ))
 }
 
-fn render_text(messages: &[Message]) -> String {
+fn render_text(messages: &[Message], mark: &str) -> String {
     messages
         .iter()
         .map(|msg| {
             let (who, session) = sender(msg);
             format!(
-                "#{} from {who} in {session} at {} ({} bytes)\n{}\n",
+                "#{} from {who} in {session} at {} ({} bytes, mark {mark})\n{}\n",
                 msg.id,
                 clock(msg.created_ms),
                 msg.body.len(),
-                body_block(msg)
+                body_block(msg, mark)
             )
         })
         .collect()
 }
 
-fn render_context(messages: &[Message]) -> String {
+fn render_context(messages: &[Message], mark: &str) -> String {
     messages
         .iter()
         .map(|msg| {
@@ -439,11 +491,11 @@ fn render_context(messages: &[Message]) -> String {
                 .map(|cmd| format!("Reply with: {cmd}\n"))
                 .unwrap_or_default();
             format!(
-                "From: {who} at {} — id {} ({} bytes)\n{}{reply}\n",
+                "From: {who} at {} — id {} ({} bytes, mark {mark})\n{}{reply}\n",
                 clock(msg.created_ms),
                 msg.id,
                 msg.body.len(),
-                body_block(msg),
+                body_block(msg, mark),
             )
         })
         .collect()
@@ -470,7 +522,9 @@ fn clock(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{is_format_char, MsgState};
+    use crate::protocol::{is_invisible, MsgState};
+
+    const MARK: &str = "5eed";
 
     fn hostile() -> Message {
         Message {
@@ -491,12 +545,15 @@ mod tests {
 
     fn has_hidden(s: &str) -> bool {
         s.chars()
-            .any(|c| (c.is_control() && c != '\n') || is_format_char(c))
+            .any(|c| (c.is_control() && c != '\n') || is_invisible(c))
     }
 
     #[test]
     fn a_hostile_message_renders_with_nothing_hidden_and_no_forged_line() {
-        for rendered in [render_text(&[hostile()]), render_context(&[hostile()])] {
+        for rendered in [
+            render_text(&[hostile()], MARK),
+            render_context(&[hostile()], MARK),
+        ] {
             assert!(!has_hidden(&rendered), "{rendered:?}");
             for line in rendered.lines() {
                 assert!(
@@ -507,7 +564,7 @@ mod tests {
             assert_eq!(
                 rendered
                     .lines()
-                    .filter(|l| *l == "(end of message 7)")
+                    .filter(|l| *l == format!("(end of message 7, mark {MARK})"))
                     .count(),
                 1,
                 "the forged trailer is not indented: {rendered}"
@@ -520,7 +577,7 @@ mod tests {
 
     #[test]
     fn text_shows_the_session_with_its_separator_escaped() {
-        let rendered = render_text(&[hostile()]);
+        let rendered = render_text(&[hostile()], MARK);
         assert!(
             rendered.contains(" in s\\x1b[2J\\x0aFrom: evil\\u{2028}From: evil2 at "),
             "{rendered}"
@@ -536,11 +593,14 @@ mod tests {
             session: "main".into(),
         };
         msg.body = "line one\nline two".into();
-        let rendered = render_context(&[msg]);
+        let rendered = render_context(&[msg], MARK);
         assert!(rendered.starts_with("From: alpha (%4) at "), "{rendered}");
-        assert!(rendered.contains(" — id 7 (17 bytes)\n"), "{rendered}");
         assert!(
-            rendered.contains("\n    line one\n    line two\n(end of message 7)\n"),
+            rendered.contains(" — id 7 (17 bytes, mark 5eed)\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\n    line one\n    line two\n(end of message 7, mark 5eed)\n"),
             "{rendered}"
         );
         assert!(rendered.contains("Reply with: remux msg send %4 --reply-to 7 --stdin\n"));
@@ -555,7 +615,7 @@ mod tests {
                 pane_id: 1,
                 name: None,
             };
-            let rendered = render_context(std::slice::from_ref(&msg));
+            let rendered = render_context(std::slice::from_ref(&msg), MARK);
             assert!(!rendered.contains("Reply with:"), "{host:?}: {rendered}");
         }
         msg.from = Sender::Remote {
@@ -563,8 +623,18 @@ mod tests {
             pane_id: 1,
             name: None,
         };
-        assert!(render_context(&[msg])
+        assert!(render_context(&[msg], MARK)
             .contains("Reply with: remux msg send lab-2.local:%1 --reply-to 7 --stdin\n"));
+    }
+
+    #[test]
+    fn each_render_draws_a_new_mark() {
+        let (a, b) = (render_mark(), render_mark());
+        assert_ne!(a, b);
+        assert!(
+            a.len() == 16 && a.chars().all(|c| c.is_ascii_hexdigit()),
+            "{a}"
+        );
     }
 
     #[test]
@@ -572,7 +642,7 @@ mod tests {
         let mut msg = hostile();
         msg.body = "col\tcol\u{1b}".into();
         assert!(
-            render_text(&[msg]).contains("\n    col\tcol\\x1b\n"),
+            render_text(&[msg], MARK).contains("\n    col\tcol\\x1b\n"),
             "a tab was escaped, or ESC was not"
         );
     }

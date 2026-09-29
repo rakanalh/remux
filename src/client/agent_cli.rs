@@ -180,7 +180,7 @@ fn render_table(panes: &[PaneStatusEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::is_format_char;
+    use crate::protocol::is_invisible;
 
     fn entry(pane_id: PaneId, name: Option<&str>) -> PaneStatusEntry {
         PaneStatusEntry {
@@ -224,7 +224,7 @@ mod tests {
         assert!(
             !table
                 .chars()
-                .any(|c| (c.is_control() && c != '\n') || is_format_char(c)),
+                .any(|c| (c.is_control() && c != '\n') || is_invisible(c)),
             "{table:?}"
         );
         assert_eq!(table.lines().count(), 2, "{table}");

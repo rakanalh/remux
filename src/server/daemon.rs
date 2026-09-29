@@ -5957,14 +5957,15 @@ async fn load_mailbox(server: &RemuxServer) {
         now_ms(),
     );
     log::info!(
-        "mailbox: restored {} message(s), {} name(s); pruned {} for closed panes, {} expired, {} invalid, {} over a cap, {} name(s); pane ids reserved through %{high_water}",
+        "mailbox: restored {} message(s), {} name(s); pruned {} for closed panes, {} expired, {} invalid, {} over a cap, {} name(s); repaired {} session label(s); pane ids reserved through %{high_water}",
         restored.message_count(),
         restored.name_count(),
         pruned.dead_pane,
         pruned.expired,
         pruned.invalid,
         pruned.over_cap,
-        pruned.names
+        pruned.names,
+        pruned.relabelled
     );
     *messaging().lock().await = restored;
     SAVED_HIGH_WATER.store(high_water, Ordering::Relaxed);

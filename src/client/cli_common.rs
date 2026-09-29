@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use crate::client::terminal::RemuxClient;
-use crate::protocol::{is_format_char, ClientMessage, PaneId, ServerMessage};
+use crate::protocol::{hidden_chars, is_invisible, ClientMessage, PaneId, ServerMessage};
 use crate::server::daemon::socket_path;
 
 /// How long a verb may take to reach the server.
@@ -210,17 +210,37 @@ pub(crate) fn parse_wait(s: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{s:?} is not a duration: use 30, 30s, 2m"))
 }
 
-/// `s` with every control and format character shown as an escape instead
-/// of emitted: `\x1b` for C0 and DEL, `\u{9b}` for C1 and `\u{202e}` for a
-/// format character (see [`is_format_char`]). Newlines included, so a field
-/// printed on one line stays on one line.
+/// `s` with every control character, and every invisible character that
+/// [`hidden_chars`] does not allow where it stands, shown as an escape
+/// instead of emitted: `\x1b` for C0 and DEL, `\u{9b}` for C1 and
+/// `\u{202e}` for an invisible one. Newlines included, so a field printed on
+/// one line stays on one line. An allowed joiner or variation selector is
+/// printed as itself, so an emoji shows as an emoji.
 pub(crate) fn escape(s: &str) -> String {
+    escape_text(s, false)
+}
+
+/// [`escape`], except that a tab is printed as a tab. For a body line: a tab
+/// moves the cursor but cannot start a line, and the indentation is what
+/// stops a body forging a header.
+pub(crate) fn escape_keeping_tabs(s: &str) -> String {
+    escape_text(s, true)
+}
+
+/// The escaping for [`escape`] and [`escape_keeping_tabs`], over the whole of
+/// `s` at once so that each character is judged by the same neighbours the
+/// server judged it by.
+fn escape_text(s: &str, keep_tabs: bool) -> String {
+    let hidden: Vec<usize> = hidden_chars(s).map(|(at, _)| at).collect();
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for (at, c) in s.char_indices() {
         match c as u32 {
+            0x09 if keep_tabs => out.push(c),
             0x00..=0x1f | 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
             0x80..=0x9f => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
-            _ if is_format_char(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            _ if hidden.binary_search(&at).is_ok() => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32))
+            }
             _ => out.push(c),
         }
     }
@@ -233,16 +253,17 @@ pub(crate) fn escape_lines(s: &str) -> String {
     s.split('\n').map(escape).collect::<Vec<_>>().join("\n")
 }
 
-/// One JSON document, with DEL, the C1 range and every format character
+/// One JSON document, with DEL, the C1 range and every invisible character
 /// escaped as well: serde_json leaves them raw, a terminal can read the C1
-/// bytes as control sequences, and a format character reorders or hides the
-/// text around it.
+/// bytes as control sequences, and an invisible character reorders or hides
+/// the text around it. Every one is escaped, allowed or not, because JSON is
+/// read by programs and the escape decodes to the same text.
 pub(crate) fn json_line(value: &serde_json::Value) -> String {
     let raw = value.to_string();
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         let code = c as u32;
-        if (0x7f..=0x9f).contains(&code) || is_format_char(c) {
+        if (0x7f..=0x9f).contains(&code) || is_invisible(c) {
             let mut units = [0u16; 2];
             for unit in c.encode_utf16(&mut units) {
                 out.push_str(&format!("\\u{unit:04x}"));
@@ -288,9 +309,19 @@ mod tests {
         assert_eq!(escape("tag\u{e0041}"), "tag\\u{e0041}");
         assert_eq!(escape("zw\u{200b}sp"), "zw\\u{200b}sp");
         assert_eq!(
-            escape("plain é ✓ \u{1F469}\u{200D}\u{1F4BB}"),
-            "plain é ✓ \u{1F469}\u{200D}\u{1F4BB}"
+            escape("plain é ✓ \u{1F469}\u{200D}\u{1F4BB} \u{2764}\u{FE0F}"),
+            "plain é ✓ \u{1F469}\u{200D}\u{1F4BB} \u{2764}\u{FE0F}"
         );
+        assert_eq!(escape("a\u{200D}\u{200D}b"), "a\\u{200d}\\u{200d}b");
+        assert_eq!(escape("\u{3164}x"), "\\u{3164}x");
+    }
+
+    #[test]
+    fn a_tab_is_kept_and_judged_in_place() {
+        assert_eq!(escape_keeping_tabs("a\tb\u{1b}"), "a\tb\\x1b");
+        assert_eq!(escape("a\tb"), "a\\x09b");
+        // Beside a tab a joiner attaches to nothing, as the server sees it.
+        assert_eq!(escape_keeping_tabs("a\u{200D}\tb"), "a\\u{200d}\tb");
     }
 
     #[test]
@@ -298,7 +329,7 @@ mod tests {
         let body = "esc\u{1b} c1\u{9b} del\u{7f} rlo\u{202e} tag\u{e0041} ls\u{2028}";
         let line = json_line(&serde_json::json!({ "body": body }));
         assert!(
-            line.chars().all(|c| !c.is_control() && !is_format_char(c)),
+            line.chars().all(|c| !c.is_control() && !is_invisible(c)),
             "{line:?}"
         );
         let back: serde_json::Value = serde_json::from_str(&line).unwrap();

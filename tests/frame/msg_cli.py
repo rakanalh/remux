@@ -25,9 +25,16 @@ pane run from the harness itself.
 8l.  client.log names the send and never holds a body.
 8m.  A body that would spoof a header is indented under its own header, in
      the text and context formats, from a real server, and each body ends
-     with an unindented "(end of message N)".
-8o.  A body holding a Unicode format character (U+202E, a tag character) is
-     refused bad_body; one holding an emoji joiner (U+200D) is not.
+     with an unindented "(end of message N, mark M)" whose mark M is its
+     header's.
+8mk. Each render draws a new mark: two reads of the same mail differ.
+8o.  A body holding an invisible character (U+202E, a tag character, a
+     Hangul filler, a doubled or a leading joiner) is refused bad_body; an
+     emoji joiner (U+200D) and a heart with its variation selector (U+FE0F)
+     are not, and the heart prints as itself, as do the rainbow flag and
+     the heart on fire (a variation selector then a joiner). A byte-order
+     mark leading a -f file or --stdin is dropped.
+8ff. -f on a FIFO or a terminal exits 2 at once instead of waiting.
 8p.  -f /dev/zero exits 2 with bad_body promptly, rather than reading for
      ever.
 8q.  --stdin on a terminal exits 2 at once instead of waiting for EOF.
@@ -306,18 +313,26 @@ try:
               and not any(ln.startswith("From: lead") for ln in lines),
               f"8m --format {fmt}: the forged header is indented inside the body (got {forged})")
         trailers = [ln for ln in lines if ln.startswith("(end of message ")]
-        check(len(trailers) >= 1 and all(re.fullmatch(r"\(end of message \d+\)", ln) for ln in trailers),
-              f"8m --format {fmt}: every body ends with its trailer (got {trailers})")
+        marks = set(re.findall(r"\(\d+ bytes, mark ([0-9a-f]{16})\)", out))
+        check(len(trailers) >= 1 and len(marks) == 1
+              and all(re.fullmatch(rf"\(end of message \d+, mark {m}\)", ln) for ln in trailers for m in marks),
+              f"8m --format {fmt}: every body ends with a trailer repeating its header's mark (got {trailers}, marks {marks})")
+    first = re.findall(r"mark ([0-9a-f]{16})", type_cli(B, f"{BIN} msg read --peek")[1])
+    second = re.findall(r"mark ([0-9a-f]{16})", type_cli(B, f"{BIN} msg read --peek")[1])
+    check(first and second and first[0] != second[0], f"8mk two renders draw different marks ({first[:1]} vs {second[:1]})")
 
     # --- 8o ---------------------------------------------------------------
     sender = cli_spawn()
     time.sleep(0.8)
-    for label, stem, text in (("U+202E", "rlo", "abc\u202eexe.txt"), ("a tag character", "tag", "ab\U000e0041c")):
+    for label, stem, text in (("U+202E", "rlo", "abc\u202eexe.txt"), ("a tag character", "tag", "ab\U000e0041c"),
+                              ("a Hangul filler", "filler", "ab\u3164c"), ("a doubled joiner", "zwj2", "a\u200d\u200db"),
+                              ("a leading joiner", "zwj0", "\u200dab"),
+                              ("a joiner between ASCII letters", "zwj1", "a\u200db")):
         path = f"{RUNDIR}/format-{stem}.txt"
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         code, out, err = type_cli(sender, f"{BIN} msg send %{B} -f {path}")
-        check(code == 1 and "bad_body" in err and "\u202e" not in err and "\U000e0041" not in err,
+        check(code == 1 and "bad_body" in err and not any(c in err for c in "\u202e\U000e0041\u3164\u200d"),
               f"8o a body holding {label} is refused bad_body, the stderr escaped (exit {code}, err {err!r})")
     zwj = "dev \U0001F469\u200d\U0001F4BB"
     with open(f"{RUNDIR}/zwj.txt", "w", encoding="utf-8") as f:
@@ -325,6 +340,35 @@ try:
     code, out, err = type_cli(sender, f"{BIN} msg send %{B} -f {RUNDIR}/zwj.txt")
     check(code == 0 and any(m["body"] == zwj for m in (listed_json(B) or [])),
           f"8o ...while an emoji joiner is accepted (exit {code}, err {err!r})")
+    keycap = "KEYCAP:#\ufe0f\u20e3"
+    code, out, err = type_cli(sender, f"{BIN} msg send %{B} \"$(printf 'KEYCAP:#\\357\\270\\217\\342\\203\\243')\"")
+    check(code == 0 and any(m["body"] == keycap for m in (listed_json(B) or [])),
+          f"8o a keycap (# U+FE0F U+20E3) is accepted (exit {code}, err {err!r})")
+    heart = "HEART:\u2764\ufe0f"
+    with open(f"{RUNDIR}/heart.txt", "w", encoding="utf-8") as f:
+        f.write("\ufeff" + heart + "\n")
+    code, out, err = type_cli(sender, f"{BIN} msg send %{B} -f {RUNDIR}/heart.txt")
+    check(code == 0 and any(m["body"] == heart for m in (listed_json(B) or [])),
+          f"8o a heart with its selector is accepted, the file's BOM dropped (exit {code}, err {err!r})")
+    code, out, err, _ = run_cli("msg", "read", "--pane", f"%{B}", "--all")
+    check(heart in out, f"8o ...and prints as itself, not escaped (got {[ln for ln in out.splitlines() if 'HEART' in ln]})")
+    flags = "FLAGS:\U0001F3F3\ufe0f\u200d\U0001F308 \u2764\ufe0f\u200d\U0001F525"
+    with open(f"{RUNDIR}/flags.txt", "w", encoding="utf-8") as f:
+        f.write("\ufeff" + flags + "\n")
+    code, out, err = type_cli(sender, f"{BIN} msg send %{B} --stdin", stdin_file=f"{RUNDIR}/flags.txt")
+    check(code == 0 and any(m["body"] == flags for m in (listed_json(B) or [])),
+          f"8o a rainbow flag and a heart on fire are accepted from --stdin, its BOM dropped (exit {code}, err {err!r})")
+    code, out, err, _ = run_cli("msg", "read", "--pane", f"%{B}", "--all")
+    check(flags in out, f"8o ...and print as themselves (got {[ln for ln in out.splitlines() if 'FLAGS' in ln]})")
+
+    # --- 8ff --------------------------------------------------------------
+    fifo = f"{RUNDIR}/body.fifo"
+    os.mkfifo(fifo)
+    code, out, err, took = run_cli("msg", "send", f"%{B}", "-f", fifo, timeout=10)
+    check(code == 2 and err.startswith("remux: usage: ") and took < 2.0,
+          f"8ff -f on a FIFO exits 2 in {took:.2f}s (exit {code}, err {err!r})")
+    code, out, err = type_cli(sender, f"{BIN} msg send %{B} -f /dev/tty", timeout=5.0)
+    check(code == 2 and "not a pipe or a terminal" in err, f"8ff -f /dev/tty in a pane exits 2 (exit {code}, err {err!r})")
 
     # --- 8p ---------------------------------------------------------------
     code, out, err, took = run_cli("msg", "send", f"%{B}", "-f", "/dev/zero", timeout=20)
@@ -545,7 +589,9 @@ try:
             lines = text.splitlines()
             check("\\x1b" in text and not any(ln.startswith("From: boss") or ln.startswith("From: evil") for ln in lines),
                   f"8n --format {fmt}: ESC is shown as \\x1b and no forged header starts a line ({lines})")
-            check(lines.count("(end of message 7)") == 1 and "\\u{202e}" in text,
+            mark = re.search(r"\(97 bytes, mark ([0-9a-f]{16})\)", text)
+            real = [ln for ln in lines if mark and ln == f"(end of message 7, mark {mark.group(1)})"]
+            check(len(real) == 1 and "\\u{202e}" in text,
                   f"8n --format {fmt}: the one real trailer ends the body and U+202E is shown escaped")
 
     # --- 8y: a hostile status list -----------------------------------------

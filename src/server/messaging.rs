@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{
-    is_format_char, valid_host, valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender,
-    Target,
+    hidden_chars, valid_host, valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender, Target,
 };
 
 /// The width of the per-sender rate window.
@@ -109,7 +108,7 @@ impl Refusal {
                 format!("rate limited: at most {per_10s} sends per 10s")
             }
             Refusal::BadBody { character, at_byte } => format!(
-                "the body has a control or format character (U+{:04X} at byte {at_byte}); only \\n and \\t are allowed",
+                "the body has a control or invisible character (U+{:04X} at byte {at_byte}); \\n, \\t and a single joiner or variation selector attached to visible text are allowed",
                 *character as u32
             ),
         }
@@ -285,22 +284,55 @@ impl MailboxFile {
     }
 }
 
-/// The first control or format character in `body` other than `\n` and
-/// `\t`. A body is typed into a pane in a later release, and an escape
-/// sequence in it (ESC[201~ ends a bracketed paste) would reach the pane's
-/// program as input rather than as text. A format character is refused
-/// because it makes a body display as text it does not contain.
+/// The first control character other than `\n` and `\t`, or invisible
+/// character that [`hidden_chars`] does not allow, in `body`. A body is typed
+/// into a pane in a later release, and an escape sequence in it (ESC[201~
+/// ends a bracketed paste) would reach the pane's program as input rather
+/// than as text. An invisible character is refused because it makes a body
+/// display as text it does not contain.
 fn control_character(body: &str) -> Option<(usize, char)> {
-    body.char_indices()
-        .find(|&(_, c)| (c.is_control() || is_format_char(c)) && c != '\n' && c != '\t')
+    let control = body
+        .char_indices()
+        .find(|&(_, c)| c.is_control() && c != '\n' && c != '\t');
+    control.into_iter().chain(hidden_chars(body).next()).min()
 }
 
+/// The most characters of a session name a sender label keeps.
+const MAX_SESSION_LABEL: usize = 128;
+
 /// A session name as a sender carries it: a label, printed wherever the
-/// message is shown, so it may hold no control character.
+/// message is shown, so it may hold no control or hidden character.
 fn valid_session(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().count() <= 128
-        && !name.chars().any(|c| c.is_control() || is_format_char(c))
+        && name.chars().count() <= MAX_SESSION_LABEL
+        && !name.chars().any(char::is_control)
+        && hidden_chars(name).next().is_none()
+}
+
+/// `name` made a [`valid_session`] label: each control or hidden character
+/// replaced with U+FFFD, and the rest cut to the length limit. A session
+/// name is whatever its creator typed, and a message whose label restore
+/// would refuse is a message lost at the next restart.
+fn session_label(name: &str) -> String {
+    // Cut first: cutting after the judgement can leave a joiner that was
+    // allowed between two characters with nothing after it.
+    let cut: String = name.chars().take(MAX_SESSION_LABEL).collect();
+    let hidden: Vec<usize> = hidden_chars(&cut).map(|(at, _)| at).collect();
+    let label: String = cut
+        .char_indices()
+        .map(|(at, c)| {
+            if c.is_control() || hidden.binary_search(&at).is_ok() {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if label.is_empty() {
+        '\u{FFFD}'.to_string()
+    } else {
+        label
+    }
 }
 
 /// Whether a message read from the file is one a send would have stored.
@@ -334,6 +366,10 @@ pub struct Pruned {
     pub invalid: usize,
     /// Messages past a mailbox's count or byte cap, the newest dropped.
     pub over_cap: usize,
+    /// Messages kept with their sender's session label repaired. A label is
+    /// a session's name, which its creator chose, so it is made valid
+    /// rather than costing the message.
+    pub relabelled: usize,
 }
 
 impl Messaging {
@@ -435,6 +471,13 @@ impl Messaging {
         messages.sort_by_key(|m| m.id);
         let mut seen = HashSet::new();
         for mut msg in messages {
+            if let Sender::Pane { session, .. } = &mut msg.from {
+                let label = session_label(session);
+                if label != *session {
+                    *session = label;
+                    pruned.relabelled += 1;
+                }
+            }
             if !seen.insert(msg.id) || !valid_stored(&msg, &limits) {
                 pruned.invalid += 1;
                 continue;
@@ -574,6 +617,18 @@ impl Messaging {
         now_ms: u64,
         now: Instant,
     ) -> Result<MsgId, Refusal> {
+        let from = match from {
+            Sender::Pane {
+                pane_id,
+                name,
+                session,
+            } => Sender::Pane {
+                pane_id,
+                name,
+                session: session_label(&session),
+            },
+            remote @ Sender::Remote { .. } => remote,
+        };
         let limits = &self.limits;
         if body.len() > limits.max_body {
             return Err(Refusal::MessageTooLarge {
@@ -1356,11 +1411,10 @@ mod tests {
         let mut m = Messaging::new(limits());
         let t0 = Instant::now();
         for character in [
-            '\u{AD}',
+            '\u{34F}',
             '\u{61C}',
             '\u{180E}',
             '\u{200B}',
-            '\u{200C}',
             '\u{200E}',
             '\u{200F}',
             '\u{2028}',
@@ -1376,6 +1430,10 @@ mod tests {
             '\u{E0001}',
             '\u{E0041}',
             '\u{E007F}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{1D173}',
+            '\u{E0100}',
         ] {
             let body = format!("ab{character}cd");
             assert_eq!(
@@ -1390,6 +1448,56 @@ mod tests {
         let emoji = "dev \u{1F469}\u{200D}\u{1F4BB}";
         assert!(send(&mut m, emoji, t0).is_ok());
         assert_eq!(bodies(&m.read(2, true, false, 0)), [emoji]);
+        for attached in [
+            "hy\u{AD}phen",
+            "\u{645}\u{6CC}\u{200C}\u{62E}",
+            "\u{2764}\u{FE0F}",
+        ] {
+            assert!(send(&mut m, attached, t0).is_ok(), "{attached:?}");
+        }
+        assert_eq!(
+            send(&mut m, "a\u{200D}\u{200D}b", t0),
+            Err(Refusal::BadBody {
+                character: '\u{200D}',
+                at_byte: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_hostile_session_name_is_labelled_so_restore_keeps_the_message() {
+        let t0 = Instant::now();
+        for session in [
+            "s\u{1b}[2J".to_string(),
+            "main\u{202E}".to_string(),
+            "tag\u{E0041}".to_string(),
+            "\u{200D}".to_string(),
+            String::new(),
+            "x".repeat(300),
+            format!("{}a\u{200D}b", "x".repeat(126)),
+            format!("{}a\u{200C}b", "x".repeat(126)),
+            format!("{}a\u{AD}b", "x".repeat(126)),
+            format!("{}\u{200D}b", "a".repeat(127)),
+            format!("{}\u{1F469}\u{200D}\u{1F4BB}", "x".repeat(126)),
+        ] {
+            assert!(valid_session(&session_label(&session)), "{session:?}");
+            let mut m = Messaging::new(limits());
+            let from = Sender::Pane {
+                pane_id: 1,
+                name: None,
+                session: session.clone(),
+            };
+            m.send(from, 2, "kept".into(), None, 0, t0).unwrap();
+            let (mut r, pruned) =
+                Messaging::restore(limits(), m.snapshot(), |_| true, HashSet::new(), 0);
+            assert_eq!(pruned.invalid, 0, "{session:?}: {pruned:?}");
+            assert_eq!(bodies(&r.read(2, true, false, 0)), ["kept"], "{session:?}");
+        }
+        assert_eq!(
+            session_label("dev \u{2764}\u{FE0F}"),
+            "dev \u{2764}\u{FE0F}"
+        );
+        assert_eq!(session_label("a\u{202E}b"), "a\u{FFFD}b");
     }
 
     type Answers = tokio::sync::mpsc::UnboundedReceiver<crate::protocol::ServerMessage>;
@@ -1752,12 +1860,6 @@ mod tests {
             name: Some("x\nFrom: boss".into()),
             session: "main".into(),
         };
-        let mut bad_session = stored(5, 2, "d");
-        bad_session.from = Sender::Pane {
-            pane_id: 1,
-            name: None,
-            session: "s\u{1b}[2J".into(),
-        };
         let mut far_future = stored(8, 3, "e");
         far_future.expires_ms = u64::MAX;
         let mut dash_host = stored(9, 2, "g");
@@ -1766,28 +1868,20 @@ mod tests {
             pane_id: 1,
             name: None,
         };
-        let mut rlo_session = stored(10, 2, "h");
-        rlo_session.from = Sender::Pane {
-            pane_id: 1,
-            name: None,
-            session: "main\u{202E}".into(),
-        };
         let f = file_of(vec![
             stored(1, 2, "ok"),
             stored(2, 2, "esc\u{1b}]52"),
             stored(11, 2, "rlo\u{202E}"),
             dash_host,
-            rlo_session,
             stored(3, 2, "too-long!"),
             bad_name,
-            bad_session,
             stored(1, 2, "dup-id"),
             stored(6, 2, "fits"),
             stored(7, 2, "over-cap"),
             far_future,
         ]);
         let (r, pruned) = Messaging::restore(lim, f, |_| true, HashSet::new(), 0);
-        assert_eq!(pruned.invalid, 8, "{pruned:?}");
+        assert_eq!(pruned.invalid, 6, "{pruned:?}");
         assert_eq!(pruned.over_cap, 1, "{pruned:?}");
         assert_eq!(
             r_read(&r, 2),
@@ -1798,6 +1892,35 @@ mod tests {
         );
         let clamped = r.mailboxes[&3].messages[0].expires_ms;
         assert_eq!(clamped, 1_000, "expiry was not clamped to created + ttl");
+    }
+
+    #[test]
+    fn restore_repairs_a_bad_session_label_and_keeps_the_message() {
+        let labelled = |id, session: &str| {
+            let mut msg = stored(id, 2, "kept");
+            msg.from = Sender::Pane {
+                pane_id: 1,
+                name: None,
+                session: session.into(),
+            };
+            msg
+        };
+        let f = file_of(vec![
+            labelled(1, "s\u{1b}[2J"),
+            labelled(2, "main\u{202E}"),
+            labelled(3, "main"),
+        ]);
+        let (r, pruned) = Messaging::restore(limits(), f, |_| true, HashSet::new(), 0);
+        assert_eq!((pruned.invalid, pruned.relabelled), (0, 2), "{pruned:?}");
+        let sessions: Vec<String> = r.mailboxes[&2]
+            .messages
+            .iter()
+            .map(|m| match &m.from {
+                Sender::Pane { session, .. } => session.clone(),
+                Sender::Remote { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(sessions, ["s\u{FFFD}[2J", "main\u{FFFD}", "main"]);
     }
 
     #[test]

@@ -1215,26 +1215,119 @@ pub fn valid_host(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// A character that changes how text around it is shown without being
-/// shown itself: bidirectional overrides and isolates, zero-width spaces and
-/// joiners, invisible operators, line and paragraph separators, tag
-/// characters. A message body or label holding one can render as text it
-/// does not contain. U+200D (zero width joiner) is left out, because emoji
-/// sequences need it.
-pub fn is_format_char(c: char) -> bool {
+/// A character that is not shown itself but can change how the text around
+/// it is shown: Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties
+/// 17.0.0, which covers bidirectional controls, zero-width characters,
+/// variation selectors, fillers and tag characters), plus the line and
+/// paragraph separators, the interlinear annotation characters, and the
+/// format characters (Cf) that property leaves out: the prepended
+/// concatenation marks and the Egyptian hieroglyph format controls. With
+/// those, every assigned Cf character in Unicode 17.0 is in the set.
+/// Unassigned code points outside the listed ranges are not, because that
+/// would take the whole character table. Text holding one can display as
+/// text it does not contain, and a tag character is read by a model while a
+/// person sees nothing.
+///
+/// Whether one is allowed where it stands is [`hidden_chars`]'s question.
+pub fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
+            | '\u{0600}'..='\u{0605}'
             | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200C}'
-            | '\u{200E}'..='\u{200F}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
     )
+}
+
+/// A character a joiner or a variation selector can attach to: one that is
+/// there, is not a control character and is not [`is_invisible`].
+fn is_base(c: Option<char>) -> bool {
+    c.is_some_and(|c| !c.is_control() && !is_invisible(c))
+}
+
+/// A [`is_base`] character outside ASCII. Joiners and variation selectors
+/// attach only to these, so plain ASCII text admits no invisible character
+/// at all.
+fn is_wide_base(c: Option<char>) -> bool {
+    is_base(c) && c.is_some_and(|c| !c.is_ascii())
+}
+
+/// Whether the invisible character at `at` is allowed among its neighbours.
+/// Emoji, Persian and Indic text and hyphenation need a few of them, so
+/// those are allowed one at a time and only where the text they belong to
+/// needs them:
+///
+/// - a zero width joiner or non-joiner between two non-ASCII base
+///   characters;
+/// - a soft hyphen between two letters;
+/// - a text or emoji variation selector after a non-ASCII base character,
+///   or U+FE0F in a keycap (`#`, `*` or a digit, U+FE0F, U+20E3);
+/// - a variation selector then a zero width joiner, between two non-ASCII
+///   base characters, because the emoji sequences for the rainbow flag or
+///   the heart on fire need it.
+///
+/// So plain ASCII text can hide nothing (a soft hyphen needs letters on both
+/// sides and shows as a hyphen where a line breaks), and elsewhere each
+/// allowed character carries at most about a bit.
+fn allowed_invisible(chars: &[char], at: usize) -> bool {
+    let near = |offset: isize| {
+        at.checked_add_signed(offset)
+            .and_then(|i| chars.get(i).copied())
+    };
+    let selector = |c: Option<char>| matches!(c, Some('\u{FE0E}' | '\u{FE0F}'));
+    let letter = |c: Option<char>| is_base(c) && c.is_some_and(char::is_alphabetic);
+    match chars[at] {
+        '\u{200D}' => {
+            is_wide_base(near(1))
+                && (is_wide_base(near(-1)) || (selector(near(-1)) && is_wide_base(near(-2))))
+        }
+        '\u{200C}' => is_wide_base(near(-1)) && is_wide_base(near(1)),
+        '\u{00AD}' => letter(near(-1)) && letter(near(1)),
+        '\u{FE0F}'
+            if matches!(near(-1), Some('0'..='9' | '#' | '*')) && near(1) == Some('\u{20E3}') =>
+        {
+            true
+        }
+        '\u{FE0E}' | '\u{FE0F}' => {
+            is_wide_base(near(-1))
+                && (!near(1).is_some_and(is_invisible)
+                    || (near(1) == Some('\u{200D}') && is_wide_base(near(2))))
+        }
+        _ => false,
+    }
+}
+
+/// The byte offset of every [`is_invisible`] character in `s` that is not
+/// allowed where it stands. The server refuses a body or label holding one,
+/// and the CLI shows each one as an escape. Both walk the whole string, so
+/// they judge each character by the same neighbours.
+pub fn hidden_chars(s: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let chars: Vec<char> = s.chars().collect();
+    s.char_indices()
+        .enumerate()
+        .filter(move |&(i, (_, c))| is_invisible(c) && !allowed_invisible(&chars, i))
+        .map(|(_, found)| found)
 }
 
 /// An agent name: `[a-z][a-z0-9_-]{0,31}`. A grammar rather than free text,
@@ -2317,6 +2410,187 @@ pub fn decode_message_length(header: &[u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hidden(s: &str) -> Vec<char> {
+        hidden_chars(s).map(|(_, c)| c).collect()
+    }
+
+    #[test]
+    fn the_invisible_set_is_default_ignorable_plus_the_separators() {
+        for c in [
+            '\u{AD}',
+            '\u{34F}',
+            '\u{61C}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{180B}',
+            '\u{180F}',
+            '\u{200B}',
+            '\u{200D}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202A}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2065}',
+            '\u{206F}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{FEFF}',
+            '\u{FFA0}',
+            '\u{FFF0}',
+            '\u{FFF8}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{1BCA0}',
+            '\u{1BCA3}',
+            '\u{1D173}',
+            '\u{1D17A}',
+            '\u{E0000}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{E0100}',
+            '\u{E0FFF}',
+            '\u{600}',
+            '\u{605}',
+            '\u{6DD}',
+            '\u{70F}',
+            '\u{890}',
+            '\u{891}',
+            '\u{8E2}',
+            '\u{110BD}',
+            '\u{110CD}',
+            '\u{13430}',
+            '\u{1343F}',
+        ] {
+            assert!(is_invisible(c), "{c:?}");
+        }
+        for c in [
+            'a',
+            ' ',
+            '\u{606}',
+            '\u{6DE}',
+            '\u{892}',
+            '\u{8E3}',
+            '\u{13440}',
+            '\u{1342F}',
+            '\u{AC}',
+            '\u{AE}',
+            '\u{34E}',
+            '\u{350}',
+            '\u{1161}',
+            '\u{180A}',
+            '\u{200A}',
+            '\u{2010}',
+            '\u{2027}',
+            '\u{202F}',
+            '\u{205F}',
+            '\u{2070}',
+            '\u{3165}',
+            '\u{FDFF}',
+            '\u{FE10}',
+            '\u{FFFC}',
+            '\u{FFFD}',
+            '\u{1D172}',
+            '\u{1D17B}',
+            '\u{DFFFF}',
+            '\u{E1000}',
+            '\u{1F469}',
+        ] {
+            assert!(!is_invisible(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_joiner_or_selector_is_allowed_singly_where_it_attaches() {
+        for ok in [
+            "love \u{2764}\u{FE0F}",
+            "\u{2764}\u{FE0F} after",
+            "\u{2764}\u{FE0E}\n",
+            "dev \u{1F469}\u{200D}\u{1F4BB}",
+            "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
+            "hy\u{AD}phen",
+        ] {
+            assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
+        }
+        for (bad, want) in [
+            ("\u{200D}lead", vec!['\u{200D}']),
+            ("trail\u{200D}", vec!['\u{200D}']),
+            ("a\u{200D}\u{200D}b", vec!['\u{200D}', '\u{200D}']),
+            ("a \u{200C}\n", vec!['\u{200C}']),
+            ("\u{FE0F}", vec!['\u{FE0F}']),
+            ("a\u{FE0F}\u{FE0F}", vec!['\u{FE0F}', '\u{FE0F}']),
+            ("a\t\u{AD}b", vec!['\u{AD}']),
+            ("a\u{200B}b", vec!['\u{200B}']),
+            ("a\u{202E}b", vec!['\u{202E}']),
+            ("a\u{E0041}", vec!['\u{E0041}']),
+        ] {
+            assert_eq!(hidden(bad), want, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn plain_ascii_admits_no_invisible_character() {
+        for (bad, want) in [
+            ("a\u{200D}b", vec!['\u{200D}']),
+            ("a\u{200C}b", vec!['\u{200C}']),
+            ("a\u{FE0F}", vec!['\u{FE0F}']),
+            ("a\u{FE0E}b", vec!['\u{FE0E}']),
+            ("a \u{AD} b", vec!['\u{AD}']),
+            ("1\u{FE0F}", vec!['\u{FE0F}']),
+            ("x\u{FE0F}\u{20E3}", vec!['\u{FE0F}']),
+        ] {
+            assert_eq!(hidden(bad), want, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_text_that_needs_one_keeps_it() {
+        for ok in [
+            "#\u{FE0F}\u{20E3} and 1\u{FE0F}\u{20E3}",
+            "\u{1F1FA}\u{1F1F8}",
+            "\u{1F926}\u{200D}\u{2642}\u{FE0F}",
+            "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
+            "Silben\u{AD}trennung",
+            "\u{2764}\u{FE0F}",
+        ] {
+            assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
+        }
+        assert_eq!(hidden("\u{13000}\u{13430}\u{13001}"), ['\u{13430}']);
+        assert_eq!(hidden("\u{600}12"), ['\u{600}']);
+    }
+
+    #[test]
+    fn a_selector_then_a_joiner_between_bases_is_allowed() {
+        for ok in [
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",
+            "\u{1F926}\u{200D}\u{2642}\u{FE0F}",
+            "x \u{1F3F3}\u{FE0E}\u{200D}\u{1F308} y",
+        ] {
+            assert_eq!(hidden(ok), Vec::<char>::new(), "{ok:?}");
+        }
+        for (bad, want) in [
+            ("a\u{FE0F}\u{200D}", vec!['\u{FE0F}', '\u{200D}']),
+            ("\u{FE0F}\u{200D}b", vec!['\u{FE0F}', '\u{200D}']),
+            (
+                "a\u{FE0F}\u{200D}\u{200D}b",
+                vec!['\u{FE0F}', '\u{200D}', '\u{200D}'],
+            ),
+            (
+                "a\u{FE0F}\u{FE0F}\u{200D}b",
+                vec!['\u{FE0F}', '\u{FE0F}', '\u{200D}'],
+            ),
+            ("a\u{FE0F}\u{200C}b", vec!['\u{FE0F}', '\u{200C}']),
+        ] {
+            assert_eq!(hidden(bad), want, "{bad:?}");
+        }
+    }
 
     fn addr(host: Option<&str>, target: Target) -> Address {
         Address {
