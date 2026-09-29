@@ -7382,6 +7382,11 @@ async fn resize_session_panes(
 /// the session is unknown, has no active tab, or (via `session_render_size`'s
 /// 80x24 fallback) would be meaningless. Border-style aware, mirroring the
 /// composite render path so the PTY/screen match the visible content area.
+///
+/// A stack's hidden panes are included, at the size of the pane the stack
+/// shows (see [`layout::compute_stack_member_rects`]), so revealing one never
+/// needs a resize. Under zoom only the zoomed pane is listed, and the others
+/// keep their unzoomed size; [`size_panes_to_layout`] covers a zoom that moves.
 async fn active_tab_content_sizes(
     session_name: &str,
     state: &Arc<Mutex<ServerState>>,
@@ -7409,7 +7414,7 @@ async fn active_tab_content_sizes(
     // single pane it is painted as (asking the real tree here is what left it a
     // row short of its painted area under the tmux border style).
     let effective_layout = tab.effective_layout();
-    let pane_rects = layout::compute_layout(&effective_layout, area, 0);
+    let pane_rects = layout::compute_stack_member_rects(&effective_layout, area, 0);
 
     let mut content_rects = Vec::new();
     for &(pane_id, rect) in &pane_rects {
@@ -7421,6 +7426,52 @@ async fn active_tab_content_sizes(
         content_rects.push((pane_id, content.width, content.height));
     }
     content_rects
+}
+
+/// Resize every pane of the session's active tab whose PTY/screen is not the
+/// size [`active_tab_content_sizes`] gives it.
+///
+/// The full-render paths call this before they composite, so a frame never
+/// paints a pane at a size the program inside it was not told about, whichever
+/// command changed what is painted. Stack reveals no longer need it (hidden
+/// members are sized already), but a zoom that follows focus onto another pane
+/// does: that pane is painted full-area while its PTY still has its split size.
+/// A pane that already has its size is left alone, so a render causes no
+/// SIGWINCH.
+///
+/// Only with a client attached: without one, a View cell may legitimately hold
+/// a pane smaller than its home allotment (see [`resize_session_panes`]), and
+/// with one that allotment is exactly what `resize_session_panes` applies.
+async fn size_panes_to_layout(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) {
+    let has_client = {
+        let cls = clients.lock().await;
+        cls.values()
+            .any(|c| c.session_name.as_deref() == Some(session_name))
+    };
+    if !has_client {
+        return;
+    }
+    let rects = active_tab_content_sizes(session_name, state, clients).await;
+    let mut ps = panes.lock().await;
+    for (pane_id, cols, rows) in rects {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        if let Some(pane_data) = ps.get_mut(&pane_id) {
+            if (pane_data.screen.cols, pane_data.screen.rows) != (cols, rows) {
+                log::debug!(
+                    "size_panes_to_layout: pane_id={pane_id} {}x{} -> {cols}x{rows}",
+                    pane_data.screen.cols,
+                    pane_data.screen.rows
+                );
+                let _ = pane_data.pty.resize(cols, rows);
+                pane_data.screen.resize(cols, rows);
+            }
+        }
+    }
 }
 
 /// The minimum `(cols, rows)` demanded across every client's *sized*
@@ -8019,6 +8070,7 @@ async fn send_full_render_to_client(
     prev_frames: &PrevFrameCache,
     ctx: RenderCtx,
 ) {
+    size_panes_to_layout(session_name, state, panes, clients).await;
     // Render at the consistent session size (min over all attached clients),
     // not the caller's own dimensions, so this client's frames never mix sizes
     // with the shared broadcast path. With a single client this equals the
@@ -8347,6 +8399,8 @@ async fn broadcast_full_render(
     };
 
     log::debug!("server: broadcast_full_render session={session_name:?} clients={client_count}");
+
+    size_panes_to_layout(session_name, state, panes, clients).await;
 
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;

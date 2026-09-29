@@ -1087,6 +1087,45 @@ pub fn compute_layout(node: &LayoutNode, area: Rect, gap_size: u16) -> Vec<(Pane
     result
 }
 
+/// The rect of EVERY pane in the layout: each pane of a stack gets its stack's
+/// rect, whether it is the painted one or not.
+///
+/// [`compute_layout`] answers "what is painted where". This answers "what size
+/// does each pane run at", which is a different question for a stack's hidden
+/// panes. A hidden pane that keeps the size it had when it was last painted is
+/// shown at the wrong size the moment any path reveals it, so every member is
+/// sized as if it were the one showing.
+pub fn compute_stack_member_rects(
+    node: &LayoutNode,
+    area: Rect,
+    gap_size: u16,
+) -> Vec<(PaneId, Rect)> {
+    let mut out = Vec::new();
+    compute_stack_member_rects_inner(node, area, gap_size, &mut out);
+    out
+}
+
+fn compute_stack_member_rects_inner(
+    node: &LayoutNode,
+    area: Rect,
+    gap_size: u16,
+    out: &mut Vec<(PaneId, Rect)>,
+) {
+    match node {
+        LayoutNode::Stack { panes, .. } => out.extend(panes.iter().map(|&p| (p, area))),
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let (first_area, second_area) = split_rect(area, direction, *ratio, gap_size);
+            compute_stack_member_rects_inner(first, first_area, gap_size, out);
+            compute_stack_member_rects_inner(second, second_area, gap_size, out);
+        }
+    }
+}
+
 fn compute_layout_inner(
     node: &LayoutNode,
     area: Rect,
@@ -1795,6 +1834,32 @@ mod tests {
         let rects = compute_layout(&node, area, 0);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0], (1, area));
+    }
+
+    #[test]
+    fn stack_member_rects_give_hidden_panes_their_stack_rect() {
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.add_to_stack(2, 3);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let painted = compute_layout(&node, area, 0);
+        let members = compute_stack_member_rects(&node, area, 0);
+
+        let stack_rect = painted
+            .iter()
+            .find(|(id, _)| *id == 2 || *id == 3)
+            .map(|(_, r)| *r)
+            .expect("the stack is painted");
+        assert_eq!(painted.len(), 2, "only one pane of the stack is painted");
+        assert_eq!(members.len(), 3, "every pane gets a rect");
+        assert!(members.contains(&(1, painted[0].1)));
+        assert!(members.contains(&(2, stack_rect)));
+        assert!(members.contains(&(3, stack_rect)));
     }
 
     #[test]
