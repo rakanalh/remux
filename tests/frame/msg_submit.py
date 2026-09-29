@@ -45,6 +45,14 @@ own, or before the body on the same line when the pane has paste off.
     well: the reader gets it and the submit is already_read.
 1p. An agent that exits the moment it reads the text: no Enter, and the
     submit is no_such_target.
+1q. A body larger than the terminal's input queue (10 KiB, many lines, the
+    last one `touch <marker>`) into an agent that stops reading and exits:
+    agent_did_not_read, and NOTHING of it reaches the shell that takes over:
+    not the tail the writer still held when the queue was flushed, not the
+    marker line. The writer is cancelled before the queue is flushed.
+1r. The same 10 KiB into an agent that reads it slower than it arrives: the
+    Enter is written only after the whole text has been read, and the send
+    is Submitted.
 1z. No panic.
 
 Task 2, the per-agent rows ([messaging.submit.<command>]). The policy is read
@@ -449,37 +457,28 @@ try:
           f"(reply {r}, got.txt {open(got).read() if os.path.exists(got) else None!r}, states {states})")
 
     # --- 1n -----------------------------------------------------------------
-    marker = f"{RUNDIR}/pwned"
-    P = cli_spawn("SplitBelow")
-    time.sleep(0.8)
-    p_log, p_ctl = f"{RUNDIR}/deaf.log", f"{RUNDIR}/deaf.ctl"
-    cli.send({"InputToPane": {"pane_id": P, "data": list(f"{FAKEAGENT} {p_log} {p_ctl}\n".encode())}})
-    end = time.time() + 8
-    while time.time() < end and not os.path.exists(p_log):
-        time.sleep(0.05)
-    tell(p_ctl, p_log, "paste-on")
-    tell(p_ctl, p_log, "deaf:3000")
-    check(wait_idle(P), f"...the agent in %{P} settled Idle before the next send")
-    r = type_send(A, send(P, f"touch {marker}", "Submit"))
-    # Once the agent has exited, the shell runs whatever is queued in the
-    # terminal, in order. A sentinel typed after that point exists only once
-    # everything queued before it has run, however slowly (a command-not-found
-    # handler can take seconds over the envelope line).
-    time.sleep(3.0)
-    sentinel = f"{RUNDIR}/sentinel"
-    cli.send({"InputToPane": {"pane_id": P, "data": list(f"touch {sentinel}\n".encode())}})
-    end = time.time() + 20
-    while time.time() < end and not os.path.exists(sentinel):
-        time.sleep(0.1)
-    check(os.path.exists(sentinel), "1n the shell took over the pane after the agent exited")
-    states = [m["state"] for m in (read_box(P) or [])]
+    # A raw agent (its own pane program, no shell in the way) that stops
+    # reading while a message is typed at it. The server must not write the
+    # Enter, and must flush what it wrote so a later reader gets none of it.
+    N, N_LOG, N_CTL = spawn_agent(paste=True)
+    tell(N_CTL, N_LOG, "deaf")
+    check(wait_idle(N), f"...the agent in %{N} settled Idle before the next send")
+    r = type_send(A, send(N, "MSG:unread", "Submit"))
     check(outcome(r) == ("Error", "agent_did_not_read"),
-          f"1n an agent that never reads the text: agent_did_not_read (got {r})")
-    check(not os.path.exists(marker) and states == ["Queued"],
-          f"1n ...the shell that takes over runs nothing, and the message is Queued (marker "
-          f"{'EXISTS' if os.path.exists(marker) else 'absent'}, states {states})")
-    check(f"not read by %{P}; typed text discarded, left in the mailbox" in srv.log(),
+          f"1n an agent that stops reading is agent_did_not_read, no Enter (got {r})")
+    check(f"not read by %{N}; typed text discarded, left in the mailbox" in srv.log(),
           "1n ...and the log says the text was discarded")
+    # Now let it read again: the flush cleared the queue, so it reads NOTHING
+    # of the message (a leftover would be read and, after a real agent exits,
+    # run by the shell).
+    before = len(rx_chunks(N_LOG))
+    tell(N_CTL, N_LOG, "resume")
+    time.sleep(0.8)
+    leftover = b"".join(c for _, c in rx_chunks(N_LOG)[before:])
+    states = [m["state"] for m in (read_box(N) or [])]
+    check(b"MSG:unread" not in leftover and b"\r" not in leftover and states == ["Queued"],
+          f"1n ...the flushed queue delivers none of it when reading resumes, and it is Queued "
+          f"(leftover {leftover!r}, states {states})")
 
     # --- 1o -----------------------------------------------------------------
     Q = cli_spawn("SplitBelow")
@@ -514,6 +513,42 @@ try:
     chunks = [c for _, c in rx_chunks(X_LOG)]
     check(outcome(r) == ("Error", "no_such_target") and len(chunks) == 1 and b"\r" not in chunks,
           f"1p an agent that exits on reading the text: no Enter, no_such_target (reply {r}, chunks {chunks})")
+
+    # --- 1q -----------------------------------------------------------------
+    # The same, with a body larger than the terminal's input queue and full of
+    # newlines: none of it, not the tail the writer still held, reaches the
+    # agent when it reads again.
+    big_lines = [f"fill{n:04d} " + "a" * 90 for n in range(100)] + ["touch /tmp/rmx-never"]
+    big = "\n".join(big_lines)
+    Q1, Q1_LOG, Q1_CTL = spawn_agent(paste=True)
+    tell(Q1_CTL, Q1_LOG, "deaf")
+    check(wait_idle(Q1), f"...the agent in %{Q1} settled Idle before the next send")
+    r = type_send(A, send(Q1, big, "Submit"))
+    check(outcome(r) == ("Error", "agent_did_not_read"),
+          f"1q a 10 KiB body into an agent that stops reading is agent_did_not_read (got {r})")
+    before = len(rx_chunks(Q1_LOG))
+    tell(Q1_CTL, Q1_LOG, "resume")
+    time.sleep(1.0)
+    leftover = b"".join(c for _, c in rx_chunks(Q1_LOG)[before:])
+    states = [m["state"] for m in (read_box(Q1) or [])]
+    check(b"fill00" not in leftover and b"touch" not in leftover and states == ["Queued"],
+          f"1q ...none of the 10 KiB reaches the agent when it reads again "
+          f"({len(leftover)} leftover bytes, states {states})")
+
+    # --- 1r -----------------------------------------------------------------
+    S2, S_LOG, S_CTL = spawn_agent(paste=True)
+    tell(S_CTL, S_LOG, "slow:256:20")
+    check(wait_idle(S2), f"...the agent in %{S2} settled Idle before the next send")
+    slow_body = "\n".join(f"slow{n:04d} " + "b" * 90 for n in range(100))
+    r = type_send(A, send(S2, slow_body, "Submit"))
+    time.sleep(0.5)
+    chunks = [c for _, c in rx_chunks(S_LOG)]
+    whole = OPEN + envelope(sent_id(r), A) + b"\n" + slow_body.encode() + CLOSE
+    check(submitted(r) and chunks and chunks[-1] == b"\r" and b"".join(chunks[:-1]) == whole
+          and len(chunks) > 10,
+          f"1r a slow reader: every byte read before the Enter, then Submitted "
+          f"(reply {r}, {len(chunks)} reads, last {chunks[-1:] if chunks else None}, "
+          f"text read {len(b''.join(chunks[:-1]))} of {len(whole)} bytes)")
 
     # --- 1j -----------------------------------------------------------------
     cli.close()

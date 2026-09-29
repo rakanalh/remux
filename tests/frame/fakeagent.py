@@ -28,9 +28,12 @@ so a command written while another is being read is never lost:
   block                  show a permission prompt ("Do you want to proceed?")
   clear                  clear the screen and say "back to work"
   work:<ms>              print "working..." every 100 ms for <ms>
-  deaf:<ms>              stop reading input, stay in raw mode, and exit after
-                         <ms>: an agent that dies with typed text unread
+  deaf                  stop reading input, stay in raw mode (an agent hung
+                        or busy while text is typed at it)
+  resume                start reading again (after deaf)
   exit-on-rx             exit right after the next read
+  slow:<bytes>:<ms>      read at most <bytes> at a time, <ms> apart: an agent
+                         that reads a long message slower than it arrives
   quit                   exit
 
 Each command is acknowledged with a `CTL <command>` line in `<log>` once its
@@ -64,19 +67,37 @@ def main():
     def ack(command):
         log.write(f"CTL {command}\n")
 
+    def take_control():
+        taken = control_path + ".taken"
+        try:
+            os.rename(control_path, taken)
+        except FileNotFoundError:
+            return []
+        with open(taken) as f:
+            commands = f.read().split()
+        os.remove(taken)
+        return commands
+
     work_until = 0.0
     next_work = 0.0
-    deaf_until = None
+    deaf = False
     exit_on_rx = False
+    read_size, read_gap = 4096, 0.0
     while True:
-        if deaf_until is not None:
-            if time.monotonic() >= deaf_until:
-                return
-            time.sleep(0.05)
+        if deaf:
+            time.sleep(0.02)
+            commands = take_control()
+            for command in commands:
+                if command == "resume":
+                    deaf = False
+                elif command == "quit":
+                    ack(command)
+                    return
+                ack(command)
             continue
         readable, _, _ = select.select([0], [], [], 0.05)
         if readable:
-            data = os.read(0, 4096)
+            data = os.read(0, read_size)
             if not data:
                 return
             line = f"RX {time.time_ns()} {data.hex()}\n"
@@ -84,20 +105,12 @@ def main():
             log.write(line)
             if exit_on_rx:
                 return
+            time.sleep(read_gap)
         now = time.monotonic()
         if now < work_until and now >= next_work:
             out("working...\n")
             next_work = now + 0.1
-        taken = control_path + ".taken"
-        try:
-            os.rename(control_path, taken)
-        except FileNotFoundError:
-            commands = []
-        else:
-            with open(taken) as f:
-                commands = f.read().split()
-            os.remove(taken)
-        for command in commands:
+        for command in take_control():
             if command == "paste-on":
                 out("\x1b[?2004h")
             elif command == "paste-off":
@@ -109,8 +122,11 @@ def main():
             elif command.startswith("work:"):
                 work_until = time.monotonic() + int(command[5:]) / 1000
                 next_work = 0.0
-            elif command.startswith("deaf:"):
-                deaf_until = time.monotonic() + int(command[5:]) / 1000
+            elif command == "deaf":
+                deaf = True
+            elif command.startswith("slow:"):
+                size, gap = command[5:].split(":")
+                read_size, read_gap = int(size), int(gap) / 1000
             elif command == "exit-on-rx":
                 exit_on_rx = True
             elif command == "quit":

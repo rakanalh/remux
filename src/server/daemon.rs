@@ -890,15 +890,14 @@ async fn submit(
         .envelope
         .then(|| crate::server::submit::envelope(id, from.0, from.1));
     let typed = type_text(to, sample.pgid, body, envelope.as_deref(), &rule, panes).await;
-    let (bracketed, bytes, enter) = match typed {
+    let (bracketed, bytes, enter, text) = match typed {
         Ok(typed) => typed,
         Err(refusal) => {
             store.lock().await.unsubmit(to, id);
             return answer_submit(id, resolved, settle(deliver, refusal), None);
         }
     };
-    tokio::time::sleep(rule.enter_delay).await;
-    match type_enter(to, sample.pgid, &enter, panes).await {
+    match type_enter(to, sample.pgid, &enter, rule.enter_delay, text, panes).await {
         Ok(()) => {
             log::info!(
                 "msg: id={id} submitted to %{to} (bracketed={}, {bytes} bytes)",
@@ -975,7 +974,7 @@ async fn type_text(
     envelope: Option<&str>,
     rule: &crate::server::submit::SubmitRule,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-) -> Result<(bool, usize, Vec<u8>), crate::server::submit::SubmitRefusal> {
+) -> Result<(bool, usize, Vec<u8>, TypedText), crate::server::submit::SubmitRefusal> {
     use crate::config::messaging::Bracketed;
     use crate::server::submit::{
         encode, multi_line_refusal, newlines_safe, Framing, SubmitRefusal,
@@ -1025,43 +1024,129 @@ async fn type_text(
         &rule.enter,
         envelope,
     );
-    pd.send_input(&text);
-    Ok((framing == Framing::Bracketed, text.len(), enter))
+    let bytes = text.len();
+    let cancel = Arc::new(pty::WriteCancel::default());
+    let written = pd.send_tracked(text, Arc::clone(&cancel));
+    Ok((
+        framing == Framing::Bracketed,
+        bytes,
+        enter,
+        TypedText { written, cancel },
+    ))
 }
 
-/// Write the Enter into `pane`, if the program sampled is still there and has
-/// READ the text: bytes left in the terminal's input queue would be read by
-/// whatever runs next, and after the agent exits that is the shell, which the
-/// Enter would make run them. Unread text is flushed instead, so nothing ever
-/// reads it. A slave that cannot be opened to ask counts as unread.
+/// How long a typed message has, after its Enter delay, to be fully written
+/// and read before it is judged not read.
+const CONSUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the pane is checked while waiting for it to read the text.
+const CONSUME_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a cancelled write is given to stop before its queue is flushed.
+const CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The text's write, as `type_text` handed it to the pane's writer.
+struct TypedText {
+    written: tokio::sync::oneshot::Receiver<bool>,
+    cancel: Arc<crate::server::pty::WriteCancel>,
+}
+
+/// Write the Enter into `pane` once the program sampled has READ the whole
+/// text: every byte has left the writer (`typed.written`) and the terminal's
+/// input queue is empty. Bytes still queued would be read by whatever runs
+/// next, and after the agent exits that is the shell, which the Enter would
+/// make run them. Checked every [`CONSUME_POLL`] from `delay` on, for up to
+/// [`CONSUME_DEADLINE`]; the Enter is written in the same `panes` section as
+/// the check that allows it.
+///
+/// On a refusal the rest of the text is cancelled FIRST and the writer's
+/// stop awaited, then the queue is flushed: flushed first, the queue would
+/// only make room for the writer to write the tail into it.
 async fn type_enter(
     pane: PaneId,
     pgid: Option<nix::unistd::Pid>,
     enter: &[u8],
+    delay: std::time::Duration,
+    mut typed: TypedText,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) -> Result<(), crate::server::submit::SubmitRefusal> {
-    let ps = panes.lock().await;
-    let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
-        return Err(crate::server::submit::SubmitRefusal::closed(pane));
-    };
-    let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
-    let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
-    let slave = pd.pty.slave_path.as_deref().and_then(open_slave);
-    let unread = slave.as_ref().and_then(unread_input);
-    if same && unread == Some(0) {
-        pd.send_input(enter);
-        return Ok(());
-    }
-    if let Some(slave) = &slave {
-        if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
-            log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
-        }
-    }
-    Err(crate::server::submit::SubmitRefusal {
+    use crate::server::submit::SubmitRefusal;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    let not_read = || {
+        SubmitRefusal {
         code: "agent_did_not_read",
         message: format!(
             "%{pane}'s agent did not read the message, so it was not submitted: it is in the mailbox"
         ),
+    }
+    };
+    let deadline = tokio::time::Instant::now() + delay + CONSUME_DEADLINE;
+    tokio::time::sleep(delay).await;
+    let slave = {
+        let ps = panes.lock().await;
+        ps.get(&pane).and_then(|pd| {
+            pd.pty
+                .slave_path
+                .as_deref()
+                .and_then(open_slave)
+                .filter(|slave| is_the_slave(slave, pd.pty.slave_dev))
+        })
+    };
+    let mut written = false;
+    let verdict = loop {
+        if !written {
+            match typed.written.try_recv() {
+                Ok(true) => written = true,
+                Ok(false) | Err(TryRecvError::Closed) => break Err(not_read()),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        {
+            let ps = panes.lock().await;
+            let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+                break Err(SubmitRefusal::closed(pane));
+            };
+            let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+            let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
+            let raw = nix::sys::termios::tcgetattr(master).is_ok_and(|t| {
+                !t.local_flags
+                    .contains(nix::sys::termios::LocalFlags::ICANON)
+            });
+            let Some(slave) = slave.as_ref().filter(|_| same && raw) else {
+                break Err(not_read());
+            };
+            if written && unread_input(slave) == Some(0) {
+                pd.send_input(enter);
+                break Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break Err(not_read());
+        }
+        tokio::time::sleep(CONSUME_POLL).await;
+    };
+    if verdict.is_err() {
+        typed.cancel.cancel();
+        if !written {
+            let _ = tokio::time::timeout(CANCEL_ACK, &mut typed.written).await;
+        }
+        if let Some(slave) = &slave {
+            if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH)
+            {
+                log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
+            }
+        }
+    }
+    verdict
+}
+
+/// Whether `slave` is the pane's own terminal: the path was read at spawn,
+/// and a path is a name, which a later terminal could have been given.
+fn is_the_slave(slave: &std::fs::File, slave_dev: Option<libc::dev_t>) -> bool {
+    slave_dev.is_some_and(|dev| {
+        nix::sys::stat::fstat(std::os::fd::AsRawFd::as_raw_fd(slave))
+            .is_ok_and(|st| st.st_rdev == dev)
     })
 }
 
@@ -1727,7 +1812,7 @@ struct PaneData {
     /// the master is non-blocking, and a synchronous loop over it dropped the
     /// tail of any write the slave's input queue could not take -- a truncated
     /// or entirely vanished paste. See [`pty::start_writer`].
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: mpsc::UnboundedSender<pty::WriteJob>,
     /// The background writer task draining `input_tx`.
     ///
     /// Held for the same reason `reader` is: dropping a `JoinHandle` detaches
@@ -1921,12 +2006,32 @@ impl PaneData {
     /// would become an `error handling client message` line, and the two callers
     /// that log an error themselves would carry a branch nothing can reach.
     fn send_input(&self, data: &[u8]) {
-        if self.input_tx.send(data.to_vec()).is_err() {
+        if self.input_tx.send(data.to_vec().into()).is_err() {
             log::warn!(
                 "server: dropping {} input byte(s) for a pane whose writer has exited",
                 data.len()
             );
         }
+    }
+
+    /// [`Self::send_input`], told when the last byte is written and able to
+    /// be cancelled; see [`pty::WriteJob`]. The receiver reports `false` (or
+    /// is closed) when the bytes were not all written.
+    fn send_tracked(
+        &self,
+        data: Vec<u8>,
+        cancel: Arc<pty::WriteCancel>,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (done, written) = tokio::sync::oneshot::channel();
+        let job = pty::WriteJob {
+            data,
+            done: Some(done),
+            cancel: Some(cancel),
+        };
+        if self.input_tx.send(job).is_err() {
+            log::warn!("server: dropping a typed message for a pane whose writer has exited");
+        }
+        written
     }
 }
 

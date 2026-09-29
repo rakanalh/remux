@@ -6,10 +6,52 @@ use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{self, ForkResult, Pid};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::sync::mpsc;
+
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
+
+/// Bytes for a pane's writer.
+pub struct WriteJob {
+    pub data: Vec<u8>,
+    /// Told `true` once every byte is written, and `false` when the job was
+    /// cancelled or abandoned first. Dropped unanswered if the writer exits.
+    pub done: Option<oneshot::Sender<bool>>,
+    pub cancel: Option<Arc<WriteCancel>>,
+}
+
+impl From<Vec<u8>> for WriteJob {
+    fn from(data: Vec<u8>) -> Self {
+        WriteJob {
+            data,
+            done: None,
+            cancel: None,
+        }
+    }
+}
+
+/// Stops a [`WriteJob`]'s remaining bytes. The writer checks it before each
+/// write and while it waits for room in the queue.
+#[derive(Debug, Default)]
+pub struct WriteCancel {
+    flag: AtomicBool,
+    wake: Notify,
+}
+
+impl WriteCancel {
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        // `notify_one` keeps the wake for a writer that is not waiting yet.
+        self.wake.notify_one();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
 
 /// Represents an allocated PTY with a running child process.
 pub struct Pty {
@@ -877,7 +919,13 @@ pub fn start_reader(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedRecei
 /// grows with what is typed at it, and a large buffer ahead of a smaller one
 /// blocks it (head-of-line). Both are inherent to preserving the byte stream --
 /// the alternative to waiting is discarding, which is the bug this replaced.
-pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSender<Vec<u8>>) {
+///
+/// A [`WriteJob`] can ask to be told when its last byte is written, and be
+/// cancelled between writes. The server needs both to type a message: bytes
+/// still waiting here are invisible to the terminal's input queue, so "the
+/// queue is empty" means "the program read it" only once the writer is done,
+/// and a flush of the queue is useless while the writer can refill it.
+pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSender<WriteJob>) {
     let raw = master_fd.as_raw_fd();
     log::debug!("pty: start_writer watching fd={raw}");
 
@@ -890,7 +938,7 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
         libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WriteJob>();
 
     let handle = tokio::spawn(async move {
         let async_fd = match AsyncFd::with_interest(master_fd, Interest::WRITABLE) {
@@ -904,12 +952,32 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
         // See the reader: once per task, because the fallback runs on a timer.
         let mut warned_fallback = false;
 
-        while let Some(buf) = rx.recv().await {
+        while let Some(WriteJob {
+            data: buf,
+            done,
+            cancel,
+        }) = rx.recv().await
+        {
             let mut offset = 0;
             while offset < buf.len() {
-                let mut guard = match tokio::time::timeout(READINESS_FALLBACK, async_fd.writable())
-                    .await
-                {
+                if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    break;
+                }
+                let writable = tokio::time::timeout(READINESS_FALLBACK, async_fd.writable());
+                // A cancel wakes a write parked on a full queue at once, rather
+                // than after the fallback: its caller waits for this before it
+                // flushes the queue, and the flush is what would wake us.
+                let ready = match &cancel {
+                    Some(cancel) => tokio::select! {
+                        ready = writable => Some(ready),
+                        _ = cancel.wake.notified() => None,
+                    },
+                    None => Some(writable.await),
+                };
+                let Some(ready) = ready else {
+                    break;
+                };
+                let mut guard = match ready {
                     Ok(Ok(g)) => g,
                     Ok(Err(e)) => {
                         log::error!("start_writer: writable() failed: {e}");
@@ -1004,6 +1072,9 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
                     }
                     Err(_would_block) => continue,
                 }
+            }
+            if let Some(done) = done {
+                let _ = done.send(offset == buf.len());
             }
         }
 
@@ -1367,8 +1438,9 @@ mod tests {
             .map(|n| format!("line{n:06}-{}\n", "x".repeat(52)))
             .collect::<String>()
             .into_bytes();
-        tx.send(payload.clone()).expect("writer task is gone");
-        tx.send(vec![4]).expect("writer task is gone"); // Ctrl-D ends `cat`
+        tx.send(payload.clone().into())
+            .expect("writer task is gone");
+        tx.send(vec![4].into()).expect("writer task is gone"); // Ctrl-D ends `cat`
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut got = Vec::new();
