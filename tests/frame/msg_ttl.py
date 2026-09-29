@@ -12,6 +12,8 @@ and reads once.
 
 4f. ttl_hours=0.0005: two messages read after their TTL are not listed, and
     the server log says both were swept.
+7f. A message that expires while the server is stopped is pruned as expired
+    when it starts, not delivered.
 
 Run: python3 tests/frame/msg_ttl.py   (RMX_RUNDIR overrides the run dir)
 """
@@ -27,6 +29,10 @@ RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgttl")
 WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.py")
 TTL_S = 0.0005 * 3600
 CONFIG = """
+[general]
+save_sessions = true
+automatic_restore = true
+
 [messaging]
 ttl_hours = 0.0005
 """
@@ -114,9 +120,45 @@ try:
     check("msg: swept 2 expired message(s)" in srv.log(),
           "4f ttl_hours=0.0005: the server log says both were swept")
     check("TTL:gone" not in srv.log(), "4f the body is not in the server log")
+
     cli.close()
     time.sleep(0.3)
     check("panicked at" not in srv.log(), "4f no panic in the server log")
+finally:
+    srv.kill()
+
+# --- 7f: expired on disk ---------------------------------------------------
+# A server of its own with a TTL longer than a stop takes (a stop sweeps
+# first, so mail that expires during it is never written, which is right).
+DISK_TTL_S = 0.002 * 3600
+srv = Server(RUNDIR + "-disk")
+try:
+    srv.start(config=CONFIG.replace("ttl_hours = 0.0005", "ttl_hours = 0.002"))
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 120, "rows": 40}})
+    cli.drain(0.8)
+    target = cli_spawn("SplitRight")
+    reply = spawn_sender({"MsgSend": {"to": {"host": None, "target": {"Pane": target}},
+                                      "body": "TTL:on-disk", "deliver": "Mailbox"}})
+    answered_at = time.time()
+    check(name_of(reply) == "MsgSent", f"7f a message was stored for %{target} (got {reply})")
+    cli.close()
+    srv.stop()
+    stopped_at = time.time()
+    on_disk = open(f"{srv.rundir}/data/remux/mailbox.json").read()
+    check("TTL:on-disk" in on_disk and stopped_at < answered_at + DISK_TTL_S,
+          f"7f the stop wrote it to mailbox.json, unexpired ({stopped_at - answered_at:.1f}s after it was sent)")
+    time.sleep(max(0.0, answered_at + DISK_TTL_S + 0.5 - time.time()))
+    srv.start_again()
+    r = read_box(target)
+    check(name_of(r) == "MsgList" and r["MsgList"]["messages"] == [],
+          f"7f after the restart it is not listed (got {r})")
+    check("pruned 0 for closed panes, 1 expired" in srv.log(),
+          "7f the start logs it pruned as expired, not as a closed pane's")
+    check("panicked at" not in srv.log(), "7f no panic in the server log")
 finally:
     srv.kill()
 

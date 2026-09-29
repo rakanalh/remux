@@ -136,7 +136,7 @@ fn legacy_state_path() -> Option<PathBuf> {
 /// to avoid corruption from partial writes.
 pub fn save_state(state: &PersistedState) -> Result<()> {
     let dir = data_dir();
-    std::fs::create_dir_all(&dir)?;
+    create_private_dir(&dir)?;
 
     let state_path = dir.join("state.json");
     log::debug!("persistence: save_state path={:?}", state_path);
@@ -146,6 +146,179 @@ pub fn save_state(state: &PersistedState) -> Result<()> {
     std::fs::write(&tmp_path, json)?;
     std::fs::rename(&tmp_path, &state_path)?;
     Ok(())
+}
+
+/// Create `dir` and its missing parents 0700: it holds session state and
+/// message bodies. An existing directory's mode is left as it is.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Where the mailboxes and agent names persist: beside `state.json`, in a file
+/// of their own so that `state.json`'s shape stays what an older binary reads.
+pub fn mailbox_path() -> PathBuf {
+    data_dir().join("mailbox.json")
+}
+
+/// Write `file` to `path` atomically: a private temp file, then a rename. The
+/// file holds message bodies, which are user content at rest, so it is 0600.
+///
+/// The temp file is created fresh (`O_EXCL`, `O_NOFOLLOW`) after removing
+/// whatever was at its name, so a link planted there cannot redirect the
+/// write; the rename replaces a link at `path` rather than following it.
+pub fn save_mailbox_to(path: &Path, file: &crate::server::messaging::MailboxFile) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(dir) = path.parent() {
+        create_private_dir(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let json = serde_json::to_vec(file)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    out.write_all(&json)?;
+    out.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    // The rename is durable only once the directory entry is.
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Remove a `mailbox.json.bad` older than the TTL: every message in it has
+/// expired, so it is no longer worth keeping for inspection.
+pub fn remove_stale_bad_mailbox(path: &Path, ttl_ms: u64) {
+    let bad = path.with_extension("json.bad");
+    let Ok(modified) = std::fs::symlink_metadata(&bad).and_then(|m| m.modified()) else {
+        return;
+    };
+    let age = std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    if age > std::time::Duration::from_millis(ttl_ms) && std::fs::remove_file(&bad).is_ok() {
+        log::info!("mailbox: removed {}, older than the TTL", bad.display());
+    }
+}
+
+/// Read the mailbox file at `path`, or `None` to start empty.
+///
+/// Never fatal. The file is opened without following a symlink, and must be
+/// a regular file owned by this user that nobody else can write; one that is
+/// not is left alone and not read. A file that cannot be read or parsed, is
+/// of another version or holds an id beyond [`MAX_FILE_ID`] is moved aside to
+/// `mailbox.json.bad` (0600) so the next save does not destroy it. The log
+/// names what was wrong and where, never the parser's text, which can quote a
+/// message body.
+///
+/// [`MAX_FILE_ID`]: crate::server::messaging::MAX_FILE_ID
+pub fn load_mailbox_from(path: &Path) -> Option<crate::server::messaging::MailboxFile> {
+    use crate::server::messaging::{MailboxFile, MAILBOX_FILE_VERSION};
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut opened = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            log::warn!(
+                "mailbox: {} is a symlink; not following it, starting empty",
+                path.display()
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!(
+                "mailbox: cannot open {}: {}; starting empty",
+                path.display(),
+                e.kind()
+            );
+            return None;
+        }
+    };
+    let meta = match opened.metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            log::warn!(
+                "mailbox: cannot stat {}: {}; starting empty",
+                path.display(),
+                e.kind()
+            );
+            return None;
+        }
+    };
+    let own_uid = unsafe { libc::geteuid() };
+    if !meta.is_file() || meta.uid() != own_uid || meta.mode() & 0o022 != 0 {
+        log::warn!(
+            "mailbox: {} is not a private file of this user (uid {}, mode {:o}); not reading it, starting empty",
+            path.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        );
+        return None;
+    }
+    let set_aside = |why: String| {
+        let bad = path.with_extension("json.bad");
+        match std::fs::rename(path, &bad) {
+            Ok(()) => {
+                let _ = std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600));
+                log::warn!(
+                    "mailbox: {} {why}; moved it to {} and starting empty",
+                    path.display(),
+                    bad.display()
+                )
+            }
+            Err(e) => log::warn!(
+                "mailbox: {} {why}; could not move it aside ({}); starting empty",
+                path.display(),
+                e.kind()
+            ),
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(e) = opened.read_to_end(&mut bytes) {
+        set_aside(format!("cannot be read ({})", e.kind()));
+        return None;
+    }
+    match serde_json::from_slice::<MailboxFile>(&bytes) {
+        Ok(file) if file.version != MAILBOX_FILE_VERSION => {
+            set_aside(format!(
+                "is version {}, not {MAILBOX_FILE_VERSION}",
+                file.version
+            ));
+            None
+        }
+        Ok(file) => match file.check_ids() {
+            Ok(()) => Some(file),
+            Err(field) => {
+                set_aside(format!("holds an impossible id ({field})"));
+                None
+            }
+        },
+        Err(e) => {
+            set_aside(format!(
+                "is not a mailbox file ({:?} at line {} column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            ));
+            None
+        }
+    }
 }
 
 /// Load the persisted state from disk.
@@ -196,6 +369,182 @@ fn load_state_from(state_path: &Path, legacy: Option<&Path>) -> Result<Option<Pe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod mailbox_file {
+        use super::super::{load_mailbox_from, save_mailbox_to};
+        use crate::server::messaging::{MailboxFile, MAILBOX_FILE_VERSION};
+        use std::os::unix::fs::PermissionsExt;
+
+        fn dir(tag: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("rmx-mbox-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn file() -> MailboxFile {
+            MailboxFile {
+                version: MAILBOX_FILE_VERSION,
+                next_id: 7,
+                pane_high_water: 12,
+                names: vec![(3, "alpha".into())],
+                messages: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn a_saved_file_loads_back_and_is_private() {
+            let d = dir("roundtrip");
+            let path = d.join("mailbox.json");
+            save_mailbox_to(&path, &file()).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "mailbox.json is {mode:o}");
+            assert_eq!(load_mailbox_from(&path), Some(file()));
+            assert!(
+                !d.join("mailbox.json.tmp").exists(),
+                "the temp file was left"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_missing_file_is_an_empty_start() {
+            let d = dir("missing");
+            assert_eq!(load_mailbox_from(&d.join("mailbox.json")), None);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_corrupt_file_is_set_aside_and_never_fatal() {
+            let d = dir("corrupt");
+            let path = d.join("mailbox.json");
+            std::fs::write(&path, b"{\"version\":1,\"next_id\":\"secret body\"").unwrap();
+            assert_eq!(load_mailbox_from(&path), None);
+            assert!(!path.exists(), "the corrupt file was left in place");
+            assert!(
+                d.join("mailbox.json.bad").exists(),
+                "the corrupt file was not kept"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_file_of_another_version_is_set_aside() {
+            let d = dir("version");
+            let path = d.join("mailbox.json");
+            let mut other = file();
+            other.version = 99;
+            std::fs::write(&path, serde_json::to_vec(&other).unwrap()).unwrap();
+            assert_eq!(load_mailbox_from(&path), None);
+            assert!(d.join("mailbox.json.bad").exists());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_file_others_can_write_is_not_loaded_or_moved() {
+            let d = dir("writable");
+            let path = d.join("mailbox.json");
+            std::fs::write(&path, serde_json::to_vec(&file()).unwrap()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o622)).unwrap();
+            assert_eq!(
+                load_mailbox_from(&path),
+                None,
+                "a group-writable file was loaded"
+            );
+            assert!(path.exists(), "a file that is not ours to judge was moved");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(load_mailbox_from(&path), Some(file()));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn an_id_beyond_the_limit_sets_the_file_aside() {
+            let d = dir("hugeid");
+            let path = d.join("mailbox.json");
+            let mut huge = file();
+            huge.pane_high_water = u64::MAX;
+            std::fs::write(&path, serde_json::to_vec(&huge).unwrap()).unwrap();
+            assert_eq!(load_mailbox_from(&path), None);
+            assert!(d.join("mailbox.json.bad").exists());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_set_aside_file_is_private() {
+            let d = dir("badmode");
+            let path = d.join("mailbox.json");
+            // Readable by others, but writable by nobody else, so it is
+            // loaded, found corrupt and set aside; the copy kept must not
+            // stay readable.
+            std::fs::write(&path, b"not json").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            load_mailbox_from(&path);
+            let bad = d.join("mailbox.json.bad");
+            let mode = std::fs::metadata(&bad).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_set_aside_file_older_than_the_ttl_is_removed() {
+            use super::super::remove_stale_bad_mailbox;
+            let d = dir("stalebad");
+            let path = d.join("mailbox.json");
+            let bad = d.join("mailbox.json.bad");
+            std::fs::write(&bad, b"old").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&bad)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            remove_stale_bad_mailbox(&path, 60_000);
+            assert!(!bad.exists(), "a stale .bad was kept");
+            std::fs::write(&bad, b"new").unwrap();
+            remove_stale_bad_mailbox(&path, 60_000);
+            assert!(bad.exists(), "a fresh .bad was removed");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn the_data_directory_is_created_private() {
+            let d = dir("dirmode");
+            let path = d.join("remux").join("mailbox.json");
+            save_mailbox_to(&path, &file()).unwrap();
+            let mode = std::fs::metadata(d.join("remux"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "the data dir is {mode:o}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn a_symlink_is_not_followed_on_load_or_on_save() {
+            let d = dir("symlink");
+            let path = d.join("mailbox.json");
+            let elsewhere = d.join("elsewhere.json");
+            std::fs::write(&elsewhere, serde_json::to_vec(&file()).unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+            assert_eq!(
+                load_mailbox_from(&path),
+                None,
+                "a symlinked mailbox was read"
+            );
+
+            // A planted link at the temp name must not redirect the write.
+            let target = d.join("target.json");
+            std::fs::write(&target, b"untouched").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&target, d.join("mailbox.json.tmp")).unwrap();
+            save_mailbox_to(&path, &file()).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+            assert_eq!(load_mailbox_from(&path), Some(file()));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
 
     #[test]
     fn test_persisted_state_roundtrip() {

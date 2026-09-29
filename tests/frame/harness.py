@@ -72,6 +72,43 @@ class Server:
             self.proc.kill()
             self.proc.wait()
 
+    def stop(self):
+        """Stop the server the way `remux restart` does (`remux stop`, a
+        SIGTERM and a clean save), and wait for it to exit."""
+        subprocess.run([BIN, "stop"], env=self.env, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.proc.wait(timeout=10)
+        for _ in range(100):
+            if not os.path.exists(self.sock):
+                break
+            time.sleep(0.05)
+
+    def crash(self):
+        """SIGKILL: no shutdown save runs, so what is on disk is whatever was
+        written before."""
+        self.kill()
+
+    def start_again(self):
+        """Start a stopped server on the SAME run dir, keeping its state and
+        data. `start()` cannot do this: it wipes the run dir first."""
+        self.proc = subprocess.Popen(
+            [BIN, "server"], env=self.env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        for _ in range(200):
+            if os.path.exists(self.sock):
+                time.sleep(0.3)
+                return self
+            time.sleep(0.05)
+        self.kill()
+        raise SystemExit("no socket after a restart")
+
+    def restart(self):
+        """`remux restart`: the only way to restart under a harness, because
+        `start()` wipes the run dir. Every client connection dies with it."""
+        self.stop()
+        return self.start_again()
+
     def log(self):
         p = f"{self.rundir}/state/remux/server.log"
         return open(p).read() if os.path.exists(p) else ""

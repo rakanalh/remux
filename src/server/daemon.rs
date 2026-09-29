@@ -1934,6 +1934,14 @@ impl RemuxServer {
             log::info!("save_sessions disabled: persistence is off");
         }
 
+        // After the restore above has SPAWNED the restored panes: the load
+        // prunes against the live pane map, and loading any earlier would
+        // prune every mailbox on every restart.
+        if server.config.messaging.persist {
+            load_mailbox(&server).await;
+            spawn_mailbox_saver(Arc::clone(&server.state));
+        }
+
         prepare_runtime_dir()?;
         let path = socket_path();
         // Remove stale socket if present.
@@ -2086,6 +2094,14 @@ impl RemuxServer {
 
     /// Perform graceful shutdown: save state, drop panes, remove socket.
     async fn shutdown(&self, socket_path: &std::path::Path) {
+        // Before the save_sessions return below: `persist` is the one switch
+        // for this file. With save_sessions off no pane is restored, so the
+        // next start prunes every mailbox, which is the right answer without
+        // a second switch.
+        if self.config.messaging.persist {
+            save_mailbox_now(&self.state).await;
+        }
+
         // Persistence is fully off when save_sessions is disabled.
         if !self.config.general.save_sessions {
             log::info!("save_sessions disabled: skipping state save on shutdown");
@@ -5892,6 +5908,153 @@ fn messaging() -> &'static Mutex<Messaging> {
     })
 }
 
+/// Replace the empty store with what `mailbox.json` holds, pruned to panes
+/// that exist and to mail that has not expired, and never issue a pane id the
+/// file refers to: a surviving message's sender must not become a new pane.
+/// `state.json` carries the pane counter too, but it is not rewritten when a
+/// pane is merely created, so after a crash it can be older than this file.
+///
+/// A pane "exists" if it is live or in a DORMANT session
+/// (`automatic_restore = false`): a dormant session is resurrected with its
+/// own pane ids, and pruning its mail would lose it for good at the next save.
+async fn load_mailbox(server: &RemuxServer) {
+    let path = crate::server::persistence::mailbox_path();
+    let ttl_ms = server.config.messaging.ttl_ms();
+    let Some(file) = tokio::task::spawn_blocking(move || {
+        crate::server::persistence::remove_stale_bad_mailbox(&path, ttl_ms);
+        crate::server::persistence::load_mailbox_from(&path)
+    })
+    .await
+    .ok()
+    .flatten() else {
+        return;
+    };
+    let mut known: std::collections::HashSet<PaneId> =
+        server.panes.lock().await.keys().copied().collect();
+    {
+        let dormant = server.dormant.lock().await;
+        known.extend(
+            dormant
+                .state
+                .sessions
+                .values()
+                .flat_map(|sess| sess.tabs.iter())
+                .flat_map(|tab| layout::all_pane_ids(&tab.layout)),
+        );
+    }
+    let high_water = file.pane_high_water;
+    let closed = messaging().lock().await.closed_panes();
+    let (restored, pruned) = Messaging::restore(
+        server.config.messaging.limits(),
+        file,
+        |pane| known.contains(&pane),
+        closed,
+        now_ms(),
+    );
+    log::info!(
+        "mailbox: restored {} message(s), {} name(s); pruned {} for closed panes, {} expired, {} invalid, {} over a cap, {} name(s); pane ids reserved through %{high_water}",
+        restored.message_count(),
+        restored.name_count(),
+        pruned.dead_pane,
+        pruned.expired,
+        pruned.invalid,
+        pruned.over_cap,
+        pruned.names
+    );
+    *messaging().lock().await = restored;
+    SAVED_HIGH_WATER.store(high_water, Ordering::Relaxed);
+    server
+        .state
+        .lock()
+        .await
+        .reserve_pane_ids_through(high_water);
+}
+
+/// How long the saver waits after a change before writing, so a burst of
+/// sends is one write.
+const MAILBOX_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Woken whenever a pane is created, so that the file's pane high water
+/// follows the pane counter even when no mail moves.
+static PANE_CREATED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The high water last written, so a pane creation writes only when it moved.
+static SAVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Held from the snapshot through the rename, so writes cannot overtake one
+/// another: without it a slow older write could land after a newer one, and
+/// the shutdown write could race a debounced write still in flight.
+static MAILBOX_SAVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Write `mailbox.json` after each change, debounced. Logs a write at debug
+/// only: on a busy pane this runs about once a second.
+fn spawn_mailbox_saver(state: Arc<Mutex<ServerState>>) {
+    tokio::spawn(async move {
+        loop {
+            let changes = messaging().lock().await.changes();
+            tokio::select! {
+                _ = changes.notified() => {}
+                _ = PANE_CREATED.notified() => {}
+            }
+            tokio::time::sleep(MAILBOX_SAVE_DEBOUNCE).await;
+            save_mailbox_now(&state).await;
+        }
+    });
+}
+
+/// Sweep expired mail, then write the store if anything changed since the
+/// last write, or if the pane counter has passed the high water written.
+///
+/// The high water is the larger of every pane id the store refers to and the
+/// last id the pane counter has issued, read under `state` alone before the
+/// store is locked, so a crash can reissue no id this server has handed out.
+async fn save_mailbox_now(state: &Arc<Mutex<ServerState>>) {
+    save_mailbox_with(
+        state,
+        messaging(),
+        crate::server::persistence::mailbox_path(),
+    )
+    .await;
+}
+
+async fn save_mailbox_with(
+    state: &Arc<Mutex<ServerState>>,
+    store: &Mutex<Messaging>,
+    path: PathBuf,
+) {
+    let _serial = MAILBOX_SAVE.lock().await;
+    let issued = state.lock().await.peek_next_pane_id().saturating_sub(1);
+    let (file, swept) = {
+        let mut store = store.lock().await;
+        store.sweep(now_ms());
+        let swept = store.take_swept();
+        let changed = store.take_dirty();
+        if !changed && issued <= SAVED_HIGH_WATER.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut file = store.snapshot();
+        file.pane_high_water = file.pane_high_water.max(issued);
+        (file, swept)
+    };
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
+    let count = file.messages.len();
+    let high_water = file.pane_high_water;
+    let written = tokio::task::spawn_blocking(move || {
+        crate::server::persistence::save_mailbox_to(&path, &file)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {
+            SAVED_HIGH_WATER.store(high_water, Ordering::Relaxed);
+            log::debug!("mailbox: saved {count} message(s), pane ids through %{high_water}");
+        }
+        Ok(Err(e)) => log::warn!("mailbox: save failed: {e}"),
+        Err(e) => log::warn!("mailbox: save task failed: {e}"),
+    }
+}
+
 /// Unix milliseconds, the clock mail expiry is measured on.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -8564,6 +8727,8 @@ async fn spawn_pane(
             exited: false,
         },
     );
+    drop(ps);
+    PANE_CREATED.notify_one();
     Ok(())
 }
 
@@ -12250,6 +12415,63 @@ mod tests {
             )
             .await;
             assert!(done.is_ok(), "the identity line waited on the panes lock");
+        }
+    }
+
+    mod mailbox_save {
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use super::super::{save_mailbox_with, MAILBOX_SAVE};
+        use crate::protocol::Sender;
+        use crate::server::messaging::Messaging;
+        use crate::server::session::ServerState;
+
+        /// A save waits for one already in flight, so an older write can
+        /// never land after a newer one, and the shutdown write never races
+        /// the debounced one.
+        #[tokio::test(start_paused = true)]
+        async fn a_save_waits_for_the_one_in_flight() {
+            let dir = std::env::temp_dir().join(format!("rmx-savelock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let path = dir.join("mailbox.json");
+            let state = Arc::new(Mutex::new(ServerState::new()));
+            let store: &'static Mutex<Messaging> = Box::leak(Box::new(Mutex::new(Messaging::new(
+                crate::config::messaging::MessagingConfig::default().limits(),
+            ))));
+            store
+                .lock()
+                .await
+                .send(
+                    Sender::Pane {
+                        pane_id: 1,
+                        name: None,
+                        session: "main".into(),
+                    },
+                    2,
+                    "a".into(),
+                    None,
+                    0,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+
+            let in_flight = MAILBOX_SAVE.lock().await;
+            let save = {
+                let path = path.clone();
+                tokio::spawn(async move { save_mailbox_with(&state, store, path).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            assert!(
+                !save.is_finished(),
+                "a save ran while another held the lock"
+            );
+            assert!(!path.exists());
+            drop(in_flight);
+            save.await.unwrap();
+            assert!(path.exists(), "the save did not run once the lock was free");
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

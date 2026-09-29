@@ -989,6 +989,18 @@ impl ServerState {
         }
     }
 
+    /// Never issue a pane id at or below `id` from now on.
+    pub fn reserve_pane_ids_through(&mut self, id: PaneId) {
+        if self.next_pane_id <= id {
+            self.next_pane_id = id.saturating_add(1);
+        }
+    }
+
+    /// The id the next pane will get, without taking it.
+    pub fn peek_next_pane_id(&self) -> PaneId {
+        self.next_pane_id
+    }
+
     /// Raise this state's pane/tab id counters so future allocations never
     /// collide with any id used by `other`.
     ///
@@ -2532,6 +2544,26 @@ mod tests {
         let b_tab1_pane = st.create_tab("b", "t1", LayoutMode::default()).unwrap();
         assert_eq!(st.locate_pane(b_pane), Some(("b".to_string(), 0)));
         assert_eq!(st.locate_pane(b_tab1_pane), Some(("b".to_string(), 1)));
+    }
+
+    #[test]
+    fn reserved_pane_ids_are_never_issued() {
+        let mut st = ServerState::new();
+        st.reserve_pane_ids_through(40);
+        assert_eq!(st.next_pane_id(), 41);
+        st.reserve_pane_ids_through(10);
+        assert_eq!(
+            st.next_pane_id(),
+            42,
+            "a lower reservation moved the counter back"
+        );
+    }
+
+    #[test]
+    fn reserving_the_largest_id_does_not_overflow() {
+        let mut st = ServerState::new();
+        st.reserve_pane_ids_through(PaneId::MAX);
+        assert_eq!(st.peek_next_pane_id(), PaneId::MAX);
     }
 
     #[test]

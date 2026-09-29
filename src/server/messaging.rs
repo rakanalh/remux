@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender, Target};
+use crate::protocol::{
+    valid_host, valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender, Target,
+};
 
 /// The width of the per-sender rate window.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -228,6 +230,106 @@ pub struct Messaging {
     /// In the order they parked, which is the order they are answered in.
     waiters: BTreeMap<WaiterId, Waiter>,
     next_waiter: WaiterId,
+    /// Something persisted changed since [`Messaging::take_dirty`] last
+    /// asked; `changed` wakes whoever writes the file.
+    dirty: bool,
+    changed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// What `mailbox.json` holds. Waiters, rate windows and the closed-pane set are
+/// deliberately absent: the first two die with their connections, and the
+/// closed set is replaced by pruning to the restored panes at load.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MailboxFile {
+    pub version: u32,
+    pub next_id: MsgId,
+    /// The highest pane id this file refers to, as a recipient, a sender or
+    /// a name. A restart reserves pane ids past it: a surviving message's
+    /// sender must never be a new pane's id.
+    pub pane_high_water: PaneId,
+    pub names: Vec<(PaneId, String)>,
+    pub messages: Vec<Message>,
+}
+
+pub const MAILBOX_FILE_VERSION: u32 = 1;
+
+/// The largest id a mailbox file may hold, 2^53. Far past any id a server
+/// issues, and small enough that the arithmetic done on an id at load cannot
+/// overflow. A file beyond it did not come from a server.
+pub const MAX_FILE_ID: u64 = 1 << 53;
+
+impl MailboxFile {
+    /// Every id in the file within [`MAX_FILE_ID`], or the field that is not.
+    pub fn check_ids(&self) -> Result<(), &'static str> {
+        let within = |id: u64| id <= MAX_FILE_ID;
+        if !within(self.next_id) {
+            return Err("next_id");
+        }
+        if !within(self.pane_high_water) {
+            return Err("pane_high_water");
+        }
+        if !self.names.iter().all(|(pane, _)| within(*pane)) {
+            return Err("a name's pane");
+        }
+        for msg in &self.messages {
+            let sender = match &msg.from {
+                Sender::Pane { pane_id, .. } | Sender::Remote { pane_id, .. } => *pane_id,
+            };
+            let reply = msg.reply_to.as_ref().map_or(0, |r| r.id);
+            if ![msg.id, msg.to, sender, reply].into_iter().all(within) {
+                return Err("a message id");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The first control character in `body` other than `\n` and `\t`. A body
+/// is typed into a pane in a later release, and an escape sequence in it
+/// (ESC[201~ ends a bracketed paste) would reach the pane's program as input
+/// rather than as text.
+fn control_character(body: &str) -> Option<(usize, char)> {
+    body.char_indices()
+        .find(|&(_, c)| c.is_control() && c != '\n' && c != '\t')
+}
+
+/// A session name as a sender carries it: a label, printed wherever the
+/// message is shown, so it may hold no control character.
+fn valid_session(name: &str) -> bool {
+    !name.is_empty() && name.chars().count() <= 128 && !name.chars().any(char::is_control)
+}
+
+/// Whether a message read from the file is one a send would have stored.
+fn valid_stored(msg: &Message, limits: &Limits) -> bool {
+    let sender = match &msg.from {
+        Sender::Pane { name, session, .. } => {
+            name.as_deref().is_none_or(valid_name) && valid_session(session)
+        }
+        Sender::Remote { host, name, .. } => {
+            valid_host(host) && name.as_deref().is_none_or(valid_name)
+        }
+    };
+    let reply = msg
+        .reply_to
+        .as_ref()
+        .and_then(|r| r.host.as_deref())
+        .is_none_or(valid_host);
+    sender && reply && msg.body.len() <= limits.max_body && control_character(&msg.body).is_none()
+}
+
+/// What a restore left out, for the log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// Messages to a pane that was not restored.
+    pub dead_pane: usize,
+    pub expired: usize,
+    /// Names of a pane that was not restored, or not a valid name.
+    pub names: usize,
+    /// Messages a send would have refused: a duplicate id, a control
+    /// character or an oversized body, a sender or host that is not valid.
+    pub invalid: usize,
+    /// Messages past a mailbox's count or byte cap, the newest dropped.
+    pub over_cap: usize,
 }
 
 impl Messaging {
@@ -242,7 +344,135 @@ impl Messaging {
             swept: 0,
             waiters: BTreeMap::new(),
             next_waiter: 1,
+            dirty: false,
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    fn touched(&mut self) {
+        self.dirty = true;
+        self.changed.notify_one();
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.mailboxes.values().map(|mb| mb.messages.len()).sum()
+    }
+
+    pub fn name_count(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether anything persisted changed since the last call.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Woken once for each change, and holds a wakeup until someone waits,
+    /// so a change made while the saver is busy is not lost.
+    pub fn changes(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.changed)
+    }
+
+    pub fn snapshot(&self) -> MailboxFile {
+        let messages: Vec<Message> = self
+            .mailboxes
+            .values()
+            .flat_map(|mb| mb.messages.iter().cloned())
+            .collect();
+        let mut names: Vec<(PaneId, String)> = self
+            .names
+            .iter()
+            .map(|(name, &pane)| (pane, name.clone()))
+            .collect();
+        names.sort();
+        let senders = messages.iter().map(|m| match &m.from {
+            Sender::Pane { pane_id, .. } => *pane_id,
+            // A remote sender's id is another server's, which this one never
+            // issues.
+            Sender::Remote { .. } => 0,
+        });
+        let pane_high_water = messages
+            .iter()
+            .map(|m| m.to)
+            .chain(senders)
+            .chain(names.iter().map(|(pane, _)| *pane))
+            .max()
+            .unwrap_or(0);
+        MailboxFile {
+            version: MAILBOX_FILE_VERSION,
+            next_id: self.next_id,
+            pane_high_water,
+            names,
+            messages,
+        }
+    }
+
+    /// A store from `file`, keeping only what belongs to a restored pane
+    /// (`is_live`, and not in `closed`) and has not expired by `now_ms`.
+    ///
+    /// The file is re-validated as a send would validate it, because it is
+    /// input: a hand edit or another program can put anything in it. Each
+    /// expiry is clamped to one TTL, so no message outlives the configured
+    /// lifetime, and ids are expected to have passed
+    /// [`MailboxFile::check_ids`], which keeps the arithmetic here in range.
+    pub fn restore(
+        limits: Limits,
+        file: MailboxFile,
+        is_live: impl Fn(PaneId) -> bool,
+        closed: HashSet<PaneId>,
+        now_ms: u64,
+    ) -> (Self, Pruned) {
+        let mut store = Self::new(limits.clone());
+        let mut pruned = Pruned::default();
+        let highest = file.messages.iter().map(|m| m.id).max().unwrap_or(0);
+        store.next_id = file.next_id.max(highest.saturating_add(1)).max(1);
+        let alive = |pane: PaneId| is_live(pane) && !closed.contains(&pane);
+        let mut messages = file.messages;
+        messages.sort_by_key(|m| m.id);
+        let mut seen = HashSet::new();
+        for mut msg in messages {
+            if !seen.insert(msg.id) || !valid_stored(&msg, &limits) {
+                pruned.invalid += 1;
+                continue;
+            }
+            if !alive(msg.to) {
+                pruned.dead_pane += 1;
+                continue;
+            }
+            msg.expires_ms = msg
+                .expires_ms
+                .min(msg.created_ms.saturating_add(limits.ttl_ms))
+                .min(now_ms.saturating_add(limits.ttl_ms));
+            if msg.expires_ms <= now_ms {
+                pruned.expired += 1;
+                continue;
+            }
+            let mailbox = store.mailboxes.entry(msg.to).or_default();
+            if mailbox.messages.len() >= limits.max_messages
+                || mailbox.bytes + msg.body.len() > limits.max_bytes
+            {
+                pruned.over_cap += 1;
+                continue;
+            }
+            mailbox.bytes += msg.body.len();
+            mailbox.messages.push_back(msg);
+        }
+        store.mailboxes.retain(|_, mb| !mb.messages.is_empty());
+        for (pane, name) in file.names {
+            if alive(pane) && valid_name(&name) && !store.names.contains_key(&name) {
+                store.names.retain(|_, holder| *holder != pane);
+                store.names.insert(name, pane);
+            } else {
+                pruned.names += 1;
+            }
+        }
+        store.closed = closed;
+        (store, pruned)
+    }
+
+    /// The closed-pane set, for a restore to carry over.
+    pub fn closed_panes(&self) -> HashSet<PaneId> {
+        self.closed.clone()
     }
 
     /// Park `waiter`, returning its id and the same client's earlier wait,
@@ -350,10 +580,7 @@ impl Messaging {
         // A body is typed into a pane in a later release, and an escape
         // sequence in it (ESC[201~ ends a bracketed paste) would reach the
         // pane's program as input rather than as text.
-        if let Some((at_byte, character)) = body
-            .char_indices()
-            .find(|&(_, c)| c.is_control() && c != '\n' && c != '\t')
-        {
+        if let Some((at_byte, character)) = control_character(&body) {
             return Err(Refusal::BadBody { character, at_byte });
         }
         if self.closed.contains(&to) {
@@ -394,6 +621,7 @@ impl Messaging {
             state: MsgState::Queued,
             reply_to,
         });
+        self.touched();
         Ok(id)
     }
 
@@ -411,6 +639,9 @@ impl Messaging {
             if mark {
                 msg.state = MsgState::Read;
             }
+        }
+        if mark && listed.iter().any(|m| m.state != MsgState::Read) {
+            self.touched();
         }
         listed
     }
@@ -437,12 +668,19 @@ impl Messaging {
             msg.state = MsgState::Read;
             acked += 1;
         }
+        if acked > 0 {
+            self.touched();
+        }
         acked
     }
 
     pub fn set_name(&mut self, pane: PaneId, name: Option<&str>) -> Result<(), Refusal> {
         let Some(name) = name else {
+            let before = self.names.len();
             self.names.retain(|_, holder| *holder != pane);
+            if self.names.len() != before {
+                self.touched();
+            }
             return Ok(());
         };
         if !valid_name(name) {
@@ -463,6 +701,7 @@ impl Messaging {
         }
         self.names.retain(|_, holder| *holder != pane);
         self.names.insert(name.to_string(), pane);
+        self.touched();
         Ok(())
     }
 
@@ -508,6 +747,9 @@ impl Messaging {
         self.names.retain(|_, holder| *holder != pane);
         self.rate.remove(&SenderKey::Pane(pane));
         self.closed.insert(pane);
+        if messages > 0 || named.is_some() {
+            self.touched();
+        }
         (messages, named)
     }
 
@@ -518,6 +760,9 @@ impl Messaging {
         }
         self.swept += dropped;
         self.mailboxes.retain(|_, mb| !mb.messages.is_empty());
+        if dropped > 0 {
+            self.touched();
+        }
         dropped
     }
 
@@ -1283,6 +1528,233 @@ mod tests {
         let (parked, _f, mut c6) = waiter(5, 6, false);
         park(&mut m, parked);
         assert!(!cancelled(&mut c6), "a parked waiter's timer was cancelled");
+    }
+
+    #[test]
+    fn mailbox_file_round_trip_drops_dead_panes_and_expired() {
+        let lim = Limits {
+            ttl_ms: 1_000,
+            ..limits()
+        };
+        let mut m = Messaging::new(lim.clone());
+        let t0 = Instant::now();
+        m.send(pane(1), 2, "to-live".into(), None, 0, t0).unwrap();
+        m.send(pane(1), 3, "to-dead".into(), None, 0, t0).unwrap();
+        m.send(pane(1), 2, "old".into(), None, 0, t0).unwrap();
+        m.send(pane(1), 2, "fresh".into(), None, 600, t0).unwrap();
+        m.read(2, false, true, 0);
+        m.set_name(2, Some("alpha")).unwrap();
+        m.set_name(3, Some("gone")).unwrap();
+
+        let file: MailboxFile =
+            serde_json::from_str(&serde_json::to_string(&m.snapshot()).unwrap()).unwrap();
+        let (r, pruned) = Messaging::restore(lim, file, |p| p == 2, HashSet::new(), 1_000);
+
+        assert_eq!(
+            pruned,
+            Pruned {
+                dead_pane: 1,
+                expired: 2,
+                names: 1,
+                ..Pruned::default()
+            }
+        );
+        let kept = r_read(&r, 2);
+        assert_eq!(kept, [("fresh".to_string(), MsgState::Read)]);
+        assert_eq!(r.pane_named("alpha"), Some(2));
+        assert_eq!(r.pane_named("gone"), None);
+    }
+
+    fn r_read(m: &Messaging, pane: PaneId) -> Vec<(String, MsgState)> {
+        m.mailboxes
+            .get(&pane)
+            .map(|mb| {
+                mb.messages
+                    .iter()
+                    .map(|m| (m.body.clone(), m.state))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Ids are never reused, even when every mailbox was empty at the save,
+    /// so a reply_to written before a restart cannot name a new message.
+    #[test]
+    fn restore_keeps_next_id_with_every_mailbox_empty() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            send(&mut m, "x", t0).unwrap();
+        }
+        m.drop_pane(2);
+        let (mut r, _) = Messaging::restore(limits(), m.snapshot(), |_| true, HashSet::new(), 0);
+        assert_eq!(send(&mut r, "after", t0), Ok(4));
+    }
+
+    /// Every pane id the file refers to (a recipient, a sender, a name) is
+    /// below the high-water mark, so a restart can reserve ids past it and
+    /// never hand a surviving message's sender id to a new pane.
+    #[test]
+    fn the_snapshot_records_the_highest_pane_id_it_refers_to() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        m.send(pane(40), 2, "a".into(), None, 0, t0).unwrap();
+        m.set_name(7, Some("seven")).unwrap();
+        assert_eq!(m.snapshot().pane_high_water, 40);
+        m.set_name(55, Some("fiftyfive")).unwrap();
+        assert_eq!(m.snapshot().pane_high_water, 55);
+        assert_eq!(Messaging::new(limits()).snapshot().pane_high_water, 0);
+    }
+
+    #[test]
+    fn a_change_marks_the_store_dirty_and_a_look_does_not() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        assert!(!m.take_dirty());
+        send(&mut m, "a", t0).unwrap();
+        assert!(m.take_dirty(), "a send");
+        assert!(!m.take_dirty(), "dirty was reported twice");
+        m.read(2, true, false, 0);
+        assert!(!m.take_dirty(), "a peek changed nothing");
+        m.read(2, false, true, 0);
+        assert!(m.take_dirty(), "a marking read");
+        m.set_name(2, Some("alpha")).unwrap();
+        assert!(m.take_dirty(), "a name");
+        m.drop_pane(2);
+        assert!(m.take_dirty(), "a closed pane");
+        assert_eq!(m.ack(9, &[1]), 0);
+        assert!(!m.take_dirty(), "an ack that marked nothing");
+    }
+
+    fn stored(id: MsgId, to: PaneId, body: &str) -> Message {
+        Message {
+            id,
+            from: pane(1),
+            to,
+            body: body.into(),
+            created_ms: 0,
+            expires_ms: 1_000,
+            state: MsgState::Queued,
+            reply_to: None,
+        }
+    }
+
+    fn file_of(messages: Vec<Message>) -> MailboxFile {
+        MailboxFile {
+            version: MAILBOX_FILE_VERSION,
+            next_id: 1,
+            pane_high_water: 0,
+            names: Vec::new(),
+            messages,
+        }
+    }
+
+    /// Every id is checked, field by field: one above 2^53 would overflow the
+    /// arithmetic done on it at load, and no real file ever holds one.
+    #[test]
+    fn an_id_beyond_2_to_the_53_makes_the_file_corrupt() {
+        let huge = MAX_FILE_ID + 1;
+        assert!(file_of(vec![stored(1, 2, "a")]).check_ids().is_ok());
+        let mut f = file_of(Vec::new());
+        f.next_id = huge;
+        assert!(f.check_ids().is_err(), "next_id");
+        let mut f = file_of(Vec::new());
+        f.pane_high_water = huge;
+        assert!(f.check_ids().is_err(), "pane_high_water");
+        assert!(
+            file_of(vec![stored(huge, 2, "a")]).check_ids().is_err(),
+            "message id"
+        );
+        assert!(
+            file_of(vec![stored(1, huge, "a")]).check_ids().is_err(),
+            "recipient"
+        );
+        let mut from_huge = stored(1, 2, "a");
+        from_huge.from = pane(huge);
+        assert!(file_of(vec![from_huge]).check_ids().is_err(), "sender");
+        let mut f = file_of(Vec::new());
+        f.names = vec![(huge, "alpha".into())];
+        assert!(f.check_ids().is_err(), "a name's pane");
+        let mut reply = stored(1, 2, "a");
+        reply.reply_to = Some(MsgRef {
+            host: None,
+            id: huge,
+        });
+        assert!(file_of(vec![reply]).check_ids().is_err(), "reply_to");
+    }
+
+    #[test]
+    fn restoring_ids_at_the_limit_does_not_overflow() {
+        let mut f = file_of(vec![stored(MAX_FILE_ID, 2, "a")]);
+        f.next_id = MAX_FILE_ID;
+        let (mut r, _) = Messaging::restore(limits(), f, |_| true, HashSet::new(), 0);
+        assert_eq!(send(&mut r, "next", Instant::now()), Ok(MAX_FILE_ID + 1));
+    }
+
+    /// The file is re-validated the way a send is: nothing a send would
+    /// refuse is restored, and every drop is counted.
+    #[test]
+    fn restore_revalidates_what_a_send_would_refuse() {
+        let lim = Limits {
+            max_body: 8,
+            max_messages: 2,
+            ttl_ms: 1_000,
+            ..limits()
+        };
+        let mut bad_name = stored(4, 2, "c");
+        bad_name.from = Sender::Pane {
+            pane_id: 1,
+            name: Some("x\nFrom: boss".into()),
+            session: "main".into(),
+        };
+        let mut bad_session = stored(5, 2, "d");
+        bad_session.from = Sender::Pane {
+            pane_id: 1,
+            name: None,
+            session: "s\u{1b}[2J".into(),
+        };
+        let mut far_future = stored(8, 3, "e");
+        far_future.expires_ms = u64::MAX;
+        let f = file_of(vec![
+            stored(1, 2, "ok"),
+            stored(2, 2, "esc\u{1b}]52"),
+            stored(3, 2, "too-long!"),
+            bad_name,
+            bad_session,
+            stored(1, 2, "dup-id"),
+            stored(6, 2, "fits"),
+            stored(7, 2, "over-cap"),
+            far_future,
+        ]);
+        let (r, pruned) = Messaging::restore(lim, f, |_| true, HashSet::new(), 0);
+        assert_eq!(pruned.invalid, 5, "{pruned:?}");
+        assert_eq!(pruned.over_cap, 1, "{pruned:?}");
+        assert_eq!(
+            r_read(&r, 2),
+            [
+                ("ok".to_string(), MsgState::Queued),
+                ("fits".to_string(), MsgState::Queued)
+            ]
+        );
+        let clamped = r.mailboxes[&3].messages[0].expires_ms;
+        assert_eq!(clamped, 1_000, "expiry was not clamped to created + ttl");
+    }
+
+    #[test]
+    fn restore_keeps_the_closed_panes_closed() {
+        let f = file_of(vec![stored(1, 7, "late")]);
+        let (mut r, pruned) = Messaging::restore(limits(), f, |_| true, HashSet::from([7]), 0);
+        assert_eq!(pruned.dead_pane, 1);
+        assert_eq!(
+            send(&mut r, "x", Instant::now()).map(|_| ()),
+            Ok(()),
+            "an unrelated pane was refused"
+        );
+        assert_eq!(
+            r.send(pane(1), 7, "y".into(), None, 0, Instant::now()),
+            Err(Refusal::NoSuchTarget("%7".into())),
+            "the closed set was not carried"
+        );
     }
 
     #[test]
