@@ -505,12 +505,14 @@ const ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 async fn log_peer_identity(
     client_id: u64,
     peer_pid: Option<i32>,
+    peer: Arc<identity::Peer>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) {
+    let pin = peer.pin_kind();
     let verdict = tokio::time::timeout(ATTRIBUTION_TIMEOUT, async {
         let index = proc_index(&*panes.lock().await);
         tokio::task::spawn_blocking(move || {
-            identity::attribute(peer_pid, &index, &identity::system_table())
+            identity::attribute_caller(&*peer, &index, &identity::system_table())
         })
         .await
     })
@@ -523,17 +525,17 @@ async fn log_peer_identity(
     };
     match verdict {
         Ok(Ok(a)) if a.tty_differs => log::info!(
-            "identity: client_id={client_id} peer={peer_pid:?} -> pane %{} by {:?}; its tty differs (nested pty?)",
+            "identity: client_id={client_id} peer={peer_pid:?} pin={pin} -> pane %{} by {:?}; its tty differs (nested pty?)",
             a.pane,
             a.how
         ),
         Ok(Ok(a)) => log::debug!(
-            "identity: client_id={client_id} peer={peer_pid:?} -> pane %{} by {:?}",
+            "identity: client_id={client_id} peer={peer_pid:?} pin={pin} -> pane %{} by {:?}",
             a.pane,
             a.how
         ),
         Ok(Err(e)) => log::debug!(
-            "identity: client_id={client_id} peer={peer_pid:?} not a pane: {}",
+            "identity: client_id={client_id} peer={peer_pid:?} pin={pin} not a pane: {}",
             e.reason()
         ),
         Err(e) => log::warn!("identity: client_id={client_id} attribution task failed: {e}"),
@@ -1268,9 +1270,10 @@ impl RemuxServer {
                                 // Spawned so that a peer that never sends its Hello
                                 // holds only its own task for the handshake timeout,
                                 // not the accept loop, the tick or SIGTERM.
+                                let pidfd = identity::peer_pidfd(std::os::fd::AsFd::as_fd(&stream));
                                 let server = server.clone();
                                 tokio::spawn(async move {
-                                    server.handle_new_connection(stream, cred.pid()).await;
+                                    server.handle_new_connection(stream, cred.pid(), pidfd).await;
                                 });
                             }
                             Ok(cred) => {
@@ -1376,7 +1379,19 @@ impl RemuxServer {
     }
 
     /// Handle a newly accepted client connection.
-    async fn handle_new_connection(&self, stream: tokio::net::UnixStream, peer_pid: Option<i32>) {
+    async fn handle_new_connection(
+        &self,
+        stream: tokio::net::UnixStream,
+        peer_pid: Option<i32>,
+        pidfd: Option<std::os::fd::OwnedFd>,
+    ) {
+        // Before the handshake, while the connector is as fresh as it gets. On
+        // a kernel without a pidfd this reads the connector's start time.
+        let peer = Arc::new(identity::Peer::capture(
+            peer_pid,
+            pidfd,
+            std::os::fd::AsFd::as_fd(&stream),
+        ));
         let (mut read_half, mut write_half) = stream.into_split();
 
         // Version handshake: exchange Hello/Welcome as the first frames, directly
@@ -1458,7 +1473,7 @@ impl RemuxServer {
 
         // Before the reader task exists, so a one-shot CLI peer cannot have
         // had its reply and exited while its process is being read.
-        log_peer_identity(client_id, peer_pid, &self.panes).await;
+        log_peer_identity(client_id, peer_pid, Arc::clone(&peer), &self.panes).await;
 
         // Spawn writer task.
         let mut writer = write_half;
@@ -1503,6 +1518,9 @@ impl RemuxServer {
 
         tokio::spawn(async move {
             let mut reader = read_half;
+            // Owned by the reader for the life of the connection, which keeps
+            // the connector pinned for every frame this loop reads.
+            let _peer = peer;
             loop {
                 match read_message::<ClientMessage>(&mut reader).await {
                     Ok(Some(msg)) => {
@@ -11192,6 +11210,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         use super::super::{log_peer_identity, ATTRIBUTION_TIMEOUT};
+        use crate::server::identity::Peer;
 
         #[tokio::test(start_paused = true)]
         async fn a_wedged_panes_lock_does_not_hold_up_the_connection() {
@@ -11199,7 +11218,7 @@ mod tests {
             let _wedged = panes.lock().await;
             let done = tokio::time::timeout(
                 ATTRIBUTION_TIMEOUT * 2,
-                log_peer_identity(0, Some(1), &panes),
+                log_peer_identity(0, Some(1), Arc::new(Peer::unpinned()), &panes),
             )
             .await;
             assert!(done.is_ok(), "the identity line waited on the panes lock");
@@ -11209,51 +11228,18 @@ mod tests {
     /// `process_pgid` through the real `/proc` read, which only exists on Linux.
     #[cfg(target_os = "linux")]
     mod stat {
-        /// The kernel sets `comm` to the exec'd file's basename cut at 15
-        /// bytes, which here ends one byte into a three-byte character. The
-        /// copy sits beside the test binary because a temp dir can be noexec.
         #[test]
         fn a_live_process_whose_comm_is_not_utf8_reports_its_group() {
-            let dir = std::env::current_exe()
-                .unwrap()
-                .with_file_name(format!("remux-comm-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let exe = dir.join("aaaaaaaaaaaaaa\u{65e5}");
-            std::fs::copy("/bin/sleep", &exe).unwrap();
-            // A raw fork, because `Command::spawn` holds std's environment lock
-            // across its fork, and a pty test forking at the same moment would
-            // copy that held lock into a child that then calls `set_var`.
-            use std::os::unix::ffi::OsStrExt;
-            let path = std::ffi::CString::new(exe.as_os_str().as_bytes()).unwrap();
-            let argv = [path.clone(), std::ffi::CString::new("5").unwrap()];
-            let child = match unsafe { nix::unistd::fork() }.unwrap() {
-                nix::unistd::ForkResult::Child => {
-                    let _ = nix::unistd::execv(&path, &argv);
-                    unsafe { libc::_exit(127) }
-                }
-                nix::unistd::ForkResult::Parent { child } => child,
-            };
-            let pid = child.as_raw();
-
-            // Until the exec, `comm` is still the forking test thread's name.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let comm = loop {
-                let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap_or_default();
-                if comm.starts_with(b"aaaaaaaaaaaaaa") || std::time::Instant::now() > deadline {
-                    break comm;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            let pgid = super::super::process_pgid(pid);
-            let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
-            let _ = nix::sys::wait::waitpid(child, None);
-            let _ = std::fs::remove_dir_all(&dir);
-
+            let child = crate::server::procfs::testing::TruncatedCommChild::spawn("comm");
             assert!(
-                comm.starts_with(b"aaaaaaaaaaaaaa") && std::str::from_utf8(&comm).is_err(),
-                "the fixture's comm is not the truncated name, so it tests nothing: {comm:?}"
+                child.comm_is_truncated(),
+                "the fixture's comm is not the truncated name, so it tests nothing: {:?}",
+                child.comm
             );
-            assert_eq!(pgid, Some(nix::unistd::getpgrp().as_raw()));
+            assert_eq!(
+                super::super::process_pgid(child.pid.as_raw()),
+                Some(nix::unistd::getpgrp().as_raw())
+            );
         }
     }
 }

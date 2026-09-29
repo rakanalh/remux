@@ -16,6 +16,8 @@ real process running inside a real pane and read the server log:
     still reaches the pane and the differing tty is logged, never refused.
 1f. A double fork that detaches fully (new session, parent gone) names no
     pane and is refused attribution.
+1g. Every connection is pinned by a pidfd when the kernel offers
+    SO_PEERPIDFD (6.5 and later), and by start time when it does not.
 1z. No panic in the server log.
 
 Later tasks extend this file with the mailbox cases.
@@ -25,6 +27,7 @@ Run: python3 tests/frame/msg_mailbox.py   (RMX_RUNDIR overrides the run dir)
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 
@@ -94,6 +97,24 @@ def log_has(pattern, timeout=4.0):
         time.sleep(0.2)
 
 
+SO_PEERPIDFD = 77
+
+
+def kernel_has_peer_pidfd():
+    """Ask the kernel, not its version string: a backported or patched kernel
+    can have the option at a version number that says it should not."""
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        fd = a.getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)
+    except OSError:
+        return False
+    finally:
+        a.close()
+        b.close()
+    os.close(fd)
+    return True
+
+
 def identity_lines():
     return [ln for ln in srv.log().splitlines() if "identity:" in ln]
 
@@ -121,13 +142,13 @@ try:
     a = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
     ok, seen = pane_content(cli, a, "LS:done")
     check(ok, f"1a `remux ls` ran inside pane A to completion (saw {seen[-5:]})")
-    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) -> pane %{a} by Sid$")
+    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{a} by Sid$")
     check(line is not None,
           f"1a the connection from inside pane A is attributed to %{a} by Sid "
           f"(identity lines: {identity_lines()})")
 
     # --- 1b: the harness itself is in no pane of this server ---------------
-    line = log_has(rf"identity: client_id=\d+ peer=Some\({os.getpid()}\) "
+    line = log_has(rf"identity: client_id=\d+ peer=Some\({os.getpid()}\) pin=\w+ "
                    r"not a pane: not a descendant of any pane$")
     check(line is not None,
           f"1b the harness's own connection is not a pane "
@@ -137,7 +158,7 @@ try:
     reply = cli_spawn("SplitRight", argv=[BIN, "ls"])
     check(name_of(reply) == "CliSpawned", f"1c pane B spawned (got {reply})")
     b = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
-    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) -> pane %{b} by Sid$")
+    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{b} by Sid$")
     check(line is not None,
           f"1c the pane's own `remux ls` is attributed to %{b} by Sid "
           f"(identity lines: {identity_lines()})")
@@ -146,7 +167,7 @@ try:
     reply = cli_spawn("SplitBelow", argv=["setsid", "-w", BIN, "ls"])
     check(name_of(reply) == "CliSpawned", f"1d pane D spawned (got {reply})")
     d = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
-    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) -> pane %{d} "
+    line = log_has(rf"identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{d} "
                    r"by Walk \{ depth: 1 \}$")
     check(line is not None,
           f"1d `setsid -w remux ls` is attributed to %{d} by the walk at depth 1 "
@@ -159,7 +180,7 @@ try:
         reply = cli_spawn("SplitRight", argv=["script", "-qec", f"{BIN} ls", "/dev/null"])
         check(name_of(reply) == "CliSpawned", f"1e pane E spawned (got {reply})")
         e = reply["CliSpawned"]["pane_id"] if name_of(reply) == "CliSpawned" else None
-        line = log_has(rf" INFO .*identity: client_id=\d+ peer=Some\(\d+\) -> pane %{e} "
+        line = log_has(rf" INFO .*identity: client_id=\d+ peer=Some\(\d+\) pin=\w+ -> pane %{e} "
                        r"by Walk \{ depth: \d+ \}; its tty differs \(nested pty\?\)$")
         check(line is not None,
               f"1e `remux ls` under `script` is attributed to %{e} with its tty "
@@ -173,7 +194,7 @@ try:
         f"( setsid /bin/sh -c 'sleep 0.5; exec {BIN} ls' & ); "
         "printf 'DF:%s\\n' forked; exec /bin/sh"])
     check(name_of(reply) == "CliSpawned", f"1f pane F spawned (got {reply})")
-    rx = re.compile(r"identity: client_id=\d+ peer=Some\((\d+)\) "
+    rx = re.compile(r"identity: client_id=\d+ peer=Some\((\d+)\) pin=\w+ "
                     r"not a pane: not a descendant of any pane$")
     detached = []
     end = time.time() + 5.0
@@ -184,6 +205,11 @@ try:
     check(len(detached) == 1,
           f"1f the detached `remux ls` is not attributed to any pane "
           f"(identity lines: {identity_lines()})")
+
+    # --- 1g: the pin in use -------------------------------------------------
+    want = "pidfd" if kernel_has_peer_pidfd() else "starttime"
+    pins = set(re.findall(r"identity: client_id=\d+ peer=Some\(\d+\) pin=(\w+) ", srv.log()))
+    check(pins == {want}, f"1g every connection is pinned by {want}, which this kernel offers (saw {pins})")
 
     cli.close()
     time.sleep(0.3)

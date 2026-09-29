@@ -7,6 +7,9 @@ pub struct StatFields {
     pub pgrp: i32,
     pub sid: i32,
     pub tty_nr: u32,
+    /// Clock ticks after boot at which the process started. `None` on a line
+    /// cut short, which only a test fixture is.
+    pub starttime: Option<u64>,
 }
 
 /// Parse a `/proc/<pid>/stat` line: `pid (comm) state ppid pgrp session tty_nr ...`.
@@ -32,12 +35,91 @@ pub fn proc_stat(line: &[u8]) -> Option<StatFields> {
     let pgrp = fields.next()?.parse().ok()?;
     let sid = fields.next()?.parse().ok()?;
     let tty_nr = fields.next()?.parse::<i32>().ok()? as u32;
+    // tpgid through itrealvalue, then starttime.
+    let starttime = fields.nth(14).and_then(|f| f.parse().ok());
     Some(StatFields {
         ppid,
         pgrp,
         sid,
         tty_nr,
+        starttime,
     })
+}
+
+/// Test support shared by every test that needs a live process whose `comm`
+/// is not valid UTF-8.
+#[cfg(test)]
+pub mod testing {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    use nix::sys::signal::{kill, Signal};
+    use nix::sys::wait::waitpid;
+    use nix::unistd::{fork, ForkResult, Pid};
+
+    /// The exec'd name: 14 ASCII bytes and a three-byte character, which the
+    /// kernel cuts at 15 bytes, one byte into the character.
+    const NAME: &str = "aaaaaaaaaaaaaa\u{65e5}";
+
+    /// A running copy of `sleep` whose `comm` is cut mid-character. It is
+    /// killed, reaped and its copy removed on drop.
+    pub struct TruncatedCommChild {
+        pub pid: Pid,
+        /// `comm` as read once the exec was seen, or at the deadline.
+        pub comm: Vec<u8>,
+        dir: PathBuf,
+    }
+
+    impl TruncatedCommChild {
+        /// The copy sits beside the test binary because a temp dir can be
+        /// noexec. The child is started by a raw `fork` with its argv built
+        /// beforehand: `Command::spawn` holds std's environment lock across
+        /// its fork, and a pty test forking at the same moment would copy that
+        /// held lock into a child that then calls `set_var`.
+        pub fn spawn(tag: &str) -> Self {
+            let dir = std::env::current_exe()
+                .unwrap()
+                .with_file_name(format!("remux-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join(NAME);
+            std::fs::copy("/bin/sleep", &exe).unwrap();
+            let path = CString::new(exe.as_os_str().as_bytes()).unwrap();
+            let arg = CString::new("5").unwrap();
+            let argv: [*const libc::c_char; 3] = [path.as_ptr(), arg.as_ptr(), std::ptr::null()];
+            let pid = match unsafe { fork() }.unwrap() {
+                ForkResult::Child => unsafe {
+                    libc::execv(path.as_ptr(), argv.as_ptr());
+                    libc::_exit(127)
+                },
+                ForkResult::Parent { child } => child,
+            };
+            // Until the exec, `comm` is still the forking test thread's name.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let comm = loop {
+                let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap_or_default();
+                if comm.starts_with(b"aaaaaaaaaaaaaa") || std::time::Instant::now() > deadline {
+                    break comm;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            TruncatedCommChild { pid, comm, dir }
+        }
+
+        /// Whether the child really carries the truncated name, which is what
+        /// makes a test that uses it test anything.
+        pub fn comm_is_truncated(&self) -> bool {
+            self.comm.starts_with(b"aaaaaaaaaaaaaa") && std::str::from_utf8(&self.comm).is_err()
+        }
+    }
+
+    impl Drop for TruncatedCommChild {
+        fn drop(&mut self) {
+            let _ = kill(self.pid, Signal::SIGKILL);
+            let _ = waitpid(self.pid, None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -57,7 +139,8 @@ mod tests {
                 ppid: 1000,
                 pgrp: 1234,
                 sid: 1001,
-                tty_nr: 34816
+                tty_nr: 34816,
+                starttime: None
             })
         );
         let spaced = b"77 (Web Content) S 2 77 3 0 -1";
@@ -67,12 +150,23 @@ mod tests {
                 ppid: 2,
                 pgrp: 77,
                 sid: 3,
-                tty_nr: 0
+                tty_nr: 0,
+                starttime: None
             })
         );
         assert_eq!(proc_stat(b"1234 no paren S 1 2 3 4"), None);
         assert_eq!(proc_stat(b"1234 (short) S 1 2 3 x"), None);
         assert_eq!(proc_stat(b"1234 (short) S 1 2"), None);
+    }
+
+    /// A whole line as the kernel writes it: `starttime` is the 22nd field,
+    /// the 20th after the `)`.
+    #[test]
+    fn proc_stat_reads_the_start_time_from_a_full_line() {
+        let line = b"4321 (sh) S 10 4321 11 34816 4321 4194560 120 0 0 0 1 2 0 0 20 0 1 0 987654 2400000 300 18446744073709551615";
+        let stat = proc_stat(line).unwrap();
+        assert_eq!(stat.starttime, Some(987654));
+        assert_eq!(stat.ppid, 10);
     }
 
     #[test]
@@ -86,7 +180,8 @@ mod tests {
                 ppid: 10,
                 pgrp: 4321,
                 sid: 11,
-                tty_nr: 34816
+                tty_nr: 34816,
+                starttime: None
             })
         );
         line.extend_from_slice(b" \xff");
