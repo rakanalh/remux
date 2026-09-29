@@ -13,6 +13,8 @@ user cannot see.
       (b) that pane's own `ID:` marker is the body on screen, and
       (c) a line typed afterwards (`printf 'RAN:%s' <tag>`) is on screen, and
           `SubscribePane` shows it in THAT pane and in no other.
+  * Zoomed: `SessionSwitchPane` naming a pane the tab does not own changes
+    nothing and does not panic a debug server.
   * Master (`default_layout = "master"`), three panes by `PaneNew`: the FIRST
     pane holds the master slot -- the widest box, in the centre column, as
     `MasterLayout` documents (`master_pane: None` means "use the first pane").
@@ -282,6 +284,26 @@ def master_case(cli):
           f"5 panes: pane one is the full-height CENTRE master ({boxes}, one at {one})")
 
 
+def stale_id_case(cli):
+    print("zoomed: SessionSwitchPane to a pane that no longer exists is refused")
+    open_session(cli, "stale")
+    cmd(cli, "PaneNew")
+    cmd(cli, "PaneToggleZoom")
+    before = [(pid, f) for pid, _, f in tree_panes(cli, "stale")]
+    # A jump can name a pane that closed after the client last saw the tree.
+    # Focusing it would carry the zoom onto a pane the tab does not own.
+    cli.send({"Command": {"SessionSwitchPane": {
+        "session": "stale", "tab_index": 0, "pane_id": 9999}}})
+    cli.drain(0.6)
+    after = [(pid, f) for pid, _, f in tree_panes(cli, "stale")]
+    print(f"  focus before {before}, after {after}")
+    check(before and after == before, f"focus is unchanged ({before} -> {after})")
+    type_line(cli, "printf 'RAN:%s\\n' st")
+    time.sleep(0.3)
+    g = snapshot(cli)
+    check(len(g.where(r"RAN:st\b")) == 1, "the zoomed pane still takes input and is shown")
+
+
 def run(config, case):
     srv = Server(RUNDIR).start(config=config)
     cli = Client(srv.sock)
@@ -299,6 +321,7 @@ def main():
     os.environ["HOME"] = RUNDIR
     run(None, monocle_case)
     run(MASTER_CONFIG, master_case)
+    run(None, stale_id_case)
     print()
     if fails:
         print(f"FAILED ({len(fails)}):")

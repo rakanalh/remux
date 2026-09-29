@@ -3804,6 +3804,16 @@ async fn handle_command(
                 }
                 if let Some(sess) = st.sessions.get_mut(&session) {
                     if let Some(tab) = sess.tabs.get_mut(sess.active_tab) {
+                        // The id comes from the client's copy of the tree, which
+                        // can name a pane that closed since. Focusing it would
+                        // also carry an active zoom onto a pane the tab does
+                        // not own.
+                        if !tab.pane_order.contains(&pane_id) {
+                            log::warn!(
+                                "SessionSwitchPane: pane {pane_id} is not in tab {tab_index} of '{session}'"
+                            );
+                            return Ok(());
+                        }
                         tab.focus_pane(pane_id);
                     }
                     session::debug_check_invariant(sess, "SessionSwitchPane");
