@@ -1,3 +1,4 @@
+pub mod agent_cli;
 pub mod chrome;
 pub mod cli_common;
 pub mod command_palette;

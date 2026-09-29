@@ -160,6 +160,10 @@ enum Commands {
     #[command(subcommand)]
     Msg(crate::client::msg_cli::MsgCmd),
 
+    /// Name panes and list the ones that can be sent to
+    #[command(subcommand)]
+    Agent(crate::client::agent_cli::AgentCmd),
+
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
     Server,
@@ -600,6 +604,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Msg(cmd)) => {
             std::process::exit(crate::client::msg_cli::run_msg(cmd).await.into());
+        }
+        Some(Commands::Agent(cmd)) => {
+            std::process::exit(crate::client::agent_cli::run_agent(cmd).await.into());
         }
         Some(Commands::NewTab { cwd, argv }) => {
             run_cli_spawn(CliPlacement::NewTab, cwd, argv).await?;

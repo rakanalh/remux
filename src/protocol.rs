@@ -1318,13 +1318,16 @@ impl ServerMessage {
         }
     }
 
-    /// Whether the server sends this without being asked: a broadcast, a
-    /// subscription or a frame. A one-shot request skips these while it waits
-    /// for its answer, because any connection can receive a broadcast such as
-    /// `Event(SessionCreated)` at any moment.
+    /// Whether the server sends this unasked to a connection that never
+    /// subscribed to anything: a broadcast or a frame. A one-shot request
+    /// skips these while it waits for its answer, because any connection can
+    /// receive a broadcast such as `Event(SessionCreated)` at any moment.
     ///
-    /// `SessionTree` counts as an answer: it is pushed only to a connection
-    /// that sent `SubscribeSessionTree`.
+    /// The subscription messages are not treated alike. `AgentList` is only
+    /// ever pushed, so it counts as a push. `SessionTree` also answers
+    /// `ListSessionTree`, so it counts as an answer, which is wrong for a
+    /// connection that sent `SubscribeSessionTree`. A verb that subscribes
+    /// must revisit this.
     pub fn is_push(&self) -> bool {
         match self {
             ServerMessage::FullRender { .. }

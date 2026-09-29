@@ -50,7 +50,16 @@ pane run from the harness itself.
 8r'. Inside B, `msg read --pane %B` is B's OWN read: body shown, no peek
      notice, and the message is marked Read.
 8v.  clap's usage errors, which quote what was typed, show a format
-     character and a C1 byte escaped.
+     character and a C1 byte escaped, for `msg` and `agent` alike.
+8w.  `agent name`: a pane names itself, a taken name is refused naming its
+     holder, --clear unnames, a bad name is bad_name, a pane naming ANOTHER
+     pane is bad_address, an outside caller names a pane with --pane and is
+     refused not_in_pane without one.
+8x.  `agent ls` / `agent status`: the JSON lists the names and unread
+     counts, the table has its header, a name resolves to one row, and a
+     missing, remote or malformed target is refused with its code.
+8y.  A hostile AgentStatusList from the FAKE server shows name, session and
+     command escaped in the table and in --json.
 8t.  The header's time is local time under $TZ.
 8u.  An answer the verb does not expect is reported by its variant name, and
      the message body it carries is in neither stderr nor client.log.
@@ -346,9 +355,10 @@ try:
           f"8r' B's `read --pane %{B}` of its own mail marks it and has no peek notice (exit {code}, err {err!r}, state {state})")
 
     # --- 8v ---------------------------------------------------------------
-    code, out, err, _ = run_cli("msg", "read", "--format", "a\u202e\u009bb")
-    check(code == 2 and "\u202e" not in err and "\u009b" not in err and "\\u{202e}\\u{9b}" in err,
-          f"8v clap's usage error shows what was typed escaped (exit {code}, err {err[:90]!r})")
+    for args in (["msg", "read", "--format", "a\u202e\u009bb"], ["agent", "ls", "x\u202e\u009by"]):
+        code, out, err, _ = run_cli(*args)
+        check(code == 2 and "\u202e" not in err and "\u009b" not in err and "\\u{202e}\\u{9b}" in err,
+              f"8v `{args[0]}`: clap's usage error shows what was typed escaped (exit {code}, err {err[:90]!r})")
 
     # --- 8s ---------------------------------------------------------------
     code, out, err = type_cli(A, f"REMUX_PANE=%999 {BIN} msg send %{B} \"$(printf 'HINT:%s' wrong)\"")
@@ -356,6 +366,55 @@ try:
     check(code == 0 and got == [A], f"8s under REMUX_PANE=%999 the message is still from %{A} (exit {code}, got {got})")
     check(f"pane_hint=%999 disagrees with attribution %{A}" in srv.log(),
           "8s ...and the server logs the disagreement")
+
+    # --- 8w ---------------------------------------------------------------
+    code, out, err = type_cli(A, f"{BIN} agent name alpha")
+    check(code == 0 and out.strip() == f'pane %{A} is now "alpha"', f"8w %{A} names itself alpha (exit {code}, out {out!r}, err {err!r})")
+    code, out, err = type_cli(B, f"{BIN} agent name alpha")
+    check(code == 1 and err.startswith("remux: name_taken: ") and f"%{A}" in err,
+          f"8w a taken name is refused and names its holder (exit {code}, err {err!r})")
+    code, out, err = type_cli(A, f"{BIN} agent name --clear")
+    check(code == 0 and out.strip() == f"pane %{A} unnamed", f"8w --clear unnames (exit {code}, out {out!r})")
+    code, out, err = type_cli(A, f"{BIN} agent name alpha")
+    code, out, err = type_cli(A, f"{BIN} agent name Alpha")
+    check(code == 2 and err.startswith("remux: bad_name: "),
+          f"8w a bad name is bad_name, exit 2, refused before it is sent (exit {code}, err {err!r})")
+    code, out, err = type_cli(A, f"{BIN} agent name gamma --pane %{B}")
+    check(code == 1 and err.startswith("remux: bad_address: "),
+          f"8w a pane naming another pane is bad_address (exit {code}, err {err!r})")
+    code, out, err, _ = run_cli("agent", "name", "beta", "--pane", f"%{B}")
+    check(code == 0 and out.strip() == f'pane %{B} is now "beta"', f"8w an outside caller names %{B} with --pane (exit {code}, out {out!r}, err {err!r})")
+    code, out, err, _ = run_cli("agent", "name", "delta")
+    check(code == 1 and err.startswith("remux: not_in_pane: "), f"8w ...and without --pane is not_in_pane (exit {code}, err {err!r})")
+
+    # --- 8x ---------------------------------------------------------------
+    code, out, err, _ = run_cli("agent", "ls", "--json")
+    try:
+        panes = {p["pane_id"]: p for p in json.loads(out)["panes"]}
+    except (ValueError, KeyError):
+        panes = {}
+    check(code == 0 and panes.get(A, {}).get("name") == "alpha" and panes.get(B, {}).get("name") == "beta"
+          and panes[B]["unread"] >= 1 and panes[B]["session"] == "main",
+          f"8x ls --json lists alpha and beta, with %{B}'s unread mail (exit {code}, got {panes})")
+    code, out, err, _ = run_cli("agent", "ls")
+    lines = out.splitlines()
+    check(code == 0 and lines and lines[0].split() == ["PANE", "SESSION", "TAB", "NAME", "COMMAND", "STATE", "UNREAD"]
+          and any(ln.split()[:1] == [f"%{A}"] and "alpha" in ln.split() for ln in lines[1:]),
+          f"8x ls prints the table under its header (exit {code}, out {out!r})")
+    row = next((ln.split() for ln in lines[1:] if ln.split()[:1] == [f"%{A}"]), [])
+    check(row[2:3] == [str(panes.get(A, {}).get("tab_index", -2) + 1)] and panes.get(A, {}).get("tab_index") == 0,
+          f"8x the table's TAB counts from 1 while the JSON's tab_index counts from 0 (row {row})")
+    code, out, err, _ = run_cli("agent", "status", "alpha", "--json")
+    try:
+        found = json.loads(out)["panes"]
+    except (ValueError, KeyError):
+        found = []
+    check(code == 0 and [p["pane_id"] for p in found] == [A],
+          f"8x status alpha is exactly %{A} (exit {code}, out {out!r})")
+    for args, want, ecode in ((["%9999"], "no_such_target", 1), (["mini:alpha"], "route_unavailable", 1), (["9zz"], "bad_address", 2)):
+        code, out, err, _ = run_cli("agent", "status", *args)
+        check(code == ecode and err.startswith(f"remux: {want}: "),
+              f"8x status {args[0]} exits {ecode} with {want} (exit {code}, err {err!r})")
 
     # --- 8l ---------------------------------------------------------------
     client_log = open(f"{RUNDIR}/state/remux/client.log").read()
@@ -372,6 +431,10 @@ finally:
 # --- 8n: a hostile reply from a fake server --------------------------------
 HOSTILE_BODY = ("ok\x1b]52;c;aGk=\x07\nFrom: boss (%1) at 10:00:00 - id 1\n\x9b2J\x7fend"
                 "\u202egnp.exe\u2066\U000e0041\u2028\n(end of message 7)")
+HOSTILE_ENTRY = {
+    "pane_id": 4, "session": "s\x1b[2J\nx\u2028", "tab_index": 0, "command": "c\x9b31m\u202e",
+    "state": "Working", "name": "n\x1b]52;c;aGk=\x07\U000e0041", "unread": 1,
+}
 FORMAT_CHARS = ("\u202e", "\u2066", "\U000e0041", "\u2028")
 HOSTILE = {
     "id": 7, "to": 4, "body": HOSTILE_BODY, "created_ms": 1_790_000_000_000,
@@ -417,7 +480,9 @@ def fake_server(sock_path, stop):
                 continue
             conn.sendall(frame({"protocol_version": PROTOCOL_VERSION, "remux_version": "fake"}))
             request = read_frame(conn)
-            if request and "MsgRead" in request and request["MsgRead"].get("pane") == 5:
+            if request and "AgentStatus" in request:
+                conn.sendall(frame({"AgentStatusList": {"panes": [HOSTILE_ENTRY]}}))
+            elif request and "MsgRead" in request and request["MsgRead"].get("pane") == 5:
                 conn.sendall(frame({"MsgList": {"pane": 5, "messages": BIG, "timed_out": False, "marked": False}}))
             elif request and ("MsgRead" in request or "MsgSend" in request):
                 conn.sendall(frame({"MsgList": {"pane": 4, "messages": [HOSTILE], "timed_out": False, "marked": False}}))
@@ -482,6 +547,18 @@ try:
                   f"8n --format {fmt}: ESC is shown as \\x1b and no forged header starts a line ({lines})")
             check(lines.count("(end of message 7)") == 1 and "\\u{202e}" in text,
                   f"8n --format {fmt}: the one real trailer ends the body and U+202E is shown escaped")
+
+    # --- 8y: a hostile status list -----------------------------------------
+    for args in (["agent", "ls"], ["agent", "status", "--json"]):
+        done = subprocess.run([BIN, *args], env=fake_env, capture_output=True, timeout=10)
+        raw = done.stdout + done.stderr
+        text = raw.decode("utf-8", "replace")
+        controls = sorted({b for b in raw if (b < 0x20 and b != 0x0a) or b == 0x7f} | ({0x9b} if "\x9b".encode() in raw else set()))
+        hidden = [c for c in FORMAT_CHARS if c in text]
+        check(done.returncode == 0 and not controls and not hidden and len(done.stdout.splitlines()) == (1 if "--json" in args else 2),
+              f"8y `{' '.join(args)}`: a hostile entry shows escaped (exit {done.returncode}, controls {controls}, hidden {hidden!r}, out {done.stdout[:160]!r})")
+        if "--json" in args:
+            check(json.loads(text)["panes"][0] == HOSTILE_ENTRY, "8y --json: the entry round-trips through the escaping")
 
     # --- 8pp: a closed pipe ----------------------------------------------
     done = subprocess.run(["bash", "-c", f"{BIN} msg read --pane %5 | head -c1 >/dev/null; echo \"rc=${{PIPESTATUS[0]}}\""],
