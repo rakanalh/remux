@@ -981,6 +981,10 @@ where
 /// Read a length-prefixed JSON message from an async reader.
 ///
 /// Returns `Ok(None)` if the connection was closed (EOF on the length header).
+/// A frame over [`protocol::MAX_FRAME_BYTES`] is an `Err` before anything is
+/// allocated, and every caller drops the connection on an `Err`. This is the
+/// one reader: the server's, the TUI client's, a remote's over ssh and the
+/// handshake's all go through it.
 pub async fn read_message<T>(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<T>>
 where
     T: DeserializeOwned,
@@ -993,6 +997,13 @@ where
     }
 
     let len = protocol::decode_message_length(&header);
+    if len > protocol::MAX_FRAME_BYTES {
+        log::warn!(
+            "protocol: refusing a {len}-byte frame (the limit is {}); dropping the connection",
+            protocol::MAX_FRAME_BYTES
+        );
+        anyhow::bail!("frame of {len} bytes is over the limit");
+    }
     let mut payload = vec![0u8; len];
     reader
         .read_exact(&mut payload)
@@ -11652,6 +11663,36 @@ mod tests {
     #[test]
     fn saved_custom_not_restorable_when_none() {
         assert!(!saved_custom_is_restorable(&None, &[1, 2]));
+    }
+
+    mod framing {
+        use super::super::read_message;
+        use crate::protocol::{ClientMessage, MAX_FRAME_BYTES};
+
+        #[tokio::test]
+        async fn a_frame_over_the_cap_is_refused_before_it_is_read() {
+            for len in [u32::MAX, MAX_FRAME_BYTES as u32 + 1] {
+                let header = len.to_be_bytes();
+                let mut wire: &[u8] = &header;
+                // A reader holding only the header fails at the payload anyway,
+                // so the error has to be the cap's, not the end of input.
+                let err = read_message::<ClientMessage>(&mut wire)
+                    .await
+                    .expect_err("an oversized frame was accepted");
+                assert!(
+                    format!("{err:#}").contains("over the limit"),
+                    "a {len}-byte frame got past the cap and failed later: {err:#}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_frame_under_the_cap_still_reads() {
+            let frame = crate::protocol::encode_message(&ClientMessage::Detach).unwrap();
+            let mut wire: &[u8] = &frame;
+            let got = read_message::<ClientMessage>(&mut wire).await.unwrap();
+            assert!(matches!(got, Some(ClientMessage::Detach)));
+        }
     }
 
     mod identity_line {

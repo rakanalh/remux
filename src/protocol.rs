@@ -2126,6 +2126,19 @@ pub fn encode_message<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The largest frame either side reads, from a client, a server or a relay.
+///
+/// A header is a bare `u32`, and the payload buffer is allocated before a
+/// byte of it arrives, so a garbage or hostile header of 0xFFFFFFFF asked for
+/// 4 GiB and could abort the whole server. The cap sits far above every real
+/// frame: a `FullRender` of a 500x200 terminal in truecolour is about 11 MiB,
+/// and 22 MiB if every cell carries a 100-byte hyperlink; a mailbox read is at
+/// most 4 MiB of bodies; a paste travels as one `Input` whose JSON byte array
+/// costs about 3.6 bytes per pasted byte, so the cap still admits a 64 MiB
+/// paste. It is also 0x1000_0000, so any header whose first byte is 0x10 or
+/// more is refused, which covers text written into the socket by mistake.
+pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
 /// Read the payload length from a 4-byte big-endian header.
 pub fn decode_message_length(header: &[u8; 4]) -> usize {
     let len = u32::from_be_bytes(*header) as usize;
