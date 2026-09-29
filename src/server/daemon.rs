@@ -539,6 +539,21 @@ async fn attribute_frame_caller(
     }
 }
 
+/// Refuse a caller whose attribution failed for a reason that says nothing
+/// about where it is. Only [`identity::Unverified::is_outside`] may be treated
+/// as a caller outside every pane, with an outsider's --pane.
+fn unverified_refusal(
+    caller: &Result<identity::Attribution, identity::Unverified>,
+) -> Option<ServerMessage> {
+    match caller {
+        Err(why) if !why.is_outside() => Some(ServerMessage::refused(
+            "sender_unverified",
+            format!("{}: {}", why.reason(), why.fix()),
+        )),
+        _ => None,
+    }
+}
+
 /// The attribution line a message handler writes. `how` is what the harnesses
 /// read to tell the session-id path from the walk.
 fn log_caller(client_id: u64, verb: &str, found: &identity::Attribution) {
@@ -583,6 +598,13 @@ struct OutgoingMessage {
     body: String,
     deliver: Deliver,
     reply_to: Option<MsgRef>,
+    pane_hint: Option<PaneId>,
+}
+
+/// A [`ClientMessage::AgentName`], unpacked.
+struct NameRequest {
+    name: Option<String>,
+    pane: Option<PaneId>,
     pane_hint: Option<PaneId>,
 }
 
@@ -800,6 +822,9 @@ async fn mailbox_of(
         log_caller(client_id, verb, found);
         log_hint(pane_hint, found.pane);
     }
+    if let Some(refused) = unverified_refusal(&caller) {
+        return Err(refused);
+    }
     let pane = match (pane, &caller) {
         (Some(pane), _) => pane,
         (None, Ok(found)) => found.pane,
@@ -810,6 +835,17 @@ async fn mailbox_of(
             ))
         }
     };
+    check_addressable(pane, state, panes).await?;
+    Ok((pane, caller.ok().map(|found| found.pane)))
+}
+
+/// Refuse a pane that mail, a name or a status request cannot address: one
+/// that is not live (closed or exited), is in no tab, or is a popup.
+async fn check_addressable(
+    pane: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<(), ServerMessage> {
     let live = live_panes(panes).await.contains(&pane);
     let (in_a_tab, popup) = {
         let st = state.lock().await;
@@ -824,7 +860,168 @@ async fn mailbox_of(
             format!("no such target: %{pane}"),
         ));
     }
-    Ok((pane, caller.ok().map(|found| found.pane)))
+    Ok(())
+}
+
+/// Name the caller's pane, or `pane` for a caller outside any pane.
+async fn handle_agent_name(
+    client_id: u64,
+    request: NameRequest,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, "AgentName", found);
+        log_hint(request.pane_hint, found.pane);
+    }
+    if let Some(refused) = unverified_refusal(&caller) {
+        return refused;
+    }
+    let pane = match (request.pane, &caller) {
+        (Some(_), Ok(found)) => {
+            return ServerMessage::refused(
+                "bad_address",
+                format!(
+                    "--pane is for callers outside a pane; you are %{}",
+                    found.pane
+                ),
+            )
+        }
+        (Some(pane), Err(_)) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            )
+        }
+    };
+    if let Err(refused) = check_addressable(pane, state, panes).await {
+        return refused;
+    }
+    let named = store.lock().await.set_name(pane, request.name.as_deref());
+    match named {
+        Ok(()) => {
+            match &request.name {
+                Some(name) => log::info!("msg: pane %{pane} named {}", loggable(name)),
+                None => log::info!("msg: pane %{pane} unnamed"),
+            }
+            ServerMessage::AgentNamed {
+                pane,
+                name: request.name,
+            }
+        }
+        Err(refusal) => ServerMessage::refused(refusal.code(), refusal.message()),
+    }
+}
+
+/// Every agent, named pane and pane with mail, or only `target`. Answered per
+/// request and never on a timer, so it logs nothing per pane.
+async fn handle_agent_status(
+    target: Option<Address>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    use crate::server::messaging::Refusal;
+
+    let live = live_panes(panes).await;
+    let wanted = match &target {
+        None => None,
+        Some(address) => {
+            if let Some(host) = &address.host {
+                if !valid_host(host) {
+                    let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
+                    return ServerMessage::refused(refusal.code(), refusal.message());
+                }
+                return ServerMessage::refused(
+                    "route_unavailable",
+                    format!(
+                        "{}: another server's panes are not listed yet",
+                        loggable(&address.to_string())
+                    ),
+                );
+            }
+            if let Target::Name(name) = &address.target {
+                if !valid_name(name) {
+                    let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+                    return ServerMessage::refused(refusal.code(), refusal.message());
+                }
+            }
+            let resolved = store
+                .lock()
+                .await
+                .resolve(&address.target, |pane| live.contains(&pane));
+            match resolved {
+                Ok(pane) => Some(pane),
+                Err(refusal) => return ServerMessage::refused(refusal.code(), refusal.message()),
+            }
+        }
+    };
+
+    // It dups the masters itself and holds no lock while it reads them.
+    let agents: HashMap<PaneId, AgentEntry> = collect_agents(state, panes, config)
+        .await
+        .into_iter()
+        .map(|entry| (entry.pane_id, entry))
+        .collect();
+    let now = now_ms();
+    let rows: Vec<(PaneId, Option<String>, usize)> = {
+        let store = store.lock().await;
+        let mut ids: Vec<PaneId> = match wanted {
+            Some(pane) => vec![pane],
+            None => agents
+                .keys()
+                .copied()
+                .chain(store.panes_with_mail_or_name(now))
+                .filter(|pane| live.contains(pane))
+                .collect(),
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|pane| {
+                (
+                    pane,
+                    store.name_of(pane).map(str::to_string),
+                    store.unread(pane, now),
+                )
+            })
+            .collect()
+    };
+    let mut entries = Vec::with_capacity(rows.len());
+    {
+        let st = state.lock().await;
+        for (pane_id, name, unread) in rows {
+            let Some((session, tab_index)) = st.locate_pane(pane_id) else {
+                if wanted.is_some() {
+                    let why = if st.is_popup(pane_id) {
+                        POPUP_REFUSED.to_string()
+                    } else {
+                        format!("no such target: %{pane_id}")
+                    };
+                    return ServerMessage::refused("no_such_target", why);
+                }
+                log::debug!("msg: status skips pane %{pane_id}, which is in no tab");
+                continue;
+            };
+            let agent = agents.get(&pane_id);
+            entries.push(PaneStatusEntry {
+                pane_id,
+                session,
+                tab_index,
+                command: agent.map(|entry| entry.command.clone()),
+                state: agent.map(|entry| entry.state),
+                name,
+                unread,
+            });
+        }
+    }
+    ServerMessage::AgentStatusList { panes: entries }
 }
 
 /// List a mailbox. Only the caller's own mailbox is ever marked read: a read
@@ -2245,6 +2442,24 @@ async fn handle_client_message(
                 ids.len()
             );
         }
+        ClientMessage::AgentName {
+            name,
+            pane,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentName(name={}, pane={pane:?}, pane_hint={pane_hint:?})",
+                name.as_deref().map_or("None".to_string(), loggable)
+            );
+        }
+        ClientMessage::AgentStatus { target } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentStatus(target={})",
+                target
+                    .as_ref()
+                    .map_or("None".to_string(), |t| loggable(&t.to_string()))
+            );
+        }
         ClientMessage::MsgRead {
             pane,
             all,
@@ -2342,6 +2557,32 @@ async fn handle_client_message(
                 messaging(),
             )
             .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentName {
+            name,
+            pane,
+            pane_hint,
+        } => {
+            let answer = handle_agent_name(
+                client_id,
+                NameRequest {
+                    name,
+                    pane,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentStatus { target } => {
+            let answer = handle_agent_status(target, state, panes, config, messaging()).await;
             reply(client_id, clients, answer).await;
             Ok(())
         }
@@ -10166,11 +10407,12 @@ async fn reap_panes(
     {
         let mut store = messaging().lock().await;
         for &pane_id in pane_ids {
-            let (dropped, named) = store.drop_pane(pane_id);
-            if dropped > 0 || named {
+            let (dropped, name) = store.drop_pane(pane_id);
+            if dropped > 0 || name.is_some() {
                 log::info!(
                     "msg: pane %{pane_id} closed; dropped {dropped} message(s){}",
-                    if named { " and its name" } else { "" }
+                    name.map(|name| format!(", name {}", loggable(&name)))
+                        .unwrap_or_default()
                 );
             }
         }
@@ -11873,6 +12115,84 @@ mod tests {
             )
             .await;
             assert!(done.is_ok(), "the identity line waited on the panes lock");
+        }
+    }
+
+    /// A caller whose attribution FAILED is not a caller outside every pane:
+    /// it may be a pane the server was too slow to check. Its --pane requests
+    /// are refused, never honoured.
+    mod unverified_caller {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use super::super::{
+            handle_agent_name, handle_msg_ack, MailboxAck, NameRequest, CALLER_ATTRIBUTION_TIMEOUT,
+        };
+        use crate::protocol::ServerMessage;
+        use crate::server::identity::Peer;
+        use crate::server::messaging::Messaging;
+        use crate::server::session::ServerState;
+
+        fn refused_unverified(answer: &ServerMessage) -> bool {
+            matches!(
+                answer,
+                ServerMessage::Error { code: Some(code), message }
+                    if code == "sender_unverified" && message.contains("in time")
+            )
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_timed_out_check_does_not_grant_outside_powers() {
+            let state = Arc::new(Mutex::new(ServerState::new()));
+            let panes = Arc::new(Mutex::new(HashMap::new()));
+            let store = Mutex::new(Messaging::new(
+                crate::config::messaging::MessagingConfig::default().limits(),
+            ));
+            let peer = Arc::new(Peer::unpinned());
+            // Held for the whole test, so every attribution times out.
+            let _wedged = panes.lock().await;
+            let bound = CALLER_ATTRIBUTION_TIMEOUT * 4;
+
+            let named = tokio::time::timeout(
+                bound,
+                handle_agent_name(
+                    0,
+                    NameRequest {
+                        name: Some("stolen".to_string()),
+                        pane: Some(5),
+                        pane_hint: None,
+                    },
+                    &peer,
+                    &state,
+                    &panes,
+                    &store,
+                ),
+            )
+            .await
+            .expect("the name request went on past the failed check");
+            assert!(refused_unverified(&named), "{named:?}");
+
+            let acked = tokio::time::timeout(
+                bound,
+                handle_msg_ack(
+                    0,
+                    MailboxAck {
+                        pane: Some(5),
+                        ids: Vec::new(),
+                        all: true,
+                        pane_hint: None,
+                    },
+                    &peer,
+                    &state,
+                    &panes,
+                    &store,
+                ),
+            )
+            .await
+            .expect("the ack went on past the failed check");
+            assert!(refused_unverified(&acked), "{acked:?}");
         }
     }
 

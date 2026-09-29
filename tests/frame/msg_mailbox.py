@@ -67,6 +67,24 @@ connection, so no earlier case's sends share its rate window.
 4h. A pane closing with no mail and no name writes no such line.
 (Expiry over the wire is tests/frame/msg_ttl.py, on a server of its own.)
 
+Names and status. `[agents] commands = ["sleep"]` makes a pane running
+`sleep` count as an agent, so 5e needs no real agent.
+
+5a. A pane names itself; a caller outside any pane names another with --pane;
+    outside any pane without --pane is not_in_pane.
+5b. A taken name is refused naming its holder, never suffixed; taking your
+    own name again is fine; a bad name is bad_name; a pane naming any pane
+    with --pane (itself included) is bad_address.
+5c. A message to a name lands in that pane, from the sender's name.
+5d. Status lists the named panes with their unread count, and a pane with
+    only mail; a pane with no name, no mail and no agent is not listed.
+5e. A pane running a configured agent command is listed with its command
+    and state, and no name.
+5f. Status of one target is exactly that pane; an unknown one is refused.
+5g. Clearing a name frees it: mail to it no longer resolves.
+5h. A named pane that closes frees its name, which another pane can take,
+    and the closed pane cannot be named again.
+
 1z/3z. No panic in the server log.
 
 Run: python3 tests/frame/msg_mailbox.py   (RMX_RUNDIR overrides the run dir)
@@ -176,6 +194,9 @@ WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.
 
 # Small caps, so that a case depending on one reaches it in a few sends.
 CONFIG = """
+[agents]
+commands = ["sleep"]
+
 [messaging]
 max_body_bytes = 64
 mailbox_max_messages = 3
@@ -622,6 +643,95 @@ try:
     check(closed is not None and f"pane %{E} closed" not in srv.log(),
           f"4h %{E} closed with no mail and wrote no drop line")
 
+    # === 5: names and status ===============================================
+    # --- 5a ---------------------------------------------------------------
+    r = type_send(A, {"AgentName": {"name": "alpha"}})
+    check(r == {"AgentNamed": {"pane": A, "name": "alpha"}}, f"5a A names itself alpha (got {r})")
+    r = ask({"AgentName": {"name": "beta", "pane": B}})
+    check(r == {"AgentNamed": {"pane": B, "name": "beta"}},
+          f"5a a caller outside any pane names %{B} beta (got {r})")
+    r = ask({"AgentName": {"name": "gamma"}})
+    check(code_of(r) == "not_in_pane", f"5a outside any pane, with no --pane, is not_in_pane (got {r})")
+    check(f'msg: pane %{A} named "alpha"' in srv.log(), "5a the naming is logged")
+
+    # --- 5b ---------------------------------------------------------------
+    r = type_send(B, {"AgentName": {"name": "alpha"}})
+    check(code_of(r) == "name_taken" and f"%{A}" in r["Error"]["message"],
+          f"5b alpha is taken, and the refusal names its holder %{A} (got {r})")
+    r = type_send(A, {"AgentName": {"name": "alpha"}})
+    check(r == {"AgentNamed": {"pane": A, "name": "alpha"}}, f"5b A taking alpha again is fine (got {r})")
+    r = type_send(A, {"AgentName": {"name": "Alpha"}})
+    check(code_of(r) == "bad_name", f"5b Alpha is bad_name (got {r})")
+    r = type_send(A, {"AgentName": {"name": "x", "pane": B}})
+    check(code_of(r) == "bad_address" and f"you are %{A}" in r["Error"]["message"],
+          f"5b a pane naming another with --pane is bad_address (got {r})")
+    r = type_send(A, {"AgentName": {"name": "x", "pane": A}})
+    check(code_of(r) == "bad_address", f"5b ...even naming itself with --pane (got {r})")
+
+    # --- 5c ---------------------------------------------------------------
+    rs = type_send(B, [send_to({"Name": "alpha"}, "NAME:1"), send_to({"Name": "alpha"}, "NAME:2")])
+    check([(name_of(x), x.get("MsgSent", {}).get("to")) for x in rs or []]
+          == [("MsgSent", {"host": None, "pane_id": A, "name": "alpha"})] * 2,
+          f"5c both messages to alpha resolve to %{A} (got {rs})")
+    box = [m for m in listed(read_box(A)) or [] if m["body"].startswith("NAME:")]
+    check([(m["body"], m["from"]["Pane"]["pane_id"], m["from"]["Pane"]["name"]) for m in box]
+          == [("NAME:1", B, "beta"), ("NAME:2", B, "beta")],
+          f"5c both land in A from B, named beta (got {box})")
+    r = type_send(B, send_to({"Name": "alph"}, "NAME:prefix"))
+    check(code_of(r) == "no_such_target", f"5c alph does not resolve to alpha (got {r})")
+
+    # --- 5d ---------------------------------------------------------------
+    def status(target=None):
+        r = ask({"AgentStatus": {"target": target}} if target else {"AgentStatus": {}})
+        rows = r["AgentStatusList"]["panes"] if name_of(r) == "AgentStatusList" else None
+        return r, rows
+
+    r, rows = status()
+    by_id = {e["pane_id"]: e for e in rows or []}
+    a_row, b_row = by_id.get(A), by_id.get(B)
+    check(a_row is not None and (a_row["name"], a_row["unread"], a_row["command"], a_row["state"])
+          == ("alpha", 2, None, None),
+          f"5d A is listed: alpha, 2 unread, not an agent (got {a_row})")
+    check(b_row is not None and b_row["name"] == "beta", f"5d B is listed as beta (got {b_row})")
+    v_row = by_id.get(V)
+    check(v_row is not None and (v_row["name"], v_row["command"], v_row["unread"]) == (None, None, 3),
+          f"5d %{V}, with mail but no name and no agent, is listed with its 3 unread (got {v_row})")
+    check(1 not in by_id, f"5d the first pane (no name, no mail, no agent) is not listed ({sorted(by_id)})")
+    check(rows == sorted(rows or [], key=lambda e: e["pane_id"]), "5d the list is sorted by pane id")
+
+    # --- 5e ---------------------------------------------------------------
+    E = cli_spawn("SplitRight", argv=["sleep", "30"])["CliSpawned"]["pane_id"]
+    time.sleep(1.0)
+    r, rows = status()
+    e_row = {e["pane_id"]: e for e in rows or []}.get(E)
+    check(e_row is not None and e_row["command"] == "sleep" and e_row["state"] in ("Idle", "Working")
+          and e_row["name"] is None,
+          f"5e the pane running sleep is listed as an agent with no name (got {e_row})")
+
+    # --- 5f ---------------------------------------------------------------
+    r, rows = status({"host": None, "target": {"Name": "alpha"}})
+    check([e["pane_id"] for e in rows or []] == [A], f"5f status of alpha is exactly %{A} (got {r})")
+    r, rows = status({"host": None, "target": {"Pane": 9999}})
+    check(code_of(r) == "no_such_target", f"5f status of %9999 is no_such_target (got {r})")
+
+    # --- 5g ---------------------------------------------------------------
+    r = type_send(A, {"AgentName": {"name": None}})
+    check(r == {"AgentNamed": {"pane": A, "name": None}}, f"5g A clears its name (got {r})")
+    r = type_send(B, send_to({"Name": "alpha"}, "NAME:after"))
+    check(code_of(r) == "no_such_target", f"5g mail to the cleared name does not resolve (got {r})")
+
+    # --- 5h ---------------------------------------------------------------
+    Z, release_z = closable("5h")
+    r = ask({"AgentName": {"name": "zeta", "pane": Z}})
+    check(r == {"AgentNamed": {"pane": Z, "name": "zeta"}}, f"5h %{Z} is named zeta (got {r})")
+    open(release_z, "w").close()
+    line = log_has(rf'msg: pane %{Z} closed; dropped 0 message\(s\), name "zeta"$')
+    check(line is not None, f"5h closing %{Z} frees its name, and the log says which")
+    r = ask({"AgentName": {"name": "zeta", "pane": T}})
+    check(r == {"AgentNamed": {"pane": T, "name": "zeta"}}, f"5h another pane takes zeta (got {r})")
+    r = ask({"AgentName": {"name": "eta", "pane": Z}})
+    check(code_of(r) == "no_such_target", f"5h the closed pane cannot be named again (got {r})")
+
     # --- 3i ---------------------------------------------------------------
     log = srv.log()
     check(re.search(rf"msg: id=1 from=%{A}\(-\) to=%{B} bytes=7 deliver=Auto -> mailbox", log) is not None,
@@ -630,7 +740,7 @@ try:
           "3i the send's attribution is logged, by Sid")
     bodies = [b for b in ("MSG:one", "MSG:two", "MSG:leader", "MSG:outside", "MSG:inherited",
                           "MSG:to-popup", "MSG:from-popup", "MSG:paste", "MSG:forged",
-                          "ACK:1", "CAP:1", "RATE:1", "GONE:1")
+                          "ACK:1", "CAP:1", "RATE:1", "GONE:1", "NAME:1")
               if b in log]
     check(bodies == [], f"3i no message body is in the server log (found {bodies})")
 

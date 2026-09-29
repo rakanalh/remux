@@ -384,6 +384,15 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             "MsgAck(pane={pane:?}, {} id(s), all={all}, pane_hint={pane_hint:?})",
             ids.len()
         ),
+        ClientMessage::AgentName {
+            name,
+            pane,
+            pane_hint,
+        } => format!("AgentName(name={name:?}, pane={pane:?}, pane_hint={pane_hint:?})"),
+        ClientMessage::AgentStatus { target } => format!(
+            "AgentStatus(target={:?})",
+            target.as_ref().map(|t| t.to_string())
+        ),
         ClientMessage::MsgRead {
             pane,
             all,

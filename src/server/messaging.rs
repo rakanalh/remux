@@ -343,6 +343,9 @@ impl Messaging {
         if !valid_name(name) {
             return Err(Refusal::BadName(name.to_string()));
         }
+        if self.closed.contains(&pane) {
+            return Err(Refusal::NoSuchTarget(format!("%{pane}")));
+        }
         match self.names.get(name) {
             Some(&holder) if holder == pane => return Ok(()),
             Some(&holder) => {
@@ -389,12 +392,14 @@ impl Messaging {
         panes
     }
 
-    pub fn drop_pane(&mut self, pane: PaneId) -> (usize, bool) {
+    /// Forget a closed pane: its mail, its name and its rate window. Returns
+    /// how many messages went and the name it held, for the log.
+    pub fn drop_pane(&mut self, pane: PaneId) -> (usize, Option<String>) {
         let messages = self
             .mailboxes
             .remove(&pane)
             .map_or(0, |mb| mb.messages.len());
-        let named = self.name_of(pane).is_some();
+        let named = self.name_of(pane).map(str::to_string);
         self.names.retain(|_, holder| *holder != pane);
         self.rate.remove(&SenderKey::Pane(pane));
         self.closed.insert(pane);
@@ -876,11 +881,11 @@ mod tests {
         m.set_name(3, Some("gamma")).unwrap();
         assert_eq!(m.panes_with_mail_or_name(0), [2, 3]);
 
-        assert_eq!(m.drop_pane(2), (2, true));
+        assert_eq!(m.drop_pane(2), (2, Some("alpha".to_string())));
         assert_eq!(m.pane_named("alpha"), None);
         assert!(m.read(2, true, false, 0).is_empty());
         assert_eq!(m.panes_with_mail_or_name(0), [3]);
-        assert_eq!(m.drop_pane(2), (0, false));
+        assert_eq!(m.drop_pane(2), (0, None));
     }
 
     #[test]
@@ -952,6 +957,22 @@ mod tests {
             "a mailbox was made for it"
         );
         assert!(send(&mut m, "fine", t0).is_ok(), "another pane was refused");
+    }
+
+    #[test]
+    fn a_closed_pane_cannot_be_named() {
+        let mut m = Messaging::new(limits());
+        m.drop_pane(7);
+        assert_eq!(
+            m.set_name(7, Some("ghost")),
+            Err(Refusal::NoSuchTarget("%7".into()))
+        );
+        assert_eq!(m.pane_named("ghost"), None);
+        assert_eq!(
+            m.set_name(8, Some("ghost")),
+            Ok(()),
+            "a live pane was refused"
+        );
     }
 
     #[test]

@@ -155,6 +155,15 @@ impl Unverified {
         }
     }
 
+    /// Whether this is a definite answer that the caller is in no pane, the
+    /// only failure that may be treated as a caller outside every pane (and so
+    /// allowed --pane). Every other failure says nothing about where the
+    /// caller is: a pane the server could not check must not gain an
+    /// outsider's powers because the server was slow.
+    pub fn is_outside(&self) -> bool {
+        matches!(self, Unverified::NoPaneAncestor | Unverified::NoPeerPid)
+    }
+
     /// What the caller can do about it, the second half of a
     /// `sender_unverified` refusal.
     pub fn fix(&self) -> &'static str {
@@ -968,6 +977,25 @@ mod tests {
         }
     }
 
+    /// Only a definite "this process is in no pane" may be treated as a
+    /// caller outside every pane. A check that failed says nothing about
+    /// where the caller is, and a pane must not gain an outsider's powers
+    /// because the server was slow.
+    #[test]
+    fn only_a_definite_answer_is_outside() {
+        for (why, outside) in [
+            (Unverified::NoPaneAncestor, true),
+            (Unverified::NoPeerPid, true),
+            (Unverified::Unreadable, false),
+            (Unverified::PeerExited, false),
+            (Unverified::PeerChanged, false),
+            (Unverified::CheckFailed, false),
+            (Unverified::TimedOut, false),
+        ] {
+            assert_eq!(why.is_outside(), outside, "{why:?}");
+        }
+    }
+
     #[test]
     fn same_process_needs_the_pid_and_the_version_to_match() {
         let t = |pid, version| TokenId { pid, version };
@@ -994,9 +1022,12 @@ mod tests {
 
         fn fork_paused() -> Pid {
             match unsafe { fork() }.unwrap() {
-                ForkResult::Child => loop {
-                    unsafe { libc::pause() };
-                },
+                ForkResult::Child => {
+                    crate::server::procfs::testing::close_inherited_descriptors();
+                    loop {
+                        unsafe { libc::pause() };
+                    }
+                }
                 ForkResult::Parent { child } => child,
             }
         }
@@ -1035,6 +1066,7 @@ mod tests {
             }
             let child = match unsafe { fork() }.unwrap() {
                 ForkResult::Child => unsafe {
+                    crate::server::procfs::testing::close_inherited_descriptors();
                     let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
                     let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
                     if libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) == 0 {

@@ -7301,7 +7301,9 @@ async fn run_client_loop(
                     // message bodies, which never go to a log.
                     Some(ServerMessage::MsgSent { .. })
                     | Some(ServerMessage::MsgList { .. })
-                    | Some(ServerMessage::MsgAcked { .. }) => {
+                    | Some(ServerMessage::MsgAcked { .. })
+                    | Some(ServerMessage::AgentNamed { .. })
+                    | Some(ServerMessage::AgentStatusList { .. }) => {
                         log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {

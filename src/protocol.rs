@@ -133,9 +133,10 @@ pub enum ConnDescriptor {
 /// 17 -> 18: agent messaging. Adds [`ClientMessage::MsgSend`] and
 /// [`ClientMessage::MsgRead`] with their replies [`ServerMessage::MsgSent`] and
 /// [`ServerMessage::MsgList`], [`ClientMessage::MsgAck`] with
-/// [`ServerMessage::MsgAcked`], and the additive `code` on
-/// [`ServerMessage::Error`]. Later tasks add `AgentName` and `AgentStatus`
-/// under the same number. An old server cannot decode any of
+/// [`ServerMessage::MsgAcked`], [`ClientMessage::AgentName`] with
+/// [`ServerMessage::AgentNamed`], [`ClientMessage::AgentStatus`] with
+/// [`ServerMessage::AgentStatusList`], and the additive `code` on
+/// [`ServerMessage::Error`]. An old server cannot decode any of
 /// them and would drop the connection.
 pub const PROTOCOL_VERSION: u32 = 18;
 
@@ -633,6 +634,30 @@ pub enum ClientMessage {
         #[serde(default)]
         pane_hint: Option<PaneId>,
     },
+    /// Give a pane an agent name, the address other panes send to; `None`
+    /// clears it. The caller's own pane, or `pane` for a caller outside any
+    /// pane. A pane naming ANOTHER pane is refused `bad_address`: a name is
+    /// how mail finds an agent, and one agent renaming another would redirect
+    /// its mail.
+    ///
+    /// Answered with [`ServerMessage::AgentNamed`], or [`ServerMessage::Error`].
+    AgentName {
+        name: Option<String>,
+        #[serde(default)]
+        pane: Option<PaneId>,
+        /// See [`ClientMessage::MsgSend::pane_hint`].
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
+    /// The panes worth listing: every agent, every named pane and every pane
+    /// with mail, or only `target`.
+    ///
+    /// Answered with [`ServerMessage::AgentStatusList`], or
+    /// [`ServerMessage::Error`].
+    AgentStatus {
+        #[serde(default)]
+        target: Option<Address>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +874,10 @@ pub enum ServerMessage {
     },
     /// The answer to a [`ClientMessage::MsgAck`]: how many messages it marked.
     MsgAcked { pane: PaneId, count: usize },
+    /// The answer to a [`ClientMessage::AgentName`]: the pane's name now.
+    AgentNamed { pane: PaneId, name: Option<String> },
+    /// The answer to a [`ClientMessage::AgentStatus`], sorted by pane id.
+    AgentStatusList { panes: Vec<PaneStatusEntry> },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -1247,6 +1276,22 @@ pub enum Delivery {
     Mailbox,
     Submitted,
     Forwarded,
+}
+
+/// One pane as `remux agent ls` and `remux agent status` show it. Its own
+/// type rather than [`AgentEntry`], whose `command` is a configured agent by
+/// construction: a named shell pane, or one holding mail, belongs here too,
+/// with `command` and `state` both `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneStatusEntry {
+    pub pane_id: PaneId,
+    pub session: String,
+    pub tab_index: usize,
+    pub command: Option<String>,
+    pub state: Option<AgentState>,
+    pub name: Option<String>,
+    /// Queued messages, not counting expired ones.
+    pub unread: usize,
 }
 
 /// The pane an [`Address`] named, as the server resolved it.
@@ -2272,6 +2317,43 @@ mod tests {
             back,
             ServerMessage::MsgAcked { pane: 4, count: 2 }
         ));
+    }
+
+    #[test]
+    fn agent_name_decodes_without_a_pane_and_a_status_entry_round_trips() {
+        let named: ClientMessage =
+            serde_json::from_str(r#"{"AgentName":{"name":"alpha"}}"#).unwrap();
+        assert!(matches!(
+            named,
+            ClientMessage::AgentName {
+                ref name,
+                pane: None,
+                pane_hint: None
+            } if name.as_deref() == Some("alpha")
+        ));
+        let status: ClientMessage = serde_json::from_str(r#"{"AgentStatus":{}}"#).unwrap();
+        assert!(matches!(
+            status,
+            ClientMessage::AgentStatus { target: None }
+        ));
+        let entry = PaneStatusEntry {
+            pane_id: 4,
+            session: "main".into(),
+            tab_index: 1,
+            command: Some("claude".into()),
+            state: Some(AgentState::Working),
+            name: Some("alpha".into()),
+            unread: 2,
+        };
+        let list = ServerMessage::AgentStatusList {
+            panes: vec![entry.clone()],
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
+        match back {
+            ServerMessage::AgentStatusList { panes } => assert_eq!(panes, vec![entry]),
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

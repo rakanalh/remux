@@ -62,6 +62,17 @@ pub mod testing {
     /// kernel cuts at 15 bytes, one byte into the character.
     const NAME: &str = "aaaaaaaaaaaaaa\u{65e5}";
 
+    /// For a test's forked child, straight after the fork: close every
+    /// descriptor it inherited from the other tests running in parallel. A
+    /// child that keeps one (a pty slave another test expects to close, or
+    /// the write end of a binary another test is about to exec) makes THAT
+    /// test fail. Async-signal-safe: one syscall.
+    pub fn close_inherited_descriptors() {
+        unsafe {
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+        }
+    }
+
     /// A running copy of `sleep` whose `comm` is cut mid-character. It is
     /// killed, reaped and its copy removed on drop.
     pub struct TruncatedCommChild {
@@ -89,7 +100,17 @@ pub mod testing {
             let argv: [*const libc::c_char; 3] = [path.as_ptr(), arg.as_ptr(), std::ptr::null()];
             let pid = match unsafe { fork() }.unwrap() {
                 ForkResult::Child => unsafe {
-                    libc::execv(path.as_ptr(), argv.as_ptr());
+                    close_inherited_descriptors();
+                    // Another test's child can still hold the copy's write
+                    // end for a moment after a fork, and exec of a file open
+                    // for writing fails with ETXTBSY.
+                    for _ in 0..200 {
+                        libc::execv(path.as_ptr(), argv.as_ptr());
+                        if *libc::__errno_location() != libc::ETXTBSY {
+                            break;
+                        }
+                        libc::usleep(10_000);
+                    }
                     libc::_exit(127)
                 },
                 ForkResult::Parent { child } => child,
