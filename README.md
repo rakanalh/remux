@@ -182,7 +182,7 @@ Recursively splits screen space, alternating horizontal and vertical. Each new p
 
 ### Master
 
-One master pane occupies 50% of the screen; secondary panes divide the remaining space evenly. Ideal for a primary editor with supporting terminals. Use `SetMaster` to promote the focused pane.
+One master pane takes 60% of the width. With two panes it sits on the left and the other pane fills the remaining 40%. From three panes on it moves to the centre, with a column on each side taking 20% of the width; the secondary panes alternate left and right in pane order (the second pane on the left, the third on the right, and so on), and each column splits its height evenly. The master is the first pane of the tab, so new panes never take the slot. Ideal for a primary editor with supporting terminals. Use `SetMaster` to promote the focused pane.
 
 ![Master layout](docs/screenshots/layout-master.png)
 
