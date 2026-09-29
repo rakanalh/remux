@@ -3260,7 +3260,7 @@ async fn handle_command(
                 _ => unreachable!(),
             };
             log::debug!("server: PaneFocus direction={direction:?}");
-            {
+            let zoom_moved = {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
                     Some(s) => s,
@@ -3278,6 +3278,7 @@ async fn handle_command(
                 };
                 // Stack-aware directional focus (zellij behavior): step within a
                 // multi-pane stack first, else fall back to the spatial neighbor.
+                let before = tab.focused_pane;
                 if let Some(target) = layout::focus_in_direction(
                     &mut tab.layout,
                     area,
@@ -3287,6 +3288,10 @@ async fn handle_command(
                 ) {
                     tab.focus_pane(target);
                 }
+                zoom_moved_to_another_pane(tab, before)
+            };
+            if zoom_moved {
+                resize_session_panes(&session_name, state, panes, clients, config).await?;
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -3495,7 +3500,7 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackNext => {
-            {
+            let zoom_moved = {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
                     Some(s) => s,
@@ -3505,14 +3510,19 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                let before = tab.focused_pane;
                 if let Some(next) = tab.layout.stack_next(tab.focused_pane) {
                     tab.focus_pane(next);
                 }
+                zoom_moved_to_another_pane(tab, before)
+            };
+            if zoom_moved {
+                resize_session_panes(&session_name, state, panes, clients, config).await?;
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneStackPrev => {
-            {
+            let zoom_moved = {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
                     Some(s) => s,
@@ -3522,9 +3532,14 @@ async fn handle_command(
                     Some(t) => t,
                     None => return Ok(()),
                 };
+                let before = tab.focused_pane;
                 if let Some(prev) = tab.layout.stack_prev(tab.focused_pane) {
                     tab.focus_pane(prev);
                 }
+                zoom_moved_to_another_pane(tab, before)
+            };
+            if zoom_moved {
+                resize_session_panes(&session_name, state, panes, clients, config).await?;
             }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -5950,6 +5965,16 @@ async fn handle_mouse_click(
     Ok(())
 }
 
+/// Whether a focus change just carried the zoom from `before` onto another pane.
+///
+/// The newly zoomed pane is painted full-area but its PTY still has the size of
+/// its slot in the layout, so the caller must run `resize_session_panes`. A
+/// stack's hidden panes are sized to the stack, never to the zoomed area, so
+/// this holds for a step within the zoomed stack as well.
+fn zoom_moved_to_another_pane(tab: &session::Tab, before: PaneId) -> bool {
+    tab.zoomed_pane.is_some() && tab.focused_pane != before
+}
+
 /// Pure decision for the layout cycle's next mode, factored out for testing.
 ///
 /// The automatic cycle is `Bsp -> Master -> Monocle -> Grid -> Columns -> Rows
@@ -7396,7 +7421,8 @@ async fn resize_session_panes(
 /// A stack's hidden panes are included, at the size of the pane the stack
 /// shows (see [`layout::compute_stack_member_rects`]), so revealing one never
 /// needs a resize. Under zoom only the zoomed pane is listed, and the others
-/// keep their unzoomed size; [`size_panes_to_layout`] covers a zoom that moves.
+/// keep their unzoomed size, so a command that moves the zoom to another pane
+/// must resize (see [`zoom_moved_to_another_pane`]).
 async fn active_tab_content_sizes(
     session_name: &str,
     state: &Arc<Mutex<ServerState>>,
@@ -7436,52 +7462,6 @@ async fn active_tab_content_sizes(
         content_rects.push((pane_id, content.width, content.height));
     }
     content_rects
-}
-
-/// Resize every pane of the session's active tab whose PTY/screen is not the
-/// size [`active_tab_content_sizes`] gives it.
-///
-/// The full-render paths call this before they composite, so a frame never
-/// paints a pane at a size the program inside it was not told about, whichever
-/// command changed what is painted. Stack reveals no longer need it (hidden
-/// members are sized already), but a zoom that follows focus onto another pane
-/// does: that pane is painted full-area while its PTY still has its split size.
-/// A pane that already has its size is left alone, so a render causes no
-/// SIGWINCH.
-///
-/// Only with a client attached: without one, a View cell may legitimately hold
-/// a pane smaller than its home allotment (see [`resize_session_panes`]), and
-/// with one that allotment is exactly what `resize_session_panes` applies.
-async fn size_panes_to_layout(
-    session_name: &str,
-    state: &Arc<Mutex<ServerState>>,
-    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
-) {
-    let has_client = {
-        let cls = clients.lock().await;
-        cls.values()
-            .any(|c| c.session_name.as_deref() == Some(session_name))
-    };
-    if !has_client {
-        return;
-    }
-    let rects = active_tab_content_sizes(session_name, state, clients).await;
-    let mut ps = panes.lock().await;
-    for (pane_id, cols, rows) in rects {
-        let (cols, rows) = (cols.max(1), rows.max(1));
-        if let Some(pane_data) = ps.get_mut(&pane_id) {
-            if (pane_data.screen.cols, pane_data.screen.rows) != (cols, rows) {
-                log::debug!(
-                    "size_panes_to_layout: pane_id={pane_id} {}x{} -> {cols}x{rows}",
-                    pane_data.screen.cols,
-                    pane_data.screen.rows
-                );
-                let _ = pane_data.pty.resize(cols, rows);
-                pane_data.screen.resize(cols, rows);
-            }
-        }
-    }
 }
 
 /// The minimum `(cols, rows)` demanded across every client's *sized*
@@ -8080,7 +8060,6 @@ async fn send_full_render_to_client(
     prev_frames: &PrevFrameCache,
     ctx: RenderCtx,
 ) {
-    size_panes_to_layout(session_name, state, panes, clients).await;
     // Render at the consistent session size (min over all attached clients),
     // not the caller's own dimensions, so this client's frames never mix sizes
     // with the shared broadcast path. With a single client this equals the
@@ -8409,8 +8388,6 @@ async fn broadcast_full_render(
     };
 
     log::debug!("server: broadcast_full_render session={session_name:?} clients={client_count}");
-
-    size_panes_to_layout(session_name, state, panes, clients).await;
 
     // Update auto-detected pane names before rendering.
     update_auto_pane_names(session_name, state, panes).await;

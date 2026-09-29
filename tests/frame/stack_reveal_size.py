@@ -15,7 +15,9 @@ frame. The reference is a pane that was painted at the stack's size all along.
   * Monocle: a click on a strip chip reveals a pane;
   * Monocle: `SessionSwitchPane` reveals a pane (focus by id);
   * BSP zoom: `PaneFocusLeft` while zoomed carries the zoom to the other pane,
-    which must now run at the full zoomed size.
+    which must now run at the full zoomed size;
+  * a zoomed stack member: `PaneStackNext` carries the zoom to the next member,
+    which runs at its stack's size until it is resized.
 
 `printf 'SZ:%s\\n' "$(stty size)"` is typed and `SZ:<rows> <cols>` searched for,
 so the typed line (which reads `SZ:%s`) can never satisfy the search. Row scans
@@ -234,6 +236,23 @@ def case_zoom_follows_focus(cli):
     check(ref is not None and got == ref, f"newly zoomed pane is {ref} ({got})")
 
 
+def case_zoom_steps_the_stack(cli):
+    print("zoomed stack: PaneStackNext carries the zoom to a pane that must grow")
+    open_session(cli, "zstack")
+    cmd(cli, "PaneSplitVertical")
+    cmd(cli, "PaneStackAdd")
+    half = stty_size(cli)
+    cmd(cli, "PaneToggleZoom", 0.6)
+    ref = stty_size(cli)
+    print(f"  stacked pane {half}, zoomed pane {ref}")
+    check(ref is not None and half is not None and ref[1] > half[1],
+          f"the zoom widens the stacked pane ({half} -> {ref})")
+    cmd(cli, "PaneStackNext")
+    got = stty_size(cli)
+    print(f"  stack member the zoom moved to: {got}")
+    check(ref is not None and got == ref, f"newly zoomed stack member is {ref} ({got})")
+
+
 def main():
     os.environ["HOME"] = RUNDIR
     srv = Server(RUNDIR).start()
@@ -245,6 +264,7 @@ def main():
         case_chip_click(cli)
         case_switch_pane(cli)
         case_zoom_follows_focus(cli)
+        case_zoom_steps_the_stack(cli)
         check("panicked" not in srv.log(), "no panic in the server log")
     finally:
         cli.close()
