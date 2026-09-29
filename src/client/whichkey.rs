@@ -12,9 +12,113 @@ use crate::server::compositor::{
     BOX_VERTICAL,
 };
 
-/// Fixed cell width for a single entry in the full-width layout:
-/// `" <key> \u{2192} <label>"`.
-const CELL_WIDTH: u16 = 22;
+/// Narrowest cell in the full-width layout, so short labels keep the grid
+/// spacing they always had.
+const FULL_WIDTH_MIN_CELL: usize = 22;
+
+/// Narrowest column in the bordered box, for the same reason.
+const BOX_MIN_COL: usize = 20;
+
+/// Narrowest truncated cell worth drawing: the leading space, one character
+/// and the ellipsis, plus the trailing gap.
+const MIN_TRUNCATED_CELL: usize = 4;
+
+/// How a section's cells are laid out: `count` columns, each `width` wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Columns {
+    count: usize,
+    width: usize,
+}
+
+/// The cell width that holds every cell in `texts` whole, plus the one-column
+/// gap that keeps a label from running into the next column or the border.
+fn natural_width<'a>(texts: impl IntoIterator<Item = &'a str>, min: usize) -> usize {
+    texts
+        .into_iter()
+        .map(|t| t.chars().count() + 1)
+        .fold(min, usize::max)
+}
+
+/// Choose the box's columns. Two columns at the natural width are preferred;
+/// a terminal too narrow for them drops to one column, and only a terminal too
+/// narrow for one whole column truncates. `entry_count` rows must fit within
+/// `max_rows` at the chosen column count.
+fn box_columns(
+    natural: usize,
+    entry_count: usize,
+    screen_cols: u16,
+    max_rows: usize,
+) -> Option<Columns> {
+    let avail = (screen_cols as usize).saturating_sub(2);
+    let rows_fit = |count: usize| entry_count.div_ceil(count) <= max_rows;
+    for count in [2, 1] {
+        if count * natural <= avail && rows_fit(count) {
+            return Some(Columns {
+                count,
+                width: natural,
+            });
+        }
+    }
+    [1, 2]
+        .into_iter()
+        .map(|count| Columns {
+            count,
+            width: avail / count,
+        })
+        .find(|c| c.width >= MIN_TRUNCATED_CELL && rows_fit(c.count))
+}
+
+/// Choose the full-width panel's columns: as many `natural`-wide columns as
+/// fit in `inner_cols`, or one truncated column when not even one fits.
+fn full_width_columns(natural: usize, inner_cols: usize) -> Columns {
+    if natural <= inner_cols {
+        Columns {
+            count: inner_cols / natural,
+            width: natural,
+        }
+    } else {
+        Columns {
+            count: 1,
+            width: inner_cols,
+        }
+    }
+}
+
+/// How many leading characters of a `len`-character cell text survive in a
+/// cell `width` wide. The last column of every cell is the gap, so text that
+/// needs it is truncated and the column before the gap holds the ellipsis.
+fn kept_chars(len: usize, width: usize) -> usize {
+    let budget = width.saturating_sub(1);
+    if len <= budget {
+        len
+    } else {
+        budget.saturating_sub(1)
+    }
+}
+
+/// `text` fitted to exactly `width` columns: padded when it fits, otherwise cut
+/// and ended with an ellipsis so the reader can see it was cut.
+fn fit_cell(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    let kept = kept_chars(len, width);
+    let mut out: String = text.chars().take(kept).collect();
+    if kept < len && width >= 2 {
+        out.push('\u{2026}');
+    }
+    format!("{out:<width$}")
+}
+
+fn box_entry_text(key: char, label: &str) -> String {
+    format!(" {key} {label}")
+}
+
+fn full_width_entry_text(key: char, label: &str) -> String {
+    format!(" {key} \u{2192} {label}")
+}
+
+fn shortcut_text(notation: &str, label: &str) -> String {
+    format!(" {notation} {label}")
+}
 
 /// A which-key popup that displays available keybindings in a bordered box.
 #[derive(Debug)]
@@ -101,7 +205,7 @@ impl WhichKeyPopup {
         }
     }
 
-    /// Render the bordered two-column box. When `centered` is false the box is
+    /// Render the bordered box of one or two columns. When `centered` is false the box is
     /// anchored to the bottom of the screen (the historical Anchored layout);
     /// when true it is centered vertically as well.
     fn render_box(
@@ -113,23 +217,32 @@ impl WhichKeyPopup {
     ) -> Vec<DrawCommand> {
         let mut commands = Vec::new();
 
-        // Calculate layout: two columns of entries.
-        let col_width: u16 = 20; // each column is 20 chars wide
-        let popup_width = col_width * 2 + 2; // 2 columns + left/right borders
-        let inner_width = (popup_width - 2) as usize;
+        // Both sections share the box, so its columns are as wide as the
+        // widest cell of either section.
+        let texts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(k, l)| box_entry_text(*k, l))
+            .chain(self.shortcuts.iter().map(|(n, l)| shortcut_text(n, l)))
+            .collect();
+        let natural = natural_width(texts.iter().map(String::as_str), BOX_MIN_COL);
 
-        let entry_rows = self.entries.len().div_ceil(2);
-        let has_shortcuts = !self.shortcuts.is_empty();
-        let shortcut_rows_full = self.shortcuts.len().div_ceil(2);
-
-        // The box must fit horizontally, and the entry rows must fit vertically
-        // within the borders. If even the entries don't fit, draw nothing (this
-        // preserves the historical "too small -> empty" behaviour).
+        // If even the entries cannot be placed, draw nothing (the historical
+        // "too small -> empty" behaviour).
         let border: u16 = 2;
         let max_inner = screen_rows.saturating_sub(border);
-        if popup_width > screen_cols || max_inner == 0 || entry_rows as u16 > max_inner {
+        let Some(columns) =
+            box_columns(natural, self.entries.len(), screen_cols, max_inner as usize)
+        else {
             return Vec::new();
-        }
+        };
+        let col_width = columns.width as u16;
+        let inner_width = columns.count * columns.width;
+        let popup_width = inner_width as u16 + 2;
+
+        let entry_rows = self.entries.len().div_ceil(columns.count);
+        let has_shortcuts = !self.shortcuts.is_empty();
+        let shortcut_rows_full = self.shortcuts.len().div_ceil(columns.count);
 
         // Decide how many shortcut rows fit below the entries. If they overflow,
         // show as many as fit and replace the last visible row with an ellipsis.
@@ -179,13 +292,16 @@ impl WhichKeyPopup {
 
         // Entry rows.
         for row in 0..entry_rows {
-            let left_entry = self.entries.get(row * 2);
-            let right_entry = self.entries.get(row * 2 + 1);
             let y = start_y + 1 + row as u16;
+            let cells: Vec<Option<&(char, String)>> = (0..columns.count)
+                .map(|c| self.entries.get(row * columns.count + c))
+                .collect();
 
             let mut row_text = BOX_VERTICAL.to_string();
-            row_text.push_str(&entry_cell(left_entry, col_width));
-            row_text.push_str(&entry_cell(right_entry, col_width));
+            for entry in &cells {
+                let text = entry.map_or_else(String::new, |(k, l)| box_entry_text(*k, l));
+                row_text.push_str(&fit_cell(&text, columns.width));
+            }
             row_text.push(BOX_VERTICAL);
             commands.push(DrawCommand {
                 x: start_x,
@@ -196,23 +312,19 @@ impl WhichKeyPopup {
             });
 
             // Separate draw commands for the key chars, for highlight color.
-            if let Some((key, _)) = left_entry {
-                commands.push(DrawCommand {
-                    x: start_x + 2,
-                    y,
-                    text: key.to_string(),
-                    fg: key_fg,
-                    bg,
-                });
-            }
-            if let Some((key, _)) = right_entry {
-                commands.push(DrawCommand {
-                    x: start_x + 2 + col_width,
-                    y,
-                    text: key.to_string(),
-                    fg: key_fg,
-                    bg,
-                });
+            for (c, entry) in cells.iter().enumerate() {
+                if let Some((key, label)) = entry {
+                    let len = box_entry_text(*key, label).chars().count();
+                    if kept_chars(len, columns.width) >= 2 {
+                        commands.push(DrawCommand {
+                            x: start_x + 2 + c as u16 * col_width,
+                            y,
+                            text: key.to_string(),
+                            fg: key_fg,
+                            bg,
+                        });
+                    }
+                }
             }
         }
 
@@ -246,12 +358,15 @@ impl WhichKeyPopup {
                     continue;
                 }
 
-                let left = self.shortcuts.get(row * 2);
-                let right = self.shortcuts.get(row * 2 + 1);
+                let cells: Vec<Option<&(String, String)>> = (0..columns.count)
+                    .map(|c| self.shortcuts.get(row * columns.count + c))
+                    .collect();
 
                 let mut row_text = BOX_VERTICAL.to_string();
-                row_text.push_str(&shortcut_cell(left, col_width));
-                row_text.push_str(&shortcut_cell(right, col_width));
+                for entry in &cells {
+                    let text = entry.map_or_else(String::new, |(n, l)| shortcut_text(n, l));
+                    row_text.push_str(&fit_cell(&text, columns.width));
+                }
                 row_text.push(BOX_VERTICAL);
                 commands.push(DrawCommand {
                     x: start_x,
@@ -262,27 +377,19 @@ impl WhichKeyPopup {
                 });
 
                 // Highlight the key notation (drawn after the leading space).
-                if let Some((notation, _)) = left {
-                    push_notation_highlight(
-                        &mut commands,
-                        start_x + 2,
-                        y,
-                        notation,
-                        col_width,
-                        key_fg,
-                        bg,
-                    );
-                }
-                if let Some((notation, _)) = right {
-                    push_notation_highlight(
-                        &mut commands,
-                        start_x + 2 + col_width,
-                        y,
-                        notation,
-                        col_width,
-                        key_fg,
-                        bg,
-                    );
+                for (c, entry) in cells.iter().enumerate() {
+                    if let Some((notation, label)) = entry {
+                        let len = shortcut_text(notation, label).chars().count();
+                        push_notation_highlight(
+                            &mut commands,
+                            start_x + 1 + c as u16 * col_width,
+                            y,
+                            notation,
+                            kept_chars(len, columns.width),
+                            key_fg,
+                            bg,
+                        );
+                    }
                 }
             }
         }
@@ -328,16 +435,25 @@ impl WhichKeyPopup {
 
         // Content region sits inside the left/right border columns.
         let inner_cols = screen_cols - 2;
+        // Both sections share one grid, sized to the widest cell of either.
+        let texts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(k, l)| full_width_entry_text(*k, l))
+            .chain(self.shortcuts.iter().map(|(n, l)| shortcut_text(n, l)))
+            .collect();
+        let natural = natural_width(texts.iter().map(String::as_str), FULL_WIDTH_MIN_CELL);
+        let columns = full_width_columns(natural, inner_cols as usize);
+        let cell_width = columns.width as u16;
         // Content starts at column 1 (after the left border); a cell in column
         // `col` starts here.
-        let content_x = |col: u16| -> u16 { 1 + col * CELL_WIDTH };
+        let content_x = |col: u16| -> u16 { 1 + col * cell_width };
         // Rightmost content column is `screen_cols - 2`; column `screen_cols - 1`
         // holds the right border. `avail` for a cell at `x` is the number of
         // content columns from `x` up to (but excluding) the right border.
         let avail_at = |x: u16| -> usize { (screen_cols - 1 - x) as usize };
 
-        // Each entry occupies a fixed-width cell: " <key> \u{2192} <label>".
-        let cols_per_row = (inner_cols / CELL_WIDTH).max(1);
+        let cols_per_row = columns.count as u16;
         let entry_rows = (self.entries.len() as u16).div_ceil(cols_per_row);
         let has_shortcuts = !self.shortcuts.is_empty();
         let shortcut_rows_full = (self.shortcuts.len() as u16).div_ceil(cols_per_row);
@@ -439,20 +555,20 @@ impl WhichKeyPopup {
 
             // Never draw past the right edge: cap the cell to the remaining
             // content width (matters on very narrow screens).
-            let take = (CELL_WIDTH as usize).min(avail_at(x));
-            let entry_str = format!(" {} \u{2192} {}", key, label);
-            let entry_str = entry_str.chars().take(take).collect::<String>();
+            let width = columns.width.min(avail_at(x));
+            let entry_str = full_width_entry_text(*key, label);
+            let kept = kept_chars(entry_str.chars().count(), width);
             commands.push(DrawCommand {
                 x,
                 y,
-                text: entry_str,
+                text: fit_cell(&entry_str, width),
                 fg,
                 bg,
             });
 
-            // Highlight the key char (drawn after the leading space). Only when
-            // the cell is wide enough for it to fall within the content bounds.
-            if take >= 2 {
+            // Highlight the key char (drawn after the leading space), unless
+            // truncation cut it off.
+            if kept >= 2 {
                 commands.push(DrawCommand {
                     x: x + 1,
                     y,
@@ -500,63 +616,22 @@ impl WhichKeyPopup {
                     continue;
                 }
 
-                let take = (CELL_WIDTH as usize).min(avail_at(x));
-                let cell_str = format!(" {} {}", notation, label);
-                let cell_str = cell_str.chars().take(take).collect::<String>();
+                let width = columns.width.min(avail_at(x));
+                let cell_str = shortcut_text(notation, label);
+                let kept = kept_chars(cell_str.chars().count(), width);
                 commands.push(DrawCommand {
                     x,
                     y,
-                    text: cell_str,
+                    text: fit_cell(&cell_str, width),
                     fg,
                     bg,
                 });
 
-                // Highlight the notation (after the leading space), clipped to
-                // the cell so it never spills past the right edge.
-                if take >= 2 {
-                    let notation_room = take - 1;
-                    let hl: String = notation.chars().take(notation_room).collect();
-                    if !hl.is_empty() {
-                        commands.push(DrawCommand {
-                            x: x + 1,
-                            y,
-                            text: hl,
-                            fg: key_fg,
-                            bg,
-                        });
-                    }
-                }
+                push_notation_highlight(&mut commands, x, y, notation, kept, key_fg, bg);
             }
         }
 
         commands
-    }
-}
-
-/// Build a two-column entry cell (single-char key) padded to `col_width`.
-fn entry_cell(entry: Option<&(char, String)>, col_width: u16) -> String {
-    let w = col_width as usize;
-    match entry {
-        Some((key, label)) => {
-            let s = format!(" {} {}", key, label);
-            let clipped: String = s.chars().take(w).collect();
-            format!("{clipped:<w$}")
-        }
-        None => " ".repeat(w),
-    }
-}
-
-/// Build a shortcut cell (`" <notation> <label>"`) clipped and padded to
-/// `col_width`.
-fn shortcut_cell(entry: Option<&(String, String)>, col_width: u16) -> String {
-    let w = col_width as usize;
-    match entry {
-        Some((notation, label)) => {
-            let s = format!(" {notation} {label}");
-            let clipped: String = s.chars().take(w).collect();
-            format!("{clipped:<w$}")
-        }
-        None => " ".repeat(w),
     }
 }
 
@@ -575,21 +650,27 @@ fn separator_line(title: &str, inner_width: usize) -> String {
     )
 }
 
-/// Push a highlight draw command for a multi-char key notation, clipped so it
-/// stays within the cell (which is `col_width` wide, minus the leading space).
+/// Push a highlight draw command for a multi-char key notation in the cell at
+/// `cell_x`. Only the part of the notation among the cell's `kept` characters
+/// is highlighted, so the colour never covers a truncation ellipsis.
 fn push_notation_highlight(
     commands: &mut Vec<DrawCommand>,
-    x: u16,
+    cell_x: u16,
     y: u16,
     notation: &str,
-    col_width: u16,
+    kept: usize,
     fg: Color,
     bg: Color,
 ) {
-    let max = (col_width as usize).saturating_sub(1);
-    let text: String = notation.chars().take(max).collect();
+    let text: String = notation.chars().take(kept.saturating_sub(1)).collect();
     if !text.is_empty() {
-        commands.push(DrawCommand { x, y, text, fg, bg });
+        commands.push(DrawCommand {
+            x: cell_x + 1,
+            y,
+            text,
+            fg,
+            bg,
+        });
     }
 }
 
@@ -928,6 +1009,169 @@ mod tests {
             "expected a full-width band row"
         );
         assert_full_width_box(&commands, cols, rows);
+    }
+
+    /// The root page's two longest Alt labels, with the short ones around them.
+    fn root_popup() -> WhichKeyPopup {
+        let mut popup = WhichKeyPopup::new();
+        let entries = vec![
+            (':', "command palette".to_string()),
+            ('a', "send prefix".to_string()),
+            ('\u{2423}', "layout next".to_string()),
+        ];
+        let shortcuts = vec![
+            ("Alt-L".to_string(), "move right".to_string()),
+            ("Alt-Space".to_string(), "next layout".to_string()),
+            ("Alt-a".to_string(), "switch agent".to_string()),
+            ("Alt-s".to_string(), "switch session".to_string()),
+            ("Alt-t".to_string(), "new tab".to_string()),
+        ];
+        popup.show("Remux".to_string(), entries, shortcuts);
+        popup
+    }
+
+    /// Whether `needle` is drawn whole and followed by a gap, a border, or
+    /// the end of its draw command, rather than run into the next column.
+    fn drawn_in_full(commands: &[DrawCommand], needle: &str) -> bool {
+        commands.iter().any(|c| {
+            c.text.match_indices(needle).any(|(i, _)| {
+                matches!(
+                    c.text[i + needle.len()..].chars().next(),
+                    None | Some(' ') | Some(BOX_VERTICAL)
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn natural_width_holds_the_widest_cell_and_a_gap() {
+        assert_eq!(natural_width(["ab", "abcd"], 0), 5);
+        assert_eq!(natural_width(["ab"], 20), 20);
+        assert_eq!(
+            natural_width([" \u{2423} \u{2192} x"], 0),
+            7,
+            "counts chars"
+        );
+    }
+
+    #[test]
+    fn box_columns_prefers_two_then_one_then_truncates() {
+        assert_eq!(
+            box_columns(23, 15, 80, 40),
+            Some(Columns {
+                count: 2,
+                width: 23
+            })
+        );
+        assert_eq!(
+            box_columns(23, 15, 40, 40),
+            Some(Columns {
+                count: 1,
+                width: 23
+            })
+        );
+        assert_eq!(
+            box_columns(23, 15, 20, 40),
+            Some(Columns {
+                count: 1,
+                width: 18
+            })
+        );
+        // Two columns only fit vertically: truncate them rather than blank.
+        assert_eq!(
+            box_columns(23, 15, 40, 8),
+            Some(Columns {
+                count: 2,
+                width: 19
+            })
+        );
+        assert_eq!(box_columns(23, 2, 5, 1), None);
+    }
+
+    #[test]
+    fn full_width_columns_fill_the_row_then_truncate_one() {
+        assert_eq!(
+            full_width_columns(23, 118),
+            Columns {
+                count: 5,
+                width: 23
+            }
+        );
+        assert_eq!(
+            full_width_columns(23, 10),
+            Columns {
+                count: 1,
+                width: 10
+            }
+        );
+    }
+
+    #[test]
+    fn fit_cell_pads_or_cuts_with_an_ellipsis() {
+        assert_eq!(fit_cell(" a b", 6), " a b  ");
+        assert_eq!(fit_cell(" Alt-s switch session", 10), " Alt-s s\u{2026} ");
+        assert_eq!(fit_cell(" Alt-s switch session", 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn every_position_draws_the_longest_labels_in_full() {
+        let popup = root_popup();
+        let theme = Theme::default();
+        for position in [
+            WhichKeyPosition::Anchored,
+            WhichKeyPosition::Centered,
+            WhichKeyPosition::FullWidth,
+        ] {
+            let commands = popup.render(80, 24, &theme, position.clone());
+            assert_within_bounds(&commands, 80, 24);
+            for label in ["Alt-s switch session", "Alt-Space next layout"] {
+                assert!(
+                    drawn_in_full(&commands, label),
+                    "{position:?}: {label:?} is cut or runs into the next column"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_box_drops_to_one_column_before_truncating() {
+        let popup = root_popup();
+        let commands = popup.render(30, 24, &Theme::default(), WhichKeyPosition::Anchored);
+        assert_within_bounds(&commands, 30, 24);
+        assert!(drawn_in_full(&commands, "Alt-Space next layout"));
+        assert!(!any_text_contains(&commands, "\u{2026}"));
+    }
+
+    #[test]
+    fn a_box_too_narrow_for_a_label_ends_it_with_an_ellipsis() {
+        let popup = root_popup();
+        let theme = Theme::default();
+        for position in [
+            WhichKeyPosition::Anchored,
+            WhichKeyPosition::Centered,
+            WhichKeyPosition::FullWidth,
+        ] {
+            let commands = popup.render(16, 24, &theme, position.clone());
+            assert_within_bounds(&commands, 16, 24);
+            assert!(
+                commands
+                    .iter()
+                    .any(
+                        |c| c.text.split_once("Alt-s swi").is_some_and(|(_, rest)| rest
+                            .contains('\u{2026}')
+                            && !rest.contains("session"))
+                    ),
+                "{position:?}: {commands:#?}"
+            );
+            // The key colour stops before the ellipsis.
+            let key_fg = theme.whichkey_key_fg;
+            assert!(
+                !commands
+                    .iter()
+                    .any(|c| c.fg == key_fg && c.text.contains('\u{2026}')),
+                "{position:?}: a highlight covers the ellipsis"
+            );
+        }
     }
 
     #[test]

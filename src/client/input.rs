@@ -1160,8 +1160,8 @@ impl SessionSwitchOverlay {
 ///
 /// The list, its order, its labels, its notes and its state colours are the
 /// agents panel's own (`sidebar::agents`), and navigation is the panels' shared
-/// [`NavList`](crate::client::sidebar::nav::NavList), so a selection survives a
-/// refresh by identity exactly as it does in the panel.
+/// [`NavList`](crate::client::sidebar::nav::NavList), so a selection the user
+/// has moved survives a refresh by identity exactly as it does in the panel.
 #[derive(Debug)]
 pub struct AgentSwitchOverlay {
     roster: crate::client::sidebar::agents::AgentRoster,
@@ -1170,6 +1170,11 @@ pub struct AgentSwitchOverlay {
     /// Whether any connection has reported yet, so an empty list reads as
     /// "no agents" only once it is an answer rather than a pending question.
     heard: bool,
+    /// Whether the user has moved the selection. Until they have, it stays on
+    /// row 0. Following the first row's identity instead would pin it to
+    /// whichever connection answered first, and a remote that answers before
+    /// the local server ends up last once the local rows sort ahead of it.
+    moved: bool,
     /// The pane the user is in, as `(connection, pane)`. Its row gets the
     /// current-pane background unless the selection is on it.
     current: Option<(ConnId, crate::server::layout::PaneId)>,
@@ -1193,6 +1198,7 @@ impl AgentSwitchOverlay {
             rows: Vec::new(),
             nav: crate::client::sidebar::nav::NavList::new(),
             heard,
+            moved: false,
             current: None,
             theme,
         };
@@ -1230,8 +1236,17 @@ impl AgentSwitchOverlay {
     fn rebuild(&mut self) {
         let previous = self.rows.get(self.nav.selected()).map(|r| r.key());
         self.rows = self.roster.rows();
+        if !self.moved {
+            self.nav.set_selected(0);
+            return;
+        }
         let keys: Vec<_> = self.rows.iter().map(|r| r.key()).collect();
         self.nav.reselect(&keys, previous.as_ref());
+    }
+
+    fn navigate(&mut self, cmd: crate::client::sidebar::nav::NavKey) {
+        self.nav.apply(cmd, self.rows.len());
+        self.moved = true;
     }
 
     fn selected_target(&self) -> Option<crate::client::tree_model::JumpTarget> {
@@ -3233,7 +3248,7 @@ impl InputHandler {
                     }
                 }
                 Some(cmd) => {
-                    overlay.nav.apply(cmd, overlay.rows.len());
+                    overlay.navigate(cmd);
                     InputAction::AgentSwitchUpdate
                 }
                 None => InputAction::None,
@@ -6328,6 +6343,60 @@ mod tests {
         );
         match handler.handle_key(enter_key()) {
             InputAction::AgentSwitchConfirm(t) => assert_eq!(t.conn(), &ConnId::Local),
+            other => panic!("expected a confirm, got {other:?}"),
+        }
+    }
+
+    fn empty_agent_switch_handler() -> InputHandler {
+        let mut handler = InputHandler::with_defaults();
+        handler.mode = Mode::Command;
+        handler.agent_switch = Some(AgentSwitchOverlay::new(
+            crate::client::sidebar::agents::AgentRoster::new(),
+            false,
+            crate::config::theme::CompositorTheme::default(),
+        ));
+        handler
+    }
+
+    #[test]
+    fn a_remote_list_that_answers_first_does_not_drag_the_cursor_to_the_end() {
+        use crate::protocol::AgentState;
+        let mut handler = empty_agent_switch_handler();
+        let sw = handler.agent_switch.as_mut().unwrap();
+        sw.apply_agents(&remote("pi"), &[agent(1, "far", AgentState::Working)], true);
+        sw.apply_agents(
+            &ConnId::Local,
+            &[
+                agent(1, "a", AgentState::Idle),
+                agent(2, "b", AgentState::NeedsInput),
+            ],
+            true,
+        );
+        assert_eq!(sw.nav.selected(), 0);
+        match handler.handle_key(enter_key()) {
+            InputAction::AgentSwitchConfirm(t) => assert_eq!(t.conn(), &ConnId::Local),
+            other => panic!("expected a confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_late_list_keeps_the_agent_the_user_moved_to() {
+        use crate::protocol::AgentState;
+        let mut handler = empty_agent_switch_handler();
+        handler.agent_switch.as_mut().unwrap().apply_agents(
+            &remote("pi"),
+            &[agent(1, "far", AgentState::Working)],
+            true,
+        );
+        handler.handle_key(char_key('G'));
+        handler.agent_switch.as_mut().unwrap().apply_agents(
+            &ConnId::Local,
+            &[agent(1, "a", AgentState::Idle)],
+            true,
+        );
+        assert_eq!(handler.agent_switch.as_ref().unwrap().nav.selected(), 1);
+        match handler.handle_key(enter_key()) {
+            InputAction::AgentSwitchConfirm(t) => assert_eq!(t.conn(), &remote("pi")),
             other => panic!("expected a confirm, got {other:?}"),
         }
     }
