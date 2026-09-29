@@ -916,6 +916,26 @@ impl LayoutNode {
         }
     }
 
+    /// Make `pane_id` the visible pane of the stack that holds it.
+    ///
+    /// Returns `false` when no stack holds `pane_id`, leaving the tree as it was.
+    pub fn activate(&mut self, pane_id: PaneId) -> bool {
+        match self {
+            LayoutNode::Stack { panes, active, .. } => {
+                match panes.iter().position(|&p| p == pane_id) {
+                    Some(pos) => {
+                        *active = pos;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            LayoutNode::Split { first, second, .. } => {
+                first.activate(pane_id) || second.activate(pane_id)
+            }
+        }
+    }
+
     /// Get the active pane ID of the first (leftmost/topmost) stack.
     pub fn active_pane(&self) -> Option<PaneId> {
         match self {
