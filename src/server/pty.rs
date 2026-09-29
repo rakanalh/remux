@@ -1090,6 +1090,90 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
 mod tests {
     use super::*;
 
+    /// A pipe whose kernel buffer is shrunk to one page and that nobody reads:
+    /// a sink the writer really parks on, which a pty in raw mode is not (on
+    /// Linux its input buffers a within-cap message whole). Linux-only for
+    /// `F_SETPIPE_SZ`.
+    #[cfg(target_os = "linux")]
+    fn small_pipe() -> (OwnedFd, OwnedFd) {
+        let (read, write) = unistd::pipe().expect("pipe");
+        fcntl(write.as_raw_fd(), FcntlArg::F_SETPIPE_SZ(4096)).expect("F_SETPIPE_SZ");
+        fcntl(
+            read.as_raw_fd(),
+            FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("O_NONBLOCK on the read end");
+        (read, write)
+    }
+
+    /// Every byte waiting in the pipe, without blocking.
+    #[cfg(target_os = "linux")]
+    fn drain(read: &OwnedFd) -> usize {
+        let mut total = 0;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = unistd::read(read.as_raw_fd(), &mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        total
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cancelled_write_stops_before_its_tail_reaches_the_sink() {
+        let (read, write) = small_pipe();
+        let (_writer, tx) = start_writer(write);
+        let cancel = Arc::new(WriteCancel::default());
+        let (done, written) = oneshot::channel();
+        tx.send(WriteJob {
+            data: vec![b'x'; 64 * 1024],
+            done: Some(done),
+            cancel: Some(Arc::clone(&cancel)),
+        })
+        .expect("writer task is gone");
+
+        // Long enough for the writer to fill the page and park on it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), written)
+            .await
+            .expect("the writer did not stop promptly after the cancel");
+        assert_eq!(
+            answer,
+            Ok(false),
+            "a cancelled write must report not written"
+        );
+
+        let before = drain(&read);
+        assert!(
+            before < 64 * 1024 / 4,
+            "{before} of 65536 bytes reached the sink: the cancel did not stop the tail"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(drain(&read), 0, "the writer wrote after it was cancelled");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_tracked_write_that_completes_reports_written() {
+        let (read, write) = small_pipe();
+        let (_writer, tx) = start_writer(write);
+        let (done, written) = oneshot::channel();
+        tx.send(WriteJob {
+            data: vec![b'y'; 100],
+            done: Some(done),
+            cancel: Some(Arc::new(WriteCancel::default())),
+        })
+        .expect("writer task is gone");
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), written)
+            .await
+            .expect("the writer never reported");
+        assert_eq!(answer, Ok(true));
+        assert_eq!(drain(&read), 100);
+    }
+
     #[test]
     fn spawn_and_exit() {
         // Spawn a shell that immediately exits.
