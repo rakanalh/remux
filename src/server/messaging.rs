@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{
-    valid_host, valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender, Target,
+    is_format_char, valid_host, valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender,
+    Target,
 };
 
 /// The width of the per-sender rate window.
@@ -108,7 +109,7 @@ impl Refusal {
                 format!("rate limited: at most {per_10s} sends per 10s")
             }
             Refusal::BadBody { character, at_byte } => format!(
-                "the body has a control character (U+{:04X} at byte {at_byte}); only \\n and \\t are allowed",
+                "the body has a control or format character (U+{:04X} at byte {at_byte}); only \\n and \\t are allowed",
                 *character as u32
             ),
         }
@@ -284,19 +285,22 @@ impl MailboxFile {
     }
 }
 
-/// The first control character in `body` other than `\n` and `\t`. A body
-/// is typed into a pane in a later release, and an escape sequence in it
-/// (ESC[201~ ends a bracketed paste) would reach the pane's program as input
-/// rather than as text.
+/// The first control or format character in `body` other than `\n` and
+/// `\t`. A body is typed into a pane in a later release, and an escape
+/// sequence in it (ESC[201~ ends a bracketed paste) would reach the pane's
+/// program as input rather than as text. A format character is refused
+/// because it makes a body display as text it does not contain.
 fn control_character(body: &str) -> Option<(usize, char)> {
     body.char_indices()
-        .find(|&(_, c)| c.is_control() && c != '\n' && c != '\t')
+        .find(|&(_, c)| (c.is_control() || is_format_char(c)) && c != '\n' && c != '\t')
 }
 
 /// A session name as a sender carries it: a label, printed wherever the
 /// message is shown, so it may hold no control character.
 fn valid_session(name: &str) -> bool {
-    !name.is_empty() && name.chars().count() <= 128 && !name.chars().any(char::is_control)
+    !name.is_empty()
+        && name.chars().count() <= 128
+        && !name.chars().any(|c| c.is_control() || is_format_char(c))
 }
 
 /// Whether a message read from the file is one a send would have stored.
@@ -1347,6 +1351,47 @@ mod tests {
         assert_eq!(bodies(&m.read(2, true, false, 0)), ["line one\nline\ttwo"]);
     }
 
+    #[test]
+    fn a_body_with_a_format_character_is_refused_but_an_emoji_joiner_is_not() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        for character in [
+            '\u{AD}',
+            '\u{61C}',
+            '\u{180E}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202A}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2066}',
+            '\u{206F}',
+            '\u{FEFF}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}',
+        ] {
+            let body = format!("ab{character}cd");
+            assert_eq!(
+                send(&mut m, &body, t0),
+                Err(Refusal::BadBody {
+                    character,
+                    at_byte: 2
+                }),
+                "{character:?}"
+            );
+        }
+        let emoji = "dev \u{1F469}\u{200D}\u{1F4BB}";
+        assert!(send(&mut m, emoji, t0).is_ok());
+        assert_eq!(bodies(&m.read(2, true, false, 0)), [emoji]);
+    }
+
     type Answers = tokio::sync::mpsc::UnboundedReceiver<crate::protocol::ServerMessage>;
     type Cancel = tokio::sync::oneshot::Receiver<()>;
 
@@ -1715,9 +1760,24 @@ mod tests {
         };
         let mut far_future = stored(8, 3, "e");
         far_future.expires_ms = u64::MAX;
+        let mut dash_host = stored(9, 2, "g");
+        dash_host.from = Sender::Remote {
+            host: "-oProxyCommand".into(),
+            pane_id: 1,
+            name: None,
+        };
+        let mut rlo_session = stored(10, 2, "h");
+        rlo_session.from = Sender::Pane {
+            pane_id: 1,
+            name: None,
+            session: "main\u{202E}".into(),
+        };
         let f = file_of(vec![
             stored(1, 2, "ok"),
             stored(2, 2, "esc\u{1b}]52"),
+            stored(11, 2, "rlo\u{202E}"),
+            dash_host,
+            rlo_session,
             stored(3, 2, "too-long!"),
             bad_name,
             bad_session,
@@ -1727,7 +1787,7 @@ mod tests {
             far_future,
         ]);
         let (r, pruned) = Messaging::restore(lim, f, |_| true, HashSet::new(), 0);
-        assert_eq!(pruned.invalid, 5, "{pruned:?}");
+        assert_eq!(pruned.invalid, 8, "{pruned:?}");
         assert_eq!(pruned.over_cap, 1, "{pruned:?}");
         assert_eq!(
             r_read(&r, 2),

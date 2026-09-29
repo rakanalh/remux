@@ -156,6 +156,10 @@ enum Commands {
         argv: Vec<String>,
     },
 
+    /// Leave messages for other panes and read your own
+    #[command(subcommand)]
+    Msg(crate::client::msg_cli::MsgCmd),
+
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
     Server,
@@ -581,6 +585,9 @@ async fn main() -> Result<()> {
                 CliPlacement::SplitBelow
             };
             run_cli_spawn(placement, cwd, argv).await?;
+        }
+        Some(Commands::Msg(cmd)) => {
+            std::process::exit(crate::client::msg_cli::run_msg(cmd).await.into());
         }
         Some(Commands::NewTab { cwd, argv }) => {
             run_cli_spawn(CliPlacement::NewTab, cwd, argv).await?;

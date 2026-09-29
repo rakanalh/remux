@@ -871,6 +871,11 @@ pub enum ServerMessage {
         messages: Vec<Message>,
         #[serde(default)]
         timed_out: bool,
+        /// Whether this read marks what it lists Read. Only a pane reading
+        /// its own mailbox without `peek` does, and only the server knows
+        /// which pane the caller is.
+        #[serde(default)]
+        marked: bool,
     },
     /// The answer to a [`ClientMessage::MsgAck`]: how many messages it marked.
     MsgAcked { pane: PaneId, count: usize },
@@ -1199,13 +1204,37 @@ impl std::fmt::Display for Address {
 }
 
 /// A remote's name as an address spells it: `[A-Za-z0-9._-]+`, not starting
-/// with `.`. Checked on the server too, because the wire carries any string
+/// with `.` or `-`, so it cannot read as an option where it is printed into a
+/// command line. Checked on the server too, because the wire carries any string
 /// and a host is written to the log.
 pub fn valid_host(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('.')
+        && !s.starts_with('-')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A character that changes how text around it is shown without being
+/// shown itself: bidirectional overrides and isolates, zero-width spaces and
+/// joiners, invisible operators, line and paragraph separators, tag
+/// characters. A message body or label holding one can render as text it
+/// does not contain. U+200D (zero width joiner) is left out, because emoji
+/// sequences need it.
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 /// An agent name: `[a-z][a-z0-9_-]{0,31}`. A grammar rather than free text,
@@ -1256,6 +1285,36 @@ impl ServerMessage {
         ServerMessage::Error {
             message: message.into(),
             code: Some(code.to_string()),
+        }
+    }
+
+    /// The variant's name, for a log line or an error about a reply nobody
+    /// expected. Never the contents: a reply can carry message bodies,
+    /// clipboard data and screen text.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ServerMessage::FullRender { .. } => "FullRender",
+            ServerMessage::RenderDiff { .. } => "RenderDiff",
+            ServerMessage::ScrollRender { .. } => "ScrollRender",
+            ServerMessage::SessionList { .. } => "SessionList",
+            ServerMessage::Error { .. } => "Error",
+            ServerMessage::Event(..) => "Event",
+            ServerMessage::CopyToClipboard { .. } => "CopyToClipboard",
+            ServerMessage::ScrollbackContent { .. } => "ScrollbackContent",
+            ServerMessage::ScrollbackInfo { .. } => "ScrollbackInfo",
+            ServerMessage::SessionBorderStyle { .. } => "SessionBorderStyle",
+            ServerMessage::CliSpawned { .. } => "CliSpawned",
+            ServerMessage::MsgSent { .. } => "MsgSent",
+            ServerMessage::MsgList { .. } => "MsgList",
+            ServerMessage::MsgAcked { .. } => "MsgAcked",
+            ServerMessage::AgentNamed { .. } => "AgentNamed",
+            ServerMessage::AgentStatusList { .. } => "AgentStatusList",
+            ServerMessage::DirectoryListing { .. } => "DirectoryListing",
+            ServerMessage::AgentList { .. } => "AgentList",
+            ServerMessage::SessionTree { .. } => "SessionTree",
+            ServerMessage::PaneContent { .. } => "PaneContent",
+            ServerMessage::ViewCreated { .. } => "ViewCreated",
+            ServerMessage::ViewList { .. } => "ViewList",
         }
     }
 }
@@ -2387,6 +2446,8 @@ mod tests {
             ":alpha",
             "mi ni:alpha",
             ".mini:alpha",
+            "-mini:alpha",
+            "-oProxyCommand:%1",
             "..:%1",
         ] {
             assert!(bad.parse::<Address>().is_err(), "{bad:?} parsed");

@@ -1,7 +1,9 @@
 pub mod chrome;
+pub mod cli_common;
 pub mod command_palette;
 pub mod editor;
 pub mod input;
+pub mod msg_cli;
 pub mod registry;
 pub mod renderer;
 pub mod session_manager;

@@ -56,6 +56,9 @@ TITLE_SECRET = TITLE_HEAD + "-" + TITLE_TAIL
 # pane, so it is in no typed bytes and on no command line: the only way into
 # the log is the server writing it.
 MSG_SECRET = "the-deploy-token-is-swordfish-BODY"
+# A body given to `remux msg send` on its command line, which writes the
+# CLIENT log. Distinct from MSG_SECRET so a hit names which half leaked.
+CLI_MSG_SECRET = "the-vault-pin-is-8812-CLI-BODY"
 WIRE_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire_send.py")
 
 
@@ -148,6 +151,7 @@ def run(srv, result):
 
     pane_id = first_pane_id(c)
     check(pane_id is not None, "a pane id was resolved off the session tree")
+    result["pane_id"] = pane_id
     if pane_id is None:
         return
 
@@ -285,6 +289,45 @@ def run_cli(srv):
     )
 
 
+def run_msg_cli(srv, result):
+    """8. The CLIENT half of message redaction: `remux msg send` and `read`.
+
+    The send runs as a pane's own program through `CliSpawn`, so the server
+    attributes it to a real pane and it is refused for no other reason. The
+    read is a peek from outside, whose JSON is the proof the body arrived.
+    """
+    pane_id = result.get("pane_id")
+    if pane_id is None:
+        return
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send(
+        {
+            "CliSpawn": {
+                "session": "main",
+                "placement": "SplitBelow",
+                "argv": [os.path.abspath(BIN), "msg", "send", f"%{pane_id}", CLI_MSG_SECRET],
+                "cwd": None,
+            }
+        }
+    )
+    cli.drain(0.6)
+    cli.close()
+    end = time.time() + 8.0
+    while time.time() < end:
+        out = subprocess.run(
+            [BIN, "msg", "read", "--pane", f"%{pane_id}", "--all", "--peek", "--format", "json"],
+            env=srv.env,
+            capture_output=True,
+            timeout=20,
+        )
+        bodies = [m["body"] for m in json.loads(out.stdout or b"{}").get("messages", [])]
+        if CLI_MSG_SECRET in bodies:
+            result["cli_msg_read"] = True
+            return
+        time.sleep(0.2)
+
+
 def main():
     # Findings that come from the WIRE rather than from the log, carried out of
     # `run` so the checks can be made after the server is stopped.
@@ -294,6 +337,7 @@ def main():
         try:
             run(srv, result)
             run_cli(srv)
+            run_msg_cli(srv, result)
         except Exception as e:  # noqa: BLE001 -- the log is the point; reach it
             check(False, f"the run completed without an exception ({e!r})")
     finally:
@@ -399,6 +443,27 @@ def main():
     check(
         any(f"{len(MSG_SECRET)} bytes" in ln for ln in send_lines) and "msg: id=" in log,
         "7 ...but the redacted line naming the id and byte count is present",
+    )
+
+    # 8. A message body through the CLI: absent from BOTH logs, while the
+    #    client's own lines naming the verb, the target and the counts are
+    #    present.
+    check(
+        result.get("cli_msg_read") is True,
+        "8 the CLI's message really was sent and stored (otherwise 8 proves nothing)",
+    )
+    check(
+        CLI_MSG_SECRET not in client_log and CLI_MSG_SECRET not in log,
+        "8 a body given to `remux msg send` is in NEITHER log",
+    )
+    check(
+        f'cmd: msg send to="%{result.get("pane_id")}"' in client_log
+        and f"bytes={len(CLI_MSG_SECRET)}" in client_log,
+        "8 ...but client.log names the send, its target and its byte count",
+    )
+    check(
+        "cmd: msg read answered MsgList(" in client_log and "message(s))" in client_log,
+        "8 ...and names the read's answer by its count",
     )
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.

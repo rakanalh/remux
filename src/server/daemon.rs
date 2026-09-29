@@ -781,6 +781,7 @@ async fn handle_msg_send(
             pane: to,
             messages,
             timed_out: false,
+            marked: waiter.mark,
         });
     }
     if swept > 0 {
@@ -1044,7 +1045,7 @@ async fn handle_agent_status(
 /// The longest a read may wait for mail, whatever it asks for. A waiter holds
 /// only a channel sender, so the bound is about not keeping a forgotten
 /// request alive for ever, not about cost.
-const MAX_WAIT_MS: u64 = 3_600_000;
+pub const MAX_WAIT_MS: u64 = 3_600_000;
 
 /// End a parked wait at its deadline, answering it timed out. Returns whether
 /// it did: removing the waiter from the store by any other path (answered,
@@ -1069,6 +1070,7 @@ async fn wait_out(
         pane,
         messages: Vec::new(),
         timed_out: true,
+        marked: waiter.mark,
     });
     true
 }
@@ -1161,6 +1163,7 @@ async fn handle_msg_read(
                     pane: earlier.pane,
                     messages: Vec::new(),
                     timed_out: true,
+                    marked: earlier.mark,
                 });
             }
             log::debug!("msg: wait on %{pane} parked for client_id={client_id} ({wait_ms}ms)");
@@ -1174,6 +1177,7 @@ async fn handle_msg_read(
             pane,
             messages,
             timed_out: true,
+            marked: mark,
         });
     }
     if !messages.is_empty() {
@@ -1183,6 +1187,7 @@ async fn handle_msg_read(
         pane,
         messages,
         timed_out: false,
+        marked: mark,
     })
 }
 

@@ -1,0 +1,326 @@
+//! Plumbing shared by the one-shot CLI verbs (`remux msg`, `remux agent`):
+//! one request, one answer, a deadline on each, a fixed exit code, and
+//! nothing printed that the server or a message chose without escaping it.
+//!
+//! These verbs are run by agents and their hooks as much as by people, so
+//! they never start a server (a message to a server that was not running has
+//! no target) and never wait without a bound.
+
+use std::time::Duration;
+
+use crate::client::terminal::RemuxClient;
+use crate::protocol::{is_format_char, ClientMessage, PaneId, ServerMessage};
+use crate::server::daemon::socket_path;
+
+/// How long a verb may take to reach the server.
+pub(crate) const CONNECT_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long a verb waits for its reply once sent, beyond any `--wait`. Above
+/// the server's own 5 s bound on checking the caller, so a slow check is
+/// reported as the server's refusal rather than as this deadline.
+pub(crate) const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+pub(crate) enum CliError {
+    NoServer,
+    Timeout,
+    Refused {
+        code: String,
+        message: String,
+    },
+    Transport(String),
+    /// A malformed invocation, refused before anything is sent. `code` is
+    /// `bad_address`, `bad_body` or `usage`.
+    Usage {
+        code: &'static str,
+        message: String,
+    },
+}
+
+impl CliError {
+    pub(crate) fn usage(code: &'static str, message: impl Into<String>) -> Self {
+        CliError::Usage {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn exit_code(&self) -> u8 {
+        match self {
+            CliError::Usage { .. } => 2,
+            _ => 1,
+        }
+    }
+
+    fn code(&self) -> &str {
+        match self {
+            CliError::NoServer => "no_server",
+            CliError::Timeout => "timeout",
+            CliError::Refused { code, .. } => code,
+            CliError::Transport(_) => "transport",
+            CliError::Usage { code, .. } => code,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            CliError::NoServer => "no remux server is running here",
+            CliError::Timeout => "the server did not answer in time",
+            CliError::Refused { message, .. }
+            | CliError::Transport(message)
+            | CliError::Usage { message, .. } => message,
+        }
+    }
+
+    /// The stderr line. Every part is escaped: the code and message can come
+    /// from a server, and a usage message can quote what was typed.
+    pub(crate) fn stderr(&self) -> String {
+        format!("remux: {}: {}", escape(self.code()), escape(self.message()))
+    }
+
+    pub(crate) fn json(&self) -> String {
+        json_line(&serde_json::json!({
+            "error": { "code": self.code(), "message": self.message() }
+        }))
+    }
+}
+
+/// Report `result` and return the exit code for it. Under `json` a failure is
+/// also printed on stdout as `{"error": {...}}`, so a caller parsing stdout
+/// always gets a document.
+pub(crate) fn finish(result: Result<(), CliError>, json: bool) -> u8 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            if json {
+                println!("{}", e.json());
+            }
+            eprintln!("{}", e.stderr());
+            e.exit_code()
+        }
+    }
+}
+
+/// Connect, send `msg`, and wait up to `deadline` for its answer.
+pub(crate) async fn ask(msg: ClientMessage, deadline: Duration) -> Result<ServerMessage, CliError> {
+    if !socket_path().exists() {
+        return Err(CliError::NoServer);
+    }
+    let mut client = tokio::time::timeout(CONNECT_DEADLINE, RemuxClient::connect_local())
+        .await
+        .map_err(|_| CliError::Timeout)?
+        .map_err(|e| {
+            if no_listener(&e) {
+                CliError::NoServer
+            } else {
+                CliError::Transport(format!("{e:#}"))
+            }
+        })?;
+    client
+        .send(msg)
+        .await
+        .map_err(|e| CliError::Transport(format!("{e:#}")))?;
+    let answer = tokio::time::timeout(deadline, client.recv_skip_views())
+        .await
+        .map_err(|_| CliError::Timeout)?
+        .map_err(|e| CliError::Transport(format!("{e:#}")))?;
+    match answer {
+        None => Err(CliError::Transport(
+            "the server closed the connection".to_string(),
+        )),
+        Some(ServerMessage::Error { message, code }) => Err(CliError::Refused {
+            code: code.unwrap_or_else(|| "error".to_string()),
+            message,
+        }),
+        Some(answer) => Ok(answer),
+    }
+}
+
+/// Whether a connect failed because nothing listens on the socket: a socket
+/// file left behind by a server that died, or one removed after the
+/// existence check.
+fn no_listener(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
+}
+
+/// An answer this verb does not expect, named by its variant only.
+pub(crate) fn unexpected(answer: &ServerMessage) -> CliError {
+    let name = answer.variant_name();
+    log::warn!("cmd: got an unexpected {name} answer");
+    CliError::Transport(format!("unexpected {name} answer from the server"))
+}
+
+/// `$REMUX_PANE`, sent as a hint the server only logs. `None` if unset or
+/// not a pane id.
+pub(crate) fn pane_hint() -> Option<PaneId> {
+    parse_pane(&std::env::var("REMUX_PANE").ok()?).ok()
+}
+
+pub(crate) fn parse_pane(s: &str) -> Result<PaneId, String> {
+    s.strip_prefix('%')
+        .unwrap_or(s)
+        .parse()
+        .map_err(|_| format!("{s:?} is not a pane: use %N"))
+}
+
+/// `30`, `30s`, `500ms`, `2m`, `1h`; a bare number is seconds.
+pub(crate) fn parse_wait(s: &str) -> Result<Duration, String> {
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{s:?} is not a duration: use 30, 30s, 2m"))?;
+    let ms = match unit {
+        "" | "s" => n.checked_mul(1_000),
+        "ms" => Some(n),
+        "m" => n.checked_mul(60_000),
+        "h" => n.checked_mul(3_600_000),
+        _ => None,
+    };
+    ms.map(Duration::from_millis)
+        .ok_or_else(|| format!("{s:?} is not a duration: use 30, 30s, 2m"))
+}
+
+/// `s` with every control and format character shown as an escape instead
+/// of emitted: `\x1b` for C0 and DEL, `\u{9b}` for C1 and `\u{202e}` for a
+/// format character (see [`is_format_char`]). Newlines included, so a field
+/// printed on one line stays on one line.
+pub(crate) fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c as u32 {
+            0x00..=0x1f | 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
+            0x80..=0x9f => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            _ if is_format_char(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One JSON document, with DEL, the C1 range and every format character
+/// escaped as well: serde_json leaves them raw, a terminal can read the C1
+/// bytes as control sequences, and a format character reorders or hides the
+/// text around it.
+pub(crate) fn json_line(value: &serde_json::Value) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        let code = c as u32;
+        if (0x7f..=0x9f).contains(&code) || is_format_char(c) {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_duration_is_seconds_unless_it_says_otherwise() {
+        assert_eq!(parse_wait("30"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_wait("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_wait("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_wait("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_wait("1h"), Ok(Duration::from_secs(3600)));
+        for bad in ["", "soon", "5d", "-1", "1.5s", "99999999999999999999h"] {
+            assert!(parse_wait(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_pane_is_written_with_or_without_its_sign() {
+        assert_eq!(parse_pane("%7"), Ok(7));
+        assert_eq!(parse_pane("7"), Ok(7));
+        assert!(parse_pane("%x").is_err());
+    }
+
+    #[test]
+    fn every_control_and_format_character_is_shown_not_emitted() {
+        assert_eq!(escape("a\u{1b}[2Jb"), "a\\x1b[2Jb");
+        assert_eq!(escape("bell\u{7}"), "bell\\x07");
+        assert_eq!(escape("del\u{7f}"), "del\\x7f");
+        assert_eq!(escape("c1\u{9b}2J"), "c1\\u{9b}2J");
+        assert_eq!(escape("two\nlines"), "two\\x0alines");
+        assert_eq!(escape("rlo\u{202e}txt"), "rlo\\u{202e}txt");
+        assert_eq!(escape("tag\u{e0041}"), "tag\\u{e0041}");
+        assert_eq!(escape("zw\u{200b}sp"), "zw\\u{200b}sp");
+        assert_eq!(
+            escape("plain é ✓ \u{1F469}\u{200D}\u{1F4BB}"),
+            "plain é ✓ \u{1F469}\u{200D}\u{1F4BB}"
+        );
+    }
+
+    #[test]
+    fn json_escapes_what_serde_leaves_raw_and_still_round_trips() {
+        let body = "esc\u{1b} c1\u{9b} del\u{7f} rlo\u{202e} tag\u{e0041} ls\u{2028}";
+        let line = json_line(&serde_json::json!({ "body": body }));
+        assert!(
+            line.chars().all(|c| !c.is_control() && !is_format_char(c)),
+            "{line:?}"
+        );
+        let back: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(back["body"], body);
+    }
+
+    #[test]
+    fn a_malformed_invocation_exits_2_and_a_refusal_1() {
+        assert_eq!(CliError::usage("bad_body", "x").exit_code(), 2);
+        for e in [
+            CliError::NoServer,
+            CliError::Timeout,
+            CliError::Refused {
+                code: "no_such_target".into(),
+                message: "x".into(),
+            },
+            CliError::Transport("x".into()),
+        ] {
+            assert_eq!(e.exit_code(), 1, "{e:?}");
+        }
+        assert_eq!(
+            CliError::NoServer.stderr(),
+            "remux: no_server: no remux server is running here"
+        );
+    }
+
+    #[test]
+    fn every_part_of_the_stderr_line_is_escaped() {
+        let e = CliError::Refused {
+            code: "x\u{1b}]52;c;aGk=\u{7}".into(),
+            message: "m\u{9b}2J\nFrom: boss".into(),
+        };
+        assert_eq!(
+            e.stderr(),
+            "remux: x\\x1b]52;c;aGk=\\x07: m\\u{9b}2J\\x0aFrom: boss"
+        );
+        let e = CliError::Transport("t\u{1b}[2J".into());
+        assert_eq!(e.stderr(), "remux: transport: t\\x1b[2J");
+        let e = CliError::usage("usage", "u\u{202e}");
+        assert_eq!(e.stderr(), "remux: usage: u\\u{202e}");
+    }
+
+    #[test]
+    fn a_refused_connect_is_no_server() {
+        let refused =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("connecting to server at /x");
+        assert!(no_listener(&refused));
+        let other = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("connecting");
+        assert!(!no_listener(&other));
+    }
+}
