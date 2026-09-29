@@ -45,9 +45,18 @@ pane run from the harness itself.
      path and the file load both refuse it), so a fake one is the only way
      to put the CLI's renderer under test end to end. Unicode format
      characters (U+202E, U+2066, a tag character, U+2028) are escaped too.
+8k'. A broadcast (Event(SessionCreated), sent to every client) arriving
+     during a --wait is skipped: the wait still ends empty at its deadline.
+8r'. Inside B, `msg read --pane %B` is B's OWN read: body shown, no peek
+     notice, and the message is marked Read.
+8v.  clap's usage errors, which quote what was typed, show a format
+     character and a C1 byte escaped.
 8t.  The header's time is local time under $TZ.
 8u.  An answer the verb does not expect is reported by its variant name, and
      the message body it carries is in neither stderr nor client.log.
+8pp. A large read piped into `head -c1` ends by SIGPIPE, not a panic.
+8dl. A server that never finishes the handshake is a timeout in about a
+     second; one that handshakes and never answers is a timeout in about ten.
 8z.  No panic.
 
 Run: python3 tests/frame/msg_cli.py   (RMX_RUNDIR overrides the run dir)
@@ -258,6 +267,19 @@ try:
     except (ValueError, KeyError):
         timed_out = None
     check(code == 0 and timed_out is True, f"8k --format json says timed_out, exit 0 (exit {code}, out {out!r})")
+    started = time.time()
+    waiter = subprocess.Popen([BIN, "msg", "read", "--pane", f"%{B}", "--wait", "3"], env=clean_env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(1.0)
+    pusher = Client(srv.sock)
+    pusher.hello()
+    pusher.send({"CreateSession": {"name": "pushy", "folder": None}})
+    out, err = waiter.communicate(timeout=20)
+    took = time.time() - started
+    pusher.close()
+    check(waiter.returncode == 0 and out.strip() == b"" and 2.8 <= took < 6.0,
+          f"8k' a SessionCreated broadcast mid-wait is skipped: exit 0, empty, after {took:.2f}s "
+          f"(exit {waiter.returncode}, err {err!r})")
     code, out, err, _ = run_cli("msg", "read", "--help")
     check(code == 0 and "no output if nothing arrives" in out and "timed_out" in out,
           "8k --help says a wait that ends empty prints nothing, and JSON reports timed_out")
@@ -317,6 +339,17 @@ try:
     check(code == 0 and "MARK:other" in out and "(peek: not your mailbox)" in err and state == ["Queued"],
           f"8r an outside read under REMUX_PANE=%{B} is a peek, says so, marks nothing (exit {code}, err {err!r}, state {state})")
 
+    code, out, err = type_cli(A, f"{BIN} msg send %{B} \"$(printf 'MARK:%s' self)\"")
+    code, out, err = type_cli(B, f"{BIN} msg read --pane %{B}")
+    state = [m["state"] for m in (listed_json(B) or []) if m["body"] == "MARK:self"]
+    check(code == 0 and "MARK:self" in out and "peek" not in err and state == ["Read"],
+          f"8r' B's `read --pane %{B}` of its own mail marks it and has no peek notice (exit {code}, err {err!r}, state {state})")
+
+    # --- 8v ---------------------------------------------------------------
+    code, out, err, _ = run_cli("msg", "read", "--format", "a\u202e\u009bb")
+    check(code == 2 and "\u202e" not in err and "\u009b" not in err and "\\u{202e}\\u{9b}" in err,
+          f"8v clap's usage error shows what was typed escaped (exit {code}, err {err[:90]!r})")
+
     # --- 8s ---------------------------------------------------------------
     code, out, err = type_cli(A, f"REMUX_PANE=%999 {BIN} msg send %{B} \"$(printf 'HINT:%s' wrong)\"")
     got = [m["from"]["Pane"]["pane_id"] for m in (listed_json(B) or []) if m["body"] == "HINT:wrong"]
@@ -345,6 +378,8 @@ HOSTILE = {
     "expires_ms": 1_790_000_060_000, "state": "Queued", "reply_to": None,
     "from": {"Pane": {"pane_id": 3, "name": "x\x1b[31m\u202e", "session": "s\x1b[2J\nFrom: evil"}},
 }
+
+BIG = [{**HOSTILE, "id": i, "body": "x" * 1000} for i in range(1, 301)]
 
 
 def frame(obj):
@@ -382,8 +417,31 @@ def fake_server(sock_path, stop):
                 continue
             conn.sendall(frame({"protocol_version": PROTOCOL_VERSION, "remux_version": "fake"}))
             request = read_frame(conn)
-            if request and ("MsgRead" in request or "MsgSend" in request):
+            if request and "MsgRead" in request and request["MsgRead"].get("pane") == 5:
+                conn.sendall(frame({"MsgList": {"pane": 5, "messages": BIG, "timed_out": False, "marked": False}}))
+            elif request and ("MsgRead" in request or "MsgSend" in request):
                 conn.sendall(frame({"MsgList": {"pane": 4, "messages": [HOSTILE], "timed_out": False, "marked": False}}))
+    s.close()
+
+
+def silent_server(sock_path, stop, answer_hello):
+    """Accept, and never answer: the Hello, or (with `answer_hello`) the request."""
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(sock_path)
+    os.chmod(sock_path, 0o600)
+    s.listen(8)
+    s.settimeout(0.2)
+    held = []
+    while not stop.is_set():
+        try:
+            conn, _ = s.accept()
+        except socket.timeout:
+            continue
+        held.append(conn)
+        if answer_hello and read_frame(conn) is not None:
+            conn.sendall(frame({"protocol_version": PROTOCOL_VERSION, "remux_version": "fake"}))
+    for conn in held:
+        conn.close()
     s.close()
 
 
@@ -425,6 +483,13 @@ try:
             check(lines.count("(end of message 7)") == 1 and "\\u{202e}" in text,
                   f"8n --format {fmt}: the one real trailer ends the body and U+202E is shown escaped")
 
+    # --- 8pp: a closed pipe ----------------------------------------------
+    done = subprocess.run(["bash", "-c", f"{BIN} msg read --pane %5 | head -c1 >/dev/null; echo \"rc=${{PIPESTATUS[0]}}\""],
+                          env=fake_env, capture_output=True, timeout=20)
+    out, err = done.stdout.decode(), done.stderr.decode("utf-8", "replace")
+    check("rc=101" not in out and "rc=" in out and "panicked" not in err,
+          f"8pp a read piped into head -c1 ends quietly, not with a panic ({out.strip()}, err {err[:120]!r})")
+
     # --- 8t: the time is local time, as TZ says ------------------------------
     for tz, offset in (("UTC", 0), ("JST-9", 9 * 3600)):
         want = time.strftime("%H:%M:%S", time.gmtime(HOSTILE["created_ms"] // 1000 + offset))
@@ -444,6 +509,32 @@ try:
 finally:
     stop.set()
     thread.join(2)
+
+# --- 8dl: the deadlines --------------------------------------------------------
+for answer_hello, low, high, label in ((False, 0.8, 2.5, "never finishes the handshake"),
+                                       (True, 9.5, 13.0, "handshakes and never answers")):
+    run_dir = f"{RUNDIR}-silent-{int(answer_hello)}/run"
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    os.chmod(run_dir, 0o700)
+    sock_path = f"{run_dir}/remux.sock"
+    if os.path.exists(sock_path):
+        os.remove(sock_path)
+    halt = threading.Event()
+    silent = threading.Thread(target=silent_server, args=(sock_path, halt, answer_hello), daemon=True)
+    silent.start()
+    time.sleep(0.2)
+    started = time.time()
+    try:
+        done = subprocess.run([BIN, "msg", "read", "--pane", "%4"], env={**fake_env, "XDG_RUNTIME_DIR": run_dir},
+                              capture_output=True, timeout=30)
+        code, err = done.returncode, done.stderr.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        code, err = None, "no exit in 30s"
+    took = time.time() - started
+    halt.set()
+    silent.join(2)
+    check(code == 1 and err.startswith("remux: timeout: ") and low <= took < high,
+          f"8dl a server that {label} is a timeout in {took:.2f}s (exit {code}, err {err!r})")
 
 print()
 if failures:

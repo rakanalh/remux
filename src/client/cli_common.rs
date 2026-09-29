@@ -85,6 +85,18 @@ impl CliError {
     }
 }
 
+/// Run one verb: restore the default SIGPIPE, then report the result with
+/// [`finish`]. Rust ignores SIGPIPE, so without this `remux msg read | head`
+/// panics on the first write after `head` exits instead of ending quietly the
+/// way a Unix tool does.
+pub(crate) async fn run_verb(
+    verb: impl std::future::Future<Output = Result<(), CliError>>,
+    json: bool,
+) -> u8 {
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    finish(verb.await, json)
+}
+
 /// Report `result` and return the exit code for it. Under `json` a failure is
 /// also printed on stdout as `{"error": {...}}`, so a caller parsing stdout
 /// always gets a document.
@@ -120,10 +132,20 @@ pub(crate) async fn ask(msg: ClientMessage, deadline: Duration) -> Result<Server
         .send(msg)
         .await
         .map_err(|e| CliError::Transport(format!("{e:#}")))?;
-    let answer = tokio::time::timeout(deadline, client.recv_skip_views())
-        .await
-        .map_err(|_| CliError::Timeout)?
-        .map_err(|e| CliError::Transport(format!("{e:#}")))?;
+    // One deadline for the whole wait, so a stream of pushes cannot extend it.
+    let answer = tokio::time::timeout(deadline, async {
+        loop {
+            match client.recv().await {
+                Ok(Some(push)) if push.is_push() => {
+                    log::debug!("cmd: skipping a {} push", push.variant_name());
+                }
+                other => return other,
+            }
+        }
+    })
+    .await
+    .map_err(|_| CliError::Timeout)?
+    .map_err(|e| CliError::Transport(format!("{e:#}")))?;
     match answer {
         None => Err(CliError::Transport(
             "the server closed the connection".to_string(),
@@ -203,6 +225,12 @@ pub(crate) fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// [`escape`] applied line by line, for text whose line breaks are layout:
+/// clap's usage errors, which quote what was typed.
+pub(crate) fn escape_lines(s: &str) -> String {
+    s.split('\n').map(escape).collect::<Vec<_>>().join("\n")
 }
 
 /// One JSON document, with DEL, the C1 range and every format character
@@ -311,6 +339,14 @@ mod tests {
         assert_eq!(e.stderr(), "remux: transport: t\\x1b[2J");
         let e = CliError::usage("usage", "u\u{202e}");
         assert_eq!(e.stderr(), "remux: usage: u\\u{202e}");
+    }
+
+    #[test]
+    fn escape_lines_keeps_the_line_breaks_and_escapes_the_rest() {
+        assert_eq!(
+            escape_lines("error: '\u{202e}\u{9b}' is bad\n\nUsage: x\n"),
+            "error: '\\u{202e}\\u{9b}' is bad\n\nUsage: x\n"
+        );
     }
 
     #[test]

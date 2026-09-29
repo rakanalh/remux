@@ -2,7 +2,10 @@
 //!
 //! Exits 0 (done), 1 (refused: the server's code on stderr) or 2 (a malformed
 //! invocation, refused before anything is sent). See `cli_common` for the
-//! deadlines and why no verb starts a server.
+//! deadlines and why no verb starts a server. An invocation that clap itself
+//! refuses (an unknown flag, a bad value) prints clap's escaped message on
+//! stderr and no `--json` document, because it fails before `--json` is
+//! known.
 //!
 //! Whatever a message carries is shown, never obeyed: every field printed in
 //! the text and context formats has its control and format characters shown
@@ -16,7 +19,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use crate::client::cli_common::{
-    ask, escape, finish, json_line, pane_hint, parse_pane, parse_wait, unexpected, CliError,
+    ask, escape, json_line, pane_hint, parse_pane, parse_wait, run_verb, unexpected, CliError,
     REPLY_DEADLINE,
 };
 use crate::protocol::{
@@ -124,7 +127,7 @@ pub async fn run_msg(cmd: MsgCmd) -> u8 {
                 ..
             }
     );
-    finish(run(cmd).await, json)
+    run_verb(run(cmd), json).await
 }
 
 async fn run(cmd: MsgCmd) -> Result<(), CliError> {
@@ -357,10 +360,16 @@ fn body_block(msg: &Message) -> String {
     let mut out: String = msg
         .body
         .split('\n')
-        .map(|line| format!("    {}\n", escape(line)))
+        .map(|line| format!("    {}\n", escape_keeping_tabs(line)))
         .collect();
     out.push_str(&format!("(end of message {})\n", msg.id));
     out
+}
+
+/// A tab moves the cursor but cannot start a line, and the indentation is
+/// what stops a body forging a header, so a tab is shown as a tab.
+fn escape_keeping_tabs(line: &str) -> String {
+    line.split('\t').map(escape).collect::<Vec<_>>().join("\t")
 }
 
 fn sender(msg: &Message) -> (String, String) {
@@ -556,6 +565,16 @@ mod tests {
         };
         assert!(render_context(&[msg])
             .contains("Reply with: remux msg send lab-2.local:%1 --reply-to 7 --stdin\n"));
+    }
+
+    #[test]
+    fn a_tab_in_a_body_is_shown_as_a_tab() {
+        let mut msg = hostile();
+        msg.body = "col\tcol\u{1b}".into();
+        assert!(
+            render_text(&[msg]).contains("\n    col\tcol\\x1b\n"),
+            "a tab was escaped, or ESC was not"
+        );
     }
 
     #[test]

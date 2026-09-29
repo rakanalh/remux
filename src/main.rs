@@ -297,7 +297,19 @@ fn install_panic_logger() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // clap quotes what was typed in a usage error, and passes format and C1
+    // characters through raw. Help and version are printed as clap renders
+    // them.
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        if e.use_stderr() {
+            eprint!(
+                "{}",
+                crate::client::cli_common::escape_lines(&e.render().to_string())
+            );
+            std::process::exit(e.exit_code());
+        }
+        e.exit()
+    });
 
     // Determine log file based on command: server.log vs relay.log vs client.log.
     let log_filename = match cli.command {

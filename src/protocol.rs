@@ -1317,6 +1317,40 @@ impl ServerMessage {
             ServerMessage::ViewList { .. } => "ViewList",
         }
     }
+
+    /// Whether the server sends this without being asked: a broadcast, a
+    /// subscription or a frame. A one-shot request skips these while it waits
+    /// for its answer, because any connection can receive a broadcast such as
+    /// `Event(SessionCreated)` at any moment.
+    ///
+    /// `SessionTree` counts as an answer: it is pushed only to a connection
+    /// that sent `SubscribeSessionTree`.
+    pub fn is_push(&self) -> bool {
+        match self {
+            ServerMessage::FullRender { .. }
+            | ServerMessage::RenderDiff { .. }
+            | ServerMessage::ScrollRender { .. }
+            | ServerMessage::Event(..)
+            | ServerMessage::CopyToClipboard { .. }
+            | ServerMessage::SessionBorderStyle { .. }
+            | ServerMessage::AgentList { .. }
+            | ServerMessage::PaneContent { .. }
+            | ServerMessage::ViewList { .. } => true,
+            ServerMessage::SessionList { .. }
+            | ServerMessage::Error { .. }
+            | ServerMessage::ScrollbackContent { .. }
+            | ServerMessage::ScrollbackInfo { .. }
+            | ServerMessage::CliSpawned { .. }
+            | ServerMessage::MsgSent { .. }
+            | ServerMessage::MsgList { .. }
+            | ServerMessage::MsgAcked { .. }
+            | ServerMessage::AgentNamed { .. }
+            | ServerMessage::AgentStatusList { .. }
+            | ServerMessage::DirectoryListing { .. }
+            | ServerMessage::SessionTree { .. }
+            | ServerMessage::ViewCreated { .. } => false,
+        }
+    }
 }
 
 /// How the sender wants a message delivered. Every message is stored in the
