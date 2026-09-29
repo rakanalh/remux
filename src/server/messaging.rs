@@ -4,7 +4,7 @@
 //! its own mutex and passes the clock in, so every ruling about ordering,
 //! bounds, expiry and names is a unit test.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender, Target};
@@ -132,6 +132,25 @@ impl SenderKey {
     }
 }
 
+pub type WaiterId = u64;
+
+/// A read that found nothing and waits for mail: answered by the next send to
+/// its pane, by the pane closing, or by its timeout, whichever comes first.
+/// It holds the client's sender, never a lock, so a waiting read blocks
+/// neither the store nor the client's other requests.
+pub struct Waiter {
+    pub client_id: u64,
+    pub pane: PaneId,
+    pub all: bool,
+    /// Whether the read marks what it lists, decided as for a read that
+    /// answers at once: the pane's own caller, not peeking.
+    pub mark: bool,
+    pub tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerMessage>,
+    /// Held only so that dropping the waiter drops it: its timer waits on the
+    /// other end, so every path that removes a waiter ends its timer too.
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+}
+
 #[derive(Default)]
 struct Mailbox {
     /// In id order, which is arrival order.
@@ -206,6 +225,9 @@ pub struct Messaging {
     /// Expired messages dropped since [`Messaging::take_swept`] last asked,
     /// by any path, so the caller can log them once.
     swept: usize,
+    /// In the order they parked, which is the order they are answered in.
+    waiters: BTreeMap<WaiterId, Waiter>,
+    next_waiter: WaiterId,
 }
 
 impl Messaging {
@@ -218,7 +240,90 @@ impl Messaging {
             rate: HashMap::new(),
             closed: HashSet::new(),
             swept: 0,
+            waiters: BTreeMap::new(),
+            next_waiter: 1,
         }
+    }
+
+    /// Park `waiter`, returning its id and the same client's earlier wait,
+    /// which it supersedes: one parked wait per client, never refused, so the
+    /// waiters are bounded by the connections. A closed pane is refused here,
+    /// under the lock that a close takes to answer its waiters, so a wait can
+    /// never park on a pane that has already gone.
+    pub fn park(&mut self, waiter: Waiter) -> Result<(WaiterId, Option<Waiter>), Refusal> {
+        if self.closed.contains(&waiter.pane) {
+            return Err(Refusal::NoSuchTarget(format!("%{}", waiter.pane)));
+        }
+        let earlier = self
+            .waiters
+            .iter()
+            .find(|(_, w)| w.client_id == waiter.client_id)
+            .map(|(&id, _)| id);
+        let superseded = earlier.and_then(|id| self.waiters.remove(&id));
+        let id = self.next_waiter;
+        self.next_waiter += 1;
+        self.waiters.insert(id, waiter);
+        Ok((id, superseded))
+    }
+
+    /// The timeout path: the waiter, if nothing has answered it yet.
+    pub fn unpark(&mut self, id: WaiterId) -> Option<Waiter> {
+        self.waiters.remove(&id)
+    }
+
+    /// Every waiter on `pane`, removed, in the order they parked.
+    pub fn take_waiters_for(&mut self, pane: PaneId) -> Vec<Waiter> {
+        let ids: Vec<WaiterId> = self
+            .waiters
+            .iter()
+            .filter(|(_, w)| w.pane == pane)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.waiters.remove(&id))
+            .collect()
+    }
+
+    /// Answer the waiters on `pane` now that mail has arrived. Every peeking
+    /// waiter is answered, and only the OLDEST marking one: the owner gets
+    /// each message once, as an immediate read would, and a later marking
+    /// waiter stays parked for the next message. All answers come from one
+    /// snapshot taken before anything is marked, so a waiter answered after
+    /// the marking one is not left with an empty list.
+    pub fn answer_waiters(&mut self, pane: PaneId, now_ms: u64) -> Vec<(Waiter, Vec<Message>)> {
+        let mut consumer_seen = false;
+        let ids: Vec<WaiterId> = self
+            .waiters
+            .iter()
+            .filter(|(_, w)| w.pane == pane)
+            .filter(|(_, w)| !w.mark || !std::mem::replace(&mut consumer_seen, true))
+            .map(|(&id, _)| id)
+            .collect();
+        let taken: Vec<Waiter> = ids
+            .into_iter()
+            .filter_map(|id| self.waiters.remove(&id))
+            .collect();
+        let answers: Vec<(Waiter, Vec<Message>)> = taken
+            .into_iter()
+            .map(|w| {
+                let listed = self.read(pane, w.all, false, now_ms);
+                (w, listed)
+            })
+            .collect();
+        for (w, listed) in &answers {
+            if w.mark {
+                let ids: Vec<MsgId> = listed.iter().map(|m| m.id).collect();
+                self.ack(pane, &ids);
+            }
+        }
+        answers
+    }
+
+    /// The disconnect path: forget every waiter of `client_id`.
+    pub fn drop_waiters_of(&mut self, client_id: u64) -> usize {
+        let before = self.waiters.len();
+        self.waiters.retain(|_, w| w.client_id != client_id);
+        before - self.waiters.len()
     }
 
     /// How many expired messages were dropped since the last call.
@@ -995,6 +1100,189 @@ mod tests {
             );
         }
         assert_eq!(bodies(&m.read(2, true, false, 0)), ["line one\nline\ttwo"]);
+    }
+
+    type Answers = tokio::sync::mpsc::UnboundedReceiver<crate::protocol::ServerMessage>;
+    type Cancel = tokio::sync::oneshot::Receiver<()>;
+
+    fn waiter(client_id: u64, pane: PaneId, mark: bool) -> (Waiter, Answers, Cancel) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        (
+            Waiter {
+                client_id,
+                pane,
+                all: false,
+                mark,
+                tx,
+                cancel,
+            },
+            rx,
+            cancelled,
+        )
+    }
+
+    fn park(m: &mut Messaging, w: Waiter) -> WaiterId {
+        m.park(w).expect("parking was refused").0
+    }
+
+    #[test]
+    fn a_parked_waiter_is_unparked_once() {
+        let mut m = Messaging::new(limits());
+        let (w, _rx, _c) = waiter(1, 2, false);
+        let id = park(&mut m, w);
+        assert_eq!(m.unpark(id).map(|w| w.pane), Some(2));
+        assert!(m.unpark(id).is_none(), "a waiter was answered twice");
+    }
+
+    /// Ruling A: one parked wait per client. A second supersedes the first,
+    /// which the caller answers as timed out; it is never refused.
+    #[test]
+    fn a_second_wait_from_one_client_supersedes_the_first() {
+        let mut m = Messaging::new(limits());
+        let (first, _a, _c1) = waiter(1, 2, false);
+        let (second, _b, _c2) = waiter(1, 3, false);
+        let first_id = park(&mut m, first);
+        let (_, superseded) = m.park(second).expect("the second wait was refused");
+        assert_eq!(superseded.map(|w| w.pane), Some(2));
+        assert!(
+            m.unpark(first_id).is_none(),
+            "the superseded wait is still parked"
+        );
+        assert_eq!(m.take_waiters_for(3).len(), 1);
+        let (other, _c, _c3) = waiter(2, 3, false);
+        assert!(
+            m.park(other).expect("refused").1.is_none(),
+            "another client was superseded"
+        );
+    }
+
+    #[test]
+    fn parking_on_a_closed_pane_is_refused() {
+        let mut m = Messaging::new(limits());
+        m.drop_pane(7);
+        let (w, _rx, _c) = waiter(1, 7, false);
+        assert!(matches!(m.park(w), Err(Refusal::NoSuchTarget(_))));
+        assert!(m.take_waiters_for(7).is_empty());
+    }
+
+    /// Ruling B: peekers all get the snapshot, taken before anything is
+    /// marked; only the OLDEST marking waiter consumes the mail, and a later
+    /// marking waiter stays parked for the next message. The owner so gets
+    /// each message once, as an immediate read would.
+    #[test]
+    fn peekers_share_the_snapshot_and_only_the_oldest_marking_waiter_consumes() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        let (owner, _a, _c1) = waiter(1, 2, true);
+        let (peeker, _b, _c2) = waiter(2, 2, false);
+        let (later_owner, _c, _c3) = waiter(3, 2, true);
+        let (elsewhere, _d, _c4) = waiter(4, 9, true);
+        for w in [owner, peeker, later_owner, elsewhere] {
+            park(&mut m, w);
+        }
+        send(&mut m, "a", t0).unwrap();
+        send(&mut m, "b", t0).unwrap();
+
+        let got: Vec<(u64, Vec<String>)> = m
+            .answer_waiters(2, 0)
+            .iter()
+            .map(|(w, msgs)| {
+                (
+                    w.client_id,
+                    bodies(msgs).iter().map(|b| b.to_string()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, vec!["a".to_string(), "b".to_string()]),
+                (2, vec!["a".to_string(), "b".to_string()])
+            ]
+        );
+        assert_eq!(m.unread(2, 0), 0, "the oldest marking waiter did not mark");
+
+        send(&mut m, "c", t0).unwrap();
+        let next: Vec<(u64, Vec<String>)> = m
+            .answer_waiters(2, 0)
+            .iter()
+            .map(|(w, msgs)| {
+                (
+                    w.client_id,
+                    bodies(msgs).iter().map(|b| b.to_string()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            next,
+            [(3, vec!["c".to_string()])],
+            "the later marking waiter was not kept"
+        );
+        assert_eq!(
+            m.take_waiters_for(9).len(),
+            1,
+            "another pane's waiter was taken"
+        );
+    }
+
+    #[test]
+    fn peeking_waiters_alone_mark_nothing() {
+        let mut m = Messaging::new(limits());
+        let (peeker, _rx, _c) = waiter(2, 2, false);
+        park(&mut m, peeker);
+        send(&mut m, "a", Instant::now()).unwrap();
+        assert_eq!(m.answer_waiters(2, 0).len(), 1);
+        assert_eq!(m.unread(2, 0), 1);
+    }
+
+    #[test]
+    fn a_disconnect_drops_only_that_clients_waiters() {
+        let mut m = Messaging::new(limits());
+        let (a1, _a, _c1) = waiter(1, 2, false);
+        let (b1, _c, _c3) = waiter(2, 2, false);
+        park(&mut m, a1);
+        let kept = park(&mut m, b1);
+        assert_eq!(m.drop_waiters_of(1), 1);
+        assert_eq!(m.drop_waiters_of(1), 0);
+        assert_eq!(m.unpark(kept).map(|w| w.client_id), Some(2));
+    }
+
+    /// Every way a waiter leaves the store drops its cancel handle, which is
+    /// what ends its timer: answered, its pane closing, its client leaving,
+    /// or superseded by the same client's next wait.
+    #[test]
+    fn every_removal_path_cancels_the_waiters_timer() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let cancelled = |c: &mut Cancel| matches!(c.try_recv(), Err(TryRecvError::Closed));
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+
+        let (answered, _a, mut c1) = waiter(1, 2, true);
+        park(&mut m, answered);
+        send(&mut m, "a", t0).unwrap();
+        drop(m.answer_waiters(2, 0));
+        assert!(cancelled(&mut c1), "answering did not cancel");
+
+        let (closing, _b, mut c2) = waiter(2, 3, false);
+        park(&mut m, closing);
+        drop(m.take_waiters_for(3));
+        assert!(cancelled(&mut c2), "the pane closing did not cancel");
+
+        let (leaving, _c, mut c3) = waiter(3, 4, false);
+        park(&mut m, leaving);
+        m.drop_waiters_of(3);
+        assert!(cancelled(&mut c3), "the client leaving did not cancel");
+
+        let (first, _d, mut c4) = waiter(4, 5, false);
+        let (second, _e, _c5) = waiter(4, 5, false);
+        park(&mut m, first);
+        drop(m.park(second));
+        assert!(cancelled(&mut c4), "superseding did not cancel");
+
+        let (parked, _f, mut c6) = waiter(5, 6, false);
+        park(&mut m, parked);
+        assert!(!cancelled(&mut c6), "a parked waiter's timer was cancelled");
     }
 
     #[test]

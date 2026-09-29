@@ -85,6 +85,24 @@ Names and status. `[agents] commands = ["sleep"]` makes a pane running
 5h. A named pane that closes frees its name, which another pane can take,
     and the closed pane cannot be named again.
 
+Waiting reads, on panes of their own (Q, R). Nothing here sleeps: a wait
+is shown to have PARKED by what it answers with, since an immediate answer
+from an empty mailbox would be an empty list.
+
+6a. A waiting read of an empty mailbox is answered by the next send to it,
+    with that message, not timed out.
+6b. A wait that nothing answers ends at its deadline, timed out and empty,
+    no earlier than the deadline.
+6c. A client that disconnects while waiting drops its waiter, logged, and a
+    later send is unaffected.
+6d. A pane waiting on its own mailbox gets the message marked Read.
+6e. Two waiters on one pane both get the mail; only the owner's marks it.
+6f. A pane closing while waited on answers the waiter no_such_target.
+6g. One parked wait per client: a client's second wait supersedes its first,
+    which is answered timed out.
+6h. Of two marking waiters on one pane, the older consumes the mail and the
+    younger stays parked for the next message.
+
 1z/3z. No panic in the server log.
 
 Run: python3 tests/frame/msg_mailbox.py   (RMX_RUNDIR overrides the run dir)
@@ -239,6 +257,40 @@ def spawn_sender(msg):
     spawned = cli_spawn("SplitBelow", argv=["python3", WIRE_SEND, srv.sock, in_file, out_file])
     pane = spawned["CliSpawned"]["pane_id"] if name_of(spawned) == "CliSpawned" else None
     return pane, wait_file(out_file)
+
+
+def open_wait(msg):
+    """Send a waiting read on a connection of its own and return it, so the
+    answer can be collected later."""
+    c = Client(srv.sock)
+    c.hello()
+    c.send(msg)
+    return c
+
+
+def collect(c, timeout):
+    """The first answer on `c` that is not a ViewList, or None by `timeout`."""
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            for m in c.drain(0.1):
+                if name_of(m) != "ViewList":
+                    return m
+    finally:
+        c.close()
+    return None
+
+
+def type_start(pane_id, msg):
+    """Like type_send, but return the reply file without waiting on it."""
+    requests[0] += 1
+    n = requests[0]
+    in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
+    with open(in_file, "w") as f:
+        json.dump(msg, f)
+    line = f"python3 {WIRE_SEND} {srv.sock} {in_file} {out_file}\n"
+    cli.send({"InputToPane": {"pane_id": pane_id, "data": list(line.encode())}})
+    return out_file
 
 
 def ask(msg, timeout=3.0):
@@ -732,6 +784,153 @@ try:
     r = ask({"AgentName": {"name": "eta", "pane": Z}})
     check(code_of(r) == "no_such_target", f"5h the closed pane cannot be named again (got {r})")
 
+    # === 6: waiting reads ==================================================
+    # Every send here comes from a fresh pane: A's rate_per_10s would
+    # otherwise decide which case is refused.
+    Q = cli_spawn("NewTab")["CliSpawned"]["pane_id"]
+    R = cli_spawn("SplitRight")["CliSpawned"]["pane_id"]
+
+    def parks_on(pane):
+        return len(re.findall(rf"msg: wait on %{pane} parked for client_id=\d+ ", srv.log()))
+
+    def wait_for_parks(pane, count, timeout=6.0):
+        """Wait until `count` waits have parked on `pane`, by the server's
+        own word, so a send made next cannot race the park."""
+        end = time.time() + timeout
+        while parks_on(pane) < count and time.time() < end:
+            time.sleep(0.05)
+        return parks_on(pane) >= count
+
+    def bodies_of(reply):
+        return [m["body"] for m in reply["MsgList"]["messages"]] if name_of(reply) == "MsgList" else None
+
+    # --- 6a ---------------------------------------------------------------
+    before = parks_on(Q)
+    w = open_wait({"MsgRead": {"pane": Q, "peek": True, "wait_ms": 8000}})
+    check(wait_for_parks(Q, before + 1), f"6a the wait on %{Q} parked")
+    _, r = spawn_sender(send_to({"Pane": Q}, "WAIT:1"))
+    check(name_of(r) == "MsgSent", f"6a a message is sent to %{Q} (got {r})")
+    got = collect(w, 5.0)
+    check(bodies_of(got) == ["WAIT:1"] and got["MsgList"]["timed_out"] is False,
+          f"6a the waiting read is answered by that send (got {got})")
+
+    # --- 6b ---------------------------------------------------------------
+    started = time.time()
+    got = collect(open_wait({"MsgRead": {"pane": R, "peek": True, "wait_ms": 600}}), 5.0)
+    took = time.time() - started
+    check(name_of(got) == "MsgList" and got["MsgList"]["messages"] == []
+          and got["MsgList"]["timed_out"] is True and 0.6 <= took < 5.0,
+          f"6b an unanswered wait times out empty after {took:.2f}s (got {got})")
+
+    # --- 6c ---------------------------------------------------------------
+    before = parks_on(R)
+    gone = open_wait({"MsgRead": {"pane": R, "peek": True, "wait_ms": 30000}})
+    wait_for_parks(R, before + 1)
+    gone.close()
+    line = log_has(r"msg: dropped 1 waiter\(s\) of client_id=\d+ \(disconnected\)$")
+    check(line is not None, "6c a client that disconnects while waiting drops its waiter")
+    _, r = spawn_sender(send_to({"Pane": R}, "WAIT:after-disconnect"))
+    check(name_of(r) == "MsgSent", f"6c a later send to %{R} is unaffected (got {r})")
+
+    # --- 6d ---------------------------------------------------------------
+    # Q's mailbox holds WAIT:1, unread, so it is read first to leave it empty.
+    listed(type_send(Q, {"MsgRead": {}}))
+    before = parks_on(Q)
+    out = type_start(Q, {"MsgRead": {"wait_ms": 8000}})
+    parked = wait_for_parks(Q, before + 1)
+    _, r = spawn_sender(send_to({"Pane": Q}, "WAIT:own"))
+    got = wait_file(out, 8.0)
+    check(name_of(r) == "MsgSent", f"6d a message is sent to %{Q} (got {r})")
+    check(parked and bodies_of(got) == ["WAIT:own"],
+          f"6d Q's own wait is answered with the message (got {got})")
+    state = {m["body"]: m["state"] for m in listed(read_box(Q, all=True)) or []}
+    check(state.get("WAIT:own") == "Read", f"6d ...and it is marked Read (got {state})")
+
+    # --- 6e ---------------------------------------------------------------
+    # The OWNER parks first, so that answering waiters one by one, each
+    # marking as it goes, would leave the peek waiter behind it empty.
+    before = parks_on(Q)
+    out = type_start(Q, {"MsgRead": {"wait_ms": 8000}})
+    wait_for_parks(Q, before + 1)
+    peek = open_wait({"MsgRead": {"pane": Q, "peek": True, "wait_ms": 8000}})
+    wait_for_parks(Q, before + 2)
+    _, r = spawn_sender(send_to({"Pane": Q}, "WAIT:both"))
+    got_own = wait_file(out, 8.0)
+    check(name_of(r) == "MsgSent", f"6e a message is sent to %{Q} (got {r})")
+    got_peek = collect(peek, 5.0)
+    seen = [bodies_of(got_own), bodies_of(got_peek)]
+    check(seen == [["WAIT:both"], ["WAIT:both"]],
+          f"6e the owner and a peek waiter on %{Q} both get the message (got {seen})")
+    state = {m["body"]: m["state"] for m in listed(read_box(Q, all=True)) or []}
+    check(state.get("WAIT:both") == "Read", f"6e ...and the owner's wait marked it Read (got {state})")
+
+    # --- 6f ---------------------------------------------------------------
+    Y, release_y = closable("6f")
+    before = parks_on(Y)
+    w = open_wait({"MsgRead": {"pane": Y, "peek": True, "wait_ms": 30000}})
+    wait_for_parks(Y, before + 1)
+    open(release_y, "w").close()
+    got = collect(w, 8.0)
+    check(code_of(got) == "no_such_target" and "closed while waiting" in got["Error"]["message"],
+          f"6f %{Y} closing answers its waiter no_such_target (got {got})")
+
+    # --- 6g: ruling A, one parked wait per client ------------------------
+    # R still holds 6c's message, which would answer a wait at once.
+    ask({"MsgAck": {"pane": R, "all": True}})
+    c = Client(srv.sock)
+    c.hello()
+    before = parks_on(R)
+    c.send({"MsgRead": {"pane": R, "peek": True, "wait_ms": 30000}})
+    check(wait_for_parks(R, before + 1), f"6g the first wait on %{R} parked")
+    c.send({"MsgRead": {"pane": R, "peek": True, "wait_ms": 30000}})
+    first = None
+    end = time.time() + 5.0
+    while first is None and time.time() < end:
+        for m in c.drain(0.1):
+            if name_of(m) == "MsgList":
+                first = m
+                break
+    check(first is not None and first["MsgList"]["timed_out"] is True and first["MsgList"]["messages"] == [],
+          f"6g a client's second wait supersedes its first, answered timed out (got {first})")
+    wait_for_parks(R, before + 2)
+    # From a fresh pane: A has used up its rate_per_10s by now.
+    _, r = spawn_sender(send_to({"Pane": R}, "WAIT:second"))
+    check(name_of(r) == "MsgSent", f"6g the next send to %{R} is stored (got {r})")
+    second = collect(c, 5.0)
+    check(bodies_of(second) == ["WAIT:second"],
+          f"6g ...and the second wait is answered by the next send (got {second})")
+
+    # --- 6h: ruling B, only the oldest marking waiter consumes -----------
+    # Two readers IN Q, each its own process and connection, run in the
+    # background so the shell starts both.
+    def type_start_bg(pane_id, msg):
+        requests[0] += 1
+        n = requests[0]
+        in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
+        with open(in_file, "w") as f:
+            json.dump(msg, f)
+        line = f"python3 {WIRE_SEND} {srv.sock} {in_file} {out_file} &\n"
+        cli.send({"InputToPane": {"pane_id": pane_id, "data": list(line.encode())}})
+        return out_file
+
+    before = parks_on(Q)
+    older = type_start_bg(Q, {"MsgRead": {"wait_ms": 20000}})
+    wait_for_parks(Q, before + 1)
+    younger = type_start_bg(Q, {"MsgRead": {"wait_ms": 20000}})
+    wait_for_parks(Q, before + 2)
+    _, r1 = spawn_sender(send_to({"Pane": Q}, "WAIT:first"))
+    got_older = wait_file(older, 8.0)
+    _, r2 = spawn_sender(send_to({"Pane": Q}, "WAIT:second"))
+    got_younger = wait_file(younger, 8.0)
+    check([name_of(r1), name_of(r2)] == ["MsgSent", "MsgSent"],
+          f"6h both sends to %{Q} are stored (got {[r1, r2]})")
+    # Decisive without timing: had the younger waiter been answered by the
+    # first send, it would carry WAIT:first.
+    check(bodies_of(got_older) == ["WAIT:first"],
+          f"6h the older marking waiter consumes the first message (got {got_older})")
+    check(bodies_of(got_younger) == ["WAIT:second"],
+          f"6h the younger one stayed parked and gets only the second (got {got_younger})")
+
     # --- 3i ---------------------------------------------------------------
     log = srv.log()
     check(re.search(rf"msg: id=1 from=%{A}\(-\) to=%{B} bytes=7 deliver=Auto -> mailbox", log) is not None,
@@ -740,7 +939,7 @@ try:
           "3i the send's attribution is logged, by Sid")
     bodies = [b for b in ("MSG:one", "MSG:two", "MSG:leader", "MSG:outside", "MSG:inherited",
                           "MSG:to-popup", "MSG:from-popup", "MSG:paste", "MSG:forged",
-                          "ACK:1", "CAP:1", "RATE:1", "GONE:1", "NAME:1")
+                          "ACK:1", "CAP:1", "RATE:1", "GONE:1", "NAME:1", "WAIT:1")
               if b in log]
     check(bodies == [], f"3i no message body is in the server log (found {bodies})")
 

@@ -747,7 +747,7 @@ async fn handle_msg_send(
     }
 
     let bytes = msg.body.len();
-    let (sent, swept) = {
+    let (sent, swept, answered) = {
         let mut store = store.lock().await;
         let to_name = store.name_of(to).map(str::to_string);
         let sent = store
@@ -764,8 +764,25 @@ async fn handle_msg_send(
                 std::time::Instant::now(),
             )
             .map(|id| (id, to_name));
-        (sent, store.take_swept())
+        let answered = if sent.is_ok() {
+            store.answer_waiters(to, now_ms())
+        } else {
+            Vec::new()
+        };
+        (sent, store.take_swept(), answered)
     };
+    for (waiter, messages) in answered {
+        log::info!(
+            "msg: wait on %{to} answered n={} for client_id={}",
+            messages.len(),
+            waiter.client_id
+        );
+        let _ = waiter.tx.send(ServerMessage::MsgList {
+            pane: to,
+            messages,
+            timed_out: false,
+        });
+    }
     if swept > 0 {
         log::info!("msg: swept {swept} expired message(s)");
     }
@@ -1024,16 +1041,52 @@ async fn handle_agent_status(
     ServerMessage::AgentStatusList { panes: entries }
 }
 
+/// The longest a read may wait for mail, whatever it asks for. A waiter holds
+/// only a channel sender, so the bound is about not keeping a forgotten
+/// request alive for ever, not about cost.
+const MAX_WAIT_MS: u64 = 3_600_000;
+
+/// End a parked wait at its deadline, answering it timed out. Returns whether
+/// it did: removing the waiter from the store by any other path (answered,
+/// its pane closing, its client leaving, superseded) drops the waiter's end
+/// of `cancelled`, and the timer then ends at once without answering.
+async fn wait_out(
+    id: crate::server::messaging::WaiterId,
+    pane: PaneId,
+    wait_ms: u64,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+    store: &'static Mutex<Messaging>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
+        _ = cancelled => return false,
+    }
+    let Some(waiter) = store.lock().await.unpark(id) else {
+        return false;
+    };
+    log::debug!("msg: wait on %{pane} timed out after {wait_ms}ms");
+    let _ = waiter.tx.send(ServerMessage::MsgList {
+        pane,
+        messages: Vec::new(),
+        timed_out: true,
+    });
+    true
+}
+
 /// List a mailbox. Only the caller's own mailbox is ever marked read: a read
 /// of anyone else's, or from outside any pane, is a peek whatever it asked.
+///
+/// With `wait_ms`, a read that finds nothing parks instead of answering and
+/// returns `None`; see [`crate::server::messaging::Waiter`].
 async fn handle_msg_read(
     client_id: u64,
     msg: MailboxRead,
     peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    store: &Mutex<Messaging>,
-) -> ServerMessage {
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
     let (pane, caller) = match mailbox_of(
         client_id,
         "MsgRead",
@@ -1046,28 +1099,91 @@ async fn handle_msg_read(
     .await
     {
         Ok(found) => found,
-        Err(refused) => return refused,
+        Err(refused) => return Some(refused),
     };
     let mark = caller == Some(pane) && !msg.peek;
-    if let Some(wait_ms) = msg.wait_ms {
-        log::debug!("msg: read wait_ms={wait_ms} is not supported yet; answering at once");
-    }
-    let (messages, swept) = {
+    // Cloned before the store is locked: a waiter answers through it later.
+    let tx = match msg.wait_ms {
+        Some(_) => clients
+            .lock()
+            .await
+            .get(&client_id)
+            .map(|conn| conn.tx.clone()),
+        None => None,
+    };
+    // The reader that called this is this client's, so it is in the map.
+    debug_assert!(
+        msg.wait_ms.is_none() || tx.is_some(),
+        "a waiting read from client_id={client_id}, which is not in the client map"
+    );
+    let has_tx = tx.is_some();
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    // The read and the park happen under one lock, and a send delivers and
+    // collects waiters under the same lock, so no message can arrive between
+    // "nothing to read" and "waiting".
+    let (messages, swept, parked) = {
         let mut store = store.lock().await;
         let messages = store.read(pane, msg.all, mark, now_ms());
-        (messages, store.take_swept())
+        let swept = store.take_swept();
+        let parked = match (msg.wait_ms, tx) {
+            (Some(wait_ms), Some(tx)) if messages.is_empty() => Some((
+                store.park(crate::server::messaging::Waiter {
+                    client_id,
+                    pane,
+                    all: msg.all,
+                    mark,
+                    tx,
+                    cancel,
+                }),
+                wait_ms.min(MAX_WAIT_MS),
+            )),
+            _ => None,
+        };
+        (messages, swept, parked)
     };
     if swept > 0 {
         log::info!("msg: swept {swept} expired message(s)");
     }
+    match parked {
+        Some((Err(_), _)) => {
+            return Some(ServerMessage::refused(
+                "no_such_target",
+                format!("pane %{pane} closed while waiting"),
+            ))
+        }
+        Some((Ok((id, superseded)), wait_ms)) => {
+            if let Some(earlier) = superseded {
+                log::debug!(
+                    "msg: wait on %{} superseded for client_id={client_id}",
+                    earlier.pane
+                );
+                let _ = earlier.tx.send(ServerMessage::MsgList {
+                    pane: earlier.pane,
+                    messages: Vec::new(),
+                    timed_out: true,
+                });
+            }
+            log::debug!("msg: wait on %{pane} parked for client_id={client_id} ({wait_ms}ms)");
+            tokio::spawn(wait_out(id, pane, wait_ms, cancelled, store));
+            return None;
+        }
+        None => {}
+    }
+    if msg.wait_ms.is_some() && messages.is_empty() && !has_tx {
+        return Some(ServerMessage::MsgList {
+            pane,
+            messages,
+            timed_out: true,
+        });
+    }
     if !messages.is_empty() {
         log::info!("msg: read pane=%{pane} n={} marked={mark}", messages.len());
     }
-    ServerMessage::MsgList {
+    Some(ServerMessage::MsgList {
         pane,
         messages,
         timed_out: false,
-    }
+    })
 }
 
 /// Mark messages Read without returning them. Naming another pane's mailbox
@@ -2531,10 +2647,15 @@ async fn handle_client_message(
                 peer,
                 state,
                 panes,
+                clients,
                 messaging(),
             )
             .await;
-            reply(client_id, clients, answer).await;
+            // `None` is a read that parked: its answer comes later, from the
+            // send that brings mail, the pane closing, or its timeout.
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer).await;
+            }
             Ok(())
         }
         ClientMessage::MsgAck {
@@ -6076,6 +6197,10 @@ async fn handle_client_disconnect(
     {
         let mut cls = clients.lock().await;
         cls.remove(&client_id);
+    }
+    let dropped = messaging().lock().await.drop_waiters_of(client_id);
+    if dropped > 0 {
+        log::info!("msg: dropped {dropped} waiter(s) of client_id={client_id} (disconnected)");
     }
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
@@ -10407,6 +10532,16 @@ async fn reap_panes(
     {
         let mut store = messaging().lock().await;
         for &pane_id in pane_ids {
+            for waiter in store.take_waiters_for(pane_id) {
+                log::info!(
+                    "msg: wait on %{pane_id} ended: the pane closed (client_id={})",
+                    waiter.client_id
+                );
+                let _ = waiter.tx.send(ServerMessage::refused(
+                    "no_such_target",
+                    format!("pane %{pane_id} closed while waiting"),
+                ));
+            }
             let (dropped, name) = store.drop_pane(pane_id);
             if dropped > 0 || name.is_some() {
                 log::info!(
@@ -12115,6 +12250,90 @@ mod tests {
             )
             .await;
             assert!(done.is_ok(), "the identity line waited on the panes lock");
+        }
+    }
+
+    mod waiting {
+        use tokio::sync::Mutex;
+
+        use super::super::wait_out;
+        use crate::protocol::{Sender, ServerMessage};
+        use crate::server::messaging::{Messaging, Waiter};
+
+        fn store() -> &'static Mutex<Messaging> {
+            Box::leak(Box::new(Mutex::new(Messaging::new(
+                crate::config::messaging::MessagingConfig::default().limits(),
+            ))))
+        }
+
+        fn waiter(
+            pane: u64,
+        ) -> (
+            Waiter,
+            tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
+            tokio::sync::oneshot::Receiver<()>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            let w = Waiter {
+                client_id: 1,
+                pane,
+                all: false,
+                mark: false,
+                tx,
+                cancel,
+            };
+            (w, rx, cancelled)
+        }
+
+        /// An answered waiter's timer ends at once, without answering again;
+        /// a waiter nobody answers is answered timed out at its deadline.
+        #[tokio::test(start_paused = true)]
+        async fn answering_a_waiter_ends_its_timer_early() {
+            const HOUR_MS: u64 = 3_600_000;
+            let store = store();
+            let (w, mut answers, cancelled) = waiter(2);
+            let id = store.lock().await.park(w).unwrap().0;
+            let timer = tokio::spawn(wait_out(id, 2, HOUR_MS, cancelled, store));
+            tokio::task::yield_now().await;
+            let started = tokio::time::Instant::now();
+            {
+                let mut s = store.lock().await;
+                s.send(
+                    Sender::Pane {
+                        pane_id: 1,
+                        name: None,
+                        session: "main".into(),
+                    },
+                    2,
+                    "hi".into(),
+                    None,
+                    0,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+                drop(s.answer_waiters(2, 0));
+            }
+            assert!(
+                !timer.await.unwrap(),
+                "the answered waiter's timer answered it again"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(HOUR_MS),
+                "the timer ran to its deadline"
+            );
+            assert!(answers.try_recv().is_err(), "a timed-out answer was sent");
+
+            let (w, mut answers, cancelled) = waiter(3);
+            let id = store.lock().await.park(w).unwrap().0;
+            assert!(wait_out(id, 3, HOUR_MS, cancelled, store).await);
+            assert!(matches!(
+                answers.try_recv(),
+                Ok(ServerMessage::MsgList {
+                    timed_out: true,
+                    ..
+                })
+            ));
         }
     }
 
