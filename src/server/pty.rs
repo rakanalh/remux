@@ -1195,6 +1195,13 @@ mod tests {
             None,
         )
         .expect("openpty failed");
+        // As `Pty::spawn` does, and for the same reason: a pane shell forked by
+        // a parallel test would otherwise keep this slave open, and
+        // `the_fallback_read_reports_the_slave_closing` would see it still
+        // open after dropping it.
+        for fd in [pair.master.as_raw_fd(), pair.slave.as_raw_fd()] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("FD_CLOEXEC failed");
+        }
         let raw = pair.master.as_raw_fd();
         // SAFETY: `pair.master` owns a valid descriptor for the whole test.
         unsafe {
