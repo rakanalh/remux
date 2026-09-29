@@ -162,12 +162,19 @@ def main():
     for m in c.drain(0.6):
         grid.apply(m)
 
-    # A 2-pane layout, each pane holding a distinct marker.
-    c.send({"Input": {"data": list(b"echo PANE_ONE_MARK\n")}})
+    # A 2-pane layout, each pane holding a distinct marker on its SECOND
+    # content row (frame row 2), which is above the popup's top edge (row 3).
+    #
+    # The prompt is pinned first. The pane runs a login shell, so its prompt
+    # comes from the system profile and typically includes the cwd; a long cwd
+    # wraps prompt + command across two rows of a 48-column pane, which pushes
+    # the marker under the popup and fails case 1 for a reason unrelated to the
+    # popup. `printf` assembles the marker, so the typed line never contains it.
+    c.send({"Input": {"data": list(b"PS1='$ '; clear; printf 'PANE_%s_MARK\\n' ONE\n")}})
     time.sleep(0.4)
     c.send({"Command": "PaneSplitVertical"})
     time.sleep(0.6)
-    c.send({"Input": {"data": list(b"echo PANE_TWO_MARK\n")}})
+    c.send({"Input": {"data": list(b"PS1='$ '; clear; printf 'PANE_%s_MARK\\n' TWO\n")}})
     time.sleep(0.5)
     for m in c.drain(0.6):
         grid.apply(m)
@@ -376,7 +383,7 @@ def main():
     check("POPUP_ONLY_MARK" not in grid.text(),
           "no popup content lingers anywhere on the frame")
 
-    c.send({"Input": {"data": list(b"echo AFTER_CLOSE_MARK\n")}})
+    c.send({"Input": {"data": list(b"printf 'AFTER_%s_MARK\\n' CLOSE\n")}})
     time.sleep(0.9)
     for m in c.drain(0.8):
         grid.apply(m)
