@@ -1105,11 +1105,16 @@ where
         );
         anyhow::bail!("frame of {len} bytes is over the limit");
     }
-    let mut payload = vec![0u8; len];
-    reader
-        .read_exact(&mut payload)
+    // Grown as the bytes arrive rather than reserved at the claimed length, so
+    // a peer that sends a large header and nothing else costs almost nothing.
+    let mut payload = Vec::with_capacity(len.min(64 * 1024));
+    let got = AsyncReadExt::take(&mut *reader, len as u64)
+        .read_to_end(&mut payload)
         .await
         .context("reading message payload")?;
+    if got < len {
+        anyhow::bail!("connection closed mid-frame ({got} of {len} bytes)");
+    }
 
     let msg: T = serde_json::from_slice(&payload).context("deserializing message")?;
     Ok(Some(msg))
@@ -11818,6 +11823,24 @@ mod tests {
                 assert!(
                     format!("{err:#}").contains("over the limit"),
                     "a {len}-byte frame got past the cap and failed later: {err:#}"
+                );
+            }
+        }
+
+        /// A peer that promises a frame and hangs up partway is a closed
+        /// connection, and says so, rather than an I/O error about EOF.
+        #[tokio::test]
+        async fn a_frame_cut_short_is_a_connection_closed_mid_frame() {
+            for claimed in [10u32, MAX_FRAME_BYTES as u32] {
+                let mut wire = claimed.to_be_bytes().to_vec();
+                wire.extend_from_slice(b"{\"Det");
+                let mut reader: &[u8] = &wire;
+                let err = read_message::<ClientMessage>(&mut reader)
+                    .await
+                    .expect_err("a truncated frame was accepted");
+                assert!(
+                    format!("{err:#}").contains("connection closed mid-frame (5 of"),
+                    "claimed {claimed}: {err:#}"
                 );
             }
         }
