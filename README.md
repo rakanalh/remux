@@ -6,7 +6,9 @@
 
 A modern terminal multiplexer written in Rust. Combines tmux's session persistence with zellij's visual pane borders, adds a modal keybinding system with which-key discoverability, and throws in pane stacking, multiple layout algorithms, a tree-view session manager, first-class SSH remote sessions, and **Views** — a single screen composed of live panes borrowed from any session on any machine.
 
-Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Keybindings, theme, and remotes hot-reload on save; the server-side `[agents]` section is read at startup and needs `remux restart`.
+Built on a client-server architecture with Unix socket IPC, async I/O via tokio, VTE-based terminal parsing, and crossterm rendering with diff-based updates. Keybindings, remotes, sidebars and client-drawn colours apply on save; settings the server reads (such as `[general]`, `[layouts]`, `[agents]` and the colours of pane borders and the status bar) need `remux restart`.
+
+**Documentation: [https://rakanalh.github.io/remux/](https://rakanalh.github.io/remux/)** — install, quick start, configuration reference, keybindings, and a page per feature.
 
 ---
 
@@ -32,7 +34,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Move to tab** — `Ctrl-a p t` opens a picker of the session's other tabs plus `+ new tab`; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it. A tab left empty closes.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
-- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows); turn any of them off under `[layouts]`.
+- **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement); turn any of them off under `[layouts]`.
 - **Popup terminal** — a scratch terminal that floats centered on top of the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per session — toggle it from any tab and it follows you. Sized as a percentage of the screen (`popup_width_pct` / `popup_height_pct`, default 80×80) and resizable while open with the pane-resize keys. It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
@@ -71,7 +73,7 @@ Tmux style borders (the Zellij style is what every other screenshot shows):
 
 - **Modal input** — Normal, Command, Visual, and Search modes. In **Normal** mode keys pass straight through to the running application.
 - **Leader key** — the leader (`Ctrl-a` by default) enters **Command** mode, which drives a tree of keybindings.
-- **Which-key popup** — after the leader, a popup lists the available keys at the current tree level (and the global Alt shortcuts, emacs-style). Appearance delay is configurable via `timeout_ms`.
+- **Which-key popup** — after the leader, a popup lists the available keys at the current tree level (and the global Alt shortcuts, emacs-style). It opens as soon as you press the leader.
 - **Configurable which-key position** — `anchored` (bordered box centered horizontally, anchored bottom), `centered` (bordered box, both axes), or `full_width` (a bordered ivy/emacs-style panel spanning the terminal width above the status bar).
 - **Instant Alt shortcuts** — a set of `Alt-…` shortcuts act immediately in Normal mode without pressing the leader first.
 - **Command palette** — `Ctrl-a :` opens a searchable list of every command.
@@ -98,7 +100,10 @@ The which-key popup after the leader, then `which_key_position = "centered"` and
 
 - **Remote attach over SSH** — declare servers in `[remotes.<name>]` (or connect ad-hoc with `RemoteConnect user@host`). Each remote is a top-level node in the session manager tree.
 - **Unified lazy tree** — expanding a remote node lazily connects over SSH (spawning `remux relay` on the remote) and lists that server's sessions, merged into the same tree as local sessions.
-- **Foreground handoff** — attaching to a remote session hands the render loop over to the remote transport, so remote sessions feel just like local ones. Structural edits (create/delete/rename/move) stay local-only; remotes support expand and switch-to-session/tab/pane.
+- **Foreground handoff** — attaching to a remote session hands the render loop over to the remote transport, so remote sessions feel just like local ones.
+- **Edit remote trees in place** — the session manager's edits (create, move and delete folders and sessions, new/close tabs and panes, renames) go to the server of the selected row, local or remote. Only resurrecting a dormant session is local-only.
+
+Full details: [https://rakanalh.github.io/remux/remotes/](https://rakanalh.github.io/remux/remotes/)
 
 ### Views (cross-machine multi-pane)
 
@@ -107,6 +112,8 @@ The which-key popup after the leader, then `which_key_position = "centered"` and
 - **Shared across terminals** — views live on the server, so every terminal on the machine sees the same views in the switcher. Add a pane in one terminal and any terminal displaying that view repaints live; focus, layout, and zoom are mirrored too. (Views are in-memory: they clear when the server restarts.)
 - **Real layouts** — views use the same layout engine as normal tabs (Grid by default, or the first enabled layout if `[layouts]` disables Grid; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
 - **Re-entry via the switcher** — the quick switcher (`Alt-s`) lists views alongside sessions; selecting one enters it.
+
+Full details: [https://rakanalh.github.io/remux/views/](https://rakanalh.github.io/remux/views/)
 
 A view over four panes from three local sessions and a `devbox` remote, in Grid and in Monocle with its title strip:
 
@@ -122,6 +129,8 @@ A view over four panes from three local sessions and a `devbox` remote, in Grid 
 - **`agents` panel** — every pane running an AI coding agent, across local and remote, colour-coded by what it is doing: **red** needs your input, **yellow** is working, dim is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to that pane wherever it is. Detection reads the pane's foreground process, so it sees `claude` running *inside* a shell — and looks through a launcher such as an npm shim, `npx` or `bunx` to the agent it started; it works on **Linux and macOS**, it is the *server's* platform that decides, and a server that cannot detect says so rather than showing an empty list.
 - **Agent switcher** — `Alt-a` (or `Ctrl-a x a`) lists every pane running an AI agent, on local **and** connected remote servers, with the same state colours as the agents panel. `j`/`k` (or the arrows) and `g`/`G` move, `Enter` jumps to the pane, `Esc` closes. It works with no agents sidebar configured.
 
+Full details: [https://rakanalh.github.io/remux/agents/](https://rakanalh.github.io/remux/agents/)
+
 The `agents` panel docked in a sidebar, and the `Alt-a` switcher over the same four agents:
 
 <img src="docs/screenshots/sidebar-agents.png" width="360" alt="Agents sidebar panel docked beside the panes">
@@ -132,6 +141,8 @@ The `agents` panel docked in a sidebar, and the `Alt-a` switcher over the same f
 - **Navigation** — `Alt-h/j/k/l` move into and out of a sidebar exactly as they move between panes, so there is nothing new to learn; `Ctrl-a b h/l/j` show and hide the left/right/bottom one and `Ctrl-a b b` walks focus through every visible panel and then back to the panes. While a panel has focus the resize keys re-target: across the edge they resize the **sidebar**, along it they adjust the focused **panel's share**. Visibility, size, and panel weights are remembered between runs.
 - **The `files` panel follows the focused pane** — it shows the directory of the pane you are focused **on**, and it moves when **focus** moves, *not* when you `cd`. That is the one thing that looks broken by hand: typing `cd ~/project` in a pane does not move the panel. Navigate the panel yourself with `h`/`l` and it stays where you put it, resuming its following once it is back on the pane's own directory. It follows the pane's **machine** too — focus a pane on a remote and it lists that remote's filesystem.
 - **Config edits apply live**, with one visible cost: reloading rebuilds the panels, so a `sessions` tree loses its expansion and selection. The alternative was a `[[sidebar]]` block that needed a client restart to appear.
+
+Full details: [https://rakanalh.github.io/remux/sidebars/](https://rakanalh.github.io/remux/sidebars/)
 
 All three at once: `sessions` on the left, `agents` on the right, `files` along the bottom:
 
@@ -151,7 +162,7 @@ The `sessions` panel with a remote connected, and the `files` panel:
 ### Theming & configuration
 
 - **Configurable theming** — named colors, CSS hex, ANSI 256 indices, and RGB tuples. Per-mode status bar colors, frame colors, tab colors, which-key colors, search-highlight colors, and more (defaults are Catppuccin Mocha).
-- **Hot-reload** — a file watcher reloads `~/.config/remux/config.toml` on save and the client applies new **keybindings, theme, and remotes** live. Server-side settings — `[agents]`, and the general/persistence options the daemon reads at startup — need `remux restart`.
+- **Hot-reload** — a file watcher reloads `~/.config/remux/config.toml` on save and the client applies what it owns live: **keybindings, remotes, sidebars**, `pane_title`, `tab_style`, `which_key_position`, and the colours of what the client draws (overlays, which-key, sidebars, Views, search highlights). The server reads the file once, at startup, so everything else needs `remux restart`: `[general]` (persistence included), `border_style`, `default_layout`, `popup_width_pct` / `popup_height_pct`, `[layouts]`, `[agents]`, and the colours of what the server draws (pane borders, tab strips and the status bar in ordinary tabs). See [When changes apply](https://rakanalh.github.io/remux/theme/#when-changes-apply).
 - **Fully configurable keybindings** — override or unbind any leader-tree key or Alt shortcut, remap the leader, and chain commands. See [Keybindings](#keybindings) and [Chaining commands](#chaining-commands).
 
 Pane borders named by `pane_title = "{session}:{tab} {command} ({cwd})"`:
@@ -172,7 +183,11 @@ Here with a `services` folder and a `devbox` remote expanded:
 
 ![Session manager](docs/screenshots/session-manager.png)
 
+Full details: [https://rakanalh.github.io/remux/sessions/](https://rakanalh.github.io/remux/sessions/)
+
 ## Layouts
+
+Full details: [https://rakanalh.github.io/remux/layouts/](https://rakanalh.github.io/remux/layouts/)
 
 ### BSP (Binary Space Partitioning)
 
@@ -218,6 +233,8 @@ Manual splits created by you. No automatic redistribution — your exact arrange
 
 ## Install / build / run
 
+Full details: [https://rakanalh.github.io/remux/install/](https://rakanalh.github.io/remux/install/) · Quick start: [https://rakanalh.github.io/remux/quick-start/](https://rakanalh.github.io/remux/quick-start/)
+
 ### Install with cargo
 
 ```bash
@@ -237,14 +254,16 @@ Requires a Unix/Linux system (uses POSIX PTY).
 ### CLI usage
 
 ```
-remux                                          # Attach to "main" (creating it if needed)
-remux new --session <name> [--folder <dir>]    # Create a session
+remux                                          # Attach to the first session (creating "main" if there are none)
+remux new --session <name> [--folder <name>]   # Create a session, filed under a session-tree folder
 remux attach <name>                            # Attach to a session
 remux ls                                       # List sessions
 remux kill <name>                              # Kill a session
 remux stop                                     # Stop the server, saving sessions first
 remux restart                                  # Stop and start it again
 ```
+
+Full details: [https://rakanalh.github.io/remux/cli/](https://rakanalh.github.io/remux/cli/)
 
 ### Talking to Remux from inside a pane
 
@@ -271,14 +290,16 @@ This is what makes an external file manager's opener hook work: point `NNN_OPENE
 
 ### Configuration file
 
-Remux reads `~/.config/remux/config.toml`. A complete, fully-commented reference lives in [`config.sample.toml`](config.sample.toml) — every option is shown commented-out at its default value, so copying it verbatim reproduces the built-in defaults:
+Remux reads `~/.config/remux/config.toml`. A complete, fully-commented reference lives in [`config.sample.toml`](config.sample.toml) — every option is shown commented-out at its default value, so copying it verbatim reproduces the built-in defaults (the few options with no default value, such as `frame_bg`, are shown with an example value and marked as such):
 
 ```bash
 mkdir -p ~/.config/remux
 cp config.sample.toml ~/.config/remux/config.toml
 ```
 
-Client-side edits — keybindings, theme, remotes, sidebars — are picked up automatically by the file watcher. Settings the **server** reads, `[agents]` in particular, need `remux restart`.
+Client-side edits — keybindings, remotes, sidebars, `pane_title`, `tab_style`, `which_key_position`, and client-drawn colours — are picked up automatically by the file watcher. Settings the **server** reads — `[general]`, `border_style`, `default_layout`, the popup size, `[layouts]`, `[agents]`, and the colours of pane borders, tab strips and the status bar — need `remux restart`.
+
+Full details: [https://rakanalh.github.io/remux/configuration/](https://rakanalh.github.io/remux/configuration/)
 
 ## Keybindings
 
@@ -289,6 +310,8 @@ Remux is modal:
 - **Alt shortcuts** act **instantly in Normal mode** — no leader press required.
 
 Both the leader tree and the Alt shortcuts are fully configurable and **hot-reload live**. The which-key popup lists both the current tree level and the global Alt shortcuts.
+
+Full details: [https://rakanalh.github.io/remux/keybindings/](https://rakanalh.github.io/remux/keybindings/) · The keys by task: [https://rakanalh.github.io/remux/keyboard/](https://rakanalh.github.io/remux/keyboard/)
 
 ### Leader tree (default, leader = `Ctrl-a`)
 
@@ -325,6 +348,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `H` / `J` / `K` / `L` | Move (swap) pane left / down / up / right; in a stack, `H` / `L` move it along the stack, then out of it at the end, and `J` / `K` take it out below / above *(→ Normal)* |
 | `z` | Toggle zoom *(→ Normal)* |
 | `o` | Toggle the popup terminal *(→ Normal)* |
+| `m` | Make the focused pane the master (Master layout) *(→ Normal)* |
 | `r` | Rename pane |
 | `t` | Move the pane to another tab, or a new one (opens a picker) |
 | `a` | Add pane to stack *(→ Normal)* |
@@ -370,6 +394,7 @@ The focused pane must share a stack with at least one other pane; alone in its s
 | Key | Action |
 |-----|--------|
 | `s` | Quick session switcher |
+| `a` | Agent switcher (local + remote) |
 | `o` | Last session (toggle) |
 | `n` | New session |
 | `r` | Rename session |
@@ -424,6 +449,7 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | `Alt-z` | Toggle pane zoom |
 | `Alt-p` | Toggle the popup terminal |
 | `Alt-Space` | Cycle layout |
+| `Alt-m` | Make the focused pane the master (Master layout) |
 
 ### Visual mode
 
@@ -460,33 +486,37 @@ It opens on the **tree**, with the highlight already on the session you are atta
 
 | Key | Action |
 |-----|--------|
-| `Up` / `Down` | Navigate the tree |
+| `j` / `k` or `Down` / `Up` | Navigate the tree |
 | `/` | Focus the search bar (filter the tree); `Tab` / `Down` / `Enter` hands focus back |
-| `Enter` | Switch to node (or expand it) |
-| `l` / `Right` / `+` | Expand (including connecting a remote, or reconnecting a disconnected one) |
-| `h` / `Left` / `-` | Collapse |
-| `}` / `{` | Switch tab within the highlighted session |
+| `Ctrl-u` | Clear the search query (while the search bar has focus) |
+| `Enter` | Switch to node (or expand it; on a remote, this also connects it) |
+| `l` / `Right` | Expand (including connecting a remote, or reconnecting a disconnected one) |
+| `h` / `Left` | Collapse |
+| `+` / `-` | Expand / collapse without connecting |
 | `n` | New session |
 | `c` | New folder |
 | `d` | Delete session — or, on a **connected remote's** server row, disconnect it (`y` to confirm) |
 | `m` | Move session |
 | `Space` | Mark/unmark the highlighted pane (multi-select, across servers) |
 | `v a` | Add the marked panes (or the highlighted one) to a view |
-| `Esc` | Close |
+| `v r` / `v x` / `v d` | Rename a view / remove a cell / delete a view |
+| `Esc` / `q` | Close |
+
+It also takes two-key chords for tabs, panes, sessions and folders (`t n`, `t r`, `p x`, `s m`, `f n`, …), acting on the highlighted row.
 
 ## Commands
 
-Every command below is a `RemuxCommand` recognised by the config parser and the command palette. Commands are written in PascalCase; arguments are space-separated (quote any argument containing spaces, e.g. `SessionNew "my project"`).
+Every command below is a `RemuxCommand` recognised by the config parser and the command palette. Commands are written in PascalCase; arguments are space-separated (quote any argument containing spaces, e.g. `FolderNew "my project"`). The naming commands — `SessionNew`, `SessionRename`, `TabRename`, `PaneRename` — always open a prompt and ignore any arguments.
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
 | `TabNew` | — | Create a new tab. |
 | `TabClose` | — | Close the active tab. |
-| `TabRename` | `<name>` | Rename the active tab. |
+| `TabRename` | — | Rename the active tab (prompts for the name). |
 | `TabGoto` | `<index>` | Jump to the tab at the given 0-based index. |
 | `TabNext` | — | Focus the next tab. |
 | `TabPrev` | — | Focus the previous tab. |
-| `TabMove` | `<index>` | Move the active tab to the given position (default 0). |
+| `TabMove` | `[index]` | Move the active tab to the given 1-based position; `0`, `1` or no index moves it first. |
 | `PaneNew` | — | Open a new pane in the current tab. |
 | `PaneClose` | — | Close the focused pane. |
 | `PaneSplitVertical` | — | Split the focused pane vertically. |
@@ -510,16 +540,16 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneMoveRight` | — | Swap the focused pane with its right neighbour. In a stack of several panes, move it one place toward the stack's end; at the end, take it out of the stack into a new slot on the right. |
 | `PaneMoveUp` | — | Swap the focused pane with the pane above. In a stack of several panes, take it out of the stack into a new slot above. |
 | `PaneMoveDown` | — | Swap the focused pane with the pane below. In a stack of several panes, take it out of the stack into a new slot below. |
-| `PaneRename` | `<name>` | Rename the focused pane. |
+| `PaneRename` | — | Rename the focused pane (prompts for the name). |
 | `PaneMoveToTab` | — | Pick another tab of the session (or `+ new tab`) and move the focused pane there. |
 | `PaneToggleZoom` | — | Toggle fullscreen zoom for the focused pane. |
 | `ResizeLeft` | `<amount>` | Resize the focused pane's left edge (default 1). |
 | `ResizeRight` | `<amount>` | Resize the focused pane's right edge (default 1). |
 | `ResizeUp` | `<amount>` | Resize the focused pane's top edge (default 1). |
 | `ResizeDown` | `<amount>` | Resize the focused pane's bottom edge (default 1). |
-| `SessionNew` | `<name> [folder]` | Create a new session, optionally inside a folder. |
+| `SessionNew` | — | Create a new session (prompts for the name). |
 | `SessionDetach` | — | Detach the client from the current session. |
-| `SessionRename` | `<name>` | Rename the current session. |
+| `SessionRename` | — | Rename the current session (prompts for the name). |
 | `SessionList` | — | List active sessions. |
 | `SessionSave` | — | Persist session state to disk immediately. |
 | `FolderNew` | `<name>` | Create a new folder. |
@@ -533,7 +563,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `SessionMoveToFolder` | — | Open a folder picker to move the current session. |
 | `SessionSwitchLast` | — | Toggle back to the previously-attached session. |
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
-| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid → Columns → Rows), skipping any disabled under `[layouts]`. |
+| `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid → Columns → Rows), skipping any disabled under `[layouts]`, then back to a remembered Custom arrangement. |
 | `SetMaster` | — | Make the focused pane the master pane (Master layout). |
 | `PopupToggle` | — | Show/hide the session's popup terminal (created on first use, kept running while hidden). |
 | `ViewNew` | `[name]` | Create a view and enter it (prompts when no name is given). |
@@ -595,7 +625,7 @@ leader = "Ctrl-b"   # remap the leader key
 
 ## Configuration
 
-The full, commented reference is [`config.sample.toml`](config.sample.toml). Highlights:
+The full, commented reference is [`config.sample.toml`](config.sample.toml), and every key is documented at [https://rakanalh.github.io/remux/config-reference/](https://rakanalh.github.io/remux/config-reference/). Highlights:
 
 - **`[general]`**
   - `default_shell` — override `$SHELL` for new panes.
@@ -613,7 +643,8 @@ The full, commented reference is [`config.sample.toml`](config.sample.toml). Hig
   - `pane_title` — a template that names every pane, everywhere: borders and the Monocle strip, the session tree, View cells, the agents panel and the Alt+a switcher. Placeholders: `{title}` (the window title the program set with OSC 0/2, adopted once it has held for a second, with a leading spinner glyph such as Claude Code's `✳` removed, and shown only while the program that set it is in the foreground: a title your shell sets names the pane only while the shell is in the foreground, so a job such as `top`, once it has held the terminal for a second, shows its own title if it set one and nothing otherwise), `{command}` (the foreground job's process once it has held the terminal for a second, else the shell; a pipeline is named after a live member), `{session}`, `{tab}` (the tab's 0-based index, as the agents panel shows it), `{cwd}` (the working directory's last component) and `{host}` (the remote's name, empty locally). Template text left dangling at either end by an empty placeholder is dropped when it is only whitespace and separators (`:` `-` `|` `·` `/` `,` `–` `—` `•`), so `"{command}: {title}"` on an untitled pane reads `zsh`, not `zsh:`. What a placeholder renders is never trimmed: a title of `/usr/local` or `-v` is shown as it is. If the result is empty the pane falls back to `{command}`. Unknown placeholders are shown literally, with a warning in the log. There is no brace escaping: `{{title}}` is shown as the literal text `{{title}}`. A title the shell sets less than 500ms before a command starts (for example `printf <title>; make` on one line, or a pasted title line followed by a command) is treated as that command's `preexec` title and dropped when the command ends; a shell that retitles at every prompt recovers within a second. A name set with `PaneRename` always wins. Unset (the default), a pane shows its title when it has one and its command otherwise, and an untitled agent is listed as `command session/tab`. **The client's template governs every server it views**: the client sends it, with the remote's name for `{host}`, to the local server and to every remote, and each server renders the borders, the Monocle strip and the session tree it sends that client with it, so two clients with different templates each see their own. It follows a config reload without a restart. A server's own `pane_title` is only the fallback for a client that sent none: an older client, or the CLI.
   - `[appearance.theme]` — per-role colors (named / hex / `{ ansi = N }` / `{ rgb = [r,g,b] }`); defaults are Catppuccin Mocha.
 - **`[modes.command]`**
-  - `timeout_ms` — delay before the which-key popup appears (default 500).
+  - `timeout_ms` — **currently has no effect**: the which-key popup opens as soon as you press the leader. Documented rather than removed because the option is still parsed.
+- **`[keybindings.visual]`** — accepted but **has no effect**: Visual mode keys are built in and cannot be rebound.
 - **`[[sidebar]]` / `[[sidebar.panel]]`** — dock panels to an edge. One sidebar per edge; `edge` and `size` are required, `visible` defaults to true. Each panel names a `plugin` (`sessions`, `files`, `agents`, `placeholder`) and optionally a `weight` (its share of the sidebar) and, for `files`, an `editor`. Nothing is docked by default:
 
 ```toml
@@ -640,10 +671,10 @@ size = 30
   | `command = "…"` | **ignored**, with a warning — delete it (use `editor` if you meant an editor override) |
 
   `command` is ignored rather than renamed because it meant opposite things to the two panels: the *file manager to run* to old-`files`, the *editor to open a file with* to `browser`. That is precisely how a `command = "nnn"` copied between them ended up opening every file in `nnn`. Ignored, `Enter` falls back to the server's `$EDITOR` — which is what you wanted in either case. To keep a file manager, run it in an ordinary pane and point its opener hook at [`remux split`](#talking-to-remux-from-inside-a-pane).
-- **`[agents]` / `[[agents.pattern]]`** — what the `agents` panel counts as an agent and how it decides one is blocked on you. `commands` lists the programs (default `claude`, `codex`, `aider`, `gemini`, `omp`, `opencode`); each `[[agents.pattern]]` is a regex matched against the bottom of the pane's screen, and a match means *needs input*. Blocked-prompt patterns ship for `claude` and `codex`, so this is optional. Three things worth knowing:
+- **`[agents]` / `[[agents.pattern]]`** — what the `agents` panel counts as an agent and how it decides one is blocked on you. `commands` lists the programs (default `claude`, `codex`, `aider`, `gemini`, `omp`, `opencode`); each `[[agents.pattern]]` is a regex matched against the bottom of the pane's screen, and a match means *needs input*. Seven blocked-prompt patterns ship (`claude-proceed`, `claude-select`, `codex-approve`, `codex-decline`, `omp-allow`, `opencode-permission`, `opencode-allow`), so this is optional; declaring any pattern replaces the whole shipped set. Three things worth knowing:
   - **A launcher is looked through to the agent it started.** An agent installed through npm or bun is often a shim — `codex` is a Node script that starts the real binary and stays alive as its parent — so the pane's foreground process is `node`, not the agent; the job underneath it is walked too, which is why you list the agent and never the interpreter.
   - **Two grades of evidence ship here, and the line does not run along agent names.** The Claude Code *question menu*, the `omp` and the `opencode` patterns were matched against a real pane, blocked and then answered again, so both that they turn the panel red and that they let it go are observed. The Claude Code *permission* pattern and both `codex` patterns were read out of the shipped binaries instead: the wordings are real, but nobody watched one of those prompts appear or clear — codex could not be driven as far as an approval on either machine available. If a pane ever sticks on *needs input*, this is the section to correct.
-  - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings, theme, and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.
+  - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.
 - **`[layouts]`** — `bsp`, `master`, `monocle`, `grid`, `columns`, `rows`, each `true` by default. `false` drops that layout from the `LayoutNext` cycle, for tabs and Views alike; the order of the rest is unchanged. After the last enabled layout, the cycle returns to a remembered Custom arrangement if there is one. A new tab, session or View whose default layout is disabled starts in the first enabled one. Custom is manual and not listed. Disabling everything is treated as enabling everything, with a warning. Read by the server at startup, so `remux restart` after a change; a tab already in a layout you disable keeps it until the next cycle.
 - **`[remotes.<name>]`** — declare SSH-reachable remote servers:
 
@@ -678,7 +709,8 @@ layout_indicator_bg = { ansi = 245 }  # the bsp/grid/… indicator, in views too
 session_name_fg = "#94e2d5"
 ```
 
-See [`config.sample.toml`](config.sample.toml) for the full list of roles.
+See [`config.sample.toml`](config.sample.toml) for the full list of roles. Full details: [https://rakanalh.github.io/remux/theme/](https://rakanalh.github.io/remux/theme/)
+Colours of what the server draws (pane borders, tab strips and the status bar in ordinary tabs) need `remux restart`; colours of what the client draws (overlays, which-key, sidebars, Views, search highlights) apply on save.
 `frame_bg`, `pane_label_fg` and `pane_label_bg` are optional: leaving them unset
 keeps the historical appearance (borders and labels on the terminal's own
 background, the label in the border's focus-tracking color).
