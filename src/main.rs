@@ -59,7 +59,7 @@ enum Commands {
         #[arg(short, long)]
         session: String,
 
-        /// Working directory for the session
+        /// Session-tree folder to file the session under (created if missing)
         #[arg(short, long)]
         folder: Option<String>,
     },
