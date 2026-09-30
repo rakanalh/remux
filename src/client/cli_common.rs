@@ -24,6 +24,9 @@ pub(crate) const REPLY_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) enum CliError {
     NoServer,
     Timeout,
+    /// A send the server did not answer in time. It may have been stored, and
+    /// typed, so the message says how to check before sending it again.
+    SendTimeout(String),
     Refused {
         code: String,
         message: String,
@@ -55,7 +58,7 @@ impl CliError {
     fn code(&self) -> &str {
         match self {
             CliError::NoServer => "no_server",
-            CliError::Timeout => "timeout",
+            CliError::Timeout | CliError::SendTimeout(_) => "timeout",
             CliError::Refused { code, .. } => code,
             CliError::Transport(_) => "transport",
             CliError::Usage { code, .. } => code,
@@ -67,6 +70,7 @@ impl CliError {
             CliError::NoServer => "no remux server is running here",
             CliError::Timeout => "the server did not answer in time",
             CliError::Refused { message, .. }
+            | CliError::SendTimeout(message)
             | CliError::Transport(message)
             | CliError::Usage { message, .. } => message,
         }

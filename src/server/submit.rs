@@ -21,18 +21,35 @@
 //! Enter would run them. Unread text is flushed and the message stays in the
 //! mailbox.
 //!
+//! Both writes re-check two things in the same `panes` section as the write.
+//! The agent must not be waiting on its user (`NeedsInput`): an Enter into a
+//! permission prompt answers it, so a message could approve another agent's
+//! action. And no human may have typed into the pane since it was sampled,
+//! for the text, or since the text was written, for the Enter: the Enter
+//! would submit the person's keys with the message. A person's keys are
+//! never flushed: when one typed after the text, the queue is left as it is.
+//!
 //! Each typed message opens with an envelope line naming it and its sender,
 //! so the agent, and the person watching it, can tell another agent's
 //! message from its user's.
 //!
 //! Residuals:
-//! - The writer drains in order, so a key a human presses between the two
-//!   writes lands between the text and the Enter and is submitted with the
-//!   message. Nothing can un-type the text once it is written.
-//! - A key a human presses in those 300 ms that the agent has not read yet
-//!   makes the check before the Enter see unread input. The server then
-//!   flushes it and leaves the message in the mailbox, although the agent
-//!   read the text; the message is delivered again by the mailbox.
+//! - A key a human presses between the text and the Enter stops the Enter
+//!   (`human_typing`), but the text is already written and is not taken
+//!   back: the agent shows it in its input box beside the person's keys,
+//!   unsubmitted, and the message stays in the mailbox, so it can arrive
+//!   twice.
+//! - A permission prompt the agent draws after the last check, in the time
+//!   between the check and the Enter's write, is still answered by the Enter.
+//!   The check and the write share one `panes` section, so the window is the
+//!   agent's own: the time between reading the text and drawing a prompt the
+//!   server has not yet parsed.
+//! - When a human typed after the text, a refusal does not flush the input
+//!   queue, so that the person's keys survive. Text of the message that the
+//!   agent did not read then stays in the queue for the next program that
+//!   reads it, which after the agent exits is the shell. This is the hazard
+//!   the flush exists for, left open only while a person is typing into the
+//!   pane and can see what reaches it.
 
 pub const PASTE_OPEN: &[u8] = b"\x1b[200~";
 pub const PASTE_CLOSE: &[u8] = b"\x1b[201~";
@@ -113,6 +130,58 @@ impl SubmitPolicy {
     }
 }
 
+/// How long a pane must be keyboard-quiet before a message is typed into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardConfig {
+    /// When a client is looking at the pane.
+    pub attended: Duration,
+    /// When none is.
+    pub unattended: Duration,
+    /// The longest a submit waits for the human to stop.
+    pub max: Duration,
+}
+
+/// Whether a submit may type now, given the last time a human typed into the
+/// pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardVerdict {
+    /// Nobody typed, or the pane has been quiet long enough.
+    Ready,
+    /// Wait until this instant, when the pane will have been quiet long
+    /// enough if nobody types again.
+    Wait(std::time::Instant),
+    /// The human kept typing past `max`: give up.
+    Expired,
+}
+
+/// The typing guard: a message is typed only into a pane that has been
+/// keyboard-quiet for a window, longer when a client is looking at it, since
+/// a person there may be halfway through a line of their own. Keystrokes
+/// only: the pane's own output does not hold a submit.
+pub fn guard_wait(
+    last_human_input: Option<std::time::Instant>,
+    attended: bool,
+    enqueued_at: std::time::Instant,
+    now: std::time::Instant,
+    cfg: &GuardConfig,
+) -> GuardVerdict {
+    let window = if attended {
+        cfg.attended
+    } else {
+        cfg.unattended
+    };
+    let Some(last) = last_human_input else {
+        return GuardVerdict::Ready;
+    };
+    if now.saturating_duration_since(last) >= window {
+        return GuardVerdict::Ready;
+    }
+    if now.saturating_duration_since(enqueued_at) >= cfg.max {
+        return GuardVerdict::Expired;
+    }
+    GuardVerdict::Wait(last + window)
+}
+
 /// The answer to a submit that does not type the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
@@ -135,15 +204,14 @@ pub fn settle(deliver: Deliver, refusal: SubmitRefusal) -> Answer {
     }
 }
 
-/// The checks made before anything is typed, in order: the pane is there,
-/// its foreground is an agent, the agent is not waiting on its user, and
-/// what its row says to do while it works. `None` means type it.
-pub fn decide(
+/// The checks made before the typing guard: the pane is there, its
+/// foreground is an agent, and the agent is not waiting on its user. `None`
+/// means go on to the guard.
+pub fn precheck(
     pane: PaneId,
     live: bool,
     agent: bool,
     state: Option<AgentState>,
-    rule: &SubmitRule,
     deliver: Deliver,
 ) -> Option<Answer> {
     if !live {
@@ -152,14 +220,37 @@ pub fn decide(
     if !agent {
         return Some(settle(deliver, SubmitRefusal::not_ready(pane)));
     }
-    match state {
-        Some(AgentState::NeedsInput) => Some(settle(deliver, SubmitRefusal::blocked(pane))),
-        Some(AgentState::Working) => match rule.while_working {
-            WhileWorking::Queue => None,
-            WhileWorking::Mailbox => Some(Answer::Mailbox("agent_working")),
-            WhileWorking::Refuse => Some(settle(deliver, SubmitRefusal::working(pane))),
-        },
-        _ => None,
+    (state == Some(AgentState::NeedsInput)).then(|| settle(deliver, SubmitRefusal::blocked(pane)))
+}
+
+/// Whether the working policy is asked before the typing guard, as §8.2
+/// orders the checks. Not while a human's last key is recent: the agent's
+/// echo of a keystroke is pane output, so the classifier reads `Working`
+/// for `working` after every key, and a `mailbox` or `refuse` row would then
+/// answer `agent_working` for an agent that is only showing what a person
+/// typed. Past `working`, a `Working` verdict cannot be that echo.
+pub fn working_first(
+    last_human_input: Option<std::time::Instant>,
+    now: std::time::Instant,
+    working: Duration,
+) -> bool {
+    last_human_input.is_none_or(|last| now.saturating_duration_since(last) >= working)
+}
+
+/// What the row says to do with an agent that is working.
+pub fn on_working(
+    pane: PaneId,
+    state: Option<AgentState>,
+    rule: &SubmitRule,
+    deliver: Deliver,
+) -> Option<Answer> {
+    if state != Some(AgentState::Working) {
+        return None;
+    }
+    match rule.while_working {
+        WhileWorking::Queue => None,
+        WhileWorking::Mailbox => Some(Answer::Mailbox("agent_working")),
+        WhileWorking::Refuse => Some(settle(deliver, SubmitRefusal::working(pane))),
     }
 }
 
@@ -199,6 +290,42 @@ impl SubmitRefusal {
             code: "agent_blocked",
             message: format!(
                 "%{pane} is waiting on its user's answer: its message is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn attended(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "pane_attended",
+            message: format!(
+                "a client is looking at %{pane}, and this server does not type into an attended pane: its message is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn out_of_time(pane: PaneId, id: crate::protocol::MsgId) -> Self {
+        SubmitRefusal {
+            code: "submit_timeout",
+            message: format!(
+                "message #{id} waited too long to be typed into %{pane}, so it was not typed: it is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn typed_over(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "human_typing",
+            message: format!(
+                "someone typed into %{pane} while its message was being typed, so it was not submitted: it is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn human_typing(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "human_typing",
+            message: format!(
+                "someone kept typing into %{pane}, so the message was not typed: it is in the mailbox"
             ),
         }
     }
@@ -279,6 +406,36 @@ pub fn multi_line_refusal(body: &str) -> Option<SubmitRefusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole policy for a pane nobody is typing into, in the order the
+    /// submitter asks it then. `None` means type it.
+    fn decide(
+        pane: PaneId,
+        live: bool,
+        agent: bool,
+        state: Option<AgentState>,
+        rule: &SubmitRule,
+        deliver: Deliver,
+    ) -> Option<Answer> {
+        precheck(pane, live, agent, state, deliver)
+            .or_else(|| on_working(pane, state, rule, deliver))
+    }
+
+    #[test]
+    fn the_working_policy_waits_for_the_echo_of_a_recent_key() {
+        let now = std::time::Instant::now();
+        let working = Duration::from_millis(500);
+        assert!(working_first(None, now, working), "nobody typed");
+        assert!(
+            !working_first(Some(now - Duration::from_millis(100)), now, working),
+            "a key 100 ms ago: Working may be its echo"
+        );
+        assert!(working_first(
+            Some(now - Duration::from_millis(500)),
+            now,
+            working
+        ));
+    }
 
     #[test]
     fn bracketed_encoding_wraps_the_body_and_keeps_enter_outside() {
@@ -488,6 +645,67 @@ mod tests {
                 rule.while_working
             );
         }
+    }
+
+    fn guard() -> GuardConfig {
+        GuardConfig {
+            attended: Duration::from_millis(3000),
+            unattended: Duration::from_millis(500),
+            max: Duration::from_millis(15000),
+        }
+    }
+
+    #[test]
+    fn guard_is_ready_when_nobody_typed() {
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            guard_wait(None, true, t0, t0, &guard()),
+            GuardVerdict::Ready
+        );
+    }
+
+    #[test]
+    fn guard_waits_the_attended_window() {
+        let t0 = std::time::Instant::now();
+        let last = t0;
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(
+            guard_wait(Some(last), true, t0, at(1000), &guard()),
+            GuardVerdict::Wait(at(3000))
+        );
+        assert_eq!(
+            guard_wait(Some(last), true, t0, at(3000), &guard()),
+            GuardVerdict::Ready
+        );
+    }
+
+    #[test]
+    fn guard_waits_the_short_window_when_unattended() {
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(
+            guard_wait(Some(t0), false, t0, at(200), &guard()),
+            GuardVerdict::Wait(at(500))
+        );
+        assert_eq!(
+            guard_wait(Some(t0), false, t0, at(500), &guard()),
+            GuardVerdict::Ready
+        );
+    }
+
+    #[test]
+    fn guard_expires_at_the_max() {
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        // A human typing every 100 ms keeps the window open; the max ends it.
+        assert_eq!(
+            guard_wait(Some(at(14_900)), true, t0, at(15_000), &guard()),
+            GuardVerdict::Expired
+        );
+        assert_eq!(
+            guard_wait(Some(at(14_900)), true, t0, at(14_950), &guard()),
+            GuardVerdict::Wait(at(17_900))
+        );
     }
 
     #[test]

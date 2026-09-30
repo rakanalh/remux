@@ -1072,6 +1072,15 @@
 #                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
 #                      bodies are then stored on disk; `false` keeps them in
 #                      memory only.
+# typing_guard_ms      a message is typed into a pane only once it has been
+#                      keyboard-quiet this long, while a client looks at it
+# typing_guard_unattended_ms  ...and this long when no client does,
+# typing_guard_max_ms  and for at most this long (capped at 30000) before the
+#                      submit gives up (`human_typing`).
+# submit_when_attended `false` never types into a pane a client looks at
+#                      (`pane_attended`).
+# submit_queue_len     the most messages waiting to be typed into one pane
+#                      (`queue_full`).
 #
 # Read by the SERVER at startup, so an edit needs `remux restart`.
 #
@@ -1082,6 +1091,11 @@
 # max_body_bytes = 65536
 # rate_per_10s = 20
 # persist = true
+# typing_guard_ms = 3000
+# typing_guard_unattended_ms = 500
+# typing_guard_max_ms = 15000
+# submit_when_attended = true
+# submit_queue_len = 8
 #
 # How a message is TYPED into an agent's pane (`remux msg send --deliver
 # submit`, or `auto`, the default), one row per `[agents] commands` spelling.

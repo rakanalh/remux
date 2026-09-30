@@ -508,7 +508,8 @@ const ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// [`ATTRIBUTION_TIMEOUT`] because here a timeout refuses the user's request
 /// rather than dropping a log line, and shorter than the CLI's 10s reply
 /// deadline so that the CLI reports the refusal instead of its own timeout.
-const CALLER_ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const CALLER_ATTRIBUTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// The pane of the process that sent the frame being handled.
 ///
@@ -652,6 +653,7 @@ fn log_hint(pane_hint: Option<PaneId>, attributed: PaneId) {
 /// Store a message from the calling pane. The sender is the attribution,
 /// never `pane_hint` and never anything else the caller sent; a caller that
 /// cannot be attributed is refused rather than sent anonymously.
+#[allow(clippy::too_many_arguments)]
 async fn handle_msg_send(
     client_id: u64,
     msg: OutgoingMessage,
@@ -659,8 +661,9 @@ async fn handle_msg_send(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     store: &'static Mutex<Messaging>,
-) -> ServerMessage {
+) -> Option<ServerMessage> {
     use crate::server::messaging::Refusal;
 
     let bad_host = msg
@@ -671,22 +674,22 @@ async fn handle_msg_send(
         .find(|host| !valid_host(host));
     if let Some(host) = bad_host {
         let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
-        return ServerMessage::refused(refusal.code(), refusal.message());
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
     }
     if msg.to.host.is_some() {
-        return ServerMessage::refused(
+        return Some(ServerMessage::refused(
             "route_unavailable",
             format!(
                 "{}: messages to another server are not routed yet",
                 loggable(&msg.to.to_string())
             ),
-        );
+        ));
     }
     // The CLI parses the address, but the wire accepts any string as a name.
     if let Target::Name(name) = &msg.to.target {
         if !valid_name(name) {
             let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
-            return ServerMessage::refused(refusal.code(), refusal.message());
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
         }
     }
 
@@ -700,10 +703,10 @@ async fn handle_msg_send(
                     .map(|hint| format!(" (pane_hint=%{hint})"))
                     .unwrap_or_default()
             );
-            return ServerMessage::refused(
+            return Some(ServerMessage::refused(
                 "sender_unverified",
                 format!("{}: {}", why.reason(), why.fix()),
-            );
+            ));
         }
     };
     log_caller(client_id, "MsgSend", &from);
@@ -719,7 +722,7 @@ async fn handle_msg_send(
     };
     let to = match resolved {
         Ok(to) => to,
-        Err(refusal) => return ServerMessage::refused(refusal.code(), refusal.message()),
+        Err(refusal) => return Some(ServerMessage::refused(refusal.code(), refusal.message())),
     };
     let (session, to_in_a_tab, from_popup, to_popup) = {
         let st = state.lock().await;
@@ -731,27 +734,51 @@ async fn handle_msg_send(
         )
     };
     if from_popup {
-        return ServerMessage::refused("sender_unverified", POPUP_REFUSED);
+        return Some(ServerMessage::refused("sender_unverified", POPUP_REFUSED));
     }
     if to_popup {
-        return ServerMessage::refused("no_such_target", POPUP_REFUSED);
+        return Some(ServerMessage::refused("no_such_target", POPUP_REFUSED));
     }
     let Some(session) = session else {
-        return ServerMessage::refused(
+        return Some(ServerMessage::refused(
             "sender_unverified",
             format!("pane %{} is closing", from.pane),
-        );
+        ));
     };
     if !to_in_a_tab {
         let refusal = Refusal::NoSuchTarget(format!("%{to}"));
-        return ServerMessage::refused(refusal.code(), refusal.message());
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
     }
 
     let bytes = msg.body.len();
-    let submit_body = (msg.deliver != Deliver::Mailbox).then(|| msg.body.clone());
-    let (sent, swept, answered) = {
+    let submit = msg.deliver != Deliver::Mailbox;
+    let reply_tx = if submit {
+        clients
+            .lock()
+            .await
+            .get(&client_id)
+            .map(|conn| conn.tx.clone())
+    } else {
+        None
+    };
+    // The parked-send check, the store and the enqueue are one section, so a
+    // send refused `bad_request` is never stored: its sender is told it was
+    // refused, and a message it cannot know about must not reach the pane.
+    let (sent, swept, answered, queued) = {
         let mut store = store.lock().await;
+        if submit && store.has_parked_send(client_id) {
+            drop(store);
+            log::info!(
+                "msg: refused from=%{} to=%{to}: bad_request (a send is already waiting)",
+                from.pane
+            );
+            return Some(ServerMessage::refused(
+                "bad_request",
+                "this connection already has a message waiting to be typed",
+            ));
+        }
         let to_name = store.name_of(to).map(str::to_string);
+        let body = submit.then(|| msg.body.clone());
         let sent = store
             .send(
                 Sender::Pane {
@@ -771,7 +798,24 @@ async fn handle_msg_send(
         } else {
             Vec::new()
         };
-        (sent, store.take_swept(), answered)
+        let queued = match (&sent, body) {
+            (Ok((id, _)), Some(body)) => Some(store.enqueue_submit(
+                crate::server::messaging::SubmitEntry {
+                    id: *id,
+                    pane: to,
+                    deliver: msg.deliver,
+                    body,
+                    from_pane: from.pane,
+                    from_name: from_name.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                    reply: reply_tx.map(|tx| crate::server::messaging::Reply { client_id, tx }),
+                    waiting_on: None,
+                },
+                config.messaging.submit_queue_len(),
+            )),
+            _ => None,
+        };
+        (sent, store.take_swept(), answered, queued)
     };
     for (waiter, messages) in answered {
         log::info!(
@@ -802,29 +846,7 @@ async fn handle_msg_send(
                 pane_id: to,
                 name: to_name,
             };
-            match submit_body {
-                None => ServerMessage::MsgSent {
-                    id,
-                    to: resolved,
-                    delivery: Delivery::Mailbox,
-                    reason: None,
-                },
-                Some(body) => {
-                    submit(
-                        id,
-                        to,
-                        resolved,
-                        &body,
-                        (from.pane, from_name.as_deref()),
-                        msg.deliver,
-                        state,
-                        panes,
-                        config,
-                        store,
-                    )
-                    .await
-                }
-            }
+            answer_enqueued(id, to, resolved, msg.deliver, queued)
         }
         Err(refusal) => {
             log::info!(
@@ -832,94 +854,426 @@ async fn handle_msg_send(
                 from.pane,
                 refusal.code()
             );
-            ServerMessage::refused(refusal.code(), refusal.message())
+            Some(ServerMessage::refused(refusal.code(), refusal.message()))
         }
     }
 }
 
-/// Type stored message `id` into `to`, if its foreground is a configured
-/// agent that is reading and its row allows it now. The message is already
-/// in the mailbox, so every outcome but `Submitted` leaves it there: see
-/// [`crate::server::submit::settle`].
-///
-/// The steps take their locks one at a time and never nest them: the sample,
-/// the claim (store), the text (`panes`), then, with nothing held, the Enter
-/// delay, and the Enter (`panes`). The reply waits for the Enter, so what it
-/// says is what happened.
-#[allow(clippy::too_many_arguments)]
-async fn submit(
+/// The answer to a stored send, by what queueing it for typing did: `None`
+/// when it was queued, since the submitter answers it once it is typed or
+/// cannot be.
+fn answer_enqueued(
     id: MsgId,
     to: PaneId,
     resolved: Resolved,
-    body: &str,
-    from: (PaneId, Option<&str>),
     deliver: Deliver,
+    queued: Option<Result<(), crate::server::messaging::EnqueueRefusal>>,
+) -> Option<ServerMessage> {
+    use crate::server::messaging::EnqueueRefusal;
+    use crate::server::submit::{settle, SubmitRefusal};
+    match queued {
+        None => Some(ServerMessage::MsgSent {
+            id,
+            to: resolved,
+            delivery: Delivery::Mailbox,
+            reason: None,
+        }),
+        Some(Ok(())) => {
+            mark_submit_dirty();
+            None
+        }
+        // Checked in the same section before the send, so never reached.
+        Some(Err(EnqueueRefusal::SendParked)) => Some(ServerMessage::refused(
+            "bad_request",
+            "this connection already has a message waiting to be typed",
+        )),
+        Some(Err(EnqueueRefusal::QueueFull)) => {
+            let refusal = SubmitRefusal {
+                code: "queue_full",
+                message: format!(
+                    "%{to} already has the most messages waiting to be typed, or the most from this sender: this one is in the mailbox"
+                ),
+            };
+            Some(answer_submit(id, resolved, settle(deliver, refusal), None))
+        }
+    }
+}
+
+/// Wakes the submitter: a submit was queued, or a pane finished typing.
+/// Never fired from pane output, which would wake it once per output chunk
+/// while a build scrolls in another pane.
+static SUBMIT_DIRTY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn mark_submit_dirty() {
+    SUBMIT_DIRTY.notify_one();
+}
+
+/// How often the submitter looks again while a submit is waiting. A guard
+/// wait ends at most this late, inside the windows' tolerance.
+const SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Type queued messages into their panes, in order per pane, holding each
+/// while its pane is not ready. Runs for the life of the server. Woken by
+/// [`SUBMIT_DIRTY`], and every [`SUBMIT_TICK`] while anything is queued or
+/// mid-typing; idle, it parks on the `Notify` and costs nothing.
+async fn run_submitter(
+    state: Arc<Mutex<ServerState>>,
+    panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: Arc<Config>,
+) {
+    let store = messaging();
+    loop {
+        let has_work = store.lock().await.has_submit_work();
+        if has_work {
+            tokio::select! {
+                _ = SUBMIT_DIRTY.notified() => {}
+                _ = tokio::time::sleep(SUBMIT_TICK) => {}
+            }
+        } else {
+            SUBMIT_DIRTY.notified().await;
+        }
+        let heads = store.lock().await.submit_heads();
+        for head in heads {
+            step_submit(head, &state, &panes, &clients, &config, store).await;
+        }
+    }
+}
+
+/// One pass over one queue head: answer it, hold it, or type it. Logs only on
+/// a transition (a new reason to wait, an answer), never per pass.
+///
+/// The steps take their locks one at a time and never nest them. Only the
+/// text is typed here; its Enter, and the answer, come from a task of their
+/// own, so one pane's wait for its agent to read never holds another pane's
+/// head. The pane stays in flight until then, so nothing behind it is typed.
+async fn step_submit(
+    head: crate::server::messaging::SubmitHead,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     store: &'static Mutex<Messaging>,
-) -> ServerMessage {
-    use crate::server::submit::{decide, settle, SubmitRefusal};
+) {
+    use crate::server::submit::{
+        guard_wait, precheck, settle, working_first, Answer, GuardVerdict, SubmitRefusal,
+    };
 
-    let sample = sample_pane(to, state, panes, config).await;
+    let (pane, id) = (head.pane, head.id);
+    let hold = std::time::Duration::from_millis(SUBMIT_HOLD_MS);
+    // A head also waits for the entries typed before it, so the guard's own
+    // cap does not bound how long it has been held.
+    if head.enqueued_at.elapsed() > hold {
+        let answer = settle(head.deliver, SubmitRefusal::out_of_time(pane, id));
+        return answer_head(pane, id, answer, None, store).await;
+    }
+    let sample = sample_pane(pane, state, panes, config).await;
     let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
     let agent_state = sample.verdict.as_ref().map(|v| v.state);
-    let decision = decide(
-        to,
+    if let Some(answer) = precheck(
+        pane,
         sample.live,
         sample.command.is_some(),
         agent_state,
-        &rule,
-        deliver,
-    );
-    if let Some(answer) = decision {
-        let policy = (agent_state == Some(AgentState::Working))
-            .then(|| format!("while_working={:?}", rule.while_working).to_lowercase());
-        return answer_submit(id, resolved, answer, policy);
+        head.deliver,
+    ) {
+        return answer_head(pane, id, answer, None, store).await;
+    }
+    let working = std::time::Duration::from_millis(config.agents.working_ms);
+    let now = std::time::Instant::now();
+    if working_first(sample.last_human_input, now, working)
+        && answer_working(pane, id, agent_state, &rule, head.deliver, store).await
+    {
+        return;
+    }
+    let attended = pane_attended(pane, state, clients).await;
+    if attended && !config.messaging.submit_when_attended {
+        let answer = settle(head.deliver, SubmitRefusal::attended(pane));
+        return answer_head(pane, id, answer, None, store).await;
+    }
+    let guard = config.messaging.typing_guard();
+    match guard_wait(
+        sample.last_human_input,
+        attended,
+        head.enqueued_at,
+        now,
+        &guard,
+    ) {
+        GuardVerdict::Ready => {}
+        GuardVerdict::Wait(_) => {
+            if store.lock().await.set_waiting(pane, id, "human_typing") {
+                log::info!("msg: id={id} submit waiting: human_typing");
+            }
+            return;
+        }
+        GuardVerdict::Expired => {
+            let answer = settle(head.deliver, SubmitRefusal::human_typing(pane));
+            return answer_head(pane, id, answer, None, store).await;
+        }
+    }
+    if answer_working(pane, id, agent_state, &rule, head.deliver, store).await {
+        return;
     }
     // Claimed before anything is typed, so a read that took the message first
-    // (a waiter answered by this very send) wins and it is delivered once.
-    if !store.lock().await.mark_submitted(to, id) {
-        let refusal = SubmitRefusal {
-            code: "already_read",
-            message: format!("%{to} already read message #{id}"),
-        };
-        return answer_submit(id, resolved, settle(deliver, refusal), None);
+    // (the pane's own waiting read, or an ack while the guard held it) wins
+    // and it is delivered once. The pop, the hold, the claim and the
+    // in-flight mark are one section, so the next pass cannot see this head
+    // again, and a head the sample took too long over is not typed.
+    enum Claim {
+        Typing(crate::server::messaging::SubmitEntry),
+        OutOfTime(crate::server::messaging::SubmitEntry),
+        AlreadyRead(crate::server::messaging::SubmitEntry),
     }
-    let envelope = rule
-        .envelope
-        .then(|| crate::server::submit::envelope(id, from.0, from.1));
-    let typed = type_text(to, sample.pgid, body, envelope.as_deref(), &rule, panes).await;
-    let (bracketed, bytes, enter, text) = match typed {
-        Ok(typed) => typed,
-        Err(refusal) => {
-            store.lock().await.unsubmit(to, id);
-            return answer_submit(id, resolved, settle(deliver, refusal), None);
+    let claim = {
+        let mut st = store.lock().await;
+        let Some(mut entry) = st.pop_submit(pane, id) else {
+            return;
+        };
+        if entry.enqueued_at.elapsed() > hold {
+            Claim::OutOfTime(entry)
+        } else if st.mark_submitted(pane, id) {
+            st.begin_typing(pane, entry.reply.take());
+            Claim::Typing(entry)
+        } else {
+            Claim::AlreadyRead(entry)
         }
     };
-    match type_enter(to, sample.pgid, &enter, rule.enter_delay, text, panes).await {
-        Ok(()) => {
-            log::info!(
-                "msg: id={id} submitted to %{to} (bracketed={}, {bytes} bytes)",
-                if bracketed { "on" } else { "off" }
-            );
-            ServerMessage::MsgSent {
-                id,
-                to: resolved,
-                delivery: Delivery::Submitted,
-                reason: None,
+    let entry = match claim {
+        Claim::Typing(entry) => entry,
+        Claim::OutOfTime(entry) => {
+            let answer = settle(entry.deliver, SubmitRefusal::out_of_time(pane, id));
+            reply_submit(entry, answer, None, store).await;
+            mark_submit_dirty();
+            return;
+        }
+        // The target has the message, which is what a submit is for: an
+        // error would make the sender retry and deliver it twice.
+        Claim::AlreadyRead(entry) => {
+            reply_submit(entry, Answer::Mailbox("already_read"), None, store).await;
+            mark_submit_dirty();
+            return;
+        }
+    };
+    let envelope = rule
+        .envelope
+        .then(|| crate::server::submit::envelope(id, entry.from_pane, entry.from_name.as_deref()));
+    let command = sample.command.clone().unwrap_or_default();
+    let typed = type_text(
+        pane,
+        &sample,
+        &command,
+        &entry.body,
+        envelope.as_deref(),
+        &rule,
+        config,
+        panes,
+    )
+    .await;
+    let (bracketed, bytes, enter, text) = match typed {
+        Ok(typed) => typed,
+        Err(TextRefusal::HumanTyped) => {
+            let mut st = store.lock().await;
+            st.unsubmit(pane, id);
+            let mut entry = entry;
+            entry.reply = st.end_typing(pane);
+            st.requeue_front(entry);
+            drop(st);
+            mark_submit_dirty();
+            return;
+        }
+        Err(TextRefusal::Refuse(refusal)) => {
+            let reply = {
+                let mut st = store.lock().await;
+                st.unsubmit(pane, id);
+                st.end_typing(pane)
+            };
+            let answer = settle(entry.deliver, refusal);
+            reply_submit(
+                crate::server::messaging::SubmitEntry { reply, ..entry },
+                answer,
+                None,
+                store,
+            )
+            .await;
+            mark_submit_dirty();
+            return;
+        }
+    };
+    let pgid = sample.pgid;
+    let panes = Arc::clone(panes);
+    let rules = agent_rules(config);
+    tokio::spawn(async move {
+        let typing = EndTypingOnDrop { pane, armed: true };
+        let outcome = type_enter(
+            pane,
+            pgid,
+            &command,
+            rules,
+            &enter,
+            rule.enter_delay,
+            text,
+            &panes,
+        )
+        .await;
+        match outcome {
+            Ok(()) => {
+                log::info!(
+                    "msg: id={id} submitted to %{pane} (bracketed={}, {bytes} bytes)",
+                    if bracketed { "on" } else { "off" }
+                );
+                let (reply, name) = {
+                    let mut st = store.lock().await;
+                    (st.end_typing(pane), st.name_of(pane).map(str::to_string))
+                };
+                let message = ServerMessage::MsgSent {
+                    id,
+                    to: Resolved {
+                        host: None,
+                        pane_id: pane,
+                        name,
+                    },
+                    delivery: Delivery::Submitted,
+                    reason: None,
+                };
+                send_reply(id, reply, message);
+            }
+            Err(refusal) => {
+                let reply = {
+                    let mut st = store.lock().await;
+                    st.unsubmit(pane, id);
+                    st.end_typing(pane)
+                };
+                if refusal.code == "agent_did_not_read" {
+                    log::info!(
+                        "msg: id={id} not read by %{pane}; typed text discarded, left in the mailbox"
+                    );
+                }
+                let answer = settle(entry.deliver, refusal);
+                reply_submit(
+                    crate::server::messaging::SubmitEntry { reply, ..entry },
+                    answer,
+                    None,
+                    store,
+                )
+                .await;
             }
         }
-        Err(refusal) => {
-            store.lock().await.unsubmit(to, id);
-            if refusal.code == "agent_did_not_read" {
-                log::info!(
-                    "msg: id={id} not read by %{to}; typed text discarded, left in the mailbox"
-                );
-            }
-            answer_submit(id, resolved, settle(deliver, refusal), None)
+        typing.disarm();
+        mark_submit_dirty();
+    });
+}
+
+/// Answer `pane`'s head by its row's `while_working`, if the agent is working
+/// and the row does not type into it. Returns whether it was answered.
+async fn answer_working(
+    pane: PaneId,
+    id: MsgId,
+    agent_state: Option<AgentState>,
+    rule: &crate::server::submit::SubmitRule,
+    deliver: Deliver,
+    store: &'static Mutex<Messaging>,
+) -> bool {
+    let Some(answer) = crate::server::submit::on_working(pane, agent_state, rule, deliver) else {
+        return false;
+    };
+    let policy = format!("while_working={:?}", rule.while_working).to_lowercase();
+    answer_head(pane, id, answer, Some(policy), store).await;
+    true
+}
+
+/// Ends a pane's typing if the task typing into it stops without doing so
+/// itself, which only a panic does: a pane left in flight is never looked at
+/// again, and every message queued for it would wait for ever.
+struct EndTypingOnDrop {
+    pane: PaneId,
+    armed: bool,
+}
+
+impl EndTypingOnDrop {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EndTypingOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let pane = self.pane;
+            log::warn!("msg: typing into %{pane} stopped unfinished; ending it");
+            tokio::spawn(async move {
+                messaging().lock().await.end_typing(pane);
+                mark_submit_dirty();
+            });
         }
     }
+}
+
+/// Answer `pane`'s head `id` without typing it, if it is still the head.
+async fn answer_head(
+    pane: PaneId,
+    id: MsgId,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    store: &'static Mutex<Messaging>,
+) {
+    let entry = store.lock().await.pop_submit(pane, id);
+    if let Some(entry) = entry {
+        reply_submit(entry, answer, policy, store).await;
+        mark_submit_dirty();
+    }
+}
+
+/// Answer `entry`'s parked send with `answer`, logged once.
+async fn reply_submit(
+    entry: crate::server::messaging::SubmitEntry,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    store: &'static Mutex<Messaging>,
+) {
+    let name = store.lock().await.name_of(entry.pane).map(str::to_string);
+    let resolved = Resolved {
+        host: None,
+        pane_id: entry.pane,
+        name,
+    };
+    let message = answer_submit(entry.id, resolved, answer, policy);
+    send_reply(entry.id, entry.reply, message);
+}
+
+/// Send a submit's answer through its parked reply, or note that the sender
+/// has gone.
+fn send_reply(id: MsgId, reply: Option<crate::server::messaging::Reply>, message: ServerMessage) {
+    match reply {
+        Some(reply) => {
+            let _ = reply.tx.send(message);
+        }
+        None => log::info!("msg: id={id} submit answered with its sender gone (reply detached)"),
+    }
+}
+
+/// Whether a client is looking at `pane`: it is the input target of a
+/// session some client is attached to. `clients` alone, then `state` alone,
+/// the order `handle_input` takes them in.
+async fn pane_attended(
+    pane: PaneId,
+    state: &Arc<Mutex<ServerState>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+) -> bool {
+    let attached: Vec<String> = clients
+        .lock()
+        .await
+        .values()
+        .filter_map(|conn| conn.session_name.clone())
+        .collect();
+    if attached.is_empty() {
+        return false;
+    }
+    let st = state.lock().await;
+    attached.iter().any(|name| {
+        st.sessions
+            .get(name)
+            .is_some_and(|session| session.input_target() == Some(pane))
+    })
 }
 
 /// The server's submit policy, read from the config once like
@@ -962,32 +1316,49 @@ fn answer_submit(
     }
 }
 
+/// Why [`type_text`] did not write the text.
+enum TextRefusal {
+    /// A person typed into the pane after it was sampled. The submit is put
+    /// back to wait for the guard again, not refused.
+    HumanTyped,
+    Refuse(crate::server::submit::SubmitRefusal),
+}
+
 /// Write the framed text into `pane`, if the program there is still the one
-/// sampled (`pgid`) and reads its input unbuffered. Returns whether it was
-/// wrapped, its length and the Enter to write after it. Every check and the
-/// write happen in one `panes` section, so nothing can change between them.
-/// The bytes are never logged: they are the message.
+/// sampled (`sample.pgid`), reads its input unbuffered and is not waiting on
+/// its user, and no person has typed into the pane since the sample. Returns
+/// whether it was wrapped, its length and the Enter to write after it. Every
+/// check and the write happen in one `panes` section, so nothing can change
+/// between them. The bytes are never logged: they are the message.
+#[allow(clippy::too_many_arguments)]
 async fn type_text(
     pane: PaneId,
-    pgid: Option<nix::unistd::Pid>,
+    sample: &PaneSample,
+    command: &str,
     body: &str,
     envelope: Option<&str>,
     rule: &crate::server::submit::SubmitRule,
+    config: &Config,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-) -> Result<(bool, usize, Vec<u8>, TypedText), crate::server::submit::SubmitRefusal> {
+) -> Result<(bool, usize, Vec<u8>, TypedText), TextRefusal> {
     use crate::config::messaging::Bracketed;
     use crate::server::submit::{
         encode, multi_line_refusal, newlines_safe, Framing, SubmitRefusal,
     };
     use nix::sys::termios::{tcgetattr, LocalFlags};
+    let refuse = |refusal| Err(TextRefusal::Refuse(refusal));
 
     let ps = panes.lock().await;
     let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
-        return Err(crate::server::submit::SubmitRefusal::closed(pane));
+        return refuse(SubmitRefusal::closed(pane));
     };
+    if pd.last_human_input != sample.last_human_input {
+        return Err(TextRefusal::HumanTyped);
+    }
     let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+    let pgid = sample.pgid;
     if pgid.is_none() || nix::unistd::tcgetpgrp(master).ok() != pgid {
-        return Err(SubmitRefusal::not_ready(pane));
+        return refuse(SubmitRefusal::not_ready(pane));
     }
     // On a pty the master's termios requests reach the slave's settings. A
     // line-buffered terminal means a shell, `read` or a password prompt is
@@ -996,13 +1367,17 @@ async fn type_text(
     match tcgetattr(master) {
         Ok(termios) if !termios.local_flags.contains(LocalFlags::ICANON) => {}
         _ => {
-            return Err(SubmitRefusal {
+            return refuse(SubmitRefusal {
                 code: "agent_not_reading",
                 message: format!(
                     "%{pane}'s terminal is line-buffered, so its agent is not the one reading: its message is in the mailbox"
                 ),
             })
         }
+    }
+    let now = std::time::Instant::now();
+    if pane_verdict(pd, command, agent_rules(config), now).state == AgentState::NeedsInput {
+        return refuse(SubmitRefusal::blocked(pane));
     }
     let framing = match rule.bracketed {
         Bracketed::On => Framing::Bracketed,
@@ -1013,7 +1388,7 @@ async fn type_text(
     let paste_live = pd.screen.bracketed_paste;
     if !newlines_safe(framing, paste_live) {
         if let Some(refusal) = multi_line_refusal(body) {
-            return Err(refusal);
+            return refuse(refusal);
         }
     }
     let (text, enter) = encode(
@@ -1031,7 +1406,11 @@ async fn type_text(
         framing == Framing::Bracketed,
         bytes,
         enter,
-        TypedText { written, cancel },
+        TypedText {
+            written,
+            cancel,
+            typed_at: now,
+        },
     ))
 }
 
@@ -1045,10 +1424,30 @@ const CONSUME_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// How long a cancelled write is given to stop before its queue is flushed.
 const CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// The longest a submit is held in its queue before it is typed: the typing
+/// guard at its cap, and one tick for the submitter to see it clear. Past
+/// this the submit is answered `timeout` and nothing is typed.
+const SUBMIT_HOLD_MS: u64 =
+    crate::config::messaging::MAX_TYPING_GUARD_MS + SUBMIT_TICK.as_millis() as u64;
+
+/// The longest from a submit's arrival to its answer: held for at most
+/// [`SUBMIT_HOLD_MS`], then typed and judged read within the Enter delay's
+/// cap, [`CONSUME_DEADLINE`] and [`CANCEL_ACK`]. The CLI waits this long
+/// beyond its usual reply deadline, so a submit is never reported as having
+/// no answer while the server is still able to type it: a retry after such a
+/// report would deliver the message twice.
+pub const SUBMIT_BUDGET_MS: u64 = SUBMIT_HOLD_MS
+    + crate::config::messaging::MAX_ENTER_DELAY_MS
+    + CONSUME_DEADLINE.as_millis() as u64
+    + CANCEL_ACK.as_millis() as u64;
+
 /// The text's write, as `type_text` handed it to the pane's writer.
 struct TypedText {
     written: tokio::sync::oneshot::Receiver<bool>,
     cancel: Arc<crate::server::pty::WriteCancel>,
+    /// When the text was handed to the writer: a person's key after this was
+    /// pressed with the message in the agent's input.
+    typed_at: std::time::Instant,
 }
 
 /// Write the Enter into `pane` once the program sampled has READ the whole
@@ -1057,14 +1456,21 @@ struct TypedText {
 /// next, and after the agent exits that is the shell, which the Enter would
 /// make run them. Checked every [`CONSUME_POLL`] from `delay` on, for up to
 /// [`CONSUME_DEADLINE`]; the Enter is written in the same `panes` section as
-/// the check that allows it.
+/// the checks that allow it. The Enter is also refused when the agent has
+/// started waiting on its user, which the Enter would answer, and when a
+/// person has typed since the text, whose keys the Enter would submit.
 ///
 /// On a refusal the rest of the text is cancelled FIRST and the writer's
 /// stop awaited, then the queue is flushed: flushed first, the queue would
-/// only make room for the writer to write the tail into it.
+/// only make room for the writer to write the tail into it. Neither happens
+/// when a person typed: the agent is reading, so its paste is closed rather
+/// than cut off, and the person's keys stay in the queue.
+#[allow(clippy::too_many_arguments)]
 async fn type_enter(
     pane: PaneId,
     pgid: Option<nix::unistd::Pid>,
+    command: &str,
+    rules: &crate::server::agents::AgentRules,
     enter: &[u8],
     delay: std::time::Duration,
     mut typed: TypedText,
@@ -1081,6 +1487,7 @@ async fn type_enter(
         ),
     }
     };
+    let typed_after = |pd: &PaneData| pd.last_human_input.is_some_and(|t| t > typed.typed_at);
     let deadline = tokio::time::Instant::now() + delay + CONSUME_DEADLINE;
     tokio::time::sleep(delay).await;
     let slave = {
@@ -1094,6 +1501,7 @@ async fn type_enter(
         })
     };
     let mut written = false;
+    let mut human = false;
     let verdict = loop {
         if !written {
             match typed.written.try_recv() {
@@ -1107,6 +1515,10 @@ async fn type_enter(
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
                 break Err(SubmitRefusal::closed(pane));
             };
+            if typed_after(pd) {
+                human = true;
+                break Err(SubmitRefusal::typed_over(pane));
+            }
             let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
             let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
             let raw = nix::sys::termios::tcgetattr(master).is_ok_and(|t| {
@@ -1116,6 +1528,10 @@ async fn type_enter(
             let Some(slave) = slave.as_ref().filter(|_| same && raw) else {
                 break Err(not_read());
             };
+            let now = std::time::Instant::now();
+            if pane_verdict(pd, command, rules, now).state == AgentState::NeedsInput {
+                break Err(SubmitRefusal::blocked(pane));
+            }
             if written && unread_input(slave) == Some(0) {
                 pd.send_input(enter);
                 break Ok(());
@@ -1126,12 +1542,13 @@ async fn type_enter(
         }
         tokio::time::sleep(CONSUME_POLL).await;
     };
-    if verdict.is_err() {
+    if verdict.is_err() && !human {
         typed.cancel.cancel();
         if !written {
             let _ = tokio::time::timeout(CANCEL_ACK, &mut typed.written).await;
         }
-        if let Some(slave) = &slave {
+        let human_after = panes.lock().await.get(&pane).is_some_and(typed_after);
+        if let Some(slave) = slave.as_ref().filter(|_| !human_after) {
             if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH)
             {
                 log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
@@ -1854,6 +2271,10 @@ struct PaneData {
     /// [`crate::server::agents::Reason`] is the same reason with that number
     /// taken out.
     agent_verdict: Option<(AgentState, crate::server::agents::Reason)>,
+    /// When a human last typed into this pane: a client's keystroke, a View
+    /// cell's, a key binding's `SendKey`, or the wheel's arrow keys. Set only
+    /// by [`Self::send_human_input`]. The typing guard reads it.
+    last_human_input: Option<std::time::Instant>,
     /// The pane's `OSC 0` / `OSC 2` titles and its foreground history.
     title: crate::server::title::TitleTracker,
     /// Process names and working directory, read outside the `panes` lock by
@@ -2012,6 +2433,15 @@ impl PaneData {
                 data.len()
             );
         }
+    }
+
+    /// [`Self::send_input`] for keys a person pressed, which arms the typing
+    /// guard. Every human key path writes through this, and nothing else
+    /// does: a submit's own writes arming it would hold the next submit
+    /// behind the guard the first one armed.
+    fn send_human_input(&mut self, data: &[u8]) {
+        self.send_input(data);
+        self.last_human_input = Some(std::time::Instant::now());
     }
 
     /// [`Self::send_input`], told when the last byte is written and able to
@@ -2394,6 +2824,17 @@ impl RemuxServer {
                 }
             });
         }
+
+        // The submitter: types queued messages into their panes. Its own
+        // `Notify`, never `AGENTS_DIRTY`: that one is `notify_one` with the
+        // pusher above as its only waiter, and a second waiter would take its
+        // wakeups.
+        tokio::spawn(run_submitter(
+            Arc::clone(&server.state),
+            Arc::clone(&server.panes),
+            Arc::clone(&server.clients),
+            Arc::clone(&server.config),
+        ));
 
         // Periodic tick that promotes quiet background `Activity` tabs to
         // `Silent` ("finished"). Runs in the real server binary, so
@@ -3014,9 +3455,22 @@ async fn handle_client_message(
                 reply_to,
                 pane_hint,
             };
-            let answer =
-                handle_msg_send(client_id, outgoing, peer, state, panes, config, messaging()).await;
-            reply(client_id, clients, answer).await;
+            let answer = handle_msg_send(
+                client_id,
+                outgoing,
+                peer,
+                state,
+                panes,
+                config,
+                clients,
+                messaging(),
+            )
+            .await;
+            // `None` is a submit that was queued: its answer comes from the
+            // submitter, once it is typed or cannot be.
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer).await;
+            }
             Ok(())
         }
         ClientMessage::MsgRead {
@@ -3651,10 +4105,10 @@ entries={} error={:?} truncated={}",
             // output will trigger the existing forwarding task, which fans out
             // PaneContent to subscribers, so no explicit broadcast is needed.
             let alive = {
-                let ps = panes.lock().await;
-                match ps.get(&pane_id) {
+                let mut ps = panes.lock().await;
+                match ps.get_mut(&pane_id) {
                     Some(pane_data) => {
-                        pane_data.send_input(&data);
+                        pane_data.send_human_input(&data);
                         true
                     }
                     None => false,
@@ -3725,7 +4179,7 @@ entries={} error={:?} truncated={}",
                     log::debug!(
                         "server: ScrollPane->alt-arrows client_id={client_id} pane_id={pane_id} app_cursor={app_cursor} up={up}"
                     );
-                    return write_to_pane(panes, pane_id, &bytes).await;
+                    return write_keys_to_pane(panes, pane_id, &bytes).await;
                 }
                 MouseRoute::Remux { .. } => {}
             }
@@ -4025,7 +4479,7 @@ async fn handle_input(
 
     let mut ps = panes.lock().await;
     if let Some(pane_data) = ps.get_mut(&active_pane) {
-        pane_data.send_input(data);
+        pane_data.send_human_input(data);
 
         // Ctrl+L (0x0C / FF): shells' readline/zsh clear-screen typically emits
         // only \e[H\e[2J (no \e[3J), so the scrollback would otherwise survive.
@@ -5234,9 +5688,9 @@ async fn handle_command(
                 };
                 tab.focused_pane
             };
-            let panes_lock = panes.lock().await;
-            if let Some(pane) = panes_lock.get(&pane_id) {
-                pane.send_input(&bytes);
+            let mut panes_lock = panes.lock().await;
+            if let Some(pane) = panes_lock.get_mut(&pane_id) {
+                pane.send_human_input(&bytes);
             }
         }
         RemuxCommand::PaneNew => {
@@ -6542,6 +6996,8 @@ struct PaneSample {
     /// The terminal's foreground process group, read before `command`, so a
     /// later write can check the program it was meant for is still there.
     pgid: Option<nix::unistd::Pid>,
+    /// When a human last typed into the pane, for the typing guard.
+    last_human_input: Option<std::time::Instant>,
 }
 
 /// One pane, sampled the way [`collect_agents`] samples every pane: the
@@ -6560,6 +7016,7 @@ async fn sample_pane(
         verdict: None,
         bracketed_paste: false,
         pgid: None,
+        last_human_input: None,
     };
     let rules = agent_rules(config);
     let master = {
@@ -6598,6 +7055,7 @@ async fn sample_pane(
         command,
         bracketed_paste: pd.screen.bracketed_paste,
         pgid,
+        last_human_input: pd.last_human_input,
     }
 }
 
@@ -6820,9 +7278,21 @@ async fn handle_client_disconnect(
         let mut cls = clients.lock().await;
         cls.remove(&client_id);
     }
-    let dropped = messaging().lock().await.drop_waiters_of(client_id);
+    let (dropped, (queued, typing)) = {
+        let mut store = messaging().lock().await;
+        (
+            store.drop_waiters_of(client_id),
+            store.detach_replies_of(client_id),
+        )
+    };
     if dropped > 0 {
         log::info!("msg: dropped {dropped} waiter(s) of client_id={client_id} (disconnected)");
+    }
+    if queued + typing > 0 {
+        log::info!(
+            "msg: detached {} submit reply(ies) of client_id={client_id} (disconnected): {queued} still queued to be typed, {typing} being typed now",
+            queued + typing
+        );
     }
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
@@ -7112,6 +7582,20 @@ async fn write_to_pane(
     let ps = panes.lock().await;
     if let Some(pane_data) = ps.get(&pane_id) {
         pane_data.send_input(bytes);
+    }
+    Ok(())
+}
+
+/// [`write_to_pane`] for bytes that stand in for keys a person pressed: the
+/// wheel's arrow keys edit an agent's input line exactly as typed arrows do,
+/// so they arm the typing guard. A mouse report is not a key and does not.
+async fn write_keys_to_pane(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    pane_id: PaneId,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Some(pane_data) = panes.lock().await.get_mut(&pane_id) {
+        pane_data.send_human_input(bytes);
     }
     Ok(())
 }
@@ -7552,7 +8036,7 @@ async fn handle_mouse_scroll(
             log::debug!(
                 "server: MouseScroll->alt-arrows client_id={client_id} pane_id={target_pane} app_cursor={app_cursor} up={up}"
             );
-            write_to_pane(panes, target_pane, &bytes).await
+            write_keys_to_pane(panes, target_pane, &bytes).await
         }
         MouseRoute::Remux { .. } => {
             // Plain shell: preserve remux's own scrollback scroll (delta ±3).
@@ -9172,6 +9656,7 @@ async fn spawn_pane(
             streamed_session_visible: false,
             last_output: std::time::Instant::now(),
             agent_verdict: None,
+            last_human_input: None,
             title: crate::server::title::TitleTracker::default(),
             names: PaneNames {
                 // Until the forwarding loop reads the real name, the program
@@ -11166,6 +11651,18 @@ async fn reap_panes(
                     format!("pane %{pane_id} closed while waiting"),
                 ));
             }
+            let (queued, replies) = store.take_submits(pane_id);
+            if queued > 0 {
+                log::info!(
+                    "msg: pane %{pane_id} closed with {queued} message(s) waiting to be typed"
+                );
+            }
+            for reply in replies {
+                let _ = reply.tx.send(ServerMessage::refused(
+                    "no_such_target",
+                    format!("pane %{pane_id} closed while its message was queued"),
+                ));
+            }
             let (dropped, name) = store.drop_pane(pane_id);
             if dropped > 0 || name.is_some() {
                 log::info!(
@@ -12015,6 +12512,61 @@ mod tests {
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn a_typing_task_that_panics_still_ends_its_panes_typing() {
+        use crate::server::messaging::SubmitEntry;
+        let pane = 9_000_001;
+        let store = super::messaging();
+        {
+            let mut st = store.lock().await;
+            st.begin_typing(pane, None);
+            let queued = SubmitEntry {
+                id: 1,
+                pane,
+                deliver: crate::protocol::Deliver::Submit,
+                body: String::new(),
+                from_pane: 1,
+                from_name: None,
+                enqueued_at: std::time::Instant::now(),
+                reply: None,
+                waiting_on: None,
+            };
+            st.enqueue_submit(queued, 8).unwrap();
+            assert!(st.submit_heads().iter().all(|h| h.pane != pane));
+        }
+        let typing = super::EndTypingOnDrop { pane, armed: true };
+        let task = tokio::spawn(async move {
+            let _typing = typing;
+            panic!("the typing task stops");
+        });
+        assert!(task.await.is_err());
+        for _ in 0..100 {
+            if store
+                .lock()
+                .await
+                .submit_heads()
+                .iter()
+                .any(|h| h.pane == pane)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the pane is still typing, so its queue is never looked at");
+    }
+
+    #[test]
+    fn the_typing_guard_at_any_setting_ends_inside_the_hold() {
+        let cfg = crate::config::messaging::MessagingConfig {
+            typing_guard_max_ms: u64::MAX,
+            ..Default::default()
+        };
+        assert!(
+            cfg.typing_guard().max < std::time::Duration::from_millis(super::SUBMIT_HOLD_MS),
+            "a guard that outlasts the hold answers `timeout` where it should answer `human_typing`"
+        );
+    }
 
     #[test]
     fn a_split_along_the_columns_or_rows_axis_becomes_auto() {

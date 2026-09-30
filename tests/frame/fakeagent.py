@@ -32,6 +32,9 @@ so a command written while another is being read is never lost:
                         or busy while text is typed at it)
   resume                start reading again (after deaf)
   exit-on-rx             exit right after the next read
+  block-on-rx            show the permission prompt the moment the next
+                         pasted block arrives: a prompt drawn between a
+                         typed message and its Enter
   slow:<bytes>:<ms>      read at most <bytes> at a time, <ms> apart: an agent
                          that reads a long message slower than it arrives
   quit                   exit
@@ -82,6 +85,7 @@ def main():
     next_work = 0.0
     deaf = False
     exit_on_rx = False
+    block_on_rx = False
     read_size, read_gap = 4096, 0.0
     while True:
         if deaf:
@@ -105,6 +109,9 @@ def main():
             log.write(line)
             if exit_on_rx:
                 return
+            if block_on_rx and data.startswith(b"\x1b[200~"):
+                block_on_rx = False
+                out("Do you want to proceed?\n> 1. Yes\n  2. No\n")
             time.sleep(read_gap)
         now = time.monotonic()
         if now < work_until and now >= next_work:
@@ -129,6 +136,8 @@ def main():
                 read_size, read_gap = int(size), int(gap) / 1000
             elif command == "exit-on-rx":
                 exit_on_rx = True
+            elif command == "block-on-rx":
+                block_on_rx = True
             elif command == "quit":
                 ack(command)
                 return

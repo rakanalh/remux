@@ -153,6 +153,49 @@ pub struct Waiter {
     pub cancel: tokio::sync::oneshot::Sender<()>,
 }
 
+/// Where a parked send is answered: the connection that made it.
+pub struct Reply {
+    pub client_id: u64,
+    pub tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerMessage>,
+}
+
+/// A message waiting to be typed into a pane, oldest first per pane.
+pub struct SubmitEntry {
+    pub id: MsgId,
+    pub pane: PaneId,
+    pub deliver: crate::protocol::Deliver,
+    pub body: String,
+    /// The sender, for the envelope.
+    pub from_pane: PaneId,
+    pub from_name: Option<String>,
+    pub enqueued_at: Instant,
+    /// `None` once the sender's connection has closed: the entry is still
+    /// typed when it can be, but nobody is told.
+    pub reply: Option<Reply>,
+    /// The last reason it was logged as waiting on, so a wait is logged once
+    /// per distinct reason rather than on every pass.
+    pub waiting_on: Option<&'static str>,
+}
+
+/// A queue head as the submitter reads it: what it decides on, without the
+/// body, which is taken only when the entry is popped to be typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitHead {
+    pub id: MsgId,
+    pub pane: PaneId,
+    pub deliver: crate::protocol::Deliver,
+    pub enqueued_at: Instant,
+}
+
+/// Why a submit could not be queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueRefusal {
+    /// The sender's connection already has a send waiting for its answer.
+    SendParked,
+    /// The pane's queue, or the sender's share of it, is full.
+    QueueFull,
+}
+
 #[derive(Default)]
 struct Mailbox {
     /// In id order, which is arrival order.
@@ -234,6 +277,15 @@ pub struct Messaging {
     /// asked; `changed` wakes whoever writes the file.
     dirty: bool,
     changed: std::sync::Arc<tokio::sync::Notify>,
+    /// Messages waiting to be typed, per pane, oldest first. Not persisted: a
+    /// restart drops them and they stay in the mailbox, Queued.
+    submit_queues: HashMap<PaneId, VecDeque<SubmitEntry>>,
+    /// Panes whose head is being typed right now (its Enter is pending), with
+    /// the reply still waiting for that answer. No other entry for such a
+    /// pane is looked at until it finishes, which is what keeps a pane's
+    /// messages in order. The reply is held here, not by the typing task, so
+    /// that a disconnect can drop it.
+    in_flight: HashMap<PaneId, Option<Reply>>,
 }
 
 /// What `mailbox.json` holds. Waiters, rate windows and the closed-pane set are
@@ -386,6 +438,8 @@ impl Messaging {
             next_waiter: 1,
             dirty: false,
             changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            submit_queues: HashMap::new(),
+            in_flight: HashMap::new(),
         }
     }
 
@@ -601,6 +655,159 @@ impl Messaging {
         let before = self.waiters.len();
         self.waiters.retain(|_, w| w.client_id != client_id);
         before - self.waiters.len()
+    }
+
+    /// Whether connection `client_id` has a send waiting for its answer,
+    /// queued or being typed. One per connection: a second cannot supersede
+    /// the first, whose message is already stored.
+    pub fn has_parked_send(&self, client_id: u64) -> bool {
+        let is_it =
+            |reply: &Option<Reply>| reply.as_ref().is_some_and(|r| r.client_id == client_id);
+        self.submit_queues
+            .values()
+            .flatten()
+            .any(|queued| is_it(&queued.reply))
+            || self.in_flight.values().any(is_it)
+    }
+
+    /// Queue `entry` to be typed into its pane. Refused when its sender
+    /// already has a send parked, and when the pane already holds `cap`
+    /// entries or the sender already holds half of them: one sender cannot
+    /// fill a pane's queue and lock every other sender out of it.
+    pub fn enqueue_submit(&mut self, entry: SubmitEntry, cap: usize) -> Result<(), EnqueueRefusal> {
+        if let Some(client_id) = entry.reply.as_ref().map(|r| r.client_id) {
+            if self.has_parked_send(client_id) {
+                return Err(EnqueueRefusal::SendParked);
+            }
+        }
+        let queue = self.submit_queues.entry(entry.pane).or_default();
+        let own = queue
+            .iter()
+            .filter(|e| e.from_pane == entry.from_pane)
+            .count();
+        if queue.len() >= cap || own >= (cap / 2).max(1) {
+            if queue.is_empty() {
+                self.submit_queues.remove(&entry.pane);
+            }
+            return Err(EnqueueRefusal::QueueFull);
+        }
+        queue.push_back(entry);
+        Ok(())
+    }
+
+    /// Put an entry popped to be typed back at the front of its queue: it
+    /// was not typed, and it must keep its place before the entries behind it.
+    pub fn requeue_front(&mut self, entry: SubmitEntry) {
+        self.submit_queues
+            .entry(entry.pane)
+            .or_default()
+            .push_front(entry);
+    }
+
+    /// The oldest entry of each pane that is not mid-typing. A head that must
+    /// wait holds its pane: nothing behind it is returned.
+    pub fn submit_heads(&self) -> Vec<SubmitHead> {
+        self.submit_queues
+            .iter()
+            .filter(|(pane, _)| !self.in_flight.contains_key(pane))
+            .filter_map(|(_, queue)| queue.front())
+            .map(|e| SubmitHead {
+                id: e.id,
+                pane: e.pane,
+                deliver: e.deliver,
+                enqueued_at: e.enqueued_at,
+            })
+            .collect()
+    }
+
+    /// Record that `pane`'s head `id` is waiting on `reason`. Returns whether
+    /// that is new, so the caller logs each distinct reason once.
+    pub fn set_waiting(&mut self, pane: PaneId, id: MsgId, reason: &'static str) -> bool {
+        match self
+            .submit_queues
+            .get_mut(&pane)
+            .and_then(|q| q.front_mut())
+            .filter(|e| e.id == id)
+        {
+            Some(entry) if entry.waiting_on != Some(reason) => {
+                entry.waiting_on = Some(reason);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove `pane`'s head if it is still `id`.
+    pub fn pop_submit(&mut self, pane: PaneId, id: MsgId) -> Option<SubmitEntry> {
+        let queue = self.submit_queues.get_mut(&pane)?;
+        if queue.front().map(|e| e.id) != Some(id) {
+            return None;
+        }
+        let entry = queue.pop_front();
+        if queue.is_empty() {
+            self.submit_queues.remove(&pane);
+        }
+        entry
+    }
+
+    /// Mark `pane` as mid-typing, holding the reply its answer goes to.
+    pub fn begin_typing(&mut self, pane: PaneId, reply: Option<Reply>) {
+        self.in_flight.insert(pane, reply);
+    }
+
+    /// Mark `pane` as done typing, and hand back its reply: `None` when the
+    /// sender has gone, or when the pane closed and was answered already.
+    pub fn end_typing(&mut self, pane: PaneId) -> Option<Reply> {
+        self.in_flight.remove(&pane).flatten()
+    }
+
+    /// Whether the submitter has anything to do: a queued entry or a pane
+    /// mid-typing.
+    pub fn has_submit_work(&self) -> bool {
+        !self.submit_queues.is_empty() || !self.in_flight.is_empty()
+    }
+
+    /// Drop the replies of a connection that closed: `(queued, typing)`.
+    /// Its entries stay and are typed when they can be, and one being typed
+    /// finishes: the sender asked for that, and its CLI giving up must not
+    /// lose the submit.
+    pub fn detach_replies_of(&mut self, client_id: u64) -> (usize, usize) {
+        let is_it =
+            |reply: &Option<Reply>| reply.as_ref().is_some_and(|r| r.client_id == client_id);
+        let mut queued = 0;
+        for entry in self.submit_queues.values_mut().flatten() {
+            if is_it(&entry.reply) {
+                entry.reply = None;
+                queued += 1;
+            }
+        }
+        let mut typing = 0;
+        for reply in self.in_flight.values_mut() {
+            if is_it(reply) {
+                *reply = None;
+                typing += 1;
+            }
+        }
+        (queued, typing)
+    }
+
+    /// For a pane that is closing: how many messages were waiting to be
+    /// typed into it, and every reply still owed an answer, the one being
+    /// typed included.
+    pub fn take_submits(&mut self, pane: PaneId) -> (usize, Vec<Reply>) {
+        let typing = self.in_flight.remove(&pane);
+        let queued: Vec<SubmitEntry> = self
+            .submit_queues
+            .remove(&pane)
+            .map(Vec::from)
+            .unwrap_or_default();
+        let count = queued.len() + usize::from(typing.is_some());
+        let replies = typing
+            .flatten()
+            .into_iter()
+            .chain(queued.into_iter().filter_map(|e| e.reply))
+            .collect();
+        (count, replies)
     }
 
     /// How many expired messages were dropped since the last call.
@@ -1501,6 +1708,173 @@ mod tests {
                 at_byte: 1
             })
         );
+    }
+
+    /// An entry from sender pane `100 + id`, so entries count against the
+    /// per-sender share only where a test says so.
+    fn entry(id: MsgId, pane: PaneId, client: Option<u64>) -> SubmitEntry {
+        SubmitEntry {
+            id,
+            pane,
+            deliver: crate::protocol::Deliver::Submit,
+            body: format!("body {id}"),
+            from_pane: 100 + id,
+            from_name: None,
+            enqueued_at: Instant::now(),
+            reply: client.map(reply),
+            waiting_on: None,
+        }
+    }
+
+    fn reply(client_id: u64) -> Reply {
+        Reply {
+            client_id,
+            tx: tokio::sync::mpsc::unbounded_channel().0,
+        }
+    }
+
+    #[test]
+    fn enqueue_refuses_past_the_cap() {
+        let mut m = Messaging::new(limits());
+        assert_eq!(m.enqueue_submit(entry(1, 5, None), 2), Ok(()));
+        assert_eq!(m.enqueue_submit(entry(2, 5, None), 2), Ok(()));
+        assert_eq!(
+            m.enqueue_submit(entry(3, 5, None), 2),
+            Err(EnqueueRefusal::QueueFull)
+        );
+        assert_eq!(
+            m.enqueue_submit(entry(4, 6, None), 2),
+            Ok(()),
+            "another pane"
+        );
+    }
+
+    #[test]
+    fn one_sender_holds_at_most_half_a_panes_queue() {
+        let mut m = Messaging::new(limits());
+        let from = |id, from_pane| SubmitEntry {
+            from_pane,
+            ..entry(id, 5, None)
+        };
+        for id in 1..=4 {
+            assert_eq!(m.enqueue_submit(from(id, 7), 8), Ok(()), "entry {id}");
+        }
+        assert_eq!(
+            m.enqueue_submit(from(5, 7), 8),
+            Err(EnqueueRefusal::QueueFull),
+            "a fifth from one sender with room for eight"
+        );
+        assert_eq!(m.enqueue_submit(from(6, 8), 8), Ok(()), "another sender");
+        assert_eq!(
+            m.enqueue_submit(entry(7, 9, None), 8),
+            Ok(()),
+            "another pane's queue is its own"
+        );
+        let mut one = Messaging::new(limits());
+        assert_eq!(
+            one.enqueue_submit(from(1, 7), 1),
+            Ok(()),
+            "a queue of one still takes one"
+        );
+    }
+
+    #[test]
+    fn one_parked_reply_per_client() {
+        let mut m = Messaging::new(limits());
+        assert_eq!(m.enqueue_submit(entry(1, 5, Some(9)), 8), Ok(()));
+        assert!(m.has_parked_send(9));
+        assert_eq!(
+            m.enqueue_submit(entry(2, 6, Some(9)), 8),
+            Err(EnqueueRefusal::SendParked),
+            "a second parked send on one connection, even to another pane"
+        );
+        assert_eq!(m.enqueue_submit(entry(3, 6, Some(10)), 8), Ok(()));
+    }
+
+    #[test]
+    fn a_send_being_typed_is_still_parked() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(1, 5, Some(9)), 8).unwrap();
+        let popped = m.pop_submit(5, 1).unwrap();
+        m.begin_typing(5, popped.reply);
+        assert!(m.has_parked_send(9), "its answer waits for the Enter");
+        assert_eq!(
+            m.enqueue_submit(entry(2, 6, Some(9)), 8),
+            Err(EnqueueRefusal::SendParked)
+        );
+        assert_eq!(m.detach_replies_of(9), (0, 1));
+        assert!(m.end_typing(5).is_none(), "the detached reply was dropped");
+        assert_eq!(m.enqueue_submit(entry(3, 6, Some(9)), 8), Ok(()));
+    }
+
+    #[test]
+    fn heads_are_the_oldest_entry_per_pane_and_in_flight_holds_the_pane() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(1, 5, None), 8).unwrap();
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        m.enqueue_submit(entry(3, 6, None), 8).unwrap();
+        let mut heads: Vec<MsgId> = m.submit_heads().iter().map(|h| h.id).collect();
+        heads.sort();
+        assert_eq!(heads, [1, 3]);
+        m.begin_typing(5, None);
+        assert_eq!(
+            m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+            [3]
+        );
+        assert!(m.pop_submit(5, 2).is_none(), "only the head pops");
+        assert_eq!(m.pop_submit(5, 1).map(|e| e.id), Some(1));
+        m.end_typing(5);
+        let mut heads: Vec<MsgId> = m.submit_heads().iter().map(|h| h.id).collect();
+        heads.sort();
+        assert_eq!(heads, [2, 3]);
+    }
+
+    #[test]
+    fn a_requeued_entry_keeps_its_place() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(1, 5, Some(9)), 8).unwrap();
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        let popped = m.pop_submit(5, 1).unwrap();
+        m.requeue_front(popped);
+        assert_eq!(
+            m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(m.has_parked_send(9), "with its reply");
+    }
+
+    #[test]
+    fn a_wait_is_logged_once_per_reason() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(1, 5, None), 8).unwrap();
+        assert!(m.set_waiting(5, 1, "human_typing"));
+        assert!(!m.set_waiting(5, 1, "human_typing"));
+        assert!(m.set_waiting(5, 1, "agent_blocked"));
+        assert!(!m.set_waiting(5, 2, "human_typing"), "not the head");
+    }
+
+    #[test]
+    fn detach_keeps_the_entry_and_take_submits_returns_every_reply() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(1, 5, Some(9)), 8).unwrap();
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        m.enqueue_submit(entry(4, 5, Some(11)), 8).unwrap();
+        assert_eq!(m.detach_replies_of(9), (1, 0));
+        assert_eq!(m.submit_heads().len(), 1, "the entry stays");
+        assert!(
+            m.enqueue_submit(entry(3, 6, Some(9)), 8).is_ok(),
+            "no reply parked now"
+        );
+        m.begin_typing(5, Some(reply(12)));
+        let (count, replies) = m.take_submits(5);
+        let mut owed: Vec<u64> = replies.iter().map(|r| r.client_id).collect();
+        owed.sort();
+        assert_eq!(count, 4, "three queued and one being typed");
+        assert_eq!(owed, [11, 12], "the detached one is owed nothing");
+        assert!(m.end_typing(5).is_none(), "answered by the close already");
+        assert!(m.has_submit_work(), "pane 6 still queued");
+        m.take_submits(6);
+        assert!(!m.has_submit_work());
     }
 
     #[test]

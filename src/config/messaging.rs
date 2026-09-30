@@ -22,6 +22,16 @@ pub struct MessagingConfig {
     /// `false` keeps mailboxes and names in memory only, so they do not
     /// survive `remux restart`.
     pub persist: bool,
+    /// How long a pane must be keyboard-quiet before a message is typed into
+    /// it, when a client is looking at it (attended) and when none is.
+    pub typing_guard_ms: u64,
+    pub typing_guard_unattended_ms: u64,
+    /// The longest a submit waits for a typing human before it gives up.
+    pub typing_guard_max_ms: u64,
+    /// `false` never types into a pane a client is looking at.
+    pub submit_when_attended: bool,
+    /// The most messages a pane's submit queue holds.
+    pub submit_queue_len: usize,
     /// How to type into each agent, by its `[agents] commands` spelling.
     /// Merged field by field over [`shipped_rows`].
     pub submit: BTreeMap<String, SubmitRow>,
@@ -112,6 +122,11 @@ pub fn shipped_rows() -> BTreeMap<String, SubmitRow> {
     ])
 }
 
+/// The longest `typing_guard_max_ms`. A send's reply waits for the guard, and
+/// the submit budget the CLI waits for (`daemon::SUBMIT_BUDGET_MS`) is built
+/// from this cap, so raising it lengthens the CLI's wait with it.
+pub const MAX_TYPING_GUARD_MS: u64 = 30_000;
+
 /// The shortest `enter_delay_ms`: with no delay the paste and its Enter can
 /// arrive in one read, which an agent can take as part of the paste.
 pub const MIN_ENTER_DELAY_MS: u64 = 50;
@@ -141,6 +156,11 @@ impl Default for MessagingConfig {
             max_body_bytes: 64 * 1024,
             rate_per_10s: 20,
             persist: true,
+            typing_guard_ms: 3000,
+            typing_guard_unattended_ms: 500,
+            typing_guard_max_ms: 15000,
+            submit_when_attended: true,
+            submit_queue_len: 8,
             submit: BTreeMap::new(),
         }
     }
@@ -170,6 +190,26 @@ impl MessagingConfig {
                 self.rate_per_10s
             },
             ttl_ms: self.ttl_ms(),
+        }
+    }
+
+    /// The guard's windows, with `typing_guard_max_ms` capped at
+    /// [`MAX_TYPING_GUARD_MS`].
+    pub fn typing_guard(&self) -> crate::server::submit::GuardConfig {
+        use std::time::Duration;
+        crate::server::submit::GuardConfig {
+            attended: Duration::from_millis(self.typing_guard_ms),
+            unattended: Duration::from_millis(self.typing_guard_unattended_ms),
+            max: Duration::from_millis(self.typing_guard_max_ms.min(MAX_TYPING_GUARD_MS)),
+        }
+    }
+
+    /// The submit queue's length, a zero falling back to the default.
+    pub fn submit_queue_len(&self) -> usize {
+        if self.submit_queue_len == 0 {
+            Self::default().submit_queue_len
+        } else {
+            self.submit_queue_len
         }
     }
 
@@ -206,6 +246,18 @@ impl MessagingConfig {
             out.push(format!(
                 "[messaging] max_body_bytes = {} is larger than a whole mailbox; using {max_bytes}",
                 self.max_body_bytes
+            ));
+        }
+        if self.typing_guard_max_ms > MAX_TYPING_GUARD_MS {
+            out.push(format!(
+                "[messaging] typing_guard_max_ms = {} is capped at {MAX_TYPING_GUARD_MS}",
+                self.typing_guard_max_ms
+            ));
+        }
+        if self.submit_queue_len == 0 {
+            out.push(format!(
+                "[messaging] submit_queue_len = 0 would refuse every submit; using {}",
+                Self::default().submit_queue_len
             ));
         }
         for (command, row) in &self.submit {
@@ -279,7 +331,11 @@ mod tests {
             .map(|l| format!("{}\n", &l[2..]))
             .collect();
         assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
-        assert_eq!(block.lines().count(), 7, "the block is not all six keys");
+        assert_eq!(
+            block.lines().count(),
+            12,
+            "the block is not all eleven keys"
+        );
         assert_eq!(parse(&block), MessagingConfig::default());
     }
 

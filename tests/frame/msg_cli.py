@@ -73,6 +73,10 @@ pane run from the harness itself.
 8pp. A large read piped into `head -c1` ends by SIGPIPE, not a panic.
 8dl. A server that never finishes the handshake is a timeout in about a
      second; one that handshakes and never answers is a timeout in about ten.
+8sb. A send answered after 13 s, past the 10 s reply deadline: a submit is
+     still waited for (its answer waits for the typing) and prints the
+     answer; a mailbox send times out at 10 s and says the outcome is
+     unknown and how to check before re-sending.
 8z.  No panic.
 
 Run: python3 tests/frame/msg_cli.py   (RMX_RUNDIR overrides the run dir)
@@ -658,6 +662,65 @@ for answer_hello, low, high, label in ((False, 0.8, 2.5, "never finishes the han
     silent.join(2)
     check(code == 1 and err.startswith("remux: timeout: ") and low <= took < high,
           f"8dl a server that {label} is a timeout in {took:.2f}s (exit {code}, err {err!r})")
+
+# --- 8sb: a slow answer to a send ---------------------------------------------
+SLOW_S = 13
+
+
+def slow_server(sock_path, stop):
+    """Handshake, then answer each MsgSend Submitted after SLOW_S seconds."""
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(sock_path)
+    os.chmod(sock_path, 0o600)
+    s.listen(8)
+    s.settimeout(0.2)
+    while not stop.is_set():
+        try:
+            conn, _ = s.accept()
+        except socket.timeout:
+            continue
+        with conn:
+            if read_frame(conn) is None:
+                continue
+            conn.sendall(frame({"protocol_version": PROTOCOL_VERSION, "remux_version": "fake"}))
+            if read_frame(conn) is None:
+                continue
+            time.sleep(SLOW_S)
+            try:
+                conn.sendall(frame({"MsgSent": {"id": 1, "to": {"host": None, "pane_id": 4, "name": None},
+                                                "delivery": "Submitted", "reason": None}}))
+            except OSError:
+                pass
+    s.close()
+
+
+slow_run = f"{RUNDIR}-slow/run"
+os.makedirs(slow_run, mode=0o700, exist_ok=True)
+os.chmod(slow_run, 0o700)
+slow_sock = f"{slow_run}/remux.sock"
+if os.path.exists(slow_sock):
+    os.remove(slow_sock)
+halt = threading.Event()
+slow = threading.Thread(target=slow_server, args=(slow_sock, halt), daemon=True)
+slow.start()
+time.sleep(0.2)
+for deliver in ("submit", "mailbox"):
+    started = time.time()
+    done = subprocess.run([BIN, "msg", "send", "%4", "x", "--deliver", deliver],
+                          env={**fake_env, "XDG_RUNTIME_DIR": slow_run}, capture_output=True, timeout=90)
+    took = time.time() - started
+    err = done.stderr.decode("utf-8", "replace")
+    if deliver == "submit":
+        check(done.returncode == 0 and SLOW_S <= took < SLOW_S + 3 and b"#1" in done.stdout,
+              f"8sb a submit answered after {SLOW_S}s is waited for (exit {done.returncode}, {took:.2f}s, "
+              f"out {done.stdout!r}, err {err!r})")
+    else:
+        check(done.returncode == 1 and 9.5 <= took < 12.5 and err.startswith("remux: timeout: ")
+              and "outcome is unknown" in err and "`remux msg read --pane %4 --all` before re-sending" in err,
+              f"8sb a mailbox send times out at 10 s and says how to check (exit {done.returncode}, "
+              f"{took:.2f}s, err {err!r})")
+halt.set()
+slow.join(SLOW_S + 2)
 
 print()
 if failures:

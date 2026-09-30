@@ -76,9 +76,43 @@ by the server at startup, so each variant is a fresh server with its config:
     because the program never asked for a paste and each newline submits.
 2z. No panic under any variant.
 
+Task 3, the typing guard, through the queue and the submitter:
+
+3a. Unattended (another pane focused): a cell's keystrokes into F hold a
+    submit for the SHORT window, 500 ms after the last one.
+3b. Attended (F focused): a client's keystrokes hold it for 3000 ms, and the
+    wait is logged once.
+3c. Typing past typing_guard_max_ms: Submit is human_typing, Auto is
+    Mailbox/human_typing, nothing typed, both Queued.
+3d. submit_when_attended = false: an attended pane is refused pane_attended
+    (Auto: Mailbox); once unattended it is typed.
+3e. Acked while the guard held it: Mailbox/already_read under both modes,
+    since the target has it and an error would provoke a retry; nothing is
+    typed.
+3f. The sender's connection closes mid-guard: the message is still typed,
+    and its reply is logged as detached.
+3g. A second send on a connection with a send parked: bad_request.
+3h. A send held 3 s behind typing logs at most 4 lines for its id.
+3j. A permission prompt drawn after the text (block-on-rx): no Enter;
+    Submit is agent_blocked, Auto is Mailbox/agent_blocked; Queued.
+3k. A person's key between the text and the Enter: no Enter, the key
+    stays, Submit is human_typing, the message is Queued.
+3l. A key binding's SendKey holds a submit like a keystroke.
+3m. One pane waiting for its agent to read does not hold another pane's
+    submit.
+3n. A send refused before its text is written does not wedge the pane: the
+    next send to it is answered.
+3i. The submit budget: six sends to an agent that reads nothing, with the
+    Enter delay at its 5 s cap, are typed one after another; the sixth
+    reaches the head of the queue after the server's hold and is answered
+    submit_timeout without being typed, and every answer arrives inside the budget
+    the CLI waits for.
+3z. No panic.
+
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
 """
 import json
+import re
 import os
 import sys
 import time
@@ -500,7 +534,7 @@ try:
     waited = wait_file(w_out, timeout=5.0) or {}
     got_bodies = [m["body"] for m in (waited.get("MsgList") or {}).get("messages", [])]
     time.sleep(0.8)
-    check(got_bodies == ["DUP:one"] and outcome(r) == ("Error", "already_read") and rx_chunks(q_log) == [],
+    check(got_bodies == ["DUP:one"] and outcome(r) == ("Mailbox", "already_read") and rx_chunks(q_log) == [],
           f"1o the pane's own waiting read gets the message and nothing is typed "
           f"(reader {got_bodies}, reply {r}, chunks {rx_chunks(q_log)})")
 
@@ -707,6 +741,445 @@ bracketed = "on"
     check("panicked at" not in srv.log(), "2z no panic under the bracketed row")
 finally:
     srv.kill()
+
+# === Task 3: the submit queue, the submitter and the typing guard ===========
+# while_working = "queue": a keystroke's echo makes the fakeagent read as
+# Working for working_ms, which is the unattended window itself, and these
+# cases are about the guard, not the working policy (Task 2 covers that).
+T3 = """
+[messaging]
+typing_guard_max_ms = 4000
+
+[messaging.submit.fakeagent]
+while_working = "queue"
+"""
+import threading  # noqa: E402
+
+
+def focused_pane():
+    """The focused pane of session main's active tab, from the session tree."""
+    reply = ask({"ListSessionTree": None})
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("is_active") and isinstance(node.get("panes"), list):
+                found.extend(p["id"] for p in node["panes"] if p.get("is_focused"))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(reply)
+    return found[0] if found else None
+
+
+def typer(stop, via, pane=None, every=0.2):
+    """Type "k" into the pane every `every` seconds until `stop` is set, on a
+    connection of its own. `via` "input" is a client's keystroke (attached to
+    main, so it reaches main's focused pane); "sendkey" is a key binding's
+    SendKey, which reaches the same pane; "cell" is a View cell's
+    (InputToPane, to `pane`)."""
+    c = Client(srv.sock)
+    c.hello()
+    if via in ("input", "sendkey"):
+        c.send({"Attach": {"session_name": "main"}})
+        c.send({"Resize": {"cols": 160, "rows": 50}})
+        c.drain(0.3)
+    while not stop.is_set():
+        if via == "input":
+            c.send({"Input": {"data": [0x6b]}})
+        elif via == "sendkey":
+            c.send({"Command": {"SendKey": [0x6b]}})
+        else:
+            c.send({"InputToPane": {"pane_id": pane, "data": [0x6b]}})
+        c.drain(every)
+    c.close()
+
+
+def last_k(log):
+    ks = [ns for ns, c in rx_chunks(log) if c == b"k"]
+    return ks[-1] if ks else None
+
+
+def chunk_at(log, body):
+    for ns, c in rx_chunks(log):
+        if body.encode() in c:
+            return ns
+    return None
+
+
+def type_start(pane_id, msg, fire=False, background=False):
+    """Like type_send, but return the reply file without waiting on it. With
+    `background` the shell runs it as a background job, so the next command
+    typed into the pane runs at once rather than after it exits."""
+    requests[0] += 1
+    n = requests[0]
+    in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
+    with open(in_file, "w") as f:
+        json.dump(msg, f)
+    flag = "--fire " if fire else ""
+    job = " &" if background else ""
+    line = f"python3 {WIRE_SEND} {flag}{srv.sock} {in_file} {out_file}{job}\n"
+    cli.send({"InputToPane": {"pane_id": pane_id, "data": list(line.encode())}})
+    return out_file
+
+
+# --- U: F unattended (A spawned last, so A is focused) ---------------------
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T3)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 160, "rows": 50}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    A = cli_spawn("SplitRight")
+    time.sleep(0.8)
+    check(focused_pane() == A, f"setup: A is focused, so %{F} is unattended (focused {focused_pane()})")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+
+    # 3a
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "cell", F))
+    t.start()
+    time.sleep(1.2)
+    stop.set()
+    t.join()
+    r = type_send(A, send(F, "GUARD:unattended", "Submit"))
+    k, at = last_k(F_LOG), chunk_at(F_LOG, "GUARD:unattended")
+    gap = (at - k) / 1e6 if (k and at) else None
+    check(submitted(r) and gap is not None and 450 <= gap < 2500,
+          f"3a unattended: typed {gap} ms after the last cell keystroke (window 500 ms) (reply {r})")
+    check("panicked at" not in srv.log(), "3z no panic (unattended)")
+finally:
+    srv.kill()
+
+# --- T: F attended (F spawned last, so F is focused) ------------------------
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T3)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 160, "rows": 50}})
+    cli.drain(0.8)
+    A = cli_spawn("SplitRight")
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    time.sleep(0.8)
+    check(focused_pane() == F, f"setup: %{F} is focused, so it is attended (focused {focused_pane()})")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+
+    # 3b
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "input"))
+    t.start()
+    time.sleep(1.2)
+    stop.set()
+    t.join()
+    r = type_send(A, send(F, "GUARD:attended", "Submit"))
+    k, at = last_k(F_LOG), chunk_at(F_LOG, "GUARD:attended")
+    gap = (at - k) / 1e6 if (k and at) else None
+    check(submitted(r) and gap is not None and 2950 <= gap < 5000,
+          f"3b attended: typed {gap} ms after the last keystroke (window 3000 ms) (reply {r})")
+    sid = sent_id(r)
+    waits = [ln for ln in srv.log().splitlines() if f"msg: id={sid} submit waiting: human_typing" in ln]
+    check(len(waits) == 1, f"3b ...logged as waiting once (got {len(waits)})")
+    # 3h: no per-pass logging
+    lines = [ln for ln in srv.log().splitlines() if re.search(rf"\bmsg: id={sid}\b", ln)]
+    check(len(lines) <= 4, f"3h a send held 3 s behind typing logs at most 4 lines (got {len(lines)}: {lines})")
+
+    # 3c
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "input"))
+    t.start()
+    time.sleep(0.6)
+    start = len(rx_chunks(F_LOG))
+    t0 = time.time()
+    r_sub = type_send(A, send(F, "GUARD:keptsub", "Submit"))
+    took = time.time() - t0
+    r_auto = type_send(A, send(F, "GUARD:keptauto", "Auto"))
+    stop.set()
+    t.join()
+    typed_any = any(b"GUARD:kept" in c for _, c in rx_chunks(F_LOG)[start:])
+    states = [m["state"] for m in (read_box(F) or []) if m["body"].startswith("GUARD:kept")]
+    check(outcome(r_sub) == ("Error", "human_typing") and 3.5 <= took < 7.0,
+          f"3c typing past the max: Submit is human_typing after {took:.1f}s (got {r_sub})")
+    check(outcome(r_auto) == ("Mailbox", "human_typing") and not typed_any and states == ["Queued", "Queued"],
+          f"3c ...Auto is Mailbox/human_typing, nothing typed, both Queued (auto {r_auto}, states {states})")
+
+    # 3e
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    for mode in ("Submit", "Auto"):
+        stop = threading.Event()
+        t = threading.Thread(target=typer, args=(stop, "input"))
+        t.start()
+        time.sleep(0.6)
+        stop.set()
+        t.join()
+        start = len(rx_chunks(F_LOG))
+        out = type_start(A, send(F, f"ACKED:{mode}", mode))
+        time.sleep(1.0)
+        acked = ask({"MsgAck": {"pane": F, "all": True}})
+        r = wait_file(out, timeout=10)
+        typed_any = any(f"ACKED:{mode}".encode() in c for _, c in rx_chunks(F_LOG)[start:])
+        want = ("Mailbox", "already_read")
+        check(outcome(r) == want and not typed_any,
+              f"3e {mode}: acked while the guard held it is {want[1]}, nothing typed (ack {acked}, reply {r})")
+
+    # 3f
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "input"))
+    t.start()
+    time.sleep(0.6)
+    stop.set()
+    t.join()
+    requests[0] += 1
+    n = requests[0]
+    in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
+    with open(in_file, "w") as f:
+        json.dump(send(F, "GUARD:detached", "Submit"), f)
+    line = f"timeout 0.5 python3 {WIRE_SEND} {srv.sock} {in_file} {out_file}\n"
+    cli.send({"InputToPane": {"pane_id": A, "data": list(line.encode())}})
+    at = None
+    end = time.time() + 10
+    while time.time() < end and at is None:
+        at = chunk_at(F_LOG, "GUARD:detached")
+        time.sleep(0.2)
+    # The detach is logged at the disconnect; "(reply detached)" only once
+    # the Enter is written, after the text this loop saw arrive.
+    end = time.time() + 5
+    log = srv.log()
+    while time.time() < end and "(reply detached)" not in log:
+        time.sleep(0.2)
+        log = srv.log()
+    check(at is not None and "submit reply(ies) of client_id=" in log and "(reply detached)" in log,
+          f"3f the sender gave up mid-guard: still typed, its reply detached (typed {at is not None}, "
+          f"detach logged {'submit reply(ies) of client_id=' in log}, answer logged {'(reply detached)' in log})")
+
+    # 3g
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "input"))
+    t.start()
+    time.sleep(0.6)
+    out = type_start(A, [send(F, "FIRE:one", "Submit"), send(F, "FIRE:two", "Submit")], fire=True)
+    time.sleep(0.5)
+    stop.set()
+    t.join()
+    replies = wait_file(out, timeout=15) or []
+    outcomes = sorted(outcome(x) for x in replies)
+    check(outcomes == sorted([("Error", "bad_request"), ("Submitted", None)]),
+          f"3g a second send on a connection with one parked is bad_request (got {replies})")
+    stored = [m["body"] for m in (read_box(F, all=True) or [])]
+    check("FIRE:one" in stored and "FIRE:two" not in stored,
+          f"3g ...and the refused send was never stored (bodies {stored})")
+
+    # 3l
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "sendkey"))
+    t.start()
+    time.sleep(1.2)
+    stop.set()
+    t.join()
+    r = type_send(A, send(F, "GUARD:sendkey", "Submit"))
+    k, at = last_k(F_LOG), chunk_at(F_LOG, "GUARD:sendkey")
+    gap = (at - k) / 1e6 if (k and at) else None
+    check(submitted(r) and gap is not None and 2950 <= gap < 5000,
+          f"3l a key binding's SendKey holds a submit like a keystroke: typed {gap} ms after it (reply {r})")
+
+    # 3k: the person's key lands between the text and the Enter.
+    time.sleep(3.5)
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    start = len(rx_chunks(F_LOG))
+    out = type_start(A, send(F, "HUMAN:between", "Submit"))
+    end = time.time() + 15
+    while time.time() < end and not any(c.startswith(OPEN) for _, c in rx_chunks(F_LOG)[start:]):
+        time.sleep(0.01)
+    cli.send({"Input": {"data": list(b"k")}})
+    r = wait_file(out, timeout=10)
+    time.sleep(0.5)
+    seq = [c for _, c in rx_chunks(F_LOG)[start:]]
+    states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == "HUMAN:between"]
+    check(outcome(r) == ("Error", "human_typing") and b"\r" not in seq and b"k" in seq and states == ["Queued"],
+          f"3k a key after the text stops the Enter; the key stays and the message is Queued "
+          f"(reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
+
+    check("panicked at" not in srv.log(), "3z no panic (attended)")
+finally:
+    srv.kill()
+
+# --- D: submit_when_attended = false -----------------------------------------
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T3.replace("typing_guard_max_ms = 4000", "typing_guard_max_ms = 4000\nsubmit_when_attended = false"))
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 160, "rows": 50}})
+    cli.drain(0.8)
+    A = cli_spawn("SplitRight")
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    time.sleep(0.8)
+    check(focused_pane() == F, f"setup: %{F} is focused (focused {focused_pane()})")
+    r_sub = type_send(A, send(F, "ATT:sub", "Submit"))
+    r_auto = type_send(A, send(F, "ATT:auto", "Auto"))
+    check(outcome(r_sub) == ("Error", "pane_attended") and outcome(r_auto) == ("Mailbox", "pane_attended"),
+          f"3d submit_when_attended=false: an attended pane is refused / left in the mailbox (sub {r_sub}, auto {r_auto})")
+    X = cli_spawn("SplitRight")
+    time.sleep(0.8)
+    check(focused_pane() == X and wait_idle(F), f"setup: %{F} is no longer focused (focused {focused_pane()})")
+    r = type_send(A, send(F, "ATT:unattended", "Submit"))
+    check(submitted(r), f"3d ...and once it is not attended it is typed (got {r})")
+    check("panicked at" not in srv.log(), "3z no panic (submit_when_attended)")
+finally:
+    srv.kill()
+
+# --- E: the checks at the writes, and panes that do not wait on each other ----
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T3)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 160, "rows": 50}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    D, D_LOG, D_CTL = spawn_agent(paste=True)
+    got = f"{RUNDIR}/wrap-got.txt"
+    W = cli_spawn("SplitBelow", argv=[WRAPPER, got])
+    A = cli_spawn("SplitRight")
+    time.sleep(0.8)
+    check(focused_pane() == A, f"setup: A is focused, so the agents are unattended (focused {focused_pane()})")
+
+    # 3j: the agent draws a permission prompt the moment the paste arrives,
+    # so the prompt is there by the Enter's check and was not at the sample.
+    for mode, want in (("Submit", ("Error", "agent_blocked")), ("Auto", ("Mailbox", "agent_blocked"))):
+        check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+        tell(F_CTL, F_LOG, "block-on-rx")
+        check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+        start = len(rx_chunks(F_LOG))
+        r = type_send(A, send(F, f"PROMPT:{mode}", mode))
+        time.sleep(0.5)
+        seq = [c for _, c in rx_chunks(F_LOG)[start:]]
+        states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == f"PROMPT:{mode}"]
+        check(outcome(r) == want and any(c.startswith(OPEN) for c in seq) and b"\r" not in seq
+              and states == ["Queued"],
+              f"3j {mode}: a prompt drawn after the text gets no Enter: {want} "
+              f"(reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
+        tell(F_CTL, F_LOG, "clear")
+
+    # 3m: a pane whose agent does not read holds only its own queue.
+    tell(D_CTL, D_LOG, "deaf")
+    check(wait_idle(D) and wait_idle(F), f"...%{D} and %{F} settled Idle before the next send")
+    slow = type_start(A, send(D, "DEAF:held", "Submit"), background=True)
+    end = time.time() + 8
+    while time.time() < end and "to=%%%d bytes" % D not in srv.log():
+        time.sleep(0.05)
+    time.sleep(0.4)
+    t0 = time.time()
+    r = type_send(A, send(F, "OTHER:pane", "Submit"))
+    took = time.time() - t0
+    held = not os.path.exists(slow)
+    check(submitted(r) and took < 1.5 and held,
+          f"3m a submit to %{F} is answered in {took:.2f}s while %{D}'s Enter still waits "
+          f"(reply {r}, %{D} still unanswered {held})")
+    check(outcome(wait_file(slow, timeout=10)) == ("Error", "agent_did_not_read"),
+          f"3m ...and %{D}'s own send ends agent_did_not_read")
+
+    # 3n: a refusal before the text is written ends the pane's typing, so the
+    # next send to it is looked at at all.
+    first = type_send(A, send(W, "WRAP:first", "Submit"))
+    second = type_send(A, send(W, "WRAP:second", "Submit"))
+    check(outcome(first) == ("Error", "agent_not_reading") and outcome(second) == ("Error", "agent_not_reading"),
+          f"3n a send after a refused one is answered too (first {first}, second {second})")
+    check("panicked at" not in srv.log(), "3z no panic (writes)")
+finally:
+    srv.kill()
+
+# --- B: the submit budget ------------------------------------------------------
+# Read from the Rust source, so this case follows the constants it tests: the
+# hold is the guard's cap plus one tick, and the budget adds the Enter delay's
+# cap and the two read-check bounds.
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src")
+DAEMON = open(f"{SRC}/server/daemon.rs").read()
+CFG_RS = open(f"{SRC}/config/messaging.rs").read()
+
+
+def rs_ms(src, pattern, scale=1):
+    m = re.search(pattern, src)
+    assert m, pattern
+    return int(m.group(1).replace("_", "")) * scale
+
+
+BUDGET_S = (rs_ms(CFG_RS, r"MAX_TYPING_GUARD_MS: u64 = ([\d_]+);")
+            + rs_ms(DAEMON, r"SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")
+            + rs_ms(CFG_RS, r"MAX_ENTER_DELAY_MS: u64 = ([\d_]+);")
+            + rs_ms(DAEMON, r"CONSUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs\(([\d_]+)\)", 1000)
+            + rs_ms(DAEMON, r"CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")) / 1000
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + """
+[messaging.submit.fakeagent]
+while_working = "queue"
+enter_delay_ms = 5000
+""")
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 160, "rows": 50}})
+    cli.drain(0.8)
+    A = cli_spawn("SplitRight")
+    A2 = cli_spawn("SplitRight")
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    tell(F_CTL, F_LOG, "deaf")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+
+    # 3i: six connections at once, each its own wire_send in the background,
+    # three from each of two panes: one sender may hold only half a queue.
+    outs, parts = [], {A: [], A2: []}
+    for i in range(6):
+        requests[0] += 1
+        n = requests[0]
+        in_file, out_file = f"{RUNDIR}/in-{n}.json", f"{RUNDIR}/out-{n}.json"
+        with open(in_file, "w") as f:
+            json.dump(send(F, f"SLOW:{i}", "Submit"), f)
+        outs.append(out_file)
+        parts[A if i % 2 else A2].append(f"python3 {WIRE_SEND} {srv.sock} {in_file} {out_file} &")
+    t0 = time.time()
+    for sender, jobs in parts.items():
+        cli.send({"InputToPane": {"pane_id": sender, "data": list((" ".join(jobs) + "\n").encode())}})
+    arrived = {}
+    end = t0 + BUDGET_S + 15
+    while time.time() < end and len(arrived) < len(outs):
+        for out in outs:
+            if out not in arrived and os.path.exists(out):
+                arrived[out] = (time.time() - t0, json.load(open(out)))
+        time.sleep(0.1)
+    outcomes = sorted(outcome(r) for _, r in arrived.values())
+    latest = max((t for t, _ in arrived.values()), default=None)
+    states = [m["state"] for m in (read_box(F) or []) if m["body"].startswith("SLOW:")]
+    check(outcomes == sorted([("Error", "agent_did_not_read")] * 5 + [("Error", "submit_timeout")]),
+          f"3i the sixth send reaches the head past the hold and is answered submit_timeout (got {outcomes})")
+    # Two seconds of slack for six pythons starting in the pane's shell. With
+    # the hold off, the sixth is answered about 3.4 s past the budget.
+    check(latest is not None and latest <= BUDGET_S + 2.0,
+          f"3i ...every answer arrives inside the {BUDGET_S:.2f}s budget (last at {latest})")
+    check(states == ["Queued"] * 6, f"3i ...and every message is still Queued in the mailbox (got {states})")
+    check("panicked at" not in srv.log(), "3z no panic (budget)")
+finally:
+    srv.kill()
+
+
 
 print()
 if failures:

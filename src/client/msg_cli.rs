@@ -30,7 +30,7 @@ use crate::client::cli_common::{
 };
 use crate::protocol::{
     valid_host, Address, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef, PaneId, Sender,
-    ServerMessage,
+    ServerMessage, Target,
 };
 
 /// The most a body source is read, whatever the server's own limit: past it
@@ -162,15 +162,19 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
             );
             let answer = ask(
                 ClientMessage::MsgSend {
-                    to,
+                    to: to.clone(),
                     body,
                     deliver: deliver.into(),
                     reply_to: reply_to.map(|id| MsgRef { host: None, id }),
                     pane_hint: pane_hint(),
                 },
-                REPLY_DEADLINE,
+                send_deadline(deliver.into()),
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                CliError::Timeout => send_timeout(&to),
+                e => e,
+            })?;
             match answer {
                 ServerMessage::MsgSent {
                     id,
@@ -378,6 +382,31 @@ fn body_of(raw: Vec<u8>) -> Result<String, CliError> {
     Ok(body)
 }
 
+/// How long `msg send` waits for its answer. A submit's answer waits for the
+/// message to be typed, so it has the server's whole submit budget on top.
+fn send_deadline(deliver: Deliver) -> Duration {
+    match deliver {
+        Deliver::Mailbox => REPLY_DEADLINE,
+        Deliver::Submit | Deliver::Auto => {
+            REPLY_DEADLINE + Duration::from_millis(crate::server::daemon::SUBMIT_BUDGET_MS)
+        }
+    }
+}
+
+/// A send with no answer in time: the server may have stored the message,
+/// and typed it, so sending it again could deliver it twice.
+fn send_timeout(to: &Address) -> CliError {
+    let check = match (&to.host, &to.target) {
+        (None, Target::Pane(pane)) => format!("`remux msg read --pane %{pane} --all`"),
+        _ => {
+            format!("`remux agent status {to}` for its pane, then `remux msg read --pane %N --all`")
+        }
+    };
+    CliError::SendTimeout(format!(
+        "the server did not answer in time, so the outcome is unknown: check {check} before re-sending"
+    ))
+}
+
 fn sent_line(
     id: MsgId,
     pane: PaneId,
@@ -525,6 +554,30 @@ mod tests {
     use crate::protocol::{is_invisible, MsgState};
 
     const MARK: &str = "5eed";
+
+    #[test]
+    fn a_submit_is_waited_for_past_the_servers_whole_budget() {
+        let server_worst = Duration::from_millis(crate::server::daemon::SUBMIT_BUDGET_MS)
+            + crate::server::daemon::CALLER_ATTRIBUTION_TIMEOUT;
+        assert!(send_deadline(Deliver::Submit) > server_worst);
+        assert!(send_deadline(Deliver::Auto) > server_worst);
+        assert_eq!(send_deadline(Deliver::Mailbox), REPLY_DEADLINE);
+    }
+
+    #[test]
+    fn a_send_timeout_says_how_to_check_before_resending() {
+        let pane: Address = "%4".parse().unwrap();
+        let named: Address = "lead".parse().unwrap();
+        let by_pane = send_timeout(&pane).stderr();
+        assert!(
+            by_pane.contains("outcome is unknown")
+                && by_pane.contains("`remux msg read --pane %4 --all` before re-sending"),
+            "{by_pane}"
+        );
+        let by_name = send_timeout(&named).stderr();
+        assert!(by_name.contains("`remux agent status lead`"), "{by_name}");
+        assert_eq!(send_timeout(&pane).exit_code(), 1);
+    }
 
     fn hostile() -> Message {
         Message {
