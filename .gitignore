@@ -11,3 +11,8 @@ __pycache__/
 # Session artifacts (never committed)
 docs/sessions/
 .claude/screenshots/
+
+# Docs site (site/) build output and dependencies
+site/node_modules/
+site/dist/
+site/.astro/

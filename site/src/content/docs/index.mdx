@@ -1,0 +1,55 @@
+---
+title: Remux
+description: A client–server terminal multiplexer written in Rust, with first-class remote servers over SSH and cross-machine Views.
+template: splash
+hero:
+  tagline: A terminal multiplexer written in Rust. Sessions that outlive your terminal, remote servers over SSH in the same tree as local ones, and Views that put panes from any machine side by side.
+  image:
+    file: ../../assets/remux-banner.svg
+  actions:
+    - text: Quick start
+      link: /remux/quick-start/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/rakanalh/remux
+      icon: github
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+![Sessions, agents and files sidebars docked around a set of panes](../../assets/screenshots/sidebars.png)
+
+Remux keeps your terminal sessions in a background server, so they survive a closed terminal or a dropped connection. It pairs tmux-style persistence with bordered, named panes, a prefix key whose options pop up as you type, and remote machines that sit in the same session tree as your local ones.
+
+## Highlights
+
+<CardGrid>
+	<Card title="Sessions that stay running" icon="rocket">
+		Detach and reattach at will. Sessions are saved to disk and come back when the server restarts.
+	</Card>
+	<Card title="Remotes over SSH" icon="server">
+		Declare a server once and its sessions appear next to your local ones, one keypress away.
+	</Card>
+	<Card title="Views" icon="window">
+		Put panes from different sessions and machines on one screen, each a live, typeable alias.
+	</Card>
+	<Card title="Seven layouts" icon="random">
+		BSP, Master, Monocle, Grid, Columns and Rows arrange panes for you. Custom keeps your own splits.
+	</Card>
+	<Card title="Discoverable keys" icon="puzzle">
+		Press `Ctrl-a` and a which-key popup shows what comes next. Every binding is configurable.
+	</Card>
+	<Card title="Sidebars and agents" icon="list-format">
+		Dock a session tree, a file browser, or a live list of your AI coding agents and what they need.
+	</Card>
+</CardGrid>
+
+## Get started
+
+<CardGrid>
+	<LinkCard title="Install" href="/remux/install/" description="Build Remux from source with cargo." />
+	<LinkCard title="Quick start" href="/remux/quick-start/" description="Open a session, split panes and detach." />
+	<LinkCard title="Concepts" href="/remux/concepts/" description="Servers, sessions, tabs, panes, Views and remotes." />
+	<LinkCard title="Keyboard" href="/remux/keyboard/" description="The prefix, modes and the default key map." />
+</CardGrid>
