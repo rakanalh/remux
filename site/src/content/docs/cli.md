@@ -45,10 +45,6 @@ Creates a session and attaches to it.
 | `-s`, `--session <SESSION>` | Name of the new session. Required. |
 | `-f`, `--folder <FOLDER>` | Put the session in this folder of the session tree. The folder is created if it does not exist. |
 
-:::note
-`remux new --help` describes `--folder` as a working directory. It is not: it names the session-manager folder the session is filed under.
-:::
-
 ## `remux attach`
 
 ```shell
