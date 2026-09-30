@@ -6,6 +6,18 @@
 # EVERY option below is shown COMMENTED OUT set to its DEFAULT value. This file
 # is therefore a complete reference: copying it verbatim yields exactly the
 # built-in defaults. Uncomment and edit any line to override that default.
+# The few exceptions are options with no value by default (`frame_bg`,
+# `pane_label_fg`, `pane_label_bg`); they are shown with an EXAMPLE value and
+# marked as such, so uncommenting one changes the look.
+#
+# WHEN AN EDIT APPLIES. The client watches this file and applies these on save:
+# keybindings, `which_key_position`, `pane_title`, `tab_style`, [remotes.*],
+# [[sidebar]], and the theme colours of what the client draws (overlays,
+# which-key, sidebars, Views, search highlights). The server reads this file
+# once, at startup, so these need `remux restart`: everything under [general],
+# `border_style`, `default_layout`, `popup_width_pct`/`popup_height_pct`,
+# [layouts], [agents], and the theme colours of what the server draws (pane
+# borders, tab strips and the status bar in ordinary tabs).
 #
 # When you uncomment options, keep TOML ordering in mind: a table's own flat
 # keys must appear BEFORE any of its sub-table headers. This file is already
@@ -57,10 +69,8 @@
 
 # Where the status bar is placed: "top" | "bottom" (default: "bottom").
 #
-# KNOWN GAP: `status_bar_position` never moves the bar. The server composites it
-# onto the frame's last row unconditionally and no compositor code reads this
-# option, so setting "top" has no effect. Wire the server up before specifying
-# against it.
+# This option has NO EFFECT. The server always draws the status bar on the
+# bottom row, so "top" changes nothing.
 # status_bar_position = "bottom"
 
 # Pane border rendering style: "zellij_style" (borders with pane names) |
@@ -168,7 +178,7 @@
 # Pane frame. `frame_bg` is UNSET by default, which leaves the border cells on
 # the terminal's own background; set it to paint the frame on a solid color.
 # frame_fg = "#585b70"
-# frame_bg = "#1e1e2e"
+# frame_bg = "#1e1e2e"          # EXAMPLE value: unset by default
 # frame_active_fg = "#89b4fa"
 
 # Status bar:
@@ -232,8 +242,8 @@
 # drawn on a pane's top border. Both are UNSET by default: the label then takes
 # the border's own color (so it keeps tracking focus) on the frame's background.
 # separator_fg = "#6c7086"
-# pane_label_fg = "#cdd6f4"
-# pane_label_bg = "#1e1e2e"
+# pane_label_fg = "#cdd6f4"     # EXAMPLE value: unset by default
+# pane_label_bg = "#1e1e2e"     # EXAMPLE value: unset by default
 # session_name_fg = "#94e2d5"
 
 # Search highlight colors (all matches vs. the current match). Search
@@ -249,8 +259,9 @@
 # -----------------------------------------------------------------------------
 # [modes.command]
 
-# Delay in milliseconds before the which-key popup appears after pressing the
-# leader key (default: 500).
+# Meant as the delay in milliseconds before the which-key popup appears after
+# pressing the leader key (default: 500). This option has NO EFFECT: the popup
+# opens as soon as you press the leader.
 # timeout_ms = 500
 
 # -----------------------------------------------------------------------------
@@ -280,7 +291,9 @@
 #
 # Commands use PascalCase names matching RemuxCommand variants (see the
 # "Available Commands Reference" at the bottom of this file). Arguments are
-# space-separated; quote arguments containing spaces: SessionNew "my project".
+# space-separated; quote arguments containing spaces: FolderNew "my project". The
+# naming commands (SessionNew, SessionRename, TabRename, PaneRename) always
+# open a prompt and ignore any arguments.
 #
 # NOTE: `[keybindings.normal]` is accepted as a DEPRECATED alias for
 # `[keybindings.command]` (it logs a warning). Use `[keybindings.command]`.
@@ -364,6 +377,8 @@
 # K = "PaneMoveUp; EnterNormal"
 # L = "PaneMoveRight; EnterNormal"
 # z = "PaneToggleZoom; EnterNormal"
+# o = "PopupToggle; EnterNormal"
+# m = "SetMaster; EnterNormal"
 # r = "PaneRename"
 # t = "PaneMoveToTab"
 # a = "PaneStackAdd; EnterNormal"
@@ -486,10 +501,10 @@
 # -----------------------------------------------------------------------------
 # Keybindings — Visual Mode
 # -----------------------------------------------------------------------------
-# Visual mode overrides (tree-based, same format as command mode). Visual mode
-# has built-in keys for scrollback navigation (j/k, gg, G, Ctrl-d/u, v/V for
-# selection, y to yank, / to search, e to open editor). Press Escape to return
-# to Normal. Add overrides here if needed. Defaults to empty.
+# Visual mode has built-in keys for scrollback navigation (j/k, gg, G,
+# Ctrl-d/u, v/V for selection, y to yank, / to search, e to open editor). Press
+# Escape to return to Normal. `[keybindings.visual]` is accepted but has NO
+# EFFECT: Visual mode keys are built in and cannot be rebound.
 # [keybindings.visual]
 
 
@@ -503,8 +518,9 @@
 #
 # The values below are also the DEFAULTS when this section is absent. Entries
 # you add here override or extend the defaults. Existing hardcoded overlay keys
-# (Enter, arrows, j/k, h/l, n/c/m/d, q) are preserved — chords are checked first
-# and fall through to those on no match.
+# (Enter, arrows, j/k, h/l, +/-, n/c/m/d, Space, /, q, Esc) are preserved —
+# chords are checked first and fall through to those on no match. `l`/Right/
+# Enter on a remote's row also connect it; `+`/`-` only expand and collapse.
 #
 # Rules:
 #   • A chord is 1-2 printable characters; invalid chords are skipped (warned).
@@ -515,7 +531,8 @@
 #
 # Actions: TabNew, TabClose, TabRename, TabMoveLeft, TabMoveRight, PaneNew,
 #          PaneClose, PaneRename, SessionNew, SessionClose, SessionRename,
-#          SessionMove, FolderNew, FolderDelete, FolderRename.
+#          SessionMove, FolderNew, FolderDelete, FolderRename, AddToView,
+#          ViewRename, ViewRemoveCell, ViewDelete.
 #
 # [keybindings.session_manager]
 # tn = "TabNew"
@@ -533,6 +550,10 @@
 # fn = "FolderNew"
 # fx = "FolderDelete"
 # fr = "FolderRename"
+# va = "AddToView"
+# vr = "ViewRename"
+# vx = "ViewRemoveCell"
+# vd = "ViewDelete"
 
 
 # =============================================================================
@@ -545,8 +566,8 @@
 #   TabGoto <index>                 — Jump to tab by 0-based index
 #   TabNext                         — Focus next tab
 #   TabPrev                         — Focus previous tab
-#   TabMove [index]                 — Move tab to position (default: 0)
-#   TabRename <name>                — Rename the active tab
+#   TabMove [index]                 — Move tab to 1-based position (0, 1 or none: first)
+#   TabRename                       — Rename the active tab (prompts)
 #
 # Pane commands:
 #   PaneNew                         — Create a new pane
@@ -573,7 +594,7 @@
 #   PaneUnstackUp                   — Take focused pane out of its stack, above it
 #   PaneUnstackDown                 — Take focused pane out of its stack, below it
 #   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
-#   PaneRename <name>               — Rename the focused pane
+#   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
 #   PopupToggle                     — Toggle the floating popup terminal
 #
@@ -596,12 +617,12 @@
 #   SidebarCycle                    — Cycle focus through every panel, then the content
 #
 # Session commands:
-#   SessionNew <name> [folder]      — Create a new session
+#   SessionNew                      — Create a new session (prompts)
 #   SessionQuickSwitch              — Open the quick session switcher
 #   AgentQuickSwitch                — Open the agent switcher (every pane running an agent)
 #   SessionSwitchLast               — Toggle to the previously-attached session
 #   SessionDetach                   — Detach from the current session
-#   SessionRename <name>            — Rename the current session
+#   SessionRename                   — Rename the current session (prompts)
 #   SessionMoveToFolder             — Move the current session to a folder
 #   OpenSessionManager              — Open the full session manager
 #   SessionList                     — List all sessions
@@ -632,7 +653,9 @@
 #
 # Layout commands:
 #   ToggleStyle                     — Toggle border style between zellij and tmux
-#   LayoutNext                      — Cycle through layout modes (BSP -> Master -> Monocle)
+#   LayoutNext                      — Cycle the enabled automatic layouts (BSP -> Master
+#                                     -> Monocle -> Grid -> Columns -> Rows), then back
+#                                     to a remembered Custom arrangement
 #   SetMaster                       — Set the focused pane as the master pane
 #
 # Remote commands:
@@ -1037,8 +1060,10 @@
 # server's sessions. Attaching to a remote session hands the foreground render
 # loop over to the remote transport — remote sessions feel like local ones.
 #
-# Remote nodes support expand (connect) and switch-to-session/tab/pane only.
-# Structural edits (create/delete/rename/move) remain local-only.
+# The session manager's edits work on a connected remote's tree too: creating,
+# moving and deleting folders and sessions, new/close tab and pane, and renames
+# go to the server of the selected row. Only resurrecting a dormant session is
+# local-only.
 #
 # Per-remote fields:
 #   ssh         — SSH destination, e.g. "user@host" (relies on ~/.ssh/config). Required.
