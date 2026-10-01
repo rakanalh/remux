@@ -802,8 +802,9 @@ pub fn display_tab_names(names: &[String], pane_ids: &[PaneId]) -> Vec<String> {
         .collect()
 }
 
-/// The fixed per-tab width of a strip: the longest display name plus one padding
-/// column on each side, capped to the strip width. `0` when there are no tabs.
+/// The natural per-tab width of a strip: the longest display name plus one
+/// padding column on each side, capped to the strip width. `0` when there are no
+/// tabs. [`strip_fit`] shrinks it when the tabs cannot all fit at this width.
 ///
 /// Measured in CHARS. One hit-tester used to measure the id fallback in BYTES,
 /// which agreed with the renderer only because ids are numeric.
@@ -834,10 +835,16 @@ pub fn tab_strip_width(display_names: &[String], width: usize) -> usize {
 /// draws a lone title as a bare ` name ` chip flush at the strip's start; the
 /// tmux tab bar is always flush.
 ///
-/// Entries past the right edge are dropped. In a plain strip the last visible
-/// one is clipped; a capped strip (see [`strip_caps`]) places whole chips only,
-/// because a clipped chip would lose its right cap. A capped entry's range
-/// includes both caps, so a click on a cap selects that tab.
+/// Every tab is as wide as the longest name needs, unless that leaves some tab
+/// past the right edge. Then all tabs shrink equally until every one fits, and
+/// [`tab_label`] cuts the names that no longer fit. A strip that hides a tab
+/// hides the pane it stands for, and the hidden tab was usually the last one,
+/// which is the focused pane right after it was created. See [`strip_fit`].
+///
+/// Only when even [`MIN_TAB_LABEL`]-wide tabs cannot all fit are entries past
+/// the right edge dropped and the last visible one clipped. That strip is
+/// always plain, because [`strip_fit`] drops the caps first. A capped entry's
+/// range includes both caps, so a click on a cap selects that tab.
 pub fn tab_strip_layout(
     display_names: &[String],
     width: usize,
@@ -845,22 +852,20 @@ pub fn tab_strip_layout(
     theme: &CompositorTheme,
 ) -> Vec<TabStripEntry> {
     let mut out = Vec::new();
-    let tab_width = tab_strip_width(display_names, width);
-    if tab_width == 0 {
+    let Some(fit) = strip_fit(display_names, width, style, theme) else {
         return out;
-    }
-    let capped = strip_caps(display_names, width, style, theme).is_some();
-    let (tab_width, gap) = if capped {
-        (tab_width + 2, 1)
+    };
+    let (tab_width, gap) = if fit.caps.is_some() {
+        (fit.label + 2, 1)
     } else {
-        (tab_width, TAB_SEPARATOR.chars().count())
+        (fit.label, TAB_SEPARATOR.chars().count())
     };
     let mut x = strip_lead(display_names, style);
     for index in 0..display_names.len() {
         if index > 0 {
             x += gap;
         }
-        if x >= width || (capped && x + tab_width > width) {
+        if x >= width {
             break;
         }
         let end = (x + tab_width).min(width);
@@ -883,38 +888,104 @@ fn strip_lead(display_names: &[String], style: &BorderStyle) -> usize {
     }
 }
 
-/// **The one cap decision.** The `(left, right)` cap glyphs a strip is drawn
-/// with, or `None` when it is drawn plain. [`tab_strip_layout`] and every
-/// renderer ask this with the same inputs, so the drawn chips and the hit
-/// ranges cannot disagree about whether the caps exist.
+/// The narrowest a squeezed tab's label gets: one character of the name with a
+/// padding column on each side. Narrower than this, a tab no longer says which
+/// pane it is, so the strip drops tabs instead.
+const MIN_TAB_LABEL: usize = 3;
+
+/// How a strip's tabs fit its width: the label width every tab gets (the name
+/// plus its padding, caps excluded) and the caps, if any.
+struct StripFit {
+    label: usize,
+    caps: Option<(char, char)>,
+}
+
+/// **The one fit decision**, shared by [`tab_strip_layout`] and, through
+/// [`strip_caps`], every renderer, so the drawn chips and the hit ranges cannot
+/// disagree about the tab width or about whether the caps exist.
+///
+/// The label is the longest name plus its padding when every tab fits at that
+/// width, else the widest label at which they all fit.
 ///
 /// A strip falls back to plain in two cases:
-/// - The first capped chip does not fit in `width`. Caps on a squeezed chip
-///   would eat the label, so a narrow strip keeps the old clipped rendering.
+/// - The capped tabs cannot all fit with [`MIN_TAB_LABEL`]-wide labels. Caps on
+///   a chip squeezed past that would eat the label.
 /// - The strip is a lone zellij title whose label has no background of its own.
 ///   A cap takes the chip's background as its foreground, and the default label
 ///   background is the border's, usually the terminal default. That cap would be
 ///   drawn in the terminal's text color around a chip with no fill. The tmux bar
 ///   is not exempt because it paints even a lone title in the active colors.
+fn strip_fit(
+    display_names: &[String],
+    width: usize,
+    style: &BorderStyle,
+    theme: &CompositorTheme,
+) -> Option<StripFit> {
+    let natural = tab_strip_width(display_names, width);
+    if natural == 0 {
+        return None;
+    }
+    let tabs = display_names.len();
+    let lead = strip_lead(display_names, style);
+    let fitted = |chip_extra: usize, gap: usize| {
+        (width.saturating_sub(lead + (tabs - 1) * gap) / tabs)
+            .saturating_sub(chip_extra)
+            .min(natural)
+    };
+    let floor = MIN_TAB_LABEL.min(natural);
+
+    let label_has_bg = theme
+        .pane_label_bg
+        .as_ref()
+        .is_some_and(|bg| *bg != theme.border_bg());
+    let lone_unfilled = matches!(style, BorderStyle::ZellijStyle) && tabs == 1 && !label_has_bg;
+    if let Some(caps) = theme.tab_style.caps().filter(|_| !lone_unfilled) {
+        let label = fitted(2, 1);
+        if label >= floor {
+            return Some(StripFit {
+                label,
+                caps: Some(caps),
+            });
+        }
+    }
+    let label = fitted(0, TAB_SEPARATOR.chars().count()).max(floor);
+    Some(StripFit { label, caps: None })
+}
+
+/// The `(left, right)` cap glyphs a strip is drawn with, or `None` when it is
+/// drawn plain. See [`strip_fit`].
 fn strip_caps(
     display_names: &[String],
     width: usize,
     style: &BorderStyle,
     theme: &CompositorTheme,
 ) -> Option<(char, char)> {
-    let caps = theme.tab_style.caps()?;
-    let max_name = display_names.iter().map(|n| n.chars().count()).max()?;
-    let label_has_bg = theme
-        .pane_label_bg
-        .as_ref()
-        .is_some_and(|bg| *bg != theme.border_bg());
-    if matches!(style, BorderStyle::ZellijStyle) && display_names.len() == 1 && !label_has_bg {
-        return None;
-    }
-    if strip_lead(display_names, style) + max_name + 4 > width {
-        return None;
-    }
-    Some(caps)
+    strip_fit(display_names, width, style, theme)?.caps
+}
+
+/// The characters of one tab `tab_width` columns wide, caps excluded: the name
+/// centred with at least one padding column on each side. A name that does not
+/// fit is cut and ends in `\u{2026}`, so a squeezed tab reads as cut rather than
+/// as a pane with a shorter name. A tab too narrow for any padding (the clipped
+/// last tab of a plain strip) shows as much of the name as fits.
+fn tab_label(name: &str, tab_width: usize) -> impl Iterator<Item = char> + '_ {
+    let len = name.chars().count();
+    let room = tab_width.saturating_sub(2);
+    let (shown, ellipsis) = if room == 0 {
+        (len.min(tab_width), false)
+    } else if len <= room {
+        (len, false)
+    } else if room >= 2 {
+        (room - 1, true)
+    } else {
+        (room, false)
+    };
+    let pad_total = tab_width - shown - usize::from(ellipsis);
+    let pad_left = pad_total / 2;
+    std::iter::repeat_n(' ', pad_left)
+        .chain(name.chars().take(shown))
+        .chain(ellipsis.then_some('\u{2026}'))
+        .chain(std::iter::repeat_n(' ', pad_total - pad_left))
 }
 
 /// The cell that closes one end of a capped chip: the chip's background as the
@@ -995,13 +1066,13 @@ pub fn build_top_border_content(
         match strip_caps(&single, max_width, &BorderStyle::ZellijStyle, theme) {
             Some((left, right)) => {
                 cells.push(cap_cell(left, &label_bg, &border_bg));
-                for ch in format!(" {name} ").chars() {
+                for ch in tab_label(name, entry.end - entry.start - 2) {
                     cells.push(styled(ch, &label_fg, &label_bg, false));
                 }
                 cells.push(cap_cell(right, &label_bg, &border_bg));
             }
             None => {
-                for ch in format!(" {name} ").chars().take(entry.end - entry.start) {
+                for ch in tab_label(name, entry.end - entry.start) {
                     cells.push(styled(ch, &label_fg, &label_bg, false));
                 }
             }
@@ -1046,22 +1117,9 @@ pub fn build_top_border_content(
             cells.push(cap_cell(left, &tab_bg, &border_bg));
         }
 
-        // Center the name within the tab's own width, less its caps.
         let tab_width = entry.end - entry.start - if caps.is_some() { 2 } else { 0 };
-        let display_name = &display_names[entry.index];
-        let content_len = display_name.chars().count().min(tab_width);
-        let pad_total = tab_width - content_len;
-        let pad_left = pad_total / 2;
-        let pad_right = pad_total - pad_left;
-
-        for _ in 0..pad_left {
-            cells.push(styled(' ', &tab_fg, &tab_bg, tab_bold));
-        }
-        for ch in display_name.chars().take(content_len) {
+        for ch in tab_label(&display_names[entry.index], tab_width) {
             cells.push(styled(ch, &tab_fg, &tab_bg, tab_bold));
-        }
-        for _ in 0..pad_right {
-            cells.push(styled(' ', &tab_fg, &tab_bg, tab_bold));
         }
 
         if let Some((_, right)) = caps {
@@ -1233,17 +1291,9 @@ pub fn draw_tmux_tab_bar(
             )
         };
 
-        // Center the name within the tab's own width, less its caps.
         let tab_width = entry.end - entry.start - if caps.is_some() { 2 } else { 0 };
-        let display_name = &display_names[entry.index];
-        let content_len = display_name.chars().count().min(tab_width);
-        let pad_total = tab_width - content_len;
-        let pad_left = pad_total / 2;
-
-        let block = std::iter::repeat_n(' ', pad_left)
-            .chain(display_name.chars().take(content_len))
-            .chain(std::iter::repeat_n(' ', pad_total - pad_left))
-            .map(|ch| styled(ch, &fg, &bg, bold));
+        let block =
+            tab_label(&display_names[entry.index], tab_width).map(|ch| styled(ch, &fg, &bg, bold));
         let chip: Vec<RenderCell> = match caps {
             Some((left, right)) => std::iter::once(cap_cell(left, &bg, &theme.status_bar_bg))
                 .chain(block)
@@ -2592,12 +2642,32 @@ mod tests {
     }
 
     #[test]
-    fn tab_strip_layout_drops_tabs_past_the_right_edge() {
+    fn tab_strip_layout_shrinks_tabs_so_every_one_fits() {
         let n = names(&["alpha", "bb", "gamma"]);
-        // Room for the first tab and a clipped second; the third is dropped.
+        let spans = |width| -> Vec<(usize, usize)> {
+            tab_strip_layout(
+                &n,
+                width,
+                &BorderStyle::ZellijStyle,
+                &CompositorTheme::default(),
+            )
+            .iter()
+            .map(|e| (e.start, e.end))
+            .collect()
+        };
+        // Natural 7-wide tabs need 28 columns; at 22 all three shrink to 5.
+        assert_eq!(spans(22), vec![(1, 6), (9, 14), (17, 22)]);
+        assert_eq!(spans(28), vec![(1, 8), (11, 18), (21, 28)]);
+        assert_eq!(spans(80), spans(28), "a strip with room never widens a tab");
+    }
+
+    #[test]
+    fn tab_strip_layout_drops_tabs_only_below_the_minimum_label() {
+        let n = names(&["alpha", "bb", "gamma"]);
+        // Three MIN_TAB_LABEL tabs need 1 + 3 + 3 + 3 + 3 + 3 = 16 columns.
         let layout = tab_strip_layout(
             &n,
-            14,
+            12,
             &BorderStyle::ZellijStyle,
             &CompositorTheme::default(),
         );
@@ -2607,12 +2677,12 @@ mod tests {
                 TabStripEntry {
                     index: 0,
                     start: 1,
-                    end: 8
+                    end: 4
                 },
                 TabStripEntry {
                     index: 1,
-                    start: 11,
-                    end: 14
+                    start: 7,
+                    end: 10
                 },
             ]
         );
@@ -2633,28 +2703,24 @@ mod tests {
         // hit-test agree; the old code centered within the full tab width and
         // let the caller truncate from the right, which desynced the two).
         let theme = CompositorTheme::default();
-        let stack = Some((names(&["alpha", "bb"]), vec![1 as PaneId, 2], 0usize));
-        let layout = tab_strip_layout(
-            &names(&["alpha", "bb"]),
-            14,
-            &BorderStyle::ZellijStyle,
-            &CompositorTheme::default(),
-        );
+        let n = names(&["alpha", "bb", "gamma"]);
+        let stack = Some((n.clone(), vec![1 as PaneId, 2, 3], 0usize));
+        let layout = tab_strip_layout(&n, 15, &BorderStyle::ZellijStyle, &theme);
         assert_eq!(
-            layout[1],
+            layout[2],
             TabStripEntry {
-                index: 1,
-                start: 11,
-                end: 14
+                index: 2,
+                start: 13,
+                end: 15
             }
         );
-        let cells = build_top_border_content(&stack, 1, &theme.frame_fg, "NORMAL", 14, &theme);
-        // The clipped tab occupies columns 11..14 of the strip content.
-        for (i, cell) in cells.iter().enumerate().take(14).skip(11) {
+        let cells = build_top_border_content(&stack, 1, &theme.frame_fg, "NORMAL", 15, &theme);
+        // The clipped tab occupies columns 13..15 of the strip content.
+        for (i, cell) in cells.iter().enumerate().take(15).skip(13) {
             assert_eq!(cell.bg, theme.tab_inactive_bg, "strip col {i}");
         }
         // ...and the separator immediately before it is not part of the block.
-        assert_ne!(cells[10].bg, theme.tab_inactive_bg);
+        assert_ne!(cells[12].bg, theme.tab_inactive_bg);
     }
 
     #[test]
@@ -3266,47 +3332,119 @@ mod tests {
     }
 
     #[test]
-    fn capped_strip_too_narrow_for_one_chip_renders_plain() {
+    fn capped_strip_too_narrow_for_minimum_chips_renders_plain() {
         let stack = Some((names(&["alpha", "bb"]), vec![1 as PaneId, 2], 0usize));
         let fg = CellColor::Indexed(4);
-        // The lead plus one capped chip (5 + 2 + 2) needs 10 columns.
+        // The lead, two MIN_TAB_LABEL chips with their caps, and the gap
+        // between them need 1 + 5 + 1 + 5 = 12 columns.
         let narrow = build_top_border_content(
             &stack,
             1,
             &fg,
             "NORMAL",
-            9,
+            11,
             &capped_theme(TabStyle::Rounded),
         );
         let plain =
-            build_top_border_content(&stack, 1, &fg, "NORMAL", 9, &CompositorTheme::default());
+            build_top_border_content(&stack, 1, &fg, "NORMAL", 11, &CompositorTheme::default());
         assert_eq!(narrow, plain);
         let fits = build_top_border_content(
             &stack,
             1,
             &fg,
             "NORMAL",
-            10,
+            12,
             &capped_theme(TabStyle::Rounded),
         );
-        assert_eq!(fits[1].c, '\u{E0B6}');
-        assert_eq!(fits[9].c, '\u{E0B4}');
+        let text: String = fits.iter().map(|c| c.c).collect();
+        assert_eq!(text, " \u{E0B6} a \u{E0B4} \u{E0B6} b \u{E0B4} ");
     }
 
     #[test]
-    fn capped_strip_places_whole_chips_only() {
+    fn capped_strip_shrinks_chips_instead_of_dropping_them() {
         let n = names(&["alpha", "bb", "gamma"]);
         let theme = capped_theme(TabStyle::Rounded);
-        // Lead 1, chips of 9, gaps of 1: two chips end at 20; a third needs 30.
-        for width in [20, 29] {
-            let layout = tab_strip_layout(&n, width, &BorderStyle::ZellijStyle, &theme);
-            let spans: Vec<(usize, usize)> = layout.iter().map(|e| (e.start, e.end)).collect();
-            assert_eq!(spans, vec![(1, 10), (11, 20)], "width {width}");
+        let spans = |width| -> Vec<(usize, usize)> {
+            tab_strip_layout(&n, width, &BorderStyle::ZellijStyle, &theme)
+                .iter()
+                .map(|e| (e.start, e.end))
+                .collect()
+        };
+        // Lead 1, natural chips of 9, gaps of 1: all three need 30.
+        assert_eq!(spans(30), vec![(1, 10), (11, 20), (21, 30)]);
+        assert_eq!(spans(29), vec![(1, 9), (10, 18), (19, 27)]);
+        assert_eq!(spans(20), vec![(1, 6), (7, 12), (13, 18)]);
+        assert!(strip_caps(&n, 18, &BorderStyle::ZellijStyle, &theme).is_some());
+        assert!(strip_caps(&n, 17, &BorderStyle::ZellijStyle, &theme).is_none());
+    }
+
+    #[test]
+    fn monocle_strip_shows_a_capped_chip_for_every_pane() {
+        // Names from a `{command}: {title}` template: four natural chips need
+        // 1 + 4 * 30 + 3 = 124 columns, so at 118 the last chip, which is the
+        // focused pane, used to be dropped.
+        let n = names(&[
+            "zsh: ~/Work/Personal/Remux",
+            "claude: fix monocle pills",
+            "nvim: compositor.rs",
+            "sh",
+        ]);
+        let theme = capped_theme(TabStyle::Rounded);
+        let stack = Some((n.clone(), vec![1 as PaneId, 2, 3, 4], 3usize));
+        let cells = build_top_border_content(&stack, 4, &theme.frame_fg, "NORMAL", 118, &theme);
+        let text: String = cells.iter().map(|c| c.c).collect();
+        assert_eq!(text.matches('\u{E0B6}').count(), 4, "{text:?}");
+        assert_eq!(text.matches('\u{E0B4}').count(), 4, "{text:?}");
+        assert!(text.contains(" sh "), "{text:?}");
+        assert!(text.contains("zsh: ~/Work/Personal/Re\u{2026}"), "{text:?}");
+        assert!(cells.len() <= 118, "{} cells", cells.len());
+        let layout = tab_strip_layout(&n, 118, &BorderStyle::ZellijStyle, &theme);
+        assert_eq!(layout.len(), 4);
+        for e in &layout {
+            assert_eq!(cells[e.start].c, '\u{E0B6}', "left cap of tab {}", e.index);
+            assert_eq!(
+                cells[e.end - 1].c,
+                '\u{E0B4}',
+                "right cap of tab {}",
+                e.index
+            );
         }
-        assert_eq!(
-            tab_strip_layout(&n, 30, &BorderStyle::ZellijStyle, &theme).len(),
-            3
+
+        let mut buffer = vec![vec![RenderCell::default(); 118]; 2];
+        let mut regions = HitRegions::default();
+        draw_tmux_tab_bar(
+            &mut buffer,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 118,
+                height: 2,
+            },
+            &stack,
+            "NORMAL",
+            &mut regions,
+            &theme,
         );
+        let bar: String = buffer[0].iter().map(|c| c.c).collect();
+        assert_eq!(bar.matches('\u{E0B6}').count(), 4, "{bar:?}");
+        assert_eq!(regions.stack_regions.len(), 4);
+    }
+
+    #[test]
+    fn tab_label_pads_and_marks_a_cut_name() {
+        let label = |name, width| tab_label(name, width).collect::<String>();
+        assert_eq!(label("bb", 7), "  bb   ");
+        assert_eq!(label("alpha", 7), " alpha ");
+        assert_eq!(label("alpha", 6), " alp\u{2026} ");
+        assert_eq!(label("alpha", 3), " a ");
+        assert_eq!(label("alpha", 2), "al");
+        for width in 0..10 {
+            assert_eq!(
+                label("alpha", width).chars().count(),
+                width,
+                "width {width}"
+            );
+        }
     }
 
     #[test]
