@@ -19,12 +19,11 @@ Run from the repo root:
 """
 import os
 import shutil
-import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import BIN, Tui, sm_compose_view  # noqa: E402
+from pty_harness import Tui, sm_compose_view  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 LEFT_CAP, RIGHT_CAP = "", ""
@@ -64,16 +63,6 @@ def strip_row(t):
 
 def pills(row):
     return row.count(LEFT_CAP), row.count(RIGHT_CAP)
-
-
-def stop_server(rundir):
-    """Stop the server the client auto-spawned, which outlives the client."""
-    env = {**os.environ, "XDG_RUNTIME_DIR": f"{rundir}/run",
-           "XDG_STATE_HOME": f"{rundir}/state", "XDG_DATA_HOME": f"{rundir}/data",
-           "XDG_CONFIG_HOME": f"{rundir}/config"}
-    subprocess.run([BIN, "stop"], env=env, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=15)
-    shutil.rmtree(rundir, ignore_errors=True)
 
 
 def main():
@@ -119,7 +108,7 @@ def main():
             check("panicked" not in t.log(which), f"no panic in {which}.log")
     finally:
         t.kill()
-        stop_server(rundir)
+        shutil.rmtree(rundir, ignore_errors=True)
     print(f"\n{'FAILED' if failures else 'OK'}: {len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
 

@@ -4,7 +4,7 @@ Drives the actual client binary through a pseudo-terminal (pexpect) and reads
 the rendered screen with pyte. Spins up an isolated throwaway server (the client
 auto-spawns it) with its own XDG dirs and a short socket path.
 """
-import os, shutil, time, pexpect, pyte
+import atexit, os, shutil, signal, subprocess, time, pexpect, pyte
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -42,12 +42,23 @@ class Tui:
         self.cols = cols
         self.rows = rows
         self.child = None
+        self.env = None
+        self._cleanup_registered = False
         # Optional `config.toml` body. Written into the isolated
         # XDG_CONFIG_HOME, which the client AND the server it auto-spawns both
         # read -- so one file themes both sides of a parity comparison.
         self.config = config
 
     def start(self):
+        # The client auto-spawns a server that outlives it, so a harness that
+        # exits without reaching `kill()` (an uncaught exception, an early
+        # `sys.exit`) would leave that server running. `atexit` covers both.
+        if not self._cleanup_registered:
+            atexit.register(self.kill)
+            self._cleanup_registered = True
+        # `kill()` runs `remux stop` against this rundir; a relative one would
+        # resolve against whatever directory the harness runs from.
+        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
         shutil.rmtree(self.rundir, ignore_errors=True)
         for s in ("run", "state", "data", "config"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
@@ -55,19 +66,22 @@ class Tui:
             os.makedirs(f"{self.rundir}/config/remux", exist_ok=True)
             with open(f"{self.rundir}/config/remux/config.toml", "w") as f:
                 f.write(self.config)
+        # The XDG keys come AFTER `extra_env` so no caller can point the socket,
+        # and with it `kill()`'s `remux stop`, at a real server.
         env = {
             **os.environ,
-            "XDG_RUNTIME_DIR": f"{self.rundir}/run",
-            "XDG_STATE_HOME": f"{self.rundir}/state",
-            "XDG_DATA_HOME": f"{self.rundir}/data",
-            "XDG_CONFIG_HOME": f"{self.rundir}/config",
             "SHELL": "/bin/sh",
             "ENV": "/dev/null",
             "TERM": "xterm-256color",
             "PS1": "$ ",
             "REMUX_ALLOW_NESTED": "1",
             **self.extra_env,
+            "XDG_RUNTIME_DIR": f"{self.rundir}/run",
+            "XDG_STATE_HOME": f"{self.rundir}/state",
+            "XDG_DATA_HOME": f"{self.rundir}/data",
+            "XDG_CONFIG_HOME": f"{self.rundir}/config",
         }
+        self.env = env
         self.screen = pyte.Screen(self.cols, self.rows)
         self.stream = pyte.ByteStream(self.screen)
         # Raw copy of everything the client wrote. pyte drops the sequences it
@@ -128,10 +142,50 @@ class Tui:
         return self.child.isalive()
 
     def kill(self):
+        """Close the client and stop the server it auto-spawned.
+
+        Safe to call more than once: only the first call after a `start()`
+        runs `remux stop`, so the `atexit` call after a harness's own `kill()`
+        does nothing, even if the harness has since deleted the rundir. A server
+        that already exited is fine too; `remux stop` only reports that none is
+        running. The rundir is kept, because harnesses read its logs after
+        `kill()`.
+        """
         try:
             self.child.terminate(force=True)
         except Exception:
             pass
+        env, self.env = self.env, None
+        if env is None:
+            return
+        try:
+            subprocess.run([BIN, "stop"], env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+            self._kill_wedged_server(env["XDG_RUNTIME_DIR"])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _kill_wedged_server(run_dir):
+        """SIGKILL a server that outlived `remux stop`'s SIGTERM.
+
+        The pid comes from the server's own pid file, and is killed only when
+        that process's XDG_RUNTIME_DIR is `run_dir`, so a pid reused by an
+        unrelated process since the server wrote the file is left alone.
+        """
+        sock, pid_file = f"{run_dir}/remux.sock", f"{run_dir}/remux.pid"
+        # The server removes the socket and then the pid file, so allow the
+        # gap between the two before treating a leftover file as a wedge.
+        for _ in range(10):
+            if not os.path.exists(sock) and not os.path.exists(pid_file):
+                return
+            time.sleep(0.1)
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            environ = f.read().split(b"\0")
+        if f"XDG_RUNTIME_DIR={run_dir}".encode() in environ:
+            os.kill(pid, signal.SIGKILL)
 
     def log(self, which="client"):
         p = f"{self.rundir}/state/remux/{which}.log"

@@ -4,12 +4,14 @@ Prefix+f zoom then Prefix+f again must EXIT zoom and restore both cells.
 Build a 2-cell view, make a custom arrangement (move a cell), zoom (Prefix f) ->
 only the focused cell shows; unzoom (Prefix f) -> BOTH cells show again.
 """
+import os
+import shutil
 import sys
 from pty_harness import Tui, sm_compose_view
 
 A = "AAAA_marker_one"
 B = "BBBB_marker_two"
-RUNDIR = "/tmp/rmxfix/i6"
+RUNDIR = f"/tmp/rmxfix-i6-{os.getpid()}"
 
 
 def make_view(t):
@@ -28,10 +30,19 @@ def both_visible(t):
 
 
 def main():
-    t = Tui(RUNDIR, cols=120, rows=40).start()
+    t = Tui(RUNDIR, cols=120, rows=40)
+    try:
+        run(t)
+    finally:
+        t.kill()
+        shutil.rmtree(RUNDIR, ignore_errors=True)
+
+
+def run(t):
+    t.start()
     make_view(t)
     if not t.has("View 1"):
-        print("FAIL: not in view"); t.dump("s"); t.kill(); sys.exit(1)
+        print("FAIL: not in view"); t.dump("s"); sys.exit(1)
 
     # Make a CUSTOM arrangement: move the focused cell right (sets custom_tree).
     t.prefix(b"pL", 0.6)
@@ -53,7 +64,6 @@ def main():
     panic = "panic" in t.log("client").lower() or "panic" in t.log("server").lower()
     if not (au and bu):
         t.dump("after unzoom")
-    t.kill()
 
     zoom_hid_one = (az != bz) or (not az and not bz)  # zoom shows only focused
     unzoom_restored = au and bu
