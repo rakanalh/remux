@@ -79,20 +79,24 @@ def set_title(cli, title):
 def session(style, cols, panes):
     """A server and client with `panes` titled panes in a BSP tab."""
     srv = Server(RUNDIR).start(CONFIG.format(style=style))
-    cli = Client(srv.sock)
-    cli.hello()
-    cli.send({"TabStyle": {"style": "rounded"}})
-    cli.drain(0.3)
-    cli.send({"CreateSession": {"name": "main", "folder": None}})
-    cli.send({"Attach": {"session_name": "main"}})
-    cli.send({"Resize": {"cols": cols, "rows": ROWS}})
-    cli.drain(0.8)
-    set_title(cli, TITLES[0])
-    for title in TITLES[1:panes]:
-        cmd(cli, "PaneNew")
-        set_title(cli, title)
-    # Titles are used only once they settle (src/server/title.rs).
-    time.sleep(1.5)
+    try:
+        cli = Client(srv.sock)
+        cli.hello()
+        cli.send({"TabStyle": {"style": "rounded"}})
+        cli.drain(0.3)
+        cli.send({"CreateSession": {"name": "main", "folder": None}})
+        cli.send({"Attach": {"session_name": "main"}})
+        cli.send({"Resize": {"cols": cols, "rows": ROWS}})
+        cli.drain(0.8)
+        set_title(cli, TITLES[0])
+        for title in TITLES[1:panes]:
+            cmd(cli, "PaneNew")
+            set_title(cli, title)
+        # Titles are used only once they settle (src/server/title.rs).
+        time.sleep(1.5)
+    except BaseException:
+        srv.kill()
+        raise
     return srv, cli
 
 

@@ -3708,13 +3708,13 @@ async fn handle_command(
                 tab.layout_mode = next_layout_mode(&tab.layout_mode, restorable, &config.layouts);
                 log::debug!("server: LayoutNext new_mode={}", tab.layout_mode.name());
                 if tab.layout_mode.is_automatic() {
-                    tab.layout = tab
-                        .layout_mode
-                        .build_tree(&tab.pane_order, tab.focused_pane);
+                    tab.rebuild_if_automatic();
                 } else if let Some(saved) = tab.saved_custom_layout.clone() {
                     // Custom: restore the remembered arrangement. Adopt its own
                     // active-pane markers so the focused pane stays visible.
-                    tab.layout = saved;
+                    // The live names replace the snapshot's, which predate any
+                    // rename made while the tab was automatic.
+                    tab.replace_layout(saved);
                     if let Some(active) = tab.layout.active_pane() {
                         tab.focus_pane(active);
                     }
@@ -3750,9 +3750,7 @@ async fn handle_command(
                 }
                 if let LayoutMode::Master(ref mut master_layout) = tab.layout_mode {
                     master_layout.master_pane = Some(tab.focused_pane);
-                    tab.layout = tab
-                        .layout_mode
-                        .build_tree(&tab.pane_order, tab.focused_pane);
+                    tab.rebuild_if_automatic();
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;

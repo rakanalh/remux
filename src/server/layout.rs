@@ -1047,6 +1047,36 @@ pub fn get_pane_name(node: &LayoutNode, pane_id: PaneId) -> Option<String> {
     }
 }
 
+/// Copy each pane's display name and custom name from `from` onto the same
+/// pane in `into`. A pane that `from` does not hold keeps what `into` has.
+///
+/// A tree built by [`LayoutMode::build_tree`] starts with no names, and the
+/// custom name a `PaneRename` sets is stored only in the tree. So every
+/// replacement of a live tree must carry them over, or the rename is lost.
+pub fn carry_pane_names(from: &LayoutNode, into: &mut LayoutNode) {
+    match into {
+        LayoutNode::Stack {
+            panes,
+            names,
+            custom_names,
+            ..
+        } => {
+            names.resize(panes.len(), String::new());
+            custom_names.resize(panes.len(), None);
+            for (pos, &pane) in panes.iter().enumerate() {
+                if let Some(custom) = get_pane_custom_name(from, pane) {
+                    custom_names[pos] = custom;
+                    names[pos] = get_pane_name(from, pane).unwrap_or_default();
+                }
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            carry_pane_names(from, first);
+            carry_pane_names(from, second);
+        }
+    }
+}
+
 /// Check whether a layout node (or any of its descendants) contains the
 /// given pane.
 fn contains_pane(node: &LayoutNode, pane_id: PaneId) -> bool {

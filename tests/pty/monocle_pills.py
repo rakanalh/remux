@@ -18,11 +18,13 @@ Run from the repo root:
     python3 tests/pty/monocle_pills.py [-v]
 """
 import os
+import shutil
+import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import Tui, sm_compose_view  # noqa: E402
+from pty_harness import BIN, Tui, sm_compose_view  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 LEFT_CAP, RIGHT_CAP = "", ""
@@ -64,9 +66,21 @@ def pills(row):
     return row.count(LEFT_CAP), row.count(RIGHT_CAP)
 
 
+def stop_server(rundir):
+    """Stop the server the client auto-spawned, which outlives the client."""
+    env = {**os.environ, "XDG_RUNTIME_DIR": f"{rundir}/run",
+           "XDG_STATE_HOME": f"{rundir}/state", "XDG_DATA_HOME": f"{rundir}/data",
+           "XDG_CONFIG_HOME": f"{rundir}/config"}
+    subprocess.run([BIN, "stop"], env=env, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=15)
+    shutil.rmtree(rundir, ignore_errors=True)
+
+
 def main():
-    t = Tui(f"/tmp/rmx-mpl-{os.getpid()}", cols=120, rows=40, config=CONFIG).start()
+    rundir = f"/tmp/rmx-mpl-{os.getpid()}"
+    t = Tui(rundir, cols=120, rows=40, config=CONFIG)
     try:
+        t.start()
         set_title(t, TITLES[0])
         for title in TITLES[1:]:
             t.prefix(b"pn", 0.8)
@@ -105,6 +119,7 @@ def main():
             check("panicked" not in t.log(which), f"no panic in {which}.log")
     finally:
         t.kill()
+        stop_server(rundir)
     print(f"\n{'FAILED' if failures else 'OK'}: {len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
 

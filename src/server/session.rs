@@ -310,10 +310,18 @@ impl Tab {
     /// A `Custom` tree is the user's own arrangement and is left as it is.
     pub fn rebuild_if_automatic(&mut self) {
         if self.layout_mode.is_automatic() {
-            self.layout = self
+            let tree = self
                 .layout_mode
                 .build_tree(&self.pane_order, self.focused_pane);
+            self.replace_layout(tree);
         }
+    }
+
+    /// Replace the layout tree with `tree`, keeping every pane's names. See
+    /// [`layout::carry_pane_names`] for why a bare assignment loses renames.
+    pub fn replace_layout(&mut self, mut tree: LayoutNode) {
+        layout::carry_pane_names(&self.layout, &mut tree);
+        self.layout = tree;
     }
 
     /// Whether [`Tab::place_auto`] can place a pane here. A `Custom` tab
@@ -331,7 +339,8 @@ impl Tab {
     /// focused pane to split; [`Tab::can_place_auto`] answers that in advance.
     pub fn place_auto(&mut self, pane: PaneId) -> bool {
         if self.layout_mode.is_automatic() {
-            self.layout = self.layout_mode.build_tree(&self.pane_order, pane);
+            let tree = self.layout_mode.build_tree(&self.pane_order, pane);
+            self.replace_layout(tree);
             true
         } else {
             self.layout.split_vertical(self.focused_pane, pane)
@@ -3025,13 +3034,9 @@ mod popup_invariant_tests {
                 let sess = st.sessions.get_mut("main").expect("session");
                 let tab = sess.tabs.get_mut(0).expect("tab");
                 tab.layout_mode = mode.clone();
-                if tab.layout_mode.is_automatic() {
-                    // The rebuild reads `pane_order` -- the exact route by which a
-                    // leaked popup id would become a real layout leaf.
-                    tab.layout = tab
-                        .layout_mode
-                        .build_tree(&tab.pane_order, tab.focused_pane);
-                }
+                // The rebuild reads `pane_order` -- the exact route by which a
+                // leaked popup id would become a real layout leaf.
+                tab.rebuild_if_automatic();
             });
         }
     }
@@ -3044,9 +3049,7 @@ mod popup_invariant_tests {
             tab.layout_mode = LayoutMode::Master(MasterLayout::default());
             if let LayoutMode::Master(ref mut ml) = tab.layout_mode {
                 ml.master_pane = Some(tab.focused_pane);
-                tab.layout = tab
-                    .layout_mode
-                    .build_tree(&tab.pane_order, tab.focused_pane);
+                tab.rebuild_if_automatic();
             }
             assert!(!layout::all_pane_ids(&tab.layout).contains(&popup));
         });
@@ -3616,6 +3619,50 @@ mod move_pane_to_tab_tests {
 
     fn bsp() -> LayoutMode {
         LayoutMode::Bsp(BspLayout)
+    }
+
+    #[test]
+    fn automatic_rebuilds_keep_custom_names() {
+        let mut tab = Tab::with_pane(1, "Tab 1", 1, bsp());
+        layout::set_pane_custom_name(&mut tab.layout, 1, "mine");
+        layout::set_pane_name(&mut tab.layout, 1, "mine");
+
+        tab.pane_order.push(2);
+        assert!(tab.place_auto(2));
+        assert_eq!(
+            layout::get_pane_custom_name(&tab.layout, 1),
+            Some(Some("mine".to_string()))
+        );
+        assert_eq!(layout::get_pane_custom_name(&tab.layout, 2), Some(None));
+
+        tab.layout_mode = LayoutMode::Master(MasterLayout::default());
+        tab.rebuild_if_automatic();
+        assert_eq!(
+            layout::get_pane_custom_name(&tab.layout, 1),
+            Some(Some("mine".to_string()))
+        );
+        assert_eq!(
+            layout::get_pane_name(&tab.layout, 1).as_deref(),
+            Some("mine")
+        );
+    }
+
+    #[test]
+    fn replace_layout_prefers_live_names() {
+        let mut tab = Tab::with_pane(1, "Tab 1", 1, custom());
+        tab.pane_order.push(2);
+        assert!(tab.place_auto(2));
+        let mut stale = tab.layout.clone();
+        layout::set_pane_custom_name(&mut stale, 1, "old");
+        layout::set_pane_custom_name(&mut tab.layout, 2, "new");
+
+        tab.replace_layout(stale);
+
+        assert_eq!(layout::get_pane_custom_name(&tab.layout, 1), Some(None));
+        assert_eq!(
+            layout::get_pane_custom_name(&tab.layout, 2),
+            Some(Some("new".to_string()))
+        );
     }
 
     fn sorted(mut v: Vec<PaneId>) -> Vec<PaneId> {
