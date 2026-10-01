@@ -17,6 +17,8 @@ full frame, and the pane's `name` in `SessionTree`.
   8  Bsp: rename, then move ANOTHER pane into this tab with `PaneMoveToTabTarget`
   9  Bsp: rename, then move ANOTHER pane out of this tab to a new one
  10  Bsp: rename, then `remux stop` and start the server again (persistence)
+ 11  Bsp: rename, then `PaneMoveLeft`, which swaps the pane with its neighbour
+ 12  Bsp: rename, then zoom the renamed pane (the border is read WHILE zoomed)
 
 Names are sent as commands, never typed, so a name on screen cannot be the
 shell echoing it.
@@ -214,6 +216,21 @@ def main():
         check(len(tab_ids(c, "s9")) == 2, "9: the moved pane is in a tab of its own")
         cmd(c, "TabPrev", 0.6)
         verify(c, "s9", "9", pid)
+
+        print("--- 11 Bsp: rename, then PaneMoveLeft swaps it with its neighbour")
+        fresh(c, "s11")
+        cmd(c, "PaneNew")
+        pid = rename(c, "s11")
+        cmd(c, "PaneMoveLeft")
+        verify(c, "s11", "11", pid)
+
+        print("--- 12 Bsp: rename, then zoom the renamed pane")
+        fresh(c, "s12")
+        cmd(c, "PaneNew")
+        pid = rename(c, "s12")
+        cmd(c, "PaneToggleZoom")
+        verify(c, "s12", "12", pid)
+        cmd(c, "PaneToggleZoom")
 
         print("--- 10 Bsp: rename, then restart the server")
         fresh(c, "s10")

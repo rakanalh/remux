@@ -1499,8 +1499,9 @@ pub fn focus_in_direction(
 /// wherever they occur in a stack slot. Because pane ids are unique across the
 /// tree, each id appears in exactly one slot; after the swap the two panes trade
 /// rectangles. If one of the panes lives in a multi-pane stack, only that pane's
-/// slot is swapped (the rest of the stack is untouched). Names/custom-names stay
-/// with the slot; they auto-refresh from the running process.
+/// slot is swapped (the rest of the stack is untouched). Each pane's display
+/// name and custom name move with it, because a custom name is never refreshed
+/// from the process and would otherwise label the other pane.
 ///
 /// Returns `true` if both panes were found and swapped.
 pub fn swap_panes(node: &mut LayoutNode, a: PaneId, b: PaneId) -> bool {
@@ -1509,7 +1510,9 @@ pub fn swap_panes(node: &mut LayoutNode, a: PaneId, b: PaneId) -> bool {
     if a == b || !contains_pane(node, a) || !contains_pane(node, b) {
         return false;
     }
+    let before = node.clone();
     swap_panes_inner(node, a, b);
+    carry_pane_names(&before, node);
     true
 }
 
@@ -3400,6 +3403,30 @@ mod tests {
         // The lone left leaf now holds P3; the stack holds [2, 1].
         assert_eq!(find_stack_for_pane(&node, 3), Some(vec![3]));
         assert_eq!(find_stack_for_pane(&node, 1), Some(vec![2, 1]));
+    }
+
+    #[test]
+    fn swap_panes_moves_names_with_the_panes() {
+        let mut node = LayoutNode::new_stack(1);
+        node.split_vertical(1, 2);
+        node.add_to_stack(2, 3); // | P1 | Stack[P2 | P3] |
+        set_pane_custom_name(&mut node, 1, "one");
+        set_pane_name(&mut node, 1, "one");
+        set_pane_custom_name(&mut node, 3, "three");
+        set_pane_name(&mut node, 3, "three");
+
+        // Across two stacks.
+        assert!(swap_panes(&mut node, 1, 2));
+        assert_eq!(get_pane_custom_name(&node, 1), Some(Some("one".into())));
+        assert_eq!(get_pane_custom_name(&node, 2), Some(None));
+        assert_eq!(get_pane_name(&node, 1).as_deref(), Some("one"));
+
+        // Within one stack, which now holds [1, 3].
+        assert!(swap_panes(&mut node, 1, 3));
+        assert_eq!(find_stack_for_pane(&node, 1), Some(vec![3, 1]));
+        assert_eq!(get_pane_custom_name(&node, 1), Some(Some("one".into())));
+        assert_eq!(get_pane_custom_name(&node, 3), Some(Some("three".into())));
+        assert_eq!(get_pane_name(&node, 3).as_deref(), Some("three"));
     }
 
     /// Two panes side by side: pane 1 (A) on the left, pane 2 (B) on the right.

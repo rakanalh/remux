@@ -378,7 +378,11 @@ impl Tab {
     /// painted for it under the tmux border style).
     pub fn effective_layout(&self) -> std::borrow::Cow<'_, LayoutNode> {
         match self.zoomed_pane {
-            Some(zoomed) => std::borrow::Cow::Owned(LayoutNode::new_stack(zoomed)),
+            Some(zoomed) => {
+                let mut stack = LayoutNode::new_stack(zoomed);
+                layout::carry_pane_names(&self.layout, &mut stack);
+                std::borrow::Cow::Owned(stack)
+            }
             None => std::borrow::Cow::Borrowed(&self.layout),
         }
     }
@@ -3645,6 +3649,24 @@ mod move_pane_to_tab_tests {
             layout::get_pane_name(&tab.layout, 1).as_deref(),
             Some("mine")
         );
+    }
+
+    #[test]
+    fn a_zoomed_pane_keeps_its_names() {
+        let mut tab = Tab::with_pane(1, "Tab 1", 1, bsp());
+        tab.pane_order.push(2);
+        assert!(tab.place_auto(2));
+        layout::set_pane_custom_name(&mut tab.layout, 2, "mine");
+        layout::set_pane_name(&mut tab.layout, 2, "mine");
+        tab.zoomed_pane = Some(2);
+
+        let zoomed = tab.effective_layout();
+        assert_eq!(layout::all_pane_ids(&zoomed), vec![2]);
+        assert_eq!(
+            layout::get_pane_custom_name(&zoomed, 2),
+            Some(Some("mine".to_string()))
+        );
+        assert_eq!(layout::get_pane_name(&zoomed, 2).as_deref(), Some("mine"));
     }
 
     #[test]
