@@ -96,7 +96,7 @@ enum Commands {
         remux_path: String,
     },
 
-    /// Split the focused pane of the session named by $REMUX_SESSION
+    /// Split the focused pane of the session this pane is in
     //
     // No short flags for the direction, and `-h` is left to clap as the help
     // flag. `-h`/`-v` are ambiguous in EVERY multiplexer -- "horizontal" names
@@ -107,8 +107,9 @@ enum Commands {
     // LANDS and cannot be misread; splitting is not frequent enough in a script
     // for four saved characters to be worth any of it.
     #[command(
-        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session to split.\n\
-                      With no COMMAND the new pane runs the login shell.\n\n\
+        after_help = "Run from inside a remux pane. The session is the one this pane is in now,\n\
+                      found from $REMUX_PANE, falling back to $REMUX_SESSION; its focused pane\n\
+                      is split. With no COMMAND the new pane runs the login shell.\n\n\
                       Examples:\n  \
                         remux split\n  \
                         remux split --right -- nvim /tmp/notes.md"
@@ -135,9 +136,10 @@ enum Commands {
         argv: Vec<String>,
     },
 
-    /// Create a new tab in the session named by $REMUX_SESSION
+    /// Create a new tab in the session this pane is in
     #[command(
-        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session.\n\
+        after_help = "Run from inside a remux pane. The session is the one this pane is in now,\n\
+                            found from $REMUX_PANE, falling back to $REMUX_SESSION.\n\
                             With no COMMAND the new pane runs the login shell."
     )]
     NewTab {
@@ -168,19 +170,24 @@ enum Commands {
 ///
 /// The whole point of the subcommand is that it is run from INSIDE a pane, by a
 /// script or a file manager's opener hook, so the session comes from the
-/// `$REMUX_SESSION` that `Pty::spawn` exported into that pane -- the
-/// `TMUX`/`TMUX_PANE` arrangement.
+/// `$REMUX_SESSION` and `$REMUX_PANE` that `Pty::spawn` exported into that
+/// pane -- the `TMUX`/`TMUX_PANE` arrangement.
 ///
 /// **An unset `$REMUX_SESSION` is refused, never guessed.** There is usually a
 /// plausible guess available ("the only session", "the most recent one"), and
 /// taking it is how a script splits a window the user was not looking at. The
 /// message says which variable is missing so the fix is obvious.
 ///
-/// Note what this deliberately does NOT read: `$REMUX_PANE`. The server splits
-/// the session's active tab's FOCUSED pane, because the variable is fixed at
-/// spawn time, which may be long past, whereas focus is where the user is now.
-/// `$REMUX_PANE` is
-/// exported for callers that want that precision by other means.
+/// `$REMUX_PANE` goes along as an IDENTITY, never as a target. Both variables
+/// were fixed when the pane was spawned, and only the pane id survives the pane
+/// being moved to another session or its session being renamed, so the server
+/// takes the session from the pane while it is live and from the name
+/// otherwise. Where the new pane goes is still the session's FOCUSED pane,
+/// because focus is where the user is now. A malformed `$REMUX_PANE` is sent as
+/// no pane at all, which takes the name.
+///
+/// `$REMUX_PANE` alone does not count as being inside a pane: without
+/// `$REMUX_SESSION` the command is refused like any other.
 ///
 /// Exits the process non-zero on every failure, since the caller is a script.
 async fn run_cli_spawn(
@@ -196,6 +203,8 @@ async fn run_cli_spawn(
         std::process::exit(1);
     };
     let session = session.to_string_lossy().into_owned();
+    let pane = std::env::var_os("REMUX_PANE")
+        .and_then(|p| p.to_str().and_then(|p| p.parse::<protocol::PaneId>().ok()));
     // The PROGRAM and a count, never the arguments. `client.log` is the same
     // kind of file as `server.log` -- plaintext, unrotated, always at `Debug` --
     // and this is the very command line the user typed, so
@@ -203,8 +212,8 @@ async fn run_cli_spawn(
     // password on disk. The server side redacts identically; see
     // `handle_client_message`'s summary match.
     log::debug!(
-        "cmd: cli-spawn session={session:?} placement={placement:?} program={:?} \
-         ({} more arg(s)) cwd={cwd:?}",
+        "cmd: cli-spawn session={session:?} pane={pane:?} placement={placement:?} \
+         program={:?} ({} more arg(s)) cwd={cwd:?}",
         argv.first(),
         argv.len().saturating_sub(1)
     );
@@ -225,7 +234,7 @@ async fn run_cli_spawn(
             placement,
             argv,
             cwd,
-            pane: None,
+            pane,
         })
         .await?;
 

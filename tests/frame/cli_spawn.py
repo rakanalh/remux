@@ -22,6 +22,16 @@ line that never attaches. This asserts what that costs the server:
    this will actually hit, and "not found" without the name explains nothing.
 6. `NewTab` adds a TAB rather than splitting the focused pane.
 
+The caller's `pane` (its `$REMUX_PANE`) names the session it is in NOW, which
+is what a pane moved to another session needs. Every case above omits the key,
+so they are the literal body an older CLI sends. With it:
+
+A. A live pane wins over a `session` that names a different, live session.
+B. A live pane wins over a `session` that names nothing.
+C. A dead pane falls back to `session`, exactly as an absent one does.
+D. A dead pane and an unknown `session` is an Error naming both, and spawns
+   nothing anywhere.
+
 Run: python3 tests/frame/cli_spawn.py
 """
 import os
@@ -48,8 +58,8 @@ def rows_text(msg):
     return ["".join(c["c"] for c in row).rstrip() for row in pc["cells"]]
 
 
-def tree_of(cli):
-    """(tabs, panes-per-tab) for session 'main', from ListSessionTree."""
+def tree_of(cli, session="main"):
+    """(tabs, panes-per-tab) for `session`, from ListSessionTree."""
     cli.send("ListSessionTree")
     for msg in cli.drain(1.5):
         if name_of(msg) != "SessionTree":
@@ -59,7 +69,7 @@ def tree_of(cli):
         for f in tree["folders"]:
             groups += f["sessions"]
         for sess in groups:
-            if sess["name"] == "main":
+            if sess["name"] == session:
                 return [[p["id"] for p in tab["panes"]] for tab in sess["tabs"]]
     return []
 
@@ -68,7 +78,7 @@ def all_pane_ids(tabs):
     return [pid for tab in tabs for pid in tab]
 
 
-def cli_spawn(placement, argv=None, cwd=None, session="main"):
+def cli_spawn(placement, argv=None, cwd=None, session="main", pane=None):
     """Send one CliSpawn on a FRESH unattached connection, as the real CLI does.
 
     A fresh connection each time is not tidiness: the whole point of the message
@@ -82,6 +92,8 @@ def cli_spawn(placement, argv=None, cwd=None, session="main"):
         body["argv"] = argv
     if cwd is not None:
         body["cwd"] = cwd
+    if pane is not None:
+        body["pane"] = pane
     caller.send({"CliSpawn": body})
     reply = None
     for msg in caller.drain(3.0):
@@ -213,6 +225,64 @@ try:
                                   "data": list(b"echo SHELL-IS-ALIVE\n")}})
         ok_s, seen_s, _ = pane_content(cli, s_id, "SHELL-IS-ALIVE")
     check(ok_s, f"the shell in an empty-argv pane responds to input (rows={seen_s})")
+
+    # --- A-D: the caller's pane picks the session ---------------------------
+    cli.send({"CreateSession": {"name": "other", "folder": None}})
+    cli.drain(0.8)
+    other_before = tree_of(cli, "other")
+    d_pane = other_before[0][0] if other_before else None
+    check(other_before == [[d_pane]] and d_pane is not None,
+          f"setup: other is one tab holding one pane D (got {other_before})")
+
+    main_before_a = tree_of(cli)
+    reply_a = cli_spawn("SplitBelow", argv=marker_argv("PANE-WINS-MARKER"),
+                        session="main", pane=d_pane)
+    check(name_of(reply_a) == "CliSpawned", f"A: answered CliSpawned (got {reply_a})")
+    a_id = reply_a["CliSpawned"]["pane_id"] if name_of(reply_a) == "CliSpawned" else None
+    other_a = tree_of(cli, "other")
+    check(a_id in all_pane_ids(other_a) and a_id not in all_pane_ids(tree_of(cli)),
+          f"A: the pane landed in other, the session holding D (other={other_a})")
+    check(tree_of(cli) == main_before_a, "A: main is unchanged")
+    ok_a, seen_a, _ = pane_content(cli, a_id, "PANE-WINS-MARKER")
+    check(ok_a, f"A: the requested argv ran in it (rows={seen_a})")
+
+    reply_b = cli_spawn("SplitBelow", argv=marker_argv("RENAMED-MARKER"),
+                        session="renamed-away", pane=d_pane)
+    check(name_of(reply_b) == "CliSpawned",
+          f"B: a live pane wins over a session name that names nothing (got {reply_b})")
+    b_id = reply_b["CliSpawned"]["pane_id"] if name_of(reply_b) == "CliSpawned" else None
+    check(b_id in all_pane_ids(tree_of(cli, "other")), "B: the pane landed in other")
+
+    reply_dead = cli_spawn("SplitBelow", argv=[])
+    dead = reply_dead["CliSpawned"]["pane_id"] if name_of(reply_dead) == "CliSpawned" else None
+    if dead is not None:
+        cli.send({"InputToPane": {"pane_id": dead, "data": list(b"exit\n")}})
+    for _ in range(20):
+        if dead not in all_pane_ids(tree_of(cli)):
+            break
+        time.sleep(0.2)
+    check(dead is not None and dead not in all_pane_ids(tree_of(cli)),
+          f"setup: pane {dead} exited and left the tree")
+
+    main_before_c = tree_of(cli)
+    reply_c2 = cli_spawn("SplitBelow", argv=marker_argv("FALLBACK-MARKER"),
+                         session="main", pane=dead)
+    check(name_of(reply_c2) == "CliSpawned",
+          f"C: a dead pane falls back to the session name (got {reply_c2})")
+    c2_id = reply_c2["CliSpawned"]["pane_id"] if name_of(reply_c2) == "CliSpawned" else None
+    check(c2_id in all_pane_ids(tree_of(cli)) and len(all_pane_ids(tree_of(cli)))
+          == len(all_pane_ids(main_before_c)) + 1,
+          "C: the pane landed in main")
+
+    trees_before_d = (tree_of(cli), tree_of(cli, "other"))
+    bad_d = cli_spawn("SplitBelow", argv=marker_argv("NEVER-RUNS"),
+                      session="renamed-away", pane=dead)
+    msg_d = bad_d["Error"]["message"] if name_of(bad_d) == "Error" else ""
+    check(name_of(bad_d) == "Error", f"D: a dead pane and an unknown session is an Error ({bad_d})")
+    check("renamed-away" in msg_d and str(dead) in msg_d,
+          f"D: the error names the session and the pane (message={msg_d!r})")
+    check((tree_of(cli), tree_of(cli, "other")) == trees_before_d,
+          "D: nothing was spawned anywhere")
 
     log = srv.log()
     check("panicked at" not in log, "no panic in the server log")

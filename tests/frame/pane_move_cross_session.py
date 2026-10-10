@@ -27,6 +27,9 @@ Cases, in the order they run:
      one with B, and `sub`'s stream is labelled with `other`.
   5. Output typed into B now is pushed to `by_other`, and `main` is not
      re-rendered for it: the forwarder follows the pane's session.
+ 5b. B sets an OSC 2 title. The output itself is a batch, which case 5 covers;
+     the redraw that shows the title comes when it SETTLES, from the
+     forwarder's quiet path, and it too must go to `other` and not to `main`.
   6. B's shell exits: B leaves `other`'s Tab 1 within 2s, and `sub` is told.
   2. A into a NEW tab of `other` (named from `other`'s count). `main`'s Tab 2 is
      emptied and removed; it was the last and active tab, so `main`'s active
@@ -388,6 +391,17 @@ def main():
               "by_other is pushed B's new output")
         _, st = pushed(by_main, g_main)
         check(st is None, f"main is not re-rendered for B's output ({st and st['session_name']})")
+
+        print("5b. a title the moved pane sets is redrawn on the TARGET when it settles")
+        g_main, _ = snapshot(by_main)
+        g_other, _ = snapshot(by_other)
+        type_line(req, "printf '\\033]2;TTL%s\\007' x")
+        time.sleep(2.0)
+        g, st = pushed(by_other, g_other)
+        check(st is not None and g.find_all(r"TTLx"),
+              "by_other is pushed a frame naming B by its settled title")
+        _, st = pushed(by_main, g_main)
+        check(st is None, f"main is not re-rendered for B's title ({st and st['session_name']})")
 
         print("6. the moved pane's exit closes it in the TARGET")
         type_line(req, "exit")

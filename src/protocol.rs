@@ -461,16 +461,19 @@ pub enum ClientMessage {
     /// The one message whose sender is not an attached client. Every other
     /// pane-creating message resolves its session from the CONNECTION, and a CLI
     /// invocation has none: it connects, sends this, reads the answer and exits
-    /// without ever attaching. Hence the explicit `session`, which the caller
-    /// gets from the `REMUX_SESSION` that [`Pty::spawn`](crate::server::pty::Pty)
-    /// exported into its pane.
+    /// without ever attaching. Hence the explicit `session` and `pane`, which the
+    /// caller gets from the `REMUX_SESSION` and `REMUX_PANE` that
+    /// [`Pty::spawn`](crate::server::pty::Pty) exported into its pane.
+    ///
+    /// **The session is the one holding `pane` now, else `session`.** Both
+    /// variables are fixed at spawn time; the pane id stays true when the pane
+    /// is moved to another session or its session is renamed, and the name does
+    /// not.
     ///
     /// **The target is the session's ACTIVE TAB's FOCUSED pane, not the pane the
-    /// caller is sitting in.** `REMUX_SESSION` picks the machine and the session;
-    /// live focus picks the spot. This is tmux's behaviour, and it is the
-    /// behaviour that survives the user moving focus after the calling process
-    /// started -- an environment variable is fixed at spawn time and may be
-    /// hours stale.
+    /// caller is sitting in.** The identity picks the session; live focus picks
+    /// the spot. This is tmux's behaviour, and it is the behaviour that survives
+    /// the user moving focus after the calling process started.
     ///
     /// `argv` is the program and its arguments; **empty means the login shell**,
     /// exactly as an interactive split gets. `cwd` of `None` inherits the target
@@ -745,10 +748,11 @@ pub enum ServerMessage {
     /// that was created.
     ///
     /// Failure is reported as [`ServerMessage::Error`] instead, carrying a
-    /// human sentence that NAMES the session it could not find -- a
-    /// `REMUX_SESSION` left over from a renamed session is the failure this
-    /// message exists to explain, and "not found" without the name explains
-    /// nothing.
+    /// human sentence that NAMES the session it could not find, and the pane
+    /// when one was sent. The failure it explains is a caller whose pane is gone
+    /// AND whose `REMUX_SESSION` names no session, such as a process that
+    /// outlived its pane after the session was renamed; "not found" without the
+    /// names explains nothing.
     ///
     /// The id is not currently used by any caller; `remux split` prints nothing
     /// on success. It is here because the alternative -- a bare ack -- makes

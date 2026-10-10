@@ -2097,11 +2097,12 @@ entries={} error={:?} truncated={}",
             placement,
             argv,
             cwd,
-            pane: _,
+            pane,
         } => {
             handle_cli_spawn(
                 client_id,
                 &session,
+                pane,
                 placement,
                 &argv,
                 cwd.as_deref(),
@@ -7179,23 +7180,32 @@ program={program:?} args={argv:?} vertical={vertical}"
 ///
 /// The only pane-creating handler that takes its session as an ARGUMENT rather
 /// than reading it off the connection, because its sender is a CLI invocation
-/// that never attaches: it connects, asks, reads the answer and exits. The name
-/// reaches it as the `REMUX_SESSION` the pane's own `Pty::spawn` exported.
+/// that never attaches: it connects, asks, reads the answer and exits. The
+/// caller sends the `REMUX_SESSION` and `REMUX_PANE` the pane's own
+/// `Pty::spawn` exported.
 ///
-/// The target within the session is the **active tab's focused pane**, which is
-/// what `create_pane_in_tab` already splits when handed no `tab_index`. That is
-/// deliberate and is not the caller's `REMUX_PANE`: an environment variable is
-/// fixed at spawn time and may be hours stale, whereas focus is where the user
-/// is looking now. tmux resolves `split-window` the same way.
+/// **The SESSION comes from `pane` first.** Both variables were fixed when the
+/// caller's pane was spawned, but only the pane id stays true: a pane moved to
+/// another session, or a renamed session, keeps its id while the name goes
+/// stale. So a live `pane` wins over a disagreeing `session`, and a pane that
+/// is absent or dead falls back to `session`, exactly as before. Pane ids are
+/// never reused within a server's lifetime, so a dead id cannot name another
+/// pane by accident.
+///
+/// **The SPOT within the session is the active tab's focused pane**, which is
+/// what `create_pane_in_tab` already splits when handed no `tab_index`, and not
+/// the caller's pane. `REMUX_PANE` is an identity here, never a target: focus
+/// is where the user is looking now, and tmux resolves `split-window` the same
+/// way.
 ///
 /// A `Some(pane_id)` answer becomes [`ServerMessage::CliSpawned`]; every failure
-/// becomes a [`ServerMessage::Error`] that NAMES the session, since the failure
-/// this will actually hit is a `REMUX_SESSION` left over from a renamed or
-/// closed session, and "session not found" without the name explains nothing.
+/// becomes a [`ServerMessage::Error`] that NAMES the session, and the pane when
+/// one was sent, since "session not found" without the name explains nothing.
 #[allow(clippy::too_many_arguments)]
 async fn handle_cli_spawn(
     client_id: u64,
     session: &str,
+    pane: Option<PaneId>,
     placement: CliPlacement,
     argv: &[String],
     cwd: Option<&str>,
@@ -7213,14 +7223,23 @@ async fn handle_cli_spawn(
         None => (None, &[][..]),
     };
     let cwd_path = cwd.map(std::path::Path::new);
+    let named = session;
+    let resolved = match pane {
+        Some(pane) => {
+            let st = state.lock().await;
+            st.session_of_pane(pane).map(str::to_owned)
+        }
+        None => None,
+    };
+    let session = resolved.as_deref().unwrap_or(named);
     // Redacted the same way as the summary line in `handle_client_message`, and
     // for the same reason: `argv` is a command line the user typed, so its
     // ARGUMENTS are where a connection string or an API key lives. The program
     // is what anyone reading this line needs. `cwd` is a path, not a
     // credential, and is the other half of "why did it fail to start".
     log::info!(
-        "server: CliSpawn client_id={client_id} session={session:?} placement={placement:?} \
-program={:?} ({} more arg(s)) cwd={cwd:?}",
+        "server: CliSpawn client_id={client_id} session={named:?} pane={pane:?} \
+resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={cwd:?}",
         argv.first(),
         argv.len().saturating_sub(1)
     );
@@ -7290,7 +7309,13 @@ program={:?} ({} more arg(s)) cwd={cwd:?}",
         let msg = match spawned {
             Some(pane_id) => ServerMessage::CliSpawned { pane_id },
             None => ServerMessage::Error {
-                message: format!("no session named '{session}' on this server"),
+                message: match pane.filter(|_| resolved.is_none()) {
+                    Some(pane) => format!(
+                        "no session named '{session}' on this server \
+                         (pane {pane} no longer exists)"
+                    ),
+                    None => format!("no session named '{session}' on this server"),
+                },
             },
         };
         let _ = conn.tx.send(msg);

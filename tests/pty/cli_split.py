@@ -33,6 +33,15 @@ What is covered:
      `REMUX_PANE` named the pane it was spawned FOR rather than itself, which is
      what made an `nnn` opener land the editor beside the user's work. Aux panes
      went with the old `files` plugin, and every pane now names itself.
+  7. `remux split` from a pane MOVED to another session lands in the session
+     the pane is in now. Its environment still names the session it was spawned
+     in, so `$REMUX_PANE` is what tells the server where it is. Proven with the
+     old session gone, and again with a new, live session of the old name.
+     **Only this phase can prove the CLI sends `$REMUX_PANE`**:
+     `tests/frame/cli_spawn.py` writes the `pane` field itself, so it stays
+     green on a CLI that never reads the variable.
+  5b. `$REMUX_PANE` alone does not make a caller "inside a pane": with
+     `$REMUX_SESSION` unset the command is still refused.
 
 **A note on every marker below.** A shell ECHOES the line it is given, so a
 marker that appears literally in the typed command is on screen whether or not
@@ -53,6 +62,10 @@ import time
 
 import pexpect
 import pyte
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "frame"))
+from harness import Client, name_of  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 RUNDIR = "/tmp/rmx-cls"
@@ -292,6 +305,14 @@ try:
     check("REMUX_SESSION" in stderr,
           f"the refusal names $REMUX_SESSION (stderr={stderr!r})")
 
+    # --- 5b: a pane id alone is not a session ------------------------------
+    pane_only = dict(env, REMUX_PANE=orig_pane or "1")
+    outside2 = subprocess.run([BIN, "split"], env=pane_only, capture_output=True, timeout=20)
+    stderr2 = outside2.stderr.decode(errors="replace")
+    check(outside2.returncode != 0 and "REMUX_SESSION" in stderr2,
+          f"with only $REMUX_PANE set it is still refused, naming $REMUX_SESSION "
+          f"(rc={outside2.returncode}, stderr={stderr2!r})")
+
     check(child.isalive(), "the client is still alive after all of it")
     log = open(f"{RUNDIR}/state/remux/server.log").read()
     check("panicked at" not in log, "no panic in the server log")
@@ -336,6 +357,121 @@ try:
     check("panicked at" not in log2, "no panic in the server log (phase 2)")
 finally:
     teardown(child2, env2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 -- `remux split` from a pane moved to another session
+# ---------------------------------------------------------------------------
+def session_tabs(cli, session):
+    """`session`'s tabs as lists of pane ids, or None when it does not exist."""
+    cli.send("ListSessionTree")
+    for msg in cli.drain(1.5):
+        if name_of(msg) != "SessionTree":
+            continue
+        tree = msg["SessionTree"]
+        groups = list(tree["unfiled"])
+        for f in tree["folders"]:
+            groups += f["sessions"]
+        for sess in groups:
+            if sess["name"] == session:
+                return [[p["id"] for p in tab["panes"]] for tab in sess["tabs"]]
+        return None
+    return None
+
+
+def reader(sock):
+    cli = Client(sock)
+    cli.hello()
+    return cli
+
+
+env3 = make_env()
+child3, screen3, pump3 = spawn(env3)
+sock3 = f"{RUNDIR}/run/remux.sock"
+mover = None
+try:
+    type_line(child3, pump3, IDENT_CMD)
+    ident3 = read_ident(pump3, screen3)
+    moved_pane = ident3[1] if ident3 else None
+    check(ident3 is not None and ident3[0] == "main",
+          f"phase 3 setup: the PTY client's pane is in main (got {ident3})")
+
+    # The requester is sized at once: a frame is sized to the smallest attached
+    # client, and an unsized one following the pane into `other` would shrink
+    # the PTY client's view under it.
+    mover = Client(sock3)
+    mover.hello()
+    mover.send({"CreateSession": {"name": "other", "folder": None}})
+    mover.send({"Attach": {"session_name": "main"}})
+    mover.send({"Resize": {"cols": COLS, "rows": ROWS}})
+    mover.drain(0.8)
+    mover.send("ListSessionTree")
+    other_tab = None
+    for msg in mover.drain(1.5):
+        if name_of(msg) == "SessionTree":
+            tree = msg["SessionTree"]
+            for sess in list(tree["unfiled"]) + [x for f in tree["folders"] for x in f["sessions"]]:
+                if sess["name"] == "other":
+                    other_tab = sess["tabs"][0]["id"]
+            break
+    mover.send({"Command": {"PaneMoveToTabTarget": {"tab_id": other_tab, "session": "other"}}})
+    mover.drain(1.0)
+    mover.close()
+    mover = None
+    pump3(1.0)
+
+    r = reader(sock3)
+    other_tabs = session_tabs(r, "other")
+    check(session_tabs(r, "main") is None, "the move emptied main, so main is gone")
+    check(other_tabs is not None and moved_pane is not None
+          and int(moved_pane) in other_tabs[0],
+          f"the PTY client's pane is now in other's Tab 1 ({other_tabs})")
+    check("other" in screen3.display[-1],
+          f"the PTY client was re-homed to other (status: {screen3.display[-1].strip()!r})")
+
+    # The premise: the moved pane's environment still names `main`.
+    type_line(child3, pump3, "clear; " + IDENT_CMD)
+    stale = read_ident(pump3, screen3)
+    check(stale == ("main", moved_pane),
+          f"the moved pane's env still says main and its own id (got {stale})")
+
+    type_line(child3, pump3, f"{BIN} split -- {RUNNER} echo", t=1.2)
+    check(ran_cols(pump3, screen3, "echo") is not None,
+          "`remux split` in the moved pane runs its command where the PTY client can see it")
+    after_echo = session_tabs(r, "other")
+    check(after_echo is not None and other_tabs is not None
+          and len(after_echo[0]) == len(other_tabs[0]) + 1,
+          f"the split landed in other's Tab 1 ({other_tabs} -> {after_echo})")
+    check(session_tabs(r, "main") is None, "the split did not re-create main")
+    if after_echo is None or other_tabs is None or len(after_echo[0]) != len(other_tabs[0]) + 1:
+        dump(screen3, "phase 3 split")
+
+    # `main` is live again and still WRONG for this pane. The split above took
+    # focus, and its pane was spawned in `other`, so its env is already right;
+    # focus goes back UP to the moved pane, whose env still says `main`.
+    r.send({"CreateSession": {"name": "main", "folder": None}})
+    r.drain(0.8)
+    child3.send(b"\x1bk")
+    pump3(0.6)
+    type_line(child3, pump3, "clear; " + IDENT_CMD)
+    refocused = read_ident(pump3, screen3)
+    check(refocused == ("main", moved_pane),
+          f"focus is back on the moved pane, env still main (got {refocused})")
+    type_line(child3, pump3, f"{BIN} split --right -- {RUNNER} foxtrot", t=1.2)
+    check(ran_cols(pump3, screen3, "foxtrot") is not None,
+          "with a live session named main, the split still lands in other")
+    new_main = session_tabs(r, "main")
+    check(new_main is not None and len(new_main) == 1 and len(new_main[0]) == 1,
+          f"the new main still holds exactly one pane ({new_main})")
+    r.close()
+
+    check(child3.isalive(), "the client survived the phase 3 move")
+    log3 = open(f"{RUNDIR}/state/remux/server.log").read()
+    check("panicked at" not in log3, "no panic in the server log (phase 3)")
+finally:
+    if mover is not None:
+        mover.close()
+    teardown(child3, env3)
 
 print()
 if FAILURES:
