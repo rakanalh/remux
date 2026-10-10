@@ -2935,12 +2935,12 @@ async fn handle_command(
     // `PaneMoveToTabTarget` is refused here for the same reason: whether its
     // target tab still exists is only known from the state, not the command.
     if let RemuxCommand::PaneMoveToTabTarget { tab_id } = cmd {
-        let target = session::MoveTarget::from(tab_id);
+        let target = session::MoveRequest::from((tab_id, None));
         let st = state.lock().await;
         let Some(pane) = move_source_pane(&st, &session_name) else {
             return Ok(());
         };
-        if let Err(why) = st.check_move_pane_to_tab(&session_name, pane, target) {
+        if let Err(why) = st.check_move_pane_to_tab(&session_name, pane, &target) {
             log::info!(
                 "server: PaneMoveToTabTarget pane_id={pane} target={target:?} refused: {why:?}"
             );
@@ -3449,21 +3449,27 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneMoveToTabTarget { tab_id } => {
-            let target = session::MoveTarget::from(tab_id);
+            let target = session::MoveRequest::from((tab_id, None));
             let outcome = {
                 let mut st = state.lock().await;
                 match move_source_pane(&st, &session_name) {
                     Some(pane) => (
                         pane,
-                        st.move_pane_to_tab(&session_name, pane, target, config.new_tab_layout()),
+                        st.move_pane_to_tab(
+                            &session_name,
+                            pane,
+                            target.clone(),
+                            config.new_tab_layout(),
+                        ),
                     ),
                     None => return Ok(()),
                 }
             };
             match outcome {
-                (pane, Ok(idx)) => {
+                (pane, Ok(moved)) => {
                     log::debug!(
-                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> tab index {idx}"
+                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> tab index {}",
+                        moved.target_idx
                     );
                 }
                 (pane, Err(why)) => {
