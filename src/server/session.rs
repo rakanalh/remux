@@ -1650,6 +1650,18 @@ impl ServerState {
         Ok(())
     }
 
+    /// The session that holds `pane` now, counting its popup. A pane can move
+    /// to another session, so a session name captured when the pane was
+    /// spawned stops being true; ask this instead.
+    pub fn session_of_pane(&self, pane: PaneId) -> Option<&str> {
+        self.sessions
+            .values()
+            .find(|s| {
+                s.popup_pane == Some(pane) || s.tabs.iter().any(|t| t.pane_order.contains(&pane))
+            })
+            .map(|s| s.name.as_str())
+    }
+
     /// Record background output for the tab that owns `pane_id`.
     ///
     /// If the owning tab is its session's `active_tab` (foreground / being
@@ -4685,5 +4697,53 @@ mod move_pane_to_tab_tests {
         assert_eq!(main.tabs[1].pane_order, vec![a]);
         assert_eq!(main.tabs[1].name, "Tab 3");
         assert_eq!(snapshot_of(&st, "other"), other_before);
+    }
+
+    #[test]
+    fn session_of_pane_finds_a_pane_in_any_session() {
+        let (st, ids) = state_with_sessions(&[
+            ("main", &[(2, custom()), (1, bsp())]),
+            ("other", &[(1, bsp()), (2, bsp())]),
+        ]);
+        for (session, tabs) in [("main", &ids[0]), ("other", &ids[1])] {
+            for pane in tabs.iter().flatten() {
+                assert_eq!(st.session_of_pane(*pane), Some(session), "pane {pane}");
+            }
+        }
+    }
+
+    #[test]
+    fn session_of_pane_follows_a_moved_pane() {
+        let (mut st, ids) =
+            state_with_sessions(&[("main", &[(2, custom())]), ("other", &[(1, bsp())])]);
+        let b = ids[0][0][1];
+        st.move_pane_to_tab(
+            "main",
+            b,
+            to(MoveTarget::NewTab, "other"),
+            LayoutMode::default(),
+        )
+        .expect("move");
+        assert_eq!(st.session_of_pane(b), Some("other"));
+    }
+
+    #[test]
+    fn session_of_pane_includes_the_popup_pane() {
+        let (mut st, _ids) =
+            state_with_sessions(&[("main", &[(1, custom())]), ("other", &[(1, bsp())])]);
+        let popup = st.next_pane_id();
+        st.sessions.get_mut("other").expect("other").popup_pane = Some(popup);
+        assert_eq!(st.session_of_pane(popup), Some("other"));
+    }
+
+    #[test]
+    fn session_of_pane_is_none_for_an_id_never_issued_or_reaped() {
+        let (mut st, ids) =
+            state_with_sessions(&[("main", &[(1, custom())]), ("other", &[(1, bsp())])]);
+        let never = st.next_pane_id();
+        assert_eq!(st.session_of_pane(never), None);
+        let reaped = st.delete_session("other").expect("delete");
+        assert_eq!(reaped, vec![ids[1][0][0]]);
+        assert_eq!(st.session_of_pane(ids[1][0][0]), None);
     }
 }

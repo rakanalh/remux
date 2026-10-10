@@ -9543,9 +9543,13 @@ async fn start_pty_forwarding(
 /// Start the one forwarding task for `pane_id`: pump its PTY into its `Screen`,
 /// stream the result to subscribers, and handle the pane's death.
 ///
-/// `session_name` is the session whose layout the pane belongs to: each batch
-/// re-composites that session's frame, and the pane's death runs the full
-/// `close_pane` path (layout repair, persistence, the tree push).
+/// Each batch re-composites the frame of the session that holds the pane, and
+/// the pane's death runs the full `close_pane` path (layout repair,
+/// persistence, the tree push) in that session. Both ask
+/// [`ServerState::session_of_pane`] at the time of the event, because a pane
+/// can be moved to another session while this task runs. `session_name` is
+/// the session the pane was spawned in: it names the pane in the log, and it
+/// is the fallback for a render when the pane is in no session.
 ///
 /// It used to be an `Option`, `None` meaning an **auxiliary** pane -- one in no
 /// layout and on no frame, whose death was `reap_panes` alone. Aux panes existed
@@ -9684,10 +9688,11 @@ async fn start_forwarding_for_pane(
                         // tab is the foreground/active tab). Panes lock is
                         // released above; acquire state alone to preserve the
                         // state-before-panes lock order used elsewhere.
-                        {
+                        let owner = {
                             let mut st = state.lock().await;
                             st.record_pane_activity(pane_id, bell, std::time::Instant::now());
-                        }
+                            st.session_of_pane(pane_id).map(str::to_owned)
+                        };
                         // Write any pending responses (e.g., DSR replies) back to the PTY.
                         if !responses.is_empty() {
                             let ps = panes.lock().await;
@@ -9709,7 +9714,7 @@ async fn start_forwarding_for_pane(
                         // nobody watches costs nothing per PTY batch.
                         stream_pane_content(pane_id, &state, &panes, &clients).await;
                         broadcast_full_render(
-                            &session_name,
+                            owner.as_deref().unwrap_or(&session_name),
                             &state,
                             &panes,
                             &clients,
@@ -9723,17 +9728,24 @@ async fn start_forwarding_for_pane(
                         log::debug!(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
-                        // Close the pane automatically.
-                        close_pane(
-                            pane_id,
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
+                        let owner = {
+                            let st = state.lock().await;
+                            st.session_of_pane(pane_id).map(str::to_owned)
+                        };
+                        // A pane in no session is already being reaped by
+                        // whatever removed it, so there is no layout to repair.
+                        if let Some(owner) = owner {
+                            close_pane(
+                                pane_id,
+                                &owner,
+                                &state,
+                                &panes,
+                                &clients,
+                                &config,
+                                &prev_frames,
+                            )
+                            .await;
+                        }
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
                         // A pane dying on its own removes a row from every
@@ -9777,8 +9789,12 @@ async fn start_forwarding_for_pane(
                         if retitled || fg_changed || renamed {
                             mark_pane_retitled();
                             stream_pane_content(pane_id, &state, &panes, &clients).await;
+                            let owner = {
+                                let st = state.lock().await;
+                                st.session_of_pane(pane_id).map(str::to_owned)
+                            };
                             broadcast_full_render(
-                                &session_name,
+                                owner.as_deref().unwrap_or(&session_name),
                                 &state,
                                 &panes,
                                 &clients,
@@ -9974,194 +9990,18 @@ async fn materialize_session(
         }
     }
 
-    // Start PTY forwarding for every pane.
     for pane_id in pane_ids {
-        // Enforce exactly one forwarding task per pane (see start_pty_forwarding).
-        {
-            let mut ps = panes.lock().await;
-            match ps.get_mut(&pane_id) {
-                Some(pane_data) => {
-                    if pane_data.forwarding_started {
-                        continue; // already has its forwarding task
-                    }
-                    pane_data.forwarding_started = true;
-                }
-                None => continue,
-            }
-        }
-
-        let state = Arc::clone(state);
-        let panes = Arc::clone(panes);
-        let clients = Arc::clone(clients);
-        let config = Arc::clone(config);
-        let prev_frames = Arc::clone(prev_frames);
-        let dormant = Arc::clone(dormant);
-        let session_name = session_name.to_string();
-
-        tokio::spawn(async move {
-            let mut watch = ForegroundWatch::new(pane_id, &panes).await;
-            let first = {
-                let ps = panes.lock().await;
-                ps.get(&pane_id)
-                    .and_then(|pd| pd.names_to_refresh(std::time::Instant::now(), true))
-            };
-            if let Some(what) = first {
-                refresh_pane_names(pane_id, &panes, what).await;
-            }
-            loop {
-                let recv_result = {
-                    let mut ps = panes.lock().await;
-                    if let Some(pane_data) = ps.get_mut(&pane_id) {
-                        match pane_data.pty_rx.try_recv() {
-                            Ok(data) => Some(Ok(data)),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                Some(Err(()))
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                };
-
-                match recv_result {
-                    Some(Ok(data)) => {
-                        let (responses, bell, clipboard, retitled, fg_changed, refresh) = {
-                            let mut ps = panes.lock().await;
-                            if let Some(pane_data) = ps.get_mut(&pane_id) {
-                                let now = std::time::Instant::now();
-                                let t = pane_data.ingest_chunk(&data);
-                                let fg_changed = note_transition(pane_id, t);
-                                pane_data.last_output = now;
-                                let retitled = pane_data.settle_title(pane_id, now);
-                                let refresh = pane_data.names_to_refresh(now, fg_changed);
-                                // Output is what makes an agent `Working`, and
-                                // what clears a `NeedsInput` prompt off the
-                                // screen. Safe under the lock for the same
-                                // reason `mark_session_tree_dirty` is.
-                                mark_agents_dirty();
-                                let bell = pane_data.screen.take_bell();
-                                let clipboard = pane_data.screen.take_clipboard();
-                                (
-                                    pane_data.screen.take_responses(),
-                                    bell,
-                                    clipboard,
-                                    retitled,
-                                    fg_changed,
-                                    refresh,
-                                )
-                            } else {
-                                (Vec::new(), false, None, false, false, None)
-                            }
-                        };
-                        let renamed = match refresh {
-                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
-                            None => false,
-                        };
-                        if retitled || fg_changed || renamed {
-                            mark_pane_retitled();
-                        }
-                        {
-                            let mut st = state.lock().await;
-                            st.record_pane_activity(pane_id, bell, std::time::Instant::now());
-                        }
-                        if !responses.is_empty() {
-                            let ps = panes.lock().await;
-                            if let Some(pane_data) = ps.get(&pane_id) {
-                                for resp in &responses {
-                                    pane_data.send_input(resp);
-                                }
-                            }
-                        }
-                        // An application asked for the system clipboard via OSC 52.
-                        if let Some(text) = clipboard {
-                            if config.general.allow_app_clipboard {
-                                deliver_app_clipboard(pane_id, text, &state, &clients).await;
-                            }
-                        }
-                        // Stream to the pane's View-cell subscribers, each at its
-                        // own scroll offset and selection. This resurrect path is a
-                        // second per-pane forwarding loop; subscribers to a
-                        // materialized session must stream here too.
-                        stream_pane_content(pane_id, &state, &panes, &clients).await;
-                        broadcast_full_render(
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
-                    }
-                    Some(Err(())) => {
-                        close_pane(
-                            pane_id,
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
-                        notify_if_close_declined(pane_id, &panes, &clients).await;
-                        save_if_enabled(&state, &panes, &config, &dormant).await;
-                        // A pane dying on its own removes a row from every
-                        // subscriber's tree, and no command ran to say so.
-                        mark_session_tree_dirty();
-                        break;
-                    }
-                    None => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        // A quiet pane gets no tagged reads, so its foreground
-                        // is sampled here, and the settle windows end here.
-                        let sample = watch.sample();
-                        let (retitled, fg_changed, refresh) = {
-                            let mut ps = panes.lock().await;
-                            match ps.get_mut(&pane_id) {
-                                Some(pane_data) => {
-                                    let fg_changed = sample.is_some_and(|(fg, at)| {
-                                        let shell = pane_data.shell_pgid();
-                                        let t = pane_data.title.note_foreground(
-                                            fg,
-                                            at,
-                                            shell,
-                                            group_alive,
-                                        );
-                                        note_transition(pane_id, t)
-                                    });
-                                    let now = std::time::Instant::now();
-                                    (
-                                        pane_data.settle_title(pane_id, now),
-                                        fg_changed,
-                                        pane_data.names_to_refresh(now, fg_changed),
-                                    )
-                                }
-                                None => break,
-                            }
-                        };
-                        let renamed = match refresh {
-                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
-                            None => false,
-                        };
-                        if retitled || fg_changed || renamed {
-                            mark_pane_retitled();
-                            stream_pane_content(pane_id, &state, &panes, &clients).await;
-                            broadcast_full_render(
-                                &session_name,
-                                &state,
-                                &panes,
-                                &clients,
-                                &config,
-                                &prev_frames,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-        });
+        start_forwarding_for_pane(
+            pane_id,
+            session_name.to_string(),
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            dormant,
+        )
+        .await;
     }
 
     Ok(())

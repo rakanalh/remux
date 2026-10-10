@@ -30,6 +30,9 @@ PUSHED, never from a `Resize` that asks for one.
      lands on `other`.
   4. A new tab in the SOURCE for the sole pane of a sole tab is still refused.
  10. No panic in server.log.
+ 11. The same move on a RESTORED server: sessions saved, the server killed and
+     started again over the same state, so every pane's PTY is spawned by the
+     restore path rather than by a command. Cases 5 and 6 again.
 
 Markers are ASSEMBLED by the shell (`printf 'RAN:%s' b` prints `RAN:b`), so a
 typed command line can never satisfy a search.
@@ -39,9 +42,13 @@ Run: python3 tests/frame/pane_move_cross_session.py
 import json
 import os
 import re
-from harness import Server, Client, name_of, only
+import subprocess
+import time
+from harness import BIN, Server, Client, name_of, only
 
 RUNDIR = "/tmp/rmxpmx"
+RESTORE_RUNDIR = "/tmp/rmxpmxr"
+MONOCLE = '[appearance]\ndefault_layout = "monocle"\n'
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")
 SCROLL_BY = 10
@@ -182,8 +189,12 @@ def active_tab(t):
 
 
 def saved_sessions():
+    return saved_sessions_in(RUNDIR)
+
+
+def saved_sessions_in(rundir):
     try:
-        with open(f"{RUNDIR}/data/remux/state.json") as f:
+        with open(f"{rundir}/data/remux/state.json") as f:
             return sorted(json.load(f)["state"]["sessions"].keys())
     except (OSError, KeyError, ValueError):
         return None
@@ -204,9 +215,82 @@ def scroll_offset(msgs):
     return off
 
 
+def restart(srv):
+    """Kill the server and start a new one over the same directories, so it
+    restores the saved sessions. `Server.start` would wipe them."""
+    srv.kill()
+    if os.path.exists(srv.sock):
+        os.unlink(srv.sock)
+    srv.proc = subprocess.Popen([BIN, "server"], env=srv.env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(200):
+        if os.path.exists(srv.sock):
+            time.sleep(0.5)
+            return
+        time.sleep(0.05)
+    raise SystemExit("the restarted server made no socket")
+
+
+def restored():
+    print("11. the same move on a restored server")
+    srv = Server(RESTORE_RUNDIR).start(config=MONOCLE)
+    clients = []
+    try:
+        seed = Client(srv.sock)
+        seed.hello()
+        seed.send({"CreateSession": {"name": "main", "folder": None}})
+        attach(seed, "main")
+        cmd(seed, "PaneNew")
+        seed.send({"CreateSession": {"name": "other", "folder": None}})
+        seed.drain(0.8)
+        seed.close()
+        check(saved_sessions_in(RESTORE_RUNDIR) == ["main", "other"],
+              "restore: both sessions are saved before the restart")
+
+        restart(srv)
+        req, by_other = Client(srv.sock), Client(srv.sock)
+        clients = [req, by_other]
+        req.hello()
+        by_other.hello()
+        attach(req, "main")
+        attach(by_other, "other")
+        m0, o0 = tree(req, "main"), tree(req, "other")
+        print(f"  restored: main={m0} other={o0}")
+        b = focused_pane(m0)
+        d = o0[0][3][0][0] if o0 else None
+        check(m0 is not None and len(m0[0][3]) == 2 and o0 is not None,
+              "restore: main has two panes and other exists")
+        check("restored 2 sessions" in srv.log(), "restore: the server restored them")
+
+        move(req, o0[0][0], "other")
+        g_other, _ = snapshot(by_other)
+        type_line(req, "printf 'POST:%s\\n' r")
+        g, st = pushed(by_other, g_other)
+        check(st is not None and st["session_name"] == "other" and g.find_all(r"POST:r"),
+              "restore: by_other is pushed the moved pane's new output")
+
+        type_line(req, "exit")
+        o1 = None
+        for _ in range(10):
+            o1 = tree(req, "other")
+            if b not in pane_ids(o1):
+                break
+            req.drain(0.2)
+        print(f"  other={o1}")
+        check(b not in pane_ids(o1) and [p for p, _ in o1[0][3]] == [d],
+              "restore: the moved pane's exit closes it in other within 2s")
+    except (OSError, ConnectionError) as e:
+        check(False, f"restore: the server stopped answering: {e!r}")
+    finally:
+        for c in clients:
+            c.close()
+        srv.kill()
+    check("panicked at" not in srv.log(), "restore: no panic in server.log")
+
+
 def main():
     os.environ["HOME"] = RUNDIR
-    srv = Server(RUNDIR).start(config='[appearance]\ndefault_layout = "monocle"\n')
+    srv = Server(RUNDIR).start(config=MONOCLE)
     req, by_main, by_other, sub, sub2 = (Client(srv.sock) for _ in range(5))
     try:
         for c in (req, by_main, by_other, sub, sub2):
@@ -278,6 +362,32 @@ def main():
         print(f"  subscriber labels: {labels}")
         check(contents and all(s == "other" for s, _ in labels),
               "the subscriber's stream is labelled with other")
+
+        print("5. output from the moved pane is composited onto the TARGET's frame")
+        g_main, _ = snapshot(by_main)
+        g_other, _ = snapshot(by_other)
+        type_line(req, "printf 'POST:%s\\n' x")
+        g, st = pushed(by_other, g_other)
+        check(st is not None and st["session_name"] == "other" and g.find_all(r"POST:x"),
+              "by_other is pushed B's new output")
+        _, st = pushed(by_main, g_main)
+        check(st is None, f"main is not re-rendered for B's output ({st and st['session_name']})")
+
+        print("6. the moved pane's exit closes it in the TARGET")
+        type_line(req, "exit")
+        o6 = None
+        for _ in range(10):
+            o6 = tree(req, "other")
+            if b not in pane_ids(o6):
+                break
+            req.drain(0.2)
+        print(f"  other={o6}")
+        check(b not in pane_ids(o6) and [p for p, _ in o6[0][3]] == [d],
+              "B left other's Tab 1 within 2s, leaving D")
+        exited = [only(only(m, "Event"), "PaneExited") for m in sub.drain(1.0)
+                  if name_of(m) == "Event" and name_of(only(m, "Event")) == "PaneExited"]
+        check(any(e["pane_id"] == b for e in exited),
+              f"B's subscriber is told it exited ({exited})")
 
         print("2. A into a new tab of another session; main's emptied last tab is removed")
         attach(req, "main")
@@ -377,6 +487,22 @@ def main():
         check(srv.log()[mark:].count("refused: SolePaneInSoleTab") == 2,
               "both refusals are logged")
 
+        print("6b. a moved pane that is its tab's sole pane closes the tab on exit")
+        attach(req, "other")
+        o_before = tree(req, "other")
+        a_tab = next(tid for tid, _, _, ps in o_before if [p for p, _ in ps] == [a])
+        cmd(req, {"TabGoto": [tid for tid, _, _, _ in o_before].index(a_tab)})
+        type_line(req, "exit")
+        o_after = None
+        for _ in range(10):
+            o_after = tree(req, "other")
+            if a_tab not in [tid for tid, _, _, _ in o_after]:
+                break
+            req.drain(0.2)
+        print(f"  other={o_before} -> {o_after}")
+        check(a_tab not in [tid for tid, _, _, _ in o_after] and a not in pane_ids(o_after),
+              "A's tab closed with it, within 2s")
+
     except (OSError, ConnectionError) as e:
         check(False, f"the server stopped answering: {e!r}")
     finally:
@@ -386,6 +512,8 @@ def main():
 
     print("10. health")
     check("panicked at" not in srv.log(), "no panic in server.log")
+
+    restored()
 
     print()
     if fails:
