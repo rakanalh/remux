@@ -6751,6 +6751,18 @@ impl PanePlacement {
         !matches!(self, PanePlacement::Auto)
     }
 
+    /// The placement to apply in a tab laid out by `mode`. A split along the
+    /// axis that Columns or Rows already lays panes out on asks for exactly
+    /// what the layout's own rebuild gives, so it becomes `Auto` and the tab
+    /// keeps its mode instead of ejecting to `Custom`.
+    fn for_layout(self, mode: &LayoutMode) -> Self {
+        match (self, mode) {
+            (PanePlacement::SplitVertical, LayoutMode::Columns(_))
+            | (PanePlacement::SplitHorizontal, LayoutMode::Rows(_)) => PanePlacement::Auto,
+            _ => self,
+        }
+    }
+
     /// The PTY's initial size, given the session's render size. A split hands
     /// the new pane about half the axis it divides; the others start full size.
     /// Only the seed size -- `resize_session_panes` corrects it from the real
@@ -6772,9 +6784,10 @@ impl PanePlacement {
 /// Every `RemuxCommand` that creates a pane funnels through here, which is what
 /// keeps the two rules below true for all of them:
 ///
-/// * **A manual placement ejects the tab to `Custom`.** `PaneSplit*` and
-///   `PaneStackAdd` mutate the tree directly, so leaving the tab in an automatic
-///   mode would let the next rebuild (`PaneNew` / `LayoutNext` / `SetMaster`)
+/// * **A manual placement ejects the tab to `Custom`**, except a split along
+///   the Columns/Rows axis, which [`PanePlacement::for_layout`] turns into
+///   `Auto`. `PaneSplit*` and `PaneStackAdd` mutate the tree directly, so
+///   leaving the tab in an automatic mode would let the next rebuild (`PaneNew` / `LayoutNext` / `SetMaster`)
 ///   silently discard the arrangement the user just made -- and, because
 ///   `saved_custom_layout` is only snapshotted when the mode is *already*
 ///   `Custom`, discard it unrecoverably. Stacking used to skip this and lose
@@ -6912,7 +6925,7 @@ command={command:?} ({} arg(s))",
 async fn create_pane_in_tab(
     session_name: &str,
     tab_index: Option<usize>,
-    placement: PanePlacement,
+    mut placement: PanePlacement,
     cols: u16,
     rows: u16,
     command: Option<&str>,
@@ -6944,6 +6957,7 @@ async fn create_pane_in_tab(
             }
         };
         let focused = tab.focused_pane;
+        placement = placement.for_layout(&tab.layout_mode);
         // Eject to Custom before touching the tree, so `is_automatic()` below
         // sees the post-eject mode.
         if placement.is_manual() && tab.layout_mode.is_automatic() {
@@ -10247,7 +10261,7 @@ mod tests {
     use super::{
         arrow_report, button_report, compute_diff, merge_dormant_into, mouse_route,
         next_layout_mode, saved_custom_is_restorable, take_dormant_session, wheel_report,
-        ButtonPhase, MouseGesture, MouseRoute,
+        ButtonPhase, MouseGesture, MouseRoute, PanePlacement,
     };
     use crate::protocol::RenderCell;
     use crate::screen::Screen;
@@ -10258,6 +10272,52 @@ mod tests {
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_split_along_the_columns_or_rows_axis_becomes_auto() {
+        assert_eq!(
+            PanePlacement::SplitVertical.for_layout(&LayoutMode::Columns(ColumnsLayout)),
+            PanePlacement::Auto
+        );
+        assert_eq!(
+            PanePlacement::SplitHorizontal.for_layout(&LayoutMode::Rows(RowsLayout)),
+            PanePlacement::Auto
+        );
+    }
+
+    #[test]
+    fn every_other_split_keeps_its_manual_placement() {
+        let modes = [
+            LayoutMode::Bsp(BspLayout),
+            LayoutMode::Master(MasterLayout::default()),
+            LayoutMode::Monocle(MonocleLayout),
+            LayoutMode::Grid(GridLayout),
+            LayoutMode::Custom(CustomLayout),
+        ];
+        for mode in &modes {
+            for p in [
+                PanePlacement::SplitVertical,
+                PanePlacement::SplitHorizontal,
+                PanePlacement::Stack,
+            ] {
+                assert_eq!(p.for_layout(mode), p, "{p:?} in {}", mode.name());
+            }
+        }
+        assert_eq!(
+            PanePlacement::SplitHorizontal.for_layout(&LayoutMode::Columns(ColumnsLayout)),
+            PanePlacement::SplitHorizontal
+        );
+        assert_eq!(
+            PanePlacement::SplitVertical.for_layout(&LayoutMode::Rows(RowsLayout)),
+            PanePlacement::SplitVertical
+        );
+        for mode in [
+            LayoutMode::Columns(ColumnsLayout),
+            LayoutMode::Rows(RowsLayout),
+        ] {
+            assert_eq!(PanePlacement::Stack.for_layout(&mode), PanePlacement::Stack);
+        }
+    }
 
     #[test]
     fn a_host_the_template_does_not_use_does_not_split_the_frame() {
