@@ -116,7 +116,20 @@ pub enum ConnDescriptor {
 ///
 /// 15 -> 16: [`ClientMessage::TabStyle`], the client's tab chip caps. An old
 /// server cannot decode it and would drop the connection.
-pub const PROTOCOL_VERSION: u32 = 16;
+///
+/// 16 -> 17: moving a pane to another session. Adds `session` to
+/// [`RemuxCommand::PaneMoveToTabTarget`]. The field is `#[serde(default)]` and
+/// `RemuxCommand` does not set `deny_unknown_fields`, so an old server DECODES
+/// the new body and ignores `session`: it moves the pane to a new tab in the
+/// requester's OWN session when the user asked for another one. The bump makes
+/// the new client refuse that server at the handshake instead.
+///
+/// 17 also carries `pane` on [`ClientMessage::CliSpawn`], for the same reason.
+/// It decodes on a 16 server too, and that server ignores it and resolves the
+/// session from the caller's `REMUX_SESSION`, which is stale for a pane moved
+/// to another session. The failure is a new pane in the wrong session, not a
+/// dropped connection, so only the handshake can catch it.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -479,6 +492,12 @@ pub enum ClientMessage {
         argv: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
+        /// The caller's own pane, from its `REMUX_PANE`. It is an IDENTITY: it
+        /// says which session holds the caller NOW, and a live pane wins over
+        /// `session`, which was fixed when the pane was spawned. It never picks
+        /// the spot; the session's focused pane still does.
+        #[serde(default)]
+        pane: Option<PaneId>,
     },
     /// Scroll a subscribed pane's own scroll view by `lines` (per-subscriber,
     /// by pane identity), independent of this client's foreground scroll. Used
@@ -1234,8 +1253,16 @@ pub enum RemuxCommand {
     /// with this id, or into a new tab when `tab_id` is `None`. By id rather
     /// than index so that a tab closed or reordered by another client makes the
     /// move fail instead of hitting a different tab.
+    ///
+    /// Tab ids are unique across the server, so the tab may be in any session.
+    /// `session` names the session a new tab is created in (`None` means the
+    /// attached one). With a `tab_id` it is a cross-check: the move is refused
+    /// when the tab is not in that session, for the same stale-tree reason the
+    /// id exists.
     PaneMoveToTabTarget {
         tab_id: Option<u64>,
+        #[serde(default)]
+        session: Option<String>,
     },
     PaneRename(String),
     PaneToggleZoom,
@@ -1987,8 +2014,22 @@ mod tests {
                 tab_index: 3,
                 delta: -1,
             },
-            RemuxCommand::PaneMoveToTabTarget { tab_id: Some(7) },
-            RemuxCommand::PaneMoveToTabTarget { tab_id: None },
+            RemuxCommand::PaneMoveToTabTarget {
+                tab_id: Some(7),
+                session: None,
+            },
+            RemuxCommand::PaneMoveToTabTarget {
+                tab_id: None,
+                session: None,
+            },
+            RemuxCommand::PaneMoveToTabTarget {
+                tab_id: Some(7),
+                session: Some("other".into()),
+            },
+            RemuxCommand::PaneMoveToTabTarget {
+                tab_id: None,
+                session: Some("other".into()),
+            },
         ];
 
         for cmd in cases {
@@ -2199,6 +2240,73 @@ mod tests {
         match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
             ClientMessage::MouseDrag { pane_id, .. } => assert_eq!(pane_id, None),
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The bodies a protocol-16 peer writes (no `session`, no `pane`) still
+    /// decode, as `None`.
+    #[test]
+    fn move_session_and_cli_spawn_pane_default_to_none() {
+        let legacy = br#"{"Command":{"PaneMoveToTabTarget":{"tab_id":null}}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::Command(cmd) => assert_eq!(
+                cmd,
+                RemuxCommand::PaneMoveToTabTarget {
+                    tab_id: None,
+                    session: None,
+                }
+            ),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy = br#"{"CliSpawn":{"session":"main","placement":"SplitBelow"}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::CliSpawn {
+                session,
+                placement,
+                argv,
+                cwd,
+                pane,
+            } => {
+                assert_eq!(session, "main");
+                assert_eq!(placement, CliPlacement::SplitBelow);
+                assert!(argv.is_empty());
+                assert_eq!(cwd, None);
+                assert_eq!(pane, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_cli_spawn() {
+        for pane in [Some(7), None] {
+            let msg = ClientMessage::CliSpawn {
+                session: "main".into(),
+                placement: CliPlacement::NewTab,
+                argv: vec!["echo".into(), "hi".into()],
+                cwd: Some("/tmp".into()),
+                pane,
+            };
+            let encoded = encode_message(&msg).unwrap();
+            let len = decode_message_length(encoded[..4].try_into().unwrap());
+            let decoded: ClientMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
+            match decoded {
+                ClientMessage::CliSpawn {
+                    session,
+                    placement,
+                    argv,
+                    cwd,
+                    pane: decoded_pane,
+                } => {
+                    assert_eq!(session, "main");
+                    assert_eq!(placement, CliPlacement::NewTab);
+                    assert_eq!(argv, vec!["echo".to_string(), "hi".to_string()]);
+                    assert_eq!(cwd.as_deref(), Some("/tmp"));
+                    assert_eq!(decoded_pane, pane);
+                }
+                other => panic!("unexpected variant: {other:?}"),
+            }
         }
     }
 

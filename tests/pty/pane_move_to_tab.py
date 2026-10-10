@@ -194,8 +194,8 @@ def main():
         t.kill()
 
     server = t.log("server")
-    check("PaneMoveToTabTarget { tab_id: Some(" in server
-          and "PaneMoveToTabTarget { tab_id: None }" in server,
+    check(re.search(r"PaneMoveToTabTarget \{ tab_id: Some\(\d+\)(, session: None)? \}", server)
+          and re.search(r"PaneMoveToTabTarget \{ tab_id: None(, session: None)? \}", server),
           "the server received both moves")
     for which in ("client", "server"):
         check("panicked at" not in t.log(which), f"no panic in {which}.log")

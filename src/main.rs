@@ -225,6 +225,7 @@ async fn run_cli_spawn(
             placement,
             argv,
             cwd,
+            pane: None,
         })
         .await?;
 
@@ -5023,7 +5024,10 @@ async fn run_client_loop(
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget { tab_id });
+                                let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget {
+                                    tab_id,
+                                    session: None,
+                                });
                                 if let Err(e) = mgr.send(conn, cmd).await {
                                     log::info!("tab picker: move not sent to {conn:?}: {e}");
                                 }

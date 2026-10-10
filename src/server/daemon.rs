@@ -1551,13 +1551,14 @@ async fn handle_client_message(
             placement,
             argv,
             cwd,
+            pane,
         } => {
             // The PROGRAM, then a count. Which binary was asked for is the
             // whole diagnostic value of this line ("it tried to run `psql`");
             // its arguments are where a connection string or an API key lives.
             log::debug!(
                 "server: client_id={client_id} msg=CliSpawn(session={session:?}, \
-                 placement={placement:?}, program={:?}, {} more arg(s), cwd={})",
+                 pane={pane:?}, placement={placement:?}, program={:?}, {} more arg(s), cwd={})",
                 argv.first(),
                 argv.len().saturating_sub(1),
                 if cwd.is_some() { "set" } else { "none" }
@@ -2096,6 +2097,7 @@ entries={} error={:?} truncated={}",
             placement,
             argv,
             cwd,
+            pane: _,
         } => {
             handle_cli_spawn(
                 client_id,
@@ -2934,7 +2936,7 @@ async fn handle_command(
     //
     // `PaneMoveToTabTarget` is refused here for the same reason: whether its
     // target tab still exists is only known from the state, not the command.
-    if let RemuxCommand::PaneMoveToTabTarget { tab_id } = cmd {
+    if let RemuxCommand::PaneMoveToTabTarget { tab_id, session: _ } = cmd {
         let target = session::MoveRequest::from((tab_id, None));
         let st = state.lock().await;
         let Some(pane) = move_source_pane(&st, &session_name) else {
@@ -3448,7 +3450,7 @@ async fn handle_command(
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::PaneMoveToTabTarget { tab_id } => {
+        RemuxCommand::PaneMoveToTabTarget { tab_id, session: _ } => {
             let target = session::MoveRequest::from((tab_id, None));
             let outcome = {
                 let mut st = state.lock().await;
