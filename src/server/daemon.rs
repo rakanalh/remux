@@ -2936,8 +2936,8 @@ async fn handle_command(
     //
     // `PaneMoveToTabTarget` is refused here for the same reason: whether its
     // target tab still exists is only known from the state, not the command.
-    if let RemuxCommand::PaneMoveToTabTarget { tab_id, session: _ } = cmd {
-        let target = session::MoveRequest::from((tab_id, None));
+    if let RemuxCommand::PaneMoveToTabTarget { tab_id, session } = &cmd {
+        let target = session::MoveRequest::from((*tab_id, session.clone()));
         let st = state.lock().await;
         let Some(pane) = move_source_pane(&st, &session_name) else {
             return Ok(());
@@ -3450,8 +3450,11 @@ async fn handle_command(
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::PaneMoveToTabTarget { tab_id, session: _ } => {
-            let target = session::MoveRequest::from((tab_id, None));
+        RemuxCommand::PaneMoveToTabTarget {
+            tab_id,
+            session: target_session,
+        } => {
+            let target = session::MoveRequest::from((tab_id, target_session));
             let outcome = {
                 let mut st = state.lock().await;
                 match move_source_pane(&st, &session_name) {
@@ -3467,12 +3470,16 @@ async fn handle_command(
                     None => return Ok(()),
                 }
             };
-            match outcome {
+            let moved = match outcome {
                 (pane, Ok(moved)) => {
                     log::debug!(
-                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> tab index {}",
-                        moved.target_idx
+                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> \
+                         tab index {} session={:?} source_removed={}",
+                        moved.target_idx,
+                        moved.target_session,
+                        moved.source_removed.is_some()
                     );
+                    moved
                 }
                 (pane, Err(why)) => {
                     log::info!(
@@ -3480,10 +3487,61 @@ async fn handle_command(
                     );
                     return Ok(());
                 }
+            };
+            if let Some(popup) = &moved.source_removed {
+                reap_panes(popup, panes, clients).await;
             }
-            resize_session_panes(&session_name, state, panes, clients, config).await?;
-            invalidate_session_baselines(&session_name, clients, prev_frames).await;
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+            if moved.target_session != session_name {
+                // The requester follows its pane. Re-pointing it BEFORE the
+                // source is handled is what keeps it out of
+                // `handle_session_removed`, which would land it on an arbitrary
+                // session instead of the one it chose.
+                handle_attach(
+                    client_id,
+                    &moved.target_session,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                )
+                .await?;
+                if moved.source_removed.is_some() {
+                    handle_session_removed(
+                        &session_name,
+                        state,
+                        panes,
+                        clients,
+                        config,
+                        prev_frames,
+                    )
+                    .await;
+                } else {
+                    resize_session_panes(&session_name, state, panes, clients, config).await?;
+                    invalidate_session_baselines(&session_name, clients, prev_frames).await;
+                    broadcast_full_render(
+                        &session_name,
+                        state,
+                        panes,
+                        clients,
+                        config,
+                        prev_frames,
+                    )
+                    .await;
+                }
+            }
+            resize_session_panes(&moved.target_session, state, panes, clients, config).await?;
+            invalidate_session_baselines(&moved.target_session, clients, prev_frames).await;
+            broadcast_full_render(
+                &moved.target_session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
             mark_agents_dirty();
         }
         RemuxCommand::PaneStackAdd => {
