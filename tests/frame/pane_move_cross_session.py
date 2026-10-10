@@ -14,25 +14,41 @@ that output alone pushes a frame to every bystander, which would hide a move
 that forgot to broadcast. A bystander's frame is read from what the server
 PUSHED, never from a `Resize` that asks for one.
 
+The source tab is the LAST tab of `main`. The daemon always moves the active
+tab's focused pane, so the source tab is always the active one, and only when
+it is also the last does removing it leave `main`'s active tab out of range.
+That is the state case 2 must see repaired.
+
+Cases, in the order they run:
+
   1. B into `other`'s Tab 1: same pid and output, `other` Tab 1 = [D, B] with B
      focused, `main` lost B and nothing else, the requester FOLLOWS (its next
-     frame names `other`), `by_main` no longer shows B, `by_other` does, and
-     `sub`'s stream is labelled with `other`.
+     frame names `other`), `by_main` is pushed a frame without B, `by_other`
+     one with B, and `sub`'s stream is labelled with `other`.
+  5. Output typed into B now is pushed to `by_other`, and `main` is not
+     re-rendered for it: the forwarder follows the pane's session.
+  6. B's shell exits: B leaves `other`'s Tab 1 within 2s, and `sub` is told.
   2. A into a NEW tab of `other` (named from `other`'s count). `main`'s Tab 2 is
-     emptied and removed; it was the LAST and active tab, so `main`'s active
+     emptied and removed; it was the last and active tab, so `main`'s active
      tab must be clamped back to Tab 1 = C, or `by_main` renders nothing.
   8. Refusals change nothing and do not re-home the requester: a closed tab id,
      a live tab id with the wrong `session`, an unknown `session`.
   9. A scrolled requester is not snapped by a refused cross move.
-  7. `main`'s hidden popup is reaped when the session goes (case 3).
-  3. The last pane out of `main` removes the session: gone from the tree and
-     from folder `work`, absent from state.json, and the bystander `by_main`
-     lands on `other`.
+  7. `main`'s popup is spawned and hidden, so it is in no tab and not in
+     state.json; its id comes from the server log.
+  3. The last pane out of `main` removes the session: gone from the tree, from
+     folder `work` and from state.json, its popup reaped and its subscriber
+     told, and the bystander `by_main` is pushed a frame of `other`.
   4. A new tab in the SOURCE for the sole pane of a sole tab is still refused.
+ 6b. A, the only pane of its tab in `other`, exits: the tab closes with it.
  10. No panic in server.log.
- 11. The same move on a RESTORED server: sessions saved, the server killed and
+ 11. Cases 5 and 6 on a RESTORED server: sessions saved, the server killed and
      started again over the same state, so every pane's PTY is spawned by the
-     restore path rather than by a command. Cases 5 and 6 again.
+     restore path rather than by a command.
+
+Not covered: an old (protocol 16) server receiving `session`. It needs a
+server built before protocol 17, and the current client refuses such a server
+at the handshake, which is the protection the bump exists to give.
 
 Markers are ASSEMBLED by the shell (`printf 'RAN:%s' b` prints `RAN:b`), so a
 typed command line can never satisfy a search.
