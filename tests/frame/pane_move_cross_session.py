@@ -41,10 +41,14 @@ Cases, in the order they run:
      state.json; its id comes from the server log.
   3. The last pane out of `main` removes the session: gone from the tree, from
      folder `work` and from state.json, its popup reaped and its subscriber
-     told, and the bystander `by_main` is pushed a frame of `other`.
+     told, and the bystander `by_main`, scrolled back on C when C moves, is
+     pushed a frame of `other` at the live tail. A scroll on the focused pane
+     makes the broadcast skip a client, so a scroll left behind would freeze it.
   4. A new tab in the SOURCE for the sole pane of a sole tab is still refused.
  6b. A, the only pane of its tab in `other`, exits: the tab closes with it.
  10. No panic in server.log.
+ 12. A bystander scrolled back on a pane that moves away and later comes back
+     to it is not frozen by the scroll it left behind, on its own server.
  11. Cases 5 and 6 on a RESTORED server: sessions saved, the server killed and
      started again over the same state, so every pane's PTY is spawned by the
      restore path rather than by a command.
@@ -67,6 +71,7 @@ from harness import BIN, Server, Client, name_of, only
 
 RUNDIR = "/tmp/rmxpmx"
 RESTORE_RUNDIR = "/tmp/rmxpmxr"
+SCROLL_RUNDIR = "/tmp/rmxpmxs"
 MONOCLE = '[appearance]\ndefault_layout = "monocle"\n'
 COLS, ROWS = 100, 30
 RENDERS = ("FullRender", "RenderDiff", "ScrollRender")
@@ -248,6 +253,52 @@ def restart(srv):
             return
         time.sleep(0.05)
     raise SystemExit("the restarted server made no socket")
+
+
+def scroll_left_behind():
+    print("12. a bystander's scroll on a pane that moves away is not left behind")
+    srv = Server(SCROLL_RUNDIR).start(config=MONOCLE)
+    clients = []
+    try:
+        req, by_main = Client(srv.sock), Client(srv.sock)
+        clients = [req, by_main]
+        req.hello()
+        by_main.hello()
+        req.send({"CreateSession": {"name": "main", "folder": None}})
+        attach(req, "main")
+        cmd(req, "PaneNew")
+        type_line(req, "for i in $(seq 1 200); do printf 'LINE:%s\\n' $i; done")
+        req.drain(1.0)
+        req.send({"CreateSession": {"name": "other", "folder": None}})
+        req.drain(0.6)
+        attach(by_main, "main")
+        m0, o0 = tree(req, "main"), tree(req, "other")
+        b = focused_pane(m0)
+        by_main.send({"ScrollDelta": {"delta": SCROLL_BY}})
+        off = scroll_offset(by_main.drain(0.8))
+        check(off == SCROLL_BY, f"scroll: by_main is scrolled back on B ({off})")
+
+        move(req, o0[0][0], "other")
+        m1 = tree(req, "main")
+        check(b not in pane_ids(m1) and len(pane_ids(m1)) == 1,
+              f"scroll: B left main, which survives ({m1})")
+        by_main.drain(0.6)
+        move(req, m1[0][0], "main")
+        m2 = tree(req, "main")
+        check(focused_pane(m2) == b, f"scroll: B is back in main and focused ({m2})")
+        msgs = by_main.drain(1.0)
+        st = last_status(msgs)
+        check(st is not None and st["session_name"] == "main",
+              "scroll: by_main is pushed a frame when B comes back")
+        check(scroll_offset(msgs) == 0,
+              f"scroll: at the live tail, not the offset left behind ({scroll_offset(msgs)})")
+    except (OSError, ConnectionError) as e:
+        check(False, f"scroll: the server stopped answering: {e!r}")
+    finally:
+        for c in clients:
+            c.close()
+        srv.kill()
+    check("panicked at" not in srv.log(), "scroll: no panic in server.log")
 
 
 def restored():
@@ -489,6 +540,9 @@ def main():
 
         print("3. the last pane out of main removes the session")
         snapshot(by_main)
+        by_main.send({"ScrollDelta": {"delta": SCROLL_BY}})
+        off = scroll_offset(by_main.drain(0.8))
+        check(off == SCROLL_BY, f"by_main is scrolled back on C ({off})")
         got = move(req, other_tab1, "other")
         st = last_status(got)
         o3 = tree(req, "other")
@@ -498,9 +552,12 @@ def main():
         check(folder_sessions(req, "work") == [], "folder work no longer lists main")
         check(c_pane in [p for p, _ in o3[0][3]], "C is in other's Tab 1")
         check(saved_sessions() == ["other"], f"state.json holds only other ({saved_sessions()})")
-        _, st = pushed(by_main, Grid(COLS, ROWS))
+        msgs = by_main.drain(0.8)
+        st = last_status(msgs)
         check(st is not None and st["session_name"] == "other",
               "the bystander by_main is pushed a frame of other")
+        check(scroll_offset(msgs) == 0,
+              f"by_main's frame of other is at the live tail ({scroll_offset(msgs)})")
         exited = [only(only(m, "Event"), "PaneExited") for m in sub2.drain(1.0)
                   if name_of(m) == "Event" and name_of(only(m, "Event")) == "PaneExited"]
         check(popup is not None and any(e["pane_id"] == popup for e in exited),
@@ -543,6 +600,7 @@ def main():
     print("10. health")
     check("panicked at" not in srv.log(), "no panic in server.log")
 
+    scroll_left_behind()
     restored()
 
     print()

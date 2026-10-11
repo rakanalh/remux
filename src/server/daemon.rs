@@ -3471,7 +3471,7 @@ async fn handle_command(
                     None => return Ok(()),
                 }
             };
-            let moved = match outcome {
+            let (pane, moved) = match outcome {
                 (pane, Ok(moved)) => {
                     log::debug!(
                         "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> \
@@ -3480,7 +3480,7 @@ async fn handle_command(
                         moved.target_session,
                         moved.source_removed.is_some()
                     );
-                    moved
+                    (pane, moved)
                 }
                 (pane, Err(why)) => {
                     log::info!(
@@ -3493,6 +3493,21 @@ async fn handle_command(
                 reap_panes(popup, panes, clients).await;
             }
             if moved.target_session != session_name {
+                // A client of the source that scrolled the pane back would
+                // otherwise keep that offset for a pane it can no longer see.
+                // The offset outlives the move, and when the pane is that
+                // client's focused pane again the broadcast skips the client,
+                // which freezes its screen.
+                {
+                    let mut cls = clients.lock().await;
+                    for c in cls.values_mut() {
+                        c.session_scroll.remove(&pane);
+                        if c.prev_scroll_pane == Some(pane) {
+                            c.prev_scroll_pane = None;
+                            c.prev_scroll_offset = 0;
+                        }
+                    }
+                }
                 // The requester follows its pane. Re-pointing it BEFORE the
                 // source is handled is what keeps it out of
                 // `handle_session_removed`, which would land it on an arbitrary
@@ -9238,6 +9253,11 @@ async fn handle_session_removed(
                 for c in cls.values_mut() {
                     if c.session_name.as_deref() == Some(removed) {
                         c.session_name = Some(next.clone());
+                        // As in `handle_attach`: these offsets index panes of
+                        // the session being left.
+                        c.session_scroll.clear();
+                        c.prev_scroll_offset = 0;
+                        c.prev_scroll_pane = None;
                     }
                 }
             }
