@@ -338,9 +338,13 @@ def run_default(c, v):
     # attribution races the program's exit: the PTY reader tags each read with
     # the foreground group it saw on waking, and a read that wakes after the
     # shell has taken the terminal back tags the program's title as the
-    # shell's. So this counts adoptions over independent runs, each from a
-    # fresh shell title, and fails when they are the rule rather than the
-    # exception: the bug adopts every time, the race rarely.
+    # shell's. The server cannot correct this, because a title the shell sets
+    # right after a short job arrives with the same samples. So this counts
+    # adoptions over independent runs, each from a fresh shell title.
+    # On 2026-10-11 the race adopted in 36 of 192 runs, with and without busy
+    # loops on half the cores. The limit is set so that a rate of 0.3 still
+    # passes about 998 harness runs in 1000 (binomial, 16 runs), while the bug
+    # this guards, adopting a job's expired title as the shell's, adopts 16/16.
     runs = []
     for i in range(16):
         set_shell_title(c, v, "Ho", f"me{i}")
@@ -349,7 +353,7 @@ def run_default(c, v):
         runs.append(pane_name(c, v))
     adopted = runs.count("Exit")
     print(f"     9: the exiting title was adopted in {adopted}/{len(runs)} runs")
-    check(adopted <= 4, f"9 an exiting program's title is not adopted as the shell's ({runs})")
+    check(adopted <= 10, f"9 an exiting program's title is not adopted as the shell's ({runs})")
 
     # 6. a user-set name wins.
     c.send({"Command": {"PaneRename": "mine"}})
