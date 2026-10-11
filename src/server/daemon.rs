@@ -70,9 +70,16 @@ pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
 /// The Linux arm: `/proc/<pid>/comm`.
 #[cfg(target_os = "linux")]
 pub(crate) fn get_process_name(pid: i32) -> String {
+    try_process_name(pid).unwrap_or_else(|| "shell".to_string())
+}
+
+/// [`get_process_name`] without its `"shell"` fallback: `None` when `pid`
+/// cannot be read, which is what a process reaped since it was found reads as.
+#[cfg(target_os = "linux")]
+fn try_process_name(pid: i32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
         .map(|s| crate::config::pane_title::sanitize_label(s.trim()))
-        .unwrap_or_else(|_| "shell".to_string())
 }
 
 /// See the Linux variant for documentation. macOS has no `/proc` and no
@@ -97,11 +104,16 @@ pub(crate) fn get_process_name(pid: i32) -> String {
 /// kernel's current answer.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_process_name(pid: i32) -> String {
+    try_process_name(pid).unwrap_or_else(|| "shell".to_string())
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+fn try_process_name(pid: i32) -> Option<String> {
     process_argv0(pid)
         .as_deref()
         .and_then(command_name_from_argv0)
         .or_else(|| executable_name(pid))
-        .unwrap_or_else(|| "shell".to_string())
 }
 
 /// The name a process's `argv[0]` gives it: the basename of a path, without
@@ -214,6 +226,11 @@ fn executable_name(pid: i32) -> Option<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn get_process_name(_pid: i32) -> String {
     "shell".to_string()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn try_process_name(_pid: i32) -> Option<String> {
+    None
 }
 
 /// Every name by which this OS will admit to knowing `pid`.
@@ -4710,14 +4727,27 @@ impl ForegroundWatch {
 /// its group (`sleep 0.1 | sleep 5`), so a live member is named when the leader
 /// is gone.
 fn group_name(pgid: i32, shell: i32) -> Option<String> {
-    let member = if process_pgid(pgid) == Some(pgid) {
-        Some(pgid)
-    } else {
-        child_pids(shell)
+    group_member_name(pgid, shell, process_pgid, child_pids, try_process_name)
+}
+
+/// [`group_name`] with its process reads passed in. A member whose name
+/// cannot be read was reaped after its group was read, and counts as gone.
+fn group_member_name(
+    pgid: i32,
+    shell: i32,
+    pgid_of: impl Fn(i32) -> Option<i32>,
+    children: impl Fn(i32) -> Vec<i32>,
+    name_of: impl Fn(i32) -> Option<String>,
+) -> Option<String> {
+    let leader = (pgid_of(pgid) == Some(pgid))
+        .then(|| name_of(pgid))
+        .flatten();
+    leader.or_else(|| {
+        children(shell)
             .into_iter()
-            .find(|&child| process_pgid(child) == Some(pgid))
-    };
-    member.map(get_process_name)
+            .filter(|&child| pgid_of(child) == Some(pgid))
+            .find_map(&name_of)
+    })
 }
 
 /// What [`refresh_pane_names`] reads for, taken under the `panes` lock by
@@ -10205,9 +10235,9 @@ async fn handle_resurrect_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        arrow_report, button_report, compute_diff, merge_dormant_into, mouse_route,
-        next_layout_mode, saved_custom_is_restorable, take_dormant_session, wheel_report,
-        ButtonPhase, MouseGesture, MouseRoute, PaneNames, PanePlacement,
+        arrow_report, button_report, compute_diff, group_member_name, merge_dormant_into,
+        mouse_route, next_layout_mode, saved_custom_is_restorable, take_dormant_session,
+        wheel_report, ButtonPhase, MouseGesture, MouseRoute, PaneNames, PanePlacement,
     };
     use crate::protocol::RenderCell;
     use crate::screen::Screen;
@@ -10285,6 +10315,46 @@ mod tests {
             job: job.map(|(g, n)| (g, n.to_string())),
             ..PaneNames::default()
         }
+    }
+
+    const SHELL_PID: i32 = 100;
+    const LEADER: i32 = 200;
+    const MEMBER: i32 = 201;
+
+    fn pgid_in_job(pid: i32) -> Option<i32> {
+        matches!(pid, LEADER | MEMBER).then_some(LEADER)
+    }
+
+    fn shell_children(_shell: i32) -> Vec<i32> {
+        vec![LEADER, MEMBER]
+    }
+
+    #[test]
+    fn a_leader_reaped_before_its_name_is_read_is_not_a_live_member() {
+        let name = group_member_name(
+            LEADER,
+            SHELL_PID,
+            |pid| (pid == LEADER).then_some(LEADER),
+            |_| Vec::new(),
+            |_| None,
+        );
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn a_group_is_named_by_a_member_whose_name_can_be_read() {
+        let name = group_member_name(LEADER, SHELL_PID, pgid_in_job, shell_children, |pid| {
+            (pid == MEMBER).then(|| "sleep".to_string())
+        });
+        assert_eq!(name.as_deref(), Some("sleep"));
+    }
+
+    #[test]
+    fn a_live_leader_names_its_group() {
+        let name = group_member_name(LEADER, SHELL_PID, pgid_in_job, shell_children, |pid| {
+            Some(format!("p{pid}"))
+        });
+        assert_eq!(name.as_deref(), Some("p200"));
     }
 
     #[test]
