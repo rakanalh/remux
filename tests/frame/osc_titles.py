@@ -387,8 +387,30 @@ def run_persistence(srv):
     c.close()
 
 
-def main():
-    srv = Server(RUNDIR).start()
+def wait_ready(sock, timeout=10.0):
+    """A client that has completed the handshake with a server listening on
+    `sock`, or None by `timeout`."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            c = Client(sock)
+        except (FileNotFoundError, ConnectionRefusedError):
+            time.sleep(0.05)
+            continue
+        try:
+            if "protocol_version" in c.hello():
+                return c
+        except (ConnectionError, socket.timeout):
+            pass
+        c.close()
+        time.sleep(0.05)
+    return None
+
+
+def run_phases():
+    # A directory per phase, because `Server.start()` empties its directory and
+    # would delete the previous phase's `server.log` with it.
+    srv = Server(f"{RUNDIR}/default").start()
     try:
         c = Client(srv.sock)
         attach(c)
@@ -398,7 +420,7 @@ def main():
     finally:
         srv.kill()
 
-    srv = Server(RUNDIR).start(config='[appearance]\npane_title = "{command}: {title}"\n')
+    srv = Server(f"{RUNDIR}/template").start(config='[appearance]\npane_title = "{command}: {title}"\n')
     try:
         c = Client(srv.sock)
         attach(c)
@@ -408,14 +430,14 @@ def main():
     finally:
         srv.kill()
 
-    srv = Server(RUNDIR).start()
+    srv = Server(f"{RUNDIR}/stack").start()
     try:
         run_stack(srv)
         check("panicked" not in srv.log(), "no panic in the server log (stack)")
     finally:
         srv.kill()
 
-    srv = Server(RUNDIR).start()
+    srv = Server(f"{RUNDIR}/persist").start()
     try:
         run_persistence(srv)
     finally:
@@ -424,13 +446,10 @@ def main():
     p = subprocess.Popen([BIN, "server"], env=srv.env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        for _ in range(200):
-            if os.path.exists(srv.sock):
-                break
-            time.sleep(0.05)
-        time.sleep(0.5)
-        c = Client(srv.sock)
-        c.hello()
+        c = wait_ready(srv.sock)
+        check(c is not None, "13 the restarted server completes a handshake")
+        if c is None:
+            return
         v = View()
         names = []
         c.send("ListSessionTree")
@@ -446,8 +465,18 @@ def main():
     finally:
         p.kill()
         p.wait()
-        shutil.rmtree(RUNDIR, ignore_errors=True)
 
+
+def main():
+    passed = False
+    try:
+        run_phases()
+        passed = not FAILS
+    finally:
+        if passed:
+            shutil.rmtree(RUNDIR, ignore_errors=True)
+        else:
+            print(f"kept {RUNDIR} for inspection")
     print(f"\n{'FAILED' if FAILS else 'OK'}: {len(FAILS)} failure(s)")
     sys.exit(1 if FAILS else 0)
 
