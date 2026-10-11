@@ -24,10 +24,16 @@
 //! Both writes re-check two things in the same `panes` section as the write.
 //! The agent must not be waiting on its user (`NeedsInput`): an Enter into a
 //! permission prompt answers it, so a message could approve another agent's
-//! action. And no human may have typed into the pane since it was sampled,
-//! for the text, or since the text was written, for the Enter: the Enter
-//! would submit the person's keys with the message. A person's keys are
-//! never flushed: when one typed after the text, the queue is left as it is.
+//! action. A submit takes a pane as waiting on its user when a configured
+//! pattern says so, and also when its screen looks like a numbered selector
+//! ([`looks_like_prompt`]), so that a prompt no pattern knows is not
+//! approved either. And no human may have typed into the pane since it was
+//! sampled, for the text, or since the text was written, for the Enter: the
+//! Enter would submit the person's keys with the message. When a person
+//! typed after the text, the agent is given the rest of the read check's
+//! time to read the queue, the person's keys with it; whatever is still
+//! unread then is flushed, keys included, because a person's Enter has made
+//! it a line the next reader would run.
 //!
 //! Each typed message opens with an envelope line naming it and its sender,
 //! so the agent, and the person watching it, can tell another agent's
@@ -44,12 +50,8 @@
 //!   The check and the write share one `panes` section, so the window is the
 //!   agent's own: the time between reading the text and drawing a prompt the
 //!   server has not yet parsed.
-//! - When a human typed after the text, a refusal does not flush the input
-//!   queue, so that the person's keys survive. Text of the message that the
-//!   agent did not read then stays in the queue for the next program that
-//!   reads it, which after the agent exits is the shell. This is the hazard
-//!   the flush exists for, left open only while a person is typing into the
-//!   pane and can see what reaches it.
+//! - A prompt that is neither named by a pattern nor drawn as a numbered
+//!   selector reads as not waiting, and its Enter is typed.
 
 pub const PASTE_OPEN: &[u8] = b"\x1b[200~";
 pub const PASTE_CLOSE: &[u8] = b"\x1b[201~";
@@ -221,6 +223,41 @@ pub fn precheck(
         return Some(settle(deliver, SubmitRefusal::not_ready(pane)));
     }
     (state == Some(AgentState::NeedsInput)).then(|| settle(deliver, SubmitRefusal::blocked(pane)))
+}
+
+/// Whether the bottom of an agent's screen looks like a selector waiting on
+/// its user: two or more numbered options, one of them marked as the choice
+/// or offering Esc ("3. No, and tell Claude what to do differently (esc)").
+///
+/// A submit refuses such a pane as `agent_blocked` whatever the configured
+/// patterns say. A pattern names a prompt by its wording, and a wording no
+/// pattern knows reads `Idle`, where the Enter after the text picks the
+/// selector's default, which for an approval is "Yes". This check knows no
+/// wording, so it fails closed: a numbered list drawn the same way leaves a
+/// message in the mailbox, which is the safe side. It is not part of the
+/// agents panel's classification, where a false `NeedsInput` never decays.
+pub fn looks_like_prompt(bottom: &[String]) -> bool {
+    let options: Vec<(bool, &str)> = bottom.iter().filter_map(|l| option_row(l)).collect();
+    options.len() >= 2
+        && options
+            .iter()
+            .any(|(marked, text)| *marked || text.to_ascii_lowercase().contains("(esc)"))
+}
+
+/// A numbered option row (`❯ 1. Yes`, `  2) No`): whether it carries a
+/// selection marker, and its text after the number.
+fn option_row(line: &str) -> Option<(bool, &str)> {
+    let rest = line.trim_start();
+    let unmarked = rest.trim_start_matches(['\u{276f}', '\u{203a}', '>', '\u{25b6}']);
+    let marked = unmarked.len() != rest.len();
+    let rest = unmarked.trim_start();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&digits) {
+        return None;
+    }
+    let rest = rest[digits..].strip_prefix(['.', ')'])?;
+    let text = rest.trim_start();
+    (text.len() < rest.len() && !text.is_empty()).then_some((marked, text))
 }
 
 /// Whether the working policy is asked before the typing guard, as §8.2
@@ -706,6 +743,46 @@ mod tests {
             guard_wait(Some(at(14_900)), true, t0, at(14_950), &guard()),
             GuardVerdict::Wait(at(17_900))
         );
+    }
+
+    #[test]
+    fn a_numbered_selector_with_a_marker_or_an_esc_option_looks_like_a_prompt() {
+        let lines = |ls: &[&str]| ls.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(looks_like_prompt(&lines(&[
+            "Edit file",
+            " src/x.rs",
+            "Do you want to make this edit to x.rs?",
+            "\u{276f} 1. Yes",
+            "  2. Yes, allow all edits during this session (shift+tab)",
+            "  3. No, and tell Claude what to do differently (esc)",
+        ])));
+        assert!(
+            looks_like_prompt(&lines(&[
+                "  1. Yes",
+                "  2. No, and tell Codex what to do differently (Esc)"
+            ])),
+            "no marker, an Esc option"
+        );
+        assert!(
+            looks_like_prompt(&lines(&["> 1) Yes", "  2) No"])),
+            "a marker, no Esc option"
+        );
+        assert!(
+            !looks_like_prompt(&lines(&["1. Fix the parser", "2. Add the tests"])),
+            "a plain numbered list"
+        );
+        assert!(
+            !looks_like_prompt(&lines(&["\u{276f} 2. Yes, and don't ask again"])),
+            "one row is not a selector"
+        );
+        assert!(
+            !looks_like_prompt(&lines(&["\u{276f} 1.5x faster", "  2.0 released"])),
+            "a number is not an option without a space after its dot"
+        );
+        assert!(!looks_like_prompt(&lines(&[
+            "\u{23fa} User answered Claude's questions:",
+            "  \u{23bf}  \u{b7} Which color do you like? \u{2192} Blue",
+        ])));
     }
 
     #[test]

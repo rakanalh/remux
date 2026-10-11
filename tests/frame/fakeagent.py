@@ -26,6 +26,8 @@ so a command written while another is being read is never lost:
 
   paste-on / paste-off   turn bracketed paste mode (2004) on or off
   block                  show a permission prompt ("Do you want to proceed?")
+  editblock              show Claude Code's file-edit approval dialog, which
+                         no harness pattern matches
   clear                  clear the screen and say "back to work"
   work:<ms>              print "working..." every 100 ms for <ms>
   deaf                  stop reading input, stay in raw mode (an agent hung
@@ -35,6 +37,7 @@ so a command written while another is being read is never lost:
   block-on-rx            show the permission prompt the moment the next
                          pasted block arrives: a prompt drawn between a
                          typed message and its Enter
+  editblock-on-rx        the same, with the file-edit approval dialog
   slow:<bytes>:<ms>      read at most <bytes> at a time, <ms> apart: an agent
                          that reads a long message slower than it arrives
   quit                   exit
@@ -46,6 +49,14 @@ import os
 import select
 import sys
 import time
+
+
+PROCEED = "Do you want to proceed?\n> 1. Yes\n  2. No\n"
+# Claude Code 2.1.x's dialog for an Edit tool call, option for option.
+EDIT = ("Edit file\n src/x.rs\nDo you want to make this edit to x.rs?\n"
+        "\u276f 1. Yes\n"
+        "  2. Yes, allow all edits during this session (shift+tab)\n"
+        "  3. No, and tell Claude what to do differently (esc)\n")
 
 
 def install(path):
@@ -85,7 +96,7 @@ def main():
     next_work = 0.0
     deaf = False
     exit_on_rx = False
-    block_on_rx = False
+    block_on_rx = None
     read_size, read_gap = 4096, 0.0
     while True:
         if deaf:
@@ -110,8 +121,8 @@ def main():
             if exit_on_rx:
                 return
             if block_on_rx and data.startswith(b"\x1b[200~"):
-                block_on_rx = False
-                out("Do you want to proceed?\n> 1. Yes\n  2. No\n")
+                out(block_on_rx)
+                block_on_rx = None
             time.sleep(read_gap)
         now = time.monotonic()
         if now < work_until and now >= next_work:
@@ -123,7 +134,9 @@ def main():
             elif command == "paste-off":
                 out("\x1b[?2004l")
             elif command == "block":
-                out("Do you want to proceed?\n> 1. Yes\n  2. No\n")
+                out(PROCEED)
+            elif command == "editblock":
+                out(EDIT)
             elif command == "clear":
                 out("\x1b[2J\x1b[Hback to work\n")
             elif command.startswith("work:"):
@@ -137,7 +150,9 @@ def main():
             elif command == "exit-on-rx":
                 exit_on_rx = True
             elif command == "block-on-rx":
-                block_on_rx = True
+                block_on_rx = PROCEED
+            elif command == "editblock-on-rx":
+                block_on_rx = EDIT
             elif command == "quit":
                 ack(command)
                 return

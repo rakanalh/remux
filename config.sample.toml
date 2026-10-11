@@ -936,12 +936,17 @@
 #
 # Declaring ANY `[[agents.pattern]]` replaces the shipped set outright — there
 # is no merge, so you own the whole list and cannot be surprised by a built-in
-# pattern you cannot see. TWO ship for Claude Code:
+# pattern you cannot see. THREE ship for Claude Code:
 #
 #   claude-proceed — its permission prompts, taken from the wordings actually
 #                    present in the binary ("Do you want to proceed?",
 #                    "...continue?", "...allow this connection?", "...use this
-#                    API key?").
+#                    API key?", and its file dialogs' "...make this edit to
+#                    x.rs?", "...create", "...overwrite", "...write to",
+#                    "...insert this cell", "...delete this cell").
+#   claude-decline — the option every approval dialog draws to refuse ("No, and
+#                    tell Claude what to do differently (esc)"), which is still
+#                    on screen when the question has scrolled out of it.
 #   claude-select  — its QUESTION menu, which asks you something rather than
 #                    asking permission ("Which color do you like?" over a list
 #                    of options) and so matches none of the wordings above. That
@@ -1009,7 +1014,12 @@
 #   [[agents.pattern]]
 #   name = "claude-proceed"
 #   command = "claude"
-#   regex = "(?i)do you want to (proceed|continue|allow|use this api key)"
+#   regex = "(?i)do you want to (proceed|continue|allow|use this api key|make this edit|create|overwrite|write to|insert this cell|delete this cell)"
+#
+#   [[agents.pattern]]
+#   name = "claude-decline"
+#   command = "claude"
+#   regex = "(?i)tell claude what to do differently"
 #
 #   [[agents.pattern]]
 #   name = "claude-select"
@@ -1044,10 +1054,10 @@
 # Two grades of evidence, and the line does not run along agent names.
 # claude-select, omp-allow and the two opencode patterns were matched against a
 # real pane — blocked, and then again after answering — so both that they fire
-# and that they STOP are observed. claude-proceed and the two codex patterns
-# were read out of the shipped binaries with `strings`: the wordings are real,
-# but nobody here has watched one of those prompts appear or clear, because
-# codex could not be driven as far as an approval. If a pane ever sticks on
+# and that they STOP are observed. claude-proceed, claude-decline and the two
+# codex patterns were read out of the shipped binaries with `strings`: the
+# wordings are real, but nobody here has watched one of those prompts appear or
+# clear, because codex could not be driven as far as an approval. If a pane ever sticks on
 # "needs input", that is the pattern to correct — a state that never decays is
 # the price of matching a prompt that never leaves the screen.
 

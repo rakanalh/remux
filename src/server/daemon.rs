@@ -969,7 +969,7 @@ async fn step_submit(
     }
     let sample = sample_pane(pane, state, panes, config).await;
     let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
-    let agent_state = sample.verdict.as_ref().map(|v| v.state);
+    let agent_state = sample.state;
     if let Some(answer) = precheck(
         pane,
         sample.live,
@@ -1065,6 +1065,7 @@ async fn step_submit(
         &entry.body,
         envelope.as_deref(),
         &rule,
+        entry.deliver,
         config,
         panes,
     )
@@ -1081,22 +1082,13 @@ async fn step_submit(
             mark_submit_dirty();
             return;
         }
+        Err(TextRefusal::Working(answer)) => {
+            let policy = Some(working_policy(&rule));
+            return answer_untyped(entry, answer, policy, store).await;
+        }
         Err(TextRefusal::Refuse(refusal)) => {
-            let reply = {
-                let mut st = store.lock().await;
-                st.unsubmit(pane, id);
-                st.end_typing(pane)
-            };
             let answer = settle(entry.deliver, refusal);
-            reply_submit(
-                crate::server::messaging::SubmitEntry { reply, ..entry },
-                answer,
-                None,
-                store,
-            )
-            .await;
-            mark_submit_dirty();
-            return;
+            return answer_untyped(entry, answer, None, store).await;
         }
     };
     let pgid = sample.pgid;
@@ -1105,6 +1097,7 @@ async fn step_submit(
     tokio::spawn(async move {
         let typing = EndTypingOnDrop { pane, armed: true };
         let outcome = type_enter(
+            id,
             pane,
             pgid,
             &command,
@@ -1163,6 +1156,28 @@ async fn step_submit(
     });
 }
 
+/// Answer an entry that was claimed but not written with `answer`.
+async fn answer_untyped(
+    entry: crate::server::messaging::SubmitEntry,
+    answer: crate::server::submit::Answer,
+    policy: Option<String>,
+    store: &'static Mutex<Messaging>,
+) {
+    let reply = {
+        let mut st = store.lock().await;
+        st.unsubmit(entry.pane, entry.id);
+        st.end_typing(entry.pane)
+    };
+    reply_submit(
+        crate::server::messaging::SubmitEntry { reply, ..entry },
+        answer,
+        policy,
+        store,
+    )
+    .await;
+    mark_submit_dirty();
+}
+
 /// Answer `pane`'s head by its row's `while_working`, if the agent is working
 /// and the row does not type into it. Returns whether it was answered.
 async fn answer_working(
@@ -1176,9 +1191,13 @@ async fn answer_working(
     let Some(answer) = crate::server::submit::on_working(pane, agent_state, rule, deliver) else {
         return false;
     };
-    let policy = format!("while_working={:?}", rule.while_working).to_lowercase();
-    answer_head(pane, id, answer, Some(policy), store).await;
+    answer_head(pane, id, answer, Some(working_policy(rule)), store).await;
     true
+}
+
+/// The row setting that answers a working agent, as the log names it.
+fn working_policy(rule: &crate::server::submit::SubmitRule) -> String {
+    format!("while_working={:?}", rule.while_working).to_lowercase()
 }
 
 /// Ends a pane's typing if the task typing into it stops without doing so
@@ -1322,11 +1341,15 @@ enum TextRefusal {
     /// back to wait for the guard again, not refused.
     HumanTyped,
     Refuse(crate::server::submit::SubmitRefusal),
+    /// The agent is working and its row's `while_working` does not type into
+    /// it: answered as the row says.
+    Working(crate::server::submit::Answer),
 }
 
 /// Write the framed text into `pane`, if the program there is still the one
-/// sampled (`sample.pgid`), reads its input unbuffered and is not waiting on
-/// its user, and no person has typed into the pane since the sample. Returns
+/// sampled (`sample.pgid`), reads its input unbuffered, is not waiting on its
+/// user and is not working against its row's `while_working`, and no person
+/// has typed into the pane since the sample. Returns
 /// whether it was wrapped, its length and the Enter to write after it. Every
 /// check and the write happen in one `panes` section, so nothing can change
 /// between them. The bytes are never logged: they are the message.
@@ -1338,12 +1361,13 @@ async fn type_text(
     body: &str,
     envelope: Option<&str>,
     rule: &crate::server::submit::SubmitRule,
+    deliver: Deliver,
     config: &Config,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) -> Result<(bool, usize, Vec<u8>, TypedText), TextRefusal> {
     use crate::config::messaging::Bracketed;
     use crate::server::submit::{
-        encode, multi_line_refusal, newlines_safe, Framing, SubmitRefusal,
+        encode, multi_line_refusal, newlines_safe, on_working, Framing, SubmitRefusal,
     };
     use nix::sys::termios::{tcgetattr, LocalFlags};
     let refuse = |refusal| Err(TextRefusal::Refuse(refusal));
@@ -1376,8 +1400,12 @@ async fn type_text(
         }
     }
     let now = std::time::Instant::now();
-    if pane_verdict(pd, command, agent_rules(config), now).state == AgentState::NeedsInput {
+    let agent_state = submit_state(pd, command, agent_rules(config), now);
+    if agent_state == AgentState::NeedsInput {
         return refuse(SubmitRefusal::blocked(pane));
+    }
+    if let Some(answer) = on_working(pane, Some(agent_state), rule, deliver) {
+        return Err(TextRefusal::Working(answer));
     }
     let framing = match rule.bracketed {
         Bracketed::On => Framing::Bracketed,
@@ -1462,11 +1490,16 @@ struct TypedText {
 ///
 /// On a refusal the rest of the text is cancelled FIRST and the writer's
 /// stop awaited, then the queue is flushed: flushed first, the queue would
-/// only make room for the writer to write the tail into it. Neither happens
-/// when a person typed: the agent is reading, so its paste is closed rather
-/// than cut off, and the person's keys stay in the queue.
+/// only make room for the writer to write the tail into it. When a person
+/// typed, the agent is given until the deadline to read the queue, the
+/// person's keys with it, so that its paste is closed rather than cut off
+/// and the keys reach it; whatever is still unread then is cancelled and
+/// flushed like any other, because a person's Enter has made it a line the
+/// next reader would run. A program other than the agent never gets that
+/// time: the queue is flushed as soon as the agent is not the one reading.
 #[allow(clippy::too_many_arguments)]
 async fn type_enter(
+    id: MsgId,
     pane: PaneId,
     pgid: Option<nix::unistd::Pid>,
     command: &str,
@@ -1502,6 +1535,10 @@ async fn type_enter(
     };
     let mut written = false;
     let mut human = false;
+    // The agent read every byte that reached the queue, so nothing is left
+    // for the next program to read.
+    let mut read_all = false;
+    let mut agent_reading = true;
     let verdict = loop {
         if !written {
             match typed.written.try_recv() {
@@ -1510,52 +1547,110 @@ async fn type_enter(
                 Err(TryRecvError::Empty) => {}
             }
         }
-        {
+        let blocked = {
             let ps = panes.lock().await;
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
                 break Err(SubmitRefusal::closed(pane));
             };
-            if typed_after(pd) {
-                human = true;
-                break Err(SubmitRefusal::typed_over(pane));
-            }
-            let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
-            let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
-            let raw = nix::sys::termios::tcgetattr(master).is_ok_and(|t| {
-                !t.local_flags
-                    .contains(nix::sys::termios::LocalFlags::ICANON)
-            });
-            let Some(slave) = slave.as_ref().filter(|_| same && raw) else {
+            human |= typed_after(pd);
+            let Some(slave) = slave.as_ref().filter(|_| agent_reads(pd, pgid)) else {
+                agent_reading = false;
                 break Err(not_read());
             };
             let now = std::time::Instant::now();
-            if pane_verdict(pd, command, rules, now).state == AgentState::NeedsInput {
-                break Err(SubmitRefusal::blocked(pane));
-            }
+            let blocked = submit_state(pd, command, rules, now) == AgentState::NeedsInput;
             if written && unread_input(slave) == Some(0) {
+                read_all = true;
+                if blocked {
+                    break Err(SubmitRefusal::blocked(pane));
+                }
+                if human {
+                    break Err(SubmitRefusal::typed_over(pane));
+                }
                 pd.send_input(enter);
                 break Ok(());
             }
-        }
+            if blocked && !human {
+                break Err(SubmitRefusal::blocked(pane));
+            }
+            blocked
+        };
         if tokio::time::Instant::now() >= deadline {
-            break Err(not_read());
+            break Err(if blocked {
+                SubmitRefusal::blocked(pane)
+            } else if human {
+                SubmitRefusal::typed_over(pane)
+            } else {
+                not_read()
+            });
         }
         tokio::time::sleep(CONSUME_POLL).await;
     };
-    if verdict.is_err() && !human {
-        typed.cancel.cancel();
-        if !written {
-            let _ = tokio::time::timeout(CANCEL_ACK, &mut typed.written).await;
-        }
-        let human_after = panes.lock().await.get(&pane).is_some_and(typed_after);
-        if let Some(slave) = slave.as_ref().filter(|_| !human_after) {
-            if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH)
-            {
-                log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
-            }
+    if verdict.is_ok() || read_all {
+        return verdict;
+    }
+    typed.cancel.cancel();
+    if !written {
+        let _ = tokio::time::timeout(CANCEL_ACK, &mut typed.written).await;
+    }
+    let human = human || panes.lock().await.get(&pane).is_some_and(typed_after);
+    if human && agent_reading && read_by(pane, pgid, slave.as_ref(), panes, deadline).await {
+        return verdict;
+    }
+    if let Some(slave) = slave.as_ref() {
+        let unread = unread_input(slave).unwrap_or(0);
+        match nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
+            Ok(()) if human => log::info!(
+                "msg: id={id} unread by %{pane} after a person typed; {unread} bytes flushed"
+            ),
+            Ok(()) => {}
+            Err(e) => log::warn!("msg: flushing %{pane}'s unread input failed: {e}"),
         }
     }
     verdict
+}
+
+/// Whether the program sampled as `pgid` is still the one reading `pd`'s
+/// terminal, unbuffered.
+fn agent_reads(pd: &PaneData, pgid: Option<nix::unistd::Pid>) -> bool {
+    let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
+    let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
+    same && nix::sys::termios::tcgetattr(master).is_ok_and(|t| {
+        !t.local_flags
+            .contains(nix::sys::termios::LocalFlags::ICANON)
+    })
+}
+
+/// Wait, until `deadline`, for the agent sampled as `pgid` to read `pane`'s
+/// input queue empty. False as soon as another program is reading it.
+async fn read_by(
+    pane: PaneId,
+    pgid: Option<nix::unistd::Pid>,
+    slave: Option<&std::fs::File>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Some(slave) = slave else {
+        return false;
+    };
+    loop {
+        {
+            let ps = panes.lock().await;
+            if !ps
+                .get(&pane)
+                .is_some_and(|pd| !pd.exited && agent_reads(pd, pgid))
+            {
+                return false;
+            }
+            if unread_input(slave) == Some(0) {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(CONSUME_POLL).await;
+    }
 }
 
 /// Whether `slave` is the pane's own terminal: the path was read at spawn,
@@ -6968,7 +7063,8 @@ fn agent_rules(config: &Config) -> &'static crate::server::agents::AgentRules {
 }
 
 /// The classifier's verdict on `pd` running `command`, as of `now`. The one
-/// place a pane's screen is classified, for the agents list and for submit.
+/// place a pane's screen is classified, for the agents list and, through
+/// [`submit_state`], for submit.
 fn pane_verdict(
     pd: &PaneData,
     command: &str,
@@ -6983,14 +7079,37 @@ fn pane_verdict(
     )
 }
 
+/// The state a submit takes `pd`'s agent to be in: the classifier's, but
+/// `NeedsInput` also when the screen looks like a selector no configured
+/// pattern names ([`crate::server::submit::looks_like_prompt`]).
+fn submit_state(
+    pd: &PaneData,
+    command: &str,
+    rules: &crate::server::agents::AgentRules,
+    now: std::time::Instant,
+) -> AgentState {
+    let bottom = rules.visible_bottom(&pd.screen);
+    if crate::server::submit::looks_like_prompt(&bottom) {
+        return AgentState::NeedsInput;
+    }
+    rules
+        .classify(
+            command,
+            &bottom,
+            now.saturating_duration_since(pd.last_output),
+        )
+        .state
+}
+
 /// One pane, as a submit needs it.
 struct PaneSample {
     /// In the table, not exited, in a tab and not a popup.
     live: bool,
     /// The foreground's configured command, or `None` when it is no agent.
     command: Option<String>,
-    /// The classifier's verdict, when `command` is an agent.
-    verdict: Option<crate::server::agents::Verdict>,
+    /// The agent's state as a submit takes it ([`submit_state`]), when
+    /// `command` is an agent.
+    state: Option<AgentState>,
     /// Whether the program in the pane has bracketed paste on, as of now.
     bracketed_paste: bool,
     /// The terminal's foreground process group, read before `command`, so a
@@ -7013,7 +7132,7 @@ async fn sample_pane(
     let gone = PaneSample {
         live: false,
         command: None,
-        verdict: None,
+        state: None,
         bracketed_paste: false,
         pgid: None,
         last_human_input: None,
@@ -7049,9 +7168,9 @@ async fn sample_pane(
     let now = std::time::Instant::now();
     PaneSample {
         live: true,
-        verdict: command
+        state: command
             .as_deref()
-            .map(|command| pane_verdict(pd, command, rules, now)),
+            .map(|command| submit_state(pd, command, rules, now)),
         command,
         bracketed_paste: pd.screen.bracketed_paste,
         pgid,

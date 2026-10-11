@@ -107,6 +107,17 @@ Task 3, the typing guard, through the queue and the submitter:
     reaches the head of the queue after the server's hold and is answered
     submit_timeout without being typed, and every answer arrives inside the budget
     the CLI waits for.
+3o. Claude Code's file-edit approval dialog on screen, which no configured
+    pattern matches (the panel reads Idle): Submit is agent_blocked, Auto is
+    Mailbox/agent_blocked, nothing is typed. Only the submit's own
+    "looks like a prompt" check can refuse it.
+3p. The same dialog drawn after the text: no Enter.
+3q. The SHIPPED claude patterns, read out of src/config/agents.rs, classify
+    that dialog NeedsInput.
+3r. An agent that reads nothing, a person's Enter after the text, then the
+    agent exits to bash: bash never runs the body, because the unread text
+    is flushed once the read check runs out of time.
+3s. The same without the person's key (the control): bash runs nothing.
 3z. No panic.
 
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
@@ -1179,6 +1190,122 @@ enter_delay_ms = 5000
 finally:
     srv.kill()
 
+
+
+# --- S: prompts no pattern names, and text nobody read --------------------------
+AGENTS_RS = open(f"{SRC}/config/agents.rs").read()
+CLAUDE_PATTERNS = re.findall(r'p\(\s*"(claude-[\w-]+)",\s*"claude",\s*r"([^"]*)",?\s*\)', AGENTS_RS)
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T3)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    A = cli_spawn("SplitRight")
+    time.sleep(0.8)
+    check(focused_pane() == A, f"setup: A is focused, so the agent is unattended (focused {focused_pane()})")
+
+    # 3o
+    tell(F_CTL, F_LOG, "editblock")
+    idle = wait_idle(F)
+    start = len(rx_chunks(F_LOG))
+    r_sub = type_send(A, send(F, "EDIT:sub", "Submit"))
+    r_auto = type_send(A, send(F, "EDIT:auto", "Auto"))
+    states = {m["body"]: m["state"] for m in (read_box(F, all=True) or []) if m["body"].startswith("EDIT:")}
+    check(idle and outcome(r_sub) == ("Error", "agent_blocked") and outcome(r_auto) == ("Mailbox", "agent_blocked")
+          and no_new_chunks(F_LOG, start) and states == {"EDIT:sub": "Queued", "EDIT:auto": "Queued"},
+          f"3o an edit-approval dialog no pattern names (the panel reads Idle: {idle}) is not typed into "
+          f"(submit {r_sub}, auto {r_auto}, states {states})")
+    tell(F_CTL, F_LOG, "clear")
+
+    # 3p
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    tell(F_CTL, F_LOG, "editblock-on-rx")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    start = len(rx_chunks(F_LOG))
+    r = type_send(A, send(F, "EDIT:after", "Submit"))
+    time.sleep(0.5)
+    seq = [c for _, c in rx_chunks(F_LOG)[start:]]
+    check(outcome(r) == ("Error", "agent_blocked") and any(c.startswith(OPEN) for c in seq) and b"\r" not in seq,
+          f"3p an edit-approval dialog drawn after the text gets no Enter (reply {r}, chunks {[c[:12] for c in seq]})")
+    tell(F_CTL, F_LOG, "clear")
+    check("panicked at" not in srv.log(), "3z no panic (prompts)")
+finally:
+    srv.kill()
+
+# 3q: the shipped claude patterns, re-aimed at the fakeagent.
+try:
+    shipped = "".join(f"""
+  [[agents.pattern]]
+  name = "{name}"
+  command = "fakeagent"
+  regex = '{regex}'
+""" for name, regex in CLAUDE_PATTERNS)
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG.split("  [[agents.pattern]]")[0] + shipped)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    tell(F_CTL, F_LOG, "editblock")
+    check(len(CLAUDE_PATTERNS) >= 2 and wait_state(F, "NeedsInput"),
+          f"3q the shipped claude patterns ({[n for n, _ in CLAUDE_PATTERNS]}) read the edit dialog as NeedsInput "
+          f"(state {status_of(F)})")
+finally:
+    srv.kill()
+
+# 3r / 3s: bash runs the agent; the agent reads nothing, then exits.
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T3)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    A = cli_spawn("SplitRight")
+    for case, human in (("3r", True), ("3s", False)):
+        marker = f"{RUNDIR}/ran-{case}"
+        log, ctl = f"{RUNDIR}/bash-agent-{case}.log", f"{RUNDIR}/bash-agent-{case}.ctl"
+        B = cli_spawn("SplitBelow", argv=["bash", "--norc", "--noprofile", "-i"])
+        time.sleep(1.0)
+        cli.send({"InputToPane": {"pane_id": B, "data": list(f"{FAKEAGENT} {log} {ctl}\r".encode())}})
+        end = time.time() + 8
+        while time.time() < end and not os.path.exists(log):
+            time.sleep(0.05)
+        tell(ctl, log, "paste-on")
+        check(wait_idle(B) and focused_pane() == B,
+              f"setup {case}: bash runs the agent in %{B}, which is focused (focused {focused_pane()})")
+        # Out of the typing guard's attended window, which the typed command armed.
+        time.sleep(3.5)
+        tell(ctl, log, "deaf")
+        out = type_start(A, send(B, f"touch {marker}", "Submit"))
+        if human:
+            end = time.time() + 15
+            while time.time() < end and "to=%%%d bytes" % B not in srv.log():
+                time.sleep(0.05)
+            time.sleep(1.2)
+            cli.send({"Input": {"data": list(b"\r")}})
+        r = wait_file(out, timeout=15)
+        tell(ctl, log, "quit")
+        time.sleep(2.0)
+        want = ("Error", "human_typing") if human else ("Error", "agent_did_not_read")
+        check(outcome(r) == want and not os.path.exists(marker),
+              f"{case} {'a person pressed Enter after the text, then ' if human else ''}the agent that read "
+              f"nothing exits: bash does not run the body (reply {r}, ran {os.path.exists(marker)})")
+        if human:
+            check("after a person typed; " in srv.log() and "bytes flushed" in srv.log(), f"{case} ...and the flush is logged")
+    check("panicked at" not in srv.log(), "3z no panic (bash)")
+finally:
+    srv.kill()
 
 
 print()

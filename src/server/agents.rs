@@ -737,15 +737,48 @@ mod tests {
         AgentRules::from_config(&AgentsConfig::default())
     }
 
-    /// The approval questions present in the installed Claude Code 2.1.251
+    /// The approval questions present in the installed Claude Code 2.1.296
     /// binary, read with `strings`. The shipped patterns exist to match these.
-    const CLAUDE_QUESTIONS: [&str; 5] = [
+    /// The file dialogs' questions are rendered from the bare "Do you want to "
+    /// prefix, a verb phrase and the file name; each verb phrase is in the
+    /// binary, and the file names are examples.
+    const CLAUDE_QUESTIONS: [&str; 11] = [
         "Do you want to proceed?",
         "Do you want to continue?",
         "Do you want to allow this connection?",
         "Do you want to allow Claude to fetch this content?",
         "Do you want to use this API key?",
+        "Do you want to make this edit to x.rs?",
+        "Do you want to create notes.md?",
+        "Do you want to overwrite notes.md?",
+        "Do you want to write to notes.md?",
+        "Do you want to insert this cell into a.ipynb?",
+        "Do you want to delete this cell from a.ipynb?",
     ];
+
+    /// Claude Code's dialog for an Edit tool call, as it draws it. Its default
+    /// is "Yes", so an Enter typed into it approves the edit.
+    const CLAUDE_EDIT_DIALOG: [&str; 6] = [
+        "Edit file",
+        " src/x.rs",
+        "Do you want to make this edit to x.rs?",
+        "\u{276f} 1. Yes",
+        "  2. Yes, allow all edits during this session (shift+tab)",
+        "  3. No, and tell Claude what to do differently (esc)",
+    ];
+
+    #[test]
+    fn the_shipped_patterns_recognise_claudes_file_edit_dialog() {
+        let r = shipped();
+        let screen: Vec<String> = CLAUDE_EDIT_DIALOG.iter().map(|s| s.to_string()).collect();
+        let v = r.classify("claude", &screen, Duration::from_secs(30));
+        assert_eq!(v.state, AgentState::NeedsInput, "{v:?}");
+        // Its refusing option alone, as when the question has scrolled out of
+        // the window.
+        let options = screen[3..].to_vec();
+        let v = r.classify("claude", &options, Duration::from_secs(30));
+        assert_eq!(v.reason, Reason::Pattern("claude-decline".to_string()));
+    }
 
     #[test]
     fn only_configured_commands_are_agents() {
@@ -1240,7 +1273,7 @@ mod tests {
     }
 
     /// The shipped patterns against the prompt wordings actually present in the
-    /// installed Claude Code binary (2.1.251, read with `strings`).
+    /// installed Claude Code binary (2.1.296, read with `strings`).
     #[test]
     fn the_shipped_patterns_recognise_claudes_real_permission_prompts() {
         let r = shipped();
