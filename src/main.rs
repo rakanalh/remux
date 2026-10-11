@@ -5029,7 +5029,7 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
-                            InputAction::TabPickerConfirm { ref conn, tab_id } => {
+                            InputAction::TabPickerConfirm { ref conn, tab_id, .. } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;

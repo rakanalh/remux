@@ -59,9 +59,14 @@ def picker(t):
     x1 = rows[top].rindex("╮")
     out = []
     y = top + 1
-    while y < len(rows) and rows[y][x0] == "│":
+    while y < len(rows) and rows[y][x0] in "│├":
         line = t.screen.buffer[y]
-        out.append((rows[y][x0 + 1:x1].strip(), line[x0 + 2].bg != line[x0].bg))
+        text = rows[y][x0 + 1:x1].strip()
+        if text.startswith("─"):
+            # A session header is a rule with the name in it, and never selected.
+            out.append(("HEADER:" + text.strip("─ "), False))
+        else:
+            out.append((text, line[x0 + 2].bg != line[x0].bg))
         y += 1
     return out
 
@@ -129,8 +134,8 @@ def main():
             t.dump("picker")
         texts = [text for text, _ in rows or []]
         check(rows is not None, "the picker opens")
-        check(texts == ["+ new tab", "2: Tab 2", "3: Tab 3"],
-              f"`+ new tab` then the other tabs, and not Tab 1 ({texts})")
+        check(texts == ["HEADER:main", "+ new tab", "2: Tab 2", "3: Tab 3"],
+              f"main's header, `+ new tab`, then the other tabs, and not Tab 1 ({texts})")
         check(selected(rows) == "2: Tab 2",
               f"the highlight starts on the first other tab ({selected(rows)})")
 
@@ -164,7 +169,7 @@ def main():
         print("[6] k + Enter on `+ new tab` breaks the pane out")
         rows = open_picker(t)
         texts = [text for text, _ in rows or []]
-        check(texts == ["+ new tab", "1: Tab 2"], f"listing from Tab 3 ({texts})")
+        check(texts == ["HEADER:main", "+ new tab", "1: Tab 2"], f"listing from Tab 3 ({texts})")
         t.send(b"k", 0.4)
         check(selected(picker(t)) == "+ new tab", f"k highlights `+ new tab` ({selected(picker(t))})")
         t.send(b"\r", 1.2)
