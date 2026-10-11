@@ -883,6 +883,28 @@ fn record_switch(
     *current = Some(new_attached);
 }
 
+/// The switch a pane move to another session made, once the server shows it.
+///
+/// The requester follows its pane into the target session, but only if the
+/// server accepts the move, and the picker cannot know that when it sends. So
+/// the switch is recorded when a tree from the move's connection names the
+/// target as the current session. A tree that names any other session settles
+/// nothing: the move may have been refused, or the tree may have been pushed
+/// before the move was handled. A move that was refused is therefore never
+/// recorded, and a follow that waits is harmless, since it can only ever
+/// record the session the client is really attached to.
+fn settle_move_follow(
+    pending: &mut Option<(ConnId, String)>,
+    src: &ConnId,
+    current: Option<&str>,
+) -> Option<(ConnId, String)> {
+    let (conn, target) = pending.as_ref()?;
+    if conn != src || current != Some(target.as_str()) {
+        return None;
+    }
+    pending.take()
+}
+
 /// The rect the server composites into: the terminal minus the visible
 /// sidebars.
 ///
@@ -2872,6 +2894,10 @@ async fn run_client_loop(
         .as_ref()
         .map(|name| (ConnId::Local, name.clone()));
     let mut previous_attached: Option<(ConnId, String)> = None;
+    // A tab-picker move into another session, waiting for the server to show
+    // the requester in the target before it counts as a switch. See
+    // `settle_move_follow`.
+    let mut pending_move_follow: Option<(ConnId, String)> = None;
 
     // Views: virtual tabs whose cells alias real panes and are composited from
     // streamed `PaneContent` snapshots. Phase 2: the shared-view registry is
@@ -5029,16 +5055,26 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
-                            InputAction::TabPickerConfirm { ref conn, tab_id, .. } => {
+                            InputAction::TabPickerConfirm { ref conn, ref session, tab_id } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
                                 let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget {
                                     tab_id,
-                                    session: None,
+                                    session: Some(session.clone()),
                                 });
-                                if let Err(e) = mgr.send(conn, cmd).await {
-                                    log::info!("tab picker: move not sent to {conn:?}: {e}");
+                                match mgr.send(conn, cmd).await {
+                                    Err(e) => log::info!("tab picker: move not sent to {conn:?}: {e}"),
+                                    Ok(()) if current_attached.as_ref() != Some(&(conn.clone(), session.clone())) => {
+                                        // The server answers on this connection
+                                        // in order, so the tree asked for here
+                                        // shows whether the move was accepted.
+                                        pending_move_follow = Some((conn.clone(), session.clone()));
+                                        if let Err(e) = mgr.send(conn, ClientMessage::ListSessionTree).await {
+                                            log::info!("tab picker: tree not requested from {conn:?}: {e}");
+                                        }
+                                    }
+                                    Ok(()) => {}
                                 }
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
@@ -6792,6 +6828,21 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
+                        let current = folders
+                            .iter()
+                            .flat_map(|f| f.sessions.iter())
+                            .chain(unfiled.iter())
+                            .find(|s| s.is_current)
+                            .map(|s| s.name.as_str());
+                        if let Some((conn, session)) =
+                            settle_move_follow(&mut pending_move_follow, &src, current)
+                        {
+                            log::debug!("tab picker: followed the pane into session={session:?} on {conn:?}");
+                            if conn == ConnId::Local {
+                                last_local_session = Some(session.clone());
+                            }
+                            record_switch(&mut current_attached, &mut previous_attached, conn, session);
+                        }
                         // Hand every panel the tree BEFORE the overlay branches
                         // below move it. Unconditional: a tree arrives whether
                         // it was asked for (`ListSessionTree`) or pushed
@@ -6922,7 +6973,7 @@ async fn run_client_loop(
                                     renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
                                 }
                                 TabPickerTree::Nothing => {
-                                    log::debug!("tab picker: closed, no other tab and no pane to break out");
+                                    log::debug!("tab picker: closed, no other tab, no other session, and no pane to break out");
                                     input.tab_picker = None;
                                     input.mode = Mode::Normal;
                                     mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
@@ -8022,6 +8073,39 @@ mod tests {
         record_switch(&mut current, &mut previous, ConnId::Local, "b".to_string());
         assert_eq!(current, Some(local("b")));
         assert_eq!(previous, Some(local("a")));
+    }
+
+    #[test]
+    fn a_move_follow_is_recorded_when_the_tree_shows_the_target() {
+        let mut pending = Some(local("other"));
+        assert_eq!(
+            settle_move_follow(&mut pending, &ConnId::Local, Some("other")),
+            Some(local("other"))
+        );
+        assert_eq!(pending, None, "settled once");
+        assert_eq!(
+            settle_move_follow(&mut pending, &ConnId::Local, Some("other")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tree_still_on_the_source_records_nothing_and_keeps_waiting() {
+        // A refused move, or a tree pushed before the move was handled.
+        let mut pending = Some(local("other"));
+        assert_eq!(
+            settle_move_follow(&mut pending, &ConnId::Local, Some("main")),
+            None
+        );
+        assert_eq!(pending, Some(local("other")));
+    }
+
+    #[test]
+    fn a_tree_from_another_connection_does_not_settle_a_move_follow() {
+        let mut pending = Some(local("other"));
+        let mini = ConnId::Remote("mini".to_string());
+        assert_eq!(settle_move_follow(&mut pending, &mini, Some("other")), None);
+        assert_eq!(pending, Some(local("other")));
     }
 
     #[test]

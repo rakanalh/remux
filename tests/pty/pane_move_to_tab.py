@@ -115,7 +115,8 @@ def main():
         print("[2] one tab holding one pane: nothing to offer")
         rows = open_picker(t)
         check(rows is None, f"the picker is not on screen ({rows})")
-        check("tab picker: closed, no other tab" in t.log("client"),
+        check("tab picker: closed, no other tab, no other session, and no pane to break out"
+              in t.log("client"),
               "the client read the tree and found nothing to offer")
         t.send(b"printf 'N:%s\\n' ok\r", 0.8)
         check(bool(spans(t, "N:ok")), "the next keystroke reaches the shell")
@@ -199,9 +200,9 @@ def main():
         t.kill()
 
     server = t.log("server")
-    check(re.search(r"PaneMoveToTabTarget \{ tab_id: Some\(\d+\)(, session: None)? \}", server)
-          and re.search(r"PaneMoveToTabTarget \{ tab_id: None(, session: None)? \}", server),
-          "the server received both moves")
+    check(re.search(r'PaneMoveToTabTarget \{ tab_id: Some\(\d+\), session: Some\("main"\) \}', server)
+          and re.search(r'PaneMoveToTabTarget \{ tab_id: None, session: Some\("main"\) \}', server),
+          "the server received both moves, each naming its session")
     for which in ("client", "server"):
         check("panicked at" not in t.log(which), f"no panic in {which}.log")
 
