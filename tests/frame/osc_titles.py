@@ -66,6 +66,7 @@ class View:
         self.g = [[" "] * COLS for _ in range(ROWS)]
         self.tree = None
         self.content = None
+        self.labels = []
 
     def feed(self, msgs):
         for m in msgs:
@@ -84,9 +85,23 @@ class View:
                 self.tree = body
             elif n == "PaneContent":
                 self.content = body
+            if n in ("FullRender", "RenderDiff"):
+                self.note_label()
 
     def rows(self):
         return ["".join(r) for r in self.g]
+
+    def label(self):
+        """The name on the first pane's top border."""
+        m = re.match(r"╭ (.*?) ─", self.rows()[0])
+        return m.group(1) if m else None
+
+    def note_label(self):
+        """Append the border's name to `labels` when a render changed it, so a
+        name shown for one frame is kept however briefly it was drawn."""
+        lbl = self.label()
+        if lbl is not None and (not self.labels or self.labels[-1] != lbl):
+            self.labels.append(lbl)
 
     def has(self, text):
         return any(text in r for r in self.rows())
@@ -288,10 +303,15 @@ def run_default(c, v):
     typed(c, "sleep 0.3\r")
     seen = watch(c, v, 1.2)
     check(seen == ["Home"], f"8 a short job never displaces the shell title ({seen})")
+    fresh_frame(c, v)
+    v.labels = []
+    v.note_label()
     typed(c, "sleep 2\r")
     seen = watch(c, v, 3.5, step=0.01)
     check(seen == ["Home", "sleep", "Home"],
           f"8 `sleep 2` reads exactly [Home, sleep, Home] ({seen})")
+    check(v.labels == ["Home", "sleep", "Home"],
+          f"8 and so does every frame of the border ({v.labels})")
 
     # 11. a job's own title does not cost the shell its title.
     typed(c, "sh -c 'printf \"\\033]2;%s%s\\007\" Job T; sleep 2.5'\r")
