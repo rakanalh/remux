@@ -105,11 +105,11 @@ Task 3, the typing guard, through the queue and the submitter:
     submit.
 3n. A send refused before its text is written does not wedge the pane: the
     next send to it is answered.
-3i. The submit budget: six sends to an agent that reads nothing, with the
-    Enter delay at its 5 s cap, are typed one after another; the sixth
-    reaches the head of the queue after the server's hold and is answered
-    submit_timeout without being typed, and every answer arrives inside the budget
-    the CLI waits for.
+3i. The submit budget: six sends to an agent that reads one byte a second,
+    so that the first runs to the body cap and is agent_too_slow; the five
+    behind it reach the server's hold first and are submit_timeout without
+    being typed, and every answer arrives inside the budget the CLI waits
+    for.
 3o. Claude Code's file-edit approval dialog on screen, which no configured
     pattern matches (the panel reads Idle): Submit is agent_blocked, Auto is
     Mailbox/agent_blocked, nothing is typed. Only the submit's own
@@ -145,7 +145,25 @@ Task 3, the typing guard, through the queue and the submitter:
 3ac. A person's key right after the agent read the probe, before the body:
     the key is never inside an open paste.
 3ad. An agent that reads the whole body and exits before its Enter, with
-    nothing left to flush: read_by_another_program, and a WARN.
+    nothing left to flush: read_by_another_program under both modes, and a
+    WARN.
+3ae. An agent that pauses 300 ms after the probe, then reads: Submitted.
+3af. An agent that takes the probe and reads nothing more: agent_did_not_read
+    at the read check's deadline, and its paste is closed after the flush.
+3ag. A 60 KB body of 600 lines, read steadily but slowly: Submitted, every
+    byte read before the Enter.
+3ah. sec-a's BIG matrix: a body of 60 padding lines with a marker line past
+    6 KB, to an agent that takes the probe and exits 0.3 s or 1.5 s later:
+    read_by_another_program, and bash runs nothing, then or on the next
+    Enter.
+3ai. sec-a's SLOWFIRST: the first lines are a command and a sleep: the same.
+3aj. An agent that reads part of a padded body and exits: the line bash is
+    left holding is the one being read, and it does not run until Enter.
+3ak. A 1,400-line body to an agent that reads at once is Submitted, well
+    inside the body cap; a 1,600-line one is too_many_lines, untyped.
+3al. An agent that forks on reading the probe and exits, leaving the child
+    reading in its process group: the child is not the agent, and gets none
+    of the message.
 3z. No panic.
 
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
@@ -337,16 +355,20 @@ PROBES = (OPEN, b"\x1b[I" + OPEN)
 
 
 def rx_chunks(log):
-    """The reads, with the server's probe (a paste opener, written and read
-    on its own before the rest of a message) joined to the read after it,
-    timed by that later read. A probe with nothing after it yet is left out,
-    so a wait for a message's text is not satisfied by its probe alone."""
+    """The reads, with each wrapped message joined into one: the server's
+    probe (a paste opener, written and read on its own), then the body in as
+    many reads as its chunks took, up to and including the read that carries
+    the paste's close, timed by that last read. A message not yet closed is
+    left out, so a wait for a message's text is not satisfied by a part of
+    it."""
     out = []
     pending = None
     for ns, data in raw_chunks(log):
         if pending is not None:
-            out.append((ns, pending + data))
-            pending = None
+            pending += data
+            if CLOSE in data:
+                out.append((ns, pending))
+                pending = None
         elif data in PROBES:
             pending = data
         else:
@@ -651,11 +673,12 @@ try:
     r = type_send(A, send(S2, slow_body, "Submit"))
     time.sleep(0.5)
     chunks = [c for _, c in rx_chunks(S_LOG)]
+    reads = len(raw_chunks(S_LOG))
     whole = OPEN + envelope(sent_id(r), A) + b"\n" + slow_body.encode() + CLOSE
     check(submitted(r) and chunks and chunks[-1] == b"\r" and b"".join(chunks[:-1]) == whole
-          and len(chunks) > 10,
+          and reads > 10,
           f"1r a slow reader: every byte read before the Enter, then Submitted "
-          f"(reply {r}, {len(chunks)} reads, last {chunks[-1:] if chunks else None}, "
+          f"(reply {r}, {reads} reads, last {chunks[-1:] if chunks else None}, "
           f"text read {len(b''.join(chunks[:-1]))} of {len(whole)} bytes)")
 
     # --- 1j -----------------------------------------------------------------
@@ -1082,7 +1105,7 @@ try:
     seq = [c for _, c in rx_chunks(F_LOG)[start:]]
     states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == "HUMAN:between"]
     check(outcome(r) == ("Mailbox", "typed_over_read") and not any(b"\r" in c for c in seq)
-          and any(c.endswith(b"k") for c in seq) and states == ["Submitted"],
+          and b"k" in seq and states == ["Submitted"],
           f"3k a key after the agent read the text stops the Enter; the key stays, and the message is the "
           f"agent's: Mailbox/typed_over_read, Submitted "
           f"(reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
@@ -1169,8 +1192,8 @@ try:
     check(submitted(r) and took < 1.5 and held,
           f"3m a submit to %{F} is answered in {took:.2f}s while %{D}'s Enter still waits "
           f"(reply {r}, %{D} still unanswered {held})")
-    check(outcome(wait_file(slow, timeout=10)) == ("Error", "agent_did_not_read"),
-          f"3m ...and %{D}'s own send ends agent_did_not_read")
+    check(submitted(wait_file(slow, timeout=30)),
+          f"3m ...and %{D}'s own send, read slowly, is Submitted in the end")
 
     # 3n: a refusal before the text is written ends the pane's typing, so the
     # next send to it is looked at at all.
@@ -1200,6 +1223,7 @@ def rs_ms(src, pattern, scale=1):
 BUDGET_S = (rs_ms(CFG_RS, r"MAX_TYPING_GUARD_MS: u64 = ([\d_]+);")
             + rs_ms(DAEMON, r"SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")
             + rs_ms(DAEMON, r"PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")
+            + rs_ms(DAEMON, r"BODY_CAP: std::time::Duration = std::time::Duration::from_secs\(([\d_]+)\)", 1000)
             + rs_ms(CFG_RS, r"MAX_ENTER_DELAY_MS: u64 = ([\d_]+);")
             + rs_ms(DAEMON, r"CONSUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs\(([\d_]+)\)", 1000)
             + rs_ms(DAEMON, r"CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")) / 1000
@@ -1219,10 +1243,10 @@ enter_delay_ms = 5000
     A = cli_spawn("SplitRight")
     A2 = cli_spawn("SplitRight")
     F, F_LOG, F_CTL = spawn_agent(paste=True)
-    # Reads each message's probe whole and its text a byte at a time, slower
-    # than the Enter delay and the read check, so every send runs the whole
-    # read check out without ever stalling.
-    tell(F_CTL, F_LOG, "trickle")
+    # Reads each message's probe whole and its text a byte a second: steadily
+    # enough that the read check never gives up on it, and far too slowly for
+    # a body to finish inside the body cap.
+    tell(F_CTL, F_LOG, "trickle:1000")
     check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
 
     # 3i: six connections at once, each its own wire_send in the background,
@@ -1249,8 +1273,18 @@ enter_delay_ms = 5000
     outcomes = sorted(outcome(r) for _, r in arrived.values())
     latest = max((t for t, _ in arrived.values()), default=None)
     states = [m["state"] for m in (read_box(F) or []) if m["body"].startswith("SLOW:")]
-    check(outcomes == sorted([("Error", "agent_did_not_read")] * 5 + [("Error", "submit_timeout")]),
-          f"3i the sixth send reaches the head past the hold and is answered submit_timeout (got {outcomes})")
+    # Six pythons start over a second or so, so a send that reached the queue
+    # late can be claimed after the first is answered and before its own
+    # hold: its probe then waits behind the first one's paste close, which
+    # the slow agent reads a byte a second, and it is agent_did_not_read.
+    behind = sorted(outcomes)
+    if ("Error", "agent_too_slow") in behind:
+        behind.remove(("Error", "agent_too_slow"))
+    check(outcomes.count(("Error", "agent_too_slow")) == 1 and len(outcomes) == 6
+          and all(o in (("Error", "submit_timeout"), ("Error", "agent_did_not_read")) for o in behind)
+          and behind.count(("Error", "submit_timeout")) >= 4,
+          f"3i the first send runs to the body cap, and those behind it end at the hold, none typed "
+          f"(got {outcomes})")
     # Two seconds of slack for six pythons starting in the pane's shell. With
     # the hold off, the sixth is answered about 3.4 s past the budget.
     check(latest is not None and latest <= BUDGET_S + 2.0,
@@ -1310,7 +1344,8 @@ try:
     start = len(raw_chunks(F_LOG))
     r = type_send(A, send(F, "PROBE:alone", "Submit"))
     raw = [c for _, c in raw_chunks(F_LOG)[start:]]
-    check(submitted(r) and len(raw) >= 3 and raw[0] == OPEN and b"PROBE:alone" in raw[1] and raw[2] == b"\r",
+    check(submitted(r) and len(raw) >= 3 and raw[0] == OPEN and b"PROBE:alone" not in raw[0]
+          and any(b"PROBE:alone" in c for c in raw[1:-1]) and raw[-1] == b"\r",
           f"3x the probe is read alone, then the text, then the Enter (reply {r}, chunks {[c[:12] for c in raw]})")
 
     # 3v: a person's Enter after the agent read the text, inside the delay.
@@ -1327,7 +1362,7 @@ try:
         time.sleep(0.5)
         seq = [c for _, c in rx_chunks(F_LOG)[start:]]
         states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == body]
-        check(outcome(r) == want and sum(c.count(b"\r") for c in seq) == 1 and states == ["Submitted"],
+        check(outcome(r) == want and seq.count(b"\r") == 1 and states == ["Submitted"],
               f"3v {mode}: a person's Enter after the agent read the text: {want}, one Enter (theirs), "
               f"Submitted (reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
 
@@ -1369,9 +1404,67 @@ try:
     time.sleep(0.5)
     stream = b"".join(c for _, c in raw_chunks(W9_LOG))
     k = stream.find(b"k")
-    check(k > 0 and stream[:k].count(OPEN) == stream[:k].count(CLOSE),
-          f"3ac a key right after the probe was read is not inside an open paste "
-          f"(reply {r}, stream {stream[:k + 1]!r})")
+    check(k > 0 and stream[:k].count(OPEN) == stream[:k].count(CLOSE) and b"NINE" not in stream[:k]
+          and b"remux message" not in stream[:k] and submitted(r) and b"NINE" in stream[k:],
+          f"3ac a key right after the probe was read is not inside an open paste, and the message, put "
+          f"back with none of it typed, is typed after (reply {r}, stream {stream[:k + 1]!r})")
+
+
+    # 3ae: rv-a's false stall. An agent that pauses 300 ms, then reads.
+    P, P_LOG, P_CTL = spawn_agent(paste=True)
+    tell(P_CTL, P_LOG, "slow:4096:300")
+    check(wait_idle(P), f"...the agent in %{P} settled Idle before the next send")
+    r = type_send(A, send(P, "PAUSE:then-read", "Submit"))
+    check(submitted(r) and chunk_at(P_LOG, "PAUSE:then-read") is not None,
+          f"3ae an agent that pauses 300 ms after the probe, then reads, is Submitted (reply {r})")
+
+    # 3af: rv R2. The agent takes the probe and reads nothing more; after the
+    # flush its paste is closed, so it is not left inside it.
+    W, W_LOG, W_CTL = spawn_agent(paste=True)
+    tell(W_CTL, W_LOG, "probe-only")
+    check(wait_idle(W), f"...the agent in %{W} settled Idle before the next send")
+    start = len(raw_chunks(W_LOG))
+    r = type_send(A, send(W, "CLOSE:after", "Submit"))
+    time.sleep(1.0)
+    raw = [c for _, c in raw_chunks(W_LOG)[start:]]
+    check(outcome(r) == ("Error", "agent_did_not_read") and raw == [OPEN, CLOSE],
+          f"3af an agent that took the probe and read nothing more: agent_did_not_read, and the paste it "
+          f"is inside is closed (reply {r}, reads {raw})")
+
+    # 3ag: a body near the size limit, read steadily but slowly.
+    L, L_LOG, L_CTL = spawn_agent(paste=True)
+    tell(L_CTL, L_LOG, "slow:256:10")
+    check(wait_idle(L), f"...the agent in %{L} settled Idle before the next send")
+    big_body = "\n".join(f"line{n:04d} " + "c" * 90 for n in range(600))
+    t0 = time.time()
+    out = type_start(A, send(L, big_body, "Submit"))
+    r = wait_file(out, timeout=60)
+    took = time.time() - t0
+    time.sleep(0.5)
+    joined = [c for _, c in rx_chunks(L_LOG)]
+    check(submitted(r) and any(c.endswith(b"line0599 " + b"c" * 90 + CLOSE) for c in joined)
+          and joined[-1] == b"\r",
+          f"3ag a 60 KB body read steadily but slowly is Submitted after {took:.1f}s (reply {r})")
+
+    # 3ak: many lines, each its own chunk.
+    M, M_LOG, M_CTL = spawn_agent(paste=True)
+    lines = "\n".join(f"l{n:04d}" for n in range(1400))
+    t0 = time.time()
+    out = type_start(A, send(M, lines, "Submit"))
+    r = wait_file(out, timeout=60)
+    took = time.time() - t0
+    stream = b"".join(c for _, c in raw_chunks(M_LOG))
+    check(submitted(r) and took < 15.0 and stream.count(b"\nl") == 1400 and b"\nl1399" + CLOSE in stream,
+          f"3ak a 1,400-line body is Submitted in {took:.1f}s, every line of it read first "
+          f"({stream.count(b'\nl')} of 1400 lines; reply {r})")
+    start = len(raw_chunks(M_LOG))
+    too_many = "\n".join(f"l{n:04d}" for n in range(1600))
+    r_sub = type_send(A, send(M, too_many, "Submit"))
+    r_auto = type_send(A, send(M, too_many, "Auto"))
+    time.sleep(0.5)
+    check(outcome(r_sub) == ("Error", "too_many_lines") and outcome(r_auto) == ("Mailbox", "too_many_lines")
+          and len(raw_chunks(M_LOG)) == start,
+          f"3ak ...a 1,600-line body is too_many_lines, nothing typed (submit {r_sub}, auto {r_auto})")
 
     check("panicked at" not in srv.log(), "3z no panic (prompts)")
 finally:
@@ -1529,19 +1622,71 @@ try:
     before = ran(marker, "3aa")
     cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
     time.sleep(1.5)
-    check(name_of(r) == "Error" and not before and not ran(marker, "3aa"),
+    check(outcome(r) == ("Error", "read_by_another_program") and not before and not ran(marker, "3aa"),
           f"3aa an agent that takes the probe, hangs and exits: no line of a multi-line body runs in bash, "
           f"then or on the next Enter (reply {r}, ran {before}, ran after Enter {ran(marker, '3aa')})")
 
     # 3ad: the agent reads the whole body and exits before its Enter. Nothing
     # is left to flush, and nothing can tell its read from the shell's.
-    marker = f"{RUNDIR}/ran-3ad"
-    B, log, ctl = bash_agent("3ad", "exit-after-body")
-    r = type_send(A, send(B, f"printf 'RAN:%s' 3ad > {marker}", "Auto"))
-    check(outcome(r) == ("Mailbox", "read_by_another_program")
-          and "nothing was left to flush: another program may have read it" in srv.log(),
-          f"3ad an agent that read the body and exited before its Enter: Mailbox/read_by_another_program, "
-          f"and a WARN (reply {r})")
+    for mode, want in (("Auto", ("Mailbox", "read_by_another_program")),
+                       ("Submit", ("Error", "read_by_another_program"))):
+        marker = f"{RUNDIR}/ran-3ad-{mode}"
+        B, log, ctl = bash_agent(f"3ad-{mode}", "exit-after-body")
+        warns = srv.log().count("nothing was left to flush: another program may have read it")
+        r = type_send(A, send(B, f"printf 'RAN:%s' 3ad > {marker}", mode))
+        check(outcome(r) == want
+              and srv.log().count("nothing was left to flush: another program may have read it") > warns,
+              f"3ad {mode}: an agent that read the body and exited before its Enter: {want}, and a WARN "
+              f"(reply {r})")
+
+    def p6(case, mode, body, quit_after, want=("Error", "read_by_another_program")):
+        """sec-a's P6 shape: bash runs the agent; `quit_after` seconds after
+        the agent read the probe, it exits; bash must run no line of `body`,
+        then or on the next Enter."""
+        marker = f"{RUNDIR}/ran-{case}"
+        B, log, ctl = bash_agent(case, mode)
+        out = type_start(A, send(B, body.replace("MARKER", marker), "Submit"))
+        end = time.time() + 10
+        while time.time() < end and not raw_chunks(log):
+            time.sleep(0.005)
+        time.sleep(quit_after)
+        tell(ctl, log, "quit", timeout=2.0)
+        r = wait_file(out, timeout=30)
+        time.sleep(1.5)
+        before = ran(marker, case)
+        cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
+        time.sleep(1.5)
+        check(outcome(r) == want and not before and not ran(marker, case),
+              f"{case} the agent exits {quit_after}s after the probe: {want}, and bash runs nothing, then or "
+              f"on the next Enter (reply {r}, ran {before}, ran after Enter {ran(marker, case)})")
+
+    pad = (": " + "p" * 98 + "\n") * 60
+    for t in (0.3, 1.5):
+        p6(f"3ah-{t}", "deaf-on-rx", pad + "printf 'RAN:%s' 3ah-" + str(t) + " > MARKER\nnext line", t)
+    p6("3ai", "deaf-on-rx", "printf 'RAN:%s' 3ai > MARKER\nsleep 2\n" + pad + "end", 0.3)
+    # A trickling agent quits part-way into the padding; the marker line is
+    # the last, never reached.
+    p6("3aj", "trickle:20", (": " + "q" * 28 + "\n") * 10 + "printf 'RAN:%s' 3aj > MARKER", 1.5)
+    # 3al: bash runs `fakeagent | cat`, so the job keeps the terminal while
+    # cat runs; the agent forks and exits on reading the probe, and its
+    # child reads on in the job's group.
+    log, ctl = f"{RUNDIR}/bash-agent-3al.log", f"{RUNDIR}/bash-agent-3al.ctl"
+    B = cli_spawn("SplitBelow", argv=["bash", "--norc", "--noprofile", "-i"])
+    time.sleep(1.0)
+    cli.send({"InputToPane": {"pane_id": B, "data": list(f"{FAKEAGENT} {log} {ctl} | cat\r".encode())}})
+    end = time.time() + 8
+    while time.time() < end and not os.path.exists(log):
+        time.sleep(0.05)
+    tell(ctl, log, "paste-on")
+    check(wait_idle(B), f"setup 3al: bash runs the agent in a pipeline in %{B}")
+    time.sleep(3.5)
+    tell(ctl, log, "fork-on-rx")
+    r = type_send(A, send(B, "FORKED:child", "Submit"))
+    time.sleep(1.0)
+    got = [c for _, c in raw_chunks(log)]
+    check(name_of(r) == "Error" and not any(b"FORKED:child" in c for c in got),
+          f"3al an agent whose child reads on in its job after it exits gets none of the message "
+          f"(reply {r}, reads {[c[:12] for c in got]})")
     check("panicked at" not in srv.log(), "3z no panic (bash)")
 finally:
     srv.kill()

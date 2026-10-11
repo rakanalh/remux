@@ -40,11 +40,13 @@ impl From<Vec<u8>> for WriteJob {
 }
 
 /// Stops a [`WriteJob`]'s remaining bytes. The writer checks it before each
-/// write and while it waits for room in the queue.
+/// write and while it waits for room in the queue, and marks it written once
+/// the last byte of a job carrying it is.
 #[derive(Debug, Default)]
 pub struct WriteCancel {
     flag: AtomicBool,
     wake: Notify,
+    written: AtomicBool,
 }
 
 impl WriteCancel {
@@ -56,6 +58,19 @@ impl WriteCancel {
 
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Whether the last job handed over with this was written whole. Read
+    /// together with an empty input queue, it says the program read all of
+    /// it, where an empty queue alone could mean the job is still waiting in
+    /// the writer.
+    pub fn is_written(&self) -> bool {
+        self.written.load(Ordering::SeqCst)
+    }
+
+    /// A new job carrying this is about to go to the writer.
+    pub fn pending(&self) {
+        self.written.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1085,6 +1100,11 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
                         break;
                     }
                     Err(_would_block) => continue,
+                }
+            }
+            if offset == buf.len() {
+                if let Some(cancel) = &cancel {
+                    cancel.written.store(true, Ordering::SeqCst);
                 }
             }
             if let Some(done) = done {

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -1083,7 +1083,7 @@ async fn step_submit(
             return answer_untyped(entry, answer, None, store).await;
         }
     };
-    let pgid = sample.pgid;
+    let (pgid, agent) = (sample.pgid, sample.agent);
     let panes = Arc::clone(panes);
     let rules = agent_rules(config);
     tokio::spawn(async move {
@@ -1092,6 +1092,7 @@ async fn step_submit(
         let outcome = deliver_text(
             pane,
             pgid,
+            agent,
             &command,
             rules,
             &enter,
@@ -1382,7 +1383,8 @@ async fn type_text(
 ) -> Result<(bool, usize, Vec<u8>, TypedText), TextRefusal> {
     use crate::config::messaging::Bracketed;
     use crate::server::submit::{
-        encode, multi_line_refusal, newlines_safe, on_working, split_probe, Framing, SubmitRefusal,
+        encode, multi_line_refusal, newlines_safe, on_working, split_chunks, split_probe, Framing,
+        SubmitRefusal, PASTE_CLOSE,
     };
     use nix::sys::termios::{tcgetattr, LocalFlags};
     let refuse = |refusal| Err(TextRefusal::Refuse(refusal));
@@ -1455,13 +1457,22 @@ async fn type_text(
     );
     let bytes = text.len();
     let (probe, body) = split_probe(text, framing, rule.focus_in);
+    let bracketed = framing == Framing::Bracketed;
+    let tail = if bracketed { PASTE_CLOSE } else { &[] };
+    let content = body.strip_suffix(tail).unwrap_or(&body);
+    let chunks = split_chunks(content, tail, CHUNK_MAX);
+    if chunks.len() > MAX_CHUNKS {
+        return refuse(SubmitRefusal::too_many_lines(pane, MAX_CHUNKS));
+    }
     let typing = Arc::new(SubmitTyping {
         id,
         cancel: Arc::new(pty::WriteCancel::default()),
         slave: Arc::new(slave),
-        bracketed: framing == Framing::Bracketed,
+        bracketed,
+        opener_read: AtomicBool::new(false),
+        last_sent: AtomicBool::new(false),
+        all_read: AtomicBool::new(false),
         taken_over: AtomicBool::new(false),
-        unread_at_takeover: AtomicUsize::new(0),
         ended: AtomicBool::new(false),
     });
     let written = pd.send_tracked(probe, Arc::clone(&typing.cancel));
@@ -1472,7 +1483,7 @@ async fn type_text(
         enter,
         TypedText {
             written,
-            body,
+            chunks,
             typing,
             typed_at: now,
         },
@@ -1485,12 +1496,44 @@ async fn type_text(
 /// shell after it reads the terminal.
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
 
-/// How long a typed message has, after its Enter delay, to be fully written
-/// and read before it is judged not read.
+/// How long the agent may go without reading any of the message, once the
+/// probe is read, before it is judged not to be reading it. Every byte it
+/// reads starts the time again, so a slow agent is never judged by this,
+/// only one that stopped.
 const CONSUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often the pane is checked while waiting for it to read the text.
 const CONSUME_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How often the pane is checked while a chunk of the body is being read.
+/// Short, because every chunk waits for one of these checks before the next
+/// is written, and a long body is many chunks.
+const CHUNK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How often, between chunks, the screen is read for a prompt. Reading it is
+/// the costly part of a check, and the chunks need it only before each write.
+const PROMPT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The largest chunk of a body written at once. Small enough to sit whole in
+/// the terminal's input queue on Linux and macOS, so that the queue's count
+/// shows every byte of it the agent reads.
+const CHUNK_MAX: usize = 1024;
+
+/// The longest the agent may take to read a whole body, however steadily.
+/// Past it the rest is withdrawn and the message is answered `agent_too_slow`.
+/// A body at the 64 KiB limit read at 2.2 KiB a second still fits.
+const BODY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What one chunk is allowed to cost, written and read, in working out
+/// [`MAX_CHUNKS`]: more than a chunk costs against an agent that reads at
+/// once on a machine with every CPU busy twice over, so that a body at the
+/// limit still fits in [`BODY_CAP`] there.
+const CHUNK_COST: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The most chunks a body may take: as many as fit in [`BODY_CAP`] at
+/// [`CHUNK_COST`] each. A body of more lines is refused `too_many_lines`
+/// before anything is typed, rather than run into the cap part-way through.
+const MAX_CHUNKS: usize = (BODY_CAP.as_millis() / CHUNK_COST.as_millis()) as usize;
 
 /// How long a cancelled write is given to stop before its queue is flushed.
 const CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -1502,13 +1545,15 @@ const SUBMIT_HOLD_MS: u64 =
     crate::config::messaging::MAX_TYPING_GUARD_MS + SUBMIT_TICK.as_millis() as u64;
 
 /// The longest from a submit's arrival to its answer: held for at most
-/// [`SUBMIT_HOLD_MS`], then typed and judged read within the Enter delay's
-/// cap, [`CONSUME_DEADLINE`] and [`CANCEL_ACK`]. The CLI waits this long
-/// beyond its usual reply deadline, so a submit is never reported as having
-/// no answer while the server is still able to type it: a retry after such a
-/// report would deliver the message twice.
+/// [`SUBMIT_HOLD_MS`]; its probe read within [`PROBE_DEADLINE`]; its body read
+/// within [`BODY_CAP`]; then the Enter delay at its cap and [`CONSUME_DEADLINE`]
+/// for the Enter's own checks; and [`CANCEL_ACK`] for a refusal's cancel. The
+/// CLI waits this long beyond its usual reply deadline, so a submit is never
+/// reported as having no answer while the server is still able to type it: a
+/// retry after such a report would deliver the message twice.
 pub const SUBMIT_BUDGET_MS: u64 = SUBMIT_HOLD_MS
     + PROBE_DEADLINE.as_millis() as u64
+    + BODY_CAP.as_millis() as u64
     + crate::config::messaging::MAX_ENTER_DELAY_MS
     + CONSUME_DEADLINE.as_millis() as u64
     + CANCEL_ACK.as_millis() as u64;
@@ -1524,14 +1569,18 @@ struct SubmitTyping {
     cancel: Arc<crate::server::pty::WriteCancel>,
     /// The pane's terminal from the slave side, where its input queue is.
     slave: Arc<std::fs::File>,
-    /// The message is wrapped, so its paste opener went to the writer first,
-    /// and the agent may be inside a paste until it reads the closer.
+    /// The message is wrapped in a paste.
     bracketed: bool,
+    /// The agent read the paste opener: a paste is open in it until it reads
+    /// the closer.
+    opener_read: AtomicBool,
+    /// The last chunk of the body went to the writer.
+    last_sent: AtomicBool,
+    /// The agent read the whole body, the paste's closer included.
+    all_read: AtomicBool,
     /// A person's key took the pane back before the message was submitted,
     /// and the rest of it was cancelled and flushed.
     taken_over: AtomicBool,
-    /// How many bytes were unread in the input queue when that key arrived.
-    unread_at_takeover: AtomicUsize,
     /// The message is no longer being typed: decided, in the same `panes`
     /// section as its last write when it had one.
     ended: AtomicBool,
@@ -1540,6 +1589,14 @@ struct SubmitTyping {
 impl SubmitTyping {
     fn end(&self) {
         self.ended.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the agent is inside the message's paste: it read the opener
+    /// and not yet the closer.
+    fn paste_open(&self) -> bool {
+        self.bracketed
+            && self.opener_read.load(Ordering::SeqCst)
+            && !self.all_read.load(Ordering::SeqCst)
     }
 }
 
@@ -1554,10 +1611,10 @@ impl Drop for TypingEnds {
 }
 
 /// The probe's write, as `type_text` handed it to the pane's writer, and the
-/// rest of the message.
+/// rest of the message in the chunks it is written in.
 struct TypedText {
     written: tokio::sync::oneshot::Receiver<bool>,
-    body: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
     typing: Arc<SubmitTyping>,
     /// When the probe was handed to the writer: a person's key after this was
     /// pressed while the message was being typed.
@@ -1581,43 +1638,38 @@ enum Typed {
     Refused(crate::server::submit::SubmitRefusal),
 }
 
-/// How long the input queue may hold unread bytes of the body without the
-/// agent reading any of them before it is judged not to be reading. Short, because an
-/// agent that stopped reading may exit at any moment, and whatever is still
-/// queued then is the shell's.
-const STALL: std::time::Duration = std::time::Duration::from_millis(150);
-
 /// Type the rest of a message whose probe `type_text` wrote, and its Enter.
 ///
 /// The probe must be read first: written, and the input queue found empty
-/// on two checks [`CONSUME_POLL`] apart, within [`PROBE_DEADLINE`]. Only then,
-/// in the same `panes` section as the checks that allow it, is the body
-/// written. An agent that does not read the probe is not reading at all, and
-/// its probe is flushed with nothing else written.
+/// on two checks [`CONSUME_POLL`] apart, within [`PROBE_DEADLINE`]. An agent
+/// that does not read it is not reading at all, and its probe is flushed with
+/// nothing else written.
 ///
-/// From the body's write on, the agent must make progress: once the whole
-/// body has been seen in the input queue at once, the queue's level falls
-/// with every read, and a level that holds for [`STALL`] means the agent
-/// stopped reading. The rest is then cancelled and flushed at once rather
-/// than at the deadline. A body larger than the queue is never seen whole in
-/// it: the terminal holds the rest in buffers the queue's count leaves out,
-/// and tops the queue up from them as fast as a slow agent reads, so its
-/// level says nothing and only the deadline judges it. The Enter is
-/// written once the Enter delay has passed and the agent has read the whole
-/// body: every byte has left the writer and the queue is empty on two
-/// checks, for up to [`CONSUME_DEADLINE`], in the same `panes` section as the
-/// checks. The Enter is refused when the agent has begun waiting on its user,
-/// which the Enter would answer.
+/// The body follows in chunks, each written only once the one before has
+/// been read whole (the queue empty on two checks), in the same `panes`
+/// section as the checks that allow it: the agent still the reader, not
+/// waiting on its user. At most one chunk is ever unread, so an agent that
+/// stops reading and exits leaves the shell one chunk, never the rest. An
+/// agent that pauses is waited for: only [`CONSUME_DEADLINE`] without a byte
+/// read refuses it, or [`BODY_CAP`] for the whole body.
+///
+/// The Enter is written once the Enter delay has passed after the last chunk
+/// was read and the queue is still empty on two checks, in the same `panes`
+/// section as the checks; it is refused when the agent has begun waiting on
+/// its user, which the Enter would answer.
 ///
 /// On a refusal the rest of the message is cancelled FIRST and the writer's
 /// stop awaited, then the queue is flushed: flushed first, the queue would
-/// only make room for the writer to write the tail into it. A person's key
-/// before the message is submitted has done both already, and its own flush
-/// is not repeated, since that would discard the key.
+/// only make room for the writer to write the tail into it. A paste the
+/// agent is still inside is then closed, if the agent is still the reader. A
+/// person's key before the message is submitted has done all of that
+/// already, and its own flush is not repeated, since that would discard the
+/// key.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_text(
     pane: PaneId,
     pgid: Option<nix::unistd::Pid>,
+    agent: Option<nix::unistd::Pid>,
     command: &str,
     rules: &crate::server::agents::AgentRules,
     enter: &[u8],
@@ -1631,15 +1683,18 @@ async fn deliver_text(
 
     let TypedText {
         mut written,
-        body,
+        chunks,
         typing,
         typed_at,
     } = typed;
-    let body_len = body.len();
-    let id = typing.id;
     let slave = &*typing.slave;
     let typed_after = |pd: &PaneData| pd.last_human_input.is_some_and(|t| t > typed_at);
     let taken_over = || typing.taken_over.load(Ordering::SeqCst);
+    let close_paste = |pd: &PaneData| {
+        if typing.paste_open() {
+            pd.send_input(PASTE_CLOSE);
+        }
+    };
 
     let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
     let mut probe_written = false;
@@ -1661,28 +1716,28 @@ async fn deliver_text(
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
                 break Err(SubmitRefusal::closed(pane));
             };
-            if !agent_reads(pd, pgid) {
+            if !agent_reads(pd, pgid, agent) {
                 agent_reading = false;
                 break Err(SubmitRefusal::not_read(pane));
             }
             let read = probe_written && unread_input(slave) == Some(0);
+            if read {
+                typing.opener_read.store(bracketed, Ordering::SeqCst);
+            }
             if read && read_once {
-                let close = |pd: &PaneData| {
-                    typing.end();
-                    if bracketed {
-                        pd.send_input(PASTE_CLOSE);
-                    }
-                };
                 if typed_after(pd) {
-                    close(pd);
+                    typing.end();
+                    close_paste(pd);
                     return Typed::PutBack;
                 }
                 let now = std::time::Instant::now();
                 if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
-                    close(pd);
+                    typing.end();
+                    close_paste(pd);
                     return Typed::Untyped(SubmitRefusal::blocked(pane));
                 }
-                written = pd.send_tracked(body, Arc::clone(&typing.cancel));
+                written = pd.send_tracked(chunks[0].clone(), Arc::clone(&typing.cancel));
+                typing.last_sent.store(chunks.len() == 1, Ordering::SeqCst);
                 break Ok(());
             }
             read_once = read;
@@ -1693,154 +1748,193 @@ async fn deliver_text(
         tokio::time::sleep(CONSUME_POLL).await;
     };
     if let Err(refusal) = probed {
-        typing.end();
-        typing.cancel.cancel();
-        if !probe_written {
-            let _ = tokio::time::timeout(CANCEL_ACK, &mut written).await;
-        }
-        if !taken_over() {
-            flush_unread(id, pane, slave, false, agent_reading);
-        }
+        withdraw(
+            &typing,
+            &mut written,
+            !probe_written,
+            agent_reading,
+            pane,
+            panes,
+        )
+        .await;
         return Typed::Untyped(refusal);
     }
 
-    let enter_at = tokio::time::Instant::now() + delay;
-    let deadline = enter_at + CONSUME_DEADLINE;
+    let body_deadline = tokio::time::Instant::now() + BODY_CAP;
+    let mut next = 1;
     let mut done = false;
     let mut human = false;
     let mut read_once = false;
-    let mut read_all = false;
-    let mut held: Option<(usize, tokio::time::Instant)> = None;
-    let mut seen_whole = false;
+    let mut level: Option<usize> = None;
+    let mut progress_at = tokio::time::Instant::now();
+    let mut enter_at: Option<tokio::time::Instant> = None;
+    let mut prompt_checked = tokio::time::Instant::now();
     let refusal = loop {
-        if !done {
-            match written.try_recv() {
-                Ok(true) => done = true,
-                Ok(false) | Err(TryRecvError::Closed) if !taken_over() => {
-                    break SubmitRefusal::not_read(pane)
-                }
-                _ => {}
-            }
-        }
         if taken_over() {
-            let read = done && typing.unread_at_takeover.load(Ordering::SeqCst) == 0;
             let refusal = SubmitRefusal::typed_over(pane);
-            return if read {
+            return if typing.all_read.load(Ordering::SeqCst) {
                 Typed::Read(refusal)
             } else {
                 Typed::Refused(refusal)
             };
         }
+        // Waiting for the writer is part of this pass's wait, so a chunk
+        // written last pass is checked the moment its last byte is out.
+        let pass_start = tokio::time::Instant::now();
+        if !done {
+            match tokio::time::timeout(CHUNK_POLL, &mut written).await {
+                Ok(Ok(true)) => done = true,
+                Ok(Ok(false) | Err(_)) if !taken_over() => break SubmitRefusal::not_read(pane),
+                _ => {}
+            }
+        }
+        let tick = tokio::time::Instant::now();
         {
             let ps = panes.lock().await;
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
                 break SubmitRefusal::closed(pane);
             };
             human |= typed_after(pd);
-            if !agent_reads(pd, pgid) {
+            if !agent_reads(pd, pgid, agent) {
                 agent_reading = false;
-                break if human {
-                    SubmitRefusal::typed_over(pane)
-                } else {
-                    SubmitRefusal::not_read(pane)
-                };
+                break SubmitRefusal::read_by_another(pane);
             }
             let unread = unread_input(slave);
-            let read = done && unread == Some(0);
-            let now = std::time::Instant::now();
-            if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
-                typing.end();
-                read_all = read;
-                break SubmitRefusal::blocked(pane);
-            }
-            let tick = tokio::time::Instant::now();
-            seen_whole |= done && unread == Some(body_len);
-            match (unread, held) {
-                (Some(n), Some((level, since))) if seen_whole && n > 0 && n == level => {
-                    if tick.duration_since(since) >= STALL {
-                        break SubmitRefusal::not_read(pane);
+            let empty = done && unread == Some(0);
+            if empty || tick.duration_since(prompt_checked) >= PROMPT_POLL {
+                prompt_checked = tick;
+                let now = std::time::Instant::now();
+                if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
+                    if next == chunks.len() && empty {
+                        typing.all_read.store(true, Ordering::SeqCst);
                     }
+                    break SubmitRefusal::blocked(pane);
                 }
-                (Some(n), _) if n > 0 => held = Some((n, tick)),
-                _ => held = None,
             }
-            if tick >= enter_at && read && read_once {
-                typing.end();
-                read_all = true;
-                if human {
-                    break SubmitRefusal::typed_over(pane);
+            if let (Some(n), Some(before)) = (unread, level) {
+                if n < before {
+                    progress_at = tick;
                 }
-                pd.send_input(enter);
-                return Typed::Submitted;
             }
-            read_once = read && tick >= enter_at;
+            level = unread;
+            match enter_at {
+                // Between chunks, one empty reading means the chunk was read.
+                // The last chunk gets a second reading, before the Enter.
+                None if empty && next < chunks.len() => {
+                    written = pd.send_tracked(chunks[next].clone(), Arc::clone(&typing.cancel));
+                    next += 1;
+                    typing
+                        .last_sent
+                        .store(next == chunks.len(), Ordering::SeqCst);
+                    done = false;
+                    read_once = false;
+                    level = None;
+                    progress_at = tick;
+                }
+                None if empty && read_once && next == chunks.len() => {
+                    typing.all_read.store(true, Ordering::SeqCst);
+                    enter_at = Some(tick + delay);
+                    read_once = false;
+                }
+                None => read_once = empty,
+                Some(at) if tick >= at && empty && read_once => {
+                    typing.end();
+                    if human {
+                        break SubmitRefusal::typed_over(pane);
+                    }
+                    pd.send_input(enter);
+                    return Typed::Submitted;
+                }
+                Some(at) => read_once = empty && tick >= at,
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            break if human {
-                SubmitRefusal::typed_over(pane)
-            } else {
-                SubmitRefusal::not_read(pane)
-            };
+        match enter_at {
+            None if tick >= body_deadline => break SubmitRefusal::too_slow(pane, BODY_CAP),
+            None if tick.duration_since(progress_at) >= CONSUME_DEADLINE => {
+                break SubmitRefusal::not_read(pane)
+            }
+            Some(at) if tick >= at + CONSUME_DEADLINE => break SubmitRefusal::not_read(pane),
+            _ => {}
         }
-        tokio::time::sleep(CONSUME_POLL).await;
+        if enter_at.is_some() {
+            tokio::time::sleep(CONSUME_POLL).await;
+        } else {
+            tokio::time::sleep_until(pass_start + CHUNK_POLL).await;
+        }
     };
-    if read_all {
+    let read_all = typing.all_read.load(Ordering::SeqCst);
+    let read_reason = matches!(refusal.code, "agent_blocked" | "human_typing");
+    if read_all && agent_reading && read_reason {
+        typing.end();
         return Typed::Read(refusal);
     }
-    typing.end();
-    typing.cancel.cancel();
-    if !done {
-        let _ = tokio::time::timeout(CANCEL_ACK, &mut written).await;
-    }
-    if taken_over() {
+    if withdraw(&typing, &mut written, !done, agent_reading, pane, panes).await {
         return Typed::Refused(SubmitRefusal::typed_over(pane));
-    }
-    let human = human || panes.lock().await.get(&pane).is_some_and(typed_after);
-    if human && agent_reading && unread_input(slave) == Some(0) {
-        return Typed::Refused(refusal);
-    }
-    if flush_unread(id, pane, slave, human, agent_reading) {
-        return Typed::Refused(SubmitRefusal::read_by_another(pane));
     }
     Typed::Refused(refusal)
 }
 
-/// Flush `pane`'s input queue, logging what a person may need to know: that
-/// keys of theirs went with it, or that there was nothing left to flush
-/// because the agent had stopped reading, so another program may have read
-/// the message. Returns whether it was the latter.
-fn flush_unread(
-    id: MsgId,
-    pane: PaneId,
-    slave: &std::fs::File,
-    human: bool,
+/// Withdraw what of a message the agent did not read: cancel the writes,
+/// await the writer's stop, flush the queue, and close a paste the agent is
+/// still inside, if it is still the reader. Returns whether a person's key
+/// had already done this, in which case none of it is repeated.
+async fn withdraw(
+    typing: &SubmitTyping,
+    written: &mut tokio::sync::oneshot::Receiver<bool>,
+    writing: bool,
     agent_reading: bool,
+    pane: PaneId,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
 ) -> bool {
+    typing.end();
+    typing.cancel.cancel();
+    if writing {
+        let _ = tokio::time::timeout(CANCEL_ACK, &mut *written).await;
+    }
+    if typing.taken_over.load(Ordering::SeqCst) {
+        return true;
+    }
+    flush_unread(typing.id, pane, &typing.slave, agent_reading);
+    if agent_reading && typing.paste_open() {
+        if let Some(pd) = panes.lock().await.get(&pane).filter(|pd| !pd.exited) {
+            pd.send_input(crate::server::submit::PASTE_CLOSE);
+        }
+    }
+    false
+}
+
+/// Flush `pane`'s input queue. When there was nothing left to flush because
+/// the agent had stopped reading, another program may have read the message,
+/// and the log says so.
+fn flush_unread(id: MsgId, pane: PaneId, slave: &std::fs::File, agent_reading: bool) {
     let unread = unread_input(slave).unwrap_or(0);
     if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
         log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
-        false
     } else if unread == 0 && !agent_reading {
         log::warn!(
             "msg: id={id} %{pane}'s agent stopped reading with the message unread, and nothing was \
              left to flush: another program may have read it"
         );
-        true
-    } else {
-        if human {
-            log::info!(
-                "msg: id={id} unread by %{pane} after a person typed; {unread} bytes flushed"
-            );
-        }
-        false
     }
 }
 
 /// Whether the program sampled as `pgid` is still the one reading `pd`'s
-/// terminal, unbuffered.
-fn agent_reads(pd: &PaneData, pgid: Option<nix::unistd::Pid>) -> bool {
+/// terminal, unbuffered. The agent itself (`agent`, the process whose name
+/// matched) must be alive as well as its group in the foreground: a job
+/// outlives any one member (`agent | cat` keeps the terminal while `cat`
+/// runs), and a member that goes on reading the terminal raw after the agent
+/// is gone is not the agent. The agent rather than the group's leader,
+/// because a launcher that starts the agent and exits leaves a live agent in
+/// a group without its leader.
+fn agent_reads(
+    pd: &PaneData,
+    pgid: Option<nix::unistd::Pid>,
+    agent: Option<nix::unistd::Pid>,
+) -> bool {
     let master = std::os::fd::AsFd::as_fd(&pd.pty.master_fd);
-    let same = pgid.is_some() && nix::unistd::tcgetpgrp(master).ok() == pgid;
+    let same = pgid.is_some()
+        && nix::unistd::tcgetpgrp(master).ok() == pgid
+        && agent.is_some_and(|pid| nix::sys::signal::kill(pid, None).is_ok());
     same && nix::sys::termios::tcgetattr(master).is_ok_and(|t| {
         !t.local_flags
             .contains(nix::sys::termios::LocalFlags::ICANON)
@@ -1869,9 +1963,30 @@ fn open_slave(path: &std::path::Path) -> Option<std::fs::File> {
 }
 
 /// Bytes in the slave's input queue: typed, and not yet read by the program.
+///
+/// Linux moves bytes written to the master into this queue as deferred work,
+/// so a count taken right after a write can be 0 for an unread chunk. Under
+/// CPU load that lasts many milliseconds. Polling the slave first makes the
+/// count exact, because the line discipline's poll finishes that deferred
+/// work before it looks at the queue. The poll reads nothing, so the agent
+/// loses no input. macOS writes into the queue directly and needs no such
+/// barrier, but the poll is harmless there.
+///
+/// Callers hold `panes`, so the poll can hold it while the kernel finishes
+/// that one piece of deferred work. A poll that fails answers `None`, which
+/// no caller takes as read.
 fn unread_input(slave: &std::fs::File) -> Option<usize> {
     let mut queued: libc::c_int = 0;
     let fd = std::os::fd::AsRawFd::as_raw_fd(slave);
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for an fd `slave` keeps open, and no wait.
+    if unsafe { libc::poll(&mut pfd, 1, 0) } < 0 {
+        return None;
+    }
     (unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } == 0).then(|| queued.max(0) as usize)
 }
 
@@ -2738,9 +2853,9 @@ impl PaneData {
     /// the queue ahead of it, which the writer runs only once the cancelled
     /// write has stopped. Behind the message, the key would be read with it
     /// by the next reader, and after the agent exits that is the shell, which
-    /// the key's Enter would make run it. A wrapped message's paste is closed
-    /// first, whether or not the agent read its opener yet, so the key is
-    /// never taken as part of a paste. Only the first key does this.
+    /// the key's Enter would make run it. A paste the agent is inside (it
+    /// read the opener, and not yet the closer) is closed first, so the key
+    /// is never taken as part of it. Only the first key does this.
     fn send_human_input(&mut self, data: &[u8]) {
         self.last_human_input = Some(std::time::Instant::now());
         let typing = self
@@ -2753,18 +2868,28 @@ impl PaneData {
             return self.send_input(data);
         };
         self.typing = None;
-        let unread = unread_input(&typing.slave).unwrap_or(0);
-        typing.unread_at_takeover.store(unread, Ordering::SeqCst);
+        // An empty queue after the writer finished the last job means the
+        // agent has read all it was given so far, whatever the typing task
+        // has yet to notice: the opener at least, and the closer too once the
+        // last chunk went out.
+        let unread = unread_input(&typing.slave);
+        if unread == Some(0) && typing.cancel.is_written() {
+            typing.opener_read.store(typing.bracketed, Ordering::SeqCst);
+            if typing.last_sent.load(Ordering::SeqCst) {
+                typing.all_read.store(true, Ordering::SeqCst);
+            }
+        }
         typing.cancel.cancel();
         let mut bytes = Vec::with_capacity(data.len() + 6);
-        if typing.bracketed {
+        if typing.paste_open() {
             bytes.extend_from_slice(crate::server::submit::PASTE_CLOSE);
         }
         bytes.extend_from_slice(data);
         log::info!(
-            "msg: id={} a person typed before it was submitted; its text is withdrawn, {unread} \
+            "msg: id={} a person typed before it was submitted; its text is withdrawn, {} \
              unread byte(s) flushed",
-            typing.id
+            typing.id,
+            unread.unwrap_or(0)
         );
         let job = pty::WriteJob {
             data: bytes,
@@ -2789,6 +2914,7 @@ impl PaneData {
         cancel: Arc<pty::WriteCancel>,
     ) -> tokio::sync::oneshot::Receiver<bool> {
         let (done, written) = tokio::sync::oneshot::channel();
+        cancel.pending();
         let job = pty::WriteJob {
             data,
             done: Some(done),
@@ -7357,6 +7483,9 @@ struct PaneSample {
     /// The terminal's foreground process group, read before `command`, so a
     /// later write can check the program it was meant for is still there.
     pgid: Option<nix::unistd::Pid>,
+    /// The process whose name matched the agent, which may be a descendant
+    /// of the group's leader.
+    agent: Option<nix::unistd::Pid>,
     /// When a human last typed into the pane, for the typing guard.
     last_human_input: Option<std::time::Instant>,
 }
@@ -7377,6 +7506,7 @@ async fn sample_pane(
         state: None,
         bracketed_paste: false,
         pgid: None,
+        agent: None,
         last_human_input: None,
     };
     let rules = agent_rules(config);
@@ -7390,12 +7520,16 @@ async fn sample_pane(
         return gone;
     };
     let pgid = nix::unistd::tcgetpgrp(std::os::fd::AsFd::as_fd(&master)).ok();
-    let command = if rules.is_empty() {
+    let found = if rules.is_empty() {
         None
     } else {
-        crate::server::agents::foreground_command(std::os::fd::AsFd::as_fd(&master), rules)
+        crate::server::agents::foreground_agent(std::os::fd::AsFd::as_fd(&master), rules)
     };
     drop(master);
+    let (command, agent) = match found {
+        Some((command, pid)) => (Some(command), Some(nix::unistd::Pid::from_raw(pid))),
+        None => (None, None),
+    };
     let placed = {
         let st = state.lock().await;
         st.locate_pane(pane_id).is_some() && !st.is_popup(pane_id)
@@ -7416,6 +7550,7 @@ async fn sample_pane(
         command,
         bracketed_paste: pd.screen.bracketed_paste,
         pgid,
+        agent,
         last_human_input: pd.last_human_input,
     }
 }
@@ -12916,6 +13051,22 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the pane is still typing, so its queue is never looked at");
+    }
+
+    #[test]
+    fn the_most_chunks_fit_the_body_cap_with_room_to_spare() {
+        use super::{BODY_CAP, MAX_CHUNKS};
+        assert_eq!(MAX_CHUNKS, 1500);
+        let idle = std::time::Duration::from_micros(4100);
+        let loaded = std::time::Duration::from_micros(12800);
+        assert!(
+            idle * (MAX_CHUNKS as u32) * 3 <= BODY_CAP,
+            "a body at the limit, at the cost per chunk measured idle, takes under a third of the cap"
+        );
+        assert!(
+            loaded * (MAX_CHUNKS as u32) <= BODY_CAP,
+            "a body at the limit, at the cost per chunk measured under load, fits in the cap"
+        );
     }
 
     #[test]

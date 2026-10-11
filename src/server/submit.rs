@@ -1,11 +1,11 @@
 //! Typing a message into an agent's pane: how its bytes are framed.
 //!
-//! A message is typed as three writes. The first is a probe that nothing
-//! acts on: the paste opener when the text is wrapped, a space when it is
-//! not ([`split_probe`]). The second is the body, wrapped in bracketed paste
-//! when the pane's program has asked for it (mode 2004), so the agent reads
-//! it as one pasted block rather than as keystrokes whose newlines would
-//! each submit a line. The third is the Enter, written after a delay: an
+//! A message is typed as a probe, the body and the Enter. The probe is
+//! something nothing acts on: the paste opener when the text is wrapped, a
+//! space when it is not ([`split_probe`]). The body is wrapped in bracketed
+//! paste when the pane's program has asked for it (mode 2004), so the agent
+//! reads it as one pasted block rather than as keystrokes whose newlines
+//! would each submit a line. The Enter is written after a delay: an
 //! agent that reads a paste and an Enter in one read can take the Enter as
 //! part of the paste, and the paste as not yet submitted. The Enter is never
 //! inside the wrap for the same reason.
@@ -48,19 +48,21 @@
 //! so the agent, and the person watching it, can tell another agent's
 //! message from its user's.
 //!
+//! The body goes in chunks ([`split_chunks`]), each written only once the
+//! agent has read the one before, so at most one chunk is ever unread. A
+//! chunk holds at most one line, and its newline comes first: a line's text
+//! never travels with the newline that would run it.
+//!
 //! Residuals:
-//! - An agent that read the probe and then stopped reading leaves the body in
-//!   the input queue. The read check finds that out once the queue has made
-//!   no progress for a stall interval after the body was written, and
-//!   flushes it; a body larger than the terminal's input queue is judged at
-//!   the read check's deadline instead, since the queue's count cannot show
-//!   its progress. An agent that EXITS before then hands the terminal
-//!   to the shell first, and the shell reads the body. Without its paste
-//!   opener, which the agent read, the shell takes the body as typed lines:
-//!   every line of a multi-line body but the last runs at once, with no
-//!   Enter from us. The envelope opens with `# ` so that its own line is a
-//!   comment to a shell; the body's lines are not. The submit is then
-//!   answered `read_by_another_program`.
+//! - An agent that exits part-way through a body hands the terminal to the
+//!   shell, which reads the unread chunk. The chunk starts with the newline
+//!   that ends a line the AGENT read, so for the shell it ends an empty line,
+//!   and the chunk's own line sits in the shell's line unexecuted until
+//!   someone presses Enter there. At most that one line; the submit is
+//!   answered `read_by_another_program`. The first chunk is the envelope,
+//!   whose `# ` makes it a comment to a shell, but only when the envelope is
+//!   on: with `envelope = false` the first chunk is the body's own first
+//!   line, and an unwrapped message has no envelope line at all.
 //! - The probe is taken as read when the input queue is empty, and any
 //!   program in the agent's process group could have emptied it: a child
 //!   the agent started that reads the terminal takes the probe, and the body
@@ -394,11 +396,30 @@ impl SubmitRefusal {
         }
     }
 
+    pub fn too_many_lines(pane: PaneId, max: usize) -> Self {
+        SubmitRefusal {
+            code: "too_many_lines",
+            message: format!(
+                "the message has more lines than the {max} this server types into %{pane}, so it was not typed: it is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn too_slow(pane: PaneId, cap: Duration) -> Self {
+        SubmitRefusal {
+            code: "agent_too_slow",
+            message: format!(
+                "%{pane}'s agent was still reading the message after {}s, so it was not submitted, and the part it read is left in its input: clear that before pressing Enter there. It is in the mailbox",
+                cap.as_secs()
+            ),
+        }
+    }
+
     pub fn read_by_another(pane: PaneId) -> Self {
         SubmitRefusal {
             code: "read_by_another_program",
             message: format!(
-                "%{pane}'s agent stopped reading before it read the message, and another program may have read it instead: the shell, if one took over the terminal, may have run its lines. It is in the mailbox"
+                "%{pane}'s agent stopped reading before it read the message, and another program may have read it instead; a line of it may be waiting at the shell prompt: clear it with Ctrl-U before pressing Enter. It is in the mailbox"
             ),
         }
     }
@@ -451,6 +472,24 @@ pub fn split_probe(text: Vec<u8>, framing: Framing, focus_in: bool) -> (Vec<u8>,
             (text, rest)
         }
     }
+}
+
+/// The body of a message split for typing: chunks of at most `max` bytes,
+/// each holding at most one newline, and that one first. `tail`, the paste's
+/// closer when there is one, is never split and ends the last chunk. Always
+/// at least one chunk.
+pub fn split_chunks(content: &[u8], tail: &[u8], max: usize) -> Vec<Vec<u8>> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut current = Vec::with_capacity(max);
+    for &b in content {
+        if !current.is_empty() && (b == b'\n' || current.len() >= max) {
+            chunks.push(std::mem::replace(&mut current, Vec::with_capacity(max)));
+        }
+        current.push(b);
+    }
+    current.extend_from_slice(tail);
+    chunks.push(current);
+    chunks
 }
 
 /// The line typed before a message's body: which message it is, who sent it
@@ -911,6 +950,34 @@ mod tests {
             split_probe(text.clone(), Framing::Plain, false),
             (b" ".to_vec(), text)
         );
+    }
+
+    #[test]
+    fn a_chunk_holds_at_most_one_line_and_starts_with_its_newline() {
+        let chunks = split_chunks(b"# env\nline one\n\nlast", PASTE_CLOSE, 1024);
+        let want: Vec<&[u8]> = vec![b"# env", b"\nline one", b"\n", b"\nlast\x1b[201~"];
+        assert_eq!(chunks, want);
+        let long = vec![b'x'; 2500];
+        let chunks = split_chunks(&long, b"", 1024);
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1024, 1024, 452],
+            "a line longer than a chunk is cut at the size"
+        );
+        assert_eq!(split_chunks(b"", b"", 1024), vec![Vec::<u8>::new()]);
+        assert_eq!(
+            split_chunks(&long, PASTE_CLOSE, 1024)
+                .last()
+                .map(|c| c.ends_with(PASTE_CLOSE)),
+            Some(true),
+            "the closer is never cut"
+        );
+        for chunk in split_chunks(b"a\nb\nc", b"", 1024) {
+            assert!(
+                chunk.iter().skip(1).all(|&b| b != b'\n'),
+                "a newline only ever opens a chunk: {chunk:?}"
+            );
+        }
     }
 
     #[test]

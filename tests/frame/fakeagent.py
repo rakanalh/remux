@@ -37,13 +37,16 @@ so a command written while another is being read is never lost:
                          server's probe), never what follows it: an agent
                          that hangs right after it starts reading a message
   exit-on-rx             exit right after the next read
+  fork-on-rx             on the next read, fork; the parent exits and the
+                         child reads on in the same process group: a group
+                         that outlives the agent that led it
   exit-after-body        exit right after reading a paste's end: an agent that
                          reads a whole message and dies before its Enter
   deaf-on-rx             stop reading right after the next read: an agent that
                          takes the probe and hangs before the body
-  trickle                read a probe whole, and anything else one byte per
-                         100 ms: an agent that reads, slowly, for as long as a
-                         message takes
+  trickle[:<ms>]         read a probe whole, and anything else one byte per
+                         <ms> (100 by default): an agent that reads, slowly,
+                         for as long as a message takes
   block-on-rx            show the permission prompt the moment the next
                          pasted block's END arrives: a prompt drawn between
                          a typed message and its Enter
@@ -118,8 +121,9 @@ def main():
     deaf = False
     probe_only = False
     deaf_on_rx = False
+    fork_on_rx = False
     exit_after_body = False
-    trickle = False
+    trickle = 0.0
     exit_on_rx = False
     block_on_rx = None
     read_size, read_gap = 4096, 0.0
@@ -153,11 +157,15 @@ def main():
                 return
             if exit_after_body and b"\x1b[201~" in data:
                 return
+            if fork_on_rx:
+                fork_on_rx = False
+                if os.fork() > 0:
+                    os._exit(0)
             if deaf_on_rx:
                 deaf_on_rx = False
                 deaf = True
             if trickle:
-                time.sleep(0.1)
+                time.sleep(trickle)
             if block_on_rx and b"\x1b[201~" in data:
                 out(block_on_rx)
                 block_on_rx = None
@@ -193,10 +201,12 @@ def main():
                 exit_on_rx = True
             elif command == "exit-after-body":
                 exit_after_body = True
+            elif command == "fork-on-rx":
+                fork_on_rx = True
             elif command == "deaf-on-rx":
                 deaf_on_rx = True
-            elif command == "trickle":
-                trickle = True
+            elif command == "trickle" or command.startswith("trickle:"):
+                trickle = int(command[8:] or 100) / 1000
             elif command == "block-on-rx":
                 block_on_rx = PROCEED
             elif command == "editblock-on-rx":

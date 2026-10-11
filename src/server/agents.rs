@@ -142,13 +142,19 @@ pub const DETECTION_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = 
 /// the agent was actually found at. See [`log_detection`] for why it is
 /// deduplicated instead of levelled down.
 pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<String> {
+    foreground_agent(fd, rules).map(|(command, _)| command)
+}
+
+/// [`foreground_command`], with the pid of the process whose name matched:
+/// the agent itself, which may be a descendant of the group's leader.
+pub fn foreground_agent(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<(String, i32)> {
     let pgid = nix::unistd::tcgetpgrp(fd).ok()?;
     let leader_pid = pgid.as_raw();
     let leader = crate::server::daemon::get_process_names(leader_pid);
     if let Some(command) = rules.match_command(&leader.name, leader.argv0.as_deref()) {
         let command = command.to_string();
         log_detection(leader_pid, &leader, Detected::Leader(&command));
-        return Some(command);
+        return Some((command, leader_pid));
     }
     // Only the processes of THIS job. `child_pids` lists every child the
     // leader has, and a job the user PARKED -- `Ctrl-Z`, or `&` under an
@@ -185,7 +191,7 @@ pub fn foreground_command(fd: BorrowedFd<'_>, rules: &AgentRules) -> Option<Stri
                     command: &command,
                 },
             );
-            Some(command)
+            Some((command, pid))
         }
         None => {
             log_detection(leader_pid, &leader, Detected::Nothing);
