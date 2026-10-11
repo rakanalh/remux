@@ -596,6 +596,15 @@ pub enum ClientMessage {
         /// wrong pane.
         #[serde(default)]
         pane_hint: Option<PaneId>,
+        /// For `Submit` and `Auto`: while the agent is waiting on its user,
+        /// keep the message queued until it is not, rather than answering
+        /// `agent_blocked` at once. Bounded by `timeout_ms`.
+        #[serde(default)]
+        defer: bool,
+        /// How long a deferred submit may wait, in milliseconds. `None` is
+        /// the server's default; the server caps it.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     /// Read a mailbox: `pane`'s, or the caller's own when `pane` is `None`.
     /// A mailbox that is not the caller's own is only peeked, whatever `peek`
@@ -863,6 +872,10 @@ pub enum ServerMessage {
         /// Why `delivery` is not what was asked for, when it is not.
         #[serde(default)]
         reason: Option<String>,
+        /// The submit ran out of time before it could be typed, and `reason`
+        /// is what it was waiting on.
+        #[serde(default)]
+        timed_out: bool,
     },
     /// The answer to a [`ClientMessage::MsgRead`]: the listed messages,
     /// oldest first.
@@ -2635,11 +2648,14 @@ mod tests {
                 deliver,
                 reply_to,
                 pane_hint,
+                defer,
+                timeout_ms,
                 ..
             } => {
                 assert_eq!(to.to_string(), "%7");
                 assert_eq!(deliver, Deliver::Auto);
                 assert_eq!((reply_to, pane_hint), (None, None));
+                assert_eq!((defer, timeout_ms), (false, None));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -2661,8 +2677,9 @@ mod tests {
                 pane_id: 7,
                 name: Some("beta".into()),
             },
-            delivery: Delivery::Submitted,
-            reason: None,
+            delivery: Delivery::Mailbox,
+            reason: Some("agent_blocked".into()),
+            timed_out: true,
         };
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
@@ -2670,8 +2687,32 @@ mod tests {
             back,
             ServerMessage::MsgSent {
                 id: 1,
-                delivery: Delivery::Submitted,
-                reason: None,
+                delivery: Delivery::Mailbox,
+                timed_out: true,
+                ..
+            }
+        ));
+        let old_sent: ServerMessage = serde_json::from_str(
+            r#"{"MsgSent":{"id":2,"to":{"host":null,"pane_id":7,"name":null},"delivery":"Submitted"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old_sent,
+            ServerMessage::MsgSent {
+                id: 2,
+                timed_out: false,
+                ..
+            }
+        ));
+        let deferred: ClientMessage = serde_json::from_str(
+            r#"{"MsgSend":{"to":{"host":null,"target":{"Pane":7}},"body":"hi","deliver":"Submit","defer":true,"timeout_ms":1500}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            deferred,
+            ClientMessage::MsgSend {
+                defer: true,
+                timeout_ms: Some(1500),
                 ..
             }
         ));

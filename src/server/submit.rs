@@ -220,6 +220,9 @@ pub enum Answer {
     Mailbox(&'static str),
     /// Refuse the send.
     Refuse(SubmitRefusal),
+    /// Leave it in the mailbox because its time ran out while it waited on
+    /// the reason given.
+    TimedOut(&'static str),
 }
 
 /// How `refusal` is answered under `deliver`. `Submit` asked to be told, so
@@ -232,6 +235,34 @@ pub fn settle(deliver: Deliver, refusal: SubmitRefusal) -> Answer {
     } else {
         Answer::Mailbox(refusal.code)
     }
+}
+
+/// How an entry whose deadline passed before it was typed is answered.
+/// `Submit` is refused. `Auto` is told the message is in the mailbox and
+/// why it waited: `waiting_on`, or `submit_timeout` for an entry that never
+/// reached the head of its queue and so never waited on anything itself.
+pub fn overdue(
+    deliver: Deliver,
+    pane: PaneId,
+    id: crate::protocol::MsgId,
+    waiting_on: Option<&'static str>,
+) -> Answer {
+    match deliver {
+        Deliver::Auto => Answer::TimedOut(waiting_on.unwrap_or("submit_timeout")),
+        _ => Answer::Refuse(SubmitRefusal::out_of_time(pane, id)),
+    }
+}
+
+/// Whether a submit waits instead of being answered `agent_blocked`: it was
+/// deferred, and the agent is there and waiting on its user. Only that wait
+/// is deferred; a pane that is not running an agent is answered at once.
+pub fn waits_while_blocked(
+    live: bool,
+    agent: bool,
+    state: Option<AgentState>,
+    defer: bool,
+) -> bool {
+    defer && live && agent && state == Some(AgentState::NeedsInput)
 }
 
 /// The checks made before the typing guard: the pane is there, its
@@ -420,6 +451,15 @@ impl SubmitRefusal {
             code: "read_by_another_program",
             message: format!(
                 "%{pane}'s agent stopped reading before it read the message, and another program may have read it instead; a line of it may be waiting at the shell prompt: clear it with Ctrl-U before pressing Enter. It is in the mailbox"
+            ),
+        }
+    }
+
+    pub fn sender_closed(from: PaneId, id: crate::protocol::MsgId) -> Self {
+        SubmitRefusal {
+            code: "sender_closed",
+            message: format!(
+                "pane %{from}, which sent message #{id}, closed before it was typed, so it was not typed: it is in the mailbox"
             ),
         }
     }
@@ -721,6 +761,7 @@ mod tests {
             None => "inject".to_string(),
             Some(Answer::Mailbox(reason)) => format!("mailbox:{reason}"),
             Some(Answer::Refuse(r)) => format!("refuse:{}", r.code),
+            Some(Answer::TimedOut(reason)) => format!("timed_out:{reason}"),
         };
         for (live, agent, state, rule, deliver, want) in [
             (
@@ -977,6 +1018,51 @@ mod tests {
                 chunk.iter().skip(1).all(|&b| b != b'\n'),
                 "a newline only ever opens a chunk: {chunk:?}"
             );
+        }
+    }
+
+    #[test]
+    fn defer_waits_only_for_an_agent_waiting_on_its_user() {
+        use AgentState::{Idle, NeedsInput, Working};
+        assert!(waits_while_blocked(true, true, Some(NeedsInput), true));
+        assert!(!waits_while_blocked(true, true, Some(NeedsInput), false));
+        assert!(!waits_while_blocked(true, true, Some(Idle), true));
+        assert!(!waits_while_blocked(true, true, Some(Working), true));
+        assert!(
+            !waits_while_blocked(true, false, None, true),
+            "a shell is answered agent_not_ready at once, deferred or not"
+        );
+        assert!(
+            !waits_while_blocked(false, true, Some(NeedsInput), true),
+            "a pane that closed"
+        );
+    }
+
+    #[test]
+    fn an_entry_out_of_time_is_refused_or_reported_timed_out() {
+        let code = |a: Answer| match a {
+            Answer::Refuse(r) => format!("refuse:{}", r.code),
+            Answer::Mailbox(reason) => format!("mailbox:{reason}"),
+            Answer::TimedOut(reason) => format!("timed_out:{reason}"),
+        };
+        assert_eq!(
+            code(overdue(Deliver::Submit, 5, 9, Some("agent_blocked"))),
+            "refuse:submit_timeout"
+        );
+        assert_eq!(
+            code(overdue(Deliver::Auto, 5, 9, Some("agent_blocked"))),
+            "timed_out:agent_blocked"
+        );
+        assert_eq!(
+            code(overdue(Deliver::Auto, 5, 9, None)),
+            "timed_out:submit_timeout",
+            "never a head, so it waited on nothing of its own"
+        );
+        match overdue(Deliver::Submit, 5, 9, None) {
+            Answer::Refuse(r) => {
+                assert!(r.message.contains("#9") && r.message.contains("in the mailbox"))
+            }
+            other => panic!("{other:?}"),
         }
     }
 

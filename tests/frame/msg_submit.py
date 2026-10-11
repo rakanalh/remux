@@ -165,6 +165,42 @@ Task 3, the typing guard, through the queue and the submitter:
     reading in its process group: the child is not the agent, and gets none
     of the message.
 3z. No panic.
+Task 4, --defer and the queue:
+4a. A deferred Submit waits while the agent is blocked, is typed once the
+    prompt is answered, and its wait is logged once.
+4b. Three deferred sends from three senders are typed in id order, each
+    its own paste with its own Enter.
+4c. A fourth deferred send to a queue of three is queue_full at once, and
+    in the mailbox.
+4d. Deferred sends whose timeout is shorter than the hold wait the hold:
+    a Submit at the head is submit_timeout, an Auto at the head is
+    Mailbox/agent_blocked timed_out, and nothing is typed once the prompt
+    is answered.
+4j. An Auto send that times out BEHIND a waiting head is Mailbox,
+    timed_out, reason submit_timeout: it never waited on anything itself.
+4e. The target pane closes under two deferred sends: both no_such_target.
+4g. A deferred send with a timeout past the hold is still typed after it.
+4h. A send that is not deferred, behind a deferred head, is answered
+    agent_blocked at once.
+4i. A deferred send outlasts the typing guard's cap.
+4k. A deferred send whose agent draws a prompt after reading it is the
+    agent's (Mailbox/agent_blocked_read), and is not typed again.
+4l. A deferred send with timeout 0 to an idle agent is typed.
+4m. A sender holds one deferred send per target pane: its second is
+    queue_full at once while another sender's is still taken.
+4n. A queued send whose SENDER pane closes is never typed, though it is
+    not deferred and its reply was already detached.
+4o. A deferred send whose sender pane closes, while the sending process
+    lives on: it is answered sender_closed, and never typed.
+4p. A deferred send whose sender's connection closes is never typed, and
+    stays in the mailbox.
+4q. A send whose sender pane closes while its probe sits unread, then a
+    person's key takes the pane back: it is not put back, and never typed.
+4s. A deferred send whose agent draws a prompt right after reading the probe
+    is put back, waits for the prompt to be answered, and is typed once.
+4t. A deferred send whose sender's connection closes while its probe sits
+    unread, then a person's key: it is not put back, and never typed.
+4z. No panic.
 
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
 """
@@ -283,11 +319,11 @@ def send(to, body, deliver):
 agents = [0]
 
 
-def spawn_agent(paste):
+def spawn_agent(paste, placement="SplitBelow"):
     """A fakeagent pane: (pane_id, log path, control path)."""
     agents[0] += 1
     log, ctl = f"{RUNDIR}/agent-{agents[0]}.log", f"{RUNDIR}/agent-{agents[0]}.ctl"
-    pane = cli_spawn("SplitBelow", argv=[FAKEAGENT, log, ctl])
+    pane = cli_spawn(placement, argv=[FAKEAGENT, log, ctl])
     end = time.time() + 8
     while time.time() < end and not os.path.exists(log):
         time.sleep(0.05)
@@ -1294,6 +1330,422 @@ enter_delay_ms = 5000
 finally:
     srv.kill()
 
+# === Task 4: --defer, queue_full, per-pane order, the deadlines ===============
+# A queue of three holds one entry per sender. while_working = "queue", since
+# the clear's own "back to work" reads as Working and a deferred message must
+# then be typed, not left in the mailbox by the row. The guard's cap is short
+# so 4i can outlast it.
+T4 = """
+[messaging]
+submit_queue_len = 3
+typing_guard_max_ms = 2000
+
+[messaging.submit.fakeagent]
+while_working = "queue"
+"""
+HOLD_S = (rs_ms(CFG_RS, r"MAX_TYPING_GUARD_MS: u64 = ([\d_]+);")
+          + rs_ms(DAEMON, r"SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")) / 1000
+
+
+def dsend(to, body, deliver, timeout_ms=None):
+    msg = send(to, body, deliver)
+    msg["MsgSend"]["defer"] = True
+    if timeout_ms is not None:
+        msg["MsgSend"]["timeout_ms"] = timeout_ms
+    return msg
+
+
+def deferred_logged():
+    return srv.log().count(" defer -> mailbox")
+
+
+def wait_logged(before, timeout=8.0):
+    """Wait until one more deferred send is stored, so the next one sent gets
+    a later id."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if deferred_logged() > before:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def defer_start(pane, msg):
+    before = deferred_logged()
+    out = type_start(pane, msg)
+    check(wait_logged(before), f"...the deferred send from %{pane} was stored")
+    return out
+
+
+def block(ctl, log, pane):
+    tell(ctl, log, "block")
+    check(wait_state(pane, "NeedsInput"), f"...the agent in %{pane} is waiting on its user")
+
+
+def ids_logged(sid):
+    return [ln for ln in srv.log().splitlines() if re.search(rf"\bmsg: id={sid}\b", ln)]
+
+
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T4)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 220, "rows": 60}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    G, G_LOG, G_CTL = spawn_agent(paste=True)
+    senders = []
+    for placement in ("SplitRight", "SplitBelow", "SplitRight", "SplitBelow", "SplitRight"):
+        senders.append(cli_spawn(placement))
+    A, A2, A3, A4, A5 = senders
+    # A tab of their own, so the panes are tall enough to show a prompt whole.
+    H, H_LOG, H_CTL = spawn_agent(paste=True, placement="NewTab")
+    I, I_LOG, I_CTL = spawn_agent(paste=True, placement="SplitRight")
+    time.sleep(1.0)
+    check(None not in senders and focused_pane() not in (F, G, H),
+          f"setup: five sender panes, and the agents are unattended (senders {senders}, focused {focused_pane()})")
+
+    # 4g, started first because it outlives the hold: a deferred send to a
+    # blocked G, with a timeout past the hold, is still typed after it.
+    block(G_CTL, G_LOG, G)
+    g_out = defer_start(A5, dsend(G, "LONG:deferred", "Submit", timeout_ms=int((HOLD_S + 60) * 1000)))
+    g_t0 = time.time()
+
+    # 4d and 4j, started early for the same reason: timeouts shorter than the
+    # hold are raised to it. In the background, so the senders' shells are
+    # free for the cases below.
+    def background_defer(pane, msg):
+        before = deferred_logged()
+        out = type_start(pane, msg, background=True)
+        check(wait_logged(before), f"...the deferred send from %{pane} was stored")
+        return out
+
+    block(H_CTL, H_LOG, H)
+    block(I_CTL, I_LOG, I)
+    d_start = (len(rx_chunks(H_LOG)), len(rx_chunks(I_LOG)))
+    d_t0 = time.time()
+    # The head outlives the entry behind it, so that one times out BEHIND it.
+    dl_sub = background_defer(A3, dsend(H, "DL:sub", "Submit", timeout_ms=int((HOLD_S + 15) * 1000)))
+    dl_behind = background_defer(A4, dsend(H, "DL:behind", "Auto", timeout_ms=1))
+    dl_auto = background_defer(A2, dsend(I, "DL:auto", "Auto", timeout_ms=0))
+
+    # 4a
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    block(F_CTL, F_LOG, F)
+    out = defer_start(A, dsend(F, "DEFER:one", "Submit"))
+    time.sleep(1.5)
+    parked = not os.path.exists(out)
+    clear_ns = time.time_ns()
+    tell(F_CTL, F_LOG, "clear")
+    r = wait_file(out, timeout=10)
+    at = chunk_at(F_LOG, "DEFER:one")
+    check(parked and submitted(r) and at is not None and at > clear_ns,
+          f"4a a deferred Submit waits while the agent is blocked, and is typed once it is cleared "
+          f"(parked {parked}, reply {r}, typed after the clear {at is not None and at > clear_ns})")
+    sid = sent_id(r)
+    waits = [ln for ln in ids_logged(sid) if "submit waiting: agent_blocked" in ln]
+    check(len(waits) == 1 and len(ids_logged(sid)) <= 4,
+          f"4a ...its wait is logged once, and its id on at most 4 lines (got {ids_logged(sid)})")
+
+    # 4h + 4b + 4c
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    block(F_CTL, F_LOG, F)
+    start = len(rx_chunks(F_LOG))
+    outs = [defer_start(A, dsend(F, "ORDER:1", "Submit"))]
+    t0 = time.time()
+    r_sub = type_send(A4, send(F, "BEHIND:sub", "Submit"))
+    r_auto = type_send(A4, send(F, "BEHIND:auto", "Auto"))
+    took = time.time() - t0
+    check(outcome(r_sub) == ("Error", "agent_blocked") and outcome(r_auto) == ("Mailbox", "agent_blocked")
+          and took < 4.0,
+          f"4h a send that is not deferred, queued behind a deferred head, is answered agent_blocked at once "
+          f"({took:.1f}s for both; submit {r_sub}, auto {r_auto})")
+    outs.append(defer_start(A2, dsend(F, "ORDER:2", "Submit")))
+    outs.append(defer_start(A3, dsend(F, "ORDER:3", "Auto")))
+    t0 = time.time()
+    r_sub = type_send(A4, dsend(F, "FULL:sub", "Submit"))
+    r_auto = type_send(A4, dsend(F, "FULL:auto", "Auto"))
+    took = time.time() - t0
+    box = {m["body"]: m["state"] for m in (read_box(F, all=True) or [])}
+    check(outcome(r_sub) == ("Error", "queue_full") and outcome(r_auto) == ("Mailbox", "queue_full")
+          and took < 4.0 and box.get("FULL:sub") == "Queued" and box.get("FULL:auto") == "Queued",
+          f"4c a fourth deferred send to a queue of three: queue_full at once ({took:.1f}s for both), "
+          f"and in the mailbox (submit {r_sub}, auto {r_auto}, box {box})")
+    held = not any(os.path.exists(o) for o in outs)
+    tell(F_CTL, F_LOG, "clear")
+    replies = [wait_file(o, timeout=15) for o in outs]
+    ids = [sent_id(x) for x in replies]
+    seq = [c for _, c in rx_chunks(F_LOG)[start:]]
+    texts = [i for i, c in enumerate(seq) if c.startswith(OPEN)]
+    order = [next((n for n in (1, 2, 3) if f"ORDER:{n}".encode() in seq[i]), None) for i in texts]
+    entered = all(i + 1 < len(seq) and seq[i + 1] == b"\r" for i in texts)
+    check(held and all(submitted(x) for x in replies) and ids == sorted(ids) and order == [1, 2, 3] and entered,
+          f"4b three deferred sends are typed in id order, each its own paste with its own Enter "
+          f"(held {held}, ids {ids}, order {order}, entered {entered}, replies {[outcome(x) for x in replies]})")
+
+    # 4l: timeout 0 is raised to the hold, so an idle agent is typed into.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    r = type_send(A, dsend(F, "ZERO:timeout", "Submit", timeout_ms=0))
+    check(submitted(r) and chunk_at(F_LOG, "ZERO:timeout") is not None,
+          f"4l a deferred send with timeout 0 to an idle agent is typed (got {r})")
+
+    # 4n: the sender pane closes under a send the typing guard holds.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    S1 = cli_spawn("SplitRight")
+    time.sleep(1.0)
+    start = len(rx_chunks(F_LOG))
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "cell", F))
+    t.start()
+    time.sleep(0.3)
+    type_start(S1, send(F, "GONE:plain", "Submit"), background=True)
+    end = time.time() + 8
+    while time.time() < end and f"from=%{S1}(" not in srv.log():
+        time.sleep(0.05)
+    cli.send({"Command": {"PaneCloseById": {"session": "main", "pane_id": S1}}})
+    time.sleep(0.5)
+    stop.set()
+    t.join()
+    time.sleep(2.0)
+    typed = [c for _, c in rx_chunks(F_LOG)[start:] if b"GONE:plain" in c]
+    states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == "GONE:plain"]
+    check(not typed and states == ["Queued"] and f"msg: pane %{S1} closed with 1 of its message(s)" in srv.log(),
+          f"4n a send whose sender pane closed is never typed, and stays in the mailbox "
+          f"(typed {len(typed)}, states {states})")
+
+    # 4o: the same for a deferred send (sec-t4's D1).
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    block(F_CTL, F_LOG, F)
+    S2 = cli_spawn("SplitRight")
+    time.sleep(1.0)
+    start = len(rx_chunks(F_LOG))
+    # nohup, so the sending process outlives its pane and its connection
+    # stays open: only the pane's close can take the send out.
+    requests[0] += 1
+    o_in, o_out = f"{RUNDIR}/in-{requests[0]}.json", f"{RUNDIR}/out-{requests[0]}.json"
+    with open(o_in, "w") as f:
+        json.dump(dsend(F, "GONE:deferred", "Submit"), f)
+    before = deferred_logged()
+    line = f"nohup python3 {WIRE_SEND} {srv.sock} {o_in} {o_out} > /dev/null 2>&1 &\n"
+    cli.send({"InputToPane": {"pane_id": S2, "data": list(line.encode())}})
+    check(wait_logged(before), f"...the deferred send from %{S2} was stored")
+    cli.send({"Command": {"PaneCloseById": {"session": "main", "pane_id": S2}}})
+    r = wait_file(o_out, timeout=10)
+    tell(F_CTL, F_LOG, "clear")
+    time.sleep(2.0)
+    typed = [c for _, c in rx_chunks(F_LOG)[start:] if b"GONE:deferred" in c]
+    check(outcome(r) == ("Error", "sender_closed") and not typed,
+          f"4o a deferred send whose sender pane closed is answered sender_closed and never typed "
+          f"(reply {r}, typed {len(typed)})")
+
+    # 4p: a deferred send whose sender's connection closes (decision 42).
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    block(F_CTL, F_LOG, F)
+    start = len(rx_chunks(F_LOG))
+    background_defer(A, dsend(F, "GONE:conn", "Submit"))
+    cli.send({"InputToPane": {"pane_id": A, "data": list(b"kill $!\n")}})
+    end = time.time() + 8
+    while time.time() < end and "dropped 1 deferred submit(s)" not in srv.log():
+        time.sleep(0.05)
+    tell(F_CTL, F_LOG, "clear")
+    time.sleep(2.0)
+    typed = [c for _, c in rx_chunks(F_LOG)[start:] if b"GONE:conn" in c]
+    states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == "GONE:conn"]
+    check(not typed and states == ["Queued"] and "dropped 1 deferred submit(s)" in srv.log(),
+          f"4p a deferred send whose sender's connection closed is never typed, and stays in the mailbox "
+          f"(typed {len(typed)}, states {states})")
+
+    # 4i: a deferred send outlasts the typing guard's cap.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    stop = threading.Event()
+    t = threading.Thread(target=typer, args=(stop, "cell", F))
+    t.start()
+    time.sleep(0.5)
+    out = type_start(A, dsend(F, "GUARD:deferred", "Submit", timeout_ms=20000))
+    time.sleep(3.0)
+    stop.set()
+    t.join()
+    r = wait_file(out, timeout=10)
+    k, at = last_k(F_LOG), chunk_at(F_LOG, "GUARD:deferred")
+    gap = (at - k) / 1e6 if (k and at) else None
+    check(submitted(r) and gap is not None and gap >= 450,
+          f"4i a deferred send held by typing past the guard's 2 s cap is typed {gap} ms after the last key (reply {r})")
+
+    # 4k: a prompt drawn after the text: the Enter is refused, and the
+    # deferred message is NOT typed again once the prompt is answered.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    tell(F_CTL, F_LOG, "block-on-rx")
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    start = len(rx_chunks(F_LOG))
+    r = type_send(A, dsend(F, "PROMPT:deferred", "Submit", timeout_ms=20000))
+    tell(F_CTL, F_LOG, "clear")
+    time.sleep(1.5)
+    seq = [c for _, c in rx_chunks(F_LOG)[start:]]
+    pastes = sum(1 for c in seq if c.startswith(OPEN) and b"PROMPT:deferred" in c)
+    check(outcome(r) == ("Mailbox", "agent_blocked_read") and pastes == 1 and b"\r" not in seq,
+          f"4k a deferred send whose agent read it and then drew a prompt is the agent's, and typed once only "
+          f"(reply {r}, pastes {pastes}, chunks {[c[:12] for c in seq]})")
+
+    # 4e: the pane closes under two deferred sends.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    block(F_CTL, F_LOG, F)
+    outs = [defer_start(A, dsend(F, "CLOSE:1", "Submit")), defer_start(A2, dsend(F, "CLOSE:2", "Auto"))]
+    cli.send({"Command": {"PaneCloseById": {"session": "main", "pane_id": F}}})
+    replies = [wait_file(o, timeout=10) for o in outs]
+    check([outcome(x) for x in replies] == [("Error", "no_such_target")] * 2,
+          f"4e the pane closes under two deferred sends: both are no_such_target (got {replies})")
+    check(f"msg: pane %{F} closed with 2 message(s) waiting to be typed" in srv.log(),
+          "4e ...and the log names the count")
+
+    # 4g, finished: clear G once the hold has passed.
+    wait = g_t0 + HOLD_S + 2.0 - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    held = not os.path.exists(g_out)
+    clear_ns = time.time_ns()
+    tell(G_CTL, G_LOG, "clear")
+    r = wait_file(g_out, timeout=10)
+    at = chunk_at(G_LOG, "LONG:deferred")
+    check(held and submitted(r) and at is not None and at > clear_ns,
+          f"4g a deferred send outlives the {HOLD_S:.2f}s hold: still parked at {time.time() - g_t0 - 0.0:.1f}s, "
+          f"then typed after the clear (held {held}, reply {r})")
+
+    # 4d and 4j, finished: all three ended at the hold, and nothing is typed
+    # once the prompts are answered.
+    replies = {name: wait_file(o, timeout=HOLD_S + 15) for name, o in
+               (("sub", dl_sub), ("behind", dl_behind), ("auto", dl_auto))}
+    took = time.time() - d_t0
+    message = ((replies["sub"] or {}).get("Error") or {}).get("message", "")
+    check(outcome(replies["sub"]) == ("Error", "submit_timeout") and "in the mailbox" in message
+          and took >= HOLD_S,
+          f"4d a deferred Submit blocked past its timeout is submit_timeout "
+          f"(after {took:.1f}s; got {replies['sub']})")
+    check(outcome(replies["auto"]) == ("Mailbox", "agent_blocked")
+          and (replies["auto"] or {}).get("MsgSent", {}).get("timed_out") is True,
+          f"4d ...a deferred Auto at the head, with timeout 0, waits the {HOLD_S:.2f}s hold, then is "
+          f"Mailbox/agent_blocked, timed_out (got {replies['auto']})")
+    check(outcome(replies["behind"]) == ("Mailbox", "submit_timeout")
+          and (replies["behind"] or {}).get("MsgSent", {}).get("timed_out") is True,
+          f"4j a deferred Auto BEHIND a waiting head times out as Mailbox/submit_timeout, timed_out "
+          f"(got {replies['behind']})")
+    tell(H_CTL, H_LOG, "clear")
+    tell(I_CTL, I_LOG, "clear")
+    time.sleep(1.5)
+    late = [c for _, c in rx_chunks(H_LOG)[d_start[0]:] + rx_chunks(I_LOG)[d_start[1]:] if b"DL:" in c]
+    check(not late, f"4d ...and nothing is typed once the prompts are answered (late chunks {len(late)})")
+    check("panicked at" not in srv.log(), "4z no panic")
+finally:
+    srv.kill()
+
+
+
+# --- T4b: one deferred send per sender per pane, at the default queue size,
+# where the per-sender share (half the queue) would allow four.
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T4.replace("submit_queue_len = 3\n", ""))
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    A = cli_spawn("SplitRight")
+    A2 = cli_spawn("SplitBelow")
+    time.sleep(1.0)
+
+    def background_defer(pane, msg):
+        before = deferred_logged()
+        out = type_start(pane, msg, background=True)
+        check(wait_logged(before), f"...the deferred send from %{pane} was stored")
+        return out
+
+    # 4m: one deferred send per sender per target pane.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    block(F_CTL, F_LOG, F)
+    start = len(rx_chunks(F_LOG))
+    first = background_defer(A, dsend(F, "ONE:first", "Submit"))
+    t0 = time.time()
+    r_second = type_send(A, dsend(F, "ONE:second", "Auto"))
+    took = time.time() - t0
+    other = background_defer(A2, dsend(F, "ONE:other", "Submit"))
+    box = {m["body"]: m["state"] for m in (read_box(F, all=True) or []) if m["body"].startswith("ONE:")}
+    check(outcome(r_second) == ("Mailbox", "queue_full") and took < 4.0 and box.get("ONE:second") == "Queued",
+          f"4m a sender's second deferred send to a pane is queue_full at once, and in the mailbox "
+          f"({took:.1f}s; reply {r_second}, box {box})")
+    tell(F_CTL, F_LOG, "clear")
+    replies = [wait_file(first, timeout=15), wait_file(other, timeout=15)]
+    check(all(submitted(x) for x in replies),
+          f"4m ...while another sender's deferred send is still taken, and both are typed (got {replies})")
+
+
+    def put_back_with_sender_gone(case, deferred, part_sender):
+        """A deaf agent, so the probe sits unread; `part_sender` makes the
+        sender go; then a person's key takes the pane back. The send must not
+        be put back: once the agent reads again, none of it is typed."""
+        X, X_LOG, X_CTL = spawn_agent(paste=True)
+        tell(X_CTL, X_LOG, "deaf")
+        S = cli_spawn("SplitRight")
+        time.sleep(1.0)
+        body = f"GONE:{case}"
+        msg = dsend(X, body, "Submit") if deferred else send(X, body, "Submit")
+        type_start(S, msg, background=True)
+        end = time.time() + 8
+        while time.time() < end and f"from=%{S}(" not in srv.log():
+            time.sleep(0.01)
+        part_sender(S)
+        cli.send({"InputToPane": {"pane_id": X, "data": list(b"k")}})
+        time.sleep(0.5)
+        tell(X_CTL, X_LOG, "resume")
+        time.sleep(2.5)
+        typed = [c for _, c in raw_chunks(X_LOG) if body.encode() in c]
+        return typed
+
+    def close_pane(S):
+        cli.send({"Command": {"PaneCloseById": {"session": "main", "pane_id": S}}})
+
+    typed = put_back_with_sender_gone("4q", False, close_pane)
+    check(not typed and "submit refused (sender_closed)" in srv.log() and "its text is withdrawn" in srv.log(),
+          f"4q a send whose sender pane closed, taken back by a person's key, is answered sender_closed and "
+          f"never typed (typed {len(typed)})")
+
+    def kill_sender(S):
+        cli.send({"InputToPane": {"pane_id": S, "data": list(b"kill $!\n")}})
+        end = time.time() + 5
+        while time.time() < end and "1 being typed now" not in srv.log():
+            time.sleep(0.01)
+        check("1 being typed now" in srv.log(),
+              f"...4t's sender %{S} went while its send was being typed, not before or after")
+
+    typed = put_back_with_sender_gone("4t", True, kill_sender)
+    check(not typed and "not put back: its sender stopped waiting for it" in srv.log(),
+          f"4t a deferred send whose sender stopped waiting, taken back by a person's key, is not put back "
+          f"and never typed (typed {len(typed)})")
+
+    # 4s: a prompt drawn right after the probe: the deferred send is put
+    # back with only its probe typed, waits, and is typed once.
+    # A tab of its own: in a small pane the agent's next lines scroll the
+    # prompt off the screen before it is seen.
+    Z, Z_LOG, Z_CTL = spawn_agent(paste=True, placement="NewTab")
+    tell(Z_CTL, Z_LOG, "block-on-probe")
+    check(wait_idle(Z), f"...the agent in %{Z} settled Idle before the next send")
+    out = background_defer(A, dsend(Z, "BLOCKED:probe", "Submit"))
+    time.sleep(2.0)
+    held = not os.path.exists(out)
+    tell(Z_CTL, Z_LOG, "clear")
+    r = wait_file(out, timeout=15)
+    time.sleep(0.5)
+    typed = sum(1 for _, c in raw_chunks(Z_LOG) if b"BLOCKED:probe" in c)
+    check(held and submitted(r) and typed == 1,
+          f"4s a deferred send whose agent drew a prompt after its probe waits, then is typed once "
+          f"(held {held}, reply {r}, typed {typed}x)")
+    check("panicked at" not in srv.log(), "4z no panic (one per sender)")
+finally:
+    srv.kill()
 
 
 # --- S: prompts no pattern names, and text nobody read --------------------------

@@ -600,6 +600,8 @@ struct OutgoingMessage {
     deliver: Deliver,
     reply_to: Option<MsgRef>,
     pane_hint: Option<PaneId>,
+    defer: bool,
+    timeout_ms: Option<u64>,
 }
 
 /// A [`ClientMessage::AgentName`], unpacked.
@@ -764,6 +766,8 @@ async fn handle_msg_send(
     // The parked-send check, the store and the enqueue are one section, so a
     // send refused `bad_request` is never stored: its sender is told it was
     // refused, and a message it cannot know about must not reach the pane.
+    let enqueued_at = std::time::Instant::now();
+    let deadline = submit_deadline(enqueued_at, msg.defer, msg.timeout_ms);
     let (sent, swept, answered, queued) = {
         let mut store = store.lock().await;
         if submit && store.has_parked_send(client_id) {
@@ -807,8 +811,12 @@ async fn handle_msg_send(
                     body,
                     from_pane: from.pane,
                     from_name: from_name.clone(),
-                    enqueued_at: std::time::Instant::now(),
+                    enqueued_at,
+                    defer: msg.defer,
+                    deadline,
+                    had_reply: reply_tx.is_some(),
                     reply: reply_tx.map(|tx| crate::server::messaging::Reply { client_id, tx }),
+                    put_back: 0,
                     waiting_on: None,
                 },
                 config.messaging.submit_queue_len(),
@@ -836,10 +844,11 @@ async fn handle_msg_send(
     match sent {
         Ok((id, to_name)) => {
             log::info!(
-                "msg: id={id} from=%{}({}) to=%{to} bytes={bytes} deliver={:?} -> mailbox",
+                "msg: id={id} from=%{}({}) to=%{to} bytes={bytes} deliver={:?}{} -> mailbox",
                 from.pane,
                 from_name.as_deref().unwrap_or("-"),
-                msg.deliver
+                msg.deliver,
+                if msg.defer && submit { " defer" } else { "" }
             );
             let resolved = Resolved {
                 host: None,
@@ -877,6 +886,7 @@ fn answer_enqueued(
             to: resolved,
             delivery: Delivery::Mailbox,
             reason: None,
+            timed_out: false,
         }),
         Some(Ok(())) => {
             mark_submit_dirty();
@@ -933,6 +943,19 @@ async fn run_submitter(
         } else {
             SUBMIT_DIRTY.notified().await;
         }
+        let late = store
+            .lock()
+            .await
+            .take_overdue_submits(std::time::Instant::now());
+        for entry in late {
+            let answer = crate::server::submit::overdue(
+                entry.deliver,
+                entry.pane,
+                entry.id,
+                entry.waiting_on,
+            );
+            reply_submit(entry, answer, None, store).await;
+        }
         let heads = store.lock().await.submit_heads();
         for head in heads {
             step_submit(head, &state, &panes, &clients, &config, store).await;
@@ -956,20 +979,22 @@ async fn step_submit(
     store: &'static Mutex<Messaging>,
 ) {
     use crate::server::submit::{
-        guard_wait, precheck, settle, working_first, Answer, GuardVerdict, SubmitRefusal,
+        guard_wait, overdue, precheck, settle, waits_while_blocked, working_first, Answer,
+        GuardVerdict, SubmitRefusal,
     };
 
     let (pane, id) = (head.pane, head.id);
-    let hold = std::time::Duration::from_millis(SUBMIT_HOLD_MS);
-    // A head also waits for the entries typed before it, so the guard's own
-    // cap does not bound how long it has been held.
-    if head.enqueued_at.elapsed() > hold {
-        let answer = settle(head.deliver, SubmitRefusal::out_of_time(pane, id));
-        return answer_head(pane, id, answer, None, store).await;
-    }
     let sample = sample_pane(pane, state, panes, config).await;
     let rule = submit_policy(config).rule_for(sample.command.as_deref().unwrap_or(""));
     let agent_state = sample.state;
+    if waits_while_blocked(
+        sample.live,
+        sample.command.is_some(),
+        agent_state,
+        head.defer,
+    ) {
+        return hold_while_blocked(pane, id, store).await;
+    }
     if let Some(answer) = precheck(
         pane,
         sample.live,
@@ -1000,15 +1025,17 @@ async fn step_submit(
         &guard,
     ) {
         GuardVerdict::Ready => {}
-        GuardVerdict::Wait(_) => {
+        GuardVerdict::Expired if !head.defer => {
+            let answer = settle(head.deliver, SubmitRefusal::human_typing(pane));
+            return answer_head(pane, id, answer, None, store).await;
+        }
+        // A deferred submit outlasts the guard's cap: its own deadline ends
+        // it, in the sweep.
+        GuardVerdict::Wait(_) | GuardVerdict::Expired => {
             if store.lock().await.set_waiting(pane, id, "human_typing") {
                 log::info!("msg: id={id} submit waiting: human_typing");
             }
             return;
-        }
-        GuardVerdict::Expired => {
-            let answer = settle(head.deliver, SubmitRefusal::human_typing(pane));
-            return answer_head(pane, id, answer, None, store).await;
         }
     }
     if answer_working(pane, id, agent_state, &rule, head.deliver, store).await {
@@ -1029,7 +1056,7 @@ async fn step_submit(
         let Some(mut entry) = st.pop_submit(pane, id) else {
             return;
         };
-        if entry.enqueued_at.elapsed() > hold {
+        if std::time::Instant::now() >= entry.deadline {
             Claim::OutOfTime(entry)
         } else if st.mark_submitted(pane, id) {
             st.begin_typing(pane, entry.reply.take());
@@ -1041,7 +1068,7 @@ async fn step_submit(
     let entry = match claim {
         Claim::Typing(entry) => entry,
         Claim::OutOfTime(entry) => {
-            let answer = settle(entry.deliver, SubmitRefusal::out_of_time(pane, id));
+            let answer = overdue(entry.deliver, pane, id, entry.waiting_on);
             reply_submit(entry, answer, None, store).await;
             mark_submit_dirty();
             return;
@@ -1073,10 +1100,19 @@ async fn step_submit(
     .await;
     let (bracketed, bytes, enter, text) = match typed {
         Ok(typed) => typed,
-        Err(TextRefusal::HumanTyped) => return requeue_untyped(entry, store).await,
+        // Nothing was written, so the entry goes back to wait: for the guard
+        // again, or, deferred, for the agent's user to answer it.
+        Err(TextRefusal::HumanTyped) => return requeue_untyped(entry, false, store).await,
+        Err(TextRefusal::Blocked) if entry.defer => {
+            return requeue_untyped(entry, false, store).await
+        }
         Err(TextRefusal::Working(answer)) => {
             let policy = Some(working_policy(&rule));
             return answer_untyped(entry, answer, policy, store).await;
+        }
+        Err(TextRefusal::Blocked) => {
+            let answer = settle(entry.deliver, SubmitRefusal::blocked(pane));
+            return answer_untyped(entry, answer, None, store).await;
         }
         Err(TextRefusal::Refuse(refusal)) => {
             let answer = settle(entry.deliver, refusal);
@@ -1121,6 +1157,7 @@ async fn step_submit(
                     },
                     delivery: Delivery::Submitted,
                     reason: None,
+                    timed_out: false,
                 };
                 send_reply(id, reply, message);
             }
@@ -1141,7 +1178,12 @@ async fn step_submit(
                 )
                 .await;
             }
-            Typed::PutBack => requeue_untyped(entry, store).await,
+            Typed::PutBack => requeue_untyped(entry, true, store).await,
+            // Only the probe reached the agent, so a deferred message waits
+            // for its user's answer as it would before anything was typed.
+            Typed::Untyped(refusal) if entry.defer && refusal.code == "agent_blocked" => {
+                requeue_untyped(entry, true, store).await
+            }
             Typed::Untyped(refusal) | Typed::Refused(refusal) => {
                 if refusal.code == "agent_did_not_read" {
                     log::info!(
@@ -1155,6 +1197,28 @@ async fn step_submit(
         typing.disarm();
         mark_submit_dirty();
     });
+}
+
+/// Hold `pane`'s deferred head `id` while its agent waits on its user. The
+/// entries behind it that were not deferred are answered `agent_blocked` now,
+/// as each would be at the head: nothing is typed, so the order of what is
+/// typed is kept.
+async fn hold_while_blocked(pane: PaneId, id: MsgId, store: &'static Mutex<Messaging>) {
+    use crate::server::submit::{settle, SubmitRefusal};
+    let (new, behind) = {
+        let mut st = store.lock().await;
+        (
+            st.set_waiting(pane, id, "agent_blocked"),
+            st.take_undeferred_behind(pane, id),
+        )
+    };
+    if new {
+        log::info!("msg: id={id} submit waiting: agent_blocked");
+    }
+    for entry in behind {
+        let answer = settle(entry.deliver, SubmitRefusal::blocked(pane));
+        reply_submit(entry, answer, None, store).await;
+    }
 }
 
 /// Answer an entry that was claimed but not written with `answer`.
@@ -1180,14 +1244,43 @@ async fn answer_untyped(
 }
 
 /// Put back an entry that was claimed but not written, at the front of its
-/// queue with its reply, so that it is decided again on the next pass.
+/// queue with its reply, so that it is decided again on the next pass:
+/// `after_probe` when its probe had been typed.
+///
+/// Not when nothing is waiting for it any more. Its sender's pane closed: a
+/// message typed later in its name would come from a pane that is gone. Or
+/// it was deferred and its sender has stopped waiting for the answer it
+/// asked for: it may otherwise wait minutes and be typed long after anyone
+/// cares. Either way it stays in the mailbox.
 async fn requeue_untyped(
     mut entry: crate::server::messaging::SubmitEntry,
+    after_probe: bool,
     store: &'static Mutex<Messaging>,
 ) {
+    use crate::server::submit::{settle, SubmitRefusal};
     let mut st = store.lock().await;
     st.unsubmit(entry.pane, entry.id);
     entry.reply = st.end_typing(entry.pane);
+    let id = entry.id;
+    if st.is_closed(entry.from_pane) {
+        drop(st);
+        let refusal = SubmitRefusal::sender_closed(entry.from_pane, id);
+        let answer = settle(entry.deliver, refusal);
+        reply_submit(entry, answer, None, store).await;
+        mark_submit_dirty();
+        return;
+    }
+    if entry.defer && entry.had_reply && entry.reply.is_none() {
+        drop(st);
+        log::info!(
+            "msg: id={id} not put back: its sender stopped waiting for it; it stays in the mailbox"
+        );
+        mark_submit_dirty();
+        return;
+    }
+    if after_probe && entry.defer && entry.note_put_back() {
+        log::info!("msg: id={id} put back after its probe more than once");
+    }
     st.requeue_front(entry);
     drop(st);
     mark_submit_dirty();
@@ -1345,6 +1438,20 @@ fn answer_submit(
                 to: resolved,
                 delivery: Delivery::Mailbox,
                 reason: Some(reason.to_string()),
+                timed_out: false,
+            }
+        }
+        Answer::TimedOut(reason) => {
+            log::info!(
+                "msg: id={id} submit -> mailbox ({}, timed out)",
+                why(reason)
+            );
+            ServerMessage::MsgSent {
+                id,
+                to: resolved,
+                delivery: Delivery::Mailbox,
+                reason: Some(reason.to_string()),
+                timed_out: true,
             }
         }
     }
@@ -1355,6 +1462,9 @@ enum TextRefusal {
     /// A person typed into the pane after it was sampled. The submit is put
     /// back to wait for the guard again, not refused.
     HumanTyped,
+    /// The agent is waiting on its user. Refused `agent_blocked`, unless
+    /// the submit was deferred, when it waits again.
+    Blocked,
     Refuse(crate::server::submit::SubmitRefusal),
     /// The agent is working and its row's `while_working` does not type into
     /// it: answered as the row says.
@@ -1419,7 +1529,7 @@ async fn type_text(
     let now = std::time::Instant::now();
     let agent_state = submit_state(pd, command, agent_rules(config), now);
     if agent_state == AgentState::NeedsInput {
-        return refuse(SubmitRefusal::blocked(pane));
+        return Err(TextRefusal::Blocked);
     }
     if let Some(answer) = on_working(pane, Some(agent_state), rule, deliver) {
         return Err(TextRefusal::Working(answer));
@@ -1538,10 +1648,33 @@ const MAX_CHUNKS: usize = (BODY_CAP.as_millis() / CHUNK_COST.as_millis()) as usi
 /// How long a cancelled write is given to stop before its queue is flushed.
 const CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long a deferred submit may wait when its sender names no timeout.
+pub const DEFAULT_SUBMIT_TIMEOUT_MS: u64 = 600_000;
+
+/// When a submit queued at `enqueued_at` is answered as out of time. A
+/// deferred one waits as long as its sender asked, between [`SUBMIT_HOLD_MS`]
+/// and [`MAX_WAIT_MS`]: it waits on a person answering their agent, which
+/// can take minutes, and it is never given less time than a submit that did
+/// not ask to wait. Any other is held at most [`SUBMIT_HOLD_MS`].
+fn submit_deadline(
+    enqueued_at: std::time::Instant,
+    defer: bool,
+    timeout_ms: Option<u64>,
+) -> std::time::Instant {
+    let ms = if defer {
+        timeout_ms
+            .unwrap_or(DEFAULT_SUBMIT_TIMEOUT_MS)
+            .clamp(SUBMIT_HOLD_MS, MAX_WAIT_MS)
+    } else {
+        SUBMIT_HOLD_MS
+    };
+    enqueued_at + std::time::Duration::from_millis(ms)
+}
+
 /// The longest a submit is held in its queue before it is typed: the typing
 /// guard at its cap, and one tick for the submitter to see it clear. Past
 /// this the submit is answered `timeout` and nothing is typed.
-const SUBMIT_HOLD_MS: u64 =
+pub const SUBMIT_HOLD_MS: u64 =
     crate::config::messaging::MAX_TYPING_GUARD_MS + SUBMIT_TICK.as_millis() as u64;
 
 /// The longest from a submit's arrival to its answer: held for at most
@@ -3830,10 +3963,12 @@ async fn handle_client_message(
             deliver,
             reply_to,
             pane_hint,
+            defer,
+            timeout_ms,
         } => {
             log::debug!(
                 "server: client_id={client_id} msg=MsgSend(to={}, deliver={deliver:?}, {} bytes, \
-                 reply_to={}, pane_hint={pane_hint:?})",
+                 reply_to={}, pane_hint={pane_hint:?}, defer={defer}, timeout={timeout_ms:?})",
                 loggable(&to.to_string()),
                 body.len(),
                 reply_to
@@ -3910,6 +4045,8 @@ async fn handle_client_message(
             deliver,
             reply_to,
             pane_hint,
+            defer,
+            timeout_ms,
         } => {
             let outgoing = OutgoingMessage {
                 to,
@@ -3917,6 +4054,8 @@ async fn handle_client_message(
                 deliver,
                 reply_to,
                 pane_hint,
+                defer,
+                timeout_ms,
             };
             let answer = handle_msg_send(
                 client_id,
@@ -7774,7 +7913,7 @@ async fn handle_client_disconnect(
         let mut cls = clients.lock().await;
         cls.remove(&client_id);
     }
-    let (dropped, (queued, typing)) = {
+    let (dropped, (queued, typing, deferred)) = {
         let mut store = messaging().lock().await;
         (
             store.drop_waiters_of(client_id),
@@ -7783,6 +7922,12 @@ async fn handle_client_disconnect(
     };
     if dropped > 0 {
         log::info!("msg: dropped {dropped} waiter(s) of client_id={client_id} (disconnected)");
+    }
+    if deferred > 0 {
+        log::info!(
+            "msg: dropped {deferred} deferred submit(s) of client_id={client_id} (disconnected): \
+             nobody waits for them now, and they stay in the mailbox"
+        );
     }
     if queued + typing > 0 {
         log::info!(
@@ -12148,6 +12293,26 @@ async fn reap_panes(
                     format!("pane %{pane_id} closed while waiting"),
                 ));
             }
+            let orphans = store.take_submits_from(pane_id);
+            if !orphans.is_empty() {
+                log::info!(
+                    "msg: pane %{pane_id} closed with {} of its message(s) waiting to be typed \
+                     elsewhere; they stay in the mailbox",
+                    orphans.len()
+                );
+            }
+            for entry in orphans {
+                let resolved = Resolved {
+                    host: None,
+                    pane_id: entry.pane,
+                    name: store.name_of(entry.pane).map(str::to_string),
+                };
+                let refusal =
+                    crate::server::submit::SubmitRefusal::sender_closed(pane_id, entry.id);
+                let answer = crate::server::submit::settle(entry.deliver, refusal);
+                let message = answer_submit(entry.id, resolved, answer, None);
+                send_reply(entry.id, entry.reply, message);
+            }
             let (queued, replies) = store.take_submits(pane_id);
             if queued > 0 {
                 log::info!(
@@ -13026,7 +13191,11 @@ mod tests {
                 from_pane: 1,
                 from_name: None,
                 enqueued_at: std::time::Instant::now(),
+                defer: false,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 reply: None,
+                had_reply: false,
+                put_back: 0,
                 waiting_on: None,
             };
             st.enqueue_submit(queued, 8).unwrap();
@@ -13067,6 +13236,35 @@ mod tests {
             loaded * (MAX_CHUNKS as u32) <= BODY_CAP,
             "a body at the limit, at the cost per chunk measured under load, fits in the cap"
         );
+    }
+
+    #[test]
+    fn a_deferred_submit_is_bounded_by_its_own_timeout_not_the_hold() {
+        use super::{submit_deadline, DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS, SUBMIT_HOLD_MS};
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        assert_eq!(submit_deadline(t0, false, None), at(SUBMIT_HOLD_MS));
+        assert_eq!(
+            submit_deadline(t0, false, Some(1)),
+            at(SUBMIT_HOLD_MS),
+            "a timeout bounds only a deferred wait"
+        );
+        assert_eq!(
+            submit_deadline(t0, true, Some(0)),
+            at(SUBMIT_HOLD_MS),
+            "never less than a submit that did not ask to wait"
+        );
+        assert_eq!(submit_deadline(t0, true, Some(1500)), at(SUBMIT_HOLD_MS));
+        assert_eq!(
+            submit_deadline(t0, true, Some(SUBMIT_HOLD_MS * 2)),
+            at(SUBMIT_HOLD_MS * 2),
+            "past the hold"
+        );
+        assert_eq!(
+            submit_deadline(t0, true, None),
+            at(DEFAULT_SUBMIT_TIMEOUT_MS)
+        );
+        assert_eq!(submit_deadline(t0, true, Some(u64::MAX)), at(MAX_WAIT_MS));
     }
 
     #[test]

@@ -167,8 +167,10 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     deliver: deliver.into(),
                     reply_to: reply_to.map(|id| MsgRef { host: None, id }),
                     pane_hint: pane_hint(),
+                    defer: false,
+                    timeout_ms: None,
                 },
-                send_deadline(deliver.into()),
+                send_deadline(deliver.into(), false, None),
             )
             .await
             .map_err(|e| match e {
@@ -181,6 +183,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     to,
                     delivery,
                     reason,
+                    timed_out: _,
                 } => {
                     log::debug!("cmd: msg send answered MsgSent(id={id})");
                     if json {
@@ -383,12 +386,27 @@ fn body_of(raw: Vec<u8>) -> Result<String, CliError> {
 }
 
 /// How long `msg send` waits for its answer. A submit's answer waits for the
-/// message to be typed, so it has the server's whole submit budget on top.
-fn send_deadline(deliver: Deliver) -> Duration {
+/// message to be typed, so it has the server's whole submit budget on top,
+/// and a deferred one may first wait for its whole timeout, as the server
+/// caps it.
+fn send_deadline(deliver: Deliver, defer: bool, timeout: Option<Duration>) -> Duration {
+    use crate::server::daemon::{
+        DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS, SUBMIT_BUDGET_MS, SUBMIT_HOLD_MS,
+    };
+    let deferred = if defer {
+        timeout
+            .unwrap_or(Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS))
+            .clamp(
+                Duration::from_millis(SUBMIT_HOLD_MS),
+                Duration::from_millis(MAX_WAIT_MS),
+            )
+    } else {
+        Duration::ZERO
+    };
     match deliver {
         Deliver::Mailbox => REPLY_DEADLINE,
         Deliver::Submit | Deliver::Auto => {
-            REPLY_DEADLINE + Duration::from_millis(crate::server::daemon::SUBMIT_BUDGET_MS)
+            REPLY_DEADLINE + Duration::from_millis(SUBMIT_BUDGET_MS) + deferred
         }
     }
 }
@@ -559,9 +577,43 @@ mod tests {
     fn a_submit_is_waited_for_past_the_servers_whole_budget() {
         let server_worst = Duration::from_millis(crate::server::daemon::SUBMIT_BUDGET_MS)
             + crate::server::daemon::CALLER_ATTRIBUTION_TIMEOUT;
-        assert!(send_deadline(Deliver::Submit) > server_worst);
-        assert!(send_deadline(Deliver::Auto) > server_worst);
-        assert_eq!(send_deadline(Deliver::Mailbox), REPLY_DEADLINE);
+        assert!(send_deadline(Deliver::Submit, false, None) > server_worst);
+        assert!(send_deadline(Deliver::Auto, false, None) > server_worst);
+        assert_eq!(send_deadline(Deliver::Mailbox, false, None), REPLY_DEADLINE);
+    }
+
+    #[test]
+    fn a_deferred_submit_is_waited_for_past_its_own_timeout_too() {
+        let plain = send_deadline(Deliver::Submit, false, None);
+        let ms = Duration::from_millis;
+        assert_eq!(
+            send_deadline(Deliver::Submit, true, Some(ms(120_000))),
+            plain + ms(120_000)
+        );
+        assert_eq!(
+            send_deadline(Deliver::Submit, true, Some(ms(0))),
+            plain + ms(crate::server::daemon::SUBMIT_HOLD_MS),
+            "no shorter than the server waits"
+        );
+        assert_eq!(
+            send_deadline(Deliver::Auto, true, None),
+            plain + ms(crate::server::daemon::DEFAULT_SUBMIT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            send_deadline(Deliver::Submit, true, Some(ms(u64::MAX / 2))),
+            plain + ms(crate::server::daemon::MAX_WAIT_MS),
+            "no longer than the server can wait"
+        );
+        assert_eq!(
+            send_deadline(Deliver::Submit, false, Some(ms(20_000))),
+            plain,
+            "a timeout bounds only a deferred wait"
+        );
+        assert_eq!(
+            send_deadline(Deliver::Mailbox, true, Some(ms(20_000))),
+            REPLY_DEADLINE,
+            "nothing is typed, so nothing is deferred"
+        );
     }
 
     #[test]

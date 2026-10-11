@@ -369,8 +369,11 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             deliver,
             reply_to,
             pane_hint,
+            defer,
+            timeout_ms,
         } => format!(
-            "MsgSend(to={:?}, deliver={deliver:?}, {} bytes, reply_to={:?}, pane_hint={pane_hint:?})",
+            "MsgSend(to={:?}, deliver={deliver:?}, {} bytes, reply_to={:?}, pane_hint={pane_hint:?}, \
+             defer={defer}, timeout={timeout_ms:?})",
             to.to_string(),
             body.len(),
             reply_to.as_ref().map(|r| r.id)
@@ -476,10 +479,16 @@ mod tests {
             deliver: crate::protocol::Deliver::Auto,
             reply_to: None,
             pane_hint: Some(3),
+            defer: true,
+            timeout_ms: Some(1500),
         });
         assert!(!s.contains("hunter2"), "the body must not appear: {s}");
         assert!(s.contains("beta"), "but the target must: {s}");
         assert!(s.contains("25 bytes"), "and the body's size: {s}");
+        assert!(
+            s.contains("defer=true, timeout=Some(1500)"),
+            "and the flags: {s}"
+        );
     }
 
     /// Drive [`handshake`] against a scripted peer that answers with `welcome`.

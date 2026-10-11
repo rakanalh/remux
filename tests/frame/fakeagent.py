@@ -51,6 +51,9 @@ so a command written while another is being read is never lost:
                          pasted block's END arrives: a prompt drawn between
                          a typed message and its Enter
   editblock-on-rx        the same, with the file-edit approval dialog
+  block-on-probe         show the permission prompt the moment the next
+                         read is a paste opener alone: a prompt drawn after
+                         the probe and before the message's body
   slow:<bytes>:<ms>      read at most <bytes> at a time, <ms> apart: an agent
                          that reads a long message slower than it arrives
   quit                   exit
@@ -126,6 +129,7 @@ def main():
     trickle = 0.0
     exit_on_rx = False
     block_on_rx = None
+    block_on_probe = False
     read_size, read_gap = 4096, 0.0
     while True:
         if deaf:
@@ -166,6 +170,9 @@ def main():
                 deaf = True
             if trickle:
                 time.sleep(trickle)
+            if block_on_probe and data == OPENER:
+                block_on_probe = False
+                out(PROCEED)
             if block_on_rx and b"\x1b[201~" in data:
                 out(block_on_rx)
                 block_on_rx = None
@@ -211,6 +218,8 @@ def main():
                 block_on_rx = PROCEED
             elif command == "editblock-on-rx":
                 block_on_rx = EDIT
+            elif command == "block-on-probe":
+                block_on_probe = True
             elif command == "quit":
                 ack(command)
                 return

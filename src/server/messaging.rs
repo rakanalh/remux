@@ -169,12 +169,32 @@ pub struct SubmitEntry {
     pub from_pane: PaneId,
     pub from_name: Option<String>,
     pub enqueued_at: Instant,
+    /// Waits while the agent is waiting on its user, rather than being
+    /// answered `agent_blocked`.
+    pub defer: bool,
+    /// When it is answered as out of time if it has not been typed, wherever
+    /// it is in its queue.
+    pub deadline: Instant,
     /// `None` once the sender's connection has closed: the entry is still
     /// typed when it can be, but nobody is told.
     pub reply: Option<Reply>,
+    /// The sender was waiting for the answer when this was queued, so a
+    /// `reply` of `None` now means it stopped waiting.
+    pub had_reply: bool,
+    /// How many times it was put back in its queue after its probe was typed.
+    pub put_back: u32,
     /// The last reason it was logged as waiting on, so a wait is logged once
     /// per distinct reason rather than on every pass.
     pub waiting_on: Option<&'static str>,
+}
+
+impl SubmitEntry {
+    /// Count a put-back after the probe. Returns whether this is the second,
+    /// so that a message going round and round is logged once, not per turn.
+    pub fn note_put_back(&mut self) -> bool {
+        self.put_back = self.put_back.saturating_add(1);
+        self.put_back == 2
+    }
 }
 
 /// A queue head as the submitter reads it: what it decides on, without the
@@ -185,6 +205,7 @@ pub struct SubmitHead {
     pub pane: PaneId,
     pub deliver: crate::protocol::Deliver,
     pub enqueued_at: Instant,
+    pub defer: bool,
 }
 
 /// Why a submit could not be queued.
@@ -422,6 +443,24 @@ pub struct Pruned {
     /// a session's name, which its creator chose, so it is made valid
     /// rather than costing the message.
     pub relabelled: usize,
+}
+
+/// Remove from `queue`, in order, the entries `take` picks, moving nothing
+/// when it picks none.
+fn take_where(
+    queue: &mut VecDeque<SubmitEntry>,
+    mut take: impl FnMut(&SubmitEntry) -> bool,
+) -> Vec<SubmitEntry> {
+    let mut taken = Vec::new();
+    let mut i = 0;
+    while i < queue.len() {
+        if take(&queue[i]) {
+            taken.extend(queue.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    taken
 }
 
 impl Messaging {
@@ -673,7 +712,10 @@ impl Messaging {
     /// Queue `entry` to be typed into its pane. Refused when its sender
     /// already has a send parked, and when the pane already holds `cap`
     /// entries or the sender already holds half of them: one sender cannot
-    /// fill a pane's queue and lock every other sender out of it.
+    /// fill a pane's queue and lock every other sender out of it. A deferred
+    /// entry waits as long as its sender asked, so a sender may hold only one
+    /// in a pane's queue: two senders holding half a queue each would lock
+    /// everyone else out for that long.
     pub fn enqueue_submit(&mut self, entry: SubmitEntry, cap: usize) -> Result<(), EnqueueRefusal> {
         if let Some(client_id) = entry.reply.as_ref().map(|r| r.client_id) {
             if self.has_parked_send(client_id) {
@@ -685,7 +727,11 @@ impl Messaging {
             .iter()
             .filter(|e| e.from_pane == entry.from_pane)
             .count();
-        if queue.len() >= cap || own >= (cap / 2).max(1) {
+        let deferred = entry.defer
+            && queue
+                .iter()
+                .any(|e| e.defer && e.from_pane == entry.from_pane);
+        if queue.len() >= cap || own >= (cap / 2).max(1) || deferred {
             if queue.is_empty() {
                 self.submit_queues.remove(&entry.pane);
             }
@@ -716,8 +762,61 @@ impl Messaging {
                 pane: e.pane,
                 deliver: e.deliver,
                 enqueued_at: e.enqueued_at,
+                defer: e.defer,
             })
             .collect()
+    }
+
+    /// Remove every queued entry whose deadline is past `now`, wherever it
+    /// is in its queue. An entry behind a head that waits is never a head,
+    /// so a check at the head alone would hold it past its sender's own
+    /// deadline, which then reports the outcome as unknown.
+    pub fn take_overdue_submits(&mut self, now: Instant) -> Vec<SubmitEntry> {
+        let mut overdue = Vec::new();
+        for queue in self.submit_queues.values_mut() {
+            overdue.extend(take_where(queue, |e| e.deadline <= now));
+        }
+        if !overdue.is_empty() {
+            self.submit_queues.retain(|_, queue| !queue.is_empty());
+        }
+        overdue
+    }
+
+    /// For a pane that is closing: remove the entries it SENT that are still
+    /// queued for other panes. Their sender is gone, and a message typed in
+    /// its name later, perhaps much later, would say it is from a pane that
+    /// no longer exists, or from a new pane given the same id.
+    pub fn take_submits_from(&mut self, from: PaneId) -> Vec<SubmitEntry> {
+        let mut taken = Vec::new();
+        for queue in self.submit_queues.values_mut() {
+            taken.extend(take_where(queue, |e| e.from_pane == from));
+        }
+        if !taken.is_empty() {
+            self.submit_queues.retain(|_, queue| !queue.is_empty());
+        }
+        taken
+    }
+
+    /// Remove, in order, the entries behind `pane`'s head `head` that are not
+    /// deferred. Called when the head waits for its agent to stop waiting on
+    /// its user: an entry that did not ask to wait for that is answered now,
+    /// as it would be at the head, rather than when its time runs out.
+    pub fn take_undeferred_behind(&mut self, pane: PaneId, head: MsgId) -> Vec<SubmitEntry> {
+        let Some(queue) = self
+            .submit_queues
+            .get_mut(&pane)
+            .filter(|q| q.front().is_some_and(|e| e.id == head))
+        else {
+            return Vec::new();
+        };
+        let Some(head) = queue.pop_front() else {
+            return Vec::new();
+        };
+        let (deferred, taken): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(queue).into_iter().partition(|e| e.defer);
+        *queue = deferred;
+        queue.push_front(head);
+        taken.into()
     }
 
     /// Record that `pane`'s head `id` is waiting on `reason`. Returns whether
@@ -735,6 +834,11 @@ impl Messaging {
             }
             _ => false,
         }
+    }
+
+    /// Whether `pane` closed: its mailbox was dropped with it.
+    pub fn is_closed(&self, pane: PaneId) -> bool {
+        self.closed.contains(&pane)
     }
 
     /// Remove `pane`'s head if it is still `id`.
@@ -767,13 +871,23 @@ impl Messaging {
         !self.submit_queues.is_empty() || !self.in_flight.is_empty()
     }
 
-    /// Drop the replies of a connection that closed: `(queued, typing)`.
-    /// Its entries stay and are typed when they can be, and one being typed
-    /// finishes: the sender asked for that, and its CLI giving up must not
-    /// lose the submit.
-    pub fn detach_replies_of(&mut self, client_id: u64) -> (usize, usize) {
+    /// Drop the replies of a connection that closed: `(queued, typing,
+    /// dropped)`. Its entries stay and are typed when they can be, and one
+    /// being typed finishes: the sender asked for that, and its CLI giving up
+    /// must not lose the submit. A DEFERRED entry whose sender was waiting
+    /// for it is removed instead (`dropped`), and stays in the mailbox: it
+    /// may wait for minutes on its agent's user, and once its sender has gone
+    /// nothing is waiting for it to be typed.
+    pub fn detach_replies_of(&mut self, client_id: u64) -> (usize, usize, usize) {
         let is_it =
             |reply: &Option<Reply>| reply.as_ref().is_some_and(|r| r.client_id == client_id);
+        let mut dropped = 0;
+        for queue in self.submit_queues.values_mut() {
+            dropped += take_where(queue, |e| e.defer && is_it(&e.reply)).len();
+        }
+        if dropped > 0 {
+            self.submit_queues.retain(|_, queue| !queue.is_empty());
+        }
         let mut queued = 0;
         for entry in self.submit_queues.values_mut().flatten() {
             if is_it(&entry.reply) {
@@ -788,7 +902,7 @@ impl Messaging {
                 typing += 1;
             }
         }
-        (queued, typing)
+        (queued, typing, dropped)
     }
 
     /// For a pane that is closing: how many messages were waiting to be
@@ -1721,9 +1835,22 @@ mod tests {
             from_pane: 100 + id,
             from_name: None,
             enqueued_at: Instant::now(),
+            defer: false,
+            deadline: Instant::now() + std::time::Duration::from_secs(60),
+            had_reply: client.is_some(),
             reply: client.map(reply),
+            put_back: 0,
             waiting_on: None,
         }
+    }
+
+    #[test]
+    fn a_second_put_back_is_noted_once() {
+        let mut e = entry(1, 5, None);
+        assert_eq!(
+            [e.note_put_back(), e.note_put_back(), e.note_put_back()],
+            [false, true, false]
+        );
     }
 
     fn reply(client_id: u64) -> Reply {
@@ -1802,7 +1929,7 @@ mod tests {
             m.enqueue_submit(entry(2, 6, Some(9)), 8),
             Err(EnqueueRefusal::SendParked)
         );
-        assert_eq!(m.detach_replies_of(9), (0, 1));
+        assert_eq!(m.detach_replies_of(9), (0, 1, 0));
         assert!(m.end_typing(5).is_none(), "the detached reply was dropped");
         assert_eq!(m.enqueue_submit(entry(3, 6, Some(9)), 8), Ok(()));
     }
@@ -1854,12 +1981,101 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_head_holds_its_queue() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(entry(1, 5, None), 8).unwrap();
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        assert!(m.set_waiting(5, 1, "agent_blocked"));
+        for _ in 0..3 {
+            assert_eq!(
+                m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+                [1],
+                "the entry behind a waiting head is never decided"
+            );
+        }
+        assert!(m.pop_submit(5, 2).is_none());
+    }
+
+    #[test]
+    fn overdue_entries_are_taken_wherever_they_sit_in_their_queue() {
+        let mut m = Messaging::new(limits());
+        let now = Instant::now();
+        let due = |id, pane, secs: i64| SubmitEntry {
+            deadline: if secs < 0 {
+                now - std::time::Duration::from_secs(secs.unsigned_abs())
+            } else {
+                now + std::time::Duration::from_secs(secs as u64)
+            },
+            ..entry(id, pane, None)
+        };
+        m.enqueue_submit(due(1, 5, 60), 8).unwrap();
+        m.enqueue_submit(due(2, 5, -1), 8).unwrap();
+        m.enqueue_submit(due(3, 5, 60), 8).unwrap();
+        m.enqueue_submit(due(4, 6, -1), 8).unwrap();
+        let mut taken: Vec<MsgId> = m.take_overdue_submits(now).iter().map(|e| e.id).collect();
+        taken.sort();
+        assert_eq!(taken, [2, 4], "behind a head as well as at one");
+        assert_eq!(
+            m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+            [1],
+            "pane 6's queue is gone with its only entry"
+        );
+        m.pop_submit(5, 1);
+        assert_eq!(
+            m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+            [3],
+            "the rest keep their order"
+        );
+        assert!(m.take_overdue_submits(now).is_empty());
+    }
+
+    #[test]
+    fn the_undeferred_entries_behind_a_head_are_taken_in_order() {
+        let mut m = Messaging::new(limits());
+        let deferred = |id| SubmitEntry {
+            defer: true,
+            ..entry(id, 5, None)
+        };
+        m.enqueue_submit(deferred(1), 8).unwrap();
+        m.enqueue_submit(entry(2, 5, None), 8).unwrap();
+        m.enqueue_submit(deferred(3), 8).unwrap();
+        m.enqueue_submit(entry(4, 5, None), 8).unwrap();
+        m.enqueue_submit(entry(5, 6, None), 8).unwrap();
+        assert!(
+            m.take_undeferred_behind(5, 3).is_empty(),
+            "a head that moved on since it was looked at"
+        );
+        let taken: Vec<MsgId> = m
+            .take_undeferred_behind(5, 1)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(taken, [2, 4]);
+        m.pop_submit(5, 1);
+        assert_eq!(
+            m.submit_heads()
+                .iter()
+                .filter(|h| h.pane == 5)
+                .map(|h| h.id)
+                .collect::<Vec<_>>(),
+            [3]
+        );
+        assert!(m.take_undeferred_behind(7, 1).is_empty(), "no such queue");
+        let mut lone = Messaging::new(limits());
+        lone.enqueue_submit(entry(1, 5, None), 8).unwrap();
+        assert!(
+            lone.take_undeferred_behind(5, 1).is_empty(),
+            "the head itself is never taken"
+        );
+    }
+
+    #[test]
     fn detach_keeps_the_entry_and_take_submits_returns_every_reply() {
         let mut m = Messaging::new(limits());
         m.enqueue_submit(entry(1, 5, Some(9)), 8).unwrap();
         m.enqueue_submit(entry(2, 5, None), 8).unwrap();
         m.enqueue_submit(entry(4, 5, Some(11)), 8).unwrap();
-        assert_eq!(m.detach_replies_of(9), (1, 0));
+        assert_eq!(m.detach_replies_of(9), (1, 0, 0));
         assert_eq!(m.submit_heads().len(), 1, "the entry stays");
         assert!(
             m.enqueue_submit(entry(3, 6, Some(9)), 8).is_ok(),
@@ -1875,6 +2091,86 @@ mod tests {
         assert!(m.has_submit_work(), "pane 6 still queued");
         m.take_submits(6);
         assert!(!m.has_submit_work());
+    }
+
+    #[test]
+    fn a_deferred_entry_whose_sender_went_is_dropped_and_others_are_kept() {
+        let mut m = Messaging::new(limits());
+        let deferred = |id, client| SubmitEntry {
+            defer: true,
+            ..entry(id, 5, client)
+        };
+        m.enqueue_submit(deferred(1, Some(9)), 8).unwrap();
+        m.enqueue_submit(deferred(2, None), 8).unwrap();
+        m.enqueue_submit(entry(3, 6, Some(10)), 8).unwrap();
+        assert_eq!(m.detach_replies_of(9), (0, 0, 1));
+        assert_eq!(m.detach_replies_of(10), (1, 0, 0), "not deferred: kept");
+        let mut heads: Vec<MsgId> = m.submit_heads().iter().map(|h| h.id).collect();
+        heads.sort();
+        assert_eq!(heads, [2, 3], "the one with no reply to lose is kept");
+    }
+
+    #[test]
+    fn an_entry_is_overdue_at_its_deadline_itself() {
+        let mut m = Messaging::new(limits());
+        let now = Instant::now();
+        let at_now = SubmitEntry {
+            deadline: now,
+            ..entry(1, 5, None)
+        };
+        m.enqueue_submit(at_now, 8).unwrap();
+        assert_eq!(m.take_overdue_submits(now).len(), 1);
+    }
+
+    #[test]
+    fn a_sender_holds_one_deferred_entry_per_pane() {
+        let mut m = Messaging::new(limits());
+        let deferred = |id, pane, from| SubmitEntry {
+            defer: true,
+            from_pane: from,
+            ..entry(id, pane, None)
+        };
+        m.enqueue_submit(deferred(1, 5, 40), 8).unwrap();
+        assert_eq!(
+            m.enqueue_submit(deferred(2, 5, 40), 8),
+            Err(EnqueueRefusal::QueueFull)
+        );
+        assert_eq!(
+            m.enqueue_submit(deferred(3, 6, 40), 8),
+            Ok(()),
+            "another pane"
+        );
+        assert_eq!(
+            m.enqueue_submit(deferred(4, 5, 41), 8),
+            Ok(()),
+            "another sender"
+        );
+        let plain = SubmitEntry {
+            from_pane: 40,
+            ..entry(5, 5, None)
+        };
+        assert_eq!(m.enqueue_submit(plain, 8), Ok(()), "not deferred");
+    }
+
+    #[test]
+    fn a_closed_pane_s_queued_sends_are_taken_from_every_queue() {
+        let mut m = Messaging::new(limits());
+        let from = |id, pane, from| SubmitEntry {
+            from_pane: from,
+            ..entry(id, pane, None)
+        };
+        m.enqueue_submit(from(1, 5, 40), 8).unwrap();
+        m.enqueue_submit(from(2, 5, 41), 8).unwrap();
+        m.enqueue_submit(from(3, 6, 40), 8).unwrap();
+        let mut taken: Vec<MsgId> = m.take_submits_from(40).iter().map(|e| e.id).collect();
+        taken.sort();
+        assert_eq!(taken, [1, 3]);
+        assert_eq!(
+            m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+            [2],
+            "pane 6's queue is gone with its only entry"
+        );
+        assert!(m.take_submits_from(40).is_empty());
     }
 
     #[test]
