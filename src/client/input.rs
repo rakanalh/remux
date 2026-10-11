@@ -456,11 +456,13 @@ pub enum InputAction {
     TabPickerUpdate,
     /// Tab picker confirmed: move the focused pane on `conn` to the tab with
     /// this id in `session`, or to a new tab in `session` when `tab_id` is
-    /// `None`.
+    /// `None`. `current` is the session the pane is in, as the picker's tree
+    /// named it.
     TabPickerConfirm {
         conn: ConnId,
         session: String,
         tab_id: Option<u64>,
+        current: String,
     },
     /// Tab picker closed without a move.
     TabPickerClose,
@@ -1356,6 +1358,11 @@ impl TabPickerOverlay {
 
     pub fn conn(&self) -> &ConnId {
         &self.conn
+    }
+
+    /// The session the focused pane is in, from the last tree.
+    fn current_session(&self) -> Option<&str> {
+        self.sessions.as_ref()?.first().map(|s| s.name.as_str())
     }
 
     /// Rebuild the rows from a tree sent by [`TabPickerOverlay::conn`].
@@ -3352,20 +3359,24 @@ impl InputHandler {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => close(self, InputAction::TabPickerClose),
             _ => match crate::client::sidebar::nav::nav_key(&key) {
-                Some(crate::client::sidebar::nav::NavKey::Activate) => match overlay.target() {
-                    Some((session, tab_id)) => {
-                        let conn = overlay.conn().clone();
-                        close(
-                            self,
-                            InputAction::TabPickerConfirm {
-                                conn,
-                                session,
-                                tab_id,
-                            },
-                        )
+                Some(crate::client::sidebar::nav::NavKey::Activate) => {
+                    match (overlay.target(), overlay.current_session()) {
+                        (Some((session, tab_id)), Some(current)) => {
+                            let conn = overlay.conn().clone();
+                            let current = current.to_owned();
+                            close(
+                                self,
+                                InputAction::TabPickerConfirm {
+                                    conn,
+                                    session,
+                                    tab_id,
+                                    current,
+                                },
+                            )
+                        }
+                        _ => InputAction::None,
                     }
-                    None => InputAction::None,
-                },
+                }
                 Some(cmd) => {
                     overlay.navigate(cmd);
                     InputAction::TabPickerUpdate
@@ -6956,6 +6967,7 @@ mod tab_picker_tests {
                 conn: ConnId::Remote("mini".into()),
                 session: "main".to_string(),
                 tab_id: Some(3),
+                current: "main".to_string(),
             }
         );
         assert!(h.tab_picker.is_none());
@@ -6980,6 +6992,7 @@ mod tab_picker_tests {
                 conn: ConnId::Local,
                 session: "other".to_string(),
                 tab_id: Some(4),
+                current: "main".to_string(),
             }
         );
 
@@ -7000,6 +7013,7 @@ mod tab_picker_tests {
                 conn: ConnId::Local,
                 session: "other".to_string(),
                 tab_id: None,
+                current: "main".to_string(),
             }
         );
     }
@@ -7015,6 +7029,7 @@ mod tab_picker_tests {
                 conn: ConnId::Local,
                 session: "main".to_string(),
                 tab_id: None,
+                current: "main".to_string(),
             }
         );
     }

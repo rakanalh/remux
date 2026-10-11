@@ -883,6 +883,15 @@ fn record_switch(
     *current = Some(new_attached);
 }
 
+/// The follow a confirmed tab-picker move arms: the target session when it is
+/// not the one the pane is in. `current` is the picker's own reading of the
+/// server's tree, not the client's `current_attached`, which can still hold a
+/// session's name from before a rename and would then mistake a move within
+/// the session for a switch.
+fn move_follow_for(conn: &ConnId, current: &str, target: &str) -> Option<(ConnId, String)> {
+    (current != target).then(|| (conn.clone(), target.to_owned()))
+}
+
 /// The switch a pane move to another session made, once the server shows it.
 ///
 /// The requester follows its pane into the target session, but only if the
@@ -5055,7 +5064,7 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
-                            InputAction::TabPickerConfirm { ref conn, ref session, tab_id } => {
+                            InputAction::TabPickerConfirm { ref conn, ref session, tab_id, ref current } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
@@ -5065,16 +5074,17 @@ async fn run_client_loop(
                                 });
                                 match mgr.send(conn, cmd).await {
                                     Err(e) => log::info!("tab picker: move not sent to {conn:?}: {e}"),
-                                    Ok(()) if current_attached.as_ref() != Some(&(conn.clone(), session.clone())) => {
-                                        // The server answers on this connection
-                                        // in order, so the tree asked for here
-                                        // shows whether the move was accepted.
-                                        pending_move_follow = Some((conn.clone(), session.clone()));
-                                        if let Err(e) = mgr.send(conn, ClientMessage::ListSessionTree).await {
-                                            log::info!("tab picker: tree not requested from {conn:?}: {e}");
+                                    Ok(()) => {
+                                        if let Some(follow) = move_follow_for(conn, current, session) {
+                                            // The server answers on this connection
+                                            // in order, so the tree asked for here
+                                            // shows whether the move was accepted.
+                                            pending_move_follow = Some(follow);
+                                            if let Err(e) = mgr.send(conn, ClientMessage::ListSessionTree).await {
+                                                log::info!("tab picker: tree not requested from {conn:?}: {e}");
+                                            }
                                         }
                                     }
-                                    Ok(()) => {}
                                 }
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
@@ -8073,6 +8083,22 @@ mod tests {
         record_switch(&mut current, &mut previous, ConnId::Local, "b".to_string());
         assert_eq!(current, Some(local("b")));
         assert_eq!(previous, Some(local("a")));
+    }
+
+    #[test]
+    fn a_move_into_another_session_arms_a_follow() {
+        assert_eq!(
+            move_follow_for(&ConnId::Local, "Macbook", "Work"),
+            Some(local("Work"))
+        );
+    }
+
+    #[test]
+    fn a_move_within_the_pickers_session_arms_nothing_even_after_a_rename() {
+        // The picker read `Macbook` from the server's tree. Whatever name the
+        // client last recorded, such as a stale `main` from before a rename,
+        // does not take part.
+        assert_eq!(move_follow_for(&ConnId::Local, "Macbook", "Macbook"), None);
     }
 
     #[test]
