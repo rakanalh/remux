@@ -1516,6 +1516,22 @@ impl SwitchRow {
     }
 }
 
+/// The first of `rows` to draw when only `visible` of them fit. The selected
+/// row is always drawn, because the list's keys can move the selection past
+/// the bottom of the box, and Enter acts on a row the user cannot see. It is
+/// drawn as low as it can go, so the rows above it, its group's header among
+/// them, stay in view whenever they fit.
+fn switch_popup_window(rows: &[SwitchRow], visible: usize) -> usize {
+    if visible == 0 || rows.len() <= visible {
+        return 0;
+    }
+    let selected = rows
+        .iter()
+        .position(|r| matches!(r, SwitchRow::Item { selected: true, .. }))
+        .unwrap_or(0);
+    (selected + 1).saturating_sub(visible)
+}
+
 /// Lay out a quick-switch popup: a titled box centred on the screen, one line
 /// per row, the selected row in the popup's inverted colours.
 ///
@@ -1566,7 +1582,8 @@ pub fn render_switch_popup(
         bg,
     });
 
-    for (i, row) in rows.iter().enumerate() {
+    let first = switch_popup_window(rows, popup_height.saturating_sub(2) as usize);
+    for (i, row) in rows.iter().skip(first).enumerate() {
         // The screen row under the top border.
         let row_offset = 1 + i as u16;
         // Stop at/below the bottom border.
@@ -7019,6 +7036,89 @@ mod tab_picker_tests {
         let mut h = handler_with(p);
         assert_eq!(h.handle_key(key(KeyCode::Char('x'))), InputAction::None);
         assert!(h.tab_picker.is_some());
+    }
+
+    /// Twelve sessions of one tab each, after the current one: far more rows
+    /// than a 12-row screen holds.
+    fn overflowing_picker() -> TabPickerOverlay {
+        let mut sessions = vec![session(
+            "main",
+            true,
+            vec![tab(1, "src", true, 1), tab(2, "two", false, 1)],
+        )];
+        for i in 0..12u64 {
+            sessions.push(session(
+                &format!("s{i:02}"),
+                false,
+                vec![tab(10 + i, &format!("tab{i:02}"), true, 1)],
+            ));
+        }
+        picker_with_sessions(sessions).0
+    }
+
+    fn drawn(p: &TabPickerOverlay, rows: u16) -> Vec<String> {
+        let theme = crate::config::theme::Theme::default();
+        p.render(60, rows, &theme)
+            .into_iter()
+            .map(|c| c.text.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_selected_row_is_drawn_when_the_list_is_taller_than_the_screen() {
+        let mut p = overflowing_picker();
+        p.navigate(crate::client::sidebar::nav::NavKey::Last);
+        assert_eq!(p.target(), Some(key_of("s11", Some(21))));
+        let rows = drawn(&p, 12);
+        assert!(
+            rows.iter().any(|r| r == "1: tab11"),
+            "the highlighted last row is on screen: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains(" s11 ")),
+            "and so is its session's header: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains(" main ")),
+            "the window scrolled: the first header is off screen: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn going_back_to_the_top_draws_the_first_row_again() {
+        let mut p = overflowing_picker();
+        p.navigate(crate::client::sidebar::nav::NavKey::Last);
+        // One fewer than the row count: Up from the first row wraps.
+        for _ in 1..p.keys().len() {
+            p.navigate(crate::client::sidebar::nav::NavKey::Up);
+        }
+        assert_eq!(p.target(), Some(key_of("main", None)));
+        let rows = drawn(&p, 12);
+        assert!(
+            rows.iter().any(|r| r.contains(" main ")),
+            "the first row, main's header, is on screen: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r == "+ new tab"));
+    }
+
+    #[test]
+    fn every_selected_row_is_drawn_while_walking_the_list() {
+        let mut p = overflowing_picker();
+        let theme = crate::config::theme::Theme::default();
+        for _ in 0..p.keys().len() {
+            let selected: Vec<_> = p
+                .render(60, 12, &theme)
+                .into_iter()
+                .filter(|c| c.bg == theme.whichkey_fg && !c.text.trim().is_empty())
+                .collect();
+            assert_eq!(
+                selected.len(),
+                1,
+                "exactly one highlighted row is drawn at {:?}",
+                p.target()
+            );
+            p.navigate(crate::client::sidebar::nav::NavKey::Down);
+        }
     }
 
     #[test]

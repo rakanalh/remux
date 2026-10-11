@@ -24,6 +24,9 @@ it, the status bar after the client follows its pane, and `Alt+o` back.
   7. A connected remote's sessions are never offered: the picker reads the
      tree of the connection it is pinned to, and the remote is another one.
   8. The client is alive, and no log has a panic.
+  9. On a terminal shorter than the list, on its own server: after G the
+     highlighted row and its session's header are drawn, and g brings the
+     first row back.
 
 The opposite of case 1 (one tab, one pane, and NO other session: the picker
 closes without opening) is case 2 of `tests/pty/pane_move_to_tab.py`.
@@ -48,6 +51,7 @@ from harness import Client, name_of  # noqa: E402
 
 RUNDIR = "/tmp/rmxpmxp"
 REMOTE = "/tmp/rmxpmxq"
+OVERFLOW_RUNDIR = "/tmp/rmxpmxw"
 COLS, ROWS = 110, 34
 ESC = b"\x1b"
 TITLE = "Move pane to tab"
@@ -80,8 +84,11 @@ def popup(t, title):
     top = next((y for y, r in enumerate(rows) if title in r and "╭" in r), None)
     if top is None:
         return None
-    x0 = rows[top].index("╭")
-    x1 = rows[top].rindex("╮")
+    # The corners nearest the title: on a short terminal the popup's top row is
+    # also a pane border's, whose own corners sit outside the popup.
+    at = rows[top].index(title)
+    x0 = rows[top].rindex("╭", 0, at)
+    x1 = rows[top].index("╮", at)
     out = []
     y = top + 1
     while y < len(rows) and rows[y][x0] in "│├":
@@ -183,7 +190,43 @@ def start_remote():
     return proc, env
 
 
+def overflow():
+    """[9] More sessions than a small terminal has rows: after G the
+    highlighted row is still drawn, so Enter never acts on a row nobody sees."""
+    print("[9] a picker taller than the terminal keeps the highlight on screen")
+    t = Tui(OVERFLOW_RUNDIR, cols=80, rows=14, extra_env={"HOME": OVERFLOW_RUNDIR})
+    try:
+        t.start()
+        t.pump(1.5)
+        c = wire(f"{OVERFLOW_RUNDIR}/run/remux.sock")
+        for i in range(10):
+            c.send({"CreateSession": {"name": f"s{i:02}", "folder": None}})
+        c.drain(1.0)
+        c.close()
+        rows = open_picker(t)
+        check(rows is not None and len(rows) < 1 + 10 * 3,
+              f"overflow: the picker is clipped to the terminal ({len(rows or [])} rows drawn)")
+        t.send(b"G", 0.6)
+        rows = popup(t, TITLE)
+        print(f"  after G: {rows}")
+        check(selected(rows) == "1: Tab 1" and texts(rows)[-2:] == ["+ new tab", "1: Tab 1"],
+              f"overflow: after G the highlighted last row is drawn ({selected(rows)})")
+        check("HEADER:s09" in texts(rows), "overflow: and its session's header is drawn")
+        t.send(b"g", 0.6)
+        rows = popup(t, TITLE)
+        check(texts(rows)[:1] == ["HEADER:main"] and selected(rows) is not None,
+              f"overflow: g brings the first row back ({texts(rows)[:2]})")
+        t.send(ESC, 0.6)
+        check(t.alive(), "overflow: the client is alive")
+    except Exception as e:
+        check(False, f"overflow: the harness could not continue: {e!r}")
+    finally:
+        t.kill()
+    check("panicked at" not in t.log("client"), "overflow: no panic in client.log")
+
+
 def main():
+    overflow()
     remote, remote_env = start_remote()
     t = Tui(RUNDIR, cols=COLS, rows=ROWS, config=CONFIG,
             extra_env={"PATH": f"{REMOTE}/bin:" + os.environ.get("PATH", ""),
