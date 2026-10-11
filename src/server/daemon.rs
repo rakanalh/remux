@@ -9686,14 +9686,6 @@ async fn start_forwarding_for_pane(
                                 // screen. Safe under the lock for the same
                                 // reason `mark_session_tree_dirty` is.
                                 mark_agents_dirty();
-                                log::debug!(
-                                    "pty_forwarding: pane_id={}, cursor=({},{}), screen.rows={}, scroll_bottom={}",
-                                    pane_id,
-                                    pane_data.screen.cursor_x,
-                                    pane_data.screen.cursor_y,
-                                    pane_data.screen.rows,
-                                    pane_data.screen.scroll_bottom
-                                );
                                 let bell = pane_data.screen.take_bell();
                                 // Always drained, even when the config gate is
                                 // off, so a disallowed write cannot sit pending
