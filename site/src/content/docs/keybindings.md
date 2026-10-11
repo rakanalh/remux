@@ -281,7 +281,7 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneUnstackLeft` / `Right` / `Up` / `Down` | Take the focused pane out of its stack, on that side |
 | `PaneToggleZoom` | Zoom or unzoom the focused pane |
 | `PaneRename` | Rename the focused pane (prompts) |
-| `PaneMoveToTab` | Move the focused pane to another tab or a new one (opens a picker) |
+| `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |
 | `PopupToggle` | Show or hide the session's floating popup terminal |
 | `ResizeLeft` / `Right` / `Up` / `Down` `[amount]` | Resize the focused pane by `amount` cells (default `1`) |
 | `SetMaster` | Make the focused pane the master pane |

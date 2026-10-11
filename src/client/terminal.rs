@@ -352,9 +352,10 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             placement,
             argv,
             cwd,
+            pane,
         } => format!(
-            "CliSpawn(session={session:?}, placement={placement:?}, program={:?}, \
-             {} more arg(s), cwd={})",
+            "CliSpawn(session={session:?}, pane={pane:?}, placement={placement:?}, \
+             program={:?}, {} more arg(s), cwd={})",
             argv.first(),
             argv.len().saturating_sub(1),
             if cwd.is_some() { "set" } else { "none" }
@@ -414,6 +415,7 @@ mod tests {
                 "postgresql://sam:hunter2@db/prod".to_string(),
             ],
             cwd: None,
+            pane: Some(7),
         });
         assert!(
             !s.contains("hunter2"),
@@ -421,6 +423,7 @@ mod tests {
         );
         assert!(s.contains("psql"), "but the program must: {s}");
         assert!(s.contains("1 more arg"), "and how many were dropped: {s}");
+        assert!(s.contains("pane=Some(7)"), "and the caller's pane id: {s}");
     }
 
     /// Drive [`handshake`] against a scripted peer that answers with `welcome`.

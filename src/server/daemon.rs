@@ -1551,13 +1551,14 @@ async fn handle_client_message(
             placement,
             argv,
             cwd,
+            pane,
         } => {
             // The PROGRAM, then a count. Which binary was asked for is the
             // whole diagnostic value of this line ("it tried to run `psql`");
             // its arguments are where a connection string or an API key lives.
             log::debug!(
                 "server: client_id={client_id} msg=CliSpawn(session={session:?}, \
-                 placement={placement:?}, program={:?}, {} more arg(s), cwd={})",
+                 pane={pane:?}, placement={placement:?}, program={:?}, {} more arg(s), cwd={})",
                 argv.first(),
                 argv.len().saturating_sub(1),
                 if cwd.is_some() { "set" } else { "none" }
@@ -2096,10 +2097,12 @@ entries={} error={:?} truncated={}",
             placement,
             argv,
             cwd,
+            pane,
         } => {
             handle_cli_spawn(
                 client_id,
                 &session,
+                pane,
                 placement,
                 &argv,
                 cwd.as_deref(),
@@ -2934,13 +2937,13 @@ async fn handle_command(
     //
     // `PaneMoveToTabTarget` is refused here for the same reason: whether its
     // target tab still exists is only known from the state, not the command.
-    if let RemuxCommand::PaneMoveToTabTarget { tab_id } = cmd {
-        let target = session::MoveTarget::from(tab_id);
+    if let RemuxCommand::PaneMoveToTabTarget { tab_id, session } = &cmd {
+        let target = session::MoveRequest::from((*tab_id, session.clone()));
         let st = state.lock().await;
         let Some(pane) = move_source_pane(&st, &session_name) else {
             return Ok(());
         };
-        if let Err(why) = st.check_move_pane_to_tab(&session_name, pane, target) {
+        if let Err(why) = st.check_move_pane_to_tab(&session_name, pane, &target) {
             log::info!(
                 "server: PaneMoveToTabTarget pane_id={pane} target={target:?} refused: {why:?}"
             );
@@ -3237,16 +3240,7 @@ async fn handle_command(
                 }
             };
             log::debug!("server: PaneClose pane_id={closed_pane}");
-            close_pane(
-                closed_pane,
-                &session_name,
-                state,
-                panes,
-                clients,
-                config,
-                prev_frames,
-            )
-            .await;
+            close_pane(closed_pane, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneFocusLeft
         | RemuxCommand::PaneFocusRight
@@ -3448,23 +3442,36 @@ async fn handle_command(
             resize_session_panes(&session_name, state, panes, clients, config).await?;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::PaneMoveToTabTarget { tab_id } => {
-            let target = session::MoveTarget::from(tab_id);
+        RemuxCommand::PaneMoveToTabTarget {
+            tab_id,
+            session: target_session,
+        } => {
+            let target = session::MoveRequest::from((tab_id, target_session));
             let outcome = {
                 let mut st = state.lock().await;
                 match move_source_pane(&st, &session_name) {
                     Some(pane) => (
                         pane,
-                        st.move_pane_to_tab(&session_name, pane, target, config.new_tab_layout()),
+                        st.move_pane_to_tab(
+                            &session_name,
+                            pane,
+                            target.clone(),
+                            config.new_tab_layout(),
+                        ),
                     ),
                     None => return Ok(()),
                 }
             };
-            match outcome {
-                (pane, Ok(idx)) => {
+            let (pane, moved) = match outcome {
+                (pane, Ok(moved)) => {
                     log::debug!(
-                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> tab index {idx}"
+                        "server: PaneMoveToTabTarget pane_id={pane} target={target:?} -> \
+                         tab index {} session={:?} source_removed={}",
+                        moved.target_idx,
+                        moved.target_session,
+                        moved.source_removed.is_some()
                     );
+                    (pane, moved)
                 }
                 (pane, Err(why)) => {
                     log::info!(
@@ -3472,10 +3479,76 @@ async fn handle_command(
                     );
                     return Ok(());
                 }
+            };
+            if let Some(popup) = &moved.source_removed {
+                reap_panes(popup, panes, clients).await;
             }
-            resize_session_panes(&session_name, state, panes, clients, config).await?;
-            invalidate_session_baselines(&session_name, clients, prev_frames).await;
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+            if moved.target_session != session_name {
+                // A client of the source that scrolled the pane back would
+                // otherwise keep that offset for a pane it can no longer see.
+                // The offset outlives the move, and when the pane is that
+                // client's focused pane again the broadcast skips the client,
+                // which freezes its screen.
+                {
+                    let mut cls = clients.lock().await;
+                    for c in cls.values_mut() {
+                        c.session_scroll.remove(&pane);
+                        if c.prev_scroll_pane == Some(pane) {
+                            c.prev_scroll_pane = None;
+                            c.prev_scroll_offset = 0;
+                        }
+                    }
+                }
+                // The requester follows its pane. Re-pointing it BEFORE the
+                // source is handled is what keeps it out of
+                // `handle_session_removed`, which would land it on an arbitrary
+                // session instead of the one it chose.
+                handle_attach(
+                    client_id,
+                    &moved.target_session,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                )
+                .await?;
+                if moved.source_removed.is_some() {
+                    handle_session_removed(
+                        &session_name,
+                        state,
+                        panes,
+                        clients,
+                        config,
+                        prev_frames,
+                    )
+                    .await;
+                } else {
+                    resize_session_panes(&session_name, state, panes, clients, config).await?;
+                    invalidate_session_baselines(&session_name, clients, prev_frames).await;
+                    broadcast_full_render(
+                        &session_name,
+                        state,
+                        panes,
+                        clients,
+                        config,
+                        prev_frames,
+                    )
+                    .await;
+                }
+            }
+            resize_session_panes(&moved.target_session, state, panes, clients, config).await?;
+            invalidate_session_baselines(&moved.target_session, clients, prev_frames).await;
+            broadcast_full_render(
+                &moved.target_session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
             mark_agents_dirty();
         }
         RemuxCommand::PaneStackAdd => {
@@ -4131,16 +4204,7 @@ async fn handle_command(
                     .unwrap_or(false)
             };
             if in_active_tab {
-                close_pane(
-                    pane_id,
-                    &session,
-                    state,
-                    panes,
-                    clients,
-                    config,
-                    prev_frames,
-                )
-                .await;
+                close_pane(pane_id, state, panes, clients, config, prev_frames).await;
             } else {
                 // Background-tab path: mirror close_pane's non-active-tab-safe
                 // subset (layout collapse + pane_order retain + focus/rebuild,
@@ -7113,23 +7177,32 @@ program={program:?} args={argv:?} vertical={vertical}"
 ///
 /// The only pane-creating handler that takes its session as an ARGUMENT rather
 /// than reading it off the connection, because its sender is a CLI invocation
-/// that never attaches: it connects, asks, reads the answer and exits. The name
-/// reaches it as the `REMUX_SESSION` the pane's own `Pty::spawn` exported.
+/// that never attaches: it connects, asks, reads the answer and exits. The
+/// caller sends the `REMUX_SESSION` and `REMUX_PANE` the pane's own
+/// `Pty::spawn` exported.
 ///
-/// The target within the session is the **active tab's focused pane**, which is
-/// what `create_pane_in_tab` already splits when handed no `tab_index`. That is
-/// deliberate and is not the caller's `REMUX_PANE`: an environment variable is
-/// fixed at spawn time and may be hours stale, whereas focus is where the user
-/// is looking now. tmux resolves `split-window` the same way.
+/// **The SESSION comes from `pane` first.** Both variables were fixed when the
+/// caller's pane was spawned, but only the pane id stays true: a pane moved to
+/// another session, or a renamed session, keeps its id while the name goes
+/// stale. So a live `pane` wins over a disagreeing `session`, and a pane that
+/// is absent or dead falls back to `session`, exactly as before. Pane ids are
+/// never reused within a server's lifetime, so a dead id cannot name another
+/// pane by accident.
+///
+/// **The SPOT within the session is the active tab's focused pane**, which is
+/// what `create_pane_in_tab` already splits when handed no `tab_index`, and not
+/// the caller's pane. `REMUX_PANE` is an identity here, never a target: focus
+/// is where the user is looking now, and tmux resolves `split-window` the same
+/// way.
 ///
 /// A `Some(pane_id)` answer becomes [`ServerMessage::CliSpawned`]; every failure
-/// becomes a [`ServerMessage::Error`] that NAMES the session, since the failure
-/// this will actually hit is a `REMUX_SESSION` left over from a renamed or
-/// closed session, and "session not found" without the name explains nothing.
+/// becomes a [`ServerMessage::Error`] that NAMES the session, and the pane when
+/// one was sent, since "session not found" without the name explains nothing.
 #[allow(clippy::too_many_arguments)]
 async fn handle_cli_spawn(
     client_id: u64,
     session: &str,
+    pane: Option<PaneId>,
     placement: CliPlacement,
     argv: &[String],
     cwd: Option<&str>,
@@ -7147,14 +7220,23 @@ async fn handle_cli_spawn(
         None => (None, &[][..]),
     };
     let cwd_path = cwd.map(std::path::Path::new);
+    let named = session;
+    let resolved = match pane {
+        Some(pane) => {
+            let st = state.lock().await;
+            st.session_of_pane(pane).map(str::to_owned)
+        }
+        None => None,
+    };
+    let session = resolved.as_deref().unwrap_or(named);
     // Redacted the same way as the summary line in `handle_client_message`, and
     // for the same reason: `argv` is a command line the user typed, so its
     // ARGUMENTS are where a connection string or an API key lives. The program
     // is what anyone reading this line needs. `cwd` is a path, not a
     // credential, and is the other half of "why did it fail to start".
     log::info!(
-        "server: CliSpawn client_id={client_id} session={session:?} placement={placement:?} \
-program={:?} ({} more arg(s)) cwd={cwd:?}",
+        "server: CliSpawn client_id={client_id} session={named:?} pane={pane:?} \
+resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={cwd:?}",
         argv.first(),
         argv.len().saturating_sub(1)
     );
@@ -7224,7 +7306,13 @@ program={:?} ({} more arg(s)) cwd={cwd:?}",
         let msg = match spawned {
             Some(pane_id) => ServerMessage::CliSpawned { pane_id },
             None => ServerMessage::Error {
-                message: format!("no session named '{session}' on this server"),
+                message: match pane.filter(|_| resolved.is_none()) {
+                    Some(pane) => format!(
+                        "no session named '{session}' on this server \
+                         (pane {pane} no longer exists)"
+                    ),
+                    None => format!("no session named '{session}' on this server"),
+                },
             },
         };
         let _ = conn.tx.send(msg);
@@ -9161,6 +9249,11 @@ async fn handle_session_removed(
                 for c in cls.values_mut() {
                     if c.session_name.as_deref() == Some(removed) {
                         c.session_name = Some(next.clone());
+                        // As in `handle_attach`: these offsets index panes of
+                        // the session being left.
+                        c.session_scroll.clear();
+                        c.prev_scroll_offset = 0;
+                        c.prev_scroll_pane = None;
                     }
                 }
             }
@@ -9346,7 +9439,6 @@ fn move_source_pane(st: &ServerState, session_name: &str) -> Option<PaneId> {
 
 async fn close_pane(
     pane_id: PaneId,
-    session_name: &str,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -9369,9 +9461,17 @@ async fn close_pane(
     // goes away -- it is in no layout tree, so nothing else would reclaim it).
     let mut also_reap: Vec<PaneId> = Vec::new();
 
-    let action = {
+    // The session is looked up here, under the lock that also closes the pane,
+    // rather than taken from the caller: a session the caller read under an
+    // earlier lock can be stale by now, because the pane may have moved to
+    // another session in between. A pane in no session is already being reaped
+    // by whatever removed it.
+    let (session_name, action) = {
         let mut st = state.lock().await;
-        let sess = match st.sessions.get_mut(session_name) {
+        let Some(session_name) = st.session_of_pane(pane_id).map(str::to_owned) else {
+            return;
+        };
+        let sess = match st.sessions.get_mut(&session_name) {
             Some(s) => s,
             None => return,
         };
@@ -9381,7 +9481,7 @@ async fn close_pane(
         // it) and leave a dead PTY behind with the popup still "open". This is
         // both the `PaneClose`-while-popup-open path and the popup shell's own
         // exit path, and it must work from any tab.
-        if sess.popup_pane == Some(pane_id) {
+        let action = if sess.popup_pane == Some(pane_id) {
             sess.take_popup();
             log::debug!("server: close_pane closed popup pane_id={pane_id}");
             CloseAction::Broadcast
@@ -9411,14 +9511,14 @@ async fn close_pane(
                     }
                     CloseAction::Broadcast
                 } else {
-                    // Last tab in the session -- remove the session entirely.
-                    let session_name_owned = session_name.to_string();
-                    also_reap.extend(sess.take_popup());
-                    st.sessions.remove(&session_name_owned);
+                    // Last tab in the session -- remove the session entirely,
+                    // with its folder entry and its popup.
+                    also_reap.extend(st.remove_emptied_session(&session_name));
                     CloseAction::SessionRemoved
                 }
             }
-        }
+        };
+        (session_name, action)
     };
     // Drop the pane(s) and TELL their subscribers. A subscription to a dead pane
     // must not linger, and a subscriber dropped without a word is exactly the
@@ -9429,11 +9529,11 @@ async fn close_pane(
     reap_panes(&reaped, panes, clients).await;
     match action {
         CloseAction::Broadcast => {
-            let _ = resize_session_panes(session_name, state, panes, clients, config).await;
-            broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+            let _ = resize_session_panes(&session_name, state, panes, clients, config).await;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::SessionRemoved => {
-            handle_session_removed(session_name, state, panes, clients, config, prev_frames).await;
+            handle_session_removed(&session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::NoBroadcast => {}
     }
@@ -9491,9 +9591,13 @@ async fn start_pty_forwarding(
 /// Start the one forwarding task for `pane_id`: pump its PTY into its `Screen`,
 /// stream the result to subscribers, and handle the pane's death.
 ///
-/// `session_name` is the session whose layout the pane belongs to: each batch
-/// re-composites that session's frame, and the pane's death runs the full
-/// `close_pane` path (layout repair, persistence, the tree push).
+/// Each batch re-composites the frame of the session that holds the pane, and
+/// the pane's death runs the full `close_pane` path (layout repair,
+/// persistence, the tree push) in that session. Both ask
+/// [`ServerState::session_of_pane`] at the time of the event, because a pane
+/// can be moved to another session while this task runs. `session_name` is
+/// the session the pane was spawned in: it names the pane in the log, and it
+/// is the fallback for a render when the pane is in no session.
 ///
 /// It used to be an `Option`, `None` meaning an **auxiliary** pane -- one in no
 /// layout and on no frame, whose death was `reap_panes` alone. Aux panes existed
@@ -9596,14 +9700,6 @@ async fn start_forwarding_for_pane(
                                 // screen. Safe under the lock for the same
                                 // reason `mark_session_tree_dirty` is.
                                 mark_agents_dirty();
-                                log::debug!(
-                                    "pty_forwarding: pane_id={}, cursor=({},{}), screen.rows={}, scroll_bottom={}",
-                                    pane_id,
-                                    pane_data.screen.cursor_x,
-                                    pane_data.screen.cursor_y,
-                                    pane_data.screen.rows,
-                                    pane_data.screen.scroll_bottom
-                                );
                                 let bell = pane_data.screen.take_bell();
                                 // Always drained, even when the config gate is
                                 // off, so a disallowed write cannot sit pending
@@ -9632,10 +9728,11 @@ async fn start_forwarding_for_pane(
                         // tab is the foreground/active tab). Panes lock is
                         // released above; acquire state alone to preserve the
                         // state-before-panes lock order used elsewhere.
-                        {
+                        let owner = {
                             let mut st = state.lock().await;
                             st.record_pane_activity(pane_id, bell, std::time::Instant::now());
-                        }
+                            st.session_of_pane(pane_id).map(str::to_owned)
+                        };
                         // Write any pending responses (e.g., DSR replies) back to the PTY.
                         if !responses.is_empty() {
                             let ps = panes.lock().await;
@@ -9657,7 +9754,7 @@ async fn start_forwarding_for_pane(
                         // nobody watches costs nothing per PTY batch.
                         stream_pane_content(pane_id, &state, &panes, &clients).await;
                         broadcast_full_render(
-                            &session_name,
+                            owner.as_deref().unwrap_or(&session_name),
                             &state,
                             &panes,
                             &clients,
@@ -9671,17 +9768,7 @@ async fn start_forwarding_for_pane(
                         log::debug!(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
-                        // Close the pane automatically.
-                        close_pane(
-                            pane_id,
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
+                        close_pane(pane_id, &state, &panes, &clients, &config, &prev_frames).await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
                         // A pane dying on its own removes a row from every
@@ -9725,8 +9812,12 @@ async fn start_forwarding_for_pane(
                         if retitled || fg_changed || renamed {
                             mark_pane_retitled();
                             stream_pane_content(pane_id, &state, &panes, &clients).await;
+                            let owner = {
+                                let st = state.lock().await;
+                                st.session_of_pane(pane_id).map(str::to_owned)
+                            };
                             broadcast_full_render(
-                                &session_name,
+                                owner.as_deref().unwrap_or(&session_name),
                                 &state,
                                 &panes,
                                 &clients,
@@ -9922,194 +10013,18 @@ async fn materialize_session(
         }
     }
 
-    // Start PTY forwarding for every pane.
     for pane_id in pane_ids {
-        // Enforce exactly one forwarding task per pane (see start_pty_forwarding).
-        {
-            let mut ps = panes.lock().await;
-            match ps.get_mut(&pane_id) {
-                Some(pane_data) => {
-                    if pane_data.forwarding_started {
-                        continue; // already has its forwarding task
-                    }
-                    pane_data.forwarding_started = true;
-                }
-                None => continue,
-            }
-        }
-
-        let state = Arc::clone(state);
-        let panes = Arc::clone(panes);
-        let clients = Arc::clone(clients);
-        let config = Arc::clone(config);
-        let prev_frames = Arc::clone(prev_frames);
-        let dormant = Arc::clone(dormant);
-        let session_name = session_name.to_string();
-
-        tokio::spawn(async move {
-            let mut watch = ForegroundWatch::new(pane_id, &panes).await;
-            let first = {
-                let ps = panes.lock().await;
-                ps.get(&pane_id)
-                    .and_then(|pd| pd.names_to_refresh(std::time::Instant::now(), true))
-            };
-            if let Some(what) = first {
-                refresh_pane_names(pane_id, &panes, what).await;
-            }
-            loop {
-                let recv_result = {
-                    let mut ps = panes.lock().await;
-                    if let Some(pane_data) = ps.get_mut(&pane_id) {
-                        match pane_data.pty_rx.try_recv() {
-                            Ok(data) => Some(Ok(data)),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                Some(Err(()))
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                };
-
-                match recv_result {
-                    Some(Ok(data)) => {
-                        let (responses, bell, clipboard, retitled, fg_changed, refresh) = {
-                            let mut ps = panes.lock().await;
-                            if let Some(pane_data) = ps.get_mut(&pane_id) {
-                                let now = std::time::Instant::now();
-                                let t = pane_data.ingest_chunk(&data);
-                                let fg_changed = note_transition(pane_id, t);
-                                pane_data.last_output = now;
-                                let retitled = pane_data.settle_title(pane_id, now);
-                                let refresh = pane_data.names_to_refresh(now, fg_changed);
-                                // Output is what makes an agent `Working`, and
-                                // what clears a `NeedsInput` prompt off the
-                                // screen. Safe under the lock for the same
-                                // reason `mark_session_tree_dirty` is.
-                                mark_agents_dirty();
-                                let bell = pane_data.screen.take_bell();
-                                let clipboard = pane_data.screen.take_clipboard();
-                                (
-                                    pane_data.screen.take_responses(),
-                                    bell,
-                                    clipboard,
-                                    retitled,
-                                    fg_changed,
-                                    refresh,
-                                )
-                            } else {
-                                (Vec::new(), false, None, false, false, None)
-                            }
-                        };
-                        let renamed = match refresh {
-                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
-                            None => false,
-                        };
-                        if retitled || fg_changed || renamed {
-                            mark_pane_retitled();
-                        }
-                        {
-                            let mut st = state.lock().await;
-                            st.record_pane_activity(pane_id, bell, std::time::Instant::now());
-                        }
-                        if !responses.is_empty() {
-                            let ps = panes.lock().await;
-                            if let Some(pane_data) = ps.get(&pane_id) {
-                                for resp in &responses {
-                                    pane_data.send_input(resp);
-                                }
-                            }
-                        }
-                        // An application asked for the system clipboard via OSC 52.
-                        if let Some(text) = clipboard {
-                            if config.general.allow_app_clipboard {
-                                deliver_app_clipboard(pane_id, text, &state, &clients).await;
-                            }
-                        }
-                        // Stream to the pane's View-cell subscribers, each at its
-                        // own scroll offset and selection. This resurrect path is a
-                        // second per-pane forwarding loop; subscribers to a
-                        // materialized session must stream here too.
-                        stream_pane_content(pane_id, &state, &panes, &clients).await;
-                        broadcast_full_render(
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
-                    }
-                    Some(Err(())) => {
-                        close_pane(
-                            pane_id,
-                            &session_name,
-                            &state,
-                            &panes,
-                            &clients,
-                            &config,
-                            &prev_frames,
-                        )
-                        .await;
-                        notify_if_close_declined(pane_id, &panes, &clients).await;
-                        save_if_enabled(&state, &panes, &config, &dormant).await;
-                        // A pane dying on its own removes a row from every
-                        // subscriber's tree, and no command ran to say so.
-                        mark_session_tree_dirty();
-                        break;
-                    }
-                    None => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        // A quiet pane gets no tagged reads, so its foreground
-                        // is sampled here, and the settle windows end here.
-                        let sample = watch.sample();
-                        let (retitled, fg_changed, refresh) = {
-                            let mut ps = panes.lock().await;
-                            match ps.get_mut(&pane_id) {
-                                Some(pane_data) => {
-                                    let fg_changed = sample.is_some_and(|(fg, at)| {
-                                        let shell = pane_data.shell_pgid();
-                                        let t = pane_data.title.note_foreground(
-                                            fg,
-                                            at,
-                                            shell,
-                                            group_alive,
-                                        );
-                                        note_transition(pane_id, t)
-                                    });
-                                    let now = std::time::Instant::now();
-                                    (
-                                        pane_data.settle_title(pane_id, now),
-                                        fg_changed,
-                                        pane_data.names_to_refresh(now, fg_changed),
-                                    )
-                                }
-                                None => break,
-                            }
-                        };
-                        let renamed = match refresh {
-                            Some(what) => refresh_pane_names(pane_id, &panes, what).await,
-                            None => false,
-                        };
-                        if retitled || fg_changed || renamed {
-                            mark_pane_retitled();
-                            stream_pane_content(pane_id, &state, &panes, &clients).await;
-                            broadcast_full_render(
-                                &session_name,
-                                &state,
-                                &panes,
-                                &clients,
-                                &config,
-                                &prev_frames,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-        });
+        start_forwarding_for_pane(
+            pane_id,
+            session_name.to_string(),
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            dormant,
+        )
+        .await;
     }
 
     Ok(())

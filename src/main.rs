@@ -96,7 +96,7 @@ enum Commands {
         remux_path: String,
     },
 
-    /// Split the focused pane of the session named by $REMUX_SESSION
+    /// Split the focused pane of the session this pane is in
     //
     // No short flags for the direction, and `-h` is left to clap as the help
     // flag. `-h`/`-v` are ambiguous in EVERY multiplexer -- "horizontal" names
@@ -107,8 +107,9 @@ enum Commands {
     // LANDS and cannot be misread; splitting is not frequent enough in a script
     // for four saved characters to be worth any of it.
     #[command(
-        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session to split.\n\
-                      With no COMMAND the new pane runs the login shell.\n\n\
+        after_help = "Run from inside a remux pane. The session is the one this pane is in now,\n\
+                      found from $REMUX_PANE, falling back to $REMUX_SESSION; its focused pane\n\
+                      is split. With no COMMAND the new pane runs the login shell.\n\n\
                       Examples:\n  \
                         remux split\n  \
                         remux split --right -- nvim /tmp/notes.md"
@@ -135,9 +136,10 @@ enum Commands {
         argv: Vec<String>,
     },
 
-    /// Create a new tab in the session named by $REMUX_SESSION
+    /// Create a new tab in the session this pane is in
     #[command(
-        after_help = "Run from inside a remux pane: $REMUX_SESSION names the session.\n\
+        after_help = "Run from inside a remux pane. The session is the one this pane is in now,\n\
+                            found from $REMUX_PANE, falling back to $REMUX_SESSION.\n\
                             With no COMMAND the new pane runs the login shell."
     )]
     NewTab {
@@ -168,19 +170,24 @@ enum Commands {
 ///
 /// The whole point of the subcommand is that it is run from INSIDE a pane, by a
 /// script or a file manager's opener hook, so the session comes from the
-/// `$REMUX_SESSION` that `Pty::spawn` exported into that pane -- the
-/// `TMUX`/`TMUX_PANE` arrangement.
+/// `$REMUX_SESSION` and `$REMUX_PANE` that `Pty::spawn` exported into that
+/// pane -- the `TMUX`/`TMUX_PANE` arrangement.
 ///
 /// **An unset `$REMUX_SESSION` is refused, never guessed.** There is usually a
 /// plausible guess available ("the only session", "the most recent one"), and
 /// taking it is how a script splits a window the user was not looking at. The
 /// message says which variable is missing so the fix is obvious.
 ///
-/// Note what this deliberately does NOT read: `$REMUX_PANE`. The server splits
-/// the session's active tab's FOCUSED pane, because the variable is fixed at
-/// spawn time, which may be long past, whereas focus is where the user is now.
-/// `$REMUX_PANE` is
-/// exported for callers that want that precision by other means.
+/// `$REMUX_PANE` goes along as an IDENTITY, never as a target. Both variables
+/// were fixed when the pane was spawned, and only the pane id survives the pane
+/// being moved to another session or its session being renamed, so the server
+/// takes the session from the pane while it is live and from the name
+/// otherwise. Where the new pane goes is still the session's FOCUSED pane,
+/// because focus is where the user is now. A malformed `$REMUX_PANE` is sent as
+/// no pane at all, which takes the name.
+///
+/// `$REMUX_PANE` alone does not count as being inside a pane: without
+/// `$REMUX_SESSION` the command is refused like any other.
 ///
 /// Exits the process non-zero on every failure, since the caller is a script.
 async fn run_cli_spawn(
@@ -196,6 +203,8 @@ async fn run_cli_spawn(
         std::process::exit(1);
     };
     let session = session.to_string_lossy().into_owned();
+    let pane = std::env::var_os("REMUX_PANE")
+        .and_then(|p| p.to_str().and_then(|p| p.parse::<protocol::PaneId>().ok()));
     // The PROGRAM and a count, never the arguments. `client.log` is the same
     // kind of file as `server.log` -- plaintext, unrotated, always at `Debug` --
     // and this is the very command line the user typed, so
@@ -203,8 +212,8 @@ async fn run_cli_spawn(
     // password on disk. The server side redacts identically; see
     // `handle_client_message`'s summary match.
     log::debug!(
-        "cmd: cli-spawn session={session:?} placement={placement:?} program={:?} \
-         ({} more arg(s)) cwd={cwd:?}",
+        "cmd: cli-spawn session={session:?} pane={pane:?} placement={placement:?} \
+         program={:?} ({} more arg(s)) cwd={cwd:?}",
         argv.first(),
         argv.len().saturating_sub(1)
     );
@@ -225,6 +234,7 @@ async fn run_cli_spawn(
             placement,
             argv,
             cwd,
+            pane,
         })
         .await?;
 
@@ -871,6 +881,77 @@ fn record_switch(
     }
     *previous = current.take();
     *current = Some(new_attached);
+}
+
+/// The follow a confirmed tab-picker move arms: the target session when it is
+/// not the one the pane is in. `current` is the picker's own reading of the
+/// server's tree, not the client's `current_attached`, which can still hold a
+/// session's name from before a rename and would then mistake a move within
+/// the session for a switch.
+fn move_follow_for(conn: &ConnId, current: &str, target: &str) -> Option<(ConnId, String)> {
+    (current != target).then(|| (conn.clone(), target.to_owned()))
+}
+
+/// A tab-picker move into another session, waiting for the server to show
+/// the client in the target before it counts as a switch.
+///
+/// The requester follows its pane into the target session, but only if the
+/// server accepts the move, and the picker cannot know that when it sends. So
+/// the switch is recorded when a tree from the move's connection names the
+/// target as the current session. A tree that names any other session settles
+/// nothing: the move may have been refused, or the tree may have been pushed
+/// before the move was handled. A move that was refused is therefore never
+/// recorded.
+///
+/// A waiting follow is forgotten when another picker opens (a newer move
+/// supersedes it), when its connection goes away, and when its connection is
+/// no longer the foreground once the answer arrives, because a background
+/// connection's session must never be recorded as the one the client is on.
+#[derive(Debug, Default)]
+struct MoveFollow(Option<(ConnId, String)>);
+
+impl MoveFollow {
+    fn arm(&mut self, follow: (ConnId, String)) {
+        self.0 = Some(follow);
+    }
+
+    fn picker_opened(&mut self) {
+        self.0 = None;
+    }
+
+    fn conn_dropped(&mut self, conn: &ConnId) {
+        if self.0.as_ref().is_some_and(|(c, _)| c == conn) {
+            self.0 = None;
+        }
+    }
+
+    /// The switch to record for a tree from `src`, whose current session is
+    /// `current`, with `foreground` in front.
+    fn settle(
+        &mut self,
+        src: &ConnId,
+        foreground: &ConnId,
+        current: Option<&str>,
+    ) -> Option<(ConnId, String)> {
+        let (conn, target) = self.0.as_ref()?;
+        if conn != src || current != Some(target.as_str()) {
+            return None;
+        }
+        let follow = self.0.take()?;
+        if src != foreground {
+            log::debug!(
+                "tab picker: follow into {:?} dropped, {src:?} is not in front",
+                follow.1
+            );
+            return None;
+        }
+        Some(follow)
+    }
+
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.0.is_none()
+    }
 }
 
 /// The rect the server composites into: the terminal minus the visible
@@ -1884,6 +1965,7 @@ struct DropCtx<'a> {
     last_local_session: &'a Option<String>,
     current_attached: &'a mut Option<(ConnId, String)>,
     previous_attached: &'a mut Option<(ConnId, String)>,
+    move_follow: &'a mut MoveFollow,
     wants_session_tree: bool,
     wants_agents: bool,
 }
@@ -1969,6 +2051,7 @@ async fn handle_connection_drop(
         last_local_session,
         current_attached,
         previous_attached,
+        move_follow,
         wants_session_tree,
         wants_agents,
     } = cx;
@@ -1977,6 +2060,7 @@ async fn handle_connection_drop(
     if let Some(sw) = input.agent_switch.as_mut() {
         sw.drop_conn(src);
     }
+    move_follow.conn_dropped(src);
     // The tab picker names tabs of that one machine, so it has nothing left
     // to offer.
     if input.tab_picker.as_ref().is_some_and(|tp| tp.conn() == src) {
@@ -2864,6 +2948,7 @@ async fn run_client_loop(
         .as_ref()
         .map(|name| (ConnId::Local, name.clone()));
     let mut previous_attached: Option<(ConnId, String)> = None;
+    let mut move_follow = MoveFollow::default();
 
     // Views: virtual tabs whose cells alias real panes and are composited from
     // streamed `PaneContent` snapshots. Phase 2: the shared-view registry is
@@ -4283,6 +4368,7 @@ async fn run_client_loop(
                                         last_local_session: &last_local_session,
                                         current_attached: &mut current_attached,
                                         previous_attached: &mut previous_attached,
+                                        move_follow: &mut move_follow,
                                         wants_session_tree,
                                         wants_agents,
                                     },
@@ -4376,6 +4462,7 @@ async fn run_client_loop(
                                                 last_local_session: &last_local_session,
                                                 current_attached: &mut current_attached,
                                                 previous_attached: &mut previous_attached,
+                                                move_follow: &mut move_follow,
                                                 wants_session_tree,
                                                 wants_agents,
                                             },
@@ -5004,6 +5091,7 @@ async fn run_client_loop(
                                     // name the same server.
                                     let conn = mgr.foreground().clone();
                                     mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+                                    move_follow.picker_opened();
                                     let picker = TabPickerOverlay::new(conn);
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.clear_overlay(c, r)?;
@@ -5021,13 +5109,27 @@ async fn run_client_loop(
                                     renderer.flush()?;
                                 }
                             }
-                            InputAction::TabPickerConfirm { ref conn, tab_id } => {
+                            InputAction::TabPickerConfirm { ref conn, ref session, tab_id, ref current } => {
                                 let (c, r) = crossterm::terminal::size()?;
                                 renderer.clear_overlay(c, r)?;
                                 renderer.flush()?;
-                                let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget { tab_id });
-                                if let Err(e) = mgr.send(conn, cmd).await {
-                                    log::info!("tab picker: move not sent to {conn:?}: {e}");
+                                let cmd = ClientMessage::Command(RemuxCommand::PaneMoveToTabTarget {
+                                    tab_id,
+                                    session: Some(session.clone()),
+                                });
+                                match mgr.send(conn, cmd).await {
+                                    Err(e) => log::info!("tab picker: move not sent to {conn:?}: {e}"),
+                                    Ok(()) => {
+                                        if let Some(follow) = move_follow_for(conn, current, session) {
+                                            // The server answers on this connection
+                                            // in order, so the tree asked for here
+                                            // shows whether the move was accepted.
+                                            move_follow.arm(follow);
+                                            if let Err(e) = mgr.send(conn, ClientMessage::ListSessionTree).await {
+                                                log::info!("tab picker: tree not requested from {conn:?}: {e}");
+                                            }
+                                        }
+                                    }
                                 }
                                 mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                             }
@@ -6313,6 +6415,7 @@ async fn run_client_loop(
                                 last_local_session: &last_local_session,
                                 current_attached: &mut current_attached,
                                 previous_attached: &mut previous_attached,
+                                move_follow: &mut move_follow,
                                 wants_session_tree,
                                 wants_agents,
                             },
@@ -6781,6 +6884,21 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::SessionTree { folders, unfiled, dormant }) => {
                         log::debug!("srv: SessionTree src={:?} folders={} unfiled={} dormant={}", src, folders.len(), unfiled.len(), dormant.len());
+                        let current = folders
+                            .iter()
+                            .flat_map(|f| f.sessions.iter())
+                            .chain(unfiled.iter())
+                            .find(|s| s.is_current)
+                            .map(|s| s.name.as_str());
+                        if let Some((conn, session)) =
+                            move_follow.settle(&src, mgr.foreground(), current)
+                        {
+                            log::debug!("tab picker: followed the pane into session={session:?} on {conn:?}");
+                            if conn == ConnId::Local {
+                                last_local_session = Some(session.clone());
+                            }
+                            record_switch(&mut current_attached, &mut previous_attached, conn, session);
+                        }
                         // Hand every panel the tree BEFORE the overlay branches
                         // below move it. Unconditional: a tree arrives whether
                         // it was asked for (`ListSessionTree`) or pushed
@@ -6903,21 +7021,23 @@ async fn run_client_loop(
                                 }
                             }
                         }
-                        if let Some(picker) = input.tab_picker.as_mut().filter(|p| *p.conn() == src) {
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_overlay(c, r)?;
-                            match picker.apply_tree(&folders, &unfiled) {
-                                TabPickerTree::Offer => {
-                                    renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
+                        if let Some(picker) = input.tab_picker.as_mut() {
+                            if let Some(verdict) = picker.apply_tree_from(&src, &folders, &unfiled) {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                match verdict {
+                                    TabPickerTree::Offer => {
+                                        renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
+                                    }
+                                    TabPickerTree::Nothing => {
+                                        log::debug!("tab picker: closed, no other tab, no other session, and no pane to break out");
+                                        input.tab_picker = None;
+                                        input.mode = Mode::Normal;
+                                        mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    }
                                 }
-                                TabPickerTree::Nothing => {
-                                    log::debug!("tab picker: closed, no other tab and no pane to break out");
-                                    input.tab_picker = None;
-                                    input.mode = Mode::Normal;
-                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                }
+                                renderer.flush()?;
                             }
-                            renderer.flush()?;
                         }
                         // The session-switch popup aggregates every connected
                         // server's tree, so it accepts trees from ANY source
@@ -8011,6 +8131,89 @@ mod tests {
         record_switch(&mut current, &mut previous, ConnId::Local, "b".to_string());
         assert_eq!(current, Some(local("b")));
         assert_eq!(previous, Some(local("a")));
+    }
+
+    #[test]
+    fn a_move_into_another_session_arms_a_follow() {
+        assert_eq!(
+            move_follow_for(&ConnId::Local, "Macbook", "Work"),
+            Some(local("Work"))
+        );
+    }
+
+    #[test]
+    fn a_move_within_the_pickers_session_arms_nothing_even_after_a_rename() {
+        // The picker read `Macbook` from the server's tree. Whatever name the
+        // client last recorded, such as a stale `main` from before a rename,
+        // does not take part.
+        assert_eq!(move_follow_for(&ConnId::Local, "Macbook", "Macbook"), None);
+    }
+
+    fn armed(conn: ConnId, session: &str) -> MoveFollow {
+        let mut f = MoveFollow::default();
+        f.arm((conn, session.to_string()));
+        f
+    }
+
+    #[test]
+    fn a_move_follow_is_recorded_when_the_tree_shows_the_target() {
+        let mut f = armed(ConnId::Local, "other");
+        assert_eq!(
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
+            Some(local("other"))
+        );
+        assert!(f.is_idle(), "settled once");
+        assert_eq!(
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tree_still_on_the_source_records_nothing_and_keeps_waiting() {
+        // A refused move, or a tree pushed before the move was handled.
+        let mut f = armed(ConnId::Local, "other");
+        assert_eq!(f.settle(&ConnId::Local, &ConnId::Local, Some("main")), None);
+        assert!(!f.is_idle());
+    }
+
+    #[test]
+    fn a_tree_from_another_connection_does_not_settle_a_move_follow() {
+        let mut f = armed(ConnId::Local, "other");
+        let mini = ConnId::Remote("mini".to_string());
+        assert_eq!(f.settle(&mini, &ConnId::Local, Some("other")), None);
+        assert!(!f.is_idle());
+    }
+
+    #[test]
+    fn a_follow_on_a_connection_no_longer_in_front_is_dropped_unrecorded() {
+        // The user switched servers before the answer came: a background
+        // connection's session must never become the current one.
+        let mini = ConnId::Remote("mini".to_string());
+        let mut f = armed(mini.clone(), "build");
+        assert_eq!(f.settle(&mini, &ConnId::Local, Some("build")), None);
+        assert!(f.is_idle());
+    }
+
+    #[test]
+    fn opening_a_picker_forgets_the_last_follow() {
+        let mut f = armed(ConnId::Local, "other");
+        f.picker_opened();
+        assert!(f.is_idle());
+        assert_eq!(
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dropped_connection_forgets_its_follow_and_only_its_own() {
+        let mini = ConnId::Remote("mini".to_string());
+        let mut f = armed(mini.clone(), "build");
+        f.conn_dropped(&ConnId::Local);
+        assert!(!f.is_idle(), "another connection's drop keeps it");
+        f.conn_dropped(&mini);
+        assert!(f.is_idle());
     }
 
     #[test]

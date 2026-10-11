@@ -321,10 +321,10 @@ def main():
           "the server log shows a move happened")
     check("refused: TargetNotFound" in log, "the closed-tab refusal is logged")
     check("refused: SolePaneInSoleTab" in log, "the sole-pane refusal is logged")
-    check(re.search(r"command PaneMoveToTabTarget \{ tab_id: Some\(\d+\) \} is a no-op "
-                    r"while the popup is open", log)
-          and "command PaneMoveToTabTarget { tab_id: None } is a no-op while the popup is open"
-          in log,
+    check(re.search(r"command PaneMoveToTabTarget \{ tab_id: Some\(\d+\)(, session: None)? \} "
+                    r"is a no-op while the popup is open", log)
+          and re.search(r"command PaneMoveToTabTarget \{ tab_id: None(, session: None)? \} "
+                        r"is a no-op while the popup is open", log),
           "the popup refusal is logged")
 
     if fails:
