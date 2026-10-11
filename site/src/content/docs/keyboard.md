@@ -82,7 +82,7 @@ Keys below follow `Ctrl-a`. For the action name behind each key, which is what y
 | Toggle the popup terminal | `p o` |
 | Make the pane the master | `p m` |
 | Rename the pane | `p r` |
-| Move the pane to another tab, or a new one | `p t` |
+| Move the pane to another tab or a new one, in any session | `p t` |
 | Add the pane to a stack | `p a` |
 | Next / previous pane in the stack | `p ]` / `p [` |
 | Fold into the left / down / up / right neighbour's stack | `p S h` / `p S j` / `p S k` / `p S l` |

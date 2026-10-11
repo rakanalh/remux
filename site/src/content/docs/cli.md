@@ -145,8 +145,9 @@ The new tab starts in `appearance.default_layout`.
 
 Both commands are meant to be run **from inside a Remux pane**, by you or by a script, an editor or a file manager's opener hook.
 
-- The session comes from `$REMUX_SESSION`, which every pane gets. If it is unset, the command refuses with `not inside a remux pane` and exits non-zero. It never guesses a session.
-- The pane that gets split is that session's **currently focused** pane in its active tab, not necessarily the pane the command ran in.
+- The session is the one the pane is in **now**. The command sends `$REMUX_PANE`, and the server looks up which session holds that pane, so a pane moved to another session, or a session renamed since the pane started, still gets the right one. When that pane no longer exists, the session named by `$REMUX_SESSION` is used instead.
+- If `$REMUX_SESSION` is unset, the command refuses with `not inside a remux pane` and exits non-zero, even when `$REMUX_PANE` is set. It never guesses a session.
+- The pane that gets split is that session's **currently focused** pane in its active tab, not necessarily the pane the command ran in. `$REMUX_PANE` picks the session, never the spot.
 - If no server is running on this machine, the command exits non-zero. It does not start a server.
 - On success it prints nothing and exits 0. Errors go to stderr with a non-zero exit, so scripts can check `$?`.
 
@@ -157,11 +158,11 @@ Remux sets these in every pane:
 | Variable | Value |
 |---|---|
 | `REMUX` | `1`. Marks the shell as running inside Remux. |
-| `REMUX_SESSION` | Name of the session the pane was created in. Read by `split` and `new-tab`. |
-| `REMUX_PANE` | ID of the pane |
+| `REMUX_SESSION` | Name of the session the pane was created in. Read by `split` and `new-tab` as the fallback, and its presence is what marks a shell as inside a pane. |
+| `REMUX_PANE` | ID of the pane. Read by `split` and `new-tab` to find the session the pane is in now. |
 | `TERM` | `xterm-256color` |
 
-These are set when the pane starts and never updated. If you rename the session later, `$REMUX_SESSION` in panes that already exist still has the old name.
+These are set when the pane starts and never updated, so `$REMUX_SESSION` keeps the old name after you rename the session or move the pane to another session. `split` and `new-tab` still find the right session through `$REMUX_PANE`. The one case left is a process that outlives its pane, such as a `nohup`'d job, after its session was renamed or closed: with the pane gone and the name matching no session, the command fails with an error naming both.
 
 Remux reads:
 

@@ -146,7 +146,7 @@ The stack's names can be drawn as chips. Set `tab_style` under `[appearance.them
 
 ## Move a pane to another tab
 
-`Ctrl-a p t` opens a picker listing the session's other tabs and `+ new tab`. Move with `j`/`k` (or the arrows), `g`/`G` to jump to either end, `Enter` to pick, and `Esc` or `q` to cancel.
+`Ctrl-a p t` opens a picker listing every session on the server the pane is on, each under its own heading with a `+ new tab` row and its tabs. The pane's own session comes first, without the tab the pane is in. Move with `j`/`k` (or the arrows), `g`/`G` to jump to either end, `Enter` to pick, and `Esc` or `q` to cancel. A list taller than the terminal scrolls to keep the highlighted row in view.
 
 ![Move pane to tab picker](../../assets/screenshots/move-to-tab.png)
 
@@ -154,9 +154,12 @@ The pane moves with its program and scrollback intact, and the target tab become
 
 - Into an automatic tab, the pane joins its layout.
 - Into a Custom tab, it splits that tab's focused pane side by side.
-- `+ new tab` builds the tab in your `default_layout`.
-- A tab left with no panes is closed.
-- A move that can't work is refused and leaves everything as it was: for example, sending the only pane of the only tab to a new tab.
+- `+ new tab` builds the tab in your `default_layout`, in the session it is listed under.
+- Into another session, you follow the pane: your client switches to that session, and `Alt+o` takes you back.
+- A tab left with no panes is closed. A session left with no tabs is closed too, and anyone else attached to it is moved to another session, as when its last pane exits.
+- A `remux split` typed in a moved pane opens beside it, in the session it is in now (see [the CLI](/remux/cli/#how-split-and-new-tab-pick-their-target)).
+- The picker lists one server's sessions. A pane is never moved to a connected remote.
+- A move that can't work is refused and leaves everything as it was: for example, sending the only pane of the only tab to a new tab in its own session. That row is not offered; the picker closes without opening only when there is no other session either.
 
 ## Related
 

@@ -31,7 +31,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Splitting & focus** — split panes vertically or horizontally, and move focus directionally. Directional focus is **stack-aware**: it steps through stacked panes at a position before crossing to the neighbouring split.
 - **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting. Inside a stack of several panes, `PaneMoveLeft`/`PaneMoveRight` move the pane one place along the stack instead, and at the stack's end take it out into its own slot on that side; `PaneMoveUp`/`PaneMoveDown` take it out above or below at once.
 - **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, `stack into` to fold an existing pane into a neighbour's stack, and `unstack` to give a stacked pane its own slot again).
-- **Move to tab** — `Ctrl-a p t` opens a picker of the session's other tabs plus `+ new tab`; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it. A tab left empty closes.
+- **Move to tab** — `Ctrl-a p t` opens a picker of every session on the pane's server, each with its tabs and a `+ new tab`, the pane's own session first; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it, into another session too. A tab left empty closes, and so does a session.
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
 - **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement); turn any of them off under `[layouts]`.
@@ -282,9 +282,9 @@ remux new-tab -c ~/project                     # a new tab, starting in ~/projec
 
 `--below` is the default: a terminal is wider than it is tall, so stacking leaves both panes more usable line length. With no command the new pane runs your login shell, exactly as an interactive split does, and `-c` defaults to the target pane's directory.
 
-**The split lands on whatever pane has focus right now**, in the active tab of `$REMUX_SESSION` — not necessarily the pane the command was typed in. That is deliberate, and it is what tmux does: the environment variable was fixed when the pane started, while focus is where you are looking.
+**The split lands in the session the pane is in now**, on whatever pane has focus right now in that session's active tab — not necessarily the pane the command was typed in. `$REMUX_PANE` tells the server which session that is, so a pane you moved to another session, or a session you renamed, still splits beside itself; `$REMUX_SESSION` is the fallback when the pane is gone. Focus, not the variable, picks the spot: that is what tmux does, and focus is where you are looking.
 
-Run outside a pane, both refuse and say so rather than guessing a session — guessing is how a script splits a window you were not looking at.
+Run outside a pane (`$REMUX_SESSION` unset), both refuse and say so rather than guessing a session, even if `$REMUX_PANE` is set — guessing is how a script splits a window you were not looking at.
 
 This is what makes an external file manager's opener hook work: point `NNN_OPENER`, yazi's `[opener]`, or ranger's `rifle.conf` at `remux split -- $EDITOR "$1"` and files open beside your work — run your file manager in an ordinary pane and it behaves as it always did. The built-in [`files` panel](#sidebars--plugins) needs none of this: it is part of the client and talks to the server directly.
 
@@ -350,7 +350,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `o` | Toggle the popup terminal *(→ Normal)* |
 | `m` | Make the focused pane the master (Master layout) *(→ Normal)* |
 | `r` | Rename pane |
-| `t` | Move the pane to another tab, or a new one (opens a picker) |
+| `t` | Move the pane to another tab or a new one, in any session (opens a picker) |
 | `a` | Add pane to stack *(→ Normal)* |
 | `]` | Next pane in stack *(→ Normal)* |
 | `[` | Previous pane in stack *(→ Normal)* |
@@ -541,7 +541,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneMoveUp` | — | Swap the focused pane with the pane above. In a stack of several panes, take it out of the stack into a new slot above. |
 | `PaneMoveDown` | — | Swap the focused pane with the pane below. In a stack of several panes, take it out of the stack into a new slot below. |
 | `PaneRename` | — | Rename the focused pane (prompts for the name). |
-| `PaneMoveToTab` | — | Pick another tab of the session (or `+ new tab`) and move the focused pane there. |
+| `PaneMoveToTab` | — | Pick a tab of any session on this server (or a session's `+ new tab`) and move the focused pane there. |
 | `PaneToggleZoom` | — | Toggle fullscreen zoom for the focused pane. |
 | `ResizeLeft` | `<amount>` | Resize the focused pane's left edge (default 1). |
 | `ResizeRight` | `<amount>` | Resize the focused pane's right edge (default 1). |
