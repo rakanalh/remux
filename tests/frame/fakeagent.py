@@ -37,6 +37,13 @@ so a command written while another is being read is never lost:
                          server's probe), never what follows it: an agent
                          that hangs right after it starts reading a message
   exit-on-rx             exit right after the next read
+  exit-after-body        exit right after reading a paste's end: an agent that
+                         reads a whole message and dies before its Enter
+  deaf-on-rx             stop reading right after the next read: an agent that
+                         takes the probe and hangs before the body
+  trickle                read a probe whole, and anything else one byte per
+                         100 ms: an agent that reads, slowly, for as long as a
+                         message takes
   block-on-rx            show the permission prompt the moment the next
                          pasted block's END arrives: a prompt drawn between
                          a typed message and its Enter
@@ -110,6 +117,9 @@ def main():
     next_work = 0.0
     deaf = False
     probe_only = False
+    deaf_on_rx = False
+    exit_after_body = False
+    trickle = False
     exit_on_rx = False
     block_on_rx = None
     read_size, read_gap = 4096, 0.0
@@ -130,7 +140,10 @@ def main():
             readable = []
             time.sleep(0.02)
         if readable:
-            data = os.read(0, read_size)
+            size = read_size
+            if trickle:
+                size = len(OPENER) if queued() == len(OPENER) else 1
+            data = os.read(0, size)
             if not data:
                 return
             line = f"RX {time.time_ns()} {data.hex()}\n"
@@ -138,6 +151,13 @@ def main():
             log.write(line)
             if exit_on_rx:
                 return
+            if exit_after_body and b"\x1b[201~" in data:
+                return
+            if deaf_on_rx:
+                deaf_on_rx = False
+                deaf = True
+            if trickle:
+                time.sleep(0.1)
             if block_on_rx and b"\x1b[201~" in data:
                 out(block_on_rx)
                 block_on_rx = None
@@ -171,6 +191,12 @@ def main():
                 read_size, read_gap = int(size), int(gap) / 1000
             elif command == "exit-on-rx":
                 exit_on_rx = True
+            elif command == "exit-after-body":
+                exit_after_body = True
+            elif command == "deaf-on-rx":
+                deaf_on_rx = True
+            elif command == "trickle":
+                trickle = True
             elif command == "block-on-rx":
                 block_on_rx = PROCEED
             elif command == "editblock-on-rx":

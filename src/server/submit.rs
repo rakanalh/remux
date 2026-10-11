@@ -49,10 +49,25 @@
 //! message from its user's.
 //!
 //! Residuals:
-//! - An agent that read the probe and then died before reading the body
-//!   leaves the body in the input queue. The read check flushes it, but the
-//!   shell can read it first, in the time between the agent's exit and the
-//!   next check.
+//! - An agent that read the probe and then stopped reading leaves the body in
+//!   the input queue. The read check finds that out once the queue has made
+//!   no progress for a stall interval after the body was written, and
+//!   flushes it; a body larger than the terminal's input queue is judged at
+//!   the read check's deadline instead, since the queue's count cannot show
+//!   its progress. An agent that EXITS before then hands the terminal
+//!   to the shell first, and the shell reads the body. Without its paste
+//!   opener, which the agent read, the shell takes the body as typed lines:
+//!   every line of a multi-line body but the last runs at once, with no
+//!   Enter from us. The envelope opens with `# ` so that its own line is a
+//!   comment to a shell; the body's lines are not. The submit is then
+//!   answered `read_by_another_program`.
+//! - The probe is taken as read when the input queue is empty, and any
+//!   program in the agent's process group could have emptied it: a child
+//!   the agent started that reads the terminal takes the probe, and the body
+//!   follows into whatever that child does with it.
+//! - A flush on a refusal and a person's key can cross: a key that arrives
+//!   after the typing is marked ended and before the queue is flushed is
+//!   flushed with the message's text.
 //! - A key a human presses after the agent read the text stops the Enter,
 //!   and the text stays in the agent's input box beside the person's keys,
 //!   unsubmitted.
@@ -379,6 +394,15 @@ impl SubmitRefusal {
         }
     }
 
+    pub fn read_by_another(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "read_by_another_program",
+            message: format!(
+                "%{pane}'s agent stopped reading before it read the message, and another program may have read it instead: the shell, if one took over the terminal, may have run its lines. It is in the mailbox"
+            ),
+        }
+    }
+
     pub fn typed_over(pane: PaneId) -> Self {
         SubmitRefusal {
             code: "human_typing",
@@ -437,7 +461,9 @@ pub fn envelope(id: crate::protocol::MsgId, from_pane: PaneId, from_name: Option
         Some(name) => format!("{} (%{from_pane})", crate::client::cli_common::escape(name)),
         None => format!("%{from_pane}"),
     };
-    format!("[remux message #{id} from {from}; reply: remux msg send %{from_pane} --reply-to {id}]")
+    format!(
+        "# [remux message #{id} from {from}; reply: remux msg send %{from_pane} --reply-to {id}]"
+    )
 }
 
 /// Whether a newline typed into the pane stays inside the message: only when
@@ -557,15 +583,15 @@ mod tests {
     fn the_envelope_names_the_message_its_sender_and_the_reply() {
         assert_eq!(
             envelope(7, 1, Some("lead")),
-            "[remux message #7 from lead (%1); reply: remux msg send %1 --reply-to 7]"
+            "# [remux message #7 from lead (%1); reply: remux msg send %1 --reply-to 7]"
         );
         assert_eq!(
             envelope(8, 3, None),
-            "[remux message #8 from %3; reply: remux msg send %3 --reply-to 8]"
+            "# [remux message #8 from %3; reply: remux msg send %3 --reply-to 8]"
         );
         assert_eq!(
             envelope(9, 3, Some("a\u{1b}b")),
-            "[remux message #9 from a\\x1bb (%3); reply: remux msg send %3 --reply-to 9]"
+            "# [remux message #9 from a\\x1bb (%3); reply: remux msg send %3 --reply-to 9]"
         );
     }
 

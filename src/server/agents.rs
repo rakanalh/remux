@@ -759,6 +759,21 @@ mod tests {
         "Are you sure you want to delete this permission rule?",
     ];
 
+    /// A known gap: this wording, also in the binary, goes on past its `?`
+    /// on the same line, so the anchored pattern misses it and the panel
+    /// reads the pane Idle. A submit still refuses it, through
+    /// `submit::looks_like_prompt` and the dialog's numbered options.
+    #[test]
+    fn a_question_with_text_after_its_mark_is_a_known_gap() {
+        let line = "Are you sure you want to delete this rule? The classifier stops applying it.";
+        assert_eq!(
+            shipped()
+                .classify("claude", &[line.to_string()], Duration::from_secs(30))
+                .state,
+            AgentState::Idle
+        );
+    }
+
     /// Claude Code's dialog for an Edit tool call, as it draws it. Its default
     /// is "Yes", so an Enter typed into it approves the edit.
     const CLAUDE_EDIT_DIALOG: [&str; 6] = [
