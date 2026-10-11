@@ -262,10 +262,19 @@ def run_default(c, v):
     # 15. preexec and precmd hooks around a long command: the command's
     # preexec title is the shell's, so it is never shown, and precmd's restores
     # nothing visible.
-    # Polled every 100ms: the flash this guards lasted a whole settle window,
-    # and polling harder slows the PTY reader enough that the preexec title is
-    # sometimes read after `sleep` has the terminal and is taken for its own.
-    typed(c, "printf '\\033]2;%s%s\\007' Jo b; sleep 2; printf '\\033]2;%s%s\\007' Ho me\r")
+    # The shell waits on `read` until the server has rendered the marker
+    # written with the title. Without that wait, the shell can start `sleep`
+    # before the PTY reader wakes, the reader then sees `sleep` in the
+    # foreground, and it attributes the shell's title to `sleep`. The server
+    # cannot correct this, because case 4's own title arrives with the same
+    # samples. The `\r` that ends the wait is sent well inside PREEXEC_GAP.
+    typed(c, "printf '\\033]2;%s%s\\007%s%s' Jo b MA RK; read _; sleep 2; "
+             "printf '\\033]2;%s%s\\007' Ho me\r")
+    end = time.time() + 2.0
+    while time.time() < end and not v.has("MARK"):
+        v.feed(c.drain(0.02))
+    check(v.has("MARK"), "15 the server has read the preexec title before the job starts")
+    typed(c, "\r")
     seen = watch(c, v, 4.5, step=0.1)
     check(seen == ["Home", "sleep", "Home"],
           f"15 preexec/precmd around `sleep 2` reads exactly [Home, sleep, Home] ({seen})")
