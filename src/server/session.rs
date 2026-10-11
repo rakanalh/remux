@@ -1505,7 +1505,7 @@ impl ServerState {
 
     /// Remove a session whose last tab is gone, and its folder entry. Returns
     /// its popup pane for the caller to reap.
-    fn remove_emptied_session(&mut self, name: &str) -> Vec<PaneId> {
+    pub(crate) fn remove_emptied_session(&mut self, name: &str) -> Vec<PaneId> {
         let Some(mut sess) = self.sessions.remove(name) else {
             return Vec::new();
         };

@@ -3240,16 +3240,7 @@ async fn handle_command(
                 }
             };
             log::debug!("server: PaneClose pane_id={closed_pane}");
-            close_pane(
-                closed_pane,
-                &session_name,
-                state,
-                panes,
-                clients,
-                config,
-                prev_frames,
-            )
-            .await;
+            close_pane(closed_pane, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneFocusLeft
         | RemuxCommand::PaneFocusRight
@@ -4213,16 +4204,7 @@ async fn handle_command(
                     .unwrap_or(false)
             };
             if in_active_tab {
-                close_pane(
-                    pane_id,
-                    &session,
-                    state,
-                    panes,
-                    clients,
-                    config,
-                    prev_frames,
-                )
-                .await;
+                close_pane(pane_id, state, panes, clients, config, prev_frames).await;
             } else {
                 // Background-tab path: mirror close_pane's non-active-tab-safe
                 // subset (layout collapse + pane_order retain + focus/rebuild,
@@ -9443,7 +9425,6 @@ fn move_source_pane(st: &ServerState, session_name: &str) -> Option<PaneId> {
 
 async fn close_pane(
     pane_id: PaneId,
-    session_name: &str,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -9466,9 +9447,17 @@ async fn close_pane(
     // goes away -- it is in no layout tree, so nothing else would reclaim it).
     let mut also_reap: Vec<PaneId> = Vec::new();
 
-    let action = {
+    // The session is looked up here, under the lock that also closes the pane,
+    // rather than taken from the caller: a session the caller read under an
+    // earlier lock can be stale by now, because the pane may have moved to
+    // another session in between. A pane in no session is already being reaped
+    // by whatever removed it.
+    let (session_name, action) = {
         let mut st = state.lock().await;
-        let sess = match st.sessions.get_mut(session_name) {
+        let Some(session_name) = st.session_of_pane(pane_id).map(str::to_owned) else {
+            return;
+        };
+        let sess = match st.sessions.get_mut(&session_name) {
             Some(s) => s,
             None => return,
         };
@@ -9478,7 +9467,7 @@ async fn close_pane(
         // it) and leave a dead PTY behind with the popup still "open". This is
         // both the `PaneClose`-while-popup-open path and the popup shell's own
         // exit path, and it must work from any tab.
-        if sess.popup_pane == Some(pane_id) {
+        let action = if sess.popup_pane == Some(pane_id) {
             sess.take_popup();
             log::debug!("server: close_pane closed popup pane_id={pane_id}");
             CloseAction::Broadcast
@@ -9508,14 +9497,14 @@ async fn close_pane(
                     }
                     CloseAction::Broadcast
                 } else {
-                    // Last tab in the session -- remove the session entirely.
-                    let session_name_owned = session_name.to_string();
-                    also_reap.extend(sess.take_popup());
-                    st.sessions.remove(&session_name_owned);
+                    // Last tab in the session -- remove the session entirely,
+                    // with its folder entry and its popup.
+                    also_reap.extend(st.remove_emptied_session(&session_name));
                     CloseAction::SessionRemoved
                 }
             }
-        }
+        };
+        (session_name, action)
     };
     // Drop the pane(s) and TELL their subscribers. A subscription to a dead pane
     // must not linger, and a subscriber dropped without a word is exactly the
@@ -9526,11 +9515,11 @@ async fn close_pane(
     reap_panes(&reaped, panes, clients).await;
     match action {
         CloseAction::Broadcast => {
-            let _ = resize_session_panes(session_name, state, panes, clients, config).await;
-            broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+            let _ = resize_session_panes(&session_name, state, panes, clients, config).await;
+            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::SessionRemoved => {
-            handle_session_removed(session_name, state, panes, clients, config, prev_frames).await;
+            handle_session_removed(&session_name, state, panes, clients, config, prev_frames).await;
         }
         CloseAction::NoBroadcast => {}
     }
@@ -9773,24 +9762,7 @@ async fn start_forwarding_for_pane(
                         log::debug!(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
-                        let owner = {
-                            let st = state.lock().await;
-                            st.session_of_pane(pane_id).map(str::to_owned)
-                        };
-                        // A pane in no session is already being reaped by
-                        // whatever removed it, so there is no layout to repair.
-                        if let Some(owner) = owner {
-                            close_pane(
-                                pane_id,
-                                &owner,
-                                &state,
-                                &panes,
-                                &clients,
-                                &config,
-                                &prev_frames,
-                            )
-                            .await;
-                        }
+                        close_pane(pane_id, &state, &panes, &clients, &config, &prev_frames).await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;
                         // A pane dying on its own removes a row from every
