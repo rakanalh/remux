@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -1059,6 +1059,7 @@ async fn step_submit(
         .then(|| crate::server::submit::envelope(id, entry.from_pane, entry.from_name.as_deref()));
     let command = sample.command.clone().unwrap_or_default();
     let typed = type_text(
+        id,
         pane,
         &sample,
         &command,
@@ -1072,16 +1073,7 @@ async fn step_submit(
     .await;
     let (bracketed, bytes, enter, text) = match typed {
         Ok(typed) => typed,
-        Err(TextRefusal::HumanTyped) => {
-            let mut st = store.lock().await;
-            st.unsubmit(pane, id);
-            let mut entry = entry;
-            entry.reply = st.end_typing(pane);
-            st.requeue_front(entry);
-            drop(st);
-            mark_submit_dirty();
-            return;
-        }
+        Err(TextRefusal::HumanTyped) => return requeue_untyped(entry, store).await,
         Err(TextRefusal::Working(answer)) => {
             let policy = Some(working_policy(&rule));
             return answer_untyped(entry, answer, policy, store).await;
@@ -1096,20 +1088,21 @@ async fn step_submit(
     let rules = agent_rules(config);
     tokio::spawn(async move {
         let typing = EndTypingOnDrop { pane, armed: true };
-        let outcome = type_enter(
-            id,
+        let _ends = TypingEnds(Arc::clone(&text.typing));
+        let outcome = deliver_text(
             pane,
             pgid,
             &command,
             rules,
             &enter,
             rule.enter_delay,
+            bracketed,
             text,
             &panes,
         )
         .await;
         match outcome {
-            Ok(()) => {
+            Typed::Submitted => {
                 log::info!(
                     "msg: id={id} submitted to %{pane} (bracketed={}, {bytes} bytes)",
                     if bracketed { "on" } else { "off" }
@@ -1130,25 +1123,32 @@ async fn step_submit(
                 };
                 send_reply(id, reply, message);
             }
-            Err(refusal) => {
-                let reply = {
-                    let mut st = store.lock().await;
-                    st.unsubmit(pane, id);
-                    st.end_typing(pane)
+            // The agent has the message, so it stays Submitted, and an error
+            // would make the sender retry and deliver it twice.
+            Typed::Read(refusal) => {
+                let reason = if refusal.code == "agent_blocked" {
+                    "agent_blocked_read"
+                } else {
+                    "typed_over_read"
                 };
+                let reply = store.lock().await.end_typing(pane);
+                reply_submit(
+                    crate::server::messaging::SubmitEntry { reply, ..entry },
+                    Answer::Mailbox(reason),
+                    None,
+                    store,
+                )
+                .await;
+            }
+            Typed::PutBack => requeue_untyped(entry, store).await,
+            Typed::Untyped(refusal) | Typed::Refused(refusal) => {
                 if refusal.code == "agent_did_not_read" {
                     log::info!(
                         "msg: id={id} not read by %{pane}; typed text discarded, left in the mailbox"
                     );
                 }
                 let answer = settle(entry.deliver, refusal);
-                reply_submit(
-                    crate::server::messaging::SubmitEntry { reply, ..entry },
-                    answer,
-                    None,
-                    store,
-                )
-                .await;
+                answer_untyped(entry, answer, None, store).await;
             }
         }
         typing.disarm();
@@ -1175,6 +1175,20 @@ async fn answer_untyped(
         store,
     )
     .await;
+    mark_submit_dirty();
+}
+
+/// Put back an entry that was claimed but not written, at the front of its
+/// queue with its reply, so that it is decided again on the next pass.
+async fn requeue_untyped(
+    mut entry: crate::server::messaging::SubmitEntry,
+    store: &'static Mutex<Messaging>,
+) {
+    let mut st = store.lock().await;
+    st.unsubmit(entry.pane, entry.id);
+    entry.reply = st.end_typing(entry.pane);
+    st.requeue_front(entry);
+    drop(st);
     mark_submit_dirty();
 }
 
@@ -1355,6 +1369,7 @@ enum TextRefusal {
 /// between them. The bytes are never logged: they are the message.
 #[allow(clippy::too_many_arguments)]
 async fn type_text(
+    id: MsgId,
     pane: PaneId,
     sample: &PaneSample,
     command: &str,
@@ -1367,13 +1382,13 @@ async fn type_text(
 ) -> Result<(bool, usize, Vec<u8>, TypedText), TextRefusal> {
     use crate::config::messaging::Bracketed;
     use crate::server::submit::{
-        encode, multi_line_refusal, newlines_safe, on_working, Framing, SubmitRefusal,
+        encode, multi_line_refusal, newlines_safe, on_working, split_probe, Framing, SubmitRefusal,
     };
     use nix::sys::termios::{tcgetattr, LocalFlags};
     let refuse = |refusal| Err(TextRefusal::Refuse(refusal));
 
-    let ps = panes.lock().await;
-    let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+    let mut ps = panes.lock().await;
+    let Some(pd) = ps.get_mut(&pane).filter(|pd| !pd.exited) else {
         return refuse(SubmitRefusal::closed(pane));
     };
     if pd.last_human_input != sample.last_human_input {
@@ -1419,6 +1434,17 @@ async fn type_text(
             return refuse(refusal);
         }
     }
+    // The terminal from the slave side, where its input queue is: without
+    // it nothing can tell whether the agent read the message.
+    let Some(slave) = pd
+        .pty
+        .slave_path
+        .as_deref()
+        .and_then(open_slave)
+        .filter(|slave| is_the_slave(slave, pd.pty.slave_dev))
+    else {
+        return refuse(SubmitRefusal::not_read(pane));
+    };
     let (text, enter) = encode(
         body,
         framing,
@@ -1428,19 +1454,35 @@ async fn type_text(
         envelope,
     );
     let bytes = text.len();
-    let cancel = Arc::new(pty::WriteCancel::default());
-    let written = pd.send_tracked(text, Arc::clone(&cancel));
+    let (probe, body) = split_probe(text, framing, rule.focus_in);
+    let typing = Arc::new(SubmitTyping {
+        id,
+        cancel: Arc::new(pty::WriteCancel::default()),
+        slave: Arc::new(slave),
+        paste_open: AtomicBool::new(false),
+        taken_over: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+    });
+    let written = pd.send_tracked(probe, Arc::clone(&typing.cancel));
+    pd.typing = Some(Arc::clone(&typing));
     Ok((
         framing == Framing::Bracketed,
         bytes,
         enter,
         TypedText {
             written,
-            cancel,
+            body,
+            typing,
             typed_at: now,
         },
     ))
 }
+
+/// How long the agent has to read a message's probe before it is judged not
+/// reading and the body is not written. Short, because an agent that is not
+/// reading may be about to exit, and the probe must be flushed before the
+/// shell after it reads the terminal.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// How long a typed message has, after its Enter delay, to be fully written
 /// and read before it is judged not read.
@@ -1465,149 +1507,267 @@ const SUBMIT_HOLD_MS: u64 =
 /// no answer while the server is still able to type it: a retry after such a
 /// report would deliver the message twice.
 pub const SUBMIT_BUDGET_MS: u64 = SUBMIT_HOLD_MS
+    + PROBE_DEADLINE.as_millis() as u64
     + crate::config::messaging::MAX_ENTER_DELAY_MS
     + CONSUME_DEADLINE.as_millis() as u64
     + CANCEL_ACK.as_millis() as u64;
 
-/// The text's write, as `type_text` handed it to the pane's writer.
+/// A message being typed into a pane, as [`PaneData::send_human_input`] sees
+/// it.
+struct SubmitTyping {
+    id: MsgId,
+    /// Stops the message's writes that have not happened yet.
+    cancel: Arc<crate::server::pty::WriteCancel>,
+    /// The pane's terminal from the slave side, where its input queue is.
+    slave: Arc<std::fs::File>,
+    /// The agent read the paste opener, so a paste is open in it until it
+    /// reads the closer.
+    paste_open: AtomicBool,
+    /// A person's key took the pane back while the message was unread, and
+    /// the rest of the message was cancelled and flushed.
+    taken_over: AtomicBool,
+    /// The message is no longer being typed.
+    ended: AtomicBool,
+}
+
+/// Marks a [`SubmitTyping`] ended when the task typing it stops, however it
+/// stops, so a later key is never taken for one into this message.
+struct TypingEnds(Arc<SubmitTyping>);
+
+impl Drop for TypingEnds {
+    fn drop(&mut self) {
+        self.0.ended.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The probe's write, as `type_text` handed it to the pane's writer, and the
+/// rest of the message.
 struct TypedText {
     written: tokio::sync::oneshot::Receiver<bool>,
-    cancel: Arc<crate::server::pty::WriteCancel>,
-    /// When the text was handed to the writer: a person's key after this was
-    /// pressed with the message in the agent's input.
+    body: Vec<u8>,
+    typing: Arc<SubmitTyping>,
+    /// When the probe was handed to the writer: a person's key after this
+    /// was pressed while the message was being typed.
     typed_at: std::time::Instant,
 }
 
-/// Write the Enter into `pane` once the program sampled has READ the whole
-/// text: every byte has left the writer (`typed.written`) and the terminal's
-/// input queue is empty. Bytes still queued would be read by whatever runs
-/// next, and after the agent exits that is the shell, which the Enter would
-/// make run them. Checked every [`CONSUME_POLL`] from `delay` on, for up to
-/// [`CONSUME_DEADLINE`]; the Enter is written in the same `panes` section as
-/// the checks that allow it. The Enter is also refused when the agent has
-/// started waiting on its user, which the Enter would answer, and when a
-/// person has typed since the text, whose keys the Enter would submit.
+/// How typing a message ended, once its probe was written.
+enum Typed {
+    Submitted,
+    /// The agent read the whole message, and it was not submitted: a person
+    /// typed, or the agent began waiting on its user. The message is in the
+    /// agent's input.
+    Read(crate::server::submit::SubmitRefusal),
+    /// Nothing of the message but the probe reached the agent, because a
+    /// person typed: it waits for the typing guard again.
+    PutBack,
+    /// Nothing of the message but the probe was written.
+    Untyped(crate::server::submit::SubmitRefusal),
+    /// Refused once the body was written. What the agent did not read was
+    /// cancelled and flushed.
+    Refused(crate::server::submit::SubmitRefusal),
+}
+
+/// Type the rest of a message whose probe `type_text` wrote, and its Enter.
 ///
-/// On a refusal the rest of the text is cancelled FIRST and the writer's
+/// The probe must be read first: written, and the input queue found empty
+/// on two checks [`CONSUME_POLL`] apart, within [`PROBE_DEADLINE`]. Only then,
+/// in the same `panes` section as the checks that allow it, is the body
+/// written. An agent that does not read the probe is not reading at all, and
+/// its probe is flushed with nothing else written.
+///
+/// The Enter is written once the agent has READ the whole body: every byte
+/// has left the writer and the input queue is empty on two checks, from the
+/// Enter delay on, for up to [`CONSUME_DEADLINE`], and in the same `panes`
+/// section as the checks. Bytes still queued would be read by whatever runs
+/// next, and after the agent exits that is the shell, which the Enter would
+/// make run them. The Enter is refused when the agent has begun waiting on
+/// its user, which the Enter would answer, and when a person has typed since
+/// the probe, whose keys the Enter would submit.
+///
+/// On a refusal the rest of the message is cancelled FIRST and the writer's
 /// stop awaited, then the queue is flushed: flushed first, the queue would
-/// only make room for the writer to write the tail into it. When a person
-/// typed, the agent is given until the deadline to read the queue, the
-/// person's keys with it, so that its paste is closed rather than cut off
-/// and the keys reach it; whatever is still unread then is cancelled and
-/// flushed like any other, because a person's Enter has made it a line the
-/// next reader would run. A program other than the agent never gets that
-/// time: the queue is flushed as soon as the agent is not the one reading.
+/// only make room for the writer to write the tail into it. A person's key
+/// that arrived while the message was unread has done both already, and its
+/// own flush is not repeated, since that would discard the key.
 #[allow(clippy::too_many_arguments)]
-async fn type_enter(
-    id: MsgId,
+async fn deliver_text(
     pane: PaneId,
     pgid: Option<nix::unistd::Pid>,
     command: &str,
     rules: &crate::server::agents::AgentRules,
     enter: &[u8],
     delay: std::time::Duration,
-    mut typed: TypedText,
+    bracketed: bool,
+    typed: TypedText,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-) -> Result<(), crate::server::submit::SubmitRefusal> {
-    use crate::server::submit::SubmitRefusal;
+) -> Typed {
+    use crate::server::submit::{SubmitRefusal, PASTE_CLOSE};
     use tokio::sync::oneshot::error::TryRecvError;
 
-    let not_read = || {
-        SubmitRefusal {
-        code: "agent_did_not_read",
-        message: format!(
-            "%{pane}'s agent did not read the message, so it was not submitted: it is in the mailbox"
-        ),
-    }
-    };
-    let typed_after = |pd: &PaneData| pd.last_human_input.is_some_and(|t| t > typed.typed_at);
-    let deadline = tokio::time::Instant::now() + delay + CONSUME_DEADLINE;
-    tokio::time::sleep(delay).await;
-    let slave = {
-        let ps = panes.lock().await;
-        ps.get(&pane).and_then(|pd| {
-            pd.pty
-                .slave_path
-                .as_deref()
-                .and_then(open_slave)
-                .filter(|slave| is_the_slave(slave, pd.pty.slave_dev))
-        })
-    };
-    let mut written = false;
-    let mut human = false;
-    // The agent read every byte that reached the queue, so nothing is left
-    // for the next program to read.
-    let mut read_all = false;
+    let TypedText {
+        mut written,
+        body,
+        typing,
+        typed_at,
+    } = typed;
+    let id = typing.id;
+    let slave = &*typing.slave;
+    let typed_after = |pd: &PaneData| pd.last_human_input.is_some_and(|t| t > typed_at);
+    let taken_over = || typing.taken_over.load(Ordering::SeqCst);
+
+    let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
+    let mut probe_written = false;
+    let mut read_once = false;
     let mut agent_reading = true;
-    let verdict = loop {
-        if !written {
-            match typed.written.try_recv() {
-                Ok(true) => written = true,
-                Ok(false) | Err(TryRecvError::Closed) => break Err(not_read()),
+    let probed = loop {
+        if taken_over() {
+            return Typed::PutBack;
+        }
+        if !probe_written {
+            match written.try_recv() {
+                Ok(true) => probe_written = true,
+                Ok(false) | Err(TryRecvError::Closed) => break Err(SubmitRefusal::not_read(pane)),
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let blocked = {
+        {
             let ps = panes.lock().await;
             let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
                 break Err(SubmitRefusal::closed(pane));
             };
-            human |= typed_after(pd);
-            let Some(slave) = slave.as_ref().filter(|_| agent_reads(pd, pgid)) else {
+            if !agent_reads(pd, pgid) {
                 agent_reading = false;
-                break Err(not_read());
-            };
-            let now = std::time::Instant::now();
-            let blocked = submit_state(pd, command, rules, now) == AgentState::NeedsInput;
-            if written && unread_input(slave) == Some(0) {
-                read_all = true;
-                if blocked {
-                    break Err(SubmitRefusal::blocked(pane));
+                break Err(SubmitRefusal::not_read(pane));
+            }
+            let read = probe_written && unread_input(slave) == Some(0);
+            if read && read_once {
+                typing.paste_open.store(bracketed, Ordering::SeqCst);
+                let close = |pd: &PaneData| {
+                    if bracketed {
+                        pd.send_input(PASTE_CLOSE);
+                    }
+                };
+                if typed_after(pd) {
+                    close(pd);
+                    return Typed::PutBack;
                 }
-                if human {
-                    break Err(SubmitRefusal::typed_over(pane));
+                let now = std::time::Instant::now();
+                if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
+                    close(pd);
+                    return Typed::Untyped(SubmitRefusal::blocked(pane));
                 }
-                pd.send_input(enter);
+                written = pd.send_tracked(body, Arc::clone(&typing.cancel));
                 break Ok(());
             }
-            if blocked && !human {
-                break Err(SubmitRefusal::blocked(pane));
-            }
-            blocked
-        };
+            read_once = read;
+        }
         if tokio::time::Instant::now() >= deadline {
-            break Err(if blocked {
-                SubmitRefusal::blocked(pane)
-            } else if human {
-                SubmitRefusal::typed_over(pane)
-            } else {
-                not_read()
-            });
+            break Err(SubmitRefusal::not_read(pane));
         }
         tokio::time::sleep(CONSUME_POLL).await;
     };
-    if verdict.is_ok() || read_all {
-        return verdict;
+    if let Err(refusal) = probed {
+        typing.cancel.cancel();
+        if !probe_written {
+            let _ = tokio::time::timeout(CANCEL_ACK, &mut written).await;
+        }
+        if !taken_over() {
+            flush_unread(id, pane, slave, false, agent_reading);
+        }
+        return Typed::Untyped(refusal);
     }
-    typed.cancel.cancel();
-    if !written {
-        let _ = tokio::time::timeout(CANCEL_ACK, &mut typed.written).await;
+
+    let deadline = tokio::time::Instant::now() + delay + CONSUME_DEADLINE;
+    tokio::time::sleep(delay).await;
+    let mut done = false;
+    let mut human = false;
+    let mut read_once = false;
+    let mut read_all = false;
+    let refusal = loop {
+        if taken_over() {
+            return Typed::Refused(SubmitRefusal::typed_over(pane));
+        }
+        if !done {
+            match written.try_recv() {
+                Ok(true) => done = true,
+                Ok(false) | Err(TryRecvError::Closed) => break SubmitRefusal::not_read(pane),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        {
+            let ps = panes.lock().await;
+            let Some(pd) = ps.get(&pane).filter(|pd| !pd.exited) else {
+                break SubmitRefusal::closed(pane);
+            };
+            human |= typed_after(pd);
+            if !agent_reads(pd, pgid) {
+                agent_reading = false;
+                break if human {
+                    SubmitRefusal::typed_over(pane)
+                } else {
+                    SubmitRefusal::not_read(pane)
+                };
+            }
+            let read = done && unread_input(slave) == Some(0);
+            let now = std::time::Instant::now();
+            if submit_state(pd, command, rules, now) == AgentState::NeedsInput {
+                read_all = read;
+                break SubmitRefusal::blocked(pane);
+            }
+            if read && read_once {
+                read_all = true;
+                if human {
+                    break SubmitRefusal::typed_over(pane);
+                }
+                pd.send_input(enter);
+                return Typed::Submitted;
+            }
+            read_once = read;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break if human {
+                SubmitRefusal::typed_over(pane)
+            } else {
+                SubmitRefusal::not_read(pane)
+            };
+        }
+        tokio::time::sleep(CONSUME_POLL).await;
+    };
+    if read_all {
+        return Typed::Read(refusal);
+    }
+    typing.cancel.cancel();
+    if !done {
+        let _ = tokio::time::timeout(CANCEL_ACK, &mut written).await;
+    }
+    if taken_over() {
+        return Typed::Refused(SubmitRefusal::typed_over(pane));
     }
     let human = human || panes.lock().await.get(&pane).is_some_and(typed_after);
-    if human && agent_reading && read_by(pane, pgid, slave.as_ref(), panes, deadline).await {
-        return verdict;
+    if human && agent_reading && unread_input(slave) == Some(0) {
+        return Typed::Refused(refusal);
     }
-    if let Some(slave) = slave.as_ref() {
-        let unread = unread_input(slave).unwrap_or(0);
-        match nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
-            Ok(()) if human => log::info!(
-                "msg: id={id} unread by %{pane} after a person typed; {unread} bytes flushed"
-            ),
-            Ok(()) => {}
-            Err(e) => log::warn!("msg: flushing %{pane}'s unread input failed: {e}"),
-        }
+    flush_unread(id, pane, slave, human, agent_reading);
+    Typed::Refused(refusal)
+}
+
+/// Flush `pane`'s input queue, logging what a person may need to know: that
+/// keys of theirs went with it, or that there was nothing left to flush
+/// because the agent had stopped reading, so another program may have read
+/// the message.
+fn flush_unread(id: MsgId, pane: PaneId, slave: &std::fs::File, human: bool, agent_reading: bool) {
+    let unread = unread_input(slave).unwrap_or(0);
+    if let Err(e) = nix::sys::termios::tcflush(slave, nix::sys::termios::FlushArg::TCIFLUSH) {
+        log::warn!("msg: flushing %{pane}'s unread input failed: {e}");
+    } else if unread == 0 && !agent_reading {
+        log::warn!(
+            "msg: id={id} %{pane}'s agent stopped reading with the message unread, and nothing was \
+             left to flush: another program may have read it"
+        );
+    } else if human {
+        log::info!("msg: id={id} unread by %{pane} after a person typed; {unread} bytes flushed");
     }
-    verdict
 }
 
 /// Whether the program sampled as `pgid` is still the one reading `pd`'s
@@ -1619,38 +1779,6 @@ fn agent_reads(pd: &PaneData, pgid: Option<nix::unistd::Pid>) -> bool {
         !t.local_flags
             .contains(nix::sys::termios::LocalFlags::ICANON)
     })
-}
-
-/// Wait, until `deadline`, for the agent sampled as `pgid` to read `pane`'s
-/// input queue empty. False as soon as another program is reading it.
-async fn read_by(
-    pane: PaneId,
-    pgid: Option<nix::unistd::Pid>,
-    slave: Option<&std::fs::File>,
-    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let Some(slave) = slave else {
-        return false;
-    };
-    loop {
-        {
-            let ps = panes.lock().await;
-            if !ps
-                .get(&pane)
-                .is_some_and(|pd| !pd.exited && agent_reads(pd, pgid))
-            {
-                return false;
-            }
-            if unread_input(slave) == Some(0) {
-                return true;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(CONSUME_POLL).await;
-    }
 }
 
 /// Whether `slave` is the pane's own terminal: the path was read at spawn,
@@ -2370,6 +2498,9 @@ struct PaneData {
     /// cell's, a key binding's `SendKey`, or the wheel's arrow keys. Set only
     /// by [`Self::send_human_input`]. The typing guard reads it.
     last_human_input: Option<std::time::Instant>,
+    /// The message being typed into the pane, while it is. See
+    /// [`Self::send_human_input`].
+    typing: Option<Arc<SubmitTyping>>,
     /// The pane's `OSC 0` / `OSC 2` titles and its foreground history.
     title: crate::server::title::TitleTracker,
     /// Process names and working directory, read outside the `panes` lock by
@@ -2534,9 +2665,49 @@ impl PaneData {
     /// guard. Every human key path writes through this, and nothing else
     /// does: a submit's own writes arming it would hold the next submit
     /// behind the guard the first one armed.
+    ///
+    /// A key that arrives while a message is still in the terminal's input
+    /// queue, unread, takes the pane back from it: the message's writes are
+    /// cancelled, and the key goes to the writer with a flush of the queue
+    /// ahead of it, which the writer runs only once the cancelled write has
+    /// stopped. Behind the message, the key would be read with it by the next
+    /// reader, and after the agent exits that is the shell, which the key's
+    /// Enter would make run it. A paste the agent had begun reading is
+    /// closed first, so the key is not taken as part of it. Only the first
+    /// key does this: the handle is taken.
     fn send_human_input(&mut self, data: &[u8]) {
-        self.send_input(data);
         self.last_human_input = Some(std::time::Instant::now());
+        let unread = self
+            .typing
+            .take()
+            .filter(|t| !t.ended.load(Ordering::SeqCst))
+            .filter(|t| unread_input(&t.slave).is_some_and(|n| n > 0));
+        let Some(typing) = unread else {
+            return self.send_input(data);
+        };
+        typing.taken_over.store(true, Ordering::SeqCst);
+        typing.cancel.cancel();
+        let mut bytes = Vec::with_capacity(data.len() + 6);
+        if typing.paste_open.load(Ordering::SeqCst) {
+            bytes.extend_from_slice(crate::server::submit::PASTE_CLOSE);
+        }
+        bytes.extend_from_slice(data);
+        log::info!(
+            "msg: id={} a person typed while it was unread; its text is withdrawn",
+            typing.id
+        );
+        let job = pty::WriteJob {
+            data: bytes,
+            done: None,
+            cancel: None,
+            flush_first: Some(Arc::clone(&typing.slave)),
+        };
+        if self.input_tx.send(job).is_err() {
+            log::warn!(
+                "server: dropping {} input byte(s) for a pane whose writer has exited",
+                data.len()
+            );
+        }
     }
 
     /// [`Self::send_input`], told when the last byte is written and able to
@@ -2552,6 +2723,7 @@ impl PaneData {
             data,
             done: Some(done),
             cancel: Some(cancel),
+            flush_first: None,
         };
         if self.input_tx.send(job).is_err() {
             log::warn!("server: dropping a typed message for a pane whose writer has exited");
@@ -9776,6 +9948,7 @@ async fn spawn_pane(
             last_output: std::time::Instant::now(),
             agent_verdict: None,
             last_human_input: None,
+            typing: None,
             title: crate::server::title::TitleTracker::default(),
             names: PaneNames {
                 // Until the forwarding loop reads the real name, the program

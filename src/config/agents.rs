@@ -185,11 +185,19 @@ fn default_patterns() -> Vec<AgentPattern> {
         //
         // The prefix is deliberately NOT matched alone: an agent's own prose
         // can contain that phrase, and a false `NeedsInput` cries wolf on a
-        // panel whose whole value is that red means red.
+        // panel whose whole value is that red means red. For the same reason
+        // the file verbs are matched only in the dialog's shape, a single file
+        // name and the line's last `?`: "Do you want to create a PR?" is
+        // prose an agent writes. A file name with a space in it is missed
+        // here and left to `claude-decline`.
+        //
+        // Also in the binary, and anchored the same way: "Would you like to
+        // proceed?" (its plan dialog), "Would you like to install ...?" and
+        // "Are you sure you want to delete ...?".
         p(
             "claude-proceed",
             "claude",
-            r"(?i)do you want to (proceed|continue|allow|use this api key|make this edit|create|overwrite|write to|insert this cell|delete this cell)",
+            r"(?i)do you want to (proceed|continue|allow|use this api key|(make this edit to|create|overwrite|write to|insert this cell into|delete this cell from) \S+\?\s*$)|(would you like to (proceed|install)|are you sure you want to delete)\b[^?]*\?\s*$",
         ),
         // The option every Claude Code approval dialog draws to refuse
         // ("No, and tell Claude what to do differently (esc)", or "Deny, and

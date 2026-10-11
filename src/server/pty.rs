@@ -21,6 +21,11 @@ pub struct WriteJob {
     /// cancelled or abandoned first. Dropped unanswered if the writer exits.
     pub done: Option<oneshot::Sender<bool>>,
     pub cancel: Option<Arc<WriteCancel>>,
+    /// The pane's terminal, opened from the slave side, whose input queue is
+    /// flushed before `data` is written. The writer does it rather than the
+    /// caller because only the writer knows a cancelled job before this one
+    /// has stopped: a flush any earlier leaves room for that job's tail.
+    pub flush_first: Option<Arc<std::fs::File>>,
 }
 
 impl From<Vec<u8>> for WriteJob {
@@ -29,6 +34,7 @@ impl From<Vec<u8>> for WriteJob {
             data,
             done: None,
             cancel: None,
+            flush_first: None,
         }
     }
 }
@@ -956,8 +962,16 @@ pub fn start_writer(master_fd: OwnedFd) -> (JoinHandle<()>, mpsc::UnboundedSende
             data: buf,
             done,
             cancel,
+            flush_first,
         }) = rx.recv().await
         {
+            if let Some(slave) = flush_first {
+                if let Err(e) =
+                    nix::sys::termios::tcflush(&*slave, nix::sys::termios::FlushArg::TCIFLUSH)
+                {
+                    log::warn!("pty: flushing fd={raw}'s input queue failed: {e}");
+                }
+            }
             let mut offset = 0;
             while offset < buf.len() {
                 if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
@@ -1131,6 +1145,7 @@ mod tests {
             data: vec![b'x'; 64 * 1024],
             done: Some(done),
             cancel: Some(Arc::clone(&cancel)),
+            flush_first: None,
         })
         .expect("writer task is gone");
 
@@ -1165,6 +1180,7 @@ mod tests {
             data: vec![b'y'; 100],
             done: Some(done),
             cancel: Some(Arc::new(WriteCancel::default())),
+            flush_first: None,
         })
         .expect("writer task is gone");
         let answer = tokio::time::timeout(std::time::Duration::from_secs(2), written)

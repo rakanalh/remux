@@ -1,12 +1,19 @@
 //! Typing a message into an agent's pane: how its bytes are framed.
 //!
-//! A message is typed as two writes. The first is the body, wrapped in
-//! bracketed paste when the pane's program has asked for it (mode 2004), so
-//! the agent reads it as one pasted block rather than as keystrokes whose
-//! newlines would each submit a line. The second is the Enter, written after a
-//! delay: an agent that reads a paste and an Enter in one read can take the
-//! Enter as part of the paste, and the paste as not yet submitted. The Enter
-//! is never inside the wrap for the same reason.
+//! A message is typed as three writes. The first is a probe that nothing
+//! acts on: the paste opener when the text is wrapped, a space when it is
+//! not ([`split_probe`]). The second is the body, wrapped in bracketed paste
+//! when the pane's program has asked for it (mode 2004), so the agent reads
+//! it as one pasted block rather than as keystrokes whose newlines would
+//! each submit a line. The third is the Enter, written after a delay: an
+//! agent that reads a paste and an Enter in one read can take the Enter as
+//! part of the paste, and the paste as not yet submitted. The Enter is never
+//! inside the wrap for the same reason.
+//!
+//! The body is written only once the agent has read the probe. An agent that
+//! is not reading its input (hung, or about to exit) is found out on the
+//! probe, which is flushed, so the body is never in its input queue to be
+//! read by the shell after it.
 //!
 //! The body cannot close the wrap early: a send refuses every control
 //! character but `\n` and `\t` (`bad_body`), so `ESC[201~` never reaches this
@@ -29,22 +36,26 @@
 //! ([`looks_like_prompt`]), so that a prompt no pattern knows is not
 //! approved either. And no human may have typed into the pane since it was
 //! sampled, for the text, or since the text was written, for the Enter: the
-//! Enter would submit the person's keys with the message. When a person
-//! typed after the text, the agent is given the rest of the read check's
-//! time to read the queue, the person's keys with it; whatever is still
-//! unread then is flushed, keys included, because a person's Enter has made
-//! it a line the next reader would run.
+//! Enter would submit the person's keys with the message. A person's key
+//! that arrives while the message is still in the input queue, unread, takes
+//! the pane back: the rest of the message is cancelled and flushed before the
+//! key is written, so the key never follows the message into the next
+//! reader. A key that arrives after the agent read the message is the
+//! agent's to handle with it; the message is then the agent's, and is left
+//! in its input unsubmitted (`typed_over_read`).
 //!
 //! Each typed message opens with an envelope line naming it and its sender,
 //! so the agent, and the person watching it, can tell another agent's
 //! message from its user's.
 //!
 //! Residuals:
-//! - A key a human presses between the text and the Enter stops the Enter
-//!   (`human_typing`), but the text is already written and is not taken
-//!   back: the agent shows it in its input box beside the person's keys,
-//!   unsubmitted, and the message stays in the mailbox, so it can arrive
-//!   twice.
+//! - An agent that read the probe and then died before reading the body
+//!   leaves the body in the input queue. The read check flushes it, but the
+//!   shell can read it first, in the time between the agent's exit and the
+//!   next check.
+//! - A key a human presses after the agent read the text stops the Enter,
+//!   and the text stays in the agent's input box beside the person's keys,
+//!   unsubmitted.
 //! - A permission prompt the agent draws after the last check, in the time
 //!   between the check and the Enter's write, is still answered by the Enter.
 //!   The check and the write share one `panes` section, so the window is the
@@ -226,8 +237,11 @@ pub fn precheck(
 }
 
 /// Whether the bottom of an agent's screen looks like a selector waiting on
-/// its user: two or more numbered options, one of them marked as the choice
-/// or offering Esc ("3. No, and tell Claude what to do differently (esc)").
+/// its user: its LAST block of numbered option rows, on consecutive lines,
+/// has two or more options, one of them marked as the choice or offering Esc
+/// ("3. No, and tell Claude what to do differently (esc)"). Only the last
+/// block counts, and only whole: a selector is drawn at the bottom in one
+/// piece, while numbered rows further up are the transcript.
 ///
 /// A submit refuses such a pane as `agent_blocked` whatever the configured
 /// patterns say. A pattern names a prompt by its wording, and a wording no
@@ -237,18 +251,25 @@ pub fn precheck(
 /// message in the mailbox, which is the safe side. It is not part of the
 /// agents panel's classification, where a false `NeedsInput` never decays.
 pub fn looks_like_prompt(bottom: &[String]) -> bool {
-    let options: Vec<(bool, &str)> = bottom.iter().filter_map(|l| option_row(l)).collect();
-    options.len() >= 2
-        && options
+    let block: Vec<(bool, &str)> = bottom
+        .iter()
+        .rev()
+        .skip_while(|line| option_row(line).is_none())
+        .map_while(|line| option_row(line))
+        .collect();
+    block.len() >= 2
+        && block
             .iter()
             .any(|(marked, text)| *marked || text.to_ascii_lowercase().contains("(esc)"))
 }
 
 /// A numbered option row (`❯ 1. Yes`, `  2) No`): whether it carries a
-/// selection marker, and its text after the number.
+/// selection marker, and its text after the number. `>` is not a marker:
+/// Claude Code draws a past prompt of the user's with it, and a numbered
+/// list typed there is not a selector.
 fn option_row(line: &str) -> Option<(bool, &str)> {
     let rest = line.trim_start();
-    let unmarked = rest.trim_start_matches(['\u{276f}', '\u{203a}', '>', '\u{25b6}']);
+    let unmarked = rest.trim_start_matches(['\u{276f}', '\u{203a}']);
     let marked = unmarked.len() != rest.len();
     let rest = unmarked.trim_start();
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
@@ -349,6 +370,15 @@ impl SubmitRefusal {
         }
     }
 
+    pub fn not_read(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "agent_did_not_read",
+            message: format!(
+                "%{pane}'s agent did not read the message, so it was not submitted: it is in the mailbox"
+            ),
+        }
+    }
+
     pub fn typed_over(pane: PaneId) -> Self {
         SubmitRefusal {
             code: "human_typing",
@@ -373,6 +403,28 @@ impl SubmitRefusal {
             message: format!(
                 "%{pane} is working and its policy refuses to type into it: its message is in the mailbox"
             ),
+        }
+    }
+}
+
+/// The text split into its probe and the rest. Wrapped, the probe is the
+/// paste opener (after the focus report, when there is one), which an agent
+/// takes as the start of a paste and a shell's line editor as a paste of
+/// nothing. Unwrapped, it is one space, written ahead of the text: a line
+/// editor holds it as a line that runs nothing, and an agent shows it as a
+/// leading space of the message.
+pub fn split_probe(text: Vec<u8>, framing: Framing, focus_in: bool) -> (Vec<u8>, Vec<u8>) {
+    let focus = if focus_in { FOCUS_IN.len() } else { 0 };
+    let mut text = text;
+    match framing {
+        Framing::Bracketed => {
+            let rest = text.split_off(focus + PASTE_OPEN.len());
+            (text, rest)
+        }
+        Framing::Plain => {
+            let rest = text.split_off(focus);
+            text.push(b' ');
+            (text, rest)
         }
     }
 }
@@ -764,8 +816,39 @@ mod tests {
             "no marker, an Esc option"
         );
         assert!(
-            looks_like_prompt(&lines(&["> 1) Yes", "  2) No"])),
+            looks_like_prompt(&lines(&["\u{203a} 1) Yes", "  2) No"])),
             "a marker, no Esc option"
+        );
+        assert!(
+            looks_like_prompt(&lines(&[
+                "Would you like to proceed?",
+                "",
+                "\u{276f} 1. Yes, and auto-accept edits",
+                "  2. Yes, and manually approve edits",
+                "  3. No, keep planning",
+                "",
+                "ctrl+g to edit in vim",
+            ])),
+            "a footer under the selector"
+        );
+        assert!(
+            !looks_like_prompt(&lines(&["> 1. fix X", "  2. add tests", "", "Done: both."])),
+            "a past prompt of the user's, drawn with >"
+        );
+        assert!(
+            !looks_like_prompt(&lines(&[
+                "\u{276f} 1. Yes",
+                "  2. No (esc)",
+                "Applied.",
+                "Next steps:",
+                "1. Run the tests",
+                "2. Open a PR",
+            ])),
+            "an answered selector above a later numbered list"
+        );
+        assert!(
+            !looks_like_prompt(&lines(&["\u{276f} 1. Yes", "between", "  2. No (esc)"])),
+            "options that are not on consecutive lines"
         );
         assert!(
             !looks_like_prompt(&lines(&["1. Fix the parser", "2. Add the tests"])),
@@ -783,6 +866,25 @@ mod tests {
             "\u{23fa} User answered Claude's questions:",
             "  \u{23bf}  \u{b7} Which color do you like? \u{2192} Blue",
         ])));
+    }
+
+    #[test]
+    fn the_probe_is_the_opener_wrapped_and_a_space_ahead_of_plain_text() {
+        let (text, _) = encode("hi", Framing::Bracketed, true, true, b"\r", None);
+        let (probe, rest) = split_probe(text.clone(), Framing::Bracketed, true);
+        assert_eq!(probe, [FOCUS_IN, PASTE_OPEN].concat());
+        assert_eq!([probe, rest].concat(), text, "nothing added, nothing lost");
+        let (text, _) = encode("hi", Framing::Bracketed, true, false, b"\r", None);
+        assert_eq!(split_probe(text, Framing::Bracketed, false).0, PASTE_OPEN);
+        let (text, _) = encode("hi", Framing::Plain, false, true, b"\r", None);
+        let (probe, rest) = split_probe(text.clone(), Framing::Plain, true);
+        assert_eq!(probe, [FOCUS_IN, b" "].concat());
+        assert_eq!(rest, text[FOCUS_IN.len()..]);
+        let (text, _) = encode("hi", Framing::Plain, false, false, b"\r", None);
+        assert_eq!(
+            split_probe(text.clone(), Framing::Plain, false),
+            (b" ".to_vec(), text)
+        );
     }
 
     #[test]

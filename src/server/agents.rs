@@ -742,7 +742,7 @@ mod tests {
     /// The file dialogs' questions are rendered from the bare "Do you want to "
     /// prefix, a verb phrase and the file name; each verb phrase is in the
     /// binary, and the file names are examples.
-    const CLAUDE_QUESTIONS: [&str; 11] = [
+    const CLAUDE_QUESTIONS: [&str; 14] = [
         "Do you want to proceed?",
         "Do you want to continue?",
         "Do you want to allow this connection?",
@@ -754,6 +754,9 @@ mod tests {
         "Do you want to write to notes.md?",
         "Do you want to insert this cell into a.ipynb?",
         "Do you want to delete this cell from a.ipynb?",
+        "Would you like to proceed?",
+        "Would you like to install this LSP plugin?",
+        "Are you sure you want to delete this permission rule?",
     ];
 
     /// Claude Code's dialog for an Edit tool call, as it draws it. Its default
@@ -766,6 +769,27 @@ mod tests {
         "  2. Yes, allow all edits during this session (shift+tab)",
         "  3. No, and tell Claude what to do differently (esc)",
     ];
+
+    /// An agent's own prose using the dialogs' words is not a dialog: the
+    /// file verbs need a single file name and the line's last `?`.
+    #[test]
+    fn claudes_dialog_wordings_in_prose_are_not_a_blocked_signal() {
+        let r = shipped();
+        for prose in [
+            "Do you want to create a PR?",
+            "Do you want to make this edit to the parser and run the tests?",
+            "Do you want to overwrite x.rs? I can keep a backup.",
+            "Would you like to proceed with the refactor, or stop here",
+            "Are you sure you want to delete it? Say so and I will.",
+        ] {
+            assert_eq!(
+                r.classify("claude", &[prose.to_string()], Duration::from_secs(30))
+                    .state,
+                AgentState::Idle,
+                "{prose:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_shipped_patterns_recognise_claudes_file_edit_dialog() {

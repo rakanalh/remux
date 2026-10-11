@@ -941,9 +941,13 @@
 #   claude-proceed — its permission prompts, taken from the wordings actually
 #                    present in the binary ("Do you want to proceed?",
 #                    "...continue?", "...allow this connection?", "...use this
-#                    API key?", and its file dialogs' "...make this edit to
-#                    x.rs?", "...create", "...overwrite", "...write to",
-#                    "...insert this cell", "...delete this cell").
+#                    API key?", "Would you like to proceed?", "...install",
+#                    "Are you sure you want to delete...?", and its file
+#                    dialogs' "...make this edit to x.rs?", "...create",
+#                    "...overwrite", "...write to", "...insert this cell",
+#                    "...delete this cell", each only as the whole question
+#                    at the end of its line, so prose using the words is not
+#                    taken for a dialog).
 #   claude-decline — the option every approval dialog draws to refuse ("No, and
 #                    tell Claude what to do differently (esc)"), which is still
 #                    on screen when the question has scrolled out of it.
@@ -1014,7 +1018,7 @@
 #   [[agents.pattern]]
 #   name = "claude-proceed"
 #   command = "claude"
-#   regex = "(?i)do you want to (proceed|continue|allow|use this api key|make this edit|create|overwrite|write to|insert this cell|delete this cell)"
+#   regex = "(?i)do you want to (proceed|continue|allow|use this api key|(make this edit to|create|overwrite|write to|insert this cell into|delete this cell from) \\S+\\?\\s*$)|(would you like to (proceed|install)|are you sure you want to delete)\\b[^?]*\\?\\s*$"
 #
 #   [[agents.pattern]]
 #   name = "claude-decline"

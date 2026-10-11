@@ -43,8 +43,10 @@ own, or before the body on the same line when the pane has paste off.
     nothing, and the message is Queued in the mailbox (agent_did_not_read).
 1o. A pane whose own waiting read takes the message is not typed into as
     well: the reader gets it and the submit is already_read.
-1p. An agent that exits the moment it reads the text: no Enter, and the
-    submit is no_such_target.
+1p. An agent that exits the moment it reads the probe: the body and the
+    Enter are never written, and the submit is no_such_target or
+    agent_did_not_read, whichever of the pane's close and the agent's exit
+    the server sees first.
 1q. A body larger than the terminal's input queue (10 KiB, many lines, the
     last one `touch <marker>`) into an agent that stops reading and exits:
     agent_did_not_read, and NOTHING of it reaches the shell that takes over:
@@ -93,10 +95,11 @@ Task 3, the typing guard, through the queue and the submitter:
     and its reply is logged as detached.
 3g. A second send on a connection with a send parked: bad_request.
 3h. A send held 3 s behind typing logs at most 4 lines for its id.
-3j. A permission prompt drawn after the text (block-on-rx): no Enter;
-    Submit is agent_blocked, Auto is Mailbox/agent_blocked; Queued.
-3k. A person's key between the text and the Enter: no Enter, the key
-    stays, Submit is human_typing, the message is Queued.
+3j. A permission prompt drawn after the agent read the text (block-on-rx):
+    no Enter; the agent has the message, so Mailbox/agent_blocked_read under
+    both modes, and Submitted.
+3k. A person's key after the agent read the text, before the Enter: no
+    Enter, the key stays, Mailbox/typed_over_read, Submitted.
 3l. A key binding's SendKey holds a submit like a keystroke.
 3m. One pane waiting for its agent to read does not hold another pane's
     submit.
@@ -114,10 +117,23 @@ Task 3, the typing guard, through the queue and the submitter:
 3p. The same dialog drawn after the text: no Enter.
 3q. The SHIPPED claude patterns, read out of src/config/agents.rs, classify
     that dialog NeedsInput.
-3r. An agent that reads nothing, a person's Enter after the text, then the
-    agent exits to bash: bash never runs the body, because the unread text
-    is flushed once the read check runs out of time.
+3r. An agent that took the probe and reads nothing more, a person's Enter
+    while the text is unread, then the agent exits to bash: bash never runs
+    the body, because the key took the pane back and the text was flushed
+    ahead of it.
 3s. The same without the person's key (the control): bash runs nothing.
+3t. An agent that reads nothing, a person's Enter 1.2 s into the send and
+    the agent's exit at 1.4 s, before any deadline: bash does not run the
+    body.
+3u. The same with no key: once the agent exits, the body is not in bash's
+    line buffer either, so the person's next Enter runs nothing.
+3v. A person's Enter during the Enter delay, after the agent read the text:
+    the agent has the message, so the answer is Mailbox/typed_over_read
+    under both modes and the message stays Submitted.
+3w. An agent that took the probe and hangs, a person's key, then the
+    agent's exit: human_typing, and bash runs nothing.
+3x. The probe (the paste opener) is written and read on its own, before the
+    rest of the message.
 3z. No panic.
 
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
@@ -284,13 +300,35 @@ def ctl_count(log, command):
         return 0
 
 
-def rx_chunks(log):
+def raw_chunks(log):
+    """Every read the fakeagent made: (time_ns, bytes)."""
     try:
         lines = open(log).read().splitlines()
     except FileNotFoundError:
         return []
     return [(int(ln.split()[1]), bytes.fromhex(ln.split()[2] if len(ln.split()) > 2 else ""))
             for ln in lines if ln.startswith("RX ")]
+
+
+PROBES = (OPEN, b"\x1b[I" + OPEN)
+
+
+def rx_chunks(log):
+    """The reads, with the server's probe (a paste opener, written and read
+    on its own before the rest of a message) joined to the read after it,
+    timed by that later read. A probe with nothing after it yet is left out,
+    so a wait for a message's text is not satisfied by its probe alone."""
+    out = []
+    pending = None
+    for ns, data in raw_chunks(log):
+        if pending is not None:
+            out.append((ns, pending + data))
+            pending = None
+        elif data in PROBES:
+            pending = data
+        else:
+            out.append((ns, data))
+    return out
 
 
 def wait_rx(log, want, start=0, timeout=6.0):
@@ -555,18 +593,19 @@ try:
     check(wait_idle(X), f"...the agent in %{X} settled Idle before the next send")
     r = type_send(A, send(X, "EXIT:now", "Submit"))
     time.sleep(0.5)
-    chunks = [c for _, c in rx_chunks(X_LOG)]
-    check(outcome(r) == ("Error", "no_such_target") and len(chunks) == 1 and b"\r" not in chunks,
-          f"1p an agent that exits on reading the text: no Enter, no_such_target (reply {r}, chunks {chunks})")
+    chunks = [c for _, c in raw_chunks(X_LOG)]
+    check(outcome(r) in (("Error", "no_such_target"), ("Error", "agent_did_not_read")) and chunks == [OPEN],
+          f"1p an agent that exits on reading the probe: no text, no Enter; the pane closing or the agent gone "
+          f"(reply {r}, chunks {chunks})")
 
     # --- 1q -----------------------------------------------------------------
-    # The same, with a body larger than the terminal's input queue and full of
-    # newlines: none of it, not the tail the writer still held, reaches the
-    # agent when it reads again.
+    # A body larger than the terminal's input queue and full of newlines, to
+    # an agent that takes the probe and then stops reading: none of it, not
+    # the tail the writer still held, reaches the agent when it reads again.
     big_lines = [f"fill{n:04d} " + "a" * 90 for n in range(100)] + ["touch /tmp/rmx-never"]
     big = "\n".join(big_lines)
     Q1, Q1_LOG, Q1_CTL = spawn_agent(paste=True)
-    tell(Q1_CTL, Q1_LOG, "deaf")
+    tell(Q1_CTL, Q1_LOG, "probe-only")
     check(wait_idle(Q1), f"...the agent in %{Q1} settled Idle before the next send")
     r = type_send(A, send(Q1, big, "Submit"))
     check(outcome(r) == ("Error", "agent_did_not_read"),
@@ -1018,8 +1057,10 @@ try:
     time.sleep(0.5)
     seq = [c for _, c in rx_chunks(F_LOG)[start:]]
     states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == "HUMAN:between"]
-    check(outcome(r) == ("Error", "human_typing") and b"\r" not in seq and b"k" in seq and states == ["Queued"],
-          f"3k a key after the text stops the Enter; the key stays and the message is Queued "
+    check(outcome(r) == ("Mailbox", "typed_over_read") and b"\r" not in seq and b"k" in seq
+          and states == ["Submitted"],
+          f"3k a key after the agent read the text stops the Enter; the key stays, and the message is the "
+          f"agent's: Mailbox/typed_over_read, Submitted "
           f"(reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
 
     check("panicked at" not in srv.log(), "3z no panic (attended)")
@@ -1073,7 +1114,7 @@ try:
 
     # 3j: the agent draws a permission prompt the moment the paste arrives,
     # so the prompt is there by the Enter's check and was not at the sample.
-    for mode, want in (("Submit", ("Error", "agent_blocked")), ("Auto", ("Mailbox", "agent_blocked"))):
+    for mode, want in (("Submit", ("Mailbox", "agent_blocked_read")), ("Auto", ("Mailbox", "agent_blocked_read"))):
         check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
         tell(F_CTL, F_LOG, "block-on-rx")
         check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
@@ -1083,13 +1124,14 @@ try:
         seq = [c for _, c in rx_chunks(F_LOG)[start:]]
         states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == f"PROMPT:{mode}"]
         check(outcome(r) == want and any(c.startswith(OPEN) for c in seq) and b"\r" not in seq
-              and states == ["Queued"],
-              f"3j {mode}: a prompt drawn after the text gets no Enter: {want} "
+              and states == ["Submitted"],
+              f"3j {mode}: a prompt drawn after the agent read the text gets no Enter, and the text is the "
+              f"agent's: {want}, Submitted "
               f"(reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
         tell(F_CTL, F_LOG, "clear")
 
     # 3m: a pane whose agent does not read holds only its own queue.
-    tell(D_CTL, D_LOG, "deaf")
+    tell(D_CTL, D_LOG, "probe-only")
     check(wait_idle(D) and wait_idle(F), f"...%{D} and %{F} settled Idle before the next send")
     slow = type_start(A, send(D, "DEAF:held", "Submit"), background=True)
     end = time.time() + 8
@@ -1133,6 +1175,7 @@ def rs_ms(src, pattern, scale=1):
 
 BUDGET_S = (rs_ms(CFG_RS, r"MAX_TYPING_GUARD_MS: u64 = ([\d_]+);")
             + rs_ms(DAEMON, r"SUBMIT_TICK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")
+            + rs_ms(DAEMON, r"PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")
             + rs_ms(CFG_RS, r"MAX_ENTER_DELAY_MS: u64 = ([\d_]+);")
             + rs_ms(DAEMON, r"CONSUME_DEADLINE: std::time::Duration = std::time::Duration::from_secs\(([\d_]+)\)", 1000)
             + rs_ms(DAEMON, r"CANCEL_ACK: std::time::Duration = std::time::Duration::from_millis\(([\d_]+)\)")) / 1000
@@ -1152,7 +1195,9 @@ enter_delay_ms = 5000
     A = cli_spawn("SplitRight")
     A2 = cli_spawn("SplitRight")
     F, F_LOG, F_CTL = spawn_agent(paste=True)
-    tell(F_CTL, F_LOG, "deaf")
+    # Reads each message's probe and none of its text, so every send runs
+    # the whole read check out.
+    tell(F_CTL, F_LOG, "probe-only")
     check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
 
     # 3i: six connections at once, each its own wire_send in the background,
@@ -1230,9 +1275,37 @@ try:
     r = type_send(A, send(F, "EDIT:after", "Submit"))
     time.sleep(0.5)
     seq = [c for _, c in rx_chunks(F_LOG)[start:]]
-    check(outcome(r) == ("Error", "agent_blocked") and any(c.startswith(OPEN) for c in seq) and b"\r" not in seq,
+    check(outcome(r) == ("Mailbox", "agent_blocked_read") and any(c.startswith(OPEN) for c in seq)
+          and b"\r" not in seq,
           f"3p an edit-approval dialog drawn after the text gets no Enter (reply {r}, chunks {[c[:12] for c in seq]})")
     tell(F_CTL, F_LOG, "clear")
+
+    # 3x: the probe is its own read, ahead of the rest.
+    check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+    start = len(raw_chunks(F_LOG))
+    r = type_send(A, send(F, "PROBE:alone", "Submit"))
+    raw = [c for _, c in raw_chunks(F_LOG)[start:]]
+    check(submitted(r) and len(raw) >= 3 and raw[0] == OPEN and b"PROBE:alone" in raw[1] and raw[2] == b"\r",
+          f"3x the probe is read alone, then the text, then the Enter (reply {r}, chunks {[c[:12] for c in raw]})")
+
+    # 3v: a person's Enter after the agent read the text, inside the delay.
+    for mode, want in (("Submit", ("Mailbox", "typed_over_read")), ("Auto", ("Mailbox", "typed_over_read"))):
+        check(wait_idle(F), f"...the agent in %{F} settled Idle before the next send")
+        start = len(rx_chunks(F_LOG))
+        body = f"READ:{mode}"
+        out = type_start(A, send(F, body, mode))
+        end = time.time() + 15
+        while time.time() < end and not any(body.encode() in c for _, c in rx_chunks(F_LOG)[start:]):
+            time.sleep(0.01)
+        cli.send({"InputToPane": {"pane_id": F, "data": list(b"\r")}})
+        r = wait_file(out, timeout=10)
+        time.sleep(0.5)
+        seq = [c for _, c in rx_chunks(F_LOG)[start:]]
+        states = [m["state"] for m in (read_box(F, all=True) or []) if m["body"] == body]
+        check(outcome(r) == want and seq.count(b"\r") == 1 and states == ["Submitted"],
+              f"3v {mode}: a person's Enter after the agent read the text: {want}, one Enter (theirs), "
+              f"Submitted (reply {r}, chunks {[c[:12] for c in seq]}, states {states})")
+
     check("panicked at" not in srv.log(), "3z no panic (prompts)")
 finally:
     srv.kill()
@@ -1286,7 +1359,9 @@ try:
               f"setup {case}: bash runs the agent in %{B}, which is focused (focused {focused_pane()})")
         # Out of the typing guard's attended window, which the typed command armed.
         time.sleep(3.5)
-        tell(ctl, log, "deaf")
+        # 3r's agent takes the probe, so the body is written and sits unread
+        # when the person's Enter arrives; 3s's reads nothing at all.
+        tell(ctl, log, "probe-only" if human else "deaf")
         out = type_start(A, send(B, f"touch {marker}", "Submit"))
         if human:
             end = time.time() + 15
@@ -1302,7 +1377,73 @@ try:
               f"{case} {'a person pressed Enter after the text, then ' if human else ''}the agent that read "
               f"nothing exits: bash does not run the body (reply {r}, ran {os.path.exists(marker)})")
         if human:
-            check("after a person typed; " in srv.log() and "bytes flushed" in srv.log(), f"{case} ...and the flush is logged")
+            check("a person typed while it was unread; its text is withdrawn" in srv.log(),
+                  f"{case} ...and the withdrawal is logged")
+
+    def bash_agent(case, mode):
+        """bash in a new pane B running the fakeagent, settled and in `mode`."""
+        log, ctl = f"{RUNDIR}/bash-agent-{case}.log", f"{RUNDIR}/bash-agent-{case}.ctl"
+        B = cli_spawn("SplitBelow", argv=["bash", "--norc", "--noprofile", "-i"])
+        time.sleep(1.0)
+        cli.send({"InputToPane": {"pane_id": B, "data": list(f"{FAKEAGENT} {log} {ctl}\r".encode())}})
+        end = time.time() + 8
+        while time.time() < end and not os.path.exists(log):
+            time.sleep(0.05)
+        tell(ctl, log, "paste-on")
+        check(wait_idle(B), f"setup {case}: bash runs the agent in %{B}")
+        time.sleep(3.5)
+        tell(ctl, log, mode)
+        return B, log, ctl
+
+    def stored(pane, timeout=15):
+        """The time the server logged storing a send to `pane`."""
+        end = time.time() + timeout
+        while time.time() < end and "to=%%%d bytes" % pane not in srv.log():
+            time.sleep(0.02)
+        return time.time()
+
+    def ran(marker, tag):
+        try:
+            return open(marker).read() == f"RAN:{tag}"
+        except FileNotFoundError:
+            return False
+
+    # 3t / 3u: sec-a's P5 and P5c. The marker's content is assembled by the
+    # shell, so text that merely reached bash's line does not count.
+    for case, human in (("3t", True), ("3u", False)):
+        marker = f"{RUNDIR}/ran-{case}"
+        B, log, ctl = bash_agent(case, "deaf")
+        out = type_start(A, send(B, f"printf 'RAN:%s' {case} > {marker}", "Submit"))
+        t0 = stored(B)
+        if human:
+            time.sleep(max(0.0, t0 + 1.2 - time.time()))
+            cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
+        time.sleep(max(0.0, t0 + 1.4 - time.time()))
+        tell(ctl, log, "quit", timeout=2.0)
+        r = wait_file(out, timeout=15)
+        time.sleep(1.5)
+        before = ran(marker, case)
+        cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
+        time.sleep(1.5)
+        check(name_of(r) == "Error" and not before and not ran(marker, case),
+              f"{case} {'a person Enter at 1.2 s, ' if human else ''}the agent that reads nothing exits at 1.4 s: "
+              f"bash runs nothing, then or on the next Enter (reply {r}, ran {before}, "
+              f"ran after Enter {ran(marker, case)})")
+
+    # 3w: the agent takes the probe and hangs; a person's key; it exits.
+    marker = f"{RUNDIR}/ran-3w"
+    B, log, ctl = bash_agent("3w", "probe-only")
+    out = type_start(A, send(B, f"printf 'RAN:%s' 3w > {marker}", "Submit"))
+    t0 = stored(B)
+    time.sleep(max(0.0, t0 + 1.2 - time.time()))
+    cli.send({"InputToPane": {"pane_id": B, "data": list(b"\r")}})
+    time.sleep(0.2)
+    tell(ctl, log, "quit", timeout=2.0)
+    r = wait_file(out, timeout=15)
+    time.sleep(1.5)
+    check(outcome(r) == ("Error", "human_typing") and not ran(marker, "3w"),
+          f"3w a person's key while the text is unread, then the agent exits: human_typing, and bash runs "
+          f"nothing (reply {r}, ran {ran(marker, '3w')})")
     check("panicked at" not in srv.log(), "3z no panic (bash)")
 finally:
     srv.kill()

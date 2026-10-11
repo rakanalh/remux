@@ -32,11 +32,14 @@ so a command written while another is being read is never lost:
   work:<ms>              print "working..." every 100 ms for <ms>
   deaf                  stop reading input, stay in raw mode (an agent hung
                         or busy while text is typed at it)
-  resume                start reading again (after deaf)
+  resume                start reading again (after deaf or probe-only)
+  probe-only             read only what is exactly a paste opener (the
+                         server's probe), never what follows it: an agent
+                         that hangs right after it starts reading a message
   exit-on-rx             exit right after the next read
   block-on-rx            show the permission prompt the moment the next
-                         pasted block arrives: a prompt drawn between a
-                         typed message and its Enter
+                         pasted block's END arrives: a prompt drawn between
+                         a typed message and its Enter
   editblock-on-rx        the same, with the file-edit approval dialog
   slow:<bytes>:<ms>      read at most <bytes> at a time, <ms> apart: an agent
                          that reads a long message slower than it arrives
@@ -57,6 +60,17 @@ EDIT = ("Edit file\n src/x.rs\nDo you want to make this edit to x.rs?\n"
         "\u276f 1. Yes\n"
         "  2. Yes, allow all edits during this session (shift+tab)\n"
         "  3. No, and tell Claude what to do differently (esc)\n")
+
+
+OPENER = b"\x1b[200~"
+
+
+def queued():
+    """Bytes waiting in this terminal's input queue, unread."""
+    import fcntl
+    import struct
+    import termios
+    return struct.unpack("i", fcntl.ioctl(0, termios.FIONREAD, b"\0\0\0\0"))[0]
 
 
 def install(path):
@@ -95,6 +109,7 @@ def main():
     work_until = 0.0
     next_work = 0.0
     deaf = False
+    probe_only = False
     exit_on_rx = False
     block_on_rx = None
     read_size, read_gap = 4096, 0.0
@@ -111,6 +126,9 @@ def main():
                 ack(command)
             continue
         readable, _, _ = select.select([0], [], [], 0.05)
+        if readable and probe_only and queued() != len(OPENER):
+            readable = []
+            time.sleep(0.02)
         if readable:
             data = os.read(0, read_size)
             if not data:
@@ -120,7 +138,7 @@ def main():
             log.write(line)
             if exit_on_rx:
                 return
-            if block_on_rx and data.startswith(b"\x1b[200~"):
+            if block_on_rx and b"\x1b[201~" in data:
                 out(block_on_rx)
                 block_on_rx = None
             time.sleep(read_gap)
@@ -144,6 +162,10 @@ def main():
                 next_work = 0.0
             elif command == "deaf":
                 deaf = True
+            elif command == "probe-only":
+                probe_only = True
+            elif command == "resume":
+                probe_only = False
             elif command.startswith("slow:"):
                 size, gap = command[5:].split(":")
                 read_size, read_gap = int(size), int(gap) / 1000
