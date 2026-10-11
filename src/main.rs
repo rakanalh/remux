@@ -892,7 +892,8 @@ fn move_follow_for(conn: &ConnId, current: &str, target: &str) -> Option<(ConnId
     (current != target).then(|| (conn.clone(), target.to_owned()))
 }
 
-/// The switch a pane move to another session made, once the server shows it.
+/// A tab-picker move into another session, waiting for the server to show
+/// the client in the target before it counts as a switch.
 ///
 /// The requester follows its pane into the target session, but only if the
 /// server accepts the move, and the picker cannot know that when it sends. So
@@ -900,18 +901,57 @@ fn move_follow_for(conn: &ConnId, current: &str, target: &str) -> Option<(ConnId
 /// target as the current session. A tree that names any other session settles
 /// nothing: the move may have been refused, or the tree may have been pushed
 /// before the move was handled. A move that was refused is therefore never
-/// recorded, and a follow that waits is harmless, since it can only ever
-/// record the session the client is really attached to.
-fn settle_move_follow(
-    pending: &mut Option<(ConnId, String)>,
-    src: &ConnId,
-    current: Option<&str>,
-) -> Option<(ConnId, String)> {
-    let (conn, target) = pending.as_ref()?;
-    if conn != src || current != Some(target.as_str()) {
-        return None;
+/// recorded.
+///
+/// A waiting follow is forgotten when another picker opens (a newer move
+/// supersedes it), when its connection goes away, and when its connection is
+/// no longer the foreground once the answer arrives, because a background
+/// connection's session must never be recorded as the one the client is on.
+#[derive(Debug, Default)]
+struct MoveFollow(Option<(ConnId, String)>);
+
+impl MoveFollow {
+    fn arm(&mut self, follow: (ConnId, String)) {
+        self.0 = Some(follow);
     }
-    pending.take()
+
+    fn picker_opened(&mut self) {
+        self.0 = None;
+    }
+
+    fn conn_dropped(&mut self, conn: &ConnId) {
+        if self.0.as_ref().is_some_and(|(c, _)| c == conn) {
+            self.0 = None;
+        }
+    }
+
+    /// The switch to record for a tree from `src`, whose current session is
+    /// `current`, with `foreground` in front.
+    fn settle(
+        &mut self,
+        src: &ConnId,
+        foreground: &ConnId,
+        current: Option<&str>,
+    ) -> Option<(ConnId, String)> {
+        let (conn, target) = self.0.as_ref()?;
+        if conn != src || current != Some(target.as_str()) {
+            return None;
+        }
+        let follow = self.0.take()?;
+        if src != foreground {
+            log::debug!(
+                "tab picker: follow into {:?} dropped, {src:?} is not in front",
+                follow.1
+            );
+            return None;
+        }
+        Some(follow)
+    }
+
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.0.is_none()
+    }
 }
 
 /// The rect the server composites into: the terminal minus the visible
@@ -1925,6 +1965,7 @@ struct DropCtx<'a> {
     last_local_session: &'a Option<String>,
     current_attached: &'a mut Option<(ConnId, String)>,
     previous_attached: &'a mut Option<(ConnId, String)>,
+    move_follow: &'a mut MoveFollow,
     wants_session_tree: bool,
     wants_agents: bool,
 }
@@ -2010,6 +2051,7 @@ async fn handle_connection_drop(
         last_local_session,
         current_attached,
         previous_attached,
+        move_follow,
         wants_session_tree,
         wants_agents,
     } = cx;
@@ -2018,6 +2060,7 @@ async fn handle_connection_drop(
     if let Some(sw) = input.agent_switch.as_mut() {
         sw.drop_conn(src);
     }
+    move_follow.conn_dropped(src);
     // The tab picker names tabs of that one machine, so it has nothing left
     // to offer.
     if input.tab_picker.as_ref().is_some_and(|tp| tp.conn() == src) {
@@ -2903,10 +2946,7 @@ async fn run_client_loop(
         .as_ref()
         .map(|name| (ConnId::Local, name.clone()));
     let mut previous_attached: Option<(ConnId, String)> = None;
-    // A tab-picker move into another session, waiting for the server to show
-    // the requester in the target before it counts as a switch. See
-    // `settle_move_follow`.
-    let mut pending_move_follow: Option<(ConnId, String)> = None;
+    let mut move_follow = MoveFollow::default();
 
     // Views: virtual tabs whose cells alias real panes and are composited from
     // streamed `PaneContent` snapshots. Phase 2: the shared-view registry is
@@ -4326,6 +4366,7 @@ async fn run_client_loop(
                                         last_local_session: &last_local_session,
                                         current_attached: &mut current_attached,
                                         previous_attached: &mut previous_attached,
+                                        move_follow: &mut move_follow,
                                         wants_session_tree,
                                         wants_agents,
                                     },
@@ -4419,6 +4460,7 @@ async fn run_client_loop(
                                                 last_local_session: &last_local_session,
                                                 current_attached: &mut current_attached,
                                                 previous_attached: &mut previous_attached,
+                                                move_follow: &mut move_follow,
                                                 wants_session_tree,
                                                 wants_agents,
                                             },
@@ -5047,6 +5089,7 @@ async fn run_client_loop(
                                     // name the same server.
                                     let conn = mgr.foreground().clone();
                                     mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+                                    move_follow.picker_opened();
                                     let picker = TabPickerOverlay::new(conn);
                                     let (c, r) = crossterm::terminal::size()?;
                                     renderer.clear_overlay(c, r)?;
@@ -5079,7 +5122,7 @@ async fn run_client_loop(
                                             // The server answers on this connection
                                             // in order, so the tree asked for here
                                             // shows whether the move was accepted.
-                                            pending_move_follow = Some(follow);
+                                            move_follow.arm(follow);
                                             if let Err(e) = mgr.send(conn, ClientMessage::ListSessionTree).await {
                                                 log::info!("tab picker: tree not requested from {conn:?}: {e}");
                                             }
@@ -6370,6 +6413,7 @@ async fn run_client_loop(
                                 last_local_session: &last_local_session,
                                 current_attached: &mut current_attached,
                                 previous_attached: &mut previous_attached,
+                                move_follow: &mut move_follow,
                                 wants_session_tree,
                                 wants_agents,
                             },
@@ -6845,7 +6889,7 @@ async fn run_client_loop(
                             .find(|s| s.is_current)
                             .map(|s| s.name.as_str());
                         if let Some((conn, session)) =
-                            settle_move_follow(&mut pending_move_follow, &src, current)
+                            move_follow.settle(&src, mgr.foreground(), current)
                         {
                             log::debug!("tab picker: followed the pane into session={session:?} on {conn:?}");
                             if conn == ConnId::Local {
@@ -8101,16 +8145,22 @@ mod tests {
         assert_eq!(move_follow_for(&ConnId::Local, "Macbook", "Macbook"), None);
     }
 
+    fn armed(conn: ConnId, session: &str) -> MoveFollow {
+        let mut f = MoveFollow::default();
+        f.arm((conn, session.to_string()));
+        f
+    }
+
     #[test]
     fn a_move_follow_is_recorded_when_the_tree_shows_the_target() {
-        let mut pending = Some(local("other"));
+        let mut f = armed(ConnId::Local, "other");
         assert_eq!(
-            settle_move_follow(&mut pending, &ConnId::Local, Some("other")),
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
             Some(local("other"))
         );
-        assert_eq!(pending, None, "settled once");
+        assert!(f.is_idle(), "settled once");
         assert_eq!(
-            settle_move_follow(&mut pending, &ConnId::Local, Some("other")),
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
             None
         );
     }
@@ -8118,20 +8168,48 @@ mod tests {
     #[test]
     fn a_tree_still_on_the_source_records_nothing_and_keeps_waiting() {
         // A refused move, or a tree pushed before the move was handled.
-        let mut pending = Some(local("other"));
-        assert_eq!(
-            settle_move_follow(&mut pending, &ConnId::Local, Some("main")),
-            None
-        );
-        assert_eq!(pending, Some(local("other")));
+        let mut f = armed(ConnId::Local, "other");
+        assert_eq!(f.settle(&ConnId::Local, &ConnId::Local, Some("main")), None);
+        assert!(!f.is_idle());
     }
 
     #[test]
     fn a_tree_from_another_connection_does_not_settle_a_move_follow() {
-        let mut pending = Some(local("other"));
+        let mut f = armed(ConnId::Local, "other");
         let mini = ConnId::Remote("mini".to_string());
-        assert_eq!(settle_move_follow(&mut pending, &mini, Some("other")), None);
-        assert_eq!(pending, Some(local("other")));
+        assert_eq!(f.settle(&mini, &ConnId::Local, Some("other")), None);
+        assert!(!f.is_idle());
+    }
+
+    #[test]
+    fn a_follow_on_a_connection_no_longer_in_front_is_dropped_unrecorded() {
+        // The user switched servers before the answer came: a background
+        // connection's session must never become the current one.
+        let mini = ConnId::Remote("mini".to_string());
+        let mut f = armed(mini.clone(), "build");
+        assert_eq!(f.settle(&mini, &ConnId::Local, Some("build")), None);
+        assert!(f.is_idle());
+    }
+
+    #[test]
+    fn opening_a_picker_forgets_the_last_follow() {
+        let mut f = armed(ConnId::Local, "other");
+        f.picker_opened();
+        assert!(f.is_idle());
+        assert_eq!(
+            f.settle(&ConnId::Local, &ConnId::Local, Some("other")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dropped_connection_forgets_its_follow_and_only_its_own() {
+        let mini = ConnId::Remote("mini".to_string());
+        let mut f = armed(mini.clone(), "build");
+        f.conn_dropped(&ConnId::Local);
+        assert!(!f.is_idle(), "another connection's drop keeps it");
+        f.conn_dropped(&mini);
+        assert!(f.is_idle());
     }
 
     #[test]
