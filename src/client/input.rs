@@ -1365,6 +1365,19 @@ impl TabPickerOverlay {
         self.sessions.as_ref()?.first().map(|s| s.name.as_str())
     }
 
+    /// [`TabPickerOverlay::apply_tree`] for a tree sent by `src`, or `None`
+    /// when `src` is not the connection the picker is pinned to. The picker
+    /// lists one server's tabs and sends its command back to that server, so a
+    /// tree from any other connection is not its tree.
+    pub fn apply_tree_from(
+        &mut self,
+        src: &ConnId,
+        folders: &[crate::protocol::FolderTreeEntry],
+        unfiled: &[crate::protocol::SessionTreeEntry],
+    ) -> Option<TabPickerTree> {
+        (*src == self.conn).then(|| self.apply_tree(folders, unfiled))
+    }
+
     /// Rebuild the rows from a tree sent by [`TabPickerOverlay::conn`].
     ///
     /// The highlight follows the row it was on by `(session, tab id)`, because
@@ -7051,6 +7064,49 @@ mod tab_picker_tests {
         let mut h = handler_with(p);
         assert_eq!(h.handle_key(key(KeyCode::Char('x'))), InputAction::None);
         assert!(h.tab_picker.is_some());
+    }
+
+    #[test]
+    fn a_picker_pinned_to_local_ignores_a_remote_tree_and_confirms_to_local() {
+        let mut p = TabPickerOverlay::new(ConnId::Local);
+        p.apply_tree_from(
+            &ConnId::Local,
+            &[],
+            &[
+                session(
+                    "main",
+                    true,
+                    vec![tab(1, "src", true, 1), tab(2, "two", false, 1)],
+                ),
+                session("other", false, vec![tab(4, "four", true, 1)]),
+            ],
+        );
+        let before = p.keys();
+
+        let remote = ConnId::Remote("x".into());
+        assert_eq!(
+            p.apply_tree_from(
+                &remote,
+                &[],
+                &[session("remote-only", true, vec![tab(9, "far", true, 2)])],
+            ),
+            None,
+            "a tree from another connection is not this picker's"
+        );
+        assert_eq!(p.keys(), before, "and changes nothing");
+        assert!(!listing(&p).iter().any(|r| r.contains("remote-only")));
+
+        let mut h = handler_with(p);
+        h.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(
+            h.handle_key(key(KeyCode::Enter)),
+            InputAction::TabPickerConfirm {
+                conn: ConnId::Local,
+                session: "other".to_string(),
+                tab_id: Some(4),
+                current: "main".to_string(),
+            }
+        );
     }
 
     /// Twelve sessions of one tab each, after the current one: far more rows

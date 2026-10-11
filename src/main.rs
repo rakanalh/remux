@@ -7019,21 +7019,23 @@ async fn run_client_loop(
                                 }
                             }
                         }
-                        if let Some(picker) = input.tab_picker.as_mut().filter(|p| *p.conn() == src) {
-                            let (c, r) = crossterm::terminal::size()?;
-                            renderer.clear_overlay(c, r)?;
-                            match picker.apply_tree(&folders, &unfiled) {
-                                TabPickerTree::Offer => {
-                                    renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
+                        if let Some(picker) = input.tab_picker.as_mut() {
+                            if let Some(verdict) = picker.apply_tree_from(&src, &folders, &unfiled) {
+                                let (c, r) = crossterm::terminal::size()?;
+                                renderer.clear_overlay(c, r)?;
+                                match verdict {
+                                    TabPickerTree::Offer => {
+                                        renderer.render_whichkey_overlay(&picker.render(c, r, &theme))?;
+                                    }
+                                    TabPickerTree::Nothing => {
+                                        log::debug!("tab picker: closed, no other tab, no other session, and no pane to break out");
+                                        input.tab_picker = None;
+                                        input.mode = Mode::Normal;
+                                        mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
+                                    }
                                 }
-                                TabPickerTree::Nothing => {
-                                    log::debug!("tab picker: closed, no other tab, no other session, and no pane to break out");
-                                    input.tab_picker = None;
-                                    input.mode = Mode::Normal;
-                                    mgr.send_foreground(ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
-                                }
+                                renderer.flush()?;
                             }
-                            renderer.flush()?;
                         }
                         // The session-switch popup aggregates every connected
                         // server's tree, so it accepts trees from ANY source

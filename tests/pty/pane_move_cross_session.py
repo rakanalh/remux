@@ -21,8 +21,11 @@ it, the status bar after the client follows its pane, and `Alt+o` back.
   5. `+ new tab` under a DIFFERENT session ("Third"): the status bar names
      `Third`, which has two tabs.
   6. `Alt+o` returns to the previous session, `Work`.
-  7. A connected remote's sessions are never offered: the picker reads the
-     tree of the connection it is pinned to, and the remote is another one.
+  7. A remote's sessions are not offered from the local picker: with a remote
+     connected (the switcher lists its session), the picker opened on the local
+     server lists none of them. The pin itself, a tree from another connection
+     being ignored, is the unit test
+     `a_picker_pinned_to_local_ignores_a_remote_tree_and_confirms_to_local`.
   8. The client is alive, and no log has a panic.
   9. On a terminal shorter than the list, on its own server: after G the
      highlighted row and its session's header are drawn, and g brings the
@@ -328,7 +331,7 @@ def main():
         t.send(b"\x1bo", 1.5)
         check(status_session(t) == "Work", f"the status bar names Work ({status_session(t)})")
 
-        print("[7] a connected remote's sessions are not offered")
+        print("[7] a remote's sessions are not offered from the local picker")
         t.send(b"\x1bs", 1.2)
         sw = popup(t, SWITCHER)
         print(f"  switcher: {texts(sw)}")
