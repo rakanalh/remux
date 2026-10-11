@@ -636,6 +636,22 @@ impl PaneNames {
             _ => &self.shell,
         }
     }
+
+    /// Job `pgid`'s name after a read that found `found` for it, which is
+    /// `None` when the group had no live member.
+    ///
+    /// A job that has exited still names the pane until a sample shows the
+    /// shell back in the foreground, so a read in that window keeps the name
+    /// the job had. Falling back to the shell's name there would show it for
+    /// that window, which is a flicker in the pane's border. A group never
+    /// seen alive has no such name, and is named after the shell.
+    fn job_after_read(&self, pgid: i32, found: Option<String>, shell: &str) -> (i32, String) {
+        match (found, &self.job) {
+            (Some(name), _) => (pgid, name),
+            (None, Some((cached, name))) if *cached == pgid => (pgid, name.clone()),
+            (None, _) => (pgid, shell.to_string()),
+        }
+    }
 }
 
 /// Whether process group `pgid` still has a member. A group whose members are
@@ -4689,19 +4705,19 @@ impl ForegroundWatch {
     }
 }
 
-/// The name of process group `pgid`, whose shell is `shell`. The group leader
-/// can exit before the rest of its group (`sleep 0.1 | sleep 5`), so a live
-/// member is named when the leader is gone, and the shell when none is found.
-fn group_name(pgid: i32, shell: i32) -> String {
+/// The name of process group `pgid`, whose shell is `shell`, or `None` when
+/// the group has no live member. The group leader can exit before the rest of
+/// its group (`sleep 0.1 | sleep 5`), so a live member is named when the leader
+/// is gone.
+fn group_name(pgid: i32, shell: i32) -> Option<String> {
     let member = if process_pgid(pgid) == Some(pgid) {
-        pgid
+        Some(pgid)
     } else {
         child_pids(shell)
             .into_iter()
             .find(|&child| process_pgid(child) == Some(pgid))
-            .unwrap_or(shell)
     };
-    get_process_name(member)
+    member.map(get_process_name)
 }
 
 /// What [`refresh_pane_names`] reads for, taken under the `panes` lock by
@@ -4724,11 +4740,12 @@ async fn refresh_pane_names(
     let cwd = persistence::get_pane_cwd(child)
         .map(|c| crate::config::pane_title::basename(&c).to_string());
     let shell = get_process_name(child.as_raw());
-    let job = what.job.map(|g| (g, group_name(g, child.as_raw())));
+    let found = what.job.map(|g| (g, group_name(g, child.as_raw())));
     let mut ps = panes.lock().await;
     let Some(pd) = ps.get_mut(&pane_id) else {
         return false;
     };
+    let job = found.map(|(g, name)| pd.names.job_after_read(g, name, &shell));
     let changed = pd.names.cwd != cwd || pd.names.shell != shell || pd.names.job != job;
     pd.names.cwd = cwd;
     pd.names.read_at = Some(now);
@@ -10190,7 +10207,7 @@ mod tests {
     use super::{
         arrow_report, button_report, compute_diff, merge_dormant_into, mouse_route,
         next_layout_mode, saved_custom_is_restorable, take_dormant_session, wheel_report,
-        ButtonPhase, MouseGesture, MouseRoute, PanePlacement,
+        ButtonPhase, MouseGesture, MouseRoute, PaneNames, PanePlacement,
     };
     use crate::protocol::RenderCell;
     use crate::screen::Screen;
@@ -10259,6 +10276,41 @@ mod tests {
         assert_eq!(
             Naming::new(None, "mini".into()),
             Naming::new(None, String::new())
+        );
+    }
+
+    fn names_with_job(job: Option<(i32, &str)>) -> PaneNames {
+        PaneNames {
+            shell: "sh".into(),
+            job: job.map(|(g, n)| (g, n.to_string())),
+            ..PaneNames::default()
+        }
+    }
+
+    #[test]
+    fn a_job_that_exits_before_the_shell_is_back_keeps_its_name() {
+        let names = names_with_job(Some((200, "sleep")));
+        assert_eq!(
+            names.job_after_read(200, None, "sh"),
+            (200, "sleep".to_string())
+        );
+    }
+
+    #[test]
+    fn a_live_job_is_named_by_what_the_read_found() {
+        let names = names_with_job(Some((200, "sh")));
+        assert_eq!(
+            names.job_after_read(200, Some("sleep".into()), "sh"),
+            (200, "sleep".to_string())
+        );
+    }
+
+    #[test]
+    fn a_job_never_seen_alive_falls_back_to_the_shell_name() {
+        let names = names_with_job(Some((100, "vim")));
+        assert_eq!(
+            names.job_after_read(200, None, "sh"),
+            (200, "sh".to_string())
         );
     }
 
