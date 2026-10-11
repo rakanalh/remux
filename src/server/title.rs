@@ -59,7 +59,9 @@ struct Candidate {
     text: String,
     since: Instant,
     /// The process group that was in the foreground when the title was
-    /// written.
+    /// written, as the PTY reader sampled it. A title that the shell writes
+    /// before it gives a job the terminal, but that the reader reads after,
+    /// is therefore attributed to the job.
     setter: i32,
 }
 

@@ -25,6 +25,7 @@ the effective foreground once it has held the terminal for the settle window
  14. a job that `exec`s (`sh -c 'sleep 1.5; exec sleep 6'`) is renamed by
      what it became.
  15. preexec + precmd titles around `sleep 2` read exactly [Home, sleep, Home].
+  15b. without precmd, the preexec title is still not shown at the prompt.
  12. a title the shell sets right after a job exits (a zsh `precmd`) is
      adopted.
   9. a title written by a program in its last moment (`sh -c 'printf ...'`) is
@@ -161,6 +162,45 @@ def set_shell_title(c, v, a, b):
     return wait_name(c, v, a + b, 2.5)
 
 
+def _preexec_gap():
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "src", "server", "title.rs")
+    m = re.search(r"const PREEXEC_GAP: Duration = Duration::from_millis\((\d+)\);",
+                  open(src).read())
+    if m is None:
+        raise SystemExit("could not read PREEXEC_GAP from src/server/title.rs")
+    return int(m.group(1)) / 1000
+
+
+PREEXEC_GAP = _preexec_gap()
+
+
+def preexec_job(c, v, case, a, b, after):
+    """Have the shell write the preexec title `Job`, run `sleep 2`, then run
+    `after`. Returns the names seen.
+
+    The shell waits on `read` until the marker `a + b`, written with the
+    title, is rendered. Without that wait, the shell can start `sleep` before
+    the PTY reader wakes. The reader then sees `sleep` in the foreground and
+    attributes the shell's title to `sleep`, and the server cannot correct
+    this because case 4's own title arrives with the same samples. The `\\r`
+    that ends the wait must reach the shell well inside `PREEXEC_GAP`, else
+    the title is no longer treated as a preexec title.
+    """
+    sent = time.time()
+    typed(c, f"printf '\\033]2;%s%s\\007%s%s' Jo b {a} {b}; read _; sleep 2{after}\r")
+    end = sent + 2.0
+    while time.time() < end and not v.has(a + b):
+        v.feed(c.drain(0.02))
+    check(v.has(a + b), f"{case} the server has read the preexec title before the job starts")
+    typed(c, "\r")
+    gap = time.time() - sent
+    print(f"     {case}: the job was released {gap * 1000:.0f}ms after the title was typed")
+    check(gap < PREEXEC_GAP * 0.6,
+          f"{case} the job starts well inside PREEXEC_GAP ({gap * 1000:.0f}ms)")
+    return watch(c, v, 4.5, step=0.1)
+
+
 def run_default(c, v):
     global SH
     time.sleep(1.2)
@@ -261,23 +301,14 @@ def run_default(c, v):
 
     # 15. preexec and precmd hooks around a long command: the command's
     # preexec title is the shell's, so it is never shown, and precmd's restores
-    # nothing visible.
-    # The shell waits on `read` until the server has rendered the marker
-    # written with the title. Without that wait, the shell can start `sleep`
-    # before the PTY reader wakes, the reader then sees `sleep` in the
-    # foreground, and it attributes the shell's title to `sleep`. The server
-    # cannot correct this, because case 4's own title arrives with the same
-    # samples. The `\r` that ends the wait is sent well inside PREEXEC_GAP.
-    typed(c, "printf '\\033]2;%s%s\\007%s%s' Jo b MA RK; read _; sleep 2; "
-             "printf '\\033]2;%s%s\\007' Ho me\r")
-    end = time.time() + 2.0
-    while time.time() < end and not v.has("MARK"):
-        v.feed(c.drain(0.02))
-    check(v.has("MARK"), "15 the server has read the preexec title before the job starts")
-    typed(c, "\r")
-    seen = watch(c, v, 4.5, step=0.1)
+    # nothing visible. 15b is the same without precmd, so only the drop of the
+    # held preexec title at the job's end keeps it off the prompt.
+    seen = preexec_job(c, v, "15", "Pa", "ss", "; printf '\\033]2;%s%s\\007' Ho me")
     check(seen == ["Home", "sleep", "Home"],
           f"15 preexec/precmd around `sleep 2` reads exactly [Home, sleep, Home] ({seen})")
+    seen = preexec_job(c, v, "15b", "Go", "on", "")
+    check(seen == ["Home", "sleep", "Home"],
+          f"15b a preexec title is not shown at the prompt after its job ({seen})")
 
     # 12. a precmd-style title right after a job.
     typed(c, "sleep 1.5; printf '\\033]2;%s%s\\007' Ho me2\r")
