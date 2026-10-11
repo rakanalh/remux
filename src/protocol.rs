@@ -1039,12 +1039,44 @@ pub struct DirEntry {
 /// Rectangle describing a focused pane's position and size in the composited
 /// screen buffer. Sent alongside render messages so the client can scope
 /// visual-mode selection to the active pane.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneRect {
     pub x: u16,
     pub y: u16,
     pub width: u16,
     pub height: u16,
+    /// Where a `PaneFocus*` from this pane would move focus. The client needs
+    /// it because the rect alone cannot say: in Monocle, or with the pane
+    /// zoomed, the rect touches every edge while other panes still exist in
+    /// each direction.
+    ///
+    /// The all-`false` default is what an older server decodes to, and it
+    /// keeps that server's clients on the geometric edge test alone, which is
+    /// how they behaved before the field existed. No `PROTOCOL_VERSION` bump:
+    /// the field decodes both ways, the same reasoning
+    /// `DirectoryListing::home` records for being added at 11.
+    #[serde(default)]
+    pub neighbors: FocusNeighbors,
+}
+
+/// For each direction, whether the server has a pane to focus that way.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FocusNeighbors {
+    pub left: bool,
+    pub right: bool,
+    pub up: bool,
+    pub down: bool,
+}
+
+impl FocusNeighbors {
+    pub fn toward(&self, dir: &FocusDirection) -> bool {
+        match dir {
+            FocusDirection::Left => self.left,
+            FocusDirection::Right => self.right,
+            FocusDirection::Up => self.up,
+            FocusDirection::Down => self.down,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

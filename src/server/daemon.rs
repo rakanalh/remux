@@ -8988,13 +8988,27 @@ async fn build_composite(
             y: interior.y,
             width: interior.width,
             height: interior.height,
+            // The server refuses `PaneFocus*` while the popup is up.
+            neighbors: FocusNeighbors::default(),
         }),
         None => {
+            // `tab.layout`, not `effective_layout`, because the `PaneFocus*`
+            // handler walks the unzoomed tree: a zoomed pane fills the area, but
+            // the handler still moves focus (and the zoom) to its real neighbours.
+            let has =
+                |dir| layout::focus_target(&tab.layout, area, tab.focused_pane, dir, 0).is_some();
+            let neighbors = FocusNeighbors {
+                left: has(layout::FocusDirection::Left),
+                right: has(layout::FocusDirection::Right),
+                up: has(layout::FocusDirection::Up),
+                down: has(layout::FocusDirection::Down),
+            };
             focused_rect_and_offsets.map(|(rect, x_off, y_off, x_off_end, y_off_end)| PaneRect {
                 x: rect.x + x_off,
                 y: rect.y + y_off,
                 width: rect.width.saturating_sub(x_off + x_off_end),
                 height: rect.height.saturating_sub(y_off + y_off_end),
+                neighbors,
             })
         }
     };

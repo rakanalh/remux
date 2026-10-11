@@ -1479,20 +1479,48 @@ pub fn focus_in_direction(
     direction: FocusDirection,
     gap_size: u16,
 ) -> Option<PaneId> {
-    if let Some((len, idx)) = stack_of(node, focused) {
-        if len > 1 {
-            match direction {
-                FocusDirection::Left | FocusDirection::Up if idx > 0 => {
-                    return node.stack_prev(focused);
-                }
-                FocusDirection::Right | FocusDirection::Down if idx < len - 1 => {
-                    return node.stack_next(focused);
-                }
-                _ => {}
-            }
-        }
+    match stack_step(node, focused, &direction) {
+        Some(StackStep::Prev) => node.stack_prev(focused),
+        Some(StackStep::Next) => node.stack_next(focused),
+        None => find_neighbor(node, area, focused, direction, gap_size),
     }
-    find_neighbor(node, area, focused, direction, gap_size)
+}
+
+/// The pane [`focus_in_direction`] would focus, without moving anything.
+pub fn focus_target(
+    node: &LayoutNode,
+    area: Rect,
+    focused: PaneId,
+    direction: FocusDirection,
+    gap_size: u16,
+) -> Option<PaneId> {
+    let Some(step) = stack_step(node, focused, &direction) else {
+        return find_neighbor(node, area, focused, direction, gap_size);
+    };
+    let stack = find_stack_for_pane(node, focused)?;
+    let idx = stack.iter().position(|&p| p == focused)?;
+    let target = match step {
+        StackStep::Prev => idx.checked_sub(1)?,
+        StackStep::Next => idx + 1,
+    };
+    stack.get(target).copied()
+}
+
+enum StackStep {
+    Prev,
+    Next,
+}
+
+fn stack_step(node: &LayoutNode, focused: PaneId, direction: &FocusDirection) -> Option<StackStep> {
+    let (len, idx) = stack_of(node, focused)?;
+    if len <= 1 {
+        return None;
+    }
+    match direction {
+        FocusDirection::Left | FocusDirection::Up if idx > 0 => Some(StackStep::Prev),
+        FocusDirection::Right | FocusDirection::Down if idx < len - 1 => Some(StackStep::Next),
+        _ => None,
+    }
 }
 
 /// Swap the positions of two panes in the layout tree by exchanging their ids
@@ -3330,6 +3358,76 @@ mod tests {
         // with no spatial neighbor to the right, returns None.
         let f = focus_in_direction(&mut node, area, 3, FocusDirection::Right, 0);
         assert_eq!(f, None);
+    }
+
+    #[test]
+    fn focus_target_in_monocle_steps_through_the_stack_and_never_wraps() {
+        let node = LayoutMode::Monocle(MonocleLayout).build_tree(&[1, 2], 2);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        assert_eq!(
+            focus_target(&node, area, 2, FocusDirection::Left, 0),
+            Some(1)
+        );
+        assert_eq!(focus_target(&node, area, 1, FocusDirection::Left, 0), None);
+        assert_eq!(
+            focus_target(&node, area, 1, FocusDirection::Right, 0),
+            Some(2)
+        );
+        assert_eq!(focus_target(&node, area, 2, FocusDirection::Right, 0), None);
+    }
+
+    #[test]
+    fn focus_target_agrees_with_focus_in_direction_in_every_layout() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 35,
+        };
+        let modes = [
+            LayoutMode::Bsp(BspLayout),
+            LayoutMode::Master(MasterLayout::default()),
+            LayoutMode::Monocle(MonocleLayout),
+            LayoutMode::Grid(GridLayout),
+            LayoutMode::Columns(ColumnsLayout),
+            LayoutMode::Rows(RowsLayout),
+        ];
+        let dirs = [
+            FocusDirection::Left,
+            FocusDirection::Right,
+            FocusDirection::Up,
+            FocusDirection::Down,
+        ];
+        let mut checked = 0;
+        for mode in &modes {
+            for n in 1..=5u32 {
+                let panes: Vec<PaneId> = (1..=n).map(u64::from).collect();
+                for &focused in &panes {
+                    let node = mode.build_tree(&panes, focused);
+                    for dir in &dirs {
+                        let predicted = focus_target(&node, area, focused, dir.clone(), 0);
+                        let mut moved = node.clone();
+                        let actual = focus_in_direction(&mut moved, area, focused, dir.clone(), 0);
+                        assert_eq!(
+                            predicted,
+                            actual,
+                            "{} with {n} panes, focus {focused}, {dir:?}",
+                            mode.name()
+                        );
+                        checked += usize::from(actual.is_some());
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no case had a neighbour, so nothing was compared"
+        );
     }
 
     #[test]

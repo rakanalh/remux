@@ -268,9 +268,14 @@ def main():
                    and exp["y"] < cy < exp["y"] + exp["height"] - 1)
     check(in_interior, f"the reported cursor ({cx},{cy}) is inside the popup interior")
     fpr = grid.fpr
-    check(fpr == {"x": exp["x"] + 1, "y": exp["y"] + 1,
-                  "width": exp["width"] - 2, "height": exp["height"] - 2},
+    geometry = {k: fpr.get(k) for k in ("x", "y", "width", "height")} if fpr else None
+    check(geometry == {"x": exp["x"] + 1, "y": exp["y"] + 1,
+                       "width": exp["width"] - 2, "height": exp["height"] - 2},
           f"focused_pane_rect is the popup interior: {fpr}")
+    # The server refuses `PaneFocus*` while the popup is up, so it reports no
+    # neighbour in any direction.
+    check(fpr is not None and not any(fpr.get("neighbors", {}).values()),
+          f"the popup reports no focus neighbours: {fpr}")
 
     # -- 8. Layout-mutating commands are no-ops while the popup is open. ----
     print("\n[8] layout commands are no-ops while the popup is open")

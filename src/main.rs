@@ -2435,6 +2435,8 @@ async fn handle_view_command(
                         y: iy as u16,
                         width: iw as u16,
                         height: ih as u16,
+                        // Reaching here means `move_focus` found no cell that way.
+                        neighbors: crate::protocol::FocusNeighbors::default(),
                     }
                 });
             crate::client::chrome::intercept_focus(

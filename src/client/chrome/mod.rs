@@ -1103,7 +1103,10 @@ pub fn intercept_focus(
                 Up => rect.y <= pa_rel_y + BORDER_INSET,
                 Down => rect.y + rect.height + BORDER_INSET >= pa_rel_y + pa.height,
             };
-            if !at_edge {
+            // In Monocle or under zoom the rect touches every edge, so the edge
+            // test alone would take every direction into the sidebar while the
+            // server still has panes that way.
+            if !at_edge || rect.neighbors.toward(&dir) {
                 return false;
             }
             let edge = match dir {
@@ -1397,6 +1400,7 @@ mod focus_tests {
             y: 1,
             width: 98,
             height: 22,
+            ..Default::default()
         };
         assert!(intercept_focus(
             &mut c,
@@ -1426,6 +1430,7 @@ mod focus_tests {
             y: 1,
             width: 68,
             height: 27,
+            ..Default::default()
         };
         assert!(intercept_focus(
             &mut c,
@@ -1455,6 +1460,7 @@ mod focus_tests {
             y: 1,
             width: 33,
             height: 27,
+            ..Default::default()
         };
         assert!(!intercept_focus(
             &mut c,
@@ -1471,6 +1477,7 @@ mod focus_tests {
             y: 1,
             width: 33,
             height: 27,
+            ..Default::default()
         };
         assert!(!intercept_focus(
             &mut c,
@@ -1492,6 +1499,7 @@ mod focus_tests {
             y: 16,
             width: 68,
             height: 12,
+            ..Default::default()
         };
         assert!(intercept_focus(
             &mut c,
@@ -1527,6 +1535,7 @@ mod focus_tests {
             y: 1,
             width: 16,
             height: 27,
+            ..Default::default()
         };
         assert!(!intercept_focus(
             &mut c,
@@ -1631,11 +1640,79 @@ mod focus_tests {
             y: 0,
             width: 35,
             height: 29,
+            ..Default::default()
         };
         assert!(intercept_focus(
             &mut c,
             FocusDirection::Left,
             Some(&pane),
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(
+            c.focus,
+            ChromeFocus::Sidebar {
+                sidebar: 0,
+                panel: 0
+            }
+        );
+    }
+
+    fn full_area_pane(neighbors: crate::protocol::FocusNeighbors) -> PaneRect {
+        PaneRect {
+            x: 1,
+            y: 1,
+            width: 68,
+            height: 27,
+            neighbors,
+        }
+    }
+
+    #[test]
+    fn a_full_area_pane_with_a_server_neighbour_is_forwarded() {
+        let neighbors = crate::protocol::FocusNeighbors {
+            left: true,
+            right: true,
+            ..Default::default()
+        };
+        let mut c = chrome_with(SidebarEdge::Left, 30);
+        assert!(!intercept_focus(
+            &mut c,
+            FocusDirection::Left,
+            Some(&full_area_pane(neighbors)),
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(c.focus, ChromeFocus::Content);
+
+        let mut c = chrome_with(SidebarEdge::Right, 30);
+        assert!(!intercept_focus(
+            &mut c,
+            FocusDirection::Right,
+            Some(&PaneRect {
+                x: 0,
+                ..full_area_pane(neighbors)
+            }),
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(c.focus, ChromeFocus::Content);
+    }
+
+    #[test]
+    fn a_full_area_pane_with_no_neighbour_that_way_enters_the_sidebar() {
+        let neighbors = crate::protocol::FocusNeighbors {
+            right: true,
+            ..Default::default()
+        };
+        let mut c = chrome_with(SidebarEdge::Left, 30);
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Left,
+            Some(&full_area_pane(neighbors)),
             100,
             30,
             &StatusBarPosition::Bottom
@@ -1657,6 +1734,7 @@ mod focus_tests {
             y: 0,
             width: 35,
             height: 29,
+            ..Default::default()
         };
         assert!(!intercept_focus(
             &mut c,
@@ -1677,6 +1755,7 @@ mod focus_tests {
             y: 0,
             width: 80,
             height: 29,
+            ..Default::default()
         };
         assert!(!intercept_focus(
             &mut c,
@@ -1724,6 +1803,7 @@ mod focus_tests {
             y: 1,
             width: 100,
             height: 22,
+            ..Default::default()
         };
         for sb in [StatusBarPosition::Top, StatusBarPosition::Bottom] {
             let mut c = chrome_with(SidebarEdge::Bottom, 5);
@@ -1740,6 +1820,7 @@ mod focus_tests {
             y: 1,
             width: 100,
             height: 10,
+            ..Default::default()
         };
         for sb in [StatusBarPosition::Top, StatusBarPosition::Bottom] {
             let mut c = chrome_with(SidebarEdge::Bottom, 5);
