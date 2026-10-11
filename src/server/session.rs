@@ -653,6 +653,7 @@ pub struct MoveRequest {
     pub session: Option<String>,
 }
 
+#[cfg(test)]
 impl From<MoveTarget> for MoveRequest {
     fn from(target: MoveTarget) -> Self {
         MoveRequest {
