@@ -98,6 +98,28 @@ def queued():
     return struct.unpack("i", fcntl.ioctl(0, termios.FIONREAD, b"\0\0\0\0"))[0]
 
 
+def ctl_count(log, command):
+    """How many times the fakeagent logging to `log` acknowledged `command`."""
+    try:
+        return sum(1 for ln in open(log) if ln.strip() == f"CTL {command}")
+    except FileNotFoundError:
+        return 0
+
+
+def tell(ctl, log, command, timeout=5.0, settle=0.4):
+    """Give the fakeagent one command, by rename, and wait for its
+    acknowledgement, then `settle` seconds for the server to parse the
+    output it caused."""
+    before = ctl_count(log, command)
+    with open(ctl + ".tmp", "w") as f:
+        f.write(command + "\n")
+    os.replace(ctl + ".tmp", ctl)
+    end = time.time() + timeout
+    while time.time() < end and ctl_count(log, command) == before:
+        time.sleep(0.05)
+    time.sleep(settle)
+
+
 def install(path):
     """Write the fakeagent to `path` as an executable with a direct shebang."""
     with open(os.path.abspath(__file__)) as f:

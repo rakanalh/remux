@@ -64,6 +64,9 @@ CLI_MSG_SECRET = "the-vault-pin-is-8812-CLI-BODY"
 # bytes the server writes into the pane are the body, framed, so logging them
 # in any form (raw, escaped or as hex) is the leak this case looks for.
 SUBMIT_SECRET = "the-signing-key-is-lobster-SUBMIT"
+# A body the CLI sends with `--deliver submit --wait`, typed by the server:
+# both the client's and the server's log could hold it.
+CLI_SUBMIT_SECRET = "the-badge-code-is-3141-CLI-SUBMIT"
 # Outside the run dir, which `Server.start` wipes.
 FAKEAGENT = f"{RUNDIR}-bin/fakeagent"
 CONFIG = """
@@ -392,6 +395,40 @@ def run_submit(srv, result):
     spawner.close()
 
 
+def run_cli_submit(srv, result):
+    """10. `remux msg send --deliver submit --wait` as a pane's own program,
+    into case 9's agent: the body is typed, and the client logs the send."""
+    agent = result.get("submit_agent")
+    if agent is None:
+        return
+    # Case 9's echo reads as work for a moment; a submit waits that out.
+    time.sleep(2.0)
+    spawner = Client(srv.sock)
+    spawner.hello()
+    spawner.send(
+        {
+            "CliSpawn": {
+                "session": "main",
+                "placement": "SplitBelow",
+                "argv": [os.path.abspath(BIN), "msg", "send", f"%{agent}", "--deliver", "submit",
+                         "--wait", "--timeout", "3", CLI_SUBMIT_SECRET],
+                "cwd": None,
+            }
+        }
+    )
+    spawner.drain(0.6)
+    spawner.close()
+    log_path = f"{RUNDIR}/agent.log"
+    end = time.time() + 12.0
+    while time.time() < end:
+        if os.path.exists(log_path) and CLI_SUBMIT_SECRET.encode().hex() in open(log_path).read():
+            result["cli_submit_typed"] = True
+            break
+        time.sleep(0.1)
+    # Long enough for the wait to time out and the CLI to log its answer.
+    time.sleep(4.0)
+
+
 def main():
     # Findings that come from the WIRE rather than from the log, carried out of
     # `run` so the checks can be made after the server is stopped.
@@ -405,6 +442,7 @@ def main():
             run_cli(srv)
             run_msg_cli(srv, result)
             run_submit(srv, result)
+            run_cli_submit(srv, result)
         except Exception as e:  # noqa: BLE001 -- the log is the point; reach it
             check(False, f"the run completed without an exception ({e!r})")
     finally:
@@ -550,6 +588,22 @@ def main():
     check(
         f"msg: id={sent_id} submitted to %{result.get('submit_agent')} (bracketed=" in log,
         "9 ...but the line naming the submit is present",
+    )
+
+    # 10. A body the CLI sends with --deliver submit --wait: typed, and in
+    #     neither log in any form, while the client's line naming the send
+    #     and its flags is present.
+    check(
+        result.get("cli_submit_typed") is True,
+        "10 the CLI's submitted body really was typed into the agent's pane",
+    )
+    leaked = [form for form in leak_forms(CLI_SUBMIT_SECRET) if form in log or form in client_log]
+    check(not leaked, f"10 a body sent by `msg send --deliver submit` is in neither log (found {leaked})")
+    sends = [ln for ln in client_log.splitlines() if f'cmd: msg send to="%{result.get("submit_agent")}"' in ln]
+    check(
+        any("deliver=Submit" in ln and "wait=true" in ln and "timeout=Some(3000)" in ln for ln in sends)
+        and "cmd: msg send answered MsgSent(" in client_log,
+        f"10 ...but client.log names the send, its delivery and its wait flags (lines {sends})",
     )
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.

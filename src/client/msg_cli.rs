@@ -29,8 +29,8 @@ use crate::client::cli_common::{
     unexpected, CliError, REPLY_DEADLINE,
 };
 use crate::protocol::{
-    valid_host, Address, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef, PaneId, Sender,
-    ServerMessage, Target,
+    valid_host, Address, AgentState, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef,
+    PaneId, Sender, ServerMessage, Target,
 };
 
 /// The most a body source is read, whatever the server's own limit: past it
@@ -44,6 +44,7 @@ pub enum MsgCmd {
     #[command(group(
         clap::ArgGroup::new("body").required(true).args(["text", "stdin", "file"])
     ))]
+    #[command(group(clap::ArgGroup::new("waits").multiple(true).args(["defer", "wait"])))]
     Send {
         /// `%N`, a name, or `host:` either
         target: String,
@@ -60,6 +61,20 @@ pub enum MsgCmd {
         file: Option<std::path::PathBuf>,
         #[arg(long, value_enum, default_value_t = DeliverArg::Auto)]
         deliver: DeliverArg,
+        /// While the agent is waiting on its user, keep the message queued
+        /// until it is not, instead of leaving it in the mailbox (`auto`) or
+        /// refusing it (`submit`)
+        #[arg(long)]
+        defer: bool,
+        /// Once the message is submitted, wait for the agent's turn to end
+        /// and say how it ended: idle, or asking for input
+        #[arg(long)]
+        wait: bool,
+        /// How long --defer and --wait may take together: one timeout, from
+        /// when the server stores the message. `30`, `30s`, `2m`, at most 1h;
+        /// 10m by default
+        #[arg(long, value_parser = parse_wait, value_name = "DUR", requires = "waits")]
+        timeout: Option<Duration>,
         /// The id of the message this one answers
         #[arg(long, value_name = "ID")]
         reply_to: Option<MsgId>,
@@ -148,18 +163,25 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
             stdin,
             file,
             deliver,
+            defer,
+            wait,
+            timeout,
             reply_to,
             json,
         } => {
             let to: Address = target
                 .parse()
                 .map_err(|why: String| CliError::usage("bad_address", why))?;
+            let timeout = send_timeout_of(deliver.into(), defer, wait, timeout)?;
             let body = read_body(text, stdin, file)?;
             log::debug!(
-                "cmd: msg send to={:?} deliver={deliver:?} bytes={}",
+                "cmd: msg send to={:?} deliver={deliver:?} bytes={} defer={defer} wait={wait} \
+                 timeout={:?}",
                 to.to_string(),
-                body.len()
+                body.len(),
+                timeout.map(|t| t.as_millis())
             );
+            let started = std::time::Instant::now();
             let answer = ask(
                 ClientMessage::MsgSend {
                     to: to.clone(),
@@ -167,11 +189,11 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     deliver: deliver.into(),
                     reply_to: reply_to.map(|id| MsgRef { host: None, id }),
                     pane_hint: pane_hint(),
-                    defer: false,
-                    timeout_ms: None,
-                    wait: false,
+                    defer,
+                    timeout_ms: timeout.map(|t| t.as_millis() as u64),
+                    wait,
                 },
-                send_deadline(deliver.into(), false, None),
+                send_deadline(deliver.into(), defer, wait, timeout),
             )
             .await
             .map_err(|e| match e {
@@ -184,22 +206,28 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     to,
                     delivery,
                     reason,
-                    timed_out: _,
-                    final_state: _,
+                    timed_out,
+                    final_state,
                 } => {
                     log::debug!("cmd: msg send answered MsgSent(id={id})");
                     if json {
                         println!(
                             "{}",
                             json_line(&serde_json::json!({
-                                "id": id, "to": to, "delivery": delivery, "reason": reason
+                                "id": id, "to": to, "delivery": delivery, "reason": reason,
+                                "final_state": final_state, "timed_out": timed_out
                             }))
                         );
                     } else {
-                        println!(
-                            "{}",
-                            sent_line(id, to.pane_id, to.name.as_deref(), delivery, reason)
-                        );
+                        let outcome = Outcome {
+                            delivery,
+                            reason,
+                            final_state,
+                            timed_out,
+                            took: started.elapsed(),
+                            timeout,
+                        };
+                        println!("{}", sent_line(id, to.pane_id, to.name.as_deref(), outcome));
                     }
                     Ok(())
                 }
@@ -387,28 +415,51 @@ fn body_of(raw: Vec<u8>) -> Result<String, CliError> {
     Ok(body)
 }
 
+/// The timeout a send asks for: `timeout`, or the server's default, at most
+/// an hour, when it defers or waits, and none otherwise. Refused, before
+/// anything is sent, when it defers or waits on a message it does not type.
+fn send_timeout_of(
+    deliver: Deliver,
+    defer: bool,
+    wait: bool,
+    timeout: Option<Duration>,
+) -> Result<Option<Duration>, CliError> {
+    use crate::server::daemon::{DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS};
+    if !(defer || wait) {
+        return Ok(None);
+    }
+    if deliver == Deliver::Mailbox {
+        return Err(CliError::usage(
+            "usage",
+            "--defer and --wait are for a message that is typed: not with --deliver mailbox",
+        ));
+    }
+    let timeout = timeout.unwrap_or(Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS));
+    Ok(Some(timeout.min(Duration::from_millis(MAX_WAIT_MS))))
+}
+
 /// How long `msg send` waits for its answer. A submit's answer waits for the
-/// message to be typed, so it has the server's whole submit budget on top,
-/// and a deferred one may first wait for its whole timeout, as the server
-/// caps it.
-fn send_deadline(deliver: Deliver, defer: bool, timeout: Option<Duration>) -> Duration {
+/// message to be typed, so it has the server's whole submit budget on top.
+/// A deferred one may first wait for its whole timeout, as the server floors
+/// and caps it, and one sent with --wait is answered at the timeout at the
+/// latest. Both count from when the server stores the message, so the
+/// longer of the two is added, not both.
+fn send_deadline(deliver: Deliver, defer: bool, wait: bool, timeout: Option<Duration>) -> Duration {
     use crate::server::daemon::{
         DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS, SUBMIT_BUDGET_MS, SUBMIT_HOLD_MS,
     };
+    let asked = timeout.unwrap_or(Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS));
+    let max = Duration::from_millis(MAX_WAIT_MS);
     let deferred = if defer {
-        timeout
-            .unwrap_or(Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS))
-            .clamp(
-                Duration::from_millis(SUBMIT_HOLD_MS),
-                Duration::from_millis(MAX_WAIT_MS),
-            )
+        asked.clamp(Duration::from_millis(SUBMIT_HOLD_MS), max)
     } else {
         Duration::ZERO
     };
+    let waited = if wait { asked.min(max) } else { Duration::ZERO };
     match deliver {
         Deliver::Mailbox => REPLY_DEADLINE,
         Deliver::Submit | Deliver::Auto => {
-            REPLY_DEADLINE + Duration::from_millis(SUBMIT_BUDGET_MS) + deferred
+            REPLY_DEADLINE + Duration::from_millis(SUBMIT_BUDGET_MS) + deferred.max(waited)
         }
     }
 }
@@ -427,25 +478,100 @@ fn send_timeout(to: &Address) -> CliError {
     ))
 }
 
-fn sent_line(
-    id: MsgId,
-    pane: PaneId,
-    name: Option<&str>,
+/// What a send's answer says, for [`sent_line`].
+struct Outcome {
     delivery: Delivery,
     reason: Option<String>,
-) -> String {
+    final_state: Option<AgentState>,
+    timed_out: bool,
+    /// From the send to its answer.
+    took: Duration,
+    /// The timeout the send asked for, when it deferred or waited.
+    timeout: Option<Duration>,
+}
+
+/// What the sender must do about a send answered with `reason`, when the
+/// answer alone does not say. Under `auto` these come back as a delivery with
+/// a reason, so the server's own advice, which an error would carry, is not
+/// there to print.
+fn advice(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "read_by_another_program" => {
+            "A line of it may be waiting at the shell prompt there: clear it with Ctrl-U before \
+             pressing Enter."
+        }
+        "agent_too_slow" => {
+            "The part the agent read is left in its input: clear that before pressing Enter there."
+        }
+        "too_many_lines" => {
+            "It has too many lines to be typed: the agent can read it from its mailbox."
+        }
+        "agent_exited" | "agent_prompt_stalled" => {
+            "It was typed and submitted: do not send it again; look at the pane."
+        }
+        "pane_closed_after_submit" => {
+            "It was typed and submitted before the pane closed: do not send it again."
+        }
+        _ => return None,
+    })
+}
+
+fn sent_line(id: MsgId, pane: PaneId, name: Option<&str>, outcome: Outcome) -> String {
     let named = name
         .map(|n| format!(" ({})", escape(n)))
         .unwrap_or_default();
-    let how = match delivery {
+    // The agent read these before a person's key or a prompt stopped the
+    // Enter: the text is in its input, so "stored" would send someone to the
+    // mailbox for a message that is on the agent's screen.
+    let read_unsubmitted = matches!(
+        outcome.reason.as_deref(),
+        Some("typed_over_read" | "agent_blocked_read")
+    );
+    let how = match outcome.delivery {
+        Delivery::Mailbox if read_unsubmitted => "typed into the pane, not submitted",
         Delivery::Mailbox => "stored in its mailbox",
         Delivery::Submitted => "typed into the pane",
         Delivery::Forwarded => "forwarded",
     };
-    let why = reason
-        .map(|r| format!(" ({})", escape(&r)))
+    let state = |s: AgentState| match s {
+        AgentState::Idle => "idle",
+        AgentState::Working => "working",
+        AgentState::NeedsInput => "asking for input",
+    };
+    let ended = match outcome.final_state {
+        Some(s) if !outcome.timed_out => {
+            format!(
+                "; {}, answered after {:.1}s",
+                state(s),
+                outcome.took.as_secs_f64()
+            )
+        }
+        _ => String::new(),
+    };
+    let mut why: Vec<String> = outcome.reason.iter().map(|r| escape(r)).collect();
+    if outcome.timed_out {
+        let after = outcome
+            .timeout
+            .map(|t| format!(" after {}s", t.as_secs()))
+            .unwrap_or_default();
+        let last = outcome
+            .final_state
+            .map(|s| format!("; last state {}", state(s)))
+            .unwrap_or_default();
+        why.push(format!("timed out{after}{last}"));
+    }
+    let advice = outcome
+        .reason
+        .as_deref()
+        .and_then(advice)
+        .map(|a| format!(". {a}"))
         .unwrap_or_default();
-    format!("sent #{id} to %{pane}{named}: {how}{why}")
+    let why = if why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", why.join("; "))
+    };
+    format!("sent #{id} to %{pane}{named}: {how}{ended}{why}{advice}")
 }
 
 /// The body under its header: every line indented and escaped, so no line of
@@ -579,42 +705,225 @@ mod tests {
     fn a_submit_is_waited_for_past_the_servers_whole_budget() {
         let server_worst = Duration::from_millis(crate::server::daemon::SUBMIT_BUDGET_MS)
             + crate::server::daemon::CALLER_ATTRIBUTION_TIMEOUT;
-        assert!(send_deadline(Deliver::Submit, false, None) > server_worst);
-        assert!(send_deadline(Deliver::Auto, false, None) > server_worst);
-        assert_eq!(send_deadline(Deliver::Mailbox, false, None), REPLY_DEADLINE);
+        assert!(send_deadline(Deliver::Submit, false, false, None) > server_worst);
+        assert!(send_deadline(Deliver::Auto, false, false, None) > server_worst);
+        assert_eq!(
+            send_deadline(Deliver::Mailbox, false, false, None),
+            REPLY_DEADLINE
+        );
     }
 
     #[test]
     fn a_deferred_submit_is_waited_for_past_its_own_timeout_too() {
-        let plain = send_deadline(Deliver::Submit, false, None);
+        let plain = send_deadline(Deliver::Submit, false, false, None);
         let ms = Duration::from_millis;
         assert_eq!(
-            send_deadline(Deliver::Submit, true, Some(ms(120_000))),
+            send_deadline(Deliver::Submit, true, false, Some(ms(120_000))),
             plain + ms(120_000)
         );
         assert_eq!(
-            send_deadline(Deliver::Submit, true, Some(ms(0))),
+            send_deadline(Deliver::Submit, true, false, Some(ms(0))),
             plain + ms(crate::server::daemon::SUBMIT_HOLD_MS),
             "no shorter than the server waits"
         );
         assert_eq!(
-            send_deadline(Deliver::Auto, true, None),
+            send_deadline(Deliver::Auto, true, false, None),
             plain + ms(crate::server::daemon::DEFAULT_SUBMIT_TIMEOUT_MS)
         );
         assert_eq!(
-            send_deadline(Deliver::Submit, true, Some(ms(u64::MAX / 2))),
+            send_deadline(Deliver::Submit, true, false, Some(ms(u64::MAX / 2))),
             plain + ms(crate::server::daemon::MAX_WAIT_MS),
             "no longer than the server can wait"
         );
         assert_eq!(
-            send_deadline(Deliver::Submit, false, Some(ms(20_000))),
+            send_deadline(Deliver::Submit, false, false, Some(ms(20_000))),
             plain,
-            "a timeout bounds only a deferred wait"
+            "a timeout bounds only a deferred or waited send"
         );
         assert_eq!(
-            send_deadline(Deliver::Mailbox, true, Some(ms(20_000))),
+            send_deadline(Deliver::Mailbox, true, true, Some(ms(20_000))),
             REPLY_DEADLINE,
             "nothing is typed, so nothing is deferred"
+        );
+    }
+
+    #[test]
+    fn a_waited_submit_is_waited_for_its_timeout_with_no_floor_and_once_with_defer() {
+        let plain = send_deadline(Deliver::Submit, false, false, None);
+        let ms = Duration::from_millis;
+        assert_eq!(
+            send_deadline(Deliver::Submit, false, true, Some(ms(1_000))),
+            plain + ms(1_000),
+            "a wait is not raised to the hold"
+        );
+        assert_eq!(
+            send_deadline(Deliver::Auto, false, true, None),
+            plain + ms(crate::server::daemon::DEFAULT_SUBMIT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            send_deadline(Deliver::Submit, true, true, Some(ms(120_000))),
+            plain + ms(120_000),
+            "one timeout from the store, so not added twice"
+        );
+        assert_eq!(
+            send_deadline(Deliver::Submit, false, true, Some(ms(u64::MAX / 2))),
+            plain + ms(crate::server::daemon::MAX_WAIT_MS)
+        );
+    }
+
+    #[test]
+    fn defer_and_wait_take_a_timeout_and_never_a_mailbox_send() {
+        let ms = Duration::from_millis;
+        assert_eq!(
+            send_timeout_of(Deliver::Submit, false, false, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            send_timeout_of(Deliver::Auto, false, true, None).unwrap(),
+            Some(ms(crate::server::daemon::DEFAULT_SUBMIT_TIMEOUT_MS))
+        );
+        assert_eq!(
+            send_timeout_of(Deliver::Submit, true, false, Some(ms(5_000))).unwrap(),
+            Some(ms(5_000))
+        );
+        assert_eq!(
+            send_timeout_of(Deliver::Submit, false, true, Some(ms(u64::MAX / 2))).unwrap(),
+            Some(ms(crate::server::daemon::MAX_WAIT_MS)),
+            "at most an hour"
+        );
+        for (defer, wait) in [(true, false), (false, true)] {
+            let refused = send_timeout_of(Deliver::Mailbox, defer, wait, None).unwrap_err();
+            assert_eq!(refused.exit_code(), 2, "a usage error, nothing sent");
+        }
+    }
+
+    #[derive(clap::Parser, Debug)]
+    struct Parsed {
+        #[command(subcommand)]
+        cmd: MsgCmd,
+    }
+
+    fn parse(args: &[&str]) -> Result<Parsed, clap::Error> {
+        use clap::Parser;
+        Parsed::try_parse_from(["msg"].iter().chain(args))
+    }
+
+    #[test]
+    fn a_timeout_needs_defer_or_wait_and_a_duration() {
+        assert!(parse(&["send", "%1", "x", "--timeout", "5"]).is_err());
+        assert!(parse(&["send", "%1", "x", "--wait", "--timeout", "abc"]).is_err());
+        for flags in [
+            &["--wait", "--timeout", "5"][..],
+            &["--defer", "--timeout", "2m"],
+            &["--defer", "--wait"],
+        ] {
+            let args: Vec<&str> = ["send", "%1", "x"].iter().chain(flags).copied().collect();
+            assert!(parse(&args).is_ok(), "{flags:?}");
+        }
+    }
+
+    fn outcome(delivery: Delivery, reason: Option<&str>) -> Outcome {
+        Outcome {
+            delivery,
+            reason: reason.map(str::to_string),
+            final_state: None,
+            timed_out: false,
+            took: Duration::from_millis(2_130),
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn the_sent_line_says_how_the_turn_ended() {
+        let line = |o| sent_line(4, 2, None, o);
+        assert_eq!(
+            line(outcome(Delivery::Submitted, None)),
+            "sent #4 to %2: typed into the pane"
+        );
+        assert_eq!(
+            line(Outcome {
+                final_state: Some(AgentState::Idle),
+                ..outcome(Delivery::Submitted, None)
+            }),
+            "sent #4 to %2: typed into the pane; idle, answered after 2.1s"
+        );
+        assert_eq!(
+            line(Outcome {
+                final_state: Some(AgentState::NeedsInput),
+                ..outcome(Delivery::Submitted, None)
+            }),
+            "sent #4 to %2: typed into the pane; asking for input, answered after 2.1s"
+        );
+        assert_eq!(
+            line(Outcome {
+                final_state: Some(AgentState::Working),
+                timed_out: true,
+                timeout: Some(Duration::from_secs(600)),
+                ..outcome(Delivery::Submitted, None)
+            }),
+            "sent #4 to %2: typed into the pane (timed out after 600s; last state working)"
+        );
+        assert_eq!(
+            line(outcome(Delivery::Submitted, Some("agent_prompt_stalled"))),
+            "sent #4 to %2: typed into the pane (agent_prompt_stalled). It was typed and \
+             submitted: do not send it again; look at the pane."
+        );
+        assert_eq!(
+            line(Outcome {
+                timed_out: true,
+                timeout: Some(Duration::from_secs(30)),
+                ..outcome(Delivery::Mailbox, Some("agent_blocked"))
+            }),
+            "sent #4 to %2: stored in its mailbox (agent_blocked; timed out after 30s)"
+        );
+        assert_eq!(
+            line(outcome(Delivery::Mailbox, Some("agent_working"))),
+            "sent #4 to %2: stored in its mailbox (agent_working)"
+        );
+    }
+
+    #[test]
+    fn a_message_the_agent_read_is_not_reported_as_stored() {
+        let line = |reason| sent_line(4, 2, None, outcome(Delivery::Mailbox, Some(reason)));
+        assert_eq!(
+            line("typed_over_read"),
+            "sent #4 to %2: typed into the pane, not submitted (typed_over_read)"
+        );
+        assert_eq!(
+            line("agent_blocked_read"),
+            "sent #4 to %2: typed into the pane, not submitted (agent_blocked_read)"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_needs_action_says_what_to_do() {
+        let line = |delivery, reason| sent_line(4, 2, None, outcome(delivery, Some(reason)));
+        let cases = [
+            (Delivery::Mailbox, "read_by_another_program", "Ctrl-U"),
+            (
+                Delivery::Mailbox,
+                "agent_too_slow",
+                "clear that before pressing Enter",
+            ),
+            (
+                Delivery::Mailbox,
+                "too_many_lines",
+                "read it from its mailbox",
+            ),
+            (Delivery::Submitted, "agent_exited", "do not send it again"),
+            (
+                Delivery::Submitted,
+                "pane_closed_after_submit",
+                "do not send it again",
+            ),
+        ];
+        for (delivery, reason, says) in cases {
+            let printed = line(delivery, reason);
+            assert!(printed.contains(says), "{reason}: {printed}");
+        }
+        assert!(
+            advice("agent_working").is_none(),
+            "a policy outcome needs nothing done"
         );
     }
 

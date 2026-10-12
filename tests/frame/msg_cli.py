@@ -79,6 +79,28 @@ pane run from the harness itself.
      unknown and how to check before re-sending.
 8z.  No panic.
 
+Task 6, `msg send --deliver submit|auto --defer --wait --timeout`, into a
+fakeagent pane (`fakeagent.py`):
+9a.  --deliver submit prints "typed into the pane", exit 0, and the agent
+     read the body; --json says delivery Submitted.
+9b.  --wait into an agent that works for 2 s prints "idle, answered after
+     N.Ns", exit 0; --json carries final_state Idle and timed_out false.
+9c.  --wait --timeout 1 into an agent that works for 5 s prints "(timed out
+     after 1s; last state working)", exit 0; --json says timed_out true.
+9d.  --deliver submit into a shell exits 1, "agent_not_ready:"; --deliver
+     auto exits 0, "stored in its mailbox (agent_not_ready)".
+9e.  --wait with --deliver mailbox, --timeout without --defer or --wait, and
+     a --timeout that is not a duration exit 2, and nothing is sent.
+9f.  --deliver submit --wait into an agent that prints nothing after the
+     echo exits 1, "agent_prompt_stalled:", and the message is Submitted.
+9g.  The same under --deliver auto exits 0: "typed into the pane
+     (agent_prompt_stalled)".
+9h.  --defer reaches the server: a --defer --timeout 20 send into a
+     blocked agent is held until the prompt is answered after 12 s, then
+     typed, and the CLI is still there to print "typed into the pane". The
+     deadline's arithmetic is the unit tests'.
+9z.  No panic.
+
 Run: python3 tests/frame/msg_cli.py   (RMX_RUNDIR overrides the run dir)
 """
 import json
@@ -93,6 +115,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, PROTOCOL_VERSION, Server, Client, name_of  # noqa: E402
+import fakeagent  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgcli")
 CONFIG = """
@@ -721,6 +744,182 @@ for deliver in ("submit", "mailbox"):
               f"{took:.2f}s, err {err!r})")
 halt.set()
 slow.join(SLOW_S + 2)
+
+
+# === Task 6: send --deliver submit|auto --defer --wait --timeout =============
+BINDIR = RUNDIR + "-bin"
+FAKEAGENT = f"{BINDIR}/fakeagent"
+os.makedirs(BINDIR, exist_ok=True)
+fakeagent.install(FAKEAGENT)
+SUBMIT_CONFIG = """
+[agents]
+commands = ["fakeagent"]
+working_ms = 500
+  [[agents.pattern]]
+  name = "fake-proceed"
+  command = "fakeagent"
+  regex = "Do you want to proceed"
+
+[messaging]
+stall_ms = 2000
+settle_ms = 500
+
+[messaging.submit.fakeagent]
+while_working = "queue"
+"""
+
+
+def agent_state(pane):
+    c = Client(srv.sock)
+    c.hello()
+    c.send({"AgentStatus": {"target": {"host": None, "target": {"Pane": pane}}}})
+    try:
+        for m in c.drain(2.0):
+            if name_of(m) == "AgentStatusList":
+                entries = m["AgentStatusList"]["panes"]
+                return entries[0]["state"] if entries else None
+    finally:
+        c.close()
+    return None
+
+
+def wait_state(pane, want, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if agent_state(pane) == want:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def agent_read(log, text):
+    """Whether the fakeagent logging to `log` read `text`, across its reads."""
+    try:
+        lines = open(log).read().splitlines()
+    except FileNotFoundError:
+        return False
+    data = b"".join(bytes.fromhex(ln.split()[2]) for ln in lines
+                    if ln.startswith("RX ") and len(ln.split()) > 2)
+    return text.encode() in data
+
+
+def box_state(pane, body):
+    return {m["body"]: m["state"] for m in (listed_json(pane) or [])}.get(body)
+
+
+def send(pane, flags, body, timeout=30.0):
+    """`remux msg send` from inside A: (exit code, stdout, stderr, seconds)."""
+    started = time.time()
+    code, out, err = type_cli(A, f"{BIN} msg send %{pane} {flags} \"$(printf '%s' '{body}')\"",
+                              timeout=timeout)
+    return code, out, err, time.time() - started
+
+
+srv = Server(RUNDIR)
+try:
+    srv.start(config=SUBMIT_CONFIG)
+    clean_env = {k: v for k, v in srv.env.items() if k not in ("REMUX_SESSION", "REMUX_PANE")}
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    F_LOG, F_CTL = f"{RUNDIR}/agent.log", f"{RUNDIR}/agent.ctl"
+    F = cli_spawn("SplitBelow", argv=[FAKEAGENT, F_LOG, F_CTL])
+    end = time.time() + 8
+    while time.time() < end and not os.path.exists(F_LOG):
+        time.sleep(0.05)
+    fakeagent.tell(F_CTL, F_LOG, "paste-on")
+    SH = cli_spawn("SplitBelow")
+    A = cli_spawn("SplitRight")
+    time.sleep(1.0)
+    check(None not in (F, SH, A) and wait_state(F, "Idle"),
+          f"setup 9: the agent in %{F} is detected and Idle (state {agent_state(F)})")
+
+    # --- 9a ---------------------------------------------------------------
+    code, out, err, _ = send(F, "--deliver submit", "MSG:typed")
+    check(code == 0 and "typed into the pane" in out and agent_read(F_LOG, "MSG:typed"),
+          f"9a --deliver submit types the message and says so (exit {code}, out {out!r}, err {err!r})")
+    wait_state(F, "Idle")
+    code, out, err, _ = send(F, "--deliver submit --json", "MSG:json")
+    doc = json.loads(out) if code == 0 and out.strip() else {}
+    check(doc.get("delivery") == "Submitted",
+          f"9a ...and --json says Submitted (exit {code}, out {out!r}, err {err!r})")
+
+    # --- 9b ---------------------------------------------------------------
+    check(wait_state(F, "Idle"), f"...the agent in %{F} is Idle before the next send")
+    code, out, err, took = send(F, "--deliver submit --wait --timeout 10", "GO:2000 go")
+    check(code == 0 and re.search(r"typed into the pane; idle, answered after \d+\.\ds$", out.strip()) is not None,
+          f"9b --wait says the turn ended idle (exit {code}, {took:.1f}s, out {out!r}, err {err!r})")
+    check(wait_state(F, "Idle"), f"...the agent in %{F} is Idle before the next send")
+    code, out, err, _ = send(F, "--wait --timeout 10 --json", "GO:2000 again")
+    doc = json.loads(out) if code == 0 and out.strip() else {}
+    check(doc.get("final_state") == "Idle" and doc.get("timed_out") is False,
+          f"9b ...and --json carries final_state and timed_out (exit {code}, out {out!r})")
+
+    # --- 9c ---------------------------------------------------------------
+    check(wait_state(F, "Idle"), f"...the agent in %{F} is Idle before the next send")
+    code, out, err, took = send(F, "--deliver submit --wait --timeout 1", "GO:5000 long")
+    check(code == 0 and out.strip().endswith("typed into the pane (timed out after 1s; last state working)"),
+          f"9c a wait that runs out says so, exit 0 (exit {code}, {took:.1f}s, out {out!r}, err {err!r})")
+    check(wait_state(F, "Idle", timeout=10), f"...the agent in %{F} is Idle before the next send")
+    code, out, err, _ = send(F, "--wait --timeout 1 --json", "GO:5000 long again")
+    doc = json.loads(out) if code == 0 and out.strip() else {}
+    check(doc.get("timed_out") is True and doc.get("final_state") == "Working",
+          f"9c ...and --json says timed_out (exit {code}, out {out!r})")
+
+    # --- 9d ---------------------------------------------------------------
+    code, out, err, _ = send(SH, "--deliver submit", "MSG:shell")
+    check(code == 1 and err.startswith("remux: agent_not_ready: "),
+          f"9d --deliver submit into a shell exits 1, agent_not_ready (exit {code}, err {err!r})")
+    code, out, err, _ = send(SH, "--deliver auto", "MSG:shell auto")
+    check(code == 0 and out.strip().endswith("stored in its mailbox (agent_not_ready)"),
+          f"9d --deliver auto into a shell is stored, exit 0 (exit {code}, out {out!r}, err {err!r})")
+
+    # --- 9e ---------------------------------------------------------------
+    for flags, why in [("--wait --deliver mailbox", "--wait with --deliver mailbox"),
+                       ("--defer --deliver mailbox", "--defer with --deliver mailbox"),
+                       ("--timeout 5", "--timeout alone"),
+                       ("--wait --timeout abc", "a --timeout that is not a duration")]:
+        body = "USAGE:" + flags.replace(" ", "_")
+        code, out, err, _ = send(F, flags, body)
+        check(code == 2 and box_state(F, body) is None and not agent_read(F_LOG, body),
+              f"9e {why} exits 2 and sends nothing (exit {code}, err {err[:120]!r})")
+
+    # --- 9f / 9g ----------------------------------------------------------
+    check(wait_state(F, "Idle", timeout=10), f"...the agent in %{F} is Idle before the next send")
+    code, out, err, _ = send(F, "--deliver submit --wait --timeout 20", "SILENT:submit")
+    check(code == 1 and err.startswith("remux: agent_prompt_stalled: ")
+          and box_state(F, "SILENT:submit") == "Submitted",
+          f"9f a stall under submit exits 1, and the message is Submitted (exit {code}, err {err!r}, "
+          f"box {box_state(F, 'SILENT:submit')})")
+    check(wait_state(F, "Idle"), f"...the agent in %{F} is Idle before the next send")
+    code, out, err, _ = send(F, "--deliver auto --wait --timeout 20", "SILENT:auto")
+    check(code == 0 and "typed into the pane (agent_prompt_stalled). It was typed and submitted" in out,
+          f"9g a stall under auto exits 0 and says it was typed (exit {code}, out {out!r}, err {err!r})")
+
+    # --- 9h ---------------------------------------------------------------
+    check(wait_state(F, "Idle"), f"...the agent in %{F} is Idle before the next send")
+    fakeagent.tell(F_CTL, F_LOG, "block")
+    check(wait_state(F, "NeedsInput"), f"...the agent in %{F} is waiting on its user")
+    result = {}
+
+    def late():
+        result["r"] = send(F, "--deliver submit --defer --timeout 20", "DEFER:late", timeout=60)
+
+    waiter = threading.Thread(target=late)
+    waiter.start()
+    time.sleep(12)
+    fakeagent.tell(F_CTL, F_LOG, "clear")
+    waiter.join(60)
+    code, out, err, took = result.get("r", (None, "", "", 0))
+    check(code == 0 and "typed into the pane" in out and took >= 12,
+          f"9h --defer reaches the server: the send is held until the prompt is answered, then typed "
+          f"(exit {code}, {took:.1f}s, out {out!r}, err {err!r})")
+    check("panicked at" not in srv.log(), "9z no panic")
+finally:
+    srv.kill()
 
 print()
 if failures:
