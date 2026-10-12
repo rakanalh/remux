@@ -196,6 +196,8 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
             let started = std::time::Instant::now();
             let answer = ask(
                 ClientMessage::MsgSend {
+                    origin: None,
+                    req: None,
                     to: to.clone(),
                     body,
                     deliver: deliver.into(),
@@ -205,7 +207,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     timeout_ms: timeout.map(|t| t.as_millis() as u64),
                     wait,
                 },
-                send_deadline(deliver.into(), defer, wait, timeout),
+                send_deadline(deliver.into(), defer, wait, timeout) + forward_deadline(&to),
             )
             .await
             .map_err(|e| match e {
@@ -220,6 +222,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     reason,
                     timed_out,
                     final_state,
+                    ..
                 } => {
                     log::debug!("cmd: msg send answered MsgSent(id={id})");
                     if json {
@@ -239,7 +242,16 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                             took: started.elapsed(),
                             timeout,
                         };
-                        println!("{}", sent_line(id, to.pane_id, to.name.as_deref(), outcome));
+                        println!(
+                            "{}",
+                            sent_line(
+                                id,
+                                to.host.as_deref(),
+                                to.pane_id,
+                                to.name.as_deref(),
+                                outcome
+                            )
+                        );
                     }
                     Ok(())
                 }
@@ -480,6 +492,17 @@ fn send_deadline(deliver: Deliver, defer: bool, wait: bool, timeout: Option<Dura
     }
 }
 
+/// What a send to another server waits on top of [`send_deadline`]: the
+/// server's whole forward budget, so the server's own answer, `forward_unknown`
+/// included, arrives before the CLI gives up.
+fn forward_deadline(to: &Address) -> Duration {
+    if to.host.is_some() {
+        Duration::from_millis(crate::server::daemon::FORWARD_BUDGET_MS)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// A send with no answer in time: the server may have stored the message,
 /// and typed it, so sending it again could deliver it twice.
 fn send_timeout(to: &Address) -> CliError {
@@ -544,7 +567,14 @@ pub(crate) fn no_mark() -> CliError {
     }
 }
 
-fn sent_line(id: MsgId, pane: PaneId, name: Option<&str>, outcome: Outcome) -> String {
+fn sent_line(
+    id: MsgId,
+    host: Option<&str>,
+    pane: PaneId,
+    name: Option<&str>,
+    outcome: Outcome,
+) -> String {
+    let host = host.map(escape);
     let named = name
         .map(|n| format!(" ({})", escape(n)))
         .unwrap_or_default();
@@ -559,7 +589,16 @@ fn sent_line(id: MsgId, pane: PaneId, name: Option<&str>, outcome: Outcome) -> S
         Delivery::Mailbox if read_unsubmitted => "typed into the pane, not submitted",
         Delivery::Mailbox => "stored in its mailbox",
         Delivery::Submitted => "typed into the pane",
-        Delivery::Forwarded => "forwarded",
+        Delivery::Forwarded => match &host {
+            Some(host) => {
+                return format!(
+                    "sent #{id} to {host}:%{pane}{}: forwarded to {host}, stored in its mailbox",
+                    name.map(|n| format!(" ({})", escape(n)))
+                        .unwrap_or_default()
+                )
+            }
+            None => "forwarded",
+        },
     };
     let state = |s: AgentState| match s {
         AgentState::Idle => "idle",
@@ -790,6 +829,19 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_send_is_waited_for_past_the_servers_whole_forward() {
+        let server_worst = crate::server::daemon::CALLER_ATTRIBUTION_TIMEOUT
+            + crate::server::daemon::forward_wait(Duration::MAX);
+        let remote: Address = "mini:%4".parse().unwrap();
+        let local: Address = "%4".parse().unwrap();
+        assert!(
+            send_deadline(Deliver::Mailbox, false, false, None) + forward_deadline(&remote)
+                > server_worst
+        );
+        assert_eq!(forward_deadline(&local), Duration::ZERO);
+    }
+
+    #[test]
     fn a_deferred_submit_is_waited_for_past_its_own_timeout_too() {
         let plain = send_deadline(Deliver::Submit, false, false, None);
         let ms = Duration::from_millis;
@@ -911,7 +963,7 @@ mod tests {
 
     #[test]
     fn the_sent_line_says_how_the_turn_ended() {
-        let line = |o| sent_line(4, 2, None, o);
+        let line = |o| sent_line(4, None, 2, None, o);
         assert_eq!(
             line(outcome(Delivery::Submitted, None)),
             "sent #4 to %2: typed into the pane"
@@ -960,7 +1012,7 @@ mod tests {
 
     #[test]
     fn a_message_the_agent_read_is_not_reported_as_stored() {
-        let line = |reason| sent_line(4, 2, None, outcome(Delivery::Mailbox, Some(reason)));
+        let line = |reason| sent_line(4, None, 2, None, outcome(Delivery::Mailbox, Some(reason)));
         assert_eq!(
             line("typed_over_read"),
             "sent #4 to %2: typed into the pane, not submitted (typed_over_read)"
@@ -973,7 +1025,7 @@ mod tests {
 
     #[test]
     fn an_answer_that_needs_action_says_what_to_do() {
-        let line = |delivery, reason| sent_line(4, 2, None, outcome(delivery, Some(reason)));
+        let line = |delivery, reason| sent_line(4, None, 2, None, outcome(delivery, Some(reason)));
         let cases = [
             (Delivery::Mailbox, "read_by_another_program", "Ctrl-U"),
             (
@@ -1025,6 +1077,7 @@ mod tests {
 
     fn hostile() -> Message {
         Message {
+origin: None,
             id: 7,
             from: Sender::Pane {
                 pane_id: 3,

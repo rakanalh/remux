@@ -4,6 +4,7 @@ pub mod compositor;
 pub mod daemon;
 pub mod identity;
 pub mod layout;
+pub mod links;
 pub mod messaging;
 pub mod persistence;
 #[cfg(target_os = "linux")]

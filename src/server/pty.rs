@@ -15,11 +15,11 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 /// Held from opening a pane's terminal until its shell is forked, where the
-/// terminal cannot be opened close-on-exec in one call. Every fork the server
-/// makes is a pane's, so no fork can land between the open and the
-/// `FD_CLOEXEC` that follows it.
+/// terminal cannot be opened close-on-exec in one call, and across every
+/// other fork the server makes (the `ssh` of a link it dials), so that no
+/// fork can land between the open and the `FD_CLOEXEC` that follows it.
 #[cfg(not(target_os = "linux"))]
-static OPEN_TO_FORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static OPEN_TO_FORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Both ends of a new terminal, `(master, slave)`, sized `winsize` and
 /// close-on-exec from the moment they exist.

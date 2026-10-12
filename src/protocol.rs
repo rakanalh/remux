@@ -145,7 +145,10 @@ pub enum ConnDescriptor {
 /// and [`ServerMessage::AgentWaited`] were added at 18 the same way, with no
 /// bump: an 18 server built before them cannot decode an `AgentWait` and drops
 /// that connection, which is the skew 13 describes, and only the finished
-/// branch is released.
+/// branch is released. Remote messaging extended 18 the same way:
+/// [`ClientMessage::PeerLink`] and [`ClientMessage::Ping`] with
+/// [`ServerMessage::Pong`], and `MsgSend`'s `origin` and `req`, `MsgSent`'s
+/// and `Error`'s `req`, and [`Message`]'s `origin`, all `#[serde(default)]`.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -620,6 +623,15 @@ pub enum ClientMessage {
         /// shows no sign of taking it up.
         #[serde(default)]
         wait: bool,
+        /// The sender on the server that forwarded this message. Honoured on
+        /// a [`ClientMessage::PeerLink`] connection only, and refused
+        /// `origin_not_allowed` on any other.
+        #[serde(default)]
+        origin: Option<Origin>,
+        /// A correlation id the answer echoes, for a connection that has
+        /// several sends in flight at once.
+        #[serde(default)]
+        req: Option<u64>,
     },
     /// Read a mailbox: `pane`'s, or the caller's own when `pane` is `None`.
     /// A mailbox that is not the caller's own is only peeked, whatever `peek`
@@ -696,6 +708,38 @@ pub enum ClientMessage {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    /// Declare this connection a link from the server named `name`, which
+    /// forwards its panes' messages with their [`Origin`]. Accepted only from
+    /// a relay under a root-owned sshd; a refusal is an [`ServerMessage::Error`]
+    /// and the connection stays an ordinary one. `ping_ms` is how often the
+    /// declaring server pings.
+    PeerLink {
+        name: String,
+        #[serde(default = "default_ping_ms")]
+        ping_ms: u64,
+    },
+    /// Answered with [`ServerMessage::Pong`] carrying the same `nonce`. Since
+    /// a connection is answered in order, a pong also says that every request
+    /// sent before the ping has been answered.
+    Ping { nonce: u64 },
+}
+
+fn default_ping_ms() -> u64 {
+    15_000
+}
+
+/// Who sent a message, as the server that forwarded it saw them. The
+/// receiving server stores the sender under the name the LINK declared,
+/// never `host`, which it only checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    pub host: String,
+    pub pane_id: PaneId,
+    pub name: Option<String>,
+    pub session: String,
+    /// The forwarding server's id for the message, which a reply names in
+    /// its `reply_to`.
+    pub id: MsgId,
 }
 
 // ---------------------------------------------------------------------------
@@ -856,6 +900,9 @@ pub enum ServerMessage {
         message: String,
         #[serde(default)]
         code: Option<String>,
+        /// The `req` of the request this answers, when it carried one.
+        #[serde(default)]
+        req: Option<u64>,
     },
     /// Asynchronous session event notification.
     Event(SessionEvent),
@@ -912,6 +959,9 @@ pub enum ServerMessage {
         /// nothing was waited on.
         #[serde(default)]
         final_state: Option<AgentState>,
+        /// The `req` of the send this answers, when it carried one.
+        #[serde(default)]
+        req: Option<u64>,
     },
     /// The answer to a [`ClientMessage::MsgRead`]: the listed messages,
     /// oldest first.
@@ -940,6 +990,8 @@ pub enum ServerMessage {
         #[serde(default)]
         timed_out: bool,
     },
+    /// The answer to a [`ClientMessage::Ping`].
+    Pong { nonce: u64 },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -1270,12 +1322,17 @@ impl std::fmt::Display for Address {
 /// with `.` or `-`, so it cannot read as an option where it is printed into a
 /// command line. Checked on the server too, because the wire carries any string
 /// and a host is written to the log.
+///
+/// A host any of whose `-`/`_` parts is a reserved word is refused as a name
+/// is (see [`reserved_part`]): `From: user:%1` would read as a message from the
+/// user. Compared without case, because a host keeps its capitals.
 pub fn valid_host(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('.')
         && !s.starts_with('-')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && reserved_part(&s.to_ascii_lowercase()).is_none()
 }
 
 /// A character that is not shown itself but can change how the text around
@@ -1480,7 +1537,22 @@ impl ServerMessage {
         ServerMessage::Error {
             message: message.into(),
             code: Some(code.to_string()),
+            req: None,
         }
+    }
+
+    /// This answer to the request `req` named, echoing it so a link carrying
+    /// many requests can match the answer to its request. `None` leaves the
+    /// answer as it is, which is every answer to a local client.
+    pub fn with_req(mut self, req: Option<u64>) -> Self {
+        if let Some(req) = req {
+            if let ServerMessage::MsgSent { req: slot, .. }
+            | ServerMessage::Error { req: slot, .. } = &mut self
+            {
+                *slot = Some(req);
+            }
+        }
+        self
     }
 
     /// The variant's name, for a log line or an error about a reply nobody
@@ -1505,6 +1577,7 @@ impl ServerMessage {
             ServerMessage::AgentNamed { .. } => "AgentNamed",
             ServerMessage::AgentStatusList { .. } => "AgentStatusList",
             ServerMessage::AgentWaited { .. } => "AgentWaited",
+            ServerMessage::Pong { .. } => "Pong",
             ServerMessage::DirectoryListing { .. } => "DirectoryListing",
             ServerMessage::AgentList { .. } => "AgentList",
             ServerMessage::SessionTree { .. } => "SessionTree",
@@ -1546,6 +1619,7 @@ impl ServerMessage {
             | ServerMessage::AgentNamed { .. }
             | ServerMessage::AgentStatusList { .. }
             | ServerMessage::AgentWaited { .. }
+            | ServerMessage::Pong { .. }
             | ServerMessage::DirectoryListing { .. }
             | ServerMessage::SessionTree { .. }
             | ServerMessage::ViewCreated { .. } => false,
@@ -1606,6 +1680,10 @@ pub struct Message {
     pub expires_ms: u64,
     pub state: MsgState,
     pub reply_to: Option<MsgRef>,
+    /// For a message that came over a link: the forwarding server, as this
+    /// server names that link, and its id for the message.
+    #[serde(default)]
+    pub origin: Option<MsgRef>,
 }
 
 /// What a client needs to name a pane with its own `[appearance] pane_title`
@@ -2516,6 +2594,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_reserved_word_as_any_part_is_not_a_valid_host() {
+        for host in [
+            "user",
+            "system-reminder",
+            "my_claude",
+            "operator_2",
+            "developer",
+            "USER",
+        ] {
+            assert!(!valid_host(host), "{host}");
+        }
+        for host in [
+            "users",
+            "userland",
+            "claudette",
+            "lab-2",
+            "lab-2.local",
+            "mini",
+        ] {
+            assert!(valid_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn valid_name_and_valid_host_share_one_reserved_rule() {
+        for word in RESERVED_NAMES {
+            for spelled in [word.to_string(), format!("x-{word}"), format!("{word}_2")] {
+                assert!(!valid_name(&spelled) && !valid_host(&spelled), "{spelled}");
+                assert!(reserved_part(&spelled).is_some(), "{spelled}");
+            }
+        }
+    }
+
+    #[test]
     fn agent_entry_decodes_without_the_messaging_fields() {
         let entry: AgentEntry = serde_json::from_str(
             r#"{"pane_id":4,"session":"main","tab_index":0,"command":"claude","state":"Idle"}"#,
@@ -2740,7 +2852,7 @@ mod tests {
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&refused).unwrap()).unwrap();
         match back {
-            ServerMessage::Error { message, code } => {
+            ServerMessage::Error { message, code, .. } => {
                 assert_eq!(code.as_deref(), Some("no_such_target"));
                 assert_eq!(message, "no such target: %9");
             }
@@ -2784,6 +2896,7 @@ mod tests {
             }
         ));
         let sent = ServerMessage::MsgSent {
+            req: None,
             id: 1,
             to: Resolved {
                 host: None,
@@ -2820,6 +2933,7 @@ mod tests {
             }
         ));
         let waited = ServerMessage::MsgSent {
+            req: None,
             id: 3,
             to: Resolved {
                 host: None,
@@ -3023,6 +3137,7 @@ mod tests {
             },
         ] {
             let msg = Message {
+                origin: None,
                 id: 42,
                 from,
                 to: 7,
@@ -3057,6 +3172,7 @@ mod tests {
     #[test]
     fn round_trip_server_message() {
         let msg = ServerMessage::Error {
+            req: None,
             message: "not found".into(),
             code: None,
         };

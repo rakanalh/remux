@@ -154,7 +154,7 @@ pub(crate) async fn ask(msg: ClientMessage, deadline: Duration) -> Result<Server
         None => Err(CliError::Transport(
             "the server closed the connection".to_string(),
         )),
-        Some(ServerMessage::Error { message, code }) => Err(CliError::Refused {
+        Some(ServerMessage::Error { message, code, .. }) => Err(CliError::Refused {
             code: code.unwrap_or_else(|| "error".to_string()),
             message,
         }),

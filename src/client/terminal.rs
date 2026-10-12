@@ -9,7 +9,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 use crate::config::theme::TabStyle;
 use crate::config::Config;
@@ -129,18 +129,16 @@ impl RemuxClient {
         );
         // stderr is inherited so ssh host-key / password prompts are visible;
         // this runs before the terminal enters raw mode.
-        let mut cmd = Command::new("ssh");
-        if let Some(port) = port {
-            cmd.arg("-p").arg(port.to_string());
-        }
-        if let Some(identity) = identity {
-            cmd.arg("-i").arg(identity);
-        }
-        cmd.args(extra_args)
-            .arg(dest)
-            .arg(remux_path)
-            .arg("relay")
-            .stdin(Stdio::piped())
+        let remote = crate::config::RemoteConfig {
+            ssh: dest.to_string(),
+            port,
+            identity: identity.map(str::to_string),
+            remux_path: remux_path.to_string(),
+            extra_args: extra_args.to_vec(),
+            ..crate::config::RemoteConfig::default()
+        };
+        let mut cmd = remote.ssh_command(false);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
@@ -300,7 +298,7 @@ impl Look {
 /// message helpers, before any `ClientMessage`/`ServerMessage` traffic. On
 /// success returns the server's reported `remux_version` so callers can detect
 /// build skew against this binary's own [`crate::protocol::build_version`].
-async fn handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<String>
+pub(crate) async fn handshake<R, W>(reader: &mut R, writer: &mut W) -> Result<String>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -372,12 +370,15 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             defer,
             timeout_ms,
             wait,
+            origin,
+            req,
         } => format!(
             "MsgSend(to={:?}, deliver={deliver:?}, {} bytes, reply_to={:?}, pane_hint={pane_hint:?}, \
-             defer={defer}, timeout={timeout_ms:?}, wait={wait})",
+             defer={defer}, timeout={timeout_ms:?}, wait={wait}, origin={:?}, req={req:?})",
             to.to_string(),
             body.len(),
-            reply_to.as_ref().map(|r| r.id)
+            reply_to.as_ref().map(|r| r.id),
+            origin.as_ref().map(|o| format!("{}:%{}", o.host, o.pane_id))
         ),
         ClientMessage::MsgAck {
             pane,
@@ -483,6 +484,8 @@ mod tests {
     #[test]
     fn msg_send_names_the_target_but_not_the_body() {
         let s = client_message_summary(&ClientMessage::MsgSend {
+            origin: None,
+            req: None,
             to: "beta".parse().unwrap(),
             body: "the token is hunter2-BODY".to_string(),
             deliver: crate::protocol::Deliver::Auto,

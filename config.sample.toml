@@ -1082,6 +1082,8 @@
 #                      (`message_too_large`).
 # rate_per_10s         sends one pane may make in any 10 seconds
 #                      (`rate_limited`), so a looping agent cannot flood a peer.
+# link_rate_per_10s    messages one other server may deliver here in any 10
+#                      seconds, whatever pane it says each is from.
 # persist              keep mailboxes and names across `remux restart`, in
 #                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
 #                      bodies are then stored on disk; `false` keeps them in
@@ -1109,6 +1111,7 @@
 # mailbox_max_bytes = 4194304
 # max_body_bytes = 65536
 # rate_per_10s = 20
+# link_rate_per_10s = 60
 # persist = true
 # typing_guard_ms = 3000
 # typing_guard_unattended_ms = 500
@@ -1117,6 +1120,21 @@
 # submit_queue_len = 8
 # stall_ms = 5000
 # settle_ms = 1000
+#
+# This server's name on the servers it sends to (their `From: laptop:%1`),
+# which must be a valid host name. The machine's hostname when unset:
+# host_name = "laptop"
+#
+# How the server dials a `[remotes.<name>]` to send to it (`remux msg send
+# mini:alpha`): ssh plus the handshake must finish in dial_ms (at most 10000),
+# a live link is to be pinged every ping_ms, and one idle for idle_ms closed.
+# This build does neither yet: the two are read, and ping_ms is told to the
+# far server, but the dialling side does not ping and nothing is closed idle.
+#
+# [messaging.links]
+# dial_ms = 10000
+# ping_ms = 15000
+# idle_ms = 300000
 #
 # How a message is TYPED into an agent's pane (`remux msg send --deliver
 # submit`, or `auto`, the default), one row per `[agents] commands` spelling.
@@ -1131,9 +1149,10 @@
 # while_working    "queue" types it anyway, "mailbox" (default) leaves it
 #                  for the agent's hook, "refuse" refuses `--deliver submit`.
 # envelope         open the text with a line naming the message and its
-#                  sender, "[remux message #7 from lead (%1); reply: ...]",
-#                  so the agent can tell another agent's message from its
-#                  user's (default true).
+#                  sender, "# [remux message #7 from lead (%1), mark ...;
+#                  reply: ...]", and close it with "# [end of remux message
+#                  #7, mark ...]", so the agent can tell another agent's
+#                  message from its user's (default true).
 #
 # The shipped rows:
 #
@@ -1168,6 +1187,16 @@
 #   extra_args  — extra ssh arguments placed before the destination (default: []).
 #   auto_connect — connect this remote automatically at client startup instead
 #                  of lazily on demand (default: false).
+#   inbound     — what the SERVER stores from this remote over a link it dialled
+#                 to send to it: "replies" (default) only answers to messages
+#                 sent from here over that link, "any" anything addressed to a
+#                 pane here, "off" nothing.
+#
+# To send messages to a remote (`remux msg send mini:alpha`), its key must be a
+# valid host name: no leading - or ., and none of user, system, claude, remux,
+# human, assistant, anthropic, operator or developer as a part between - and _.
+# A remote whose key is not can still be connected to; messaging refuses it,
+# and the logs name it at startup.
 #
 # [remotes.pi]
 # ssh = "pi@raspberrypi.local"

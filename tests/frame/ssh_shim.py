@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""The fake `ssh` for the remote-messaging harness (`msg_remote.py`).
+
+`SHIM` is written to `$SHIMDIR/ssh`, which is on server A's PATH, so A's
+daemon runs it where it would run ssh. It records how it was called, then
+plays the mode the harness chose in `$RMX_SHIM_MODE`:
+
+  relay    exec B's relay under B's four XDG variables, as sshd's login
+           environment on B would give it, so relay.log is B's
+  prompt   ssh asking for a passphrase under BatchMode: one stderr line, 255
+  hang     a dial that never answers (exec, so the recorded pid IS the sleep)
+  skew     a Welcome with protocol_version 16, then exit (this file, run as a
+           program on stdin/stdout)
+  oldpeer  a correct handshake, then exit on the first frame after it
+  eatsend  a correct handshake and peer link, then exit on the first send,
+           unanswered: the send was written and its outcome is unknown
+  mute     the same, but stay open and never answer the send
+
+Before the relay, the shim lists its own open descriptors to `$RMX_SHIM_FDS`:
+the relay inherits exactly these, and decision 71 says they are 0, 1 and 2.
+
+Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute`) it is the
+far side of the link for the modes that need no real server.
+"""
+import json
+import os
+import struct
+import sys
+
+SHIM = r"""#!/bin/sh
+# The fake ssh: records how it was called, then plays the mode the harness chose.
+echo "$$" >> "$RMX_SHIM_PIDS"; printf '%s\n' "$*" >> "$RMX_SHIM_ARGV"
+mode=$(cat "$RMX_SHIM_MODE" 2>/dev/null || echo relay)
+case "$mode" in
+  relay)   ls -l "/proc/$$/fd" > "$RMX_SHIM_FDS" 2>/dev/null || lsof -p "$$" > "$RMX_SHIM_FDS" 2>/dev/null
+           export XDG_RUNTIME_DIR="$RMX_B_RUN" XDG_STATE_HOME="$RMX_B_STATE" XDG_DATA_HOME="$RMX_B_DATA" XDG_CONFIG_HOME="$RMX_B_CONFIG"
+           exec "$RMX_BIN" relay ;;
+  prompt)  echo "Enter passphrase for key '/home/x/.ssh/id_ed25519':" >&2; exit 255 ;;
+  hang)    exec sleep 60 ;;
+  skew)    exec "$RMX_PY" "$RMX_SHIM_PY" skew ;;
+  oldpeer) exec "$RMX_PY" "$RMX_SHIM_PY" oldpeer ;;
+  eatsend) exec "$RMX_PY" "$RMX_SHIM_PY" eatsend ;;
+  mute)    exec "$RMX_PY" "$RMX_SHIM_PY" mute ;;
+esac
+"""
+
+
+def _read_frame(stream):
+    head = stream.read(4)
+    if len(head) < 4:
+        return None
+    (n,) = struct.unpack(">I", head)
+    return json.loads(stream.read(n))
+
+
+def _write_frame(stream, obj):
+    body = json.dumps(obj).encode()
+    stream.write(struct.pack(">I", len(body)) + body)
+    stream.flush()
+
+
+def main(mode):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from harness import PROTOCOL_VERSION  # noqa: E402
+
+    stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    if _read_frame(stdin) is None:
+        return 0
+    version = 16 if mode == "skew" else PROTOCOL_VERSION
+    _write_frame(stdout, {"protocol_version": version, "remux_version": f"shim-{mode}"})
+    if mode == "oldpeer":
+        _read_frame(stdin)
+    if mode in ("eatsend", "mute"):
+        # The far server answers a PeerLink only to refuse it, and the ping
+        # after it with a Pong, which is what tells the dialler the link is up.
+        while True:
+            frame = _read_frame(stdin)
+            if frame is None:
+                return 0
+            if "Ping" in frame:
+                _write_frame(stdout, {"Pong": {"nonce": frame["Ping"]["nonce"]}})
+            elif "MsgSend" in frame and mode == "eatsend":
+                return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))

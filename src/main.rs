@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod paths;
 mod protocol;
+mod relay;
 mod screen;
 mod server;
 
@@ -537,20 +538,16 @@ async fn main() -> Result<()> {
             let sock = tokio::net::UnixStream::connect(socket_path())
                 .await
                 .context("relay: connecting to local server socket")?;
-            let (mut srd, mut swr) = sock.into_split();
-            let mut stdin = tokio::io::stdin();
-            let mut stdout = tokio::io::stdout();
-
-            // Exit as soon as EITHER direction hits EOF.
-            tokio::select! {
-                r = tokio::io::copy(&mut stdin, &mut swr) => {
-                    log::debug!("relay: stdin->socket ended: {:?}", r);
-                }
-                r = tokio::io::copy(&mut srd, &mut stdout) => {
-                    log::debug!("relay: socket->stdout ended: {:?}", r);
-                }
-            }
+            let (srd, swr) = sock.into_split();
+            let end = relay::pump(tokio::io::stdin(), tokio::io::stdout(), srd, swr).await;
+            log::info!("{}", end.summary());
             log::info!("cmd: relay exiting");
+            // Exit now rather than return: the runtime would wait on the
+            // blocking stdin read, so a relay whose server went away would
+            // linger until ssh next wrote to it, and the server that dialled
+            // it would not learn the link was gone.
+            log::logger().flush();
+            std::process::exit(0);
         }
         Some(Commands::Kill { name }) => {
             log::debug!("cmd: kill session={name:?}");
@@ -630,6 +627,20 @@ async fn main() -> Result<()> {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
+/// `remux server`, as a client starts it, with no stdio. It never inherits
+/// `REMUX_TEST_PEER_ANCESTOR`: a pane process that sets it and then starts a
+/// server (a relay does, when none is running) would otherwise hand that
+/// server the peer-link test seam. Only a harness's own `remux server` sets it.
+fn server_command(exe: std::path::PathBuf) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("server")
+        .env_remove("REMUX_TEST_PEER_ANCESTOR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
 /// Ensure a server is running, starting one in the background if needed.
 async fn ensure_server_running() -> Result<()> {
     daemon::prepare_runtime_dir()?;
@@ -658,11 +669,7 @@ async fn ensure_server_running() -> Result<()> {
         "ensure_server_running: spawning server from {}",
         exe.display()
     );
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("server")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let mut cmd = server_command(exe);
 
     // Detach the server from the terminal that is spawning it. Null stdio LOOKS
     // like daemonizing and is not: without this the child inherits our process
@@ -7330,7 +7337,8 @@ async fn run_client_loop(
                     | Some(ServerMessage::MsgAcked { .. })
                     | Some(ServerMessage::AgentNamed { .. })
                     | Some(ServerMessage::AgentStatusList { .. })
-                    | Some(ServerMessage::AgentWaited { .. }) => {
+                    | Some(ServerMessage::AgentWaited { .. })
+                    | Some(ServerMessage::Pong { .. }) => {
                         log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
@@ -7928,6 +7936,19 @@ async fn run_client_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_server_a_client_starts_never_inherits_the_peer_seam() {
+        let cmd = super::server_command("remux".into());
+        assert!(cmd
+            .get_envs()
+            .any(|(key, value)| key == "REMUX_TEST_PEER_ANCESTOR" && value.is_none()));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            ["server"],
+            "it is still `remux server`"
+        );
+    }
+
     use super::*;
 
     fn local(name: &str) -> (ConnId, String) {

@@ -55,7 +55,7 @@ EOF
 
 An address is `%<pane_id>` or a name: `%4`, `alpha`. A name is what `agent name` set: one per pane, unique on a server, matching `[a-z][a-z0-9_-]{0,31}`. A name is refused `bad_name` when it, or any part of it between `-` and `_`, is one of `user`, `system`, `claude`, `remux`, `human`, `assistant`, `anthropic`, `operator` or `developer`. So `user` and `system-reminder` are refused, and `users` is fine. Mail "from user" would read like an instruction from your user, and it never is one.
 
-An address can carry a host, `mini:alpha` or `mini:%7`. Sending to another machine is not routed yet: such a send is refused `route_unavailable`.
+An address can carry a host, `mini:alpha` or `mini:%7`, where `mini` names a `[remotes.mini]` entry in your server's config. Your server forwards the message over ssh to the server on that machine, which stores it in the target's mailbox there. Only mailbox delivery crosses machines for now, so say so: `remux msg send mini:%7 --stdin --deliver mailbox`. A send to another machine with the default `auto`, or with `submit`, is refused `route_unavailable`, as is one to a host with no `[remotes]` entry or whose link does not come up. When the other machine's server refuses it, the answer is `remote_refused` with that server's own code.
 
 ## Sending
 
@@ -182,7 +182,9 @@ Under `auto`, a code from the agent's side (`agent_working`, `agent_blocked`, `h
 | `read_by_another_program` | The agent stopped reading after the body was typed. Another program, the shell if the agent exited, may have your text. Stored. | **Do not retry.** Tell the person at that pane to clear the prompt with Ctrl-U before pressing Enter. |
 | `busy` | `agent wait` is refused: too many callers already wait on agents. | Try again later. |
 | `timeout` | The command got no answer in time. For a typed send the outcome is UNKNOWN: the server may still type it. | Do not send it again on your own: a retry can duplicate it. Tell your user; with their go-ahead, `remux msg read --pane %4 --all` shows its state. |
-| `route_unavailable` | A target on another machine. | Not routed yet. |
+| `remote_refused` | The other machine's server refused the message, with its own code and reason after it, such as `mini refused: mailbox_full: ...`. Nothing was stored there. | Read the far code as you would the same code here. |
+| `route_unavailable` | A target on another machine that could not be reached: no `[remotes]` entry names it, the link to it did not come up, or the send asked for `auto` or `submit`, which do not cross machines yet. Nothing was sent. | For `auto` or `submit`, send it again with `--deliver mailbox`; otherwise tell your user, the message says why. |
+| `forward_unknown` | The message went to another machine and no answer came back. The outcome is UNKNOWN: it may be stored there. | Do not send it again on your own: a retry can duplicate it. Tell your user; with their go-ahead, `remux msg read --pane %4 --all` on that machine shows whether it arrived. |
 | `no_server` | No remux server is running here. | You are not in a remux pane. |
 | `bad_request` | Contradictory fields, such as an ack with ids and `--all`. | Fix the invocation. |
 | `transport` | The connection to the server broke. | Retry once; for a typed send, check the mailbox first. |

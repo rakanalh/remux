@@ -69,6 +69,52 @@ pub struct RemoteConfig {
     /// When true, connect this remote automatically at client startup (instead
     /// of lazily on demand).
     pub auto_connect: bool,
+    /// What the SERVER accepts back over a link it dialled to this remote.
+    /// The client ignores it.
+    pub inbound: Inbound,
+}
+
+/// What a server stores from a remote it dialled. Dialling a remote must not
+/// let that remote instruct every local agent through their mailboxes.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Inbound {
+    /// Nothing.
+    Off,
+    /// Only answers to messages a pane here sent over that link.
+    #[default]
+    Replies,
+    /// Anything addressed to a pane here.
+    Any,
+    /// A spelling this build does not know, reported at startup and read as
+    /// `replies`.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RemoteConfig {
+    /// The `ssh` argv that runs `remux relay` on this remote, with no stdio
+    /// set. `batch` adds `-o BatchMode=yes` first, for a dial nobody can
+    /// answer a prompt for: the server's own. `--` ends the options, so a
+    /// destination can never read as one.
+    pub fn ssh_command(&self, batch: bool) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("ssh");
+        if batch {
+            cmd.arg("-o").arg("BatchMode=yes");
+        }
+        if let Some(port) = self.port {
+            cmd.arg("-p").arg(port.to_string());
+        }
+        if let Some(identity) = &self.identity {
+            cmd.arg("-i").arg(identity);
+        }
+        cmd.args(&self.extra_args)
+            .arg("--")
+            .arg(&self.ssh)
+            .arg(&self.remux_path)
+            .arg("relay");
+        cmd
+    }
 }
 
 impl Default for RemoteConfig {
@@ -80,6 +126,7 @@ impl Default for RemoteConfig {
             remux_path: "remux".to_string(),
             extra_args: Vec::new(),
             auto_connect: false,
+            inbound: Inbound::Replies,
         }
     }
 }
@@ -352,7 +399,16 @@ impl Config {
         }
 
         let contents = std::fs::read_to_string(&config_path)?;
-        let config: Config = toml::from_str(&contents)?;
+        Self::parse(&contents)
+    }
+
+    /// A config file's contents as [`Self::load`] reads them, each problem
+    /// logged.
+    pub fn parse(contents: &str) -> anyhow::Result<Self> {
+        let mut config: Config = toml::from_str(contents)?;
+        for problem in config.check_remotes() {
+            log::warn!("{problem}");
+        }
         config.warn_unknown_pane_title_placeholders();
         for problem in config.messaging.problems() {
             log::warn!("{problem}");
@@ -527,6 +583,32 @@ known ones are {:?}",
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+impl Config {
+    /// Report every `[remotes.<key>]` whose key could not be a host, and an
+    /// `inbound` this build does not know, which reads as `replies`. Such a
+    /// remote is KEPT: the client connects to it like any other, and only
+    /// messaging refuses it, since a remote named `user` would label its mail
+    /// `From: user:%1`. It is named here rather than left to fail on first use.
+    pub fn check_remotes(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (key, remote) in &mut self.remotes {
+            if !crate::protocol::valid_host(key) {
+                out.push(format!(
+                    "[remotes.{key}] is not a valid host name for messaging (a reserved word, or a leading - or .): it can be connected to, but not sent to"
+                ));
+            }
+            if remote.inbound == Inbound::Unknown {
+                out.push(format!(
+                    "[remotes.{key}] inbound is not \"off\", \"replies\" or \"any\"; using \"replies\""
+                ));
+                remote.inbound = Inbound::Replies;
+            }
+        }
+        out.sort();
+        out
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -816,6 +898,83 @@ mod tests {
         // remux_path defaults to "remux" when omitted.
         assert_eq!(server.remux_path, "remux");
         assert_eq!(server.extra_args, vec!["-o", "StrictHostKeyChecking=no"]);
+    }
+
+    #[test]
+    fn ssh_command_prepends_batch_mode_puts_dashdash_before_the_destination_and_matches_connect_ssh(
+    ) {
+        let remote = RemoteConfig {
+            ssh: "user@host".into(),
+            port: Some(2222),
+            identity: Some("~/.ssh/k".into()),
+            remux_path: "/opt/remux".into(),
+            extra_args: vec!["-o".into(), "Foo=bar".into()],
+            ..RemoteConfig::default()
+        };
+        let argv = |cmd: tokio::process::Command| -> Vec<String> {
+            cmd.as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let client = argv(remote.ssh_command(false));
+        assert_eq!(
+            client,
+            [
+                "-p",
+                "2222",
+                "-i",
+                "~/.ssh/k",
+                "-o",
+                "Foo=bar",
+                "--",
+                "user@host",
+                "/opt/remux",
+                "relay"
+            ]
+        );
+        let server = argv(remote.ssh_command(true));
+        assert_eq!(server[..2], ["-o", "BatchMode=yes"]);
+        assert_eq!(
+            server[2..],
+            client[..],
+            "the server's argv is the client's after BatchMode"
+        );
+        assert_eq!(remote.ssh_command(true).as_std().get_program(), "ssh");
+    }
+
+    #[test]
+    fn inbound_defaults_to_replies() {
+        let config: Config = toml::from_str("[remotes.pi]\nssh = \"pi\"").unwrap();
+        assert_eq!(config.remotes["pi"].inbound, Inbound::Replies);
+        let mut odd: Config =
+            toml::from_str("[remotes.pi]\nssh = \"pi\"\ninbound = \"all\"").unwrap();
+        assert_eq!(odd.remotes["pi"].inbound, Inbound::Unknown);
+        assert_eq!(odd.check_remotes().len(), 1);
+        assert_eq!(odd.remotes["pi"].inbound, Inbound::Replies);
+    }
+
+    #[test]
+    fn a_loaded_config_keeps_a_remote_whose_name_messaging_refuses() {
+        let config = Config::parse("[remotes.claude-box]\nssh = \"c\"").unwrap();
+        assert_eq!(config.remotes["claude-box"].ssh, "c");
+    }
+
+    #[test]
+    fn a_remote_named_like_a_reserved_word_is_reported_by_name_and_kept() {
+        let mut config: Config = toml::from_str(
+            "[remotes.claude-box]\nssh = \"c\"\n[remotes.remux-dev]\nssh = \"r\"\n[remotes.mini]\nssh = \"m\"",
+        )
+        .unwrap();
+        let problems = config.check_remotes();
+        assert!(
+            problems.iter().any(|p| p.contains("[remotes.claude-box]"))
+                && problems.iter().any(|p| p.contains("[remotes.remux-dev]")),
+            "{problems:?}"
+        );
+        for key in ["claude-box", "remux-dev", "mini"] {
+            assert!(config.remotes.contains_key(key), "{key} was dropped");
+        }
     }
 
     #[test]

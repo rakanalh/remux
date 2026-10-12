@@ -490,6 +490,7 @@ mod tests {
 
     fn message(id: u64, from: Sender, body: &str) -> Message {
         Message {
+            origin: None,
             id,
             from,
             to: 2,

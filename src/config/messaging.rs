@@ -19,6 +19,10 @@ pub struct MessagingConfig {
     pub mailbox_max_bytes: usize,
     pub max_body_bytes: usize,
     pub rate_per_10s: u32,
+    /// Messages one server link may deliver here in any 10 seconds, whatever
+    /// pane each names: a peer that rotates its sender's pane id is held by
+    /// this rather than by the per-pane rate.
+    pub link_rate_per_10s: u32,
     /// `false` keeps mailboxes and names in memory only, so they do not
     /// survive `remux restart`.
     pub persist: bool,
@@ -41,7 +45,50 @@ pub struct MessagingConfig {
     /// How to type into each agent, by its `[agents] commands` spelling.
     /// Merged field by field over [`shipped_rows`].
     pub submit: BTreeMap<String, SubmitRow>,
+    /// This server's name to the servers it sends to: their `From:
+    /// <host_name>:%N`. `None` is the machine's hostname, read at use, never
+    /// stored here, so the sample block stays the defaults on every machine.
+    pub host_name: Option<String>,
+    /// How the server dials the remotes it sends to.
+    pub links: LinksConfig,
 }
+
+/// `[messaging.links]`: the server's own connections to `[remotes]`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LinksConfig {
+    /// How long a dial (ssh plus the handshake) may take.
+    pub dial_ms: u64,
+    /// How often a live link is pinged.
+    pub ping_ms: u64,
+    /// A link with nothing in flight and no message for this long is closed.
+    pub idle_ms: u64,
+}
+
+impl Default for LinksConfig {
+    fn default() -> Self {
+        Self {
+            dial_ms: 10_000,
+            ping_ms: 15_000,
+            idle_ms: 300_000,
+        }
+    }
+}
+
+impl LinksConfig {
+    /// How long a dial may take: `dial_ms` capped at the server's dial
+    /// budget, and the default for a zero, which would fail every dial.
+    pub fn dial(&self) -> std::time::Duration {
+        let ms = match self.dial_ms {
+            0 => Self::default().dial_ms,
+            ms => ms,
+        };
+        std::time::Duration::from_millis(ms.min(crate::server::daemon::LINK_DIAL_BUDGET_MS))
+    }
+}
+
+/// Below this a ping is noise; only a harness wants it.
+pub const MIN_PING_MS: u64 = 1_000;
 
 /// Whether a typed message is wrapped in bracketed paste.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -161,6 +208,7 @@ impl Default for MessagingConfig {
             mailbox_max_bytes: 4 * 1024 * 1024,
             max_body_bytes: 64 * 1024,
             rate_per_10s: 20,
+            link_rate_per_10s: 60,
             persist: true,
             typing_guard_ms: 3000,
             typing_guard_unattended_ms: 500,
@@ -170,6 +218,8 @@ impl Default for MessagingConfig {
             stall_ms: 5000,
             settle_ms: 1000,
             submit: BTreeMap::new(),
+            host_name: None,
+            links: LinksConfig::default(),
         }
     }
 }
@@ -223,6 +273,39 @@ impl MessagingConfig {
         }
     }
 
+    /// The per-link rate, a zero falling back to the default.
+    pub fn link_rate_per_10s(&self) -> u32 {
+        if self.link_rate_per_10s == 0 {
+            Self::default().link_rate_per_10s
+        } else {
+            self.link_rate_per_10s
+        }
+    }
+
+    /// The name this server gives itself on a link: `host_name` when it is a
+    /// valid host, else the machine's hostname, else `localhost`.
+    pub fn host_name(&self) -> String {
+        self.host_name
+            .clone()
+            .filter(|name| crate::protocol::valid_host(name))
+            .or_else(hostname)
+            .unwrap_or_else(|| "localhost".to_string())
+    }
+
+    /// The warning for a server that calls itself `localhost` because no
+    /// `host_name` is set and the machine's hostname cannot be a host (such
+    /// as `claude-dev`): every peer would see the same name.
+    pub fn host_name_warning(&self) -> Option<String> {
+        if self
+            .host_name
+            .as_deref()
+            .is_some_and(crate::protocol::valid_host)
+        {
+            return None;
+        }
+        localhost_because(raw_hostname().as_deref())
+    }
+
     /// The submit queue's length, a zero falling back to the default.
     pub fn submit_queue_len(&self) -> usize {
         if self.submit_queue_len == 0 {
@@ -253,6 +336,11 @@ impl MessagingConfig {
                 self.rate_per_10s as usize,
                 default.rate_per_10s as usize,
             ),
+            (
+                "link_rate_per_10s",
+                self.link_rate_per_10s as usize,
+                default.link_rate_per_10s as usize,
+            ),
         ] {
             if value == 0 {
                 out.push(format!(
@@ -279,6 +367,35 @@ impl MessagingConfig {
                 Self::default().submit_queue_len
             ));
         }
+        if let Some(name) = self
+            .host_name
+            .as_deref()
+            .filter(|name| !crate::protocol::valid_host(name))
+        {
+            out.push(format!(
+                "[messaging] host_name = {name:?} is not a valid host name; using {:?}",
+                self.host_name()
+            ));
+        }
+        let budget = crate::server::daemon::LINK_DIAL_BUDGET_MS;
+        if self.links.dial_ms == 0 {
+            out.push(format!(
+                "[messaging.links] dial_ms = 0 would fail every dial; using {}",
+                LinksConfig::default().dial_ms
+            ));
+        }
+        if self.links.dial_ms > budget {
+            out.push(format!(
+                "[messaging.links] dial_ms = {} is capped at {budget}",
+                self.links.dial_ms
+            ));
+        }
+        if self.links.ping_ms < MIN_PING_MS {
+            out.push(format!(
+                "[messaging.links] ping_ms = {} is under {MIN_PING_MS}",
+                self.links.ping_ms
+            ));
+        }
         for (command, row) in &self.submit {
             if let Some(enter) = row.enter.as_deref().filter(|e| !valid_enter(e)) {
                 out.push(format!(
@@ -301,10 +418,139 @@ impl MessagingConfig {
     }
 }
 
+/// The machine's hostname, when it is one a link can carry.
+fn hostname() -> Option<String> {
+    raw_hostname().filter(|name| crate::protocol::valid_host(name))
+}
+
+/// Why a server with no valid `host_name` calls itself `localhost`, given
+/// the machine's hostname: `None` when the hostname is a valid host, and so
+/// is used.
+fn localhost_because(raw: Option<&str>) -> Option<String> {
+    match raw {
+        Some(name) if crate::protocol::valid_host(name) => None,
+        Some(name) => Some(format!(
+            "this machine's hostname {} is not a valid host name, so this server calls itself \"localhost\" on its links; set [messaging] host_name",
+            crate::client::cli_common::escape(name)
+        )),
+        None => Some(
+            "this machine's hostname could not be read, so this server calls itself \"localhost\" on its links; set [messaging] host_name"
+                .to_string(),
+        ),
+    }
+}
+
+fn raw_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes.
+    let got = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if got != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn a_hostname_that_cannot_be_a_host_is_why_the_server_is_localhost() {
+        assert_eq!(localhost_because(Some("fedoradesktop")), None);
+        let why = localhost_because(Some("claude-dev")).unwrap();
+        assert!(
+            why.contains("claude-dev") && why.contains("localhost"),
+            "{why}"
+        );
+        assert!(localhost_because(None)
+            .unwrap()
+            .contains("could not be read"));
+        let named = parse("[messaging]\nhost_name = \"laptop\"");
+        assert_eq!(
+            named.host_name_warning(),
+            None,
+            "a valid host_name needs no hostname"
+        );
+    }
+
+    #[test]
+    fn host_name_none_means_the_hostname() {
+        let m = parse("");
+        assert_eq!(m.host_name, None);
+        assert_eq!(
+            m.host_name(),
+            hostname().unwrap_or_else(|| "localhost".into())
+        );
+        assert_eq!(
+            parse("[messaging]\nhost_name = \"laptop\"").host_name(),
+            "laptop"
+        );
+    }
+
+    #[test]
+    fn a_bad_host_name_is_reported_and_replaced() {
+        for bad in ["-oProxyCommand=x", "user", "my_claude", ""] {
+            let m = parse(&format!("[messaging]\nhost_name = {bad:?}"));
+            assert_ne!(m.host_name(), bad);
+            assert!(
+                m.problems().iter().any(|p| p.contains("host_name")),
+                "{bad:?}: {:?}",
+                m.problems()
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_dial_is_reported_and_dials_with_the_default() {
+        let zero = parse("[messaging.links]\ndial_ms = 0");
+        assert_eq!(zero.links.dial(), LinksConfig::default().dial());
+        assert!(
+            zero.problems().iter().any(|p| p.contains("dial_ms = 0")),
+            "{:?}",
+            zero.problems()
+        );
+        let over = parse("[messaging.links]\ndial_ms = 999999");
+        assert_eq!(
+            over.links.dial(),
+            std::time::Duration::from_millis(crate::server::daemon::LINK_DIAL_BUDGET_MS)
+        );
+    }
+
+    #[test]
+    fn a_dial_over_the_servers_budget_is_reported_capped() {
+        let budget = crate::server::daemon::LINK_DIAL_BUDGET_MS;
+        let at = parse(&format!("[messaging.links]\ndial_ms = {budget}"));
+        assert!(at.problems().is_empty(), "{:?}", at.problems());
+        let over = parse(&format!("[messaging.links]\ndial_ms = {}", budget + 1));
+        assert_eq!(
+            over.problems(),
+            vec![format!(
+                "[messaging.links] dial_ms = {} is capped at {budget}",
+                budget + 1
+            )]
+        );
+    }
+
+    /// The `[messaging.links]` block in `config.sample.toml`, uncommented, is
+    /// the default.
+    #[test]
+    fn the_sample_links_block_is_the_default() {
+        let sample = include_str!("../../config.sample.toml");
+        let block: String = sample
+            .lines()
+            .skip_while(|l| *l != "# [messaging.links]")
+            .take_while(|l| l.starts_with("# "))
+            .map(|l| format!("{}\n", &l[2..]))
+            .collect();
+        assert!(
+            block.starts_with("[messaging.links]\n"),
+            "no [messaging.links] block"
+        );
+        assert_eq!(block.lines().count(), 4, "{block}");
+        assert_eq!(parse(&block).links, LinksConfig::default());
+    }
 
     fn parse(s: &str) -> MessagingConfig {
         toml::from_str::<Config>(s).unwrap().messaging
@@ -352,8 +598,8 @@ mod tests {
         assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
         assert_eq!(
             block.lines().count(),
-            14,
-            "the block is not all thirteen keys"
+            15,
+            "the block is not all fourteen keys"
         );
         assert_eq!(parse(&block), MessagingConfig::default());
     }

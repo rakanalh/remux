@@ -8,6 +8,25 @@
 //!
 //! Attribution is a pure function over [`ProcTable`], so each ruling is a unit
 //! test with an injected table. The platform adapters only read one process.
+//!
+//! [`peer_link_check`] decides the other question a connection can ask: may
+//! it declare itself a link from another server, whose messages arrive with a
+//! sender that the link vouches for. Only a relay that sshd started may: its
+//! strict ancestry reaches a root-owned `sshd` (or `sshd-session`, OpenSSH 9.8
+//! and later) before it reaches this server or init. Only root can give a
+//! process such an ancestor, a pane's process always passes this server
+//! first, and a double fork reparents to init, not to sshd. Its residuals:
+//! (1) a process of the user that holds the user's ssh key can run `ssh
+//! localhost remux relay` and IS under a root sshd: the same-uid boundary,
+//! bounded by the dialling side's `inbound` policy and this side's per-link
+//! rate. (2) A machine whose sshd does not run as root refuses every link,
+//! by design, with no override. (3) A `ForceCommand` or `~/.ssh/rc` wrapper
+//! that daemonises the relay is refused. (4) On macOS the check reads a root
+//! process's uid, parent and name as the user, the one read attribution
+//! never needed. (5) On Linux with `/proc` mounted `hidepid=1` or `hidepid=2`
+//! the user cannot read root's sshd there, so the walk finds no readable
+//! ancestor and every link is refused: it fails closed, and remote messaging
+//! needs a `/proc` the user can see root's processes in.
 
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -72,6 +91,150 @@ pub struct ProcInfo {
 pub trait ProcTable {
     /// `None` when the process does not exist or cannot be read.
     fn info(&self, pid: i32) -> Option<ProcInfo>;
+
+    /// Who owns `pid` and its short name, for [`peer_link_check`] alone. A
+    /// separate read from [`ProcTable::info`], which every send makes, so a
+    /// send does not pay for it. `None` when it cannot be read.
+    fn owner(&self, pid: i32) -> Option<Owner> {
+        let _ = pid;
+        None
+    }
+}
+
+/// A process's real uid and its `comm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    pub uid: u32,
+    pub comm: String,
+}
+
+/// Why a connection may not declare itself a peer link.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerRefusal {
+    /// The peer is attributed to a pane.
+    IsPane,
+    /// The walk ended without a root-owned sshd: `ended` says where.
+    NotUnderSshd { ended: &'static str },
+    /// The walk reached this server: the peer descends from it, as every
+    /// pane's process does.
+    DescendsFromServer,
+    /// An ancestor could not be read, or the tree changed during the walk.
+    AncestorUnreadable,
+    /// Attribution could not say the peer is outside every pane.
+    Unverified(Unverified),
+}
+
+impl PeerRefusal {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            PeerRefusal::IsPane => "a pane cannot be a peer link",
+            PeerRefusal::NotUnderSshd { .. } => "not a relay under sshd",
+            PeerRefusal::DescendsFromServer => "relay descends from this server",
+            PeerRefusal::AncestorUnreadable => "ancestor unreadable",
+            PeerRefusal::Unverified(why) => why.reason(),
+        }
+    }
+
+    /// Where the walk stopped, for the log.
+    pub fn ended(&self) -> &'static str {
+        match self {
+            PeerRefusal::NotUnderSshd { ended } => ended,
+            PeerRefusal::DescendsFromServer => "reached this server",
+            PeerRefusal::AncestorUnreadable => "an ancestor could not be read",
+            PeerRefusal::IsPane => "the peer is in a pane",
+            PeerRefusal::Unverified(_) => "attribution failed",
+        }
+    }
+}
+
+/// Whether `owner` is the sshd that runs a login: real uid 0, and named
+/// `sshd`, or `sshd-session` since OpenSSH 9.8 split the per-connection
+/// monitor out under that name.
+fn is_root_sshd(owner: &Owner) -> bool {
+    owner.uid == 0 && matches!(owner.comm.as_str(), "sshd" | "sshd-session")
+}
+
+/// Whether the process `peer` may declare a peer link (see the module doc).
+/// `seam` is a test pid that satisfies the per-ancestor predicate as a root
+/// sshd would; nothing else about the walk changes for it. Returns the pid of
+/// the ancestor that satisfied it.
+pub fn peer_link_check(
+    peer: i32,
+    server_pid: i32,
+    seam: Option<i32>,
+    procs: &ProcIndex,
+    table: &impl ProcTable,
+) -> Result<i32, PeerRefusal> {
+    match attribute(Some(peer), procs, table) {
+        Ok(_) => return Err(PeerRefusal::IsPane),
+        Err(Unverified::NoPaneAncestor) => {}
+        Err(other) => return Err(PeerRefusal::Unverified(other)),
+    }
+    let mut current = table.info(peer).ok_or(PeerRefusal::AncestorUnreadable)?;
+    // Strict ancestors only: the peer itself is never the sshd, whatever it
+    // calls itself.
+    let mut child = peer;
+    let mut pid = current.ppid;
+    for _ in 0..MAX_GENERATIONS {
+        if pid <= 1 {
+            return Err(PeerRefusal::NotUnderSshd {
+                ended: "reached init",
+            });
+        }
+        if pid == server_pid {
+            return Err(PeerRefusal::DescendsFromServer);
+        }
+        let accepted = seam == Some(pid) || {
+            let owner = table.owner(pid).ok_or(PeerRefusal::AncestorUnreadable)?;
+            is_root_sshd(&owner)
+        };
+        if accepted {
+            return pin_ancestor(pid, child, &current, table).map(|()| pid);
+        }
+        let above = table.info(pid).ok_or(PeerRefusal::AncestorUnreadable)?;
+        if above.start > current.start {
+            return Err(PeerRefusal::AncestorUnreadable);
+        }
+        child = pid;
+        current = above;
+        pid = current.ppid;
+    }
+    Err(PeerRefusal::NotUnderSshd {
+        ended: "the chain is longer than 64 generations",
+    })
+}
+
+/// Whether the ancestor `pid`, accepted on its owner, is still the process
+/// the walk reached from `child` (read as `child_info`): it started no later
+/// than `child`, and `child`'s parent is still `pid`. A pid freed and reused
+/// between the reads fails one or the other.
+fn pin_ancestor(
+    pid: i32,
+    child: i32,
+    child_info: &ProcInfo,
+    table: &impl ProcTable,
+) -> Result<(), PeerRefusal> {
+    let accepted = table.info(pid).ok_or(PeerRefusal::AncestorUnreadable)?;
+    let parent_now = table
+        .info(child)
+        .ok_or(PeerRefusal::AncestorUnreadable)?
+        .ppid;
+    if accepted.start > child_info.start || parent_now != pid {
+        return Err(PeerRefusal::AncestorUnreadable);
+    }
+    Ok(())
+}
+
+/// The test seam, from its environment variable's value: a pid that
+/// [`peer_link_check`] counts as a root sshd. A release build ignores it.
+pub fn seam_from_env(value: Option<&str>) -> Option<i32> {
+    if cfg!(debug_assertions) {
+        value
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&pid| pid > 1)
+    } else {
+        None
+    }
 }
 
 /// Pane shell pid to the pane and its slave device.
@@ -578,6 +741,23 @@ impl ProcTable for Procfs {
             start: stat.starttime?,
         })
     }
+
+    // The uid comes from `status`, never from `exe`: reading `exe` of a
+    // root process is EACCES for anyone else, and would refuse every relay.
+    fn owner(&self, pid: i32) -> Option<Owner> {
+        if pid <= 0 {
+            return None;
+        }
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let open = stat.iter().position(|&b| b == b'(')?;
+        let close = stat.iter().rposition(|&b| b == b')')?;
+        let comm = String::from_utf8_lossy(stat.get(open + 1..close)?).into_owned();
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        Some(Owner {
+            uid: status_real_uid(&status)?,
+            comm,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -585,12 +765,109 @@ pub fn system_table() -> impl ProcTable {
     Procfs
 }
 
+/// The real uid (`Uid:`'s first field) from a `/proc/<pid>/status` text.
+#[cfg(target_os = "linux")]
+fn status_real_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// `proc_bsdinfo` has no session id, so on macOS the walk is the only path.
 ///
 /// `proc_pidinfo` returns the number of bytes it wrote, so a short answer is a
 /// failure rather than a half-filled struct.
+///
+/// XNU serves `PROC_PIDTBSDINFO` only for the caller's own processes (or to
+/// root): for another user's, a root `sshd` among them, it fails. A peer
+/// link's walk must read exactly those, so they are read through the two
+/// reads XNU serves for any process: `PROC_PIDT_SHORTBSDINFO` for the parent,
+/// real uid and name, and `sysctl(KERN_PROC_PID)` for the start time.
 #[cfg(target_os = "macos")]
 pub struct Libproc;
+
+/// `struct proc_bsdshortinfo` from XNU's `sys/proc_info.h`, which the `libc`
+/// this crate builds with does not declare.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcBsdShortInfo {
+    pbsi_pid: u32,
+    pbsi_ppid: u32,
+    pbsi_pgid: u32,
+    pbsi_status: u32,
+    pbsi_comm: [libc::c_char; 16],
+    pbsi_flags: u32,
+    pbsi_uid: libc::uid_t,
+    pbsi_gid: libc::gid_t,
+    pbsi_ruid: libc::uid_t,
+    pbsi_rgid: libc::gid_t,
+    pbsi_svuid: libc::uid_t,
+    pbsi_svgid: libc::gid_t,
+    pbsi_rfu: u32,
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+// XNU's struct is 64 bytes, and `proc_pidinfo` answers with exactly that many.
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
+
+#[cfg(target_os = "macos")]
+fn short_bsd_info(pid: i32) -> Option<ProcBsdShortInfo> {
+    // SAFETY: an all-zero `ProcBsdShortInfo` is valid: integers and bytes.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdShortInfo>() as libc::c_int;
+    // SAFETY: `info` is a writable `ProcBsdShortInfo` of `size` bytes.
+    let wrote = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (wrote == size).then_some(info)
+}
+
+/// When `pid` started, in microseconds of wall-clock time (the clock
+/// [`Libproc::info`] reports), from `sysctl(KERN_PROC_PID)`. `kinfo_proc`
+/// opens with `kp_proc.p_un.__p_starttime`, a `struct timeval` (an `i64` of
+/// seconds, then an `i32` of microseconds, little-endian on both macOS
+/// architectures), so only those first 16 bytes are read and the rest of the
+/// struct need not be declared.
+#[cfg(target_os = "macos")]
+fn start_time(pid: i32) -> Option<u64> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // Larger than `kinfo_proc` (648 bytes on 64-bit), 8-byte aligned.
+    let mut buf = [0u64; 128];
+    let mut len = std::mem::size_of_val(&buf);
+    // SAFETY: `mib` has 4 entries, `buf` is writable for `len` bytes, and
+    // `len` is updated to the bytes written.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // A pid that does not exist answers 0 with nothing written.
+    if rc != 0 || len < 16 {
+        return None;
+    }
+    let secs = buf[0];
+    let micros = buf[1] & 0xffff_ffff;
+    Some(secs.saturating_mul(1_000_000).saturating_add(micros))
+}
 
 #[cfg(target_os = "macos")]
 impl ProcTable for Libproc {
@@ -610,7 +887,16 @@ impl ProcTable for Libproc {
             )
         };
         if wrote != size {
-            return None;
+            // Another user's process: its parent and start, through the
+            // reads XNU serves for any process. No terminal, which only
+            // attribution reads, and attribution only walks the user's own.
+            let short = short_bsd_info(pid)?;
+            return Some(ProcInfo {
+                ppid: short.pbsi_ppid as i32,
+                sid: None,
+                tty: None,
+                start: start_time(pid)?,
+            });
         }
         // XNU reports "no controlling terminal" as NODEV, which is all ones,
         // not as 0.
@@ -624,6 +910,27 @@ impl ProcTable for Libproc {
                 .pbi_start_tvsec
                 .saturating_mul(1_000_000)
                 .saturating_add(info.pbi_start_tvusec),
+        })
+    }
+
+    // The short BSD info, which XNU serves for another user's process (a
+    // root sshd is one), unlike the full flavor `info` reads first. If a
+    // release stops serving it, every link is refused (fail closed); the
+    // macOS live run (P2's M8) is what checks it is served.
+    fn owner(&self, pid: i32) -> Option<Owner> {
+        if pid <= 0 {
+            return None;
+        }
+        let info = short_bsd_info(pid)?;
+        let comm: Vec<u8> = info
+            .pbsi_comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        Some(Owner {
+            uid: info.pbsi_ruid,
+            comm: String::from_utf8_lossy(&comm).into_owned(),
         })
     }
 }
@@ -660,6 +967,259 @@ mod tests {
         fn info(&self, pid: i32) -> Option<ProcInfo> {
             self.0.get(&pid).copied()
         }
+    }
+
+    /// A process table with owners, for [`peer_link_check`]: each entry is
+    /// `(pid, ppid, uid, comm)`, with no sid naming a pane.
+    struct Owned(HashMap<i32, (ProcInfo, Owner)>);
+
+    impl Owned {
+        fn new(entries: &[(i32, i32, u32, &str)]) -> Self {
+            Owned(
+                entries
+                    .iter()
+                    .map(|&(pid, ppid, uid, comm)| {
+                        (
+                            pid,
+                            (
+                                proc(ppid, Some(4242), None),
+                                Owner {
+                                    uid,
+                                    comm: comm.to_string(),
+                                },
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl ProcTable for Owned {
+        fn info(&self, pid: i32) -> Option<ProcInfo> {
+            self.0.get(&pid).map(|(info, _)| *info)
+        }
+        fn owner(&self, pid: i32) -> Option<Owner> {
+            self.0.get(&pid).map(|(_, owner)| owner.clone())
+        }
+    }
+
+    const SERVER: i32 = 50;
+    const USER: u32 = 1000;
+
+    fn no_panes() -> ProcIndex {
+        ProcIndex::new([])
+    }
+
+    #[test]
+    fn a_relay_under_a_root_sshd_is_a_peer() {
+        let t = Owned::new(&[
+            (700, 600, USER, "remux"),
+            (600, 500, 0, "sshd"),
+            (500, 1, 0, "sshd"),
+        ]);
+        assert_eq!(peer_link_check(700, SERVER, None, &no_panes(), &t), Ok(600));
+    }
+
+    /// `Owned`, with start times, and one pid that reads differently from its
+    /// `nth` read on: a tree that changes under the walk.
+    struct Shifting {
+        table: Owned,
+        starts: HashMap<i32, u64>,
+        change: Option<Change>,
+        reads: std::cell::RefCell<HashMap<i32, u32>>,
+    }
+
+    /// From the `nth` read of `pid` on, its parent or its start time.
+    struct Change {
+        pid: i32,
+        nth: u32,
+        ppid: Option<i32>,
+        start: Option<u64>,
+    }
+
+    impl ProcTable for Shifting {
+        fn info(&self, pid: i32) -> Option<ProcInfo> {
+            let mut info = self.table.info(pid)?;
+            info.start = self.starts.get(&pid).copied().unwrap_or(0);
+            let mut reads = self.reads.borrow_mut();
+            let n = reads.entry(pid).or_default();
+            *n += 1;
+            if let Some(change) = self.change.as_ref().filter(|c| c.pid == pid && *n >= c.nth) {
+                info.ppid = change.ppid.unwrap_or(info.ppid);
+                info.start = change.start.unwrap_or(info.start);
+            }
+            Some(info)
+        }
+        fn owner(&self, pid: i32) -> Option<Owner> {
+            self.table.owner(pid)
+        }
+    }
+
+    const STARTS: [(i32, u64); 3] = [(700, 30), (650, 20), (600, 10)];
+
+    fn shifting(change: Option<Change>) -> Shifting {
+        Shifting {
+            table: Owned::new(&[
+                (700, 650, USER, "remux"),
+                (650, 600, USER, "sshd-session"),
+                (600, 1, 0, "sshd-session"),
+            ]),
+            starts: STARTS.into_iter().collect(),
+            change,
+            reads: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_accepted_sshd_is_pinned_to_the_child_that_led_to_it() {
+        let fine = shifting(None);
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &fine),
+            Ok(600)
+        );
+        // The pin's reads are each pid's last in the unchanged tree; a change
+        // from there on happened after the walk accepted the sshd.
+        let last = |pid| fine.reads.borrow()[&pid];
+        // The sshd's pid was freed and reused by a process started later.
+        let reused = shifting(Some(Change {
+            pid: 600,
+            nth: last(600),
+            ppid: None,
+            start: Some(25),
+        }));
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &reused),
+            Err(PeerRefusal::AncestorUnreadable)
+        );
+        // The child was reparented away from the sshd.
+        let moved = shifting(Some(Change {
+            pid: 650,
+            nth: last(650),
+            ppid: Some(1),
+            start: None,
+        }));
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &moved),
+            Err(PeerRefusal::AncestorUnreadable)
+        );
+    }
+
+    #[test]
+    fn sshd_session_counts_as_sshd() {
+        let t = Owned::new(&[
+            (700, 650, USER, "remux"),
+            (650, 600, USER, "sh"),
+            (600, 1, 0, "sshd-session"),
+        ]);
+        assert_eq!(peer_link_check(700, SERVER, None, &no_panes(), &t), Ok(600));
+    }
+
+    #[test]
+    fn a_user_owned_sshd_is_walked_past_not_accepted() {
+        let t = Owned::new(&[
+            (700, 650, USER, "remux"),
+            (650, 600, USER, "bash"),
+            (600, 1, USER, "sshd"),
+        ]);
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &t),
+            Err(PeerRefusal::NotUnderSshd {
+                ended: "reached init"
+            })
+        );
+    }
+
+    #[test]
+    fn a_pane_descendant_is_refused_even_with_sshd_above_the_server() {
+        // The pane map no longer knows the pane (it is being reaped), so rule
+        // 1 says "outside", and only the server-pid clause catches it.
+        let t = Owned::new(&[
+            (700, 650, USER, "remux"),
+            (650, SERVER, USER, "zsh"),
+            (SERVER, 40, USER, "remux"),
+            (40, 1, 0, "sshd"),
+        ]);
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &t),
+            Err(PeerRefusal::DescendsFromServer)
+        );
+    }
+
+    #[test]
+    fn a_double_fork_from_a_pane_is_still_a_pane() {
+        // `( ... & )` reparents to init but keeps the pane shell's sid.
+        let table = FakeTable(HashMap::from([(700, proc(1, Some(100), None))]));
+        let procs = ProcIndex::new([(100, 1, None)]);
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &procs, &table),
+            Err(PeerRefusal::IsPane)
+        );
+    }
+
+    #[test]
+    fn a_setsid_orphan_reaches_init_and_is_refused() {
+        let t = Owned::new(&[(700, 1, USER, "python3")]);
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &t).map_err(|e| e.reason()),
+            Err("not a relay under sshd")
+        );
+    }
+
+    #[test]
+    fn the_peer_itself_is_never_the_sshd() {
+        let t = Owned::new(&[(700, 600, 0, "sshd"), (600, 1, USER, "bash")]);
+        assert!(peer_link_check(700, SERVER, None, &no_panes(), &t).is_err());
+        // Nor is the seam satisfied by the peer itself.
+        assert!(peer_link_check(700, SERVER, Some(700), &no_panes(), &t).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_ancestor_refuses() {
+        // Each process is there, but whose it is cannot be read.
+        let table = FakeTable(HashMap::from([
+            (700, proc(600, Some(4242), None)),
+            (600, proc(1, Some(4242), None)),
+        ]));
+        assert_eq!(
+            peer_link_check(700, SERVER, None, &no_panes(), &table),
+            Err(PeerRefusal::AncestorUnreadable)
+        );
+        // A parent that is gone is no verdict either.
+        let gone = Owned::new(&[(700, 600, USER, "remux")]);
+        assert!(matches!(
+            peer_link_check(700, SERVER, None, &no_panes(), &gone),
+            Err(PeerRefusal::Unverified(Unverified::AncestorUnreadable))
+        ));
+    }
+
+    #[test]
+    fn the_seam_pid_satisfies_the_predicate_only_under_debug_assertions() {
+        let t = Owned::new(&[
+            (700, 650, USER, "remux"),
+            (650, 600, USER, "python3"),
+            (600, 1, USER, "zsh"),
+        ]);
+        let seam = seam_from_env(Some("650"));
+        if cfg!(debug_assertions) {
+            assert_eq!(seam, Some(650));
+            assert_eq!(peer_link_check(700, SERVER, seam, &no_panes(), &t), Ok(650));
+        } else {
+            assert_eq!(seam, None);
+            assert!(peer_link_check(700, SERVER, seam, &no_panes(), &t).is_err());
+        }
+        assert_eq!(seam_from_env(Some("1")), None, "init is never the seam");
+        assert_eq!(seam_from_env(None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_gives_the_real_uid_not_the_effective_one() {
+        assert_eq!(
+            status_real_uid("Name:\tx\nUid:\t0\t1000\t1000\t1000\n"),
+            Some(0)
+        );
+        assert_eq!(status_real_uid("Name:\tx\n"), None);
     }
 
     fn proc(ppid: i32, sid: Option<i32>, tty: Option<Tty>) -> ProcInfo {

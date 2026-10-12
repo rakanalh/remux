@@ -603,6 +603,8 @@ struct OutgoingMessage {
     defer: bool,
     timeout_ms: Option<u64>,
     wait: bool,
+    origin: Option<crate::protocol::Origin>,
+    req: Option<u64>,
 }
 
 /// A [`ClientMessage::AgentName`], unpacked.
@@ -669,6 +671,25 @@ async fn handle_msg_send(
 ) -> Option<ServerMessage> {
     use crate::server::messaging::Refusal;
 
+    let link = links()
+        .lock()
+        .await
+        .peer_name(client_id)
+        .map(str::to_string);
+    if let Some(link) = link {
+        return handle_link_send(client_id, link, msg, state, panes, config, store).await;
+    }
+    if msg.origin.is_some() {
+        log::warn!(
+            "msg: origin refused (origin_not_allowed): client_id={client_id} peer_pid={} is not a peer link",
+            peer_pid(peer)
+        );
+        return Some(ServerMessage::refused(
+            "origin_not_allowed",
+            "only a peer link may forward a message with its origin",
+        ));
+    }
+
     let bad_host = msg
         .to
         .host
@@ -679,14 +700,8 @@ async fn handle_msg_send(
         let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
         return Some(ServerMessage::refused(refusal.code(), refusal.message()));
     }
-    if msg.to.host.is_some() {
-        return Some(ServerMessage::refused(
-            "route_unavailable",
-            format!(
-                "{}: messages to another server are not routed yet",
-                loggable(&msg.to.to_string())
-            ),
-        ));
+    if let Some(host) = msg.to.host.clone() {
+        return forward_send(client_id, host, msg, peer, state, panes, config, store).await;
     }
     // The CLI parses the address, but the wire accepts any string as a name.
     if let Target::Name(name) = &msg.to.target {
@@ -873,6 +888,496 @@ async fn handle_msg_send(
     }
 }
 
+/// The longest a dial may count for in a forward's deadline, whatever
+/// `[messaging.links] dial_ms` says, so the server always answers a remote
+/// send before the CLI gives up on it (`msg_cli::send_deadline`).
+pub const LINK_DIAL_BUDGET_MS: u64 = 10_000;
+
+/// How long a forward waits for the far server's answer once the link is up.
+pub const FORWARD_ANSWER_MS: u64 = 8_000;
+
+/// The longest the server takes to answer a send to a remote: the caller's
+/// attribution, the dial, and the far server's answer. A CLI waiting less
+/// would report its own timeout over the server's answer.
+pub const FORWARD_BUDGET_MS: u64 =
+    CALLER_ATTRIBUTION_TIMEOUT.as_millis() as u64 + LINK_DIAL_BUDGET_MS + FORWARD_ANSWER_MS;
+
+/// How long a forward waits, once attributed, for a link dialled within
+/// `dial` to carry it and the far server to answer.
+pub fn forward_wait(dial: std::time::Duration) -> std::time::Duration {
+    dial.min(std::time::Duration::from_millis(LINK_DIAL_BUDGET_MS))
+        + std::time::Duration::from_millis(FORWARD_ANSWER_MS)
+}
+
+/// A send to `host:<target>`: attributed and rate-checked here, then
+/// forwarded over the link to `[remotes.<host>]` with its origin, and stored
+/// only there. Only mailbox delivery crosses a link in this build.
+#[allow(clippy::too_many_arguments)]
+async fn forward_send(
+    client_id: u64,
+    host: String,
+    msg: OutgoingMessage,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::links::{Forward, LinkSpec, Undelivered};
+    use crate::server::messaging::Refusal;
+
+    let Some(remote) = config.remotes.get(&host).cloned() else {
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!("no remote named {} in [remotes]", loggable(&host)),
+        ));
+    };
+    if msg.deliver != Deliver::Mailbox {
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!(
+                "{}: typing a message over a link is not built yet; send it --deliver mailbox",
+                loggable(&host)
+            ),
+        ));
+    }
+    if let Target::Name(name) = &msg.to.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    }
+    let from = match attribute_frame_caller(peer, panes).await {
+        Ok(found) => found,
+        Err(why) => {
+            log::info!(
+                "msg: sender unverified: client_id={client_id} {}",
+                why.reason()
+            );
+            return Some(ServerMessage::refused(
+                "sender_unverified",
+                format!("{}: {}", why.reason(), why.fix()),
+            ));
+        }
+    };
+    log_caller(client_id, "MsgSend", &from);
+    log_hint(msg.pane_hint, from.pane);
+    let (session, from_popup) = {
+        let st = state.lock().await;
+        (
+            st.locate_pane(from.pane).map(|(session, _)| session),
+            st.is_popup(from.pane),
+        )
+    };
+    if from_popup {
+        return Some(ServerMessage::refused("sender_unverified", POPUP_REFUSED));
+    }
+    let Some(session) = session else {
+        return Some(ServerMessage::refused(
+            "sender_unverified",
+            format!("pane %{} is closing", from.pane),
+        ));
+    };
+    let (minted, from_name) = {
+        let mut store = store.lock().await;
+        let from_name = store.name_of(from.pane).map(str::to_string);
+        let sender = Sender::Pane {
+            pane_id: from.pane,
+            name: from_name.clone(),
+            session: session.clone(),
+        };
+        (
+            store
+                .check_rate(&sender, std::time::Instant::now())
+                .map(|()| store.mint_id()),
+            from_name,
+        )
+    };
+    let id = match minted {
+        Ok(id) => id,
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from=%{} to={}: {}",
+                from.pane,
+                loggable(&msg.to.to_string()),
+                refusal.code()
+            );
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    };
+    let bytes = msg.body.len();
+    let target = msg.to.target.clone();
+    log::info!(
+        "msg: id={id} forwarded to {host} (origin=%{}) bytes={bytes}",
+        from.pane
+    );
+    let host_name = config.messaging.host_name();
+    let forwarded = ClientMessage::MsgSend {
+        to: Address {
+            host: None,
+            target: msg.to.target.clone(),
+        },
+        body: msg.body,
+        deliver: Deliver::Mailbox,
+        reply_to: msg.reply_to,
+        pane_hint: None,
+        defer: false,
+        timeout_ms: None,
+        wait: false,
+        origin: Some(Origin {
+            host: host_name.clone(),
+            pane_id: from.pane,
+            name: from_name,
+            session,
+            id,
+        }),
+        req: None,
+    };
+    let dial = config.messaging.links.dial();
+    let spec = LinkSpec {
+        key: host.clone(),
+        remote,
+        host_name,
+        dial,
+        ping_ms: config.messaging.links.ping_ms,
+    };
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let started = links().lock().await.forward(
+        spec,
+        Forward {
+            msg: forwarded,
+            reply,
+        },
+    );
+    if let Some(dial) = started {
+        tokio::spawn(crate::server::links::run_link(dial));
+    }
+    let budget = forward_wait(dial);
+    let answer = match tokio::time::timeout(budget, answer).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => Err(Undelivered::Unknown(format!("{host}: link lost"))),
+        Err(_) => Err(Undelivered::Unknown(format!(
+            "{host}: no answer in {}s",
+            budget.as_secs()
+        ))),
+    };
+    match answer {
+        Ok(ServerMessage::MsgSent { to, .. }) => {
+            log::info!("msg: id={id} -> {host}:%{} (forwarded)", to.pane_id);
+            Some(ServerMessage::MsgSent {
+                id,
+                to: Resolved {
+                    host: Some(host),
+                    pane_id: to.pane_id,
+                    // The far server's word for the pane's name, kept only
+                    // when it could be one.
+                    name: to.name.filter(|name| valid_name(name)),
+                },
+                delivery: Delivery::Forwarded,
+                reason: None,
+                timed_out: false,
+                final_state: None,
+                req: None,
+            })
+        }
+        Ok(ServerMessage::Error { message, code, .. }) => {
+            let (code, message) = crate::server::links::far_refusal(code.as_deref(), &message);
+            log::info!("msg: id={id} refused by {host}: {code}");
+            Some(ServerMessage::refused(
+                "remote_refused",
+                format!("{host} refused: {code}: {message}"),
+            ))
+        }
+        Ok(other) => Some(forward_unknown(
+            id,
+            &host,
+            &target,
+            &format!("{host} answered {}", other.variant_name()),
+        )),
+        Err(Undelivered::NotSent(reason)) => {
+            log::info!("msg: id={id} not forwarded: {reason}");
+            Some(ServerMessage::refused("route_unavailable", reason))
+        }
+        Err(Undelivered::Unknown(reason)) => Some(forward_unknown(id, &host, &target, &reason)),
+    }
+}
+
+/// A forward that reached the link and was not answered: the far server may
+/// have stored it, so the caller is told how to look before sending it again,
+/// which could deliver it twice.
+fn forward_unknown(id: MsgId, host: &str, target: &Target, reason: &str) -> ServerMessage {
+    log::info!("msg: id={id} outcome unknown: {reason}");
+    let look = match target {
+        Target::Pane(pane) => format!("`remux msg read --pane %{pane} --all` on {host}"),
+        Target::Name(name) => {
+            format!("`remux msg read --pane %N --all` on {host}, for the pane named {name}")
+        }
+    };
+    ServerMessage::refused(
+        "forward_unknown",
+        format!("{reason}; the outcome is unknown: check {look} before re-sending"),
+    )
+}
+
+/// The connection's peer pid, for a log line: `?` when it cannot be read.
+fn peer_pid(peer: &identity::Peer) -> String {
+    use identity::PeerPin;
+    peer.begin()
+        .map_or_else(|_| "?".to_string(), |(pid, _)| pid.to_string())
+}
+
+/// A `PeerLink`: admit the connection as a link from the server `name`, or
+/// refuse it. `None` when it is admitted, since nothing waits on that: the
+/// declaring server learns it from the `Pong` to the ping it sends next.
+async fn handle_peer_link(
+    client_id: u64,
+    name: &str,
+    ping_ms: u64,
+    peer: &Arc<identity::Peer>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Option<ServerMessage> {
+    use crate::server::links::Declare;
+    use identity::{PeerPin, PeerRefusal};
+
+    if !valid_host(name) {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad peer link name {}", loggable(name)),
+        ));
+    }
+    if let Some(held) = links().lock().await.peer_name(client_id) {
+        return Some(ServerMessage::refused(
+            "bad_request",
+            format!("this connection is already the peer link {held}"),
+        ));
+    }
+    let seam = peer_seam();
+    let server_pid = std::process::id() as i32;
+    let peer = Arc::clone(peer);
+    let checked = tokio::time::timeout(CALLER_ATTRIBUTION_TIMEOUT, async {
+        let index = proc_index(&*panes.lock().await);
+        tokio::task::spawn_blocking(move || {
+            let table = identity::system_table();
+            let (pid, mark) = match peer.begin() {
+                Ok(begun) => begun,
+                Err(why) => return (None, Err(PeerRefusal::Unverified(why))),
+            };
+            let verdict = identity::peer_link_check(pid, server_pid, seam, &index, &table);
+            let pinned = peer.confirm(mark, &table);
+            (
+                Some(pid),
+                pinned.map_err(PeerRefusal::Unverified).and(verdict),
+            )
+        })
+        .await
+    })
+    .await;
+    let (pid, verdict) = match checked {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => {
+            log::warn!("identity: peer link check failed: {e}");
+            (
+                None,
+                Err(PeerRefusal::Unverified(identity::Unverified::CheckFailed)),
+            )
+        }
+        Err(_) => (
+            None,
+            Err(PeerRefusal::Unverified(identity::Unverified::TimedOut)),
+        ),
+    };
+    let pid = pid.map_or("?".to_string(), |pid| pid.to_string());
+    let sshd = match verdict {
+        Ok(sshd) => sshd,
+        Err(refusal) => {
+            log::info!(
+                "peer link {name}: refused client_id={client_id} peer_pid={pid}: {} ({})",
+                refusal.reason(),
+                refusal.ended()
+            );
+            return Some(ServerMessage::refused(
+                "sender_unverified",
+                refusal.reason(),
+            ));
+        }
+    };
+    let ping = crate::server::links::declared_ping(ping_ms);
+    let declared = links().lock().await.declare(name, client_id, ping);
+    match declared {
+        Ok(()) => {
+            log::info!(
+                "peer link {name}: declared by client_id={client_id} peer_pid={pid} under sshd={sshd}"
+            );
+            None
+        }
+        Err(Declare::Held { retry_after }) => Some(ServerMessage::refused(
+            "name_taken",
+            format!(
+                "peer link \"{name}\" is held by a live link; retry after {}s",
+                retry_after.as_secs()
+            ),
+        )),
+        Err(Declare::AlreadyPeer(held)) => Some(ServerMessage::refused(
+            "bad_request",
+            format!("this connection is already the peer link {held}"),
+        )),
+        Err(Declare::BadName) => Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad peer link name {}", loggable(name)),
+        )),
+    }
+}
+
+/// A `MsgSend` on a peer link: no pane to attribute, since the relay is
+/// sshd's child. The sender is the link's declared name and the origin's
+/// pane; `origin.host` is checked and never stored, so one connection names
+/// one host. Only mailbox delivery arrives over a link in this build.
+async fn handle_link_send(
+    client_id: u64,
+    link: String,
+    msg: OutgoingMessage,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    use crate::server::messaging::{Arrival, Refusal};
+
+    let Some(origin) = msg.origin else {
+        return Some(ServerMessage::refused(
+            "bad_request",
+            "a peer link forwards every message with its origin",
+        ));
+    };
+    if !valid_host(&origin.host) {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad origin host {}", loggable(&origin.host)),
+        ));
+    }
+    if let Some(name) = origin.name.as_deref().filter(|name| !valid_name(name)) {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            format!("bad origin name {}", loggable(name)),
+        ));
+    }
+    if msg.to.host.is_some() {
+        return Some(ServerMessage::refused(
+            "bad_address",
+            "a forwarded message names a pane on this server",
+        ));
+    }
+    if origin.host != link && links().lock().await.first_host_mismatch(client_id) {
+        log::info!(
+            "peer link {link}: an origin names host {}; stored as {link} (logged once per link)",
+            loggable(&origin.host)
+        );
+    }
+    if msg.deliver != Deliver::Mailbox {
+        return Some(ServerMessage::refused(
+            "bad_request",
+            "only mailbox delivery arrives over a link in this build",
+        ));
+    }
+    if let Target::Name(name) = &msg.to.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    }
+    let live = live_panes(panes).await;
+    let resolved = store
+        .lock()
+        .await
+        .resolve(&msg.to.target, |pane| live.contains(&pane));
+    let to = match resolved {
+        Ok(to) => to,
+        Err(refusal) => return Some(ServerMessage::refused(refusal.code(), refusal.message())),
+    };
+    if state.lock().await.locate_pane(to).is_none() {
+        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+    }
+    let bytes = msg.body.len();
+    let from_pane = origin.pane_id;
+    let (sent, swept, answered) = {
+        let mut store = store.lock().await;
+        let to_name = store.name_of(to).map(str::to_string);
+        let sent = store
+            .send_arrival(
+                Sender::Remote {
+                    host: link.clone(),
+                    pane_id: from_pane,
+                    name: origin.name,
+                },
+                to,
+                msg.body,
+                msg.reply_to,
+                Arrival {
+                    link: &link,
+                    link_rate_per_10s: config.messaging.link_rate_per_10s(),
+                    origin: MsgRef {
+                        host: Some(link.clone()),
+                        id: origin.id,
+                    },
+                },
+                now_ms(),
+                std::time::Instant::now(),
+            )
+            .map(|id| (id, to_name));
+        let answered = if sent.is_ok() {
+            store.answer_waiters(to, now_ms())
+        } else {
+            Vec::new()
+        };
+        (sent, store.take_swept(), answered)
+    };
+    mark_agents_dirty();
+    for (waiter, messages) in answered {
+        log::info!(
+            "msg: wait on %{to} answered n={} for client_id={}",
+            messages.len(),
+            waiter.client_id
+        );
+        let _ = waiter.tx.send(ServerMessage::MsgList {
+            pane: to,
+            messages,
+            timed_out: false,
+            marked: waiter.mark,
+        });
+    }
+    if swept > 0 {
+        log::info!("msg: swept {swept} expired message(s)");
+    }
+    match sent {
+        Ok((id, to_name)) => {
+            log::info!(
+                "msg: id={id} from {link}:%{from_pane} to=%{to} bytes={bytes} (client_id={client_id}) -> mailbox"
+            );
+            Some(ServerMessage::MsgSent {
+                id,
+                to: Resolved {
+                    host: None,
+                    pane_id: to,
+                    name: to_name,
+                },
+                delivery: Delivery::Mailbox,
+                reason: None,
+                timed_out: false,
+                final_state: None,
+                req: None,
+            })
+        }
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from {link}:%{from_pane} to=%{to}: {}",
+                refusal.code()
+            );
+            Some(ServerMessage::refused(refusal.code(), refusal.message()))
+        }
+    }
+}
+
 /// The answer to a stored send, by what queueing it for typing did: `None`
 /// when it was queued, since the submitter answers it once it is typed or
 /// cannot be.
@@ -887,6 +1392,7 @@ fn answer_enqueued(
     use crate::server::submit::{settle, SubmitRefusal};
     match queued {
         None => Some(ServerMessage::MsgSent {
+            req: None,
             id,
             to: resolved,
             delivery: Delivery::Mailbox,
@@ -1028,6 +1534,7 @@ async fn step_submit_waits(
 /// A submitted message, answered with no final state and why.
 fn submitted_because(id: MsgId, pane: PaneId, name: Option<String>, reason: &str) -> ServerMessage {
     ServerMessage::MsgSent {
+        req: None,
         id,
         to: Resolved {
             host: None,
@@ -1079,6 +1586,7 @@ fn answer_submit_wait(
         .saturating_duration_since(wait.machine.enter_at())
         .as_millis();
     let sent = |final_state: AgentState, timed_out: bool| ServerMessage::MsgSent {
+        req: None,
         id,
         to: Resolved {
             host: None,
@@ -1339,6 +1847,7 @@ async fn step_submit(
                     None => log::info!("msg: id={id} waiting for %{pane}'s turn to end"),
                     Some((reply, name)) => {
                         let message = ServerMessage::MsgSent {
+                            req: None,
                             id,
                             to: Resolved {
                                 host: None,
@@ -1637,6 +2146,7 @@ fn answer_submit(
         Answer::Mailbox(reason) => {
             log::info!("msg: id={id} submit -> mailbox ({})", why(reason));
             ServerMessage::MsgSent {
+                req: None,
                 id,
                 to: resolved,
                 delivery: Delivery::Mailbox,
@@ -1651,6 +2161,7 @@ fn answer_submit(
                 why(reason)
             );
             ServerMessage::MsgSent {
+                req: None,
                 id,
                 to: resolved,
                 delivery: Delivery::Mailbox,
@@ -3098,6 +3609,17 @@ pub async fn read_message<T>(reader: &mut (impl AsyncReadExt + Unpin)) -> Result
 where
     T: DeserializeOwned,
 {
+    let Some(payload) = read_frame(reader).await? else {
+        return Ok(None);
+    };
+    let msg: T = serde_json::from_slice(&payload).context("deserializing message")?;
+    Ok(Some(msg))
+}
+
+/// One frame's payload, undecoded, with [`read_message`]'s bounds: `Ok(None)`
+/// on EOF before a header. A reader that must outlive a frame it cannot
+/// decode reads with this and decodes itself.
+pub async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header).await {
         Ok(_) => {}
@@ -3123,9 +3645,7 @@ where
     if got < len {
         anyhow::bail!("connection closed mid-frame ({got} of {len} bytes)");
     }
-
-    let msg: T = serde_json::from_slice(&payload).context("deserializing message")?;
-    Ok(Some(msg))
+    Ok(Some(payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -3679,6 +4199,15 @@ impl RemuxServer {
     /// Start the server: bind socket, accept connections, run the event loop.
     pub async fn run(config: Config) -> Result<()> {
         let server = Self::new(config);
+        let seam =
+            identity::seam_from_env(std::env::var("REMUX_TEST_PEER_ANCESTOR").ok().as_deref());
+        if let Some(warning) = server.config.messaging.host_name_warning() {
+            log::warn!("[messaging] {warning}");
+        }
+        if let Some(pid) = seam {
+            log::warn!("identity: TEST SEAM: pid {pid} counts as a root sshd for peer links");
+        }
+        let _ = PEER_SEAM.set(seam);
 
         // Load persisted state before accepting connections. Behavior depends
         // on two config flags:
@@ -4116,6 +4645,7 @@ impl RemuxServer {
                             let cls = clients.lock().await;
                             if let Some(client) = cls.get(&client_id) {
                                 let _ = client.tx.send(ServerMessage::Error {
+                                    req: None,
                                     message: format!("{e}"),
                                     code: None,
                                 });
@@ -4352,11 +4882,17 @@ async fn handle_client_message(
             defer,
             timeout_ms,
             wait,
+            origin,
+            req,
         } => {
+            // A host and a pane id are labels, never content.
+            let origin = origin.as_ref().map_or("None".to_string(), |o| {
+                format!("{}:%{}", loggable(&o.host), o.pane_id)
+            });
             log::debug!(
                 "server: client_id={client_id} msg=MsgSend(to={}, deliver={deliver:?}, {} bytes, \
                  reply_to={}, pane_hint={pane_hint:?}, defer={defer}, timeout={timeout_ms:?}, \
-                 wait={wait})",
+                 wait={wait}, origin={origin}, req={req:?})",
                 loggable(&to.to_string()),
                 body.len(),
                 reply_to
@@ -4447,6 +4983,8 @@ async fn handle_client_message(
             defer,
             timeout_ms,
             wait,
+            origin,
+            req,
         } => {
             let outgoing = OutgoingMessage {
                 to,
@@ -4457,6 +4995,8 @@ async fn handle_client_message(
                 defer,
                 timeout_ms,
                 wait,
+                origin,
+                req,
             };
             let answer = handle_msg_send(
                 client_id,
@@ -4472,7 +5012,7 @@ async fn handle_client_message(
             // `None` is a submit that was queued: its answer comes from the
             // submitter, once it is typed or cannot be.
             if let Some(answer) = answer {
-                reply(client_id, clients, answer).await;
+                reply(client_id, clients, answer.with_req(req)).await;
             }
             Ok(())
         }
@@ -4553,6 +5093,16 @@ async fn handle_client_message(
         ClientMessage::AgentStatus { target } => {
             let answer = handle_agent_status(target, state, panes, config, messaging()).await;
             reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::PeerLink { name, ping_ms } => {
+            if let Some(answer) = handle_peer_link(client_id, &name, ping_ms, peer, panes).await {
+                reply(client_id, clients, answer).await;
+            }
+            Ok(())
+        }
+        ClientMessage::Ping { nonce } => {
+            reply(client_id, clients, ServerMessage::Pong { nonce }).await;
             Ok(())
         }
         ClientMessage::AgentWait {
@@ -5370,6 +5920,7 @@ async fn handle_attach(
             let cls = clients.lock().await;
             if let Some(client) = cls.get(&client_id) {
                 let _ = client.tx.send(ServerMessage::Error {
+                    req: None,
                     message: format!("session '{}' not found", session_name),
                     code: None,
                 });
@@ -7755,6 +8306,22 @@ static PANE_TITLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::ne
 /// nothing else is taken while it is held, so it adds no lock ordering.
 static MESSAGING: std::sync::OnceLock<Mutex<Messaging>> = std::sync::OnceLock::new();
 
+/// The server's links to other servers. Taken alone, like the store.
+static LINKS: std::sync::OnceLock<Mutex<crate::server::links::Links>> = std::sync::OnceLock::new();
+
+fn links() -> &'static Mutex<crate::server::links::Links> {
+    LINKS.get_or_init(|| Mutex::new(crate::server::links::Links::new()))
+}
+
+/// The debug-only test seam for [`identity::peer_link_check`], read once from
+/// this server's own environment at startup: a pane cannot set it on a
+/// running server, and a release build ignores it.
+static PEER_SEAM: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+
+fn peer_seam() -> Option<i32> {
+    PEER_SEAM.get().copied().flatten()
+}
+
 fn messaging() -> &'static Mutex<Messaging> {
     MESSAGING.get_or_init(|| {
         Mutex::new(Messaging::new(
@@ -8356,6 +8923,9 @@ async fn handle_client_disconnect(
     {
         let mut cls = clients.lock().await;
         cls.remove(&client_id);
+    }
+    if let Some(name) = links().lock().await.drop_client(client_id) {
+        log::info!("peer link {name}: closed (client_id={client_id})");
     }
     let (dropped, (queued, typing, deferred), waits) = {
         let mut store = messaging().lock().await;
@@ -10669,6 +11239,7 @@ resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={
         let msg = match spawned {
             Some(pane_id) => ServerMessage::CliSpawned { pane_id },
             None => ServerMessage::Error {
+                req: None,
                 message: match pane.filter(|_| resolved.is_none()) {
                     Some(pane) => format!(
                         "no session named '{session}' on this server \
@@ -14784,7 +15355,7 @@ mod tests {
         fn refused_unverified(answer: &ServerMessage) -> bool {
             matches!(
                 answer,
-                ServerMessage::Error { code: Some(code), message }
+                ServerMessage::Error { code: Some(code), message, .. }
                     if code == "sender_unverified" && message.contains("in time")
             )
         }
