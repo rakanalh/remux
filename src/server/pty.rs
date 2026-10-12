@@ -1441,6 +1441,22 @@ mod tests {
         }
     }
 
+    /// Wait, up to five seconds, for `master` to report its slave gone. Dropping
+    /// the slave closes this test's descriptor, but a pane shell that another
+    /// test in this process forks at that moment holds a copy of it until the
+    /// child execs, or for good if the fork came between `openpty` and the
+    /// `FD_CLOEXEC` in `idle_pair`. Until the last copy closes the slave is
+    /// open, and the master reads as idle.
+    fn wait_for_hangup(master: BorrowedFd<'_>) {
+        let mut pfd = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for a descriptor the caller keeps open.
+        unsafe { libc::poll(&mut pfd, 1, 5000) };
+    }
+
     /// A closed slave must reach an arm the reader BREAKS on, and which arm that
     /// is depends on the platform: Linux answers `EIO` rather than a zero-length
     /// read. Both are accepted because both end the reader.
@@ -1448,6 +1464,7 @@ mod tests {
     fn the_fallback_read_reports_the_slave_closing() {
         let pair = idle_pair();
         drop(pair.slave);
+        wait_for_hangup(pair.master.as_fd());
         let mut buf = [0u8; 64];
         match fallback_read(pair.master.as_fd(), &mut buf) {
             FallbackRead::Eof => {}
