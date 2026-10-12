@@ -2,7 +2,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-use nix::pty::{openpty, OpenptyResult, Winsize};
+use nix::pty::Winsize;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{self, ForkResult, Pid};
@@ -13,6 +13,93 @@ use tokio::io::Interest;
 
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
+
+/// Held from opening a pane's terminal until its shell is forked, where the
+/// terminal cannot be opened close-on-exec in one call. Every fork the server
+/// makes is a pane's, so no fork can land between the open and the
+/// `FD_CLOEXEC` that follows it.
+#[cfg(not(target_os = "linux"))]
+static OPEN_TO_FORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Both ends of a new terminal, `(master, slave)`, sized `winsize` and
+/// close-on-exec from the moment they exist.
+///
+/// A descriptor without `FD_CLOEXEC` is inherited by every process the
+/// server forks, and kept across its `exec`. Two panes are created
+/// concurrently (`spawn_pane` runs per connection, without the `panes`
+/// lock), so a pane whose shell was forked while another pane's terminal was
+/// open but not yet marked kept that pane's master and slave for good: its
+/// shell could type into the other pane and read it, outside every check the
+/// server makes on what reaches a pane, and the other pane's shell never saw
+/// its hangup. Linux opens both ends with `O_CLOEXEC` in the call that
+/// creates them. Elsewhere `posix_openpt` refuses `O_CLOEXEC`, so the pair is
+/// opened and marked under [`OPEN_TO_FORK`], which the caller holds until it
+/// has forked.
+#[cfg(target_os = "linux")]
+fn open_pty_pair(winsize: &Winsize) -> Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: posix_openpt takes only flags; a non-negative result is a new
+    // descriptor this function owns from here on.
+    let raw = unsafe { libc::posix_openpt(flags) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("posix_openpt failed");
+    }
+    // SAFETY: `raw` is a new descriptor nothing else owns.
+    let master = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: both take a valid master descriptor.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0
+        || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("unlocking the PTY failed");
+    }
+    // SAFETY: TIOCGPTPEER takes open flags and returns a new descriptor for
+    // the slave of this master, or -1.
+    let raw = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) };
+    let slave = if raw >= 0 {
+        // SAFETY: as above, a new descriptor nothing else owns.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    } else {
+        // Kernels before 4.13 have no TIOCGPTPEER: open the slave by name,
+        // still close-on-exec in the open itself.
+        let mut name = [0 as libc::c_char; 128];
+        // SAFETY: `name` is writable for its length, which bounds the write.
+        if unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("ptsname_r failed");
+        }
+        // SAFETY: ptsname_r wrote a NUL-terminated path into `name`.
+        let raw = unsafe { libc::open(name.as_ptr(), flags) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error()).context("opening the PTY slave failed");
+        }
+        // SAFETY: as above.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+    // SAFETY: TIOCSWINSZ reads one winsize from the pointer.
+    if unsafe {
+        libc::ioctl(
+            slave.as_raw_fd(),
+            libc::TIOCSWINSZ,
+            winsize as *const Winsize,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("sizing the PTY failed");
+    }
+    Ok((master, slave))
+}
+
+/// See the Linux version. The caller holds [`OPEN_TO_FORK`].
+#[cfg(not(target_os = "linux"))]
+fn open_pty_pair(winsize: &Winsize) -> Result<(OwnedFd, OwnedFd)> {
+    let nix::pty::OpenptyResult { master, slave } =
+        nix::pty::openpty(winsize, None).context("failed to open PTY pair")?;
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .context("failed to set FD_CLOEXEC on the PTY pair")?;
+    }
+    Ok((master, slave))
+}
 
 /// Bytes for a pane's writer.
 pub struct WriteJob {
@@ -196,29 +283,12 @@ impl Pty {
             ws_ypixel: 0,
         };
 
-        let OpenptyResult { master, slave } =
-            openpty(&winsize, None).context("failed to open PTY pair")?;
-
-        // `openpty` returns both descriptors WITHOUT `FD_CLOEXEC`, so every later
-        // `fork`/`exec` inherits them: a pane's shell was found holding a copy of
-        // every EARLIER pane's master, and so was everything that shell ran.
-        //
-        // That is not untidiness. A pane's master is what reports the pane's
-        // death, and while a sibling shell holds a copy the closed pane's slave
-        // still has a peer, so the pane's own shell never receives its hangup.
-        // Only the base master leaked: the reader's and writer's copies come from
-        // `OwnedFd::try_clone`, which uses `F_DUPFD_CLOEXEC`.
-        //
-        // The SLAVE is marked for the same reason over a narrower window.
-        // `spawn_pane` is `async`, runs per client connection and calls this
-        // function without the `panes` lock, so two pane creations can interleave
-        // and one pane's `openpty` can land between another's `openpty` and its
-        // `fork`. An inherited slave holds a pane open exactly as an inherited
-        // master does.
-        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
-            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-                .context("failed to set FD_CLOEXEC on the PTY pair")?;
-        }
+        // Held through the fork below, where the open cannot be atomic.
+        #[cfg(not(target_os = "linux"))]
+        let _open_to_fork = OPEN_TO_FORK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (master, slave) = open_pty_pair(&winsize)?;
 
         // A pane without a recorded slave only loses a diagnostic in sender
         // attribution, so a failed `fstat` does not refuse the spawn.
@@ -1389,24 +1459,26 @@ mod tests {
 
     /// A PTY pair with no child, and a non-blocking master, which is the state
     /// [`fallback_read`] is always called in.
-    fn idle_pair() -> OpenptyResult {
-        let pair = openpty(
-            &Winsize {
-                ws_row: 24,
-                ws_col: 80,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-            None,
-        )
-        .expect("openpty failed");
-        // As `Pty::spawn` does, and for the same reason: a pane shell forked by
-        // a parallel test would otherwise keep this slave open, and
-        // `the_fallback_read_reports_the_slave_closing` would see it still
-        // open after dropping it.
-        for fd in [pair.master.as_raw_fd(), pair.slave.as_raw_fd()] {
-            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("FD_CLOEXEC failed");
-        }
+    struct IdlePair {
+        master: OwnedFd,
+        slave: OwnedFd,
+    }
+
+    /// A terminal opened as `Pty::spawn` opens one, so a pane shell forked by
+    /// a parallel test does not keep this slave open.
+    fn idle_pair() -> IdlePair {
+        #[cfg(not(target_os = "linux"))]
+        let _open_to_fork = OPEN_TO_FORK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (master, slave) = open_pty_pair(&Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        })
+        .expect("opening a PTY pair failed");
+        let pair = IdlePair { master, slave };
         let raw = pair.master.as_raw_fd();
         // SAFETY: `pair.master` owns a valid descriptor for the whole test.
         unsafe {
@@ -1444,9 +1516,8 @@ mod tests {
     /// Wait, up to five seconds, for `master` to report its slave gone. Dropping
     /// the slave closes this test's descriptor, but a pane shell that another
     /// test in this process forks at that moment holds a copy of it until the
-    /// child execs, or for good if the fork came between `openpty` and the
-    /// `FD_CLOEXEC` in `idle_pair`. Until the last copy closes the slave is
-    /// open, and the master reads as idle.
+    /// child execs. Until the last copy closes the slave is open, and the
+    /// master reads as idle.
     fn wait_for_hangup(master: BorrowedFd<'_>) {
         let mut pfd = libc::pollfd {
             fd: master.as_raw_fd(),
@@ -1455,6 +1526,45 @@ mod tests {
         };
         // SAFETY: one valid pollfd for a descriptor the caller keeps open.
         unsafe { libc::poll(&mut pfd, 1, 5000) };
+    }
+
+    /// Both ends of a pane's terminal exist close-on-exec, read back from the
+    /// descriptors themselves: `F_GETFD`, and on Linux the open flags the
+    /// kernel reports in `/proc/self/fdinfo`.
+    #[test]
+    fn both_ends_of_a_new_terminal_are_close_on_exec() {
+        #[cfg(not(target_os = "linux"))]
+        let _open_to_fork = OPEN_TO_FORK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (master, slave) = open_pty_pair(&Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        })
+        .expect("opening a PTY pair failed");
+        for (end, fd) in [("master", master.as_raw_fd()), ("slave", slave.as_raw_fd())] {
+            let flags = fcntl(fd, FcntlArg::F_GETFD).expect("F_GETFD failed");
+            assert!(
+                FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC),
+                "the {end} is not close-on-exec"
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+                let open_flags = info
+                    .lines()
+                    .find_map(|l| l.strip_prefix("flags:"))
+                    .map(|v| i64::from_str_radix(v.trim(), 8).unwrap())
+                    .expect("no flags line in fdinfo");
+                assert_ne!(
+                    open_flags & i64::from(libc::O_CLOEXEC),
+                    0,
+                    "the {end} was not opened O_CLOEXEC: {info}"
+                );
+            }
+        }
     }
 
     /// A closed slave must reach an arm the reader BREAKS on, and which arm that
