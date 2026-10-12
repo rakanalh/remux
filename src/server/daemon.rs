@@ -2122,7 +2122,9 @@ async fn deliver_text(
         if !done {
             match tokio::time::timeout(CHUNK_POLL, &mut written).await {
                 Ok(Ok(true)) => done = true,
-                Ok(Ok(false) | Err(_)) if !taken_over() => break SubmitRefusal::not_read(pane),
+                Ok(Ok(false) | Err(_)) if !taken_over() => {
+                    break SubmitRefusal::stopped_reading(pane)
+                }
                 _ => {}
             }
         }
@@ -2189,9 +2191,11 @@ async fn deliver_text(
         match enter_at {
             None if tick >= body_deadline => break SubmitRefusal::too_slow(pane, BODY_CAP),
             None if tick.duration_since(progress_at) >= CONSUME_DEADLINE => {
-                break SubmitRefusal::not_read(pane)
+                break SubmitRefusal::stopped_reading(pane)
             }
-            Some(at) if tick >= at + CONSUME_DEADLINE => break SubmitRefusal::not_read(pane),
+            Some(at) if tick >= at + CONSUME_DEADLINE => {
+                break SubmitRefusal::stopped_reading(pane)
+            }
             _ => {}
         }
         if enter_at.is_some() {

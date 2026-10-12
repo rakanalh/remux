@@ -427,6 +427,18 @@ impl SubmitRefusal {
         }
     }
 
+    /// The agent read the probe and then stopped part-way through the body.
+    /// What it read before it stopped is in its input, unsubmitted, which a
+    /// person must clear: sending it again would type it twice.
+    pub fn stopped_reading(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "agent_did_not_read",
+            message: format!(
+                "%{pane}'s agent stopped reading the message part-way, so it was not submitted: what it read may be left in its input, unsent; clear that there, and do not send it again with submit. It is in the mailbox"
+            ),
+        }
+    }
+
     pub fn too_many_lines(pane: PaneId, max: usize) -> Self {
         SubmitRefusal {
             code: "too_many_lines",

@@ -671,6 +671,8 @@ try:
     r = type_send(A, send(N, "MSG:unread", "Submit"))
     check(outcome(r) == ("Error", "agent_did_not_read"),
           f"1n an agent that stops reading is agent_did_not_read, no Enter (got {r})")
+    check("part-way" not in str(r),
+          f"1n ...and an agent that never read the probe is not told it stopped part-way (got {r})")
     check(f"not read by %{N}; typed text discarded, left in the mailbox" in srv.log(),
           "1n ...and the log says the text was discarded")
     # Now let it read again: the flush cleared the queue, so it reads NOTHING
@@ -1923,6 +1925,9 @@ try:
     check(outcome(r) == ("Error", "agent_did_not_read") and raw == [OPEN, CLOSE],
           f"3af an agent that took the probe and read nothing more: agent_did_not_read, and the paste it "
           f"is inside is closed (reply {r}, reads {raw})")
+    message = (r or {}).get("Error", {}).get("message", "")
+    check("part-way" in message and "left in its input" in message and "do not send it again" in message,
+          f"3af ...and the sender is told part of it may be left in the agent's input (got {message!r})")
 
     # 3ag: a body near the size limit, read steadily but slowly.
     L, L_LOG, L_CTL = spawn_agent(paste=True)

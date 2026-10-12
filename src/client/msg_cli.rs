@@ -515,6 +515,10 @@ fn advice(reason: &str) -> Option<&'static str> {
         "agent_too_slow" => {
             "The part the agent read is left in its input: clear that before pressing Enter there."
         }
+        "agent_did_not_read" => {
+            "If the agent stopped part-way, what it read is left in its input: clear that there, \
+             and do not send it again with submit."
+        }
         "too_many_lines" => {
             "It has too many lines to be typed: the agent can read it from its mailbox."
         }
@@ -945,6 +949,11 @@ mod tests {
                 Delivery::Mailbox,
                 "too_many_lines",
                 "read it from its mailbox",
+            ),
+            (
+                Delivery::Mailbox,
+                "agent_did_not_read",
+                "do not send it again",
             ),
             (Delivery::Submitted, "agent_exited", "do not send it again"),
             (
