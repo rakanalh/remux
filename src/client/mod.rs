@@ -3,6 +3,7 @@ pub mod chrome;
 pub mod cli_common;
 pub mod command_palette;
 pub mod editor;
+pub mod hook_cli;
 pub mod input;
 pub mod msg_cli;
 pub mod registry;

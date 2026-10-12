@@ -1390,13 +1390,48 @@ pub fn hidden_chars(s: &str) -> impl Iterator<Item = (usize, char)> + '_ {
         .map(|(_, found)| found)
 }
 
-/// An agent name: `[a-z][a-z0-9_-]{0,31}`. A grammar rather than free text,
-/// because a name is an address and must survive a shell unquoted.
+/// Words no pane's name may be, or contain as a part. Mail is rendered
+/// `From: <name> (%N)`, and a pane named `user`, or `claude-user`, would forge
+/// the one sender a model trusts most. A part is what `-` and `_` separate, so
+/// `user1` and `users` are names and `my-user` is not.
+pub const RESERVED_NAMES: [&str; 9] = [
+    "user",
+    "system",
+    "claude",
+    "remux",
+    "human",
+    "assistant",
+    "anthropic",
+    "operator",
+    "developer",
+];
+
+/// The first part of `s` that is a reserved word, if any.
+pub fn reserved_part(s: &str) -> Option<&str> {
+    s.split(['-', '_'])
+        .find(|part| RESERVED_NAMES.contains(part))
+}
+
+/// An agent name: `[a-z][a-z0-9_-]{0,31}`, and not one of [`RESERVED_NAMES`].
+/// A grammar rather than free text, because a name is an address and must
+/// survive a shell unquoted.
 pub fn valid_name(s: &str) -> bool {
     let mut bytes = s.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_lowercase())
         && s.len() <= 32
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        && reserved_part(s).is_none()
+}
+
+/// Why `s` is not a name, for a refusal: a reserved word, or not the grammar.
+pub fn bad_name_reason(s: &str) -> String {
+    match reserved_part(s) {
+        Some(word) => format!(
+            "\"{word}\" is reserved: {} cannot be names or parts of names",
+            RESERVED_NAMES.join(", ")
+        ),
+        None => "use [a-z][a-z0-9_-]{0,31}".to_string(),
+    }
 }
 
 /// The message a reply answers. `host` is `None` for this server.
@@ -2472,6 +2507,22 @@ pub fn decode_message_length(header: &[u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_names_are_not_valid_names() {
+        for word in RESERVED_NAMES {
+            assert!(!valid_name(word), "{word}");
+            assert!(bad_name_reason(word).contains("reserved"), "{word}");
+        }
+        for name in ["my-user", "claude-2", "dev_operator", "a-anthropic-b"] {
+            assert!(!valid_name(name), "a reserved part: {name}");
+            assert!(bad_name_reason(name).contains("reserved"), "{name}");
+        }
+        for name in ["user1", "users", "claudes", "alpha", "dev-ops"] {
+            assert!(valid_name(name), "whole parts, not prefixes: {name}");
+        }
+        assert!(bad_name_reason("Alpha").contains("[a-z]"));
+    }
 
     fn hidden(s: &str) -> Vec<char> {
         hidden_chars(s).map(|(_, c)| c).collect()

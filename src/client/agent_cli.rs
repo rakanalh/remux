@@ -110,8 +110,9 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                 return Err(CliError::usage(
                     "bad_name",
                     format!(
-                        "\"{}\" is not a name: use [a-z][a-z0-9_-]{{0,31}}",
-                        escape(bad)
+                        "\"{}\" is not a name: {}",
+                        escape(bad),
+                        crate::protocol::bad_name_reason(bad)
                     ),
                 ));
             }

@@ -35,6 +35,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import BIN, Client, Server, name_of  # noqa: E402
 import fakeagent  # noqa: E402
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pty"))
+import fakeclaude  # noqa: E402
+
 RUNDIR = "/tmp/rmx-logredact"
 FAILURES = []
 
@@ -67,6 +70,11 @@ SUBMIT_SECRET = "the-signing-key-is-lobster-SUBMIT"
 # A body the CLI sends with `--deliver submit --wait`, typed by the server:
 # both the client's and the server's log could hold it.
 CLI_SUBMIT_SECRET = "the-badge-code-is-3141-CLI-SUBMIT"
+# A body a Stop hook hands to a fake Claude: `remux msg hook claude-stop`
+# prints it on stdout, which must never reach either log.
+HOOK_SECRET = "the-safe-combination-is-2718-HOOK"
+FAKECLAUDE = f"{RUNDIR}-bin/claude"
+HOOK_HOME = f"{RUNDIR}-home"
 # Outside the run dir, which `Server.start` wipes.
 FAKEAGENT = f"{RUNDIR}-bin/fakeagent"
 CONFIG = """
@@ -429,12 +437,53 @@ def run_cli_submit(srv, result):
     time.sleep(4.0)
 
 
+def run_hook(srv, result):
+    """11. A Stop hook delivers a body to a fake Claude in a pane of its own."""
+    ctl, log_path = f"{RUNDIR}/claude.ctl", f"{RUNDIR}/claude.log"
+    fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fixtures", "hooks")
+    os.makedirs(f"{HOOK_HOME}/.claude", exist_ok=True)
+    with open(f"{HOOK_HOME}/.claude/settings.json", "w") as f:
+        json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "timeout": 10,
+                   "command": "'" + os.path.realpath(BIN) + "' msg hook claude-stop || true"}]}]}}, f)
+    spawner = Client(srv.sock)
+    spawner.hello()
+    spawner.send({"CliSpawn": {"session": "main", "placement": "SplitBelow",
+                               "argv": [FAKECLAUDE, ctl, log_path, os.path.abspath(fixtures), BIN]}})
+    pane = None
+    for m in spawner.drain(3.0):
+        if name_of(m) == "CliSpawned":
+            pane = m["CliSpawned"]["pane_id"]
+            break
+    if pane is None:
+        spawner.close()
+        return
+    spawner.send({"CliSpawn": {"session": "main", "placement": "SplitBelow",
+                               "argv": [os.path.abspath(BIN), "msg", "send", f"%{pane}", HOOK_SECRET,
+                                        "--deliver", "mailbox"], "cwd": None}})
+    spawner.drain(1.5)
+    spawner.close()
+    with open(ctl + ".tmp", "w") as f:
+        f.write("stop\n")
+    os.replace(ctl + ".tmp", ctl)
+    end = time.time() + 20
+    while time.time() < end:
+        lines = open(log_path).read().splitlines() if os.path.exists(log_path) else []
+        if any('"ctl": "stop"' in ln for ln in lines):
+            result["hook_delivered"] = any(HOOK_SECRET in json.loads(ln).get("stdout", "")
+                                           for ln in lines if '"event": "stop"' in ln)
+            return
+        time.sleep(0.1)
+
+
 def main():
     # Findings that come from the WIRE rather than from the log, carried out of
     # `run` so the checks can be made after the server is stopped.
     result = {}
     os.makedirs(os.path.dirname(FAKEAGENT), exist_ok=True)
     fakeagent.install(FAKEAGENT)
+    fakeclaude.install(FAKECLAUDE)
+    # The server's panes, and so the fake Claude, read settings.json from here.
+    os.environ["HOME"] = HOOK_HOME
     srv = Server(RUNDIR).start(config=CONFIG)
     try:
         try:
@@ -443,6 +492,7 @@ def main():
             run_msg_cli(srv, result)
             run_submit(srv, result)
             run_cli_submit(srv, result)
+            run_hook(srv, result)
         except Exception as e:  # noqa: BLE001 -- the log is the point; reach it
             check(False, f"the run completed without an exception ({e!r})")
     finally:
@@ -604,6 +654,19 @@ def main():
         any("deliver=Submit" in ln and "wait=true" in ln and "timeout=Some(3000)" in ln for ln in sends)
         and "cmd: msg send answered MsgSent(" in client_log,
         f"10 ...but client.log names the send, its delivery and its wait flags (lines {sends})",
+    )
+
+    # 11. A body handed to a fake Claude by its Stop hook: delivered, in
+    #     neither log in any form, and the hook's count line is present.
+    check(
+        result.get("hook_delivered") is True,
+        "11 the Stop hook really printed the body for the fake Claude",
+    )
+    leaked = [form for form in leak_forms(HOOK_SECRET) if form in log or form in client_log]
+    check(not leaked, f"11 a body the hook delivered is in neither log (found {leaked})")
+    check(
+        "cmd: msg hook claude-stop -> 1 queued, acked 1" in client_log,
+        "11 ...but client.log names the hook and its counts",
     )
 
     # 5. ListDirectory: logged on CHANGE, not on every 2s poll.

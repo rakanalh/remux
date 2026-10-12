@@ -2969,6 +2969,22 @@ pub fn prepare_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// `dir`, created 0700 if it is missing, then refused unless it is a private
+/// directory of ours, by the rules the socket's fallback directory follows.
+pub fn private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    check_private_dir(dir, own_uid())
+}
+
 /// Whether `dir` is a directory, not a symlink, owned by `uid`, and closed to
 /// group and other.
 fn check_private_dir(dir: &std::path::Path, uid: u32) -> Result<()> {
@@ -7757,7 +7773,7 @@ async fn load_mailbox(server: &RemuxServer) {
         now_ms(),
     );
     log::info!(
-        "mailbox: restored {} message(s), {} name(s); pruned {} for closed panes, {} expired, {} invalid, {} over a cap, {} name(s); repaired {} session label(s); pane ids reserved through %{high_water}",
+        "mailbox: restored {} message(s), {} name(s); pruned {} for closed panes, {} expired, {} invalid, {} over a cap, {} name(s); repaired {} session label(s); dropped {} reserved sender name(s); pane ids reserved through %{high_water}",
         restored.message_count(),
         restored.name_count(),
         pruned.dead_pane,
@@ -7765,7 +7781,8 @@ async fn load_mailbox(server: &RemuxServer) {
         pruned.invalid,
         pruned.over_cap,
         pruned.names,
-        pruned.relabelled
+        pruned.relabelled,
+        pruned.unnamed
     );
     *messaging().lock().await = restored;
     SAVED_HIGH_WATER.store(high_water, Ordering::Relaxed);

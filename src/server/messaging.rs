@@ -83,7 +83,10 @@ impl Refusal {
         match self {
             Refusal::BadAddress(why) => why.clone(),
             Refusal::BadName(name) => {
-                format!("bad name {name:?}: use [a-z][a-z0-9_-]{{0,31}}")
+                format!(
+                    "bad name {name:?}: {}",
+                    crate::protocol::bad_name_reason(name)
+                )
             }
             Refusal::NameTaken { name, holder } => format!("name {name:?} is held by %{holder}"),
             Refusal::NoSuchTarget(target) => format!("no such target: {target}"),
@@ -480,6 +483,9 @@ pub struct Pruned {
     /// a session's name, which its creator chose, so it is made valid
     /// rather than costing the message.
     pub relabelled: usize,
+    /// Messages kept with their sender's name removed, because the name is
+    /// now reserved. The mail was sent under a name that was valid then.
+    pub unnamed: usize,
 }
 
 /// Remove from `queue`, in order, the entries `take` picks, moving nothing
@@ -610,9 +616,19 @@ impl Messaging {
                     pruned.relabelled += 1;
                 }
             }
+            let (Sender::Pane { name, .. } | Sender::Remote { name, .. }) = &mut msg.from;
+            let unnamed = name
+                .as_deref()
+                .is_some_and(|n| crate::protocol::reserved_part(n).is_some());
+            if unnamed {
+                *name = None;
+            }
             if !seen.insert(msg.id) || !valid_stored(&msg, &limits) {
                 pruned.invalid += 1;
                 continue;
+            }
+            if unnamed {
+                pruned.unnamed += 1;
             }
             if !alive(msg.to) {
                 pruned.dead_pane += 1;
@@ -3064,6 +3080,41 @@ mod tests {
             })
             .collect();
         assert_eq!(sessions, ["s\u{FFFD}[2J", "main\u{FFFD}", "main"]);
+    }
+
+    #[test]
+    fn restore_drops_a_reserved_name_and_keeps_the_mail() {
+        let mut from_user = stored(1, 2, "kept");
+        from_user.from = Sender::Pane {
+            pane_id: 1,
+            name: Some("user".into()),
+            session: "main".into(),
+        };
+        // Invalid for another reason (a control character): counted invalid,
+        // not as a name removed from mail that was kept.
+        let mut invalid_from_user = stored(3, 2, "bad\u{1b}body");
+        invalid_from_user.from = from_user.from.clone();
+        let mut f = file_of(vec![
+            from_user,
+            stored(2, 2, "also kept"),
+            invalid_from_user,
+        ]);
+        f.names = vec![(2, "user".into()), (1, "alpha".into())]
+            .into_iter()
+            .collect();
+        let (r, pruned) = Messaging::restore(limits(), f, |_| true, HashSet::new(), 0);
+        assert_eq!(
+            (pruned.unnamed, pruned.invalid, pruned.names),
+            (1, 1, 1),
+            "{pruned:?}"
+        );
+        assert_eq!(r.mailboxes[&2].messages.len(), 2, "the mail is kept");
+        assert!(matches!(
+            &r.mailboxes[&2].messages[0].from,
+            Sender::Pane { name: None, .. }
+        ));
+        assert_eq!(r.name_of(2), None, "the reserved name is dropped");
+        assert_eq!(r.name_of(1), Some("alpha"));
     }
 
     #[test]
