@@ -1231,9 +1231,20 @@ async fn step_submit(
             return;
         }
     };
-    let envelope = rule
-        .envelope
-        .then(|| crate::server::submit::envelope(id, entry.from_pane, entry.from_name.as_deref()));
+    // A mark per typing, never stored: the body was written before it.
+    let envelope = match rule.envelope.then(crate::client::msg_cli::render_mark) {
+        None => None,
+        Some(Some(mark)) => Some(crate::server::submit::envelope(
+            id,
+            entry.from_pane,
+            entry.from_name.as_deref(),
+            &mark,
+        )),
+        Some(None) => {
+            let answer = settle(entry.deliver, SubmitRefusal::no_mark(pane));
+            return answer_untyped(entry, answer, None, store).await;
+        }
+    };
     let command = sample.command.clone().unwrap_or_default();
     let typed = type_text(
         id,
@@ -1241,7 +1252,7 @@ async fn step_submit(
         &sample,
         &command,
         &entry.body,
-        envelope.as_deref(),
+        envelope.as_ref(),
         &rule,
         entry.deliver,
         config,
@@ -1679,7 +1690,7 @@ async fn type_text(
     sample: &PaneSample,
     command: &str,
     body: &str,
-    envelope: Option<&str>,
+    envelope: Option<&crate::server::submit::Envelope>,
     rule: &crate::server::submit::SubmitRule,
     deliver: Deliver,
     config: &Config,

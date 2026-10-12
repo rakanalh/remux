@@ -257,6 +257,12 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                 "cmd: msg read pane={pane:?} all={all} peek={peek} wait={:?}",
                 wait.map(|w| w.as_millis())
             );
+            // Drawn before the read: a read marks the mail it returns, so
+            // a mark that failed after it would leave mail read and unshown.
+            let mark = match format {
+                Format::Json => String::new(),
+                Format::Text | Format::Context => render_mark().ok_or_else(no_mark)?,
+            };
             let cap = Duration::from_millis(crate::server::daemon::MAX_WAIT_MS);
             let deadline = wait.map_or(REPLY_DEADLINE, |w| w.min(cap) + REPLY_DEADLINE);
             let answer = ask(
@@ -294,10 +300,8 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                                 "timed_out": timed_out, "marked": marked
                             }))
                         ),
-                        Format::Text => print!("{}", render_text(&messages, &render_mark())),
-                        Format::Context => {
-                            print!("{}", render_context(&messages, &render_mark()))
-                        }
+                        Format::Text => print!("{}", render_text(&messages, &mark)),
+                        Format::Context => print!("{}", render_context(&messages, &mark)),
                     }
                     Ok(())
                 }
@@ -532,6 +536,14 @@ fn advice(reason: &str) -> Option<&'static str> {
     })
 }
 
+/// The refusal when no random source answered (see [`render_mark`]).
+pub(crate) fn no_mark() -> CliError {
+    CliError::Refused {
+        code: "no_randomness".into(),
+        message: "no random source answered, so the mail cannot be marked; nothing was read".into(),
+    }
+}
+
 fn sent_line(id: MsgId, pane: PaneId, name: Option<&str>, outcome: Outcome) -> String {
     let named = name
         .map(|n| format!(" ({})", escape(n)))
@@ -604,15 +616,39 @@ fn body_block(msg: &Message, mark: &str) -> String {
     out
 }
 
-/// A mark for one render: 64 bits from the standard library's randomly
-/// keyed hasher, which the OS seeds. It only has to be unguessable by
-/// whoever wrote a body before the render.
-pub(crate) fn render_mark() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let hash = std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish();
-    format!("{hash:016x}")
+/// A mark for one render or one typing: 64 bits from the OS's
+/// cryptographic random source, as 16 hex digits. It has to be unguessable
+/// by whoever wrote a body, which a sender can mint as many of as it likes.
+/// `None` when no random source answered: a caller must then show or type
+/// nothing, because a predictable mark is a forgeable one.
+pub(crate) fn render_mark() -> Option<String> {
+    let mut bytes = [0u8; 8];
+    if !os_random(&mut bytes) {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .ok()?;
+    }
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(target_os = "linux")]
+fn os_random(buf: &mut [u8]) -> bool {
+    // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes.
+    let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+    n == buf.len() as isize
+}
+
+#[cfg(target_os = "macos")]
+fn os_random(buf: &mut [u8]) -> bool {
+    // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes, and
+    // getentropy takes at most 256.
+    unsafe { libc::getentropy(buf.as_mut_ptr().cast(), buf.len()) == 0 }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn os_random(_: &mut [u8]) -> bool {
+    false
 }
 
 fn sender(msg: &Message) -> (String, String) {
@@ -1111,8 +1147,9 @@ mod tests {
 
     #[test]
     fn each_render_draws_a_new_mark() {
-        let (a, b) = (render_mark(), render_mark());
+        let (a, b) = (render_mark().unwrap(), render_mark().unwrap());
         assert_ne!(a, b);
+        assert!(b.len() == 16 && b.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(
             a.len() == 16 && a.chars().all(|c| c.is_ascii_hexdigit()),
             "{a}"

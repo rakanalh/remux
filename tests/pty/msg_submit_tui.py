@@ -297,7 +297,9 @@ try:
         probe, closed, joined = found
         enter = got[closed + 1] if closed + 1 < len(got) else None
         gap = (enter[0] - got[closed][0]) / 1e6 if enter else None
-        framed = joined.startswith(OPEN) and joined.endswith(b"\nGO:hello" + CLOSE) and b"# [remux message #" in joined
+        framed = re.fullmatch(
+            re.escape(OPEN) + rb"# \[remux message #(\d+) from [^\n]*, mark ([0-9a-f]{16}); reply: [^\n]*\]"
+            rb"\nGO:hello\n# \[end of remux message #\1, mark \2\]" + re.escape(CLOSE), joined, re.S)
         check(framed and enter is not None and enter[1] == b"\r" and gap >= 290,
               f"D1 B read the message as one paste, then the Enter alone {gap and round(gap)} ms later "
               f"(paste {joined!r}, then {enter and enter[1]!r})")

@@ -439,6 +439,17 @@ impl SubmitRefusal {
         }
     }
 
+    /// No random source answered for the envelope's mark, and a predictable
+    /// mark is a forgeable one, so nothing is typed.
+    pub fn no_mark(pane: PaneId) -> Self {
+        SubmitRefusal {
+            code: "no_randomness",
+            message: format!(
+                "no random source answered for the envelope's mark, so nothing was typed into %{pane}: it is in the mailbox"
+            ),
+        }
+    }
+
     pub fn too_many_lines(pane: PaneId, max: usize) -> Self {
         SubmitRefusal {
             code: "too_many_lines",
@@ -558,17 +569,38 @@ pub fn split_chunks(content: &[u8], tail: &[u8], max: usize) -> Vec<Vec<u8>> {
     chunks
 }
 
-/// The line typed before a message's body: which message it is, who sent it
-/// and how to answer. `from_name` is a validated agent name, escaped all the
-/// same because the line reaches a terminal.
-pub fn envelope(id: crate::protocol::MsgId, from_pane: PaneId, from_name: Option<&str>) -> String {
+/// The lines typed around a message's body. A body can contain a copy of the
+/// opening line, so the opening line alone cannot say where the sender's
+/// text ends. Both lines carry the same `mark`, drawn for this typing, which
+/// the body was written before and so cannot know: a closing line with any
+/// other mark is part of the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+    /// Which message it is, who sent it, its mark and how to answer.
+    pub open: String,
+    /// `# [end of remux message #N, mark M]`: a comment, like the opening
+    /// line, to a shell left holding it at its prompt.
+    pub close: String,
+}
+
+/// The envelope for message `id`. `from_name` is a validated agent name,
+/// escaped all the same because the line reaches a terminal.
+pub fn envelope(
+    id: crate::protocol::MsgId,
+    from_pane: PaneId,
+    from_name: Option<&str>,
+    mark: &str,
+) -> Envelope {
     let from = match from_name {
         Some(name) => format!("{} (%{from_pane})", crate::client::cli_common::escape(name)),
         None => format!("%{from_pane}"),
     };
-    format!(
-        "# [remux message #{id} from {from}; reply: remux msg send %{from_pane} --reply-to {id}]"
-    )
+    Envelope {
+        open: format!(
+            "# [remux message #{id} from {from}, mark {mark}; reply: remux msg send %{from_pane} --reply-to {id}]"
+        ),
+        close: format!("# [end of remux message #{id}, mark {mark}]"),
+    }
 }
 
 /// Whether a newline typed into the pane stays inside the message: only when
@@ -581,16 +613,17 @@ pub fn newlines_safe(framing: Framing, paste_live: bool) -> bool {
 
 /// The two writes for `body`: the text, with its wrap and `focus_in` first
 /// when asked, and the Enter, which the caller writes separately after its
-/// delay. The envelope opens the text, on a line of its own when newlines
-/// are safe (see [`newlines_safe`]) and before the body on the same line
-/// otherwise, where a newline would submit the envelope alone.
+/// delay. The envelope's lines open and close the text, inside the wrap and
+/// before the Enter: each on a line of its own when newlines are safe (see
+/// [`newlines_safe`]), and on the body's line otherwise, where a newline
+/// would submit a line on its own.
 pub fn encode(
     body: &str,
     framing: Framing,
     paste_live: bool,
     focus_in: bool,
     enter: &[u8],
-    envelope: Option<&str>,
+    envelope: Option<&Envelope>,
 ) -> (Vec<u8>, Vec<u8>) {
     let mut text = Vec::with_capacity(body.len() + 128);
     if focus_in {
@@ -599,15 +632,20 @@ pub fn encode(
     if framing == Framing::Bracketed {
         text.extend_from_slice(PASTE_OPEN);
     }
-    if let Some(line) = envelope {
-        text.extend_from_slice(line.as_bytes());
-        if newlines_safe(framing, paste_live) {
+    let lines = newlines_safe(framing, paste_live);
+    if let Some(envelope) = envelope {
+        text.extend_from_slice(envelope.open.as_bytes());
+        if lines {
             text.push(b'\n');
         } else {
             text.extend_from_slice(" \u{2014} ".as_bytes());
         }
     }
     text.extend_from_slice(body.as_bytes());
+    if let Some(envelope) = envelope {
+        text.push(if lines { b'\n' } else { b' ' });
+        text.extend_from_slice(envelope.close.as_bytes());
+    }
     if framing == Framing::Bracketed {
         text.extend_from_slice(PASTE_CLOSE);
     }
@@ -805,37 +843,47 @@ mod tests {
     }
 
     #[test]
-    fn the_envelope_names_the_message_its_sender_and_the_reply() {
+    fn the_envelope_names_the_message_its_sender_its_mark_and_the_reply() {
         assert_eq!(
-            envelope(7, 1, Some("lead")),
-            "# [remux message #7 from lead (%1); reply: remux msg send %1 --reply-to 7]"
+            envelope(7, 1, Some("lead"), "5eed"),
+            Envelope {
+                open: "# [remux message #7 from lead (%1), mark 5eed; reply: remux msg send %1 --reply-to 7]".into(),
+                close: "# [end of remux message #7, mark 5eed]".into(),
+            }
         );
         assert_eq!(
-            envelope(8, 3, None),
-            "# [remux message #8 from %3; reply: remux msg send %3 --reply-to 8]"
+            envelope(8, 3, None, "5eed").open,
+            "# [remux message #8 from %3, mark 5eed; reply: remux msg send %3 --reply-to 8]"
         );
         assert_eq!(
-            envelope(9, 3, Some("a\u{1b}b")),
-            "# [remux message #9 from a\\x1bb (%3); reply: remux msg send %3 --reply-to 9]"
+            envelope(9, 3, Some("a\u{1b}b"), "5eed").open,
+            "# [remux message #9 from a\\x1bb (%3), mark 5eed; reply: remux msg send %3 --reply-to 9]"
         );
     }
 
+    fn env() -> Envelope {
+        Envelope {
+            open: "[env]".into(),
+            close: "[end]".into(),
+        }
+    }
+
     #[test]
-    fn the_envelope_opens_the_paste_on_a_line_of_its_own() {
-        let (text, _) = encode("hi", Framing::Bracketed, true, false, b"\r", Some("[env]"));
-        assert_eq!(text, b"\x1b[200~[env]\nhi\x1b[201~");
+    fn the_envelope_opens_and_closes_the_paste_on_lines_of_their_own() {
+        let (text, _) = encode("hi", Framing::Bracketed, true, false, b"\r", Some(&env()));
+        assert_eq!(text, b"\x1b[200~[env]\nhi\n[end]\x1b[201~");
     }
 
     #[test]
     fn a_forced_wrap_keeps_the_envelope_on_the_bodys_line() {
-        let (text, _) = encode("hi", Framing::Bracketed, false, false, b"\r", Some("[env]"));
-        assert_eq!(text, "\x1b[200~[env] \u{2014} hi\x1b[201~".as_bytes());
+        let (text, _) = encode("hi", Framing::Bracketed, false, false, b"\r", Some(&env()));
+        assert_eq!(text, "\x1b[200~[env] \u{2014} hi [end]\x1b[201~".as_bytes());
     }
 
     #[test]
     fn plain_text_keeps_the_envelope_on_the_bodys_line() {
-        let (text, _) = encode("hi", Framing::Plain, true, false, b"\r", Some("[env]"));
-        assert_eq!(text, "[env] \u{2014} hi".as_bytes());
+        let (text, _) = encode("hi", Framing::Plain, true, false, b"\r", Some(&env()));
+        assert_eq!(text, "[env] \u{2014} hi [end]".as_bytes());
         assert!(!text.contains(&b'\n'));
     }
 

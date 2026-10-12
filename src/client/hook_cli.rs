@@ -395,6 +395,10 @@ async fn hook(event: HookEvent) -> Result<Delivery, String> {
         ));
     }
     let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
+    // Rendered before the ack, which marks the mail: a render that failed
+    // after it would lose mail the model never saw.
+    let rendered =
+        render(&messages).ok_or("no random source answered, so the mail cannot be marked")?;
     // A harness seam, in debug builds only: pause between the peek and the
     // ack for `REMUX_HOOK_DELAY_MS` (at most 3 s, inside the hook's deadline),
     // so a test can acknowledge the mailbox in between. A release build never
@@ -455,7 +459,7 @@ async fn hook(event: HookEvent) -> Result<Delivery, String> {
     // marked must be shown, and a message someone else marked in between is
     // shown once more, a duplicate rather than a loss.
     Ok(Delivery {
-        out: output_for(event, &render(&messages)),
+        out: output_for(event, &rendered),
         note,
         store: counter.map(|c| (c, count)),
     })
@@ -473,8 +477,8 @@ fn lose_the_reply(acked: Result<ServerMessage, CliError>) -> Result<ServerMessag
     acked
 }
 
-fn render(messages: &[Message]) -> String {
-    render_context(messages, &render_mark())
+fn render(messages: &[Message]) -> Option<String> {
+    Some(render_context(messages, &render_mark()?))
 }
 
 #[cfg(test)]
@@ -511,7 +515,7 @@ mod tests {
 
     #[test]
     fn stop_output_is_a_block_with_the_render_as_reason() {
-        let rendered = render(&[from_pane(1), from_pane(2)]);
+        let rendered = render(&[from_pane(1), from_pane(2)]).unwrap();
         let out = output_for(HookEvent::ClaudeStop, &rendered).unwrap();
         assert!(!out.contains('\n'), "one line on stdout: {out}");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -526,7 +530,7 @@ mod tests {
 
     #[test]
     fn prompt_output_wraps_the_render_in_hook_specific_output() {
-        let rendered = render(&[from_pane(1)]);
+        let rendered = render(&[from_pane(1)]).unwrap();
         let out = output_for(HookEvent::ClaudePrompt, &rendered).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
@@ -560,7 +564,10 @@ mod tests {
 
     #[test]
     fn an_empty_mailbox_prints_nothing() {
-        assert_eq!(output_for(HookEvent::ClaudeStop, &render(&[])), None);
+        assert_eq!(
+            output_for(HookEvent::ClaudeStop, &render(&[]).unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -684,7 +691,7 @@ mod tests {
             },
             "hi",
         );
-        let out = output_for(HookEvent::ClaudeStop, &render(&[remote])).unwrap();
+        let out = output_for(HookEvent::ClaudeStop, &render(&[remote]).unwrap()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(
             parsed["reason"]
