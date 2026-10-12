@@ -27,6 +27,9 @@ taken by rename, so none is lost; each is acknowledged with `{"ctl": cmd}` in
   stop:keepfeeding    the same, and after every block send this pane one new
                       message (a sender mailing once per Stop)
   stop:once=<file>    run the Stop hooks once with <file> as the payload
+  prompt              run the UserPromptSubmit hooks with a prompt payload
+  prompt:wrong        run them with a Stop payload, as a swapped settings
+                      entry would
   env:<K>=<V>         set a variable for later hook runs
   unenv:<K>           remove it
   name:<name>         run `remux agent name <name>` from this pane, recording
@@ -176,6 +179,10 @@ def main():
                 stop(True)
             elif cmd.startswith("stop:once="):
                 run("Stop", cmd[len("stop:once="):], "stop")
+            elif cmd == "prompt":
+                run("UserPromptSubmit", os.path.join(fixtures, "claude_prompt.json"), "prompt")
+            elif cmd == "prompt:wrong":
+                run("UserPromptSubmit", os.path.join(fixtures, "claude_stop.json"), "prompt")
             elif cmd.startswith("env:"):
                 key, _, value = cmd[4:].partition("=")
                 env[key] = value

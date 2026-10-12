@@ -1,5 +1,7 @@
-//! `remux msg hook claude-stop`: Claude Code's `Stop` hook, which hands an
-//! agent the mail that arrived while it worked.
+//! `remux msg hook claude-stop | claude-prompt`: Claude Code's `Stop` hook,
+//! which hands an agent the mail that arrived while it worked, and its
+//! `UserPromptSubmit` hook, which puts queued mail beside the prompt its user
+//! just submitted.
 //!
 //! A hook must never fail or hang the agent. Every outcome exits 0, and every
 //! soft failure (no server, an unverified caller, a timeout, a payload that is
@@ -29,12 +31,15 @@ use crate::protocol::{ClientMessage, Message, PaneId, ServerMessage};
 pub enum HookEvent {
     /// Claude Code's `Stop`: the turn is about to end
     ClaudeStop,
+    /// Claude Code's `UserPromptSubmit`: the user submitted a prompt
+    ClaudePrompt,
 }
 
 impl HookEvent {
     fn verb(self) -> &'static str {
         match self {
             HookEvent::ClaudeStop => "claude-stop",
+            HookEvent::ClaudePrompt => "claude-prompt",
         }
     }
 
@@ -42,6 +47,7 @@ impl HookEvent {
     fn event_name(self) -> &'static str {
         match self {
             HookEvent::ClaudeStop => "Stop",
+            HookEvent::ClaudePrompt => "UserPromptSubmit",
         }
     }
 }
@@ -153,6 +159,12 @@ fn output_for(event: HookEvent, rendered: &str) -> Option<String> {
     }
     let out = match event {
         HookEvent::ClaudeStop => serde_json::json!({ "decision": "block", "reason": rendered }),
+        HookEvent::ClaudePrompt => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": rendered,
+            }
+        }),
     };
     Some(out.to_string())
 }
@@ -348,7 +360,12 @@ async fn hook(event: HookEvent) -> Result<Delivery, String> {
     let ServerMessage::MsgList { pane, messages, .. } = answer else {
         return Err(format!("unexpected {} answer", answer.variant_name()));
     };
-    let counter = Counter::load(pane);
+    // Only a Stop continues a turn, so only a Stop counts continuations. A
+    // prompt is the user's own turn, and delivers what the cap held back.
+    let counter = match event {
+        HookEvent::ClaudeStop => Counter::load(pane),
+        HookEvent::ClaudePrompt => None,
+    };
     if messages.is_empty() {
         log::debug!(
             "cmd: msg hook {} -> 0 queued, stop_hook_active={}",
@@ -362,7 +379,10 @@ async fn hook(event: HookEvent) -> Result<Delivery, String> {
         });
     }
     let stored = counter.as_ref().map_or(0, |c| c.stored);
-    let (deliver, count) = continuation_verdict(payload.stop_hook_active, stored);
+    let (deliver, count) = match event {
+        HookEvent::ClaudeStop => continuation_verdict(payload.stop_hook_active, stored),
+        HookEvent::ClaudePrompt => (true, 0),
+    };
     if !deliver {
         log::debug!(
             "cmd: msg hook {} -> {} queued, held: {MAX_CONTINUATIONS} continuations in a row",
@@ -502,6 +522,40 @@ mod tests {
             "the render verbatim, newlines and quotes too"
         );
         assert!(reason.starts_with(RENDER_PREAMBLE));
+    }
+
+    #[test]
+    fn prompt_output_wraps_the_render_in_hook_specific_output() {
+        let rendered = render(&[from_pane(1)]);
+        let out = output_for(HookEvent::ClaudePrompt, &rendered).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"],
+            rendered.as_str()
+        );
+        assert!(parsed.get("additionalContext").is_none() && parsed.get("decision").is_none());
+        assert_eq!(output_for(HookEvent::ClaudePrompt, ""), None);
+    }
+
+    #[test]
+    fn a_stop_payload_on_the_prompt_verb_is_a_soft_failure() {
+        let stop = parse_payload(br#"{"hook_event_name":"Stop"}"#).unwrap();
+        let why = check_event(HookEvent::ClaudePrompt, &stop).unwrap_err();
+        assert!(why.contains("UserPromptSubmit"), "{why}");
+        let prompt = parse_payload(
+            br#"{"hook_event_name":"UserPromptSubmit","prompt":"a secret the user typed"}"#,
+        )
+        .unwrap();
+        assert!(check_event(HookEvent::ClaudePrompt, &prompt).is_ok());
+        assert!(
+            !format!("{prompt:?}").contains("secret"),
+            "the prompt is not held"
+        );
+        assert!(check_event(HookEvent::ClaudeStop, &prompt).is_err());
     }
 
     #[test]
