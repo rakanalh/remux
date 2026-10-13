@@ -15,12 +15,17 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
   eatsend  a correct handshake and peer link, then exit on the first send,
            unanswered: the send was written and its outcome is unknown
   mute     the same, but stay open and never answer the send
+  hostile  a far server that pushes messages back: one MsgInbound before
+           its Pong (req 100), then, once the dialler forwards a send (which
+           it answers), each frame in $RMX_SHIM_PUSH with "$PANE" and
+           "$MINTED" replaced by that send's origin pane and id; every
+           MsgInboundAck it gets is appended to $RMX_SHIM_ACKS, one per line
 
 Before the relay, the shim lists its own open descriptors to `$RMX_SHIM_FDS`:
 the relay inherits exactly these, and decision 71 says they are 0, 1 and 2.
 
-Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute`) it is the
-far side of the link for the modes that need no real server.
+Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute|hostile`) it
+is the far side of the link for the modes that need no real server.
 """
 import json
 import os
@@ -41,6 +46,7 @@ case "$mode" in
   oldpeer) exec "$RMX_PY" "$RMX_SHIM_PY" oldpeer ;;
   eatsend) exec "$RMX_PY" "$RMX_SHIM_PY" eatsend ;;
   mute)    exec "$RMX_PY" "$RMX_SHIM_PY" mute ;;
+  hostile) exec "$RMX_PY" "$RMX_SHIM_PY" hostile ;;
 esac
 """
 
@@ -70,6 +76,8 @@ def main(mode):
     _write_frame(stdout, {"protocol_version": version, "remux_version": f"shim-{mode}"})
     if mode == "oldpeer":
         _read_frame(stdin)
+    if mode == "hostile":
+        return _hostile(stdin, stdout)
     if mode in ("eatsend", "mute"):
         # The far server answers a PeerLink only to refuse it, and the ping
         # after it with a Pong, which is what tells the dialler the link is up.
@@ -82,6 +90,41 @@ def main(mode):
             elif "MsgSend" in frame and mode == "eatsend":
                 return 0
     return 0
+
+
+def _filled(frame, pane, minted):
+    """`frame` with "$PANE" and "$MINTED" replaced, wherever they are."""
+    text = json.dumps(frame).replace('"$PANE"', str(pane)).replace('"$MINTED"', str(minted))
+    return json.loads(text)
+
+
+def _hostile(stdin, stdout):
+    early = {"MsgInbound": {"to": {"Pane": 1}, "body": "early", "deliver": "Mailbox",
+                            "reply_to": None, "req": 100,
+                            "origin": {"host": "x", "pane_id": 1, "name": None, "session": "s", "id": 1}}}
+    pushed = False
+    while True:
+        frame = _read_frame(stdin)
+        if frame is None:
+            return 0
+        if "Ping" in frame:
+            _write_frame(stdout, early)
+            _write_frame(stdout, {"Pong": {"nonce": frame["Ping"]["nonce"]}})
+        elif "MsgSend" in frame and not pushed:
+            send = frame["MsgSend"]
+            _write_frame(stdout, {"MsgSent": {
+                "id": 1, "to": {"host": None, "pane_id": 1, "name": None},
+                "delivery": "Mailbox", "reason": None, "timed_out": False,
+                "final_state": None, "req": send.get("req")}})
+            origin = send["origin"]
+            with open(os.environ["RMX_SHIM_PUSH"]) as f:
+                frames = json.load(f)
+            for push in frames:
+                _write_frame(stdout, _filled(push, origin["pane_id"], origin["id"]))
+            pushed = True
+        elif "MsgInboundAck" in frame:
+            with open(os.environ["RMX_SHIM_ACKS"], "a") as f:
+                f.write(json.dumps(frame["MsgInboundAck"]) + "\n")
 
 
 if __name__ == "__main__":

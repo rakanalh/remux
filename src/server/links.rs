@@ -21,8 +21,10 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::RemoteConfig;
-use crate::protocol::{valid_host, ClientMessage, ServerMessage};
+use crate::config::{Inbound, RemoteConfig};
+use crate::protocol::{
+    valid_host, ClientMessage, Deliver, MsgId, MsgRef, Origin, PaneId, ServerMessage, Target,
+};
 
 /// What a forward is answered with: the far server's own answer, or why
 /// there is none.
@@ -54,6 +56,76 @@ pub struct LinkSpec {
     pub host_name: String,
     pub dial: Duration,
     pub ping_ms: u64,
+    /// Where a message the far server sends back over this link goes to be
+    /// stored, answered with the ack to write back. `None` refuses every one.
+    pub on_inbound: Option<InboundTx>,
+}
+
+/// A message that came back over a dialled link, and where its ack goes.
+pub type InboundItem = (InboundRequest, oneshot::Sender<InboundAck>);
+pub type InboundTx = mpsc::Sender<InboundItem>;
+pub type InboundRx = mpsc::Receiver<InboundItem>;
+
+/// How many messages that came back over one link may wait for their acks at
+/// once. Past it the far server is answered `queue_full` at once, so a peer
+/// pushing faster than this server stores costs a refusal, not a queue.
+pub const INBOUND_IN_FLIGHT: usize = 8;
+
+/// A `MsgInbound` that arrived over a link this server dialled, for the
+/// daemon to gate by `inbound`, store, and answer.
+#[derive(Debug)]
+pub struct InboundRequest {
+    /// The `[remotes]` key of the link it came over: the sender's host.
+    pub link: String,
+    pub policy: Inbound,
+    pub to: Target,
+    pub body: String,
+    pub deliver: Deliver,
+    pub reply_to: Option<MsgRef>,
+    pub origin: Origin,
+}
+
+/// What an inbound message came to: stored under `id` in `pane_id`'s
+/// mailbox, or refused with `code`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboundAck {
+    pub id: Option<MsgId>,
+    pub pane_id: Option<PaneId>,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+impl InboundAck {
+    pub fn refused(code: &str, message: impl Into<String>) -> Self {
+        InboundAck {
+            code: Some(code.to_string()),
+            message: Some(message.into()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Where a send to `host` goes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Route {
+    /// Back over the live link `host` holds open to this server: the
+    /// connection's client id.
+    Inbound(u64),
+    /// Over a link this server dials to `[remotes.<host>]`.
+    Dial,
+    /// Neither exists.
+    Neither,
+}
+
+/// A live inbound link from `host` wins over a `[remotes.<host>]` entry: the
+/// reply goes back over the connection the sender already holds open, and
+/// no second ssh is made.
+pub fn route_for(inbound: Option<u64>, has_remote: bool) -> Route {
+    match (inbound, has_remote) {
+        (Some(client_id), _) => Route::Inbound(client_id),
+        (None, true) => Route::Dial,
+        (None, false) => Route::Neither,
+    }
 }
 
 /// A link that must be dialled: the caller spawns [`run_link`] with these,
@@ -109,11 +181,43 @@ pub struct Links {
     /// closed queue is a link whose task ended, which the next forward dials
     /// again.
     outbound: HashMap<String, mpsc::UnboundedSender<Forward>>,
+    /// Messages pushed back over an inbound link, waiting for their ack, by
+    /// `req`, with the connection they went out on.
+    pending: HashMap<u64, (u64, oneshot::Sender<InboundAck>)>,
+    next_req: u64,
 }
 
 impl Links {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The client id of the live inbound link named `name`.
+    pub fn live_inbound(&self, name: &str) -> Option<u64> {
+        self.inbound.get(name).map(|link| link.client_id)
+    }
+
+    /// A fresh `req` for a message pushed over `client_id`'s link, and where
+    /// its ack will arrive.
+    pub fn expect_ack(&mut self, client_id: u64) -> (u64, oneshot::Receiver<InboundAck>) {
+        self.next_req += 1;
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(self.next_req, (client_id, tx));
+        (self.next_req, rx)
+    }
+
+    /// The waiter for `req`, when the ack came over the link it was pushed
+    /// on: another connection cannot answer it.
+    pub fn take_ack(&mut self, client_id: u64, req: u64) -> Option<oneshot::Sender<InboundAck>> {
+        match self.pending.get(&req) {
+            Some((on, _)) if *on == client_id => self.pending.remove(&req).map(|(_, tx)| tx),
+            _ => None,
+        }
+    }
+
+    /// Stop waiting for `req`'s ack.
+    pub fn forget_ack(&mut self, req: u64) {
+        self.pending.remove(&req);
     }
 
     /// The name `client_id` declared, if its connection is a peer link.
@@ -185,6 +289,8 @@ impl Links {
     /// Forget `client_id`'s link, if it had one, when its connection closes:
     /// the name it held is free again.
     pub fn drop_client(&mut self, client_id: u64) -> Option<String> {
+        // Its pushes will never be acked: their waiters learn so at once.
+        self.pending.retain(|_, (on, _)| *on != client_id);
         let name = self.peer_name(client_id)?.to_string();
         self.inbound.remove(&name);
         Some(name)
@@ -194,19 +300,18 @@ impl Links {
 /// The longest message from the far server this server repeats.
 const FAR_MESSAGE_MAX: usize = 300;
 
+/// Whether `code` is spelled like a refusal code, `[a-z_]{1,32}`: the only
+/// code from the far server this server repeats or logs.
+pub fn code_like(code: &str) -> bool {
+    (1..=32).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
 /// A refusal's code and message from the far server, as this server repeats
 /// them: the code only when it is spelled like one (else `error`), the
 /// message escaped and cut to [`FAR_MESSAGE_MAX`] characters. Both are the
 /// far server's to write, and land in a reply and a log.
 pub fn far_refusal(code: Option<&str>, message: &str) -> (String, String) {
-    let code = code
-        .filter(|c| {
-            (1..=32).contains(&c.len())
-                && c.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        })
-        .unwrap_or("error")
-        .to_string();
+    let code = code.filter(|c| code_like(c)).unwrap_or("error").to_string();
     let message = crate::client::cli_common::escape(message)
         .chars()
         .take(FAR_MESSAGE_MAX)
@@ -325,7 +430,7 @@ pub async fn run_link((spec, mut rx): Dial) {
         crate::client::cli_common::escape(&up.stamp),
         crate::protocol::PROTOCOL_VERSION
     );
-    let reason = serve(&key, up, &mut rx).await;
+    let reason = serve(&spec, up, &mut rx).await;
     log::info!("link {key}: down ({reason})");
     fail_queued(&mut rx, &format!("{key}: {reason}"));
 }
@@ -396,15 +501,22 @@ fn frame_variant(bytes: &[u8]) -> String {
     )
 }
 
-/// Hand each frame the far server sends to `tx` until the link ends.
+/// How many frames from the far server wait for the link task. A bound,
+/// not a convenience: a far server that floods the link and stops reading
+/// its own input stalls the link task's writes, and only a full queue
+/// pushes back through ssh rather than growing without end.
+const FRAMES_QUEUE: usize = 64;
+
+/// Hand each frame the far server sends to `tx` until the link ends,
+/// waiting while `tx` is full.
 async fn pump_frames(
     key: String,
     mut reader: impl tokio::io::AsyncRead + Unpin,
-    tx: mpsc::UnboundedSender<ServerMessage>,
+    tx: mpsc::Sender<ServerMessage>,
 ) {
     let mut skipped = false;
     while let Ok(Some(frame)) = next_frame(&key, &mut reader, &mut skipped).await {
-        if tx.send(frame).is_err() {
+        if tx.send(frame).await.is_err() {
             break;
         }
     }
@@ -414,7 +526,7 @@ struct Up {
     stamp: String,
     _child: tokio::process::Child,
     writer: tokio::process::ChildStdin,
-    frames: mpsc::UnboundedReceiver<ServerMessage>,
+    frames: mpsc::Receiver<ServerMessage>,
 }
 
 /// ssh, the handshake, and the `PeerLink` declaration, which the far server
@@ -485,6 +597,17 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
                         "{key} refused the peer link: {message}"
                     )));
                 }
+                // The link is not up until the Pong: a message pushed
+                // before it is refused, never stored or left unanswered.
+                Ok(Some(ServerMessage::MsgInbound { req, .. })) => {
+                    let ack = inbound_ack(
+                        req,
+                        InboundAck::refused("route_unavailable", "link not up yet"),
+                    );
+                    write_message(&mut writer, &ack)
+                        .await
+                        .map_err(|e| DialError::from(format!("{e:#}")))?;
+                }
                 Ok(Some(_)) => continue,
                 Ok(None) => return Err("the connection closed".into()),
                 Err(e) => return Err(format!("{e:#}").into()),
@@ -513,7 +636,7 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
             });
         }
     };
-    let (frames_tx, frames) = mpsc::unbounded_channel();
+    let (frames_tx, frames) = mpsc::channel(FRAMES_QUEUE);
     tokio::spawn(pump_frames(key.clone(), reader, frames_tx));
     Ok(Up {
         stamp,
@@ -523,13 +646,79 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
     })
 }
 
-/// Carry forwards until the link is lost; the reason it was.
-async fn serve(key: &str, mut up: Up, rx: &mut mpsc::UnboundedReceiver<Forward>) -> String {
+/// The ack to write back for the `MsgInbound` `req`.
+fn inbound_ack(req: u64, ack: InboundAck) -> ClientMessage {
+    ClientMessage::MsgInboundAck {
+        req,
+        id: ack.id,
+        pane_id: ack.pane_id,
+        code: ack.code,
+        message: ack.message,
+    }
+}
+
+/// The messages that came back over one link and wait for their acks.
+#[derive(Default)]
+struct InboundSlots {
+    taken: usize,
+}
+
+impl InboundSlots {
+    /// Hand `request` to `on_inbound` for its ack, or the refusal to write
+    /// back at once: no handler, [`INBOUND_IN_FLIGHT`] already waiting on
+    /// this link, or the handler's queue full. A taken slot is given back by
+    /// [`Self::release`] when its ack is written.
+    fn admit(
+        &mut self,
+        on_inbound: Option<&InboundTx>,
+        request: InboundRequest,
+    ) -> Result<oneshot::Receiver<InboundAck>, InboundAck> {
+        let Some(tx) = on_inbound else {
+            return Err(InboundAck::refused(
+                "origin_not_allowed",
+                "this server takes no messages over its links",
+            ));
+        };
+        if self.taken >= INBOUND_IN_FLIGHT {
+            return Err(InboundAck::refused(
+                "queue_full",
+                format!("{INBOUND_IN_FLIGHT} messages already wait on this link"),
+            ));
+        }
+        let (reply, answered) = oneshot::channel();
+        if tx.try_send((request, reply)).is_err() {
+            return Err(InboundAck::refused(
+                "queue_full",
+                "this server is storing too many messages from its links",
+            ));
+        }
+        self.taken += 1;
+        Ok(answered)
+    }
+
+    fn release(&mut self) {
+        self.taken = self.taken.saturating_sub(1);
+    }
+}
+
+/// Carry forwards until the link is lost, and hand each message the far
+/// server sends back to `spec.on_inbound`; the reason the link was lost.
+async fn serve(spec: &LinkSpec, mut up: Up, rx: &mut mpsc::UnboundedReceiver<Forward>) -> String {
     use crate::server::daemon::write_message;
 
+    let key = spec.key.as_str();
     let mut in_flight = InFlight::default();
+    let mut slots = InboundSlots::default();
+    // Every ack comes from a taken slot, so the slots bound this channel.
+    let (acks_tx, mut acks) = mpsc::channel::<ClientMessage>(INBOUND_IN_FLIGHT);
     let reason = loop {
         tokio::select! {
+            Some(ack) = acks.recv() => {
+                slots.release();
+                if let Err(e) = write_message(&mut up.writer, &ack).await {
+                    break format!("write failed: {e:#}");
+                }
+            }
             fwd = rx.recv() => {
                 let Some(fwd) = fwd else { break "closed".to_string() };
                 let Some((req, fwd)) = in_flight.admit(fwd) else { continue };
@@ -544,6 +733,33 @@ async fn serve(key: &str, mut up: Up, rx: &mut mpsc::UnboundedReceiver<Forward>)
             frame = up.frames.recv() => match frame {
                 Some(answer @ (ServerMessage::MsgSent { .. } | ServerMessage::Error { .. })) => {
                     in_flight.answer(answer);
+                }
+                Some(ServerMessage::MsgInbound { to, body, deliver, reply_to, origin, req }) => {
+                    let request = InboundRequest {
+                        link: key.to_string(),
+                        policy: spec.remote.inbound,
+                        to,
+                        body,
+                        deliver,
+                        reply_to,
+                        origin,
+                    };
+                    match slots.admit(spec.on_inbound.as_ref(), request) {
+                        Ok(answered) => {
+                            let acks_tx = acks_tx.clone();
+                            tokio::spawn(async move {
+                                let ack = answered.await.unwrap_or_else(|_| {
+                                    InboundAck::refused("route_unavailable", "the receiving server could not take it")
+                                });
+                                let _ = acks_tx.send(inbound_ack(req, ack)).await;
+                            });
+                        }
+                        Err(refused) => {
+                            if let Err(e) = write_message(&mut up.writer, &inbound_ack(req, refused)).await {
+                                break format!("write failed: {e:#}");
+                            }
+                        }
+                    }
                 }
                 // Pongs and the far server's broadcasts to every
                 // connection: dropped, with no line per frame.
@@ -569,7 +785,42 @@ mod tests {
             host_name: "laptop".into(),
             dial: Duration::from_secs(1),
             ping_ms: 1000,
+            on_inbound: None,
         }
+    }
+
+    #[test]
+    fn route_for_prefers_a_live_inbound_link_over_a_remotes_entry() {
+        assert_eq!(route_for(Some(7), true), Route::Inbound(7));
+        assert_eq!(route_for(Some(7), false), Route::Inbound(7));
+    }
+
+    #[test]
+    fn route_for_falls_back_to_remotes() {
+        assert_eq!(route_for(None, true), Route::Dial);
+    }
+
+    #[test]
+    fn route_for_names_both_misses() {
+        assert_eq!(route_for(None, false), Route::Neither);
+    }
+
+    #[test]
+    fn an_ack_is_taken_only_from_the_link_it_was_pushed_on() {
+        let mut links = Links::new();
+        let (req, _rx) = links.expect_ack(7);
+        assert!(links.take_ack(8, req).is_none());
+        assert!(links.take_ack(7, req).is_some());
+        assert!(links.take_ack(7, req).is_none(), "taken once");
+    }
+
+    #[tokio::test]
+    async fn a_closed_link_fails_its_pending_acks_at_once() {
+        let mut links = Links::new();
+        links.declare("laptop", 7, PING).unwrap();
+        let (_, rx) = links.expect_ack(7);
+        links.drop_client(7);
+        assert!(rx.await.is_err());
     }
 
     fn fwd() -> (Forward, oneshot::Receiver<Answer>) {
@@ -756,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn a_frame_this_build_cannot_decode_is_skipped_not_the_end_of_the_link() {
         let (mut far, near) = tokio::io::duplex(4096);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(4);
         let reader = tokio::spawn(pump_frames("mini".into(), near, tx));
         write_frame(&mut far, r#"{"SomeVariantFromANewerServer":{"x":1}}"#).await;
         write_frame(&mut far, r#"{"Pong":{"nonce":7}}"#).await;
@@ -778,6 +1029,25 @@ mod tests {
             ),
             "{got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_frame_queue_stops_the_reader_until_it_is_drained() {
+        let (mut far, near) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel(1);
+        let reader = tokio::spawn(pump_frames("mini".into(), near, tx));
+        for nonce in 0..3 {
+            write_frame(&mut far, &format!(r#"{{"Pong":{{"nonce":{nonce}}}}}"#)).await;
+        }
+        drop(far);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!reader.is_finished(), "the reader waits on the full queue");
+        let mut got = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            got.push(frame);
+        }
+        reader.await.unwrap();
+        assert_eq!(got.len(), 3, "nothing was dropped to make room");
     }
 
     #[test]
@@ -825,6 +1095,65 @@ mod tests {
         assert_eq!(long.chars().count(), FAR_MESSAGE_MAX);
         let (_, esc) = far_refusal(Some("x"), "a\u{1b}[31mb\nc");
         assert!(!esc.contains('\u{1b}') && !esc.contains('\n'), "{esc:?}");
+    }
+
+    fn inbound_request() -> InboundRequest {
+        InboundRequest {
+            link: "mini".into(),
+            policy: crate::config::Inbound::Replies,
+            to: crate::protocol::Target::Pane(1),
+            body: "RE".into(),
+            deliver: crate::protocol::Deliver::Mailbox,
+            reply_to: None,
+            origin: Origin {
+                host: "mini".into(),
+                pane_id: 2,
+                name: None,
+                session: "main".into(),
+                id: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_link_holds_at_most_its_cap_of_inbound_messages_waiting() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut slots = InboundSlots::default();
+        let mut waiting = Vec::new();
+        for _ in 0..INBOUND_IN_FLIGHT {
+            waiting.push(
+                slots
+                    .admit(Some(&tx), inbound_request())
+                    .expect("under the cap"),
+            );
+        }
+        let over = slots.admit(Some(&tx), inbound_request()).unwrap_err();
+        assert_eq!(over.code.as_deref(), Some("queue_full"));
+        slots.release();
+        assert!(
+            slots.admit(Some(&tx), inbound_request()).is_ok(),
+            "an ack frees a slot"
+        );
+    }
+
+    #[test]
+    fn a_full_handler_queue_is_refused_not_waited_on() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut slots = InboundSlots::default();
+        assert!(slots.admit(Some(&tx), inbound_request()).is_ok());
+        let full = slots.admit(Some(&tx), inbound_request()).unwrap_err();
+        assert_eq!(full.code.as_deref(), Some("queue_full"));
+        assert_eq!(slots.taken, 1, "a refused one takes no slot");
+        let none = slots.admit(None, inbound_request()).unwrap_err();
+        assert_eq!(none.code.as_deref(), Some("origin_not_allowed"));
+    }
+
+    #[test]
+    fn a_code_is_lowercase_letters_and_underscores() {
+        assert!(code_like("mailbox_full"));
+        for odd in ["", "Mailbox", "a1", "a b", &"a".repeat(33)] {
+            assert!(!code_like(odd), "{odd:?}");
+        }
     }
 
     #[test]

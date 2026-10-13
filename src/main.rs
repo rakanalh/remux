@@ -7338,7 +7338,8 @@ async fn run_client_loop(
                     | Some(ServerMessage::AgentNamed { .. })
                     | Some(ServerMessage::AgentStatusList { .. })
                     | Some(ServerMessage::AgentWaited { .. })
-                    | Some(ServerMessage::Pong { .. }) => {
+                    | Some(ServerMessage::Pong { .. })
+                    | Some(ServerMessage::MsgInbound { .. }) => {
                         log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {

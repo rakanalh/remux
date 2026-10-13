@@ -136,14 +136,36 @@ enum SenderKey {
         pane_id: PaneId,
     },
     /// Everything one peer link delivered, whatever pane each message names:
-    /// the bound a peer cannot escape by rotating its sender's pane id.
-    Link(String),
+    /// the bound a peer cannot escape by rotating its sender's pane id. A
+    /// link that declared itself here, and one this server dialled, are
+    /// counted apart, since a declared name can equal a `[remotes]` key.
+    InboundLink(String),
+    DialledLink(String),
+}
+
+/// Which side of a link a message arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSide {
+    /// A peer link that declared itself to this server.
+    Inbound,
+    /// A link this server dialled to one of its `[remotes]`.
+    Dialled,
+}
+
+impl LinkSide {
+    fn key(self, link: &str) -> SenderKey {
+        match self {
+            LinkSide::Inbound => SenderKey::InboundLink(link.to_string()),
+            LinkSide::Dialled => SenderKey::DialledLink(link.to_string()),
+        }
+    }
 }
 
 /// A message that arrived over a peer link: the link's declared name, its
 /// rate, and the sending server's reference for the message.
 pub struct Arrival<'a> {
     pub link: &'a str,
+    pub side: LinkSide,
     pub link_rate_per_10s: u32,
     pub origin: MsgRef,
 }
@@ -370,7 +392,26 @@ pub struct Messaging {
     /// the order they parked, so a pane's sample is checked against its own
     /// waits only.
     state_waits: BTreeMap<PaneId, Vec<StateWait>>,
+    /// Ids minted for forwards, by (link, sending pane), oldest first, with
+    /// when each expires. Persisted, since a reply routinely outlives a
+    /// restart of the server it answers.
+    minted: HashMap<(String, PaneId), VecDeque<MintedId>>,
 }
+
+/// One id minted for a forward: when it expires, and how many replies to it
+/// have been admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MintedId {
+    id: MsgId,
+    expires_ms: u64,
+    replies: u32,
+}
+
+/// How many replies one forwarded message admits under `inbound =
+/// "replies"`. An id is not used up by its first reply, since an agent may
+/// answer in parts (a note, then the result), but it is not a standing
+/// channel either.
+pub const MAX_REPLIES_PER_ID: u32 = 8;
 
 /// What `mailbox.json` holds. Waiters, rate windows and the closed-pane set are
 /// deliberately absent: the first two die with their connections, and the
@@ -385,6 +426,35 @@ pub struct MailboxFile {
     pub pane_high_water: PaneId,
     pub names: Vec<(PaneId, String)>,
     pub messages: Vec<Message>,
+    /// The ids minted for messages forwarded over a link, by link and pane,
+    /// which a reply over that link must name (see [`Messaging::check_reply`]).
+    #[serde(default)]
+    pub minted: Vec<Minted>,
+}
+
+/// An id minted for a message forwarded from `pane` over `link`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Minted {
+    pub link: String,
+    pub pane: PaneId,
+    pub id: MsgId,
+    pub expires_ms: u64,
+    /// The replies admitted to it so far.
+    #[serde(default)]
+    pub replies: u32,
+}
+
+/// Why a reply over a link was not admitted under `inbound = "replies"`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplyGate {
+    /// Nothing was forwarded from that pane over that link.
+    NoForward,
+    /// The id was not minted for that pane over that link.
+    NotMinted(MsgId),
+    /// It was, but its message has expired.
+    Expired(MsgId),
+    /// It has had [`MAX_REPLIES_PER_ID`] replies already.
+    Exhausted(MsgId),
 }
 
 pub const MAILBOX_FILE_VERSION: u32 = 1;
@@ -556,6 +626,7 @@ impl Messaging {
             submit_waits: BTreeMap::new(),
             state_waits: BTreeMap::new(),
             in_flight: HashMap::new(),
+            minted: HashMap::new(),
         }
     }
 
@@ -606,6 +677,7 @@ impl Messaging {
             .map(|m| m.to)
             .chain(senders)
             .chain(names.iter().map(|(pane, _)| *pane))
+            .chain(self.minted.keys().map(|(_, pane)| *pane))
             .max()
             .unwrap_or(0);
         MailboxFile {
@@ -614,6 +686,23 @@ impl Messaging {
             pane_high_water,
             names,
             messages,
+            minted: {
+                let mut minted: Vec<Minted> = self
+                    .minted
+                    .iter()
+                    .flat_map(|((link, pane), ids)| {
+                        ids.iter().map(move |m| Minted {
+                            link: link.clone(),
+                            pane: *pane,
+                            id: m.id,
+                            expires_ms: m.expires_ms,
+                            replies: m.replies,
+                        })
+                    })
+                    .collect();
+                minted.sort_by_key(|m| m.id);
+                minted
+            },
         }
     }
 
@@ -691,6 +780,20 @@ impl Messaging {
                 store.names.insert(name, pane);
             } else {
                 pruned.names += 1;
+            }
+        }
+        for minted in file.minted {
+            let expires_ms = minted.expires_ms.min(now_ms.saturating_add(limits.ttl_ms));
+            if alive(minted.pane) && valid_host(&minted.link) && expires_ms > now_ms {
+                store
+                    .minted
+                    .entry((minted.link, minted.pane))
+                    .or_default()
+                    .push_back(MintedId {
+                        id: minted.id,
+                        expires_ms,
+                        replies: minted.replies.min(MAX_REPLIES_PER_ID),
+                    });
             }
         }
         store.closed = closed;
@@ -1215,6 +1318,113 @@ impl Messaging {
         Ok(())
     }
 
+    /// [`Self::mint_id`] for a message forwarded from `pane` over `link`,
+    /// remembered until it expires so that a reply naming it is admitted
+    /// (`inbound = "replies"`). At most `max_messages` per pane and link,
+    /// the oldest forgotten first.
+    pub fn mint_for(&mut self, link: &str, pane: PaneId, now_ms: u64) -> MsgId {
+        let id = self.mint_id();
+        let expires_ms = now_ms.saturating_add(self.limits.ttl_ms);
+        let cap = self.limits.max_messages.max(1);
+        let ids = self.minted.entry((link.to_string(), pane)).or_default();
+        ids.push_back(MintedId {
+            id,
+            expires_ms,
+            replies: 0,
+        });
+        while ids.len() > cap {
+            ids.pop_front();
+        }
+        id
+    }
+
+    /// Whether a reply over `link` to `pane` names an id minted for a
+    /// forward from that pane over that link, not yet expired, and short of
+    /// [`MAX_REPLIES_PER_ID`] replies. It counts nothing: a reply is counted
+    /// by [`Self::count_reply`] once it is stored, so a refusal after the gate
+    /// (a full mailbox, a body too large) does not use up the budget. An id
+    /// is not used up by one reply: one message may be answered in parts.
+    pub fn check_reply(
+        &mut self,
+        link: &str,
+        pane: PaneId,
+        reply_to: MsgId,
+        now_ms: u64,
+    ) -> Result<(), ReplyGate> {
+        let key = (link.to_string(), pane);
+        let Some(ids) = self.minted.get_mut(&key) else {
+            return Err(ReplyGate::NoForward);
+        };
+        let verdict = match ids.iter_mut().find(|m| m.id == reply_to) {
+            Some(m) if m.expires_ms <= now_ms => Err(ReplyGate::Expired(reply_to)),
+            Some(m) if m.replies >= MAX_REPLIES_PER_ID => Err(ReplyGate::Exhausted(reply_to)),
+            Some(_) => Ok(()),
+            None => Err(ReplyGate::NotMinted(reply_to)),
+        };
+        ids.retain(|m| m.expires_ms > now_ms);
+        let empty = ids.is_empty();
+        if empty {
+            self.minted.remove(&key);
+        }
+        match verdict {
+            Err(ReplyGate::NotMinted(_)) if empty => Err(ReplyGate::NoForward),
+            verdict => verdict,
+        }
+    }
+
+    /// Count a stored reply against the id [`Self::check_reply`] admitted it
+    /// on. Called under the same lock as the store, so no reply is stored
+    /// uncounted.
+    pub fn count_reply(&mut self, link: &str, pane: PaneId, reply_to: MsgId) {
+        let minted = self
+            .minted
+            .get_mut(&(link.to_string(), pane))
+            .and_then(|ids| ids.iter_mut().find(|m| m.id == reply_to));
+        if let Some(m) = minted {
+            m.replies = m.replies.saturating_add(1);
+            self.touched();
+        }
+    }
+
+    /// Room on the dialled link `link` for one more message under
+    /// `per_10s`, without counting one.
+    pub fn link_has_room(&mut self, link: &str, per_10s: u32, now: Instant) -> Result<(), Refusal> {
+        self.drop_old_windows(now);
+        let key = LinkSide::Dialled.key(link);
+        if Self::window_full(&mut self.rate, &key, per_10s, now) {
+            return Err(Refusal::LinkRateLimited {
+                link: link.to_string(),
+                per_10s,
+            });
+        }
+        Ok(())
+    }
+
+    /// Count a message refused before it was stored against the dialled
+    /// link it came over, as a stored one is counted, so a peer cannot send
+    /// refusals for free.
+    pub fn charge_link(&mut self, link: &str, now: Instant) {
+        self.rate
+            .entry(LinkSide::Dialled.key(link))
+            .or_default()
+            .push_back(now);
+    }
+
+    /// The size and character checks a send makes on `body`, for a body that
+    /// leaves for another server and is not stored here.
+    pub fn check_body(&self, body: &str) -> Result<(), Refusal> {
+        if body.len() > self.limits.max_body {
+            return Err(Refusal::MessageTooLarge {
+                bytes: body.len(),
+                max: self.limits.max_body,
+            });
+        }
+        if let Some((at_byte, character)) = control_character(body) {
+            return Err(Refusal::BadBody { character, at_byte });
+        }
+        Ok(())
+    }
+
     /// A fresh message id with nothing stored under it, for a message
     /// forwarded to another server. Marked for saving, so a restart cannot
     /// issue it again while it sits in the other server's thread.
@@ -1308,7 +1518,7 @@ impl Messaging {
 
         self.drop_old_windows(now);
         if let Some(arrival) = &arrival {
-            let link = SenderKey::Link(arrival.link.to_string());
+            let link = arrival.side.key(arrival.link);
             if Self::window_full(&mut self.rate, &link, arrival.link_rate_per_10s, now) {
                 return Err(Refusal::LinkRateLimited {
                     link: arrival.link.to_string(),
@@ -1334,7 +1544,7 @@ impl Messaging {
         self.rate.entry(key).or_default().push_back(now);
         let origin = arrival.map(|arrival| {
             self.rate
-                .entry(SenderKey::Link(arrival.link.to_string()))
+                .entry(arrival.side.key(arrival.link))
                 .or_default()
                 .push_back(now);
             arrival.origin
@@ -1532,6 +1742,7 @@ impl Messaging {
         let named = self.name_of(pane).map(str::to_string);
         self.names.retain(|_, holder| *holder != pane);
         self.rate.remove(&SenderKey::Pane(pane));
+        self.minted.retain(|(_, from), _| *from != pane);
         self.closed.insert(pane);
         if messages > 0 || named.is_some() {
             self.touched();
@@ -1879,6 +2090,7 @@ mod tests {
     fn arrival(link: &str, per_10s: u32, id: MsgId) -> Arrival<'_> {
         Arrival {
             link,
+            side: LinkSide::Inbound,
             link_rate_per_10s: per_10s,
             origin: MsgRef {
                 host: Some(link.to_string()),
@@ -2016,6 +2228,138 @@ mod tests {
                 host: Some("laptop".into()),
                 id: 17
             })
+        );
+    }
+
+    #[test]
+    fn a_reply_must_name_an_id_minted_for_that_pane_over_that_link() {
+        let mut m = Messaging::new(limits());
+        let id = m.mint_for("mini", 4, 0);
+        let other = m.mint_for("mini2", 4, 0);
+        assert_eq!(m.check_reply("mini", 4, id, 1), Ok(()));
+        assert_eq!(
+            m.check_reply("mini", 4, id, 2),
+            Ok(()),
+            "an id is not used up"
+        );
+        assert_eq!(
+            m.check_reply("mini", 4, 999, 1),
+            Err(ReplyGate::NotMinted(999))
+        );
+        assert_eq!(
+            m.check_reply("mini", 4, other, 1),
+            Err(ReplyGate::NotMinted(other))
+        );
+        assert_eq!(m.check_reply("mini", 5, id, 1), Err(ReplyGate::NoForward));
+        assert_eq!(
+            m.check_reply("mini2", 4, id, 1),
+            Err(ReplyGate::NotMinted(id))
+        );
+    }
+
+    #[test]
+    fn an_id_admits_eight_replies_and_counts_them_across_a_restore() {
+        let mut m = Messaging::new(limits());
+        let id = m.mint_for("mini", 4, 0);
+        for n in 0..5 {
+            assert_eq!(m.check_reply("mini", 4, id, 1), Ok(()), "reply {n}");
+            m.count_reply("mini", 4, id);
+        }
+        let (mut r, _) = Messaging::restore(limits(), m.snapshot(), |_| true, HashSet::new(), 1);
+        for n in 5..MAX_REPLIES_PER_ID {
+            assert_eq!(r.check_reply("mini", 4, id, 1), Ok(()), "reply {n}");
+            r.count_reply("mini", 4, id);
+        }
+        assert_eq!(
+            r.check_reply("mini", 4, id, 1),
+            Err(ReplyGate::Exhausted(id))
+        );
+        let next = r.mint_for("mini", 4, 1);
+        assert_eq!(
+            r.check_reply("mini", 4, next, 1),
+            Ok(()),
+            "a new id has its own count"
+        );
+    }
+
+    #[test]
+    fn only_a_stored_reply_counts_against_its_id() {
+        let mut m = Messaging::new(limits());
+        let id = m.mint_for("mini", 4, 0);
+        for _ in 0..MAX_REPLIES_PER_ID * 2 {
+            assert_eq!(
+                m.check_reply("mini", 4, id, 1),
+                Ok(()),
+                "checked, never stored"
+            );
+        }
+        for _ in 0..MAX_REPLIES_PER_ID {
+            m.count_reply("mini", 4, id);
+        }
+        assert_eq!(
+            m.check_reply("mini", 4, id, 1),
+            Err(ReplyGate::Exhausted(id))
+        );
+    }
+
+    #[test]
+    fn refusals_charged_to_a_dialled_link_use_up_its_rate() {
+        let mut m = Messaging::new(limits());
+        let now = Instant::now();
+        for _ in 0..3 {
+            assert!(m.link_has_room("mini", 3, now).is_ok());
+            m.charge_link("mini", now);
+        }
+        assert!(matches!(
+            m.link_has_room("mini", 3, now),
+            Err(Refusal::LinkRateLimited { .. })
+        ));
+        assert!(m.link_has_room("other", 3, now).is_ok());
+    }
+
+    #[test]
+    fn a_minted_id_expires_and_dies_with_its_pane() {
+        let mut m = Messaging::new(Limits {
+            ttl_ms: 1_000,
+            ..limits()
+        });
+        let id = m.mint_for("mini", 4, 0);
+        let second = m.mint_for("mini", 4, 500);
+        assert_eq!(
+            m.check_reply("mini", 4, id, 1_200),
+            Err(ReplyGate::Expired(id))
+        );
+        assert_eq!(m.check_reply("mini", 4, second, 1_200), Ok(()));
+        m.drop_pane(4);
+        assert_eq!(
+            m.check_reply("mini", 4, second, 1_200),
+            Err(ReplyGate::NoForward)
+        );
+    }
+
+    #[test]
+    fn minted_ids_survive_a_restore() {
+        let mut m = Messaging::new(limits());
+        let id = m.mint_for("mini", 4, 0);
+        m.mint_for("mini", 7, 0);
+        let mut f = m.snapshot();
+        f.minted.push(Minted {
+            link: "-oProxyCommand".into(),
+            pane: 4,
+            id: 99,
+            expires_ms: u64::MAX,
+            replies: 0,
+        });
+        let (mut r, _) = Messaging::restore(limits(), f, |pane| pane == 4, HashSet::new(), 10);
+        assert_eq!(r.check_reply("mini", 4, id, 10), Ok(()));
+        assert_eq!(
+            r.check_reply("mini", 7, id, 10),
+            Err(ReplyGate::NoForward),
+            "pane 7 is gone"
+        );
+        assert_eq!(
+            r.check_reply("-oProxyCommand", 4, 99, 10),
+            Err(ReplyGate::NoForward)
         );
     }
 
@@ -3327,6 +3671,7 @@ mod tests {
             pane_high_water: 0,
             names: Vec::new(),
             messages,
+            minted: Vec::new(),
         }
     }
 

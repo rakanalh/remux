@@ -147,8 +147,10 @@ pub enum ConnDescriptor {
 /// that connection, which is the skew 13 describes, and only the finished
 /// branch is released. Remote messaging extended 18 the same way:
 /// [`ClientMessage::PeerLink`] and [`ClientMessage::Ping`] with
-/// [`ServerMessage::Pong`], and `MsgSend`'s `origin` and `req`, `MsgSent`'s
-/// and `Error`'s `req`, and [`Message`]'s `origin`, all `#[serde(default)]`.
+/// [`ServerMessage::Pong`], [`ServerMessage::MsgInbound`] with
+/// [`ClientMessage::MsgInboundAck`], and `MsgSend`'s `origin` and `req`,
+/// `MsgSent`'s and `Error`'s `req`, and [`Message`]'s `origin`, all
+/// `#[serde(default)]`.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -722,6 +724,22 @@ pub enum ClientMessage {
     /// a connection is answered in order, a pong also says that every request
     /// sent before the ping has been answered.
     Ping { nonce: u64 },
+    /// The answer to a [`ServerMessage::MsgInbound`] with the same `req`,
+    /// from the server that dialled the link: the id it stored the message
+    /// under and the pane it went to, or the `code` and `message` it was
+    /// refused with. `pane_id` because only the receiver can say which pane a
+    /// name meant.
+    MsgInboundAck {
+        req: u64,
+        #[serde(default)]
+        id: Option<MsgId>,
+        #[serde(default)]
+        pane_id: Option<PaneId>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+    },
 }
 
 fn default_ping_ms() -> u64 {
@@ -992,6 +1010,19 @@ pub enum ServerMessage {
     },
     /// The answer to a [`ClientMessage::Ping`].
     Pong { nonce: u64 },
+    /// A message for a pane on the server that dialled this link, pushed to
+    /// that link's connection alone: a reply going back the way the message
+    /// it answers came. A request, not a stored [`Message`], since only the
+    /// receiver can resolve `to`. Answered with
+    /// [`ClientMessage::MsgInboundAck`] carrying the same `req`.
+    MsgInbound {
+        to: Target,
+        body: String,
+        deliver: Deliver,
+        reply_to: Option<MsgRef>,
+        origin: Origin,
+        req: u64,
+    },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -1578,6 +1609,7 @@ impl ServerMessage {
             ServerMessage::AgentStatusList { .. } => "AgentStatusList",
             ServerMessage::AgentWaited { .. } => "AgentWaited",
             ServerMessage::Pong { .. } => "Pong",
+            ServerMessage::MsgInbound { .. } => "MsgInbound",
             ServerMessage::DirectoryListing { .. } => "DirectoryListing",
             ServerMessage::AgentList { .. } => "AgentList",
             ServerMessage::SessionTree { .. } => "SessionTree",
@@ -1607,7 +1639,8 @@ impl ServerMessage {
             | ServerMessage::SessionBorderStyle { .. }
             | ServerMessage::AgentList { .. }
             | ServerMessage::PaneContent { .. }
-            | ServerMessage::ViewList { .. } => true,
+            | ServerMessage::ViewList { .. }
+            | ServerMessage::MsgInbound { .. } => true,
             ServerMessage::SessionList { .. }
             | ServerMessage::Error { .. }
             | ServerMessage::ScrollbackContent { .. }
@@ -2858,6 +2891,60 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_inbound_message_round_trips_and_is_a_push() {
+        let inbound = ServerMessage::MsgInbound {
+            to: Target::Name("lead".into()),
+            body: "RE:one".into(),
+            deliver: Deliver::Mailbox,
+            reply_to: Some(MsgRef {
+                host: Some("laptop".into()),
+                id: 4,
+            }),
+            origin: Origin {
+                host: "mini".into(),
+                pane_id: 2,
+                name: Some("beta".into()),
+                session: "main".into(),
+                id: 9,
+            },
+            req: 3,
+        };
+        let json = serde_json::to_value(&inbound).unwrap();
+        let back: ServerMessage = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+        assert!(
+            back.is_push(),
+            "a reader waiting for an answer must skip it"
+        );
+        assert_eq!(back.variant_name(), "MsgInbound");
+    }
+
+    #[test]
+    fn an_inbound_ack_needs_only_its_req() {
+        let ack: ClientMessage = serde_json::from_str(r#"{"MsgInboundAck":{"req":3}}"#).unwrap();
+        assert!(matches!(
+            ack,
+            ClientMessage::MsgInboundAck {
+                req: 3,
+                id: None,
+                pane_id: None,
+                code: None,
+                message: None
+            }
+        ));
+        let stored = ClientMessage::MsgInboundAck {
+            req: 3,
+            id: Some(12),
+            pane_id: Some(1),
+            code: None,
+            message: None,
+        };
+        let json = serde_json::to_value(&stored).unwrap();
+        let back: ClientMessage = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
     }
 
     #[test]

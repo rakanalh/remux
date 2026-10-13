@@ -592,8 +592,13 @@ fn sent_line(
         Delivery::Forwarded => match &host {
             Some(host) => {
                 return format!(
-                    "sent #{id} to {host}:%{pane}{}: forwarded to {host}, stored in its mailbox",
+                    "sent #{id} to {host}:%{pane}{}: forwarded to {host}, stored in its mailbox{}",
                     name.map(|n| format!(" ({})", escape(n)))
+                        .unwrap_or_default(),
+                    outcome
+                        .reason
+                        .as_deref()
+                        .map(|r| format!(" ({})", escape(r)))
                         .unwrap_or_default()
                 )
             }
@@ -732,10 +737,10 @@ fn reply_command(msg: &Message) -> Option<String> {
         Sender::Remote { host, pane_id, .. } if valid_host(host) => format!("{host}:%{pane_id}"),
         Sender::Remote { .. } => return None,
     };
-    Some(format!(
-        "remux msg send {target} --reply-to {} --stdin",
-        msg.id
-    ))
+    // A message that came over a link is answered with the SENDING server's
+    // id for it: this server's id means nothing there.
+    let id = msg.origin.as_ref().map_or(msg.id, |origin| origin.id);
+    Some(format!("remux msg send {target} --reply-to {id} --stdin"))
 }
 
 /// The line that opens every text and context render of mail. A message is
@@ -1196,6 +1201,32 @@ origin: None,
         };
         assert!(render_context(&[msg], MARK)
             .contains("Reply with: remux msg send lab-2.local:%1 --reply-to 7 --stdin\n"));
+    }
+
+    #[test]
+    fn reply_command_uses_the_origin_id_across_a_link() {
+        let mut msg = hostile();
+        msg.from = Sender::Remote {
+            host: "laptop".into(),
+            pane_id: 3,
+            name: None,
+        };
+        msg.origin = Some(MsgRef {
+            host: Some("laptop".into()),
+            id: 41,
+        });
+        assert_eq!(
+            reply_command(&msg).as_deref(),
+            Some("remux msg send laptop:%3 --reply-to 41 --stdin")
+        );
+    }
+
+    #[test]
+    fn reply_command_uses_the_local_id_at_home() {
+        let msg = hostile();
+        assert!(reply_command(&msg)
+            .unwrap()
+            .ends_with(&format!("--reply-to {} --stdin", msg.id)));
     }
 
     #[test]

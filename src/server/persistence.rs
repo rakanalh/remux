@@ -389,6 +389,7 @@ mod tests {
                 pane_high_water: 12,
                 names: vec![(3, "alpha".into())],
                 messages: Vec::new(),
+                minted: Vec::new(),
             }
         }
 
