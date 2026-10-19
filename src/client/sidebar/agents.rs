@@ -25,6 +25,8 @@
 //! pane, which is the same class of bug the identity-preserving selection
 //! exists to prevent.
 
+use std::collections::HashMap;
+
 use crossterm::event::{KeyEvent, MouseEventKind};
 
 use super::nav::{self, ListLayout, NavKey, NavList};
@@ -97,8 +99,9 @@ impl AgentRow {
     /// A name the user gave the pane, a `pane_title` template result or the
     /// pane's own title is shown whole, as [`AgentRow::label`] shows it. With
     /// none of those, the location is the name: the session, then ` · ` and the
-    /// tab index. The command is left out because the second line carries it.
-    pub fn flat_name(&self) -> (String, Option<String>) {
+    /// tab's name, or its index when `tab_name` is not known (a tree not yet
+    /// received). The command is left out because the second line carries it.
+    pub fn flat_name(&self, tab_name: Option<&str>) -> (String, Option<String>) {
         let titled = self.entry.custom_name.is_some()
             || self.pane_title.is_some()
             || self.entry.title.as_deref().is_some_and(|t| !t.is_empty());
@@ -107,7 +110,10 @@ impl AgentRow {
         }
         (
             self.entry.session.clone(),
-            Some(format!(" \u{b7} {}", self.entry.tab_index)),
+            Some(match tab_name.filter(|n| !n.is_empty()) {
+                Some(name) => format!(" \u{b7} {name}"),
+                None => format!(" \u{b7} {}", self.entry.tab_index),
+            }),
         )
     }
 
@@ -268,6 +274,10 @@ pub struct AgentsPlugin {
     /// whichever agent slid into that slot.
     current: Option<(ConnId, PaneId)>,
     nav: NavList,
+    /// Tab names from the session tree, keyed by connection, session and tab
+    /// index, so a flat row can name the tab the agent runs in. The agent list
+    /// itself carries only the index.
+    tab_names: HashMap<(ConnId, String, usize), String>,
 }
 
 impl AgentsPlugin {
@@ -277,7 +287,18 @@ impl AgentsPlugin {
             rows: Vec::new(),
             current: None,
             nav: NavList::new(),
+            tab_names: HashMap::new(),
         }
+    }
+
+    fn tab_name(&self, row: &AgentRow) -> Option<&str> {
+        self.tab_names
+            .get(&(
+                row.conn.clone(),
+                row.entry.session.clone(),
+                row.entry.tab_index,
+            ))
+            .map(String::as_str)
     }
 
     /// Paint one flat, two-line row at panel row `y`.
@@ -291,6 +312,7 @@ impl AgentsPlugin {
         y: u16,
         cols: u16,
         row: &AgentRow,
+        tab_name: Option<&str>,
         band: Option<&CellColor>,
         name_fg: CellColor,
         bold: bool,
@@ -316,7 +338,7 @@ impl AgentsPlugin {
             state_fg(row.entry.state, theme),
             bg.clone(),
         );
-        let (name, tail) = row.flat_name();
+        let (name, tail) = row.flat_name(tab_name);
         draw_text_with(grid, 3, y, &name, name_fg, bg.clone(), bold);
         if let Some(tail) = tail {
             let x = 3 + unicode_width::UnicodeWidthStr::width(name.as_str()) as u16;
@@ -473,7 +495,19 @@ impl SidebarPlugin for AgentsPlugin {
                 } else {
                     None
                 };
-                Self::paint_flat_row(&mut grid, y, cols, row, band.as_ref(), fg, bold, &bg, theme);
+                let tab_name = self.tab_name(row);
+                Self::paint_flat_row(
+                    &mut grid,
+                    y,
+                    cols,
+                    row,
+                    tab_name,
+                    band.as_ref(),
+                    fg,
+                    bold,
+                    &bg,
+                    theme,
+                );
                 continue;
             }
             let (fg, mut row_bg) = nav::row_colors(theme, focused, selected, &bg);
@@ -567,17 +601,34 @@ impl SidebarPlugin for AgentsPlugin {
                 if self.current.as_ref().is_some_and(|(c, _)| c == conn) {
                     self.current = None;
                 }
+                self.tab_names.retain(|(c, _, _), _| c != conn);
                 if self.roster.drop_conn(conn) {
                     self.rebuild();
                 }
             }
-            // The tree itself is the sessions panel's -- this panel subscribes
-            // to it only so the focused-pane event above is derived at all --
-            // the cwd is the `files` panel's half of that same walk, and the
-            // directory events are the `files` panel's too.
-            PluginEvent::SessionTree { .. }
-            | PluginEvent::FocusedCwd { .. }
-            | PluginEvent::DirectoryListing { .. } => {}
+            // The tree is the sessions panel's, but its tab names are what a
+            // flat row shows beside the session. The cwd is the `files`
+            // panel's half of the focused-pane walk, and the directory events
+            // are the `files` panel's too.
+            PluginEvent::SessionTree {
+                conn,
+                folders,
+                unfiled,
+                ..
+            } => {
+                self.tab_names.retain(|(c, _, _), _| c != conn);
+                let sessions = folders
+                    .iter()
+                    .flat_map(|f| f.sessions.iter())
+                    .chain(unfiled.iter());
+                for session in sessions {
+                    for (i, tab) in session.tabs.iter().enumerate() {
+                        self.tab_names
+                            .insert((conn.clone(), session.name.clone(), i), tab.name.clone());
+                    }
+                }
+            }
+            PluginEvent::FocusedCwd { .. } | PluginEvent::DirectoryListing { .. } => {}
             PluginEvent::PaneTitle { template } => {
                 self.roster.set_pane_title(template.clone());
                 self.rebuild();
@@ -1619,5 +1670,62 @@ mod tests {
         ));
         let out = painted(&p, 24, 4);
         assert_eq!(out[1], "\u{25CF} claude main/0");
+    }
+
+    fn tree_with_tab(conn: ConnId, session: &str, tab: &str) -> PluginEvent {
+        PluginEvent::SessionTree {
+            conn,
+            folders: Vec::new(),
+            dormant: Vec::new(),
+            unfiled: vec![crate::protocol::SessionTreeEntry {
+                name: session.to_string(),
+                tabs: vec![crate::protocol::TabTreeEntry {
+                    id: 1,
+                    name: tab.to_string(),
+                    panes: Vec::new(),
+                    is_active: true,
+                }],
+                client_count: 0,
+                is_current: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_flat_row_names_the_tab_from_the_session_tree() {
+        let mut p = flat_plugin(1);
+        assert_eq!(
+            painted(&p, 24, 6)[2],
+            " \u{25CF} s1 \u{b7} 0",
+            "no tree yet"
+        );
+        p.on_event(&tree_with_tab(ConnId::Local, "s1", "editor"));
+        assert_eq!(painted(&p, 24, 6)[2], " \u{25CF} s1 \u{b7} editor");
+        // Another machine's tab of the same session name is not this agent's.
+        p.on_event(&tree_with_tab(remote("mini"), "s1", "other"));
+        assert_eq!(painted(&p, 24, 6)[2], " \u{25CF} s1 \u{b7} editor");
+        p.on_event(&PluginEvent::ConnectionLost {
+            conn: ConnId::Local,
+        });
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "s1", AgentState::Working)],
+        ));
+        assert_eq!(
+            painted(&p, 24, 6)[2],
+            " \u{25CF} s1 \u{b7} 0",
+            "a lost connection's tab names are dropped"
+        );
+    }
+
+    #[test]
+    fn the_boxed_label_ignores_the_tree() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "s1", AgentState::Idle)],
+        ));
+        p.on_event(&tree_with_tab(ConnId::Local, "s1", "editor"));
+        assert_eq!(painted(&p, 24, 4)[1], "\u{25CF} claude s1/0");
     }
 }
