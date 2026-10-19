@@ -432,14 +432,19 @@ fn marker_name(server: &str, pane_id: PaneId, kind: NotifyKind) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Whether this client should send the event `name` stands for, by being the
-/// first to create its marker in `dir` within [`DEDUPE_WINDOW`].
+/// Whether the client with process id `pid` should send the event `name`
+/// stands for: no other client has claimed it within [`DEDUPE_WINDOW`].
 ///
 /// Every client attached to a server sees the same agent list and would
-/// otherwise each show the same notification. Best-effort by design: two
-/// clients that race past each other both deliver, and an I/O failure delivers,
-/// because a duplicate is a smaller fault than a lost notification.
-fn claim(dir: &Path, name: &str, now: SystemTime) -> bool {
+/// otherwise each show the same notification. The marker holds the pid of the
+/// client that wrote it, so that a fresh marker stops only OTHER clients. The
+/// same client sending the same event again inside the window, such as a second
+/// `needs_input` from the same pane, is a new event and is delivered.
+///
+/// Best-effort by design: two clients that race past each other both deliver,
+/// and an I/O failure delivers, because a duplicate is a smaller fault than a
+/// lost notification.
+fn claim(dir: &Path, name: &str, now: SystemTime, pid: u32) -> bool {
     use std::os::unix::fs::DirBuilderExt;
 
     if let Err(e) = std::fs::DirBuilder::new()
@@ -457,7 +462,10 @@ fn claim(dir: &Path, name: &str, now: SystemTime) -> bool {
         .create_new(true)
         .open(&path)
     {
-        Ok(_) => true,
+        Ok(_) => {
+            take(&path, now, pid);
+            true
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let modified = std::fs::metadata(&path).and_then(|m| m.modified());
             // A marker written after `now` was read was written by a client
@@ -466,22 +474,34 @@ fn claim(dir: &Path, name: &str, now: SystemTime) -> bool {
                 now.duration_since(m)
                     .map_or(true, |age| age < DEDUPE_WINDOW)
             });
-            if fresh {
+            // An empty or unreadable owner is another client between creating
+            // the marker and writing its pid, so it counts as someone else's.
+            let owner = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if fresh && owner != Some(pid) {
                 return false;
             }
-            if let Err(e) = std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_modified(now))
-            {
-                log::debug!("notify: cannot refresh {}: {e}", path.display());
-            }
+            take(&path, now, pid);
             true
         }
         Err(e) => {
             log::debug!("notify: cannot create {}: {e}", path.display());
             true
         }
+    }
+}
+
+/// Record `pid` as the owner of the marker at `path`, as of `now`.
+fn take(path: &Path, now: SystemTime, pid: u32) {
+    let written = std::fs::write(path, pid.to_string()).and_then(|()| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(now)
+    });
+    if let Err(e) = written {
+        log::debug!("notify: cannot write {}: {e}", path.display());
     }
 }
 
@@ -563,7 +583,7 @@ pub fn deliver(n: &Notification, config: &NotificationsConfig) {
     let spawned = std::thread::Builder::new()
         .name("remux-notify".to_string())
         .spawn(move || {
-            if !claim(&marker_dir(), &marker, SystemTime::now()) {
+            if !claim(&marker_dir(), &marker, SystemTime::now(), std::process::id()) {
                 log::debug!("notify: another client already sent {marker}");
                 return;
             }
@@ -1059,6 +1079,9 @@ mod tests {
         assert_ne!(base, marker_name("local", 1, NotifyKind::Exited));
     }
 
+    const A: u32 = 1001;
+    const B: u32 = 1002;
+
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rmx-notify-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1069,9 +1092,31 @@ mod tests {
     fn the_first_client_to_claim_an_event_sends_it_and_the_second_does_not() {
         let dir = scratch_dir("claim");
         let now = SystemTime::now();
-        assert!(claim(&dir, "m", now));
-        assert!(!claim(&dir, "m", now + Duration::from_secs(1)));
-        assert!(claim(&dir, "other", now));
+        assert!(claim(&dir, "m", now, A));
+        assert!(!claim(&dir, "m", now + Duration::from_secs(1), B));
+        assert!(claim(&dir, "other", now, B));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_client_repeating_its_own_event_inside_the_window_sends_it_again() {
+        let dir = scratch_dir("repeat");
+        let now = SystemTime::now();
+        assert!(claim(&dir, "m", now, A));
+        assert!(claim(&dir, "m", now + Duration::from_secs(6), A));
+        assert!(
+            !claim(&dir, "m", now + Duration::from_secs(7), B),
+            "the repeat still belongs to the first client"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_marker_with_no_owner_is_left_to_whoever_is_writing_it() {
+        let dir = scratch_dir("owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m"), b"").unwrap();
+        assert!(!claim(&dir, "m", SystemTime::now(), A));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1084,8 +1129,8 @@ mod tests {
             .unwrap()
             .set_modified(then)
             .unwrap();
-        assert!(claim(&dir, "m", SystemTime::now()));
-        assert!(!claim(&dir, "m", SystemTime::now()));
+        assert!(claim(&dir, "m", SystemTime::now(), A));
+        assert!(!claim(&dir, "m", SystemTime::now(), B));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1093,7 +1138,7 @@ mod tests {
     fn a_directory_that_cannot_be_made_still_delivers() {
         let file = scratch_dir("blocked");
         std::fs::write(&file, b"").unwrap();
-        assert!(claim(&file.join("sub"), "m", SystemTime::now()));
+        assert!(claim(&file.join("sub"), "m", SystemTime::now(), A));
         let _ = std::fs::remove_file(&file);
     }
 
@@ -1105,7 +1150,7 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(60))
             .unwrap();
-        assert!(claim(&dir, "new", SystemTime::now()));
+        assert!(claim(&dir, "new", SystemTime::now(), A));
         assert!(!dir.join("old").exists());
         assert!(dir.join("new").exists());
         let _ = std::fs::remove_dir_all(&dir);
