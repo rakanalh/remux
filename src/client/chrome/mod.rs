@@ -17,7 +17,7 @@ use anyhow::Result;
 pub use geometry::{
     bar_rects, content_point, content_rect, effective_sizes, frame_size_inset, pane_area,
     panel_rects, past_the_server_bar, sidebar_frame, status_bar_rect, PanelGeom, SidebarEdge,
-    SidebarGeom,
+    SidebarGeom, SidebarStyle,
 };
 
 use crate::client::renderer::Renderer;
@@ -40,6 +40,7 @@ pub struct Sidebar {
     pub edge: SidebarEdge,
     pub size: u16,
     pub visible: bool,
+    pub style: SidebarStyle,
     pub panels: Vec<Panel>,
     /// Which panel takes keys when this sidebar is focused. Written by the
     /// navigation task (Task 7); tracked here from the start so focus survives
@@ -115,6 +116,7 @@ impl Chrome {
                 edge: sc.edge,
                 size: sc.size,
                 visible: sc.visible,
+                style: sc.style,
                 panels,
                 focused_panel: 0,
             });
@@ -147,6 +149,7 @@ impl Chrome {
                 edge: s.edge,
                 size: s.size,
                 visible: s.visible,
+                style: s.style,
                 panels: s
                     .panels
                     .iter()
@@ -1166,6 +1169,7 @@ mod focus_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,
@@ -1182,6 +1186,7 @@ mod focus_tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,
@@ -1231,6 +1236,7 @@ mod focus_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
             panel: (0..n)
                 .map(|_| PanelConfig {
                     editor: None,
@@ -1316,6 +1322,7 @@ mod focus_tests {
                 edge: SidebarEdge::Left,
                 size: 30,
                 visible: true,
+                style: Default::default(),
                 panel: vec![
                     PanelConfig {
                         editor: None,
@@ -1335,6 +1342,7 @@ mod focus_tests {
                 edge: SidebarEdge::Right,
                 size: 20,
                 visible: true,
+                style: Default::default(),
                 panel: vec![PanelConfig {
                     editor: None,
                     command: None,
@@ -1565,6 +1573,7 @@ mod focus_tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -1855,6 +1864,7 @@ mod focus_tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -1952,6 +1962,7 @@ mod resize_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -2128,6 +2139,7 @@ mod resize_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
             panel: (0..panels)
                 .map(|_| PanelConfig {
                     editor: None,
@@ -2146,6 +2158,7 @@ mod resize_tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {

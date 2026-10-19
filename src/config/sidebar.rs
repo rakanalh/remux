@@ -8,7 +8,7 @@
 
 use serde::Deserialize;
 
-use crate::client::chrome::SidebarEdge;
+use crate::client::chrome::{SidebarEdge, SidebarStyle};
 
 fn default_visible() -> bool {
     true
@@ -73,6 +73,9 @@ pub struct SidebarConfig {
     pub size: u16,
     #[serde(default = "default_visible")]
     pub visible: bool,
+    /// `"boxed"` (the default) or `"flat"`.
+    #[serde(default)]
+    pub style: SidebarStyle,
     /// `[[sidebar.panel]]` entries, in stacking order.
     #[serde(default)]
     pub panel: Vec<PanelConfig>,
@@ -128,6 +131,37 @@ visible = true
         assert_eq!(cfg[0].panel[1].plugin, "agents");
         assert_eq!(cfg[0].panel[0].editor, None);
         assert_eq!(cfg[0].panel[0].command, None);
+    }
+
+    #[test]
+    fn style_defaults_to_boxed_and_parses_flat() {
+        let cfg = parse(
+            r#"
+[[sidebar]]
+edge = "left"
+size = 30
+
+[[sidebar]]
+edge = "right"
+size = 30
+style = "flat"
+"#,
+        );
+        assert_eq!(cfg[0].style, SidebarStyle::Boxed);
+        assert_eq!(cfg[1].style, SidebarStyle::Flat);
+    }
+
+    #[test]
+    fn an_unknown_style_is_rejected() {
+        let err = toml::from_str::<Wrapper>(
+            r#"
+[[sidebar]]
+edge = "left"
+size = 30
+style = "rounded"
+"#,
+        );
+        assert!(err.is_err());
     }
 
     #[test]

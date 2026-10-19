@@ -17,6 +17,19 @@ pub enum SidebarEdge {
     Bottom,
 }
 
+/// How a sidebar is drawn.
+///
+/// `Boxed` follows the pane border style (a zellij box or a tmux seam). `Flat`
+/// has no frame: one quiet divider against the content, rules between stacked
+/// panels, and panels that draw their own padding and section header.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarStyle {
+    #[default]
+    Boxed,
+    Flat,
+}
+
 /// The geometric facts about one panel: how much of its sidebar it claims and
 /// the smallest rect it can usefully render into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +46,7 @@ pub struct SidebarGeom {
     /// Columns for `Left`/`Right`, rows for `Bottom`.
     pub size: u16,
     pub visible: bool,
+    pub style: SidebarStyle,
     pub panels: Vec<PanelGeom>,
 }
 
@@ -578,6 +592,7 @@ mod tests {
             edge,
             size,
             visible: true,
+            style: Default::default(),
             panels: weights
                 .iter()
                 .map(|w| PanelGeom {
@@ -1121,6 +1136,7 @@ mod tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
             panels: vec![
                 PanelGeom {
                     weight: 10,
@@ -1156,6 +1172,7 @@ mod tests {
             edge: SidebarEdge::Left,
             size: 30,
             visible: true,
+            style: Default::default(),
             panels: vec![
                 PanelGeom {
                     weight: 1,
