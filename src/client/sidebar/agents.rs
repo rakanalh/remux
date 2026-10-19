@@ -733,7 +733,8 @@ mod tests {
         // A band is two adjacent panel rows: a half-painted one must fail here
         // rather than pass as a smaller count.
         assert!(
-            marked.len() % 2 == 0 && marked.windows(2).step_by(2).all(|w| w[1] == w[0] + 1),
+            marked.len().is_multiple_of(2)
+                && marked.windows(2).step_by(2).all(|w| w[1] == w[0] + 1),
             "the marked rows are not whole two-line bands: {marked:?}"
         );
         // Reported in `painted`'s numbering: the blank header row is not counted.

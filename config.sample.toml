@@ -720,7 +720,8 @@
 #             against the panes, in `sidebar_divider_fg`. The divider takes one
 #             column of `size`. Everything inside is the same in both styles:
 #             one column of left padding, a lowercase bold header
-#             (`sidebar_dim_fg`) and a blank row above each panel's list, a
+#             (`sidebar_dim_fg`, or `frame_active_fg` while that panel has the
+#             keyboard) and a blank row above each panel's list, a
 #             rule between stacked panels, and a full-width band
 #             (`sidebar_selection_bg`) behind the selected row. An unknown
 #             value is a parse error. Applies on config reload.

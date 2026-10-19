@@ -22,7 +22,7 @@ pub enum SidebarEdge {
 /// Only the edge treatment. `Boxed` follows the pane border style (a zellij box
 /// or a tmux seam). `Flat` has no frame, just one quiet divider against the
 /// content. The panels inside draw the same in both.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarStyle {
     #[default]
@@ -55,7 +55,7 @@ pub struct SidebarGeom {
 
 /// Thickness of a collapsed sidebar's strip: one column for `Left`/`Right`,
 /// one row for `Bottom`.
-pub const STRIP_THICKNESS: u16 = 1;
+const STRIP_THICKNESS: u16 = 1;
 
 impl SidebarGeom {
     /// Whether this sidebar is drawn as a strip: collapsed, and configured to
@@ -655,7 +655,7 @@ pub fn expand_glyph(edge: SidebarEdge) -> char {
 }
 
 /// Cells in a collapse chip: a space, the glyph, a space.
-pub const CHIP_LEN: u16 = 3;
+const CHIP_LEN: u16 = 3;
 
 /// The narrowest interior (along the chip's row) that still gets a full chip.
 /// Narrower than this the chip would cover most of its row, so the button

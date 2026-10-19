@@ -164,6 +164,7 @@ pub fn move_selection(selected: &mut usize, len: usize, cmd: NavKey) {
 /// above its content loop). A pure function of `(selected, rows)`, which is
 /// what lets `render(&self)` compute it: a panel is not told its height until
 /// it is asked to paint.
+#[cfg(test)]
 pub fn scroll_offset(selected: usize, rows: u16) -> usize {
     scroll_offset_in(ListLayout::PLAIN, selected, rows)
 }
@@ -199,6 +200,7 @@ pub enum Hit {
 ///
 /// `on_mouse` is not told the panel's height, and the selection cannot have
 /// moved since that paint -- a click is what moves it.
+#[cfg(test)]
 pub fn hit_test(y: u16, top: usize, selected: usize, len: usize) -> Hit {
     hit_test_in(ListLayout::PLAIN, y, top, selected, len)
 }

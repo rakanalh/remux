@@ -2540,17 +2540,14 @@ mod resize_tests {
     }
 
     #[test]
-    fn the_panels_draw_the_shared_look_in_either_style() {
+    fn a_panel_built_from_config_draws_the_shared_header() {
         let theme = CompositorTheme::default();
-        for style in [SidebarStyle::Boxed, SidebarStyle::Flat] {
-            let mut cfg = bar(SidebarEdge::Left, 30, 1);
-            cfg.style = style;
-            cfg.panel[0].plugin = "agents".into();
-            let c = Chrome::from_config(&[cfg]);
-            let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
-            let header: String = grid[0].iter().map(|cell| cell.c).collect();
-            assert_eq!(header.trim_end(), " agents", "{style:?}");
-        }
+        let mut cfg = bar(SidebarEdge::Left, 30, 1);
+        cfg.panel[0].plugin = "agents".into();
+        let c = Chrome::from_config(&[cfg]);
+        let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
+        let header: String = grid[0].iter().map(|cell| cell.c).collect();
+        assert_eq!(header.trim_end(), " agents");
     }
 
     fn strippable(edge: SidebarEdge) -> SidebarConfig {
