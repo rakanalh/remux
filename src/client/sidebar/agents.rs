@@ -95,15 +95,15 @@ impl AgentRow {
         format!("{} {}", self.entry.command, where_)
     }
 
-    /// What a flat sidebar shows on a row's first line: a name, and an optional
-    /// dimmer tail.
+    /// What a row shows on its first line: a name, and an optional dimmer
+    /// tail.
     ///
     /// A name the user gave the pane, a `pane_title` template result or the
     /// pane's own title is shown whole, as [`AgentRow::label`] shows it. With
     /// none of those, the location is the name: the session, then ` · ` and the
     /// tab's name, or its index when `tab_name` is not known (a tree not yet
     /// received). The command is left out because the second line carries it.
-    pub fn flat_name(&self, tab_name: Option<&str>) -> (String, Option<String>) {
+    pub fn row_name(&self, tab_name: Option<&str>) -> (String, Option<String>) {
         let titled = self.entry.custom_name.is_some()
             || self.pane_title.is_some()
             || self.entry.title.as_deref().is_some_and(|t| !t.is_empty());
@@ -119,9 +119,8 @@ impl AgentRow {
         )
     }
 
-    /// A flat row's second line: the agent, and the host when it runs on a
-    /// remote.
-    pub fn flat_detail(&self) -> String {
+    /// A row's second line: the agent, and the host when it runs on a remote.
+    pub fn row_detail(&self) -> String {
         match &self.conn {
             ConnId::Local => self.entry.command.clone(),
             ConnId::Remote(host) => format!("{} \u{b7} {host}", self.entry.command),
@@ -266,6 +265,20 @@ impl AgentRoster {
     }
 }
 
+/// How one row is painted: where it sits and in which colours.
+struct RowLook {
+    /// Width of the panel, which the selection band spans.
+    cols: u16,
+    /// Columns of left padding.
+    pad: u16,
+    /// The band behind both lines, when the row is selected or current.
+    band: Option<CellColor>,
+    name_fg: CellColor,
+    bold: bool,
+    /// The panel background, behind a row without a band.
+    base_bg: CellColor,
+}
+
 pub struct AgentsPlugin {
     roster: AgentRoster,
     /// The flattened rows, in render order.
@@ -276,10 +289,10 @@ pub struct AgentsPlugin {
     /// whichever agent slid into that slot.
     current: Option<(ConnId, PaneId)>,
     nav: NavList,
-    /// Tab names from the session tree, keyed by connection, session and tab
-    /// index, so a flat row can name the tab the agent runs in. The agent list
-    /// itself carries only the index.
-    tab_names: HashMap<(ConnId, String, usize), String>,
+    /// Tab names from the session tree: per connection, a session's tab names in
+    /// tab order. A row names the tab the agent runs in; the agent list itself
+    /// carries only the index. Nested so a lookup borrows the row's own strings.
+    tab_names: HashMap<ConnId, HashMap<String, Vec<String>>>,
 }
 
 impl AgentsPlugin {
@@ -299,11 +312,9 @@ impl AgentsPlugin {
 
     fn tab_name(&self, row: &AgentRow) -> Option<&str> {
         self.tab_names
-            .get(&(
-                row.conn.clone(),
-                row.entry.session.clone(),
-                row.entry.tab_index,
-            ))
+            .get(&row.conn)?
+            .get(row.entry.session.as_str())?
+            .get(row.entry.tab_index)
             .map(String::as_str)
     }
 
@@ -312,22 +323,26 @@ impl AgentsPlugin {
     /// Line one is the state dot at the padding column and the name two columns
     /// after it. Line two sits under the name. The band, when there is one,
     /// covers both lines edge to edge. The secondary text is `sidebar_dim_fg`.
-    #[allow(clippy::too_many_arguments)]
     fn paint_row(
         grid: &mut [Vec<RenderCell>],
         y: u16,
-        cols: u16,
-        pad: u16,
         row: &AgentRow,
         tab_name: Option<&str>,
-        band: Option<&CellColor>,
-        name_fg: CellColor,
-        bold: bool,
-        base_bg: &CellColor,
+        look: &RowLook,
         theme: &CompositorTheme,
     ) {
+        let RowLook {
+            cols,
+            pad,
+            band,
+            name_fg,
+            bold,
+            base_bg,
+        } = look;
+        let (cols, pad, bold) = (*cols, *pad, *bold);
+        let name_fg = name_fg.clone();
         let dim_fg = theme.sidebar_dim_fg.clone();
-        let bg = band.unwrap_or(base_bg).clone();
+        let bg = band.as_ref().unwrap_or(base_bg).clone();
         if band.is_some() {
             for line in [y, y + 1] {
                 nav::fill_row(grid, line, cols, &name_fg, &bg);
@@ -350,13 +365,14 @@ impl AgentsPlugin {
             bg.clone(),
         );
         let text_x = pad + 2;
-        let (name, tail) = row.flat_name(tab_name);
+        let (name, tail) = row.row_name(tab_name);
         draw_text_with(grid, text_x, y, &name, name_fg, bg.clone(), bold);
         if let Some(tail) = tail {
-            let x = text_x + unicode_width::UnicodeWidthStr::width(name.as_str()) as u16;
+            let name_width = unicode_width::UnicodeWidthStr::width(name.as_str());
+            let x = text_x.saturating_add(u16::try_from(name_width).unwrap_or(u16::MAX));
             draw_text(grid, x, y, &tail, dim_fg.clone(), bg.clone());
         }
-        draw_text(grid, text_x, y + 1, &row.flat_detail(), dim_fg, bg);
+        draw_text(grid, text_x, y + 1, &row.row_detail(), dim_fg, bg);
     }
 
     fn layout(&self) -> ListLayout {
@@ -496,19 +512,15 @@ impl SidebarPlugin for AgentsPlugin {
             } else {
                 None
             };
-            Self::paint_row(
-                &mut grid,
-                y,
+            let look = RowLook {
                 cols,
-                layout.pad(),
-                row,
-                tab_name,
-                band.as_ref(),
-                fg,
+                pad: layout.pad(),
+                band,
+                name_fg: fg,
                 bold,
-                &bg,
-                theme,
-            );
+                base_bg: bg.clone(),
+            };
+            Self::paint_row(&mut grid, y, row, tab_name, &look, theme);
         }
 
         // Directly under the last row when the list is short, and at the bottom
@@ -577,13 +589,13 @@ impl SidebarPlugin for AgentsPlugin {
                 if self.current.as_ref().is_some_and(|(c, _)| c == conn) {
                     self.current = None;
                 }
-                self.tab_names.retain(|(c, _, _), _| c != conn);
+                self.tab_names.remove(conn);
                 if self.roster.drop_conn(conn) {
                     self.rebuild();
                 }
             }
             // The tree is the sessions panel's, but its tab names are what a
-            // flat row shows beside the session. The cwd is the `files`
+            // row shows beside the session. The cwd is the `files`
             // panel's half of the focused-pane walk, and the directory events
             // are the `files` panel's too.
             PluginEvent::SessionTree {
@@ -592,17 +604,17 @@ impl SidebarPlugin for AgentsPlugin {
                 unfiled,
                 ..
             } => {
-                self.tab_names.retain(|(c, _, _), _| c != conn);
                 let sessions = folders
                     .iter()
                     .flat_map(|f| f.sessions.iter())
                     .chain(unfiled.iter());
-                for session in sessions {
-                    for (i, tab) in session.tabs.iter().enumerate() {
-                        self.tab_names
-                            .insert((conn.clone(), session.name.clone(), i), tab.name.clone());
-                    }
-                }
+                let names = sessions
+                    .map(|session| {
+                        let tabs = session.tabs.iter().map(|t| t.name.clone()).collect();
+                        (session.name.clone(), tabs)
+                    })
+                    .collect();
+                self.tab_names.insert(conn.clone(), names);
             }
             PluginEvent::FocusedCwd { .. } | PluginEvent::DirectoryListing { .. } => {}
             PluginEvent::PaneTitle { template } => {
@@ -718,6 +730,12 @@ mod tests {
             .filter(|(_, r)| r.iter().all(|c| c.bg == theme.sidebar_current_bg))
             .map(|(y, _)| y)
             .collect();
+        // A band is two adjacent panel rows: a half-painted one must fail here
+        // rather than pass as a smaller count.
+        assert!(
+            marked.len() % 2 == 0 && marked.windows(2).step_by(2).all(|w| w[1] == w[0] + 1),
+            "the marked rows are not whole two-line bands: {marked:?}"
+        );
         // Reported in `painted`'s numbering: the blank header row is not counted.
         (marked.first().map(|y| y - 1), marked.len() / 2)
     }
