@@ -46,6 +46,11 @@ import time
 import pexpect
 import pyte
 
+# The shared stand-ins for the desktop notifier: a run must not pop real
+# notifications for this test's agents.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pty_harness import install_notify_shims  # noqa: E402
+
 BIN = os.path.abspath("target/debug/remux")
 RUN = "/tmp/rmx-sba"
 SOCK = f"{RUN}/run/remux.sock"
@@ -131,6 +136,7 @@ def setup_dirs():
     for s in ("run", "state", "data", "bin", "cfg"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     os.makedirs(f"{RUN}/cfg/remux", exist_ok=True)
+    install_notify_shims(f"{RUN}/bin")
     with open(f"{RUN}/cfg/remux/config.toml", "w") as f:
         f.write(CFG)
     for name in ("claude", "notanagent"):
