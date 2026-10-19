@@ -423,7 +423,7 @@ impl SidebarPlugin for AgentsPlugin {
             return grid;
         }
         let layout = self.layout();
-        nav::draw_header(&mut grid, self.title(), theme, &bg);
+        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
 
         // The notes are CAPPED against the list, not just against the panel.
         // Uncapped, three unsupported remotes beside four blocked agents took
@@ -1546,7 +1546,7 @@ mod tests {
     fn the_header_is_lowercase_bold_and_dim() {
         let p = plugin_with(1);
         let theme = CompositorTheme::default();
-        let grid = p.render(24, 6, true, &theme);
+        let grid = p.render(24, 6, false, &theme);
         assert_eq!(grid[0][1].c, 'a');
         assert!(grid[0][1].bold);
         assert_eq!(grid[0][1].fg, theme.sidebar_dim_fg);
@@ -1708,6 +1708,20 @@ mod tests {
             painted_raw(&p, 24, 6)[2],
             " \u{25CF} s1 \u{b7} 0",
             "a lost connection's tab names are dropped"
+        );
+    }
+
+    #[test]
+    fn the_header_takes_the_active_colour_only_while_the_panel_has_focus() {
+        let p = plugin_with(1);
+        let theme = CompositorTheme::default();
+        assert_eq!(
+            p.render(24, 6, true, &theme)[0][1].fg,
+            theme.frame_active_fg
+        );
+        assert_eq!(
+            p.render(24, 6, false, &theme)[0][1].fg,
+            theme.sidebar_dim_fg
         );
     }
 }

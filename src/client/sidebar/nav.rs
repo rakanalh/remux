@@ -260,11 +260,22 @@ pub fn fill_row(grid: &mut [Vec<RenderCell>], y: u16, cols: u16, fg: &CellColor,
     );
 }
 
-/// Paint a panel's header: the title in lowercase, bold and dim, one column
-/// in.
+/// The colour of a panel's header: the active frame colour while the panel
+/// holds the keyboard, so the user can tell which of several stacked panels
+/// takes their keys, and the dim colour otherwise.
+pub fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
+    if focused {
+        theme.frame_active_fg.clone()
+    } else {
+        theme.sidebar_dim_fg.clone()
+    }
+}
+
+/// Paint a panel's header: the title in lowercase and bold, one column in.
 pub fn draw_header(
     grid: &mut [Vec<RenderCell>],
     title: &str,
+    focused: bool,
     theme: &CompositorTheme,
     bg: &CellColor,
 ) {
@@ -273,7 +284,7 @@ pub fn draw_header(
         1,
         0,
         &title.to_lowercase(),
-        theme.sidebar_dim_fg.clone(),
+        header_fg(focused, theme),
         bg.clone(),
         true,
     );

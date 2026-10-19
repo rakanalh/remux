@@ -152,7 +152,7 @@ impl SidebarPlugin for SessionsPlugin {
             return grid;
         }
         let layout = self.layout();
-        nav::draw_header(&mut grid, self.title(), theme, &bg);
+        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
 
         let top = nav::scroll_offset_in(layout, self.model.selected, rows);
         self.last_top.set(top);
@@ -841,5 +841,20 @@ mod tests {
         assert_eq!(p.on_mouse(0, 1, down), PluginAction::None, "the blank row");
         assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
         assert_eq!(p.model.selected, 1);
+    }
+
+    #[test]
+    fn the_header_takes_the_active_colour_only_while_the_panel_has_focus() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let theme = CompositorTheme::default();
+        assert_eq!(
+            p.render(24, 6, true, &theme)[0][1].fg,
+            theme.frame_active_fg
+        );
+        assert_eq!(
+            p.render(24, 6, false, &theme)[0][1].fg,
+            theme.sidebar_dim_fg
+        );
     }
 }

@@ -438,7 +438,7 @@ impl SidebarPlugin for FilesPlugin {
             pad,
             0,
             &header,
-            theme.sidebar_dim_fg.clone(),
+            nav::header_fg(focused, theme),
             bg.clone(),
             true,
         );
@@ -1609,5 +1609,19 @@ mod tests {
     fn the_header_keeps_the_end_of_a_path_too_long_to_fit() {
         let p = at("/home/me/a/very/deep/place", vec![entry("f", false)]);
         assert_eq!(painted(&p, 8, 3)[0], "…/place");
+    }
+
+    #[test]
+    fn the_header_takes_the_active_colour_only_while_the_panel_has_focus() {
+        let p = at("/w", vec![entry("a", false)]);
+        let theme = CompositorTheme::default();
+        assert_eq!(
+            p.render(20, 5, true, &theme)[0][1].fg,
+            theme.frame_active_fg
+        );
+        assert_eq!(
+            p.render(20, 5, false, &theme)[0][1].fg,
+            theme.sidebar_dim_fg
+        );
     }
 }
