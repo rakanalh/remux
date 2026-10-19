@@ -25,8 +25,11 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::nav::{self, NavKey, HEADER_ROWS};
-use super::{blank_grid, draw_text, PluginAction, PluginEvent, SidebarPlugin};
+#[cfg(test)]
+use super::nav::HEADER_ROWS;
+use super::nav::{self, ListLayout, NavKey};
+use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
+use crate::client::chrome::SidebarStyle;
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
@@ -46,6 +49,7 @@ pub struct SessionsPlugin {
     /// `&mut self` render: this is a record of what was drawn, not state the
     /// panel reasons with.
     last_top: Cell<usize>,
+    style: SidebarStyle,
 }
 
 impl SessionsPlugin {
@@ -54,7 +58,12 @@ impl SessionsPlugin {
             trees: Vec::new(),
             model: TreeModel::new(),
             last_top: Cell::new(0),
+            style: SidebarStyle::Boxed,
         }
+    }
+
+    fn layout(&self) -> ListLayout {
+        ListLayout::for_style(self.style, 1)
     }
 
     /// Push `trees` into the model: roster first (it is what makes server rows
@@ -126,7 +135,11 @@ impl SidebarPlugin for SessionsPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (12, 3)
+        (12, self.layout().header_rows as u16 + 2)
+    }
+
+    fn set_style(&mut self, style: SidebarStyle) {
+        self.style = style;
     }
 
     fn wants_session_tree(&self) -> bool {
@@ -145,17 +158,27 @@ impl SidebarPlugin for SessionsPlugin {
         if grid.is_empty() {
             return grid;
         }
-        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        let layout = self.layout();
+        if layout.flat {
+            nav::draw_flat_header(&mut grid, self.title(), theme, &bg);
+        } else {
+            nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        }
 
-        let top = nav::scroll_offset(self.model.selected, rows);
+        let top = nav::scroll_offset_in(layout, self.model.selected, rows);
         self.last_top.set(top);
-        for i in 0..(rows as usize).saturating_sub(HEADER_ROWS) {
+        for i in 0..layout.visible(rows) {
             let Some(row) = self.model.rows.get(top + i) else {
                 break;
             };
-            let y = (HEADER_ROWS + i) as u16;
+            let y = layout.row_of(i);
             let selected = top + i == self.model.selected;
-            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+            let (fg, row_bg, bold) = if layout.flat {
+                nav::flat_row_colors(theme, focused, selected, &bg)
+            } else {
+                let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+                (fg, row_bg, false)
+            };
             if selected {
                 nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
@@ -175,7 +198,7 @@ impl SidebarPlugin for SessionsPlugin {
                 current,
                 row.display_name
             );
-            draw_text(&mut grid, 0, y, &text, fg, row_bg);
+            draw_text_with(&mut grid, layout.pad(), y, &text, fg, row_bg, bold);
         }
         grid
     }
@@ -221,7 +244,8 @@ impl SidebarPlugin for SessionsPlugin {
         if !nav::is_select_click(kind) {
             return PluginAction::None;
         }
-        let hit = nav::hit_test(
+        let hit = nav::hit_test_in(
+            self.layout(),
             y,
             self.last_top.get(),
             self.model.selected,

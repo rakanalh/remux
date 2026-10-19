@@ -195,6 +195,10 @@ pub enum PluginRequest {
 
 /// A panel that can live inside a sidebar.
 pub trait SidebarPlugin: Send {
+    /// The look of the sidebar this panel sits in. Called when the chrome is
+    /// built. A panel that has no flat variant ignores it.
+    fn set_style(&mut self, _style: crate::client::chrome::SidebarStyle) {}
+
     /// Short name shown in the panel header.
     fn title(&self) -> &str;
 
@@ -386,6 +390,19 @@ pub fn draw_text(
     fg: CellColor,
     bg: CellColor,
 ) {
+    draw_text_with(grid, x, y, text, fg, bg, false);
+}
+
+/// [`draw_text`] with the bold attribute chosen by the caller.
+pub fn draw_text_with(
+    grid: &mut [Vec<RenderCell>],
+    x: u16,
+    y: u16,
+    text: &str,
+    fg: CellColor,
+    bg: CellColor,
+    bold: bool,
+) {
     let Some(row) = grid.get_mut(y as usize) else {
         return;
     };
@@ -414,7 +431,7 @@ pub fn draw_text(
             c: ch,
             fg: fg.clone(),
             bg: bg.clone(),
-            bold: false,
+            bold,
             italic: false,
             underline: false,
             width: w as u8,

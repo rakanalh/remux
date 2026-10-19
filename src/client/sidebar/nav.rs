@@ -42,12 +42,66 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
-use super::draw_text;
+use super::{draw_text, draw_text_with};
+use crate::client::chrome::SidebarStyle;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
 /// Rows of chrome above a panel's list: the header.
 pub const HEADER_ROWS: usize = 1;
+
+/// Where a list's rows start and how tall each one is.
+///
+/// Boxed sidebars have a one-row header and one-line rows, which is what every
+/// function below assumed before flat existed; [`ListLayout::BOXED`] is that and
+/// the plain functions delegate to it. A flat sidebar has a header row plus a
+/// blank row, one column of left padding, and (for the agents panel) rows two
+/// lines tall. The selection, the scroll offset and every count in the
+/// `NavList` are in ITEMS, never in screen rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLayout {
+    pub header_rows: usize,
+    pub row_height: usize,
+    pub flat: bool,
+}
+
+impl ListLayout {
+    pub const BOXED: Self = Self {
+        header_rows: HEADER_ROWS,
+        row_height: 1,
+        flat: false,
+    };
+
+    pub fn for_style(style: SidebarStyle, row_height: usize) -> Self {
+        match style {
+            SidebarStyle::Boxed => Self::BOXED,
+            SidebarStyle::Flat => Self {
+                header_rows: FLAT_HEADER_ROWS,
+                row_height: row_height.max(1),
+                flat: true,
+            },
+        }
+    }
+
+    /// Columns of left padding before any content.
+    pub fn pad(&self) -> u16 {
+        u16::from(self.flat)
+    }
+
+    /// How many whole items fit in `rows` rows below the header.
+    pub fn visible(&self, rows: u16) -> usize {
+        (rows as usize).saturating_sub(self.header_rows) / self.row_height
+    }
+
+    /// The panel row an item `i` places in the window (`i` counted from the
+    /// window's first item) starts on.
+    pub fn row_of(&self, i: usize) -> u16 {
+        (self.header_rows + i * self.row_height) as u16
+    }
+}
+
+/// A flat panel's header: the title row and one blank row.
+pub const FLAT_HEADER_ROWS: usize = 2;
 
 /// A list command, independent of what the rows mean.
 ///
@@ -113,7 +167,13 @@ pub fn move_selection(selected: &mut usize, len: usize, cmd: NavKey) {
 /// what lets `render(&self)` compute it: a panel is not told its height until
 /// it is asked to paint.
 pub fn scroll_offset(selected: usize, rows: u16) -> usize {
-    let visible = (rows as usize).saturating_sub(HEADER_ROWS);
+    scroll_offset_in(ListLayout::BOXED, selected, rows)
+}
+
+/// [`scroll_offset`] for a given layout. `selected` and the result are item
+/// indices.
+pub fn scroll_offset_in(layout: ListLayout, selected: usize, rows: u16) -> usize {
+    let visible = layout.visible(rows);
     if visible == 0 {
         return 0;
     }
@@ -142,10 +202,15 @@ pub enum Hit {
 /// `on_mouse` is not told the panel's height, and the selection cannot have
 /// moved since that paint -- a click is what moves it.
 pub fn hit_test(y: u16, top: usize, selected: usize, len: usize) -> Hit {
-    let Some(offset) = (y as usize).checked_sub(HEADER_ROWS) else {
+    hit_test_in(ListLayout::BOXED, y, top, selected, len)
+}
+
+/// [`hit_test`] for a given layout: any line of a multi-line row hits that row.
+pub fn hit_test_in(layout: ListLayout, y: u16, top: usize, selected: usize, len: usize) -> Hit {
+    let Some(offset) = (y as usize).checked_sub(layout.header_rows) else {
         return Hit::Nothing;
     };
-    let idx = top + offset;
+    let idx = top + offset / layout.row_height;
     if idx >= len {
         Hit::Nothing
     } else if idx == selected {
@@ -181,6 +246,28 @@ pub fn row_colors(
     }
 }
 
+/// `(fg, bg, bold)` for one row of a flat list.
+///
+/// The selection keeps its focused/unfocused distinction: the band is always
+/// painted, and the name takes the bright selected colour only while the panel
+/// holds the keyboard.
+pub fn flat_row_colors(
+    theme: &CompositorTheme,
+    focused: bool,
+    selected: bool,
+    bg: &CellColor,
+) -> (CellColor, CellColor, bool) {
+    if !selected {
+        return (theme.status_bar_fg.clone(), bg.clone(), false);
+    }
+    let fg = if focused {
+        theme.sidebar_name_selected_fg.clone()
+    } else {
+        theme.status_bar_fg.clone()
+    };
+    (fg, theme.sidebar_selection_bg.clone(), true)
+}
+
 /// Paint row `y` edge to edge in `bg`.
 ///
 /// The selection is a full-width bar, not just a highlight behind the text: one
@@ -212,13 +299,32 @@ pub fn draw_header(
     draw_text(grid, 0, 0, title, header_fg, bg.clone());
 }
 
+/// Paint a flat panel's header: the title in lowercase, bold and dim, one
+/// column in.
+pub fn draw_flat_header(
+    grid: &mut [Vec<RenderCell>],
+    title: &str,
+    theme: &CompositorTheme,
+    bg: &CellColor,
+) {
+    draw_text_with(
+        grid,
+        1,
+        0,
+        &title.to_lowercase(),
+        theme.sidebar_dim_fg.clone(),
+        bg.clone(),
+        true,
+    );
+}
+
 /// A cursor and a viewport over a panel's rows.
 ///
 /// For panels whose rows are a plain `Vec` and so have no model to keep the
 /// cursor in. It stores neither the rows nor their length: the panel owns those
 /// and passes the length in, which is what keeps this usable by a panel whose
 /// rows are rebuilt wholesale on every push.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NavList {
     selected: usize,
     /// The row index the last `render` started its window at.
@@ -235,11 +341,31 @@ pub struct NavList {
     /// resolve a click on that something else to whatever row index happened to
     /// sit at the same offset.
     last_shown: Cell<usize>,
+    layout: ListLayout,
+}
+
+impl Default for NavList {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            last_top: Cell::new(0),
+            last_shown: Cell::new(0),
+            layout: ListLayout::BOXED,
+        }
+    }
 }
 
 impl NavList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_layout(&mut self, layout: ListLayout) {
+        self.layout = layout;
+    }
+
+    pub fn layout(&self) -> ListLayout {
+        self.layout
     }
 
     pub fn selected(&self) -> usize {
@@ -266,8 +392,8 @@ impl NavList {
     /// The window start for a panel `rows` tall holding `len` rows, recording
     /// what this paint will show for [`NavList::hit`].
     pub fn top_for(&self, rows: u16, len: usize) -> usize {
-        let top = scroll_offset(self.selected, rows);
-        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let top = scroll_offset_in(self.layout, self.selected, rows);
+        let capacity = self.layout.visible(rows);
         self.last_top.set(top);
         self.last_shown.set(len.saturating_sub(top).min(capacity));
         top
@@ -289,7 +415,13 @@ impl NavList {
     ///   coming.
     pub fn hit(&self, y: u16, len: usize) -> Hit {
         let painted = self.last_top.get() + self.last_shown.get();
-        hit_test(y, self.last_top.get(), self.selected, painted.min(len))
+        hit_test_in(
+            self.layout,
+            y,
+            self.last_top.get(),
+            self.selected,
+            painted.min(len),
+        )
     }
 
     /// Resolve a click at panel-local row `y`, move the cursor, and say what is

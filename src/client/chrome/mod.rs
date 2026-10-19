@@ -98,10 +98,13 @@ impl Chrome {
             let mut panels = Vec::new();
             for pc in &sc.panel {
                 match make_plugin(pc) {
-                    Some(plugin) => panels.push(Panel {
-                        plugin,
-                        weight: pc.weight.max(1),
-                    }),
+                    Some(mut plugin) => {
+                        plugin.set_style(sc.style);
+                        panels.push(Panel {
+                            plugin,
+                            weight: pc.weight.max(1),
+                        });
+                    }
                     None => log::warn!(
                         "sidebar: unknown plugin {:?}; skipping this panel",
                         pc.plugin

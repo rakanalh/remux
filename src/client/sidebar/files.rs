@@ -50,11 +50,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
-use super::nav::{self, NavKey, NavList, HEADER_ROWS};
+use super::nav::{self, NavKey, NavList};
 use super::{
-    blank_grid, draw_text, shorten_path, tilde_path, PluginAction, PluginEvent, PluginRequest,
-    SidebarPlugin,
+    blank_grid, draw_text, draw_text_with, shorten_path, tilde_path, PluginAction, PluginEvent,
+    PluginRequest, SidebarPlugin,
 };
+use crate::client::chrome::SidebarStyle;
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, DirEntry, RenderCell};
@@ -391,7 +392,11 @@ impl SidebarPlugin for FilesPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (8, 3)
+        (8, self.nav.layout().header_rows as u16 + 2)
+    }
+
+    fn set_style(&mut self, style: SidebarStyle) {
+        self.nav.set_layout(nav::ListLayout::for_style(style, 1));
     }
 
     /// Yes -- indirectly. This panel never reads a `SessionTree`, but
@@ -418,10 +423,30 @@ impl SidebarPlugin for FilesPlugin {
             // Substituted BEFORE truncating: `~` is worth ten or more columns
             // here, and they go to the end of the path -- the part that says
             // which directory this is.
-            Some(cwd) => shorten_path(&tilde_path(cwd, self.home.as_deref()), cols as usize),
+            Some(cwd) => shorten_path(
+                &tilde_path(cwd, self.home.as_deref()),
+                cols.saturating_sub(self.nav.layout().pad()) as usize,
+            ),
             None => self.title().to_string(),
         };
-        nav::draw_header(&mut grid, &header, focused, theme, &bg);
+        let layout = self.nav.layout();
+        let header_rows = layout.header_rows;
+        let pad = layout.pad();
+        if layout.flat {
+            // The path is the header here, so it is not lowercased the way a
+            // fixed panel name is.
+            draw_text_with(
+                &mut grid,
+                pad,
+                0,
+                &header,
+                theme.sidebar_dim_fg.clone(),
+                bg.clone(),
+                true,
+            );
+        } else {
+            nav::draw_header(&mut grid, &header, focused, theme, &bg);
+        }
 
         // The same budget rule the agents panel arrived at: at most half the
         // rows when there is a list to crowd out, all of them when there is not.
@@ -440,7 +465,7 @@ impl SidebarPlugin for FilesPlugin {
         // The agents panel does not have this bug despite the shared rule: its
         // note appears only when it has no rows, so the halving never binds
         // there. That is why this floor lives here and not in `nav`.
-        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let capacity = (rows as usize).saturating_sub(header_rows);
         let all_notes = self.notes();
         let budget = if self.rows.is_empty() {
             capacity
@@ -462,8 +487,8 @@ impl SidebarPlugin for FilesPlugin {
             };
             draw_text(
                 &mut grid,
-                0,
-                HEADER_ROWS as u16,
+                pad,
+                header_rows as u16,
                 msg,
                 theme.status_bar_fg.clone(),
                 bg,
@@ -478,28 +503,33 @@ impl SidebarPlugin for FilesPlugin {
         // and `nav`'s hit test records the smaller painted window.
         let note_rows = notes.len();
         let list_height = rows.saturating_sub(note_rows as u16);
-        let list_capacity = (list_height as usize).saturating_sub(HEADER_ROWS);
+        let list_capacity = layout.visible(list_height);
 
         let top = self.nav.top_for(list_height, self.rows.len());
         for i in 0..list_capacity {
             let Some(entry) = self.rows.get(top + i) else {
                 break;
             };
-            let y = (HEADER_ROWS + i) as u16;
+            let y = layout.row_of(i);
             let selected = top + i == self.nav.selected();
-            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+            let (fg, row_bg, bold) = if layout.flat {
+                nav::flat_row_colors(theme, focused, selected, &bg)
+            } else {
+                let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
+                (fg, row_bg, false)
+            };
             if selected {
                 nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
-            draw_text(&mut grid, 0, y, &Self::label(entry), fg, row_bg);
+            draw_text_with(&mut grid, pad, y, &Self::label(entry), fg, row_bg, bold);
         }
 
         let painted = self.rows.len().saturating_sub(top).min(list_capacity);
         for (n, note) in notes.iter().enumerate() {
-            let y = (HEADER_ROWS + painted + n) as u16;
+            let y = (header_rows + painted + n) as u16;
             draw_text(
                 &mut grid,
-                0,
+                pad,
                 y,
                 note,
                 theme.status_bar_fg.clone(),
