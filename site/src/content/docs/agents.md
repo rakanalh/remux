@@ -67,7 +67,7 @@ Remux shows a desktop notification when an agent:
 
 They are on by default, on **macOS** (through `osascript`) and **Linux** (through `notify-send`, from libnotify). The client sends them, for agents on the local server and on every connected [remote](/remux/remotes/), so they appear on the machine you are sitting at. Nothing is sent while no client is running.
 
-A notification is skipped when the agent's pane is focused in any client attached to its server, and when it is the pane this client is showing you, including a View cell. Two clients attached to the same server show one notification between them, not two.
+A notification is skipped when the agent's pane is focused in any client attached to its server, and when it is the pane this client is showing you, including a View cell. Two clients on the same machine attached to the same server show one notification between them, not two.
 
 The title names the agent the same way the agents panel does, followed by the event, for example `claude main/0 needs input`. The body says where it is: `session · tab N`, with the remote's name in front for a remote agent.
 

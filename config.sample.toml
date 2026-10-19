@@ -1060,8 +1060,9 @@
 # while no client is running. Applied on save.
 #
 # An agent whose pane is focused in any attached client is skipped, and so is
-# the pane this client is showing you (including a View cell). Two clients
-# attached to the same server show one notification between them.
+# the pane this client is showing you (including a View cell). Two clients on
+# the same machine attached to the same server show one notification between
+# them.
 #
 # macOS uses `osascript`, Linux `notify-send` (libnotify). `command` replaces
 # either with an argv of your own: an argument that is exactly "{title}" or
