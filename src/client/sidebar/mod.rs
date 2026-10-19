@@ -195,10 +195,6 @@ pub enum PluginRequest {
 
 /// A panel that can live inside a sidebar.
 pub trait SidebarPlugin: Send {
-    /// The look of the sidebar this panel sits in. Called when the chrome is
-    /// built. A panel that has no flat variant ignores it.
-    fn set_style(&mut self, _style: crate::client::chrome::SidebarStyle) {}
-
     /// Short name shown in the panel header.
     fn title(&self) -> &str;
 

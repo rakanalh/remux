@@ -55,7 +55,6 @@ use super::{
     blank_grid, draw_text, draw_text_with, shorten_path, tilde_path, PluginAction, PluginEvent,
     PluginRequest, SidebarPlugin,
 };
-use crate::client::chrome::SidebarStyle;
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, DirEntry, RenderCell};
@@ -188,7 +187,11 @@ impl FilesPlugin {
             pending: None,
             pending_select: None,
             last_request: None,
-            nav: NavList::new(),
+            nav: {
+                let mut nav = NavList::new();
+                nav.set_layout(nav::ListLayout::new(1));
+                nav
+            },
             requests: Vec::new(),
         }
     }
@@ -395,10 +398,6 @@ impl SidebarPlugin for FilesPlugin {
         (8, self.nav.layout().header_rows as u16 + 2)
     }
 
-    fn set_style(&mut self, style: SidebarStyle) {
-        self.nav.set_layout(nav::ListLayout::for_style(style, 1));
-    }
-
     /// Yes -- indirectly. This panel never reads a `SessionTree`, but
     /// [`PluginEvent::FocusedCwd`] is derived from one, so a client whose only
     /// panel is this one must still subscribe or the directory it starts in
@@ -432,21 +431,17 @@ impl SidebarPlugin for FilesPlugin {
         let layout = self.nav.layout();
         let header_rows = layout.header_rows;
         let pad = layout.pad();
-        if layout.flat {
-            // The path is the header here, so it is not lowercased the way a
-            // fixed panel name is.
-            draw_text_with(
-                &mut grid,
-                pad,
-                0,
-                &header,
-                theme.sidebar_dim_fg.clone(),
-                bg.clone(),
-                true,
-            );
-        } else {
-            nav::draw_header(&mut grid, &header, focused, theme, &bg);
-        }
+        // The path is the header here, so it is not lowercased the way a fixed
+        // panel name is.
+        draw_text_with(
+            &mut grid,
+            pad,
+            0,
+            &header,
+            theme.sidebar_dim_fg.clone(),
+            bg.clone(),
+            true,
+        );
 
         // The same budget rule the agents panel arrived at: at most half the
         // rows when there is a list to crowd out, all of them when there is not.
@@ -512,12 +507,7 @@ impl SidebarPlugin for FilesPlugin {
             };
             let y = layout.row_of(i);
             let selected = top + i == self.nav.selected();
-            let (fg, row_bg, bold) = if layout.flat {
-                nav::flat_row_colors(theme, focused, selected, &bg)
-            } else {
-                let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
-                (fg, row_bg, false)
-            };
+            let (fg, row_bg, bold) = nav::row_colors(theme, focused, selected, &bg);
             if selected {
                 nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
@@ -763,19 +753,27 @@ mod tests {
         }
     }
 
-    /// The panel's visible rows, from a real render.
+    /// The panel as a list of lines: the header at index 0 and the list rows
+    /// from index 1, each without its padding column.
+    ///
+    /// A real render of a panel one row taller than `rows`, because the header
+    /// is followed by a blank row that these tests do not index. That row is
+    /// dropped, so `rows` is still the number of lines the caller sees.
     fn painted(p: &FilesPlugin, cols: u16, rows: u16) -> Vec<String> {
         let theme = CompositorTheme::default();
-        p.render(cols, rows, true, &theme)
+        let mut lines: Vec<String> = p
+            .render(cols, rows + 1, true, &theme)
             .iter()
             .map(|row| {
-                row.iter()
-                    .map(|c| c.c)
-                    .collect::<String>()
+                let text: String = row.iter().map(|c| c.c).collect();
+                text.strip_prefix(' ')
+                    .unwrap_or(&text)
                     .trim_end()
                     .to_string()
             })
-            .collect()
+            .collect();
+        lines.remove(1);
+        lines
     }
 
     /// Drive a panel to a listed directory, returning it ready to navigate.
@@ -1377,10 +1375,10 @@ mod tests {
         });
         let _ = painted(&p, 24, 4);
         let down = MouseEventKind::Down(MouseButton::Left);
-        // Rows are painted at y=1..2; the notice is at y=3.
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
+        // The two-row header leaves rows at y=2..3; the notice is at y=4.
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
         assert_eq!(
-            p.on_mouse(0, 3, down),
+            p.on_mouse(0, 4, down),
             PluginAction::None,
             "the notice is not a row, however many rows exist below the fold"
         );
@@ -1391,8 +1389,8 @@ mod tests {
         let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
         let _ = painted(&p, 24, 5);
         let down = MouseEventKind::Down(MouseButton::Left);
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Leave);
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Leave);
         assert_eq!(
             p.take_requests(),
             vec![PluginRequest::OpenInSplit {
@@ -1403,6 +1401,7 @@ mod tests {
             }]
         );
         assert_eq!(p.on_mouse(0, 0, down), PluginAction::None, "not the header");
+        assert_eq!(p.on_mouse(0, 1, down), PluginAction::None, "not the gap");
     }
 
     // -- Ruling 5: following the focused pane, and knowing when to stop -------
@@ -1609,6 +1608,6 @@ mod tests {
     #[test]
     fn the_header_keeps_the_end_of_a_path_too_long_to_fit() {
         let p = at("/home/me/a/very/deep/place", vec![entry("f", false)]);
-        assert_eq!(painted(&p, 8, 3)[0], "…p/place");
+        assert_eq!(painted(&p, 8, 3)[0], "…/place");
     }
 }

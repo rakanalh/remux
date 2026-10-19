@@ -43,7 +43,6 @@ use std::cell::Cell;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 
 use super::{draw_text, draw_text_with};
-use crate::client::chrome::SidebarStyle;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
@@ -52,45 +51,39 @@ pub const HEADER_ROWS: usize = 1;
 
 /// Where a list's rows start and how tall each one is.
 ///
-/// Row height belongs to the panel (the agents panel's rows are two lines in
-/// every style); the header and the padding belong to the style. A boxed
-/// sidebar has a one-row header and no padding, which is what every function
-/// below assumed before flat existed; [`ListLayout::BOXED`] is that with
-/// one-line rows, and the plain functions delegate to it. A flat sidebar has a
-/// header row plus a blank row and one column of left padding. The selection,
-/// the scroll offset and every count in the `NavList` are in ITEMS, never in
-/// screen rows.
+/// Every sidebar style shares one layout: a header row plus a blank row, one
+/// column of left padding, and rows whose height belongs to the panel (the
+/// agents panel's are two lines). [`ListLayout::PLAIN`] is the older shape the
+/// plain functions below assume (a one-row header, no padding, one-line rows),
+/// and a bare [`NavList`] starts with it. The selection, the scroll offset and
+/// every count in the `NavList` are in ITEMS, never in screen rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListLayout {
     pub header_rows: usize,
     pub row_height: usize,
-    pub flat: bool,
+    pad: u16,
 }
 
 impl ListLayout {
-    pub const BOXED: Self = Self {
+    pub const PLAIN: Self = Self {
         header_rows: HEADER_ROWS,
         row_height: 1,
-        flat: false,
+        pad: 0,
     };
 
-    pub fn for_style(style: SidebarStyle, row_height: usize) -> Self {
-        match style {
-            SidebarStyle::Boxed => Self {
-                row_height: row_height.max(1),
-                ..Self::BOXED
-            },
-            SidebarStyle::Flat => Self {
-                header_rows: FLAT_HEADER_ROWS,
-                row_height: row_height.max(1),
-                flat: true,
-            },
+    /// The layout the sidebar panels draw with, for rows `row_height` lines
+    /// tall.
+    pub fn new(row_height: usize) -> Self {
+        Self {
+            header_rows: LIST_HEADER_ROWS,
+            row_height: row_height.max(1),
+            pad: 1,
         }
     }
 
     /// Columns of left padding before any content.
     pub fn pad(&self) -> u16 {
-        u16::from(self.flat)
+        self.pad
     }
 
     /// How many whole items fit in `rows` rows below the header.
@@ -105,8 +98,8 @@ impl ListLayout {
     }
 }
 
-/// A flat panel's header: the title row and one blank row.
-pub const FLAT_HEADER_ROWS: usize = 2;
+/// A panel's header: the title row and one blank row.
+pub const LIST_HEADER_ROWS: usize = 2;
 
 /// A list command, independent of what the rows mean.
 ///
@@ -172,7 +165,7 @@ pub fn move_selection(selected: &mut usize, len: usize, cmd: NavKey) {
 /// what lets `render(&self)` compute it: a panel is not told its height until
 /// it is asked to paint.
 pub fn scroll_offset(selected: usize, rows: u16) -> usize {
-    scroll_offset_in(ListLayout::BOXED, selected, rows)
+    scroll_offset_in(ListLayout::PLAIN, selected, rows)
 }
 
 /// [`scroll_offset`] for a given layout. `selected` and the result are item
@@ -207,7 +200,7 @@ pub enum Hit {
 /// `on_mouse` is not told the panel's height, and the selection cannot have
 /// moved since that paint -- a click is what moves it.
 pub fn hit_test(y: u16, top: usize, selected: usize, len: usize) -> Hit {
-    hit_test_in(ListLayout::BOXED, y, top, selected, len)
+    hit_test_in(ListLayout::PLAIN, y, top, selected, len)
 }
 
 /// [`hit_test`] for a given layout: any line of a multi-line row hits that row.
@@ -230,33 +223,12 @@ pub fn is_select_click(kind: MouseEventKind) -> bool {
     matches!(kind, MouseEventKind::Down(MouseButton::Left))
 }
 
-/// `(fg, bg)` for one list row.
-///
-/// An UNFOCUSED panel still marks its selection, dimmer: the row is where the
-/// keyboard would land on re-entry, so losing it entirely would make focusing
-/// the panel feel like it moved.
-pub fn row_colors(
-    theme: &CompositorTheme,
-    focused: bool,
-    selected: bool,
-    bg: &CellColor,
-) -> (CellColor, CellColor) {
-    if !selected {
-        return (theme.status_bar_fg.clone(), bg.clone());
-    }
-    if focused {
-        (theme.tab_active_fg.clone(), theme.tab_active_bg.clone())
-    } else {
-        (theme.tab_inactive_fg.clone(), theme.tab_inactive_bg.clone())
-    }
-}
-
-/// `(fg, bg, bold)` for one row of a flat list.
+/// `(fg, bg, bold)` for one list row.
 ///
 /// The selection keeps its focused/unfocused distinction: the band is always
 /// painted, and the name takes the bright selected colour only while the panel
 /// holds the keyboard.
-pub fn flat_row_colors(
+pub fn row_colors(
     theme: &CompositorTheme,
     focused: bool,
     selected: bool,
@@ -288,25 +260,9 @@ pub fn fill_row(grid: &mut [Vec<RenderCell>], y: u16, cols: u16, fg: &CellColor,
     );
 }
 
-/// Paint a panel's header row.
-///
-/// A panel's header tracks focus with the SAME theme roles its frame does --
-/// that is why they match on screen -- so it asks the same rule rather than
-/// restating the choice.
+/// Paint a panel's header: the title in lowercase, bold and dim, one column
+/// in.
 pub fn draw_header(
-    grid: &mut [Vec<RenderCell>],
-    title: &str,
-    focused: bool,
-    theme: &CompositorTheme,
-    bg: &CellColor,
-) {
-    let header_fg = crate::server::compositor::border_fg(theme, focused);
-    draw_text(grid, 0, 0, title, header_fg, bg.clone());
-}
-
-/// Paint a flat panel's header: the title in lowercase, bold and dim, one
-/// column in.
-pub fn draw_flat_header(
     grid: &mut [Vec<RenderCell>],
     title: &str,
     theme: &CompositorTheme,
@@ -355,7 +311,7 @@ impl Default for NavList {
             selected: 0,
             last_top: Cell::new(0),
             last_shown: Cell::new(0),
-            layout: ListLayout::BOXED,
+            layout: ListLayout::PLAIN,
         }
     }
 }

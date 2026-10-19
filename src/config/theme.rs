@@ -227,21 +227,20 @@ pub struct ThemeConfig {
     /// lives here beside the chip colors it shapes.
     pub tab_style: TabStyle,
     /// Background of the full-width bar on the agents panel row whose pane the
-    /// user is currently in. Must stay distinct from BOTH selection bars
-    /// (`tab_active_bg` while the panel has focus, `tab_inactive_bg` while it
-    /// does not): the two marks are shown together while the user scrolls the
-    /// list, and one that matched a selection bar would read as a second cursor.
+    /// user is currently in. Must stay distinct from the selection band
+    /// (`sidebar_selection_bg`): the two marks are shown together while the user
+    /// scrolls the list, and one that matched the band would read as a second
+    /// cursor.
     pub sidebar_current_bg: ThemeColor,
-    /// Colour of a `flat` sidebar's divider against the content and of the
-    /// rules between its stacked panels. Meant to sit only just off the
-    /// terminal background.
+    /// Colour of a `flat` sidebar's divider against the content. Meant to sit
+    /// only just off the terminal background.
     pub sidebar_divider_fg: ThemeColor,
-    /// Background band behind the selected row (both lines of a two-line row)
-    /// in a `flat` sidebar.
+    /// Background band behind the selected row of a sidebar panel (both lines
+    /// of a two-line row).
     pub sidebar_selection_bg: ThemeColor,
-    /// Section headers and secondary lines in a `flat` sidebar.
+    /// Section headers and secondary lines in a sidebar panel.
     pub sidebar_dim_fg: ThemeColor,
-    /// The selected item's name in a `flat` sidebar. Unselected names use
+    /// The selected item's name in a sidebar panel. Unselected names use
     /// `status_bar_fg`.
     pub sidebar_name_selected_fg: ThemeColor,
     /// Background of the collapse button on an expanded sidebar and of the chip

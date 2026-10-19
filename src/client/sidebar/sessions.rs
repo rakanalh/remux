@@ -26,10 +26,9 @@ use std::cell::Cell;
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 
 #[cfg(test)]
-use super::nav::HEADER_ROWS;
+use super::nav::LIST_HEADER_ROWS;
 use super::nav::{self, ListLayout, NavKey};
 use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
-use crate::client::chrome::SidebarStyle;
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
@@ -49,7 +48,6 @@ pub struct SessionsPlugin {
     /// `&mut self` render: this is a record of what was drawn, not state the
     /// panel reasons with.
     last_top: Cell<usize>,
-    style: SidebarStyle,
 }
 
 impl SessionsPlugin {
@@ -58,12 +56,11 @@ impl SessionsPlugin {
             trees: Vec::new(),
             model: TreeModel::new(),
             last_top: Cell::new(0),
-            style: SidebarStyle::Boxed,
         }
     }
 
     fn layout(&self) -> ListLayout {
-        ListLayout::for_style(self.style, 1)
+        ListLayout::new(1)
     }
 
     /// Push `trees` into the model: roster first (it is what makes server rows
@@ -138,10 +135,6 @@ impl SidebarPlugin for SessionsPlugin {
         (12, self.layout().header_rows as u16 + 2)
     }
 
-    fn set_style(&mut self, style: SidebarStyle) {
-        self.style = style;
-    }
-
     fn wants_session_tree(&self) -> bool {
         true
     }
@@ -159,11 +152,7 @@ impl SidebarPlugin for SessionsPlugin {
             return grid;
         }
         let layout = self.layout();
-        if layout.flat {
-            nav::draw_flat_header(&mut grid, self.title(), theme, &bg);
-        } else {
-            nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
-        }
+        nav::draw_header(&mut grid, self.title(), theme, &bg);
 
         let top = nav::scroll_offset_in(layout, self.model.selected, rows);
         self.last_top.set(top);
@@ -173,12 +162,7 @@ impl SidebarPlugin for SessionsPlugin {
             };
             let y = layout.row_of(i);
             let selected = top + i == self.model.selected;
-            let (fg, row_bg, bold) = if layout.flat {
-                nav::flat_row_colors(theme, focused, selected, &bg)
-            } else {
-                let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
-                (fg, row_bg, false)
-            };
+            let (fg, row_bg, bold) = nav::row_colors(theme, focused, selected, &bg);
             if selected {
                 nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
             }
@@ -437,7 +421,7 @@ mod tests {
         let mut p = SessionsPlugin::new();
         p.on_event(&local_tree());
         let rows = painted(&p, 24, 8);
-        assert_eq!(rows[0], "Sessions");
+        assert_eq!(rows[0], " sessions");
         assert!(
             rows.iter().any(|r| r.contains("local")),
             "no local server row: {rows:?}"
@@ -629,14 +613,14 @@ mod tests {
         p.on_event(&local_tree());
         let open = painted(&p, 24, 12);
         assert!(
-            open.iter().any(|r| r.starts_with("\u{25BC} local")),
+            open.iter().any(|r| r.starts_with(" \u{25BC} local")),
             "an expanded server is not marked open: {open:?}"
         );
         select(&mut p, "local");
         p.on_key(key(KeyCode::Char('h')));
         let shut = painted(&p, 24, 12);
         assert!(
-            shut.iter().any(|r| r.starts_with("\u{25B6} local")),
+            shut.iter().any(|r| r.starts_with(" \u{25B6} local")),
             "a collapsed server is not marked shut: {shut:?}"
         );
     }
@@ -691,11 +675,14 @@ mod tests {
         let theme = CompositorTheme::default();
         let focused = p.render(24, 6, true, &theme);
         let idle = p.render(24, 6, false, &theme);
-        assert_eq!(focused[1][0].bg, theme.tab_active_bg);
-        assert_eq!(focused[1][0].fg, theme.tab_active_fg);
-        assert_eq!(idle[1][0].bg, theme.tab_inactive_bg);
+        assert_eq!(focused[2][0].bg, theme.sidebar_selection_bg);
+        assert_eq!(focused[2][1].fg, theme.sidebar_name_selected_fg);
+        assert!(focused[2][1].bold);
+        // Unfocused, the band stays and the name loses its bright colour.
+        assert_eq!(idle[2][0].bg, theme.sidebar_selection_bg);
+        assert_eq!(idle[2][1].fg, theme.status_bar_fg);
         assert_ne!(
-            focused[2][0].bg, theme.tab_active_bg,
+            focused[3][0].bg, theme.sidebar_selection_bg,
             "an unselected row is highlighted too"
         );
     }
@@ -712,7 +699,7 @@ mod tests {
             .iter()
             .position(|r| r.display_name == "alpha")
             .unwrap();
-        let y = (alpha + HEADER_ROWS) as u16;
+        let y = (alpha + LIST_HEADER_ROWS) as u16;
         let down = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(p.on_mouse(0, y, down), PluginAction::Redraw);
         assert_eq!(p.model.selected, alpha);
@@ -742,10 +729,10 @@ mod tests {
         select(&mut p, "editor");
         p.on_key(key(KeyCode::Char('l')));
         p.on_key(key(KeyCode::Char('G')));
-        // A 3-row panel shows the header plus the last two tree rows.
-        let _ = painted(&p, 24, 3);
+        // A 4-row panel shows the two-row header plus the last two tree rows.
+        let _ = painted(&p, 24, 4);
         let down = MouseEventKind::Down(MouseButton::Left);
-        p.on_mouse(0, 1, down);
+        p.on_mouse(0, 2, down);
         assert_eq!(
             p.model.selected,
             p.model.rows.len() - 2,
@@ -833,9 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_tree_has_a_lowercase_header_a_blank_row_and_one_column_of_padding() {
+    fn the_tree_has_a_lowercase_header_a_blank_row_and_one_column_of_padding() {
         let mut p = SessionsPlugin::new();
-        p.set_style(SidebarStyle::Flat);
         p.on_event(&local_tree());
         let out = painted(&p, 24, 8);
         assert_eq!(out[0], " sessions");
@@ -844,9 +830,8 @@ mod tests {
     }
 
     #[test]
-    fn the_flat_band_spans_the_row_and_a_click_resolves_below_the_two_row_header() {
+    fn the_band_spans_the_row_and_a_click_resolves_below_the_two_row_header() {
         let mut p = SessionsPlugin::new();
-        p.set_style(SidebarStyle::Flat);
         p.on_event(&local_tree());
         let theme = CompositorTheme::default();
         let grid = p.render(24, 8, true, &theme);

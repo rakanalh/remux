@@ -101,13 +101,10 @@ impl Chrome {
             let mut panels = Vec::new();
             for pc in &sc.panel {
                 match make_plugin(pc) {
-                    Some(mut plugin) => {
-                        plugin.set_style(sc.style);
-                        panels.push(Panel {
-                            plugin,
-                            weight: pc.weight.max(1),
-                        });
-                    }
+                    Some(plugin) => panels.push(Panel {
+                        plugin,
+                        weight: pc.weight.max(1),
+                    }),
                     None => log::warn!(
                         "sidebar: unknown plugin {:?}; skipping this panel",
                         pc.plugin
@@ -2483,14 +2480,17 @@ mod resize_tests {
     }
 
     #[test]
-    fn the_style_reaches_the_plugins_when_the_chrome_is_built() {
-        let mut cfg = flat(bar(SidebarEdge::Left, 30, 1));
-        cfg.panel[0].plugin = "agents".into();
-        let c = Chrome::from_config(&[cfg]);
+    fn the_panels_draw_the_shared_look_in_either_style() {
         let theme = CompositorTheme::default();
-        let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
-        let header: String = grid[0].iter().map(|cell| cell.c).collect();
-        assert_eq!(header.trim_end(), " agents");
+        for style in [SidebarStyle::Boxed, SidebarStyle::Flat] {
+            let mut cfg = bar(SidebarEdge::Left, 30, 1);
+            cfg.style = style;
+            cfg.panel[0].plugin = "agents".into();
+            let c = Chrome::from_config(&[cfg]);
+            let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
+            let header: String = grid[0].iter().map(|cell| cell.c).collect();
+            assert_eq!(header.trim_end(), " agents", "{style:?}");
+        }
     }
 
     fn strippable(edge: SidebarEdge) -> SidebarConfig {

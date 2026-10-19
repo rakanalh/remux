@@ -19,9 +19,9 @@ pub enum SidebarEdge {
 
 /// How a sidebar is drawn.
 ///
-/// `Boxed` follows the pane border style (a zellij box or a tmux seam). `Flat`
-/// has no frame: one quiet divider against the content, rules between stacked
-/// panels, and panels that draw their own padding and section header.
+/// Only the edge treatment. `Boxed` follows the pane border style (a zellij box
+/// or a tmux seam). `Flat` has no frame, just one quiet divider against the
+/// content. The panels inside draw the same in both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarStyle {
