@@ -386,6 +386,19 @@ pub fn draw_text(
     fg: CellColor,
     bg: CellColor,
 ) {
+    draw_text_with(grid, x, y, text, fg, bg, false);
+}
+
+/// [`draw_text`] with the bold attribute chosen by the caller.
+pub fn draw_text_with(
+    grid: &mut [Vec<RenderCell>],
+    x: u16,
+    y: u16,
+    text: &str,
+    fg: CellColor,
+    bg: CellColor,
+    bold: bool,
+) {
     let Some(row) = grid.get_mut(y as usize) else {
         return;
     };
@@ -414,7 +427,7 @@ pub fn draw_text(
             c: ch,
             fg: fg.clone(),
             bg: bg.clone(),
-            bold: false,
+            bold,
             italic: false,
             underline: false,
             width: w as u8,

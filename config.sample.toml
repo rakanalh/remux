@@ -210,10 +210,22 @@
 # tab_style = "plain"
 
 # The agents sidebar panel paints the row of the pane you are currently in as a
-# full-width bar in this colour. Keep it distinct from `tab_active_bg` and
-# `tab_inactive_bg`, which the panel uses for its j/k selection (focused and
-# unfocused); the selection wins on a row that is both.
+# full-width bar in this colour. Keep it distinct from `sidebar_selection_bg`,
+# which the panels use for their j/k selection; the selection wins on a row
+# that is both.
 # sidebar_current_bg = "#3e385e"
+
+# Colours for the sidebar panels (see [[sidebar]] below).
+# sidebar_divider_fg = "#313244"          # a flat sidebar's divider
+# sidebar_selection_bg = "#313244"        # the band behind the selected row, both lines of an agent
+# sidebar_dim_fg = "#6c7086"              # section headers and an agent row's second line
+# sidebar_name_selected_fg = "#cdd6f4"    # the selected item's name (others use status_bar_fg)
+
+# The collapse button (a three-cell chip on the last row of an expanded sidebar)
+# and the strip a collapsed sidebar leaves behind. The chip's glyph is drawn
+# bold in `sidebar_name_selected_fg`.
+# sidebar_button_bg = "#45475a"           # the chip behind the glyph
+# sidebar_strip_bg = "#313244"            # the whole collapsed strip
 
 # Background-activity markers on inactive status-bar tabs: `!` for a bell,
 # `●` for output, `✓` for a tab that has gone quiet.
@@ -702,6 +714,35 @@
 #             the default border style.
 #   visible — whether it starts open (default: true). Toggling it at runtime
 #             also persists, so this is only the very first run's state.
+#   style   — "boxed" | "flat" (default: "boxed"). Only the EDGE treatment:
+#             "boxed" frames the sidebar with the pane border style; "flat" has
+#             no frame, just a single quiet divider column (row, for "bottom")
+#             against the panes, in `sidebar_divider_fg`. The divider takes one
+#             column of `size`. Everything inside is the same in both styles:
+#             one column of left padding, a lowercase bold header
+#             (`sidebar_dim_fg`, or `frame_active_fg` while that panel has the
+#             keyboard) and a blank row above each panel's list, a
+#             rule between stacked panels, and a full-width band
+#             (`sidebar_selection_bg`) behind the selected row. An unknown
+#             value is a parse error. Applies on config reload.
+#   collapse_to_strip — true | false (default: true). Every expanded sidebar
+#             shows a small chip on its last row (the first row inside, for
+#             "bottom"), against the divider or frame: ` ◀ ` on a left sidebar,
+#             ` ▶ ` on a right one, ` ▼ ` on the bottom one. Click it to
+#             collapse the sidebar. With `collapse_to_strip = true` a collapsed
+#             sidebar shrinks to a one-cell strip along its edge (one column,
+#             or one row for "bottom"), filled with `sidebar_strip_bg` and
+#             carrying a chip with the opposite glyph (`▶`, `◀`, `▲`); click
+#             anywhere on the strip to expand it again.
+#             The strip is chrome: it holds no panel and never takes the
+#             keyboard, and the panes get the rest of the terminal. The
+#             keyboard does the same: `Prefix b h`/`l`/`j` collapse to and
+#             expand from the strip, and focusing a collapsed sidebar
+#             (`Alt+h`/`Alt+l`, `Prefix b b`) expands it. With `false`,
+#             collapsing hides the sidebar entirely, as before, and only the
+#             keyboard brings it back. A sidebar with `visible = false` starts
+#             as a strip. The strip is dropped, like any sidebar, on a terminal
+#             too small to keep the minimum pane area.
 #
 # Runtime state (each sidebar's visibility and size, and each panel's weight)
 # is saved to `$XDG_STATE_HOME/remux/sidebar.json` and restored on the next
@@ -777,8 +818,10 @@
 #   agents      — the panes running an AI coding agent (`claude`, `codex`, ...),
 #                 on the local server and every connected remote, each with a
 #                 colour-coded state: RED needs your input, YELLOW is working,
-#                 dim is idle. `j`/`k`/`g`/`G` move and Enter jumps to that
-#                 pane, wherever it is. Configure WHICH commands count as an
+#                 dim is idle. Each agent takes two lines: the state dot and
+#                 `session · tab`, then the agent (and the host, for a
+#                 remote). `j`/`k`/`g`/`G` move by agent and Enter jumps to
+#                 that pane, wherever it is. Configure WHICH commands count as an
 #                 agent, and what a blocked one looks like, under `[agents]`
 #                 below — the defaults cover `claude`, `codex`, `omp` and
 #                 `opencode` with no setup.
