@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -157,29 +158,35 @@ struct Watching {
 
 impl Watching {
     /// Watch `dir` unless it already is, keyed by its canonical form so two
-    /// spellings of one directory do not produce duplicate events.
-    fn watch_dir(&mut self, dir: &Path) {
+    /// spellings of one directory do not produce duplicate events. Returns the
+    /// key the watch is held under, or `None` when it could not be watched.
+    fn watch_dir(&mut self, dir: &Path) -> Option<PathBuf> {
         let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         if self.watched.contains(&key) {
-            return;
+            return Some(key);
         }
         match self.watcher.watch(&key, RecursiveMode::NonRecursive) {
             Ok(()) => {
-                self.watched.insert(key);
+                self.watched.insert(key.clone());
+                Some(key)
             }
-            Err(e) => log::warn!("config watch: cannot watch {}: {e}", key.display()),
+            Err(e) => {
+                log::warn!("config watch: cannot watch {}: {e}", key.display());
+                None
+            }
         }
     }
 
-    /// Stop watching a directory that was watched for an earlier target, so a
-    /// superseded ancestor (possibly `$HOME`) does not keep a kernel watch
-    /// running. The config's own directory is kept.
-    fn unwatch_dir(&mut self, dir: &Path) {
-        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if key == self.keep || !self.watched.remove(&key) {
+    /// Stop watching `key`, a directory that was watched for an earlier target,
+    /// so a superseded ancestor (possibly `$HOME`) does not keep a kernel watch
+    /// running. The config's own directory and `current`, the directory now
+    /// watched for the target, are never dropped: both are compared as keys, so
+    /// a different spelling of either cannot remove a watch still in use.
+    fn unwatch_dir(&mut self, key: &Path, current: &Path) {
+        if key == self.keep || key == current || !self.watched.remove(key) {
             return;
         }
-        if let Err(e) = self.watcher.unwatch(&key) {
+        if let Err(e) = self.watcher.unwatch(key) {
             log::debug!("config watch: cannot unwatch {}: {e}", key.display());
         }
     }
@@ -250,6 +257,10 @@ fn watch_path<T: Send + 'static>(
     // for why the callback cannot do it itself.
     let (relink_tx, relink_rx) = std::sync::mpsc::channel::<()>();
 
+    // Set when the callback reloaded for the target while the link dangled, so
+    // the thread does not reload a second time for the same appearance.
+    let reloaded_while_dangling = Arc::new(AtomicBool::new(false));
+    let cb_flag = Arc::clone(&reloaded_while_dangling);
     let cb_target = Arc::clone(&target);
     let cb_emit = Arc::clone(&emit);
     let watched_path = config_path.clone();
@@ -271,6 +282,9 @@ fn watch_path<T: Send + 'static>(
             return;
         }
 
+        if current.as_ref().is_some_and(|t| t.dangling) {
+            cb_flag.store(true, Ordering::SeqCst);
+        }
         cb_emit();
     })?;
 
@@ -280,9 +294,7 @@ fn watch_path<T: Send + 'static>(
         keep: std::fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone()),
     };
     watching.watch_dir(&config_dir);
-    if let Some(dir) = &extra_dir {
-        watching.watch_dir(dir);
-    }
+    let extra_key = extra_dir.as_ref().and_then(|dir| watching.watch_dir(dir));
     if watching.watched.is_empty() {
         anyhow::bail!("cannot watch {}", config_dir.display());
     }
@@ -293,7 +305,7 @@ fn watch_path<T: Send + 'static>(
     let weak = Arc::downgrade(&watching);
     std::thread::spawn(move || {
         // The directory watched for the target, other than the config's own.
-        let mut extra = extra_dir;
+        let mut extra = extra_key;
         while relink_rx.recv().is_ok() {
             // One look answers every request queued behind it.
             while relink_rx.try_recv().is_ok() {}
@@ -312,12 +324,16 @@ fn watch_path<T: Send + 'static>(
                     break;
                 };
                 if let Ok(mut w) = watching.lock() {
-                    w.watch_dir(&dir);
-                    if let Some(old) = extra.as_ref().filter(|old| **old != dir) {
-                        w.unwatch_dir(old);
+                    let key = w.watch_dir(&dir);
+                    if let (Some(old), Some(new)) = (extra.as_ref(), key.as_ref()) {
+                        if old != new {
+                            w.unwatch_dir(old, new);
+                        }
+                    }
+                    if key.is_some() {
+                        extra = key;
                     }
                 }
-                extra = Some(dir.clone());
                 // The watch reports only what happens from now on. Whatever
                 // appeared while it was being added (the next directory down,
                 // or the file itself) is found by looking again.
@@ -333,9 +349,13 @@ fn watch_path<T: Send + 'static>(
                 *t = now.map(|(t, _)| t);
             }
             // The creation that made the link resolve may have happened before
-            // it was watched, so no event is coming for it.
-            if was_dangling && live_now {
+            // it was watched, so no event is coming for it. When the callback
+            // already reloaded for it, this would be the same appearance twice.
+            if was_dangling && live_now && !reloaded_while_dangling.swap(false, Ordering::SeqCst) {
                 emit();
+            }
+            if !live_now {
+                reloaded_while_dangling.store(false, Ordering::SeqCst);
             }
         }
     });
@@ -626,5 +646,55 @@ mod tests {
         );
         assert!(watched.contains(&std::fs::canonicalize(&cfg).unwrap()));
         assert!(watched.contains(&std::fs::canonicalize(target.parent().unwrap()).unwrap()));
+    }
+
+    /// A `../` link, as GNU stow makes them, to a directory that exists, with the
+    /// file moved in by a rename (one event). The spelling of the link's
+    /// directory differs from its canonical form, which must not make the
+    /// re-resolve drop the watch it just kept.
+    #[test]
+    fn a_relative_dotdot_link_keeps_its_watch_after_the_target_is_renamed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let real = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let link = cfg.join("config.toml");
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &link).unwrap();
+        let (_handle, mut rx) = start_watching(&link);
+
+        let staged = dir.path().join("staged.toml");
+        std::fs::write(&staged, "v1").unwrap();
+        std::fs::rename(&staged, real.join("config.toml")).unwrap();
+        assert!(
+            expect_quiet_reload(&mut rx).is_some(),
+            "the first version was never loaded"
+        );
+        while rx.try_recv().is_ok() {}
+
+        std::fs::write(real.join("config.toml"), "v2").unwrap();
+        assert!(
+            expect_quiet_reload(&mut rx).is_some(),
+            "a save after the target appeared was ignored: the watch was dropped"
+        );
+    }
+
+    #[test]
+    fn one_appearance_of_the_target_is_one_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        let real = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let link = cfg.join("config.toml");
+        std::os::unix::fs::symlink(real.join("config.toml"), &link).unwrap();
+        let (_handle, mut rx) = start_watching(&link);
+
+        let staged = dir.path().join("staged.toml");
+        std::fs::write(&staged, "v1").unwrap();
+        std::fs::rename(&staged, real.join("config.toml")).unwrap();
+        assert!(expect_quiet_reload(&mut rx).is_some());
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(rx.try_recv().is_err(), "the same appearance reloaded twice");
     }
 }
