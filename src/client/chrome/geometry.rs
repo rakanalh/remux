@@ -639,23 +639,32 @@ pub enum BarHit {
 /// the sidebar will retreat to.
 pub fn collapse_glyph(edge: SidebarEdge) -> char {
     match edge {
-        SidebarEdge::Left => '\u{AB}',
-        SidebarEdge::Right => '\u{BB}',
-        SidebarEdge::Bottom => '\u{25BE}',
+        SidebarEdge::Left => '\u{25C0}',
+        SidebarEdge::Right => '\u{25B6}',
+        SidebarEdge::Bottom => '\u{25BC}',
     }
 }
 
 /// The glyph on a collapsed strip: it points back into the terminal.
 pub fn expand_glyph(edge: SidebarEdge) -> char {
     match edge {
-        SidebarEdge::Left => '\u{BB}',
-        SidebarEdge::Right => '\u{AB}',
-        SidebarEdge::Bottom => '\u{25B4}',
+        SidebarEdge::Left => '\u{25B6}',
+        SidebarEdge::Right => '\u{25C0}',
+        SidebarEdge::Bottom => '\u{25B2}',
     }
 }
 
-/// The cell of a bar's inner edge that holds a glyph: the bottom end of a
-/// vertical sidebar's edge line, the right end of the bottom sidebar's.
+/// Cells in a collapse chip: a space, the glyph, a space.
+pub const CHIP_LEN: u16 = 3;
+
+/// The narrowest interior (along the chip's row) that still gets a full chip.
+/// Narrower than this the chip would cover most of its row, so the button
+/// falls back to a single glyph on the edge line.
+const MIN_CHIP_ROOM: u16 = 6;
+
+/// The cell of a bar's inner edge that holds the single-glyph fallback: the
+/// bottom end of a vertical sidebar's edge line, the right end of the bottom
+/// sidebar's.
 ///
 /// `inset` steps the cell back along the line, to clear a box corner.
 fn glyph_cell(edge: SidebarEdge, bar: Rect, inset: u16) -> Option<Rect> {
@@ -675,13 +684,19 @@ fn glyph_cell(edge: SidebarEdge, bar: Rect, inset: u16) -> Option<Rect> {
     })
 }
 
-/// The one-cell collapse button of an EXPANDED sidebar, in screen coordinates,
-/// or `None` when the bar has no inner edge line to put it on.
+/// The collapse button of an EXPANDED sidebar, in screen coordinates, or
+/// `None` when the bar has nowhere to put one.
 ///
-/// The button sits on the line the frame already draws against the panes (the
-/// box's inner border, or the flat divider). A box leaves that line's last cell
-/// to its corner, so under a zellij box the button steps one cell in. It is
-/// drawn and hit-tested from this one rect.
+/// The button is a three-cell chip inside the sidebar's interior, against the
+/// edge facing the panes: on the interior's last row, right-aligned for a left
+/// sidebar and left-aligned for a right one; on the bottom sidebar's first
+/// interior row, at its right end. Taking the interior from [`frame_for`] means
+/// the chip sits inside a box and beside a flat divider without a per-style
+/// case. Its panel's content on those cells is overpainted.
+///
+/// An interior too narrow for the chip gets a single glyph on the edge line
+/// instead (one cell in from a zellij box's corner). The returned rect is what
+/// is drawn and what is hit-tested, so the two cannot disagree.
 pub fn collapse_button(
     style: SidebarStyle,
     border: &BorderStyle,
@@ -692,23 +707,63 @@ pub fn collapse_button(
     if !frame.framed {
         return None;
     }
+    let inner = frame.interior;
+    if inner.width >= MIN_CHIP_ROOM && inner.height >= 1 {
+        let y = match edge {
+            SidebarEdge::Left | SidebarEdge::Right => inner.y + inner.height - 1,
+            SidebarEdge::Bottom => inner.y,
+        };
+        let x = match edge {
+            SidebarEdge::Right => inner.x,
+            _ => inner.x + inner.width - CHIP_LEN,
+        };
+        return Some(Rect {
+            x,
+            y,
+            width: CHIP_LEN,
+            height: 1,
+        });
+    }
     let boxed_corner = style == SidebarStyle::Boxed && matches!(border, BorderStyle::ZellijStyle);
     let inset = u16::from(boxed_corner);
     let along = match edge {
         SidebarEdge::Left | SidebarEdge::Right => bar.height,
         SidebarEdge::Bottom => bar.width,
     };
-    // Room for the glyph between the two ends of the line, corners included.
     if along < 3 + inset {
         return None;
     }
     glyph_cell(edge, bar, inset)
 }
 
-/// The cell of a collapsed strip that carries the expand glyph, in screen
-/// coordinates. The strip is `bar` itself.
-pub fn strip_glyph_cell(edge: SidebarEdge, bar: Rect) -> Option<Rect> {
-    glyph_cell(edge, bar, 0)
+/// The chip on a collapsed strip, in screen coordinates: three cells along the
+/// strip, centred, with the glyph in the middle one. A strip shorter than the
+/// chip gets a single centred glyph, and a zero-length one gets nothing.
+///
+/// The strip is `bar` itself.
+pub fn strip_chip(edge: SidebarEdge, bar: Rect) -> Option<Rect> {
+    let vertical = !matches!(edge, SidebarEdge::Bottom);
+    let len = if vertical { bar.height } else { bar.width };
+    if len == 0 || bar.width == 0 || bar.height == 0 {
+        return None;
+    }
+    let n = len.min(CHIP_LEN);
+    let at = (len - n) / 2;
+    Some(if vertical {
+        Rect {
+            x: bar.x,
+            y: bar.y + at,
+            width: 1,
+            height: n,
+        }
+    } else {
+        Rect {
+            x: bar.x + at,
+            y: bar.y,
+            width: n,
+            height: 1,
+        }
+    })
 }
 
 /// What the sidebar bar under a screen point is, as `(sidebar_index, hit)`.
@@ -1843,39 +1898,46 @@ mod tests {
     }
 
     #[test]
-    fn the_collapse_button_sits_on_the_inner_edge_line_at_the_bottom_end() {
+    fn the_collapse_button_is_a_three_cell_chip_inside_the_sidebar_against_the_edge() {
         let bar = Rect {
             x: 0,
             y: 0,
             width: 30,
             height: 29,
         };
-        let cell = |style, border: &BorderStyle, edge, bar| {
-            collapse_button(style, border, edge, bar).map(|r| (r.x, r.y))
+        let chip = |style, border: &BorderStyle, edge, bar| {
+            collapse_button(style, border, edge, bar).map(|r| (r.x, r.y, r.width, r.height))
         };
-        // Flat: the divider's last cell. Boxed zellij: one in from the corner.
+        // Flat: the last row, right-aligned against the divider (column 29).
         assert_eq!(
-            cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, bar),
-            Some((29, 28))
+            chip(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, bar),
+            Some((26, 28, 3, 1))
+        );
+        // Boxed zellij: the last INTERIOR row, against the inner border.
+        assert_eq!(
+            chip(SidebarStyle::Boxed, &ZJ, SidebarEdge::Left, bar),
+            Some((26, 27, 3, 1))
         );
         assert_eq!(
-            cell(SidebarStyle::Boxed, &ZJ, SidebarEdge::Left, bar),
-            Some((29, 27))
-        );
-        assert_eq!(
-            cell(
+            chip(
                 SidebarStyle::Boxed,
                 &BorderStyle::TmuxStyle,
                 SidebarEdge::Left,
                 bar
             ),
-            Some((29, 28))
+            Some((26, 28, 3, 1))
         );
+        // A right sidebar: left-aligned against the divider at its first column.
         let right = Rect { x: 70, ..bar };
         assert_eq!(
-            cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Right, right),
-            Some((70, 28))
+            chip(SidebarStyle::Flat, &ZJ, SidebarEdge::Right, right),
+            Some((71, 28, 3, 1))
         );
+        assert_eq!(
+            chip(SidebarStyle::Boxed, &ZJ, SidebarEdge::Right, right),
+            Some((71, 27, 3, 1))
+        );
+        // The bottom sidebar: the first interior row, at the right end.
         let bottom = Rect {
             x: 0,
             y: 20,
@@ -1883,26 +1945,113 @@ mod tests {
             height: 8,
         };
         assert_eq!(
-            cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Bottom, bottom),
-            Some((99, 20))
+            chip(SidebarStyle::Flat, &ZJ, SidebarEdge::Bottom, bottom),
+            Some((97, 21, 3, 1))
         );
         assert_eq!(
-            cell(SidebarStyle::Boxed, &ZJ, SidebarEdge::Bottom, bottom),
-            Some((98, 20))
+            chip(SidebarStyle::Boxed, &ZJ, SidebarEdge::Bottom, bottom),
+            Some((96, 21, 3, 1))
         );
-        // Too short to carry it.
-        let tiny = Rect { height: 2, ..bar };
-        assert_eq!(cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, tiny), None);
     }
 
     #[test]
-    fn the_glyphs_point_at_the_edge_and_back() {
-        assert_eq!(collapse_glyph(SidebarEdge::Left), '\u{AB}');
-        assert_eq!(collapse_glyph(SidebarEdge::Right), '\u{BB}');
-        assert_eq!(collapse_glyph(SidebarEdge::Bottom), '\u{25BE}');
-        assert_eq!(expand_glyph(SidebarEdge::Left), '\u{BB}');
-        assert_eq!(expand_glyph(SidebarEdge::Right), '\u{AB}');
-        assert_eq!(expand_glyph(SidebarEdge::Bottom), '\u{25B4}');
+    fn the_chip_always_lies_inside_the_interior_its_panels_share() {
+        for style in [SidebarStyle::Flat, SidebarStyle::Boxed] {
+            for border in [ZJ, BorderStyle::TmuxStyle] {
+                for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+                    let bar = Rect {
+                        x: 5,
+                        y: 3,
+                        width: 30,
+                        height: 12,
+                    };
+                    let inner = frame_for(style, &border, edge, bar).interior;
+                    let c = collapse_button(style, &border, edge, bar).unwrap();
+                    assert_eq!(c.width, CHIP_LEN);
+                    assert!(
+                        c.x >= inner.x
+                            && c.x + c.width <= inner.x + inner.width
+                            && c.y >= inner.y
+                            && c.y < inner.y + inner.height,
+                        "{style:?} {border:?} {edge:?}: {c:?} outside {inner:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_sidebar_too_narrow_for_the_chip_falls_back_to_one_glyph() {
+        let narrow = Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 29,
+        };
+        assert_eq!(
+            collapse_button(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, narrow),
+            Some(Rect {
+                x: 4,
+                y: 28,
+                width: 1,
+                height: 1
+            })
+        );
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 2,
+        };
+        assert_eq!(
+            collapse_button(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, tiny),
+            None
+        );
+    }
+
+    #[test]
+    fn the_strip_chip_is_three_cells_centred_along_the_strip() {
+        let v = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 29,
+        };
+        assert_eq!(
+            strip_chip(SidebarEdge::Left, v),
+            Some(Rect {
+                x: 0,
+                y: 13,
+                width: 1,
+                height: 3
+            })
+        );
+        let r = Rect { x: 99, ..v };
+        assert_eq!(
+            strip_chip(SidebarEdge::Right, r).map(|c| (c.x, c.height)),
+            Some((99, 3))
+        );
+        let h = Rect {
+            x: 1,
+            y: 28,
+            width: 98,
+            height: 1,
+        };
+        assert_eq!(
+            strip_chip(SidebarEdge::Bottom, h),
+            Some(Rect {
+                x: 1 + 47,
+                y: 28,
+                width: 3,
+                height: 1
+            })
+        );
+        // Shorter than the chip: what fits, centred. Nothing: nothing.
+        assert_eq!(
+            strip_chip(SidebarEdge::Left, Rect { height: 2, ..v }).map(|c| c.height),
+            Some(2)
+        );
+        assert_eq!(strip_chip(SidebarEdge::Left, Rect { height: 0, ..v }), None);
     }
 
     #[test]
@@ -1916,7 +2065,8 @@ mod tests {
         for y in 0..29 {
             for x in 0..30 {
                 let hit = bar_hit(&sbs, 100, 30, &ZJ, x, y).map(|(_, h)| h);
-                let want = if (x, y) == (b.x, b.y) {
+                let on_chip = y == b.y && x >= b.x && x < b.x + b.width;
+                let want = if on_chip {
                     BarHit::Button
                 } else {
                     BarHit::Frame

@@ -221,6 +221,12 @@
 # sidebar_dim_fg = "#6c7086"              # section headers and an agent row's second line
 # sidebar_name_selected_fg = "#cdd6f4"    # the selected item's name (others use status_bar_fg)
 
+# The collapse button (a three-cell chip on the last row of an expanded sidebar)
+# and the strip a collapsed sidebar leaves behind. The chip's glyph is drawn
+# bold in `sidebar_name_selected_fg`.
+# sidebar_button_bg = "#45475a"           # the chip behind the glyph
+# sidebar_strip_bg = "#313244"            # the whole collapsed strip
+
 # Background-activity markers on inactive status-bar tabs: `!` for a bell,
 # `●` for output, `✓` for a tab that has gone quiet.
 # tab_bell_fg = "bright_red"

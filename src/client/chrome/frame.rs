@@ -33,7 +33,7 @@ use crate::server::compositor::{
 };
 use crate::server::layout::Rect;
 
-use super::geometry::{SidebarEdge, SidebarStyle};
+use super::geometry::SidebarEdge;
 
 /// Draw a sidebar's frame into `grid`, a bar-sized grid indexed
 /// `[row][col]` in bar-local coordinates.
@@ -134,58 +134,42 @@ pub fn draw_flat_frame(
     }
 }
 
-/// The colour of the glyphs and lines a collapsed or collapsible sidebar draws
-/// for itself: the dim token for a flat sidebar, the inactive frame colour for a
-/// boxed one.
-fn chrome_glyph_fg(style: SidebarStyle, theme: &CompositorTheme) -> crate::protocol::CellColor {
-    match style {
-        SidebarStyle::Flat => theme.sidebar_dim_fg.clone(),
-        SidebarStyle::Boxed => border_fg(theme, false),
+/// Fill `rect` (bar-local) with the button background and put `glyph` in its
+/// middle cell, bold in the bright sidebar text colour.
+///
+/// Used for the collapse button on an expanded sidebar and for the chip on a
+/// collapsed strip. A one-cell rect is the glyph alone.
+pub fn draw_chip(grid: &mut [Vec<RenderCell>], rect: Rect, glyph: char, theme: &CompositorTheme) {
+    for dy in 0..rect.height {
+        for dx in 0..rect.width {
+            let mut cell = border_cell(' ', &theme.sidebar_name_selected_fg, theme);
+            cell.bg = theme.sidebar_button_bg.clone();
+            if dx == rect.width / 2 && dy == rect.height / 2 {
+                cell.c = glyph;
+                cell.bold = true;
+            }
+            put_cell(grid, (rect.y + dy) as usize, (rect.x + dx) as usize, cell);
+        }
     }
 }
 
-/// Draw the collapse button's glyph at bar-local `(x, y)`.
-pub fn draw_button(
-    grid: &mut [Vec<RenderCell>],
-    x: u16,
-    y: u16,
-    glyph: char,
-    style: SidebarStyle,
-    theme: &CompositorTheme,
-) {
-    let fg = chrome_glyph_fg(style, theme);
-    put_cell(grid, y as usize, x as usize, border_cell(glyph, &fg, theme));
-}
-
-/// Draw a collapsed sidebar's strip into `grid`, which is the strip itself.
-///
-/// The line is the one the expanded sidebar drew against the panes (the flat
-/// divider, or the boxed frame colour). `glyph` is the bar-local cell and the
-/// character that invite expanding.
+/// Draw a collapsed sidebar's strip into `grid`, which is the strip itself: the
+/// whole strip on the strip background, with the expand chip (bar-local
+/// `chip`, and the glyph that goes in it) on top.
 pub fn draw_strip(
     grid: &mut [Vec<RenderCell>],
-    edge: SidebarEdge,
-    style: SidebarStyle,
-    glyph: Option<(u16, u16, char)>,
+    chip: Option<(Rect, char)>,
     theme: &CompositorTheme,
 ) {
-    let h = grid.len();
-    if h == 0 || grid[0].is_empty() {
-        return;
-    }
-    let w = grid[0].len();
-    let line_fg = match style {
-        SidebarStyle::Flat => theme.sidebar_divider_fg.clone(),
-        SidebarStyle::Boxed => border_fg(theme, false),
-    };
-    match edge {
-        SidebarEdge::Left | SidebarEdge::Right => {
-            draw_divider_column(grid, 0, 0, h, &line_fg, theme)
+    for row in grid.iter_mut() {
+        for cell in row.iter_mut() {
+            let mut blank = border_cell(' ', &theme.sidebar_dim_fg, theme);
+            blank.bg = theme.sidebar_strip_bg.clone();
+            *cell = blank;
         }
-        SidebarEdge::Bottom => draw_divider_row(grid, 0, 0, w, &line_fg, theme),
     }
-    if let Some((x, y, c)) = glyph {
-        draw_button(grid, x, y, c, style, theme);
+    if let Some((rect, glyph)) = chip {
+        draw_chip(grid, rect, glyph, theme);
     }
 }
 
@@ -481,47 +465,49 @@ mod tests {
     }
 
     #[test]
-    fn a_strip_is_the_edge_line_with_the_expand_glyph_on_it() {
+    fn a_strip_is_filled_with_a_chip_in_it() {
         let t = theme();
-        let mut g = blank_grid(1, 5, CellColor::Default);
-        draw_strip(
-            &mut g,
-            SidebarEdge::Left,
-            SidebarStyle::Flat,
-            Some((0, 4, '\u{BB}')),
-            &t,
-        );
-        assert_eq!(
-            chars(&g),
-            vec!["\u{2502}", "\u{2502}", "\u{2502}", "\u{2502}", "\u{BB}"]
-        );
-        assert_eq!(g[0][0].fg, t.sidebar_divider_fg);
-        assert_eq!(g[4][0].fg, t.sidebar_dim_fg);
-
-        let mut b = blank_grid(6, 1, CellColor::Default);
-        draw_strip(
-            &mut b,
-            SidebarEdge::Bottom,
-            SidebarStyle::Boxed,
-            Some((5, 0, '\u{25B4}')),
-            &t,
-        );
-        assert_eq!(
-            chars(&b),
-            vec!["\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{25B4}"]
-        );
-        assert_eq!(b[0][0].fg, t.frame_fg);
-        assert_eq!(b[0][5].fg, t.frame_fg);
+        let mut g = blank_grid(1, 7, CellColor::Default);
+        let chip = Rect {
+            x: 0,
+            y: 2,
+            width: 1,
+            height: 3,
+        };
+        draw_strip(&mut g, Some((chip, '\u{25B6}')), &t);
+        for (y, row) in g.iter().enumerate() {
+            let in_chip = (2..5).contains(&y);
+            let want = if in_chip {
+                &t.sidebar_button_bg
+            } else {
+                &t.sidebar_strip_bg
+            };
+            assert_eq!(&row[0].bg, want, "row {y}");
+        }
+        assert_eq!(chars(&g)[3], "\u{25B6}");
+        assert!(g[3][0].bold);
+        assert_eq!(g[3][0].fg, t.sidebar_name_selected_fg);
+        assert_eq!(chars(&g)[2], " ");
+        assert!(!g[2][0].bold);
     }
 
     #[test]
-    fn the_collapse_button_is_drawn_in_the_styles_dim_colour() {
+    fn a_chip_is_space_glyph_space_on_the_button_background() {
         let t = theme();
-        let mut g = blank_grid(4, 4, CellColor::Default);
-        draw_button(&mut g, 3, 2, '\u{AB}', SidebarStyle::Flat, &t);
-        assert_eq!(g[2][3].c, '\u{AB}');
-        assert_eq!(g[2][3].fg, t.sidebar_dim_fg);
-        draw_button(&mut g, 3, 1, '\u{AB}', SidebarStyle::Boxed, &t);
-        assert_eq!(g[1][3].fg, t.frame_fg);
+        let mut g = blank_grid(8, 2, CellColor::Default);
+        let chip = Rect {
+            x: 4,
+            y: 1,
+            width: 3,
+            height: 1,
+        };
+        draw_chip(&mut g, chip, '\u{25C0}', &t);
+        assert_eq!(chars(&g)[1], "    \u{20}\u{25C0}\u{20} ");
+        for cell in &g[1][4..7] {
+            assert_eq!(cell.bg, t.sidebar_button_bg);
+        }
+        assert_eq!(g[1][3].bg, CellColor::Default);
+        assert_eq!(g[1][5].fg, t.sidebar_name_selected_fg);
+        assert!(g[1][5].bold);
     }
 }

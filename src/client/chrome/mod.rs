@@ -14,7 +14,7 @@ use anyhow::Result;
 // `MIN_CONTENT_COLS`/`MIN_CONTENT_ROWS` are deliberately NOT re-exported: this
 // is a binary crate, so a `pub use` nothing outside `geometry` imports trips
 // `unused_imports` under `-D warnings`.
-use geometry::{bar_hit, collapse_button, collapse_glyph, expand_glyph, strip_glyph_cell};
+use geometry::{bar_hit, collapse_button, collapse_glyph, expand_glyph, strip_chip};
 pub use geometry::{
     bar_rects, content_point, content_rect, effective_sizes, frame_for, inset_for, pane_area,
     panel_rects, past_the_server_bar, status_bar_rect, BarHit, PanelGeom, SidebarEdge, SidebarGeom,
@@ -308,10 +308,16 @@ impl Chrome {
         for (si, bar) in self.bar_rects(term_cols, term_rows) {
             if !self.sidebars[si].visible {
                 let sb = &self.sidebars[si];
-                let glyph = strip_glyph_cell(sb.edge, bar)
-                    .map(|g| (g.x - bar.x, g.y - bar.y, expand_glyph(sb.edge)));
+                let chip = strip_chip(sb.edge, bar).map(|c| {
+                    let local = Rect {
+                        x: c.x - bar.x,
+                        y: c.y - bar.y,
+                        ..c
+                    };
+                    (local, expand_glyph(sb.edge))
+                });
                 let mut grid = blank_grid(bar.width, bar.height, theme.border_bg());
-                frame::draw_strip(&mut grid, sb.edge, sb.style, glyph, theme);
+                frame::draw_strip(&mut grid, chip, theme);
                 renderer.paint_panel(bar, &grid)?;
                 continue;
             }
@@ -403,14 +409,12 @@ impl Chrome {
             }
             let sb = &self.sidebars[si];
             if let Some(b) = collapse_button(sb.style, &self.border_style, sb.edge, bar) {
-                frame::draw_button(
-                    &mut grid,
-                    b.x - bar.x,
-                    b.y - bar.y,
-                    collapse_glyph(sb.edge),
-                    sb.style,
-                    theme,
-                );
+                let local = Rect {
+                    x: b.x - bar.x,
+                    y: b.y - bar.y,
+                    ..b
+                };
+                frame::draw_chip(&mut grid, local, collapse_glyph(sb.edge), theme);
             }
             renderer.paint_panel(bar, &grid)?;
         }

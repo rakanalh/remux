@@ -244,6 +244,11 @@ pub struct ThemeConfig {
     /// The selected item's name in a `flat` sidebar. Unselected names use
     /// `status_bar_fg`.
     pub sidebar_name_selected_fg: ThemeColor,
+    /// Background of the collapse button on an expanded sidebar and of the chip
+    /// on a collapsed strip. The glyph on it uses `sidebar_name_selected_fg`.
+    pub sidebar_button_bg: ThemeColor,
+    /// Background of a collapsed sidebar's whole strip.
+    pub sidebar_strip_bg: ThemeColor,
     pub whichkey_fg: ThemeColor,
     pub whichkey_bg: ThemeColor,
     pub whichkey_key_fg: ThemeColor,
@@ -329,6 +334,8 @@ impl Default for ThemeConfig {
             sidebar_selection_bg: ThemeColor::Rgb(49, 50, 68), // surface0
             sidebar_dim_fg: ThemeColor::Rgb(108, 112, 134),  // overlay0
             sidebar_name_selected_fg: ThemeColor::Rgb(205, 214, 244), // text
+            sidebar_button_bg: ThemeColor::Rgb(69, 71, 90),  // surface1
+            sidebar_strip_bg: ThemeColor::Rgb(49, 50, 68),   // surface0
 
             // Which-key popup
             whichkey_fg: ThemeColor::Rgb(205, 214, 244), // text
@@ -504,6 +511,8 @@ pub struct CompositorTheme {
     pub sidebar_selection_bg: CellColor,
     pub sidebar_dim_fg: CellColor,
     pub sidebar_name_selected_fg: CellColor,
+    pub sidebar_button_bg: CellColor,
+    pub sidebar_strip_bg: CellColor,
     pub whichkey_fg: CellColor,
     pub whichkey_bg: CellColor,
     pub whichkey_key_fg: CellColor,
@@ -551,6 +560,8 @@ impl CompositorTheme {
             sidebar_selection_bg: config.sidebar_selection_bg.to_cell_color(),
             sidebar_dim_fg: config.sidebar_dim_fg.to_cell_color(),
             sidebar_name_selected_fg: config.sidebar_name_selected_fg.to_cell_color(),
+            sidebar_button_bg: config.sidebar_button_bg.to_cell_color(),
+            sidebar_strip_bg: config.sidebar_strip_bg.to_cell_color(),
             whichkey_fg: config.whichkey_fg.to_cell_color(),
             whichkey_bg: config.whichkey_bg.to_cell_color(),
             whichkey_key_fg: config.whichkey_key_fg.to_cell_color(),
@@ -702,6 +713,8 @@ mod tests {
         assert_eq!(ct.sidebar_selection_bg, CellColor::Rgb(49, 50, 68)); // surface0
         assert_eq!(ct.sidebar_dim_fg, CellColor::Rgb(108, 112, 134)); // overlay0
         assert_eq!(ct.sidebar_name_selected_fg, CellColor::Rgb(205, 214, 244)); // text
+        assert_eq!(ct.sidebar_button_bg, CellColor::Rgb(69, 71, 90)); // surface1
+        assert_eq!(ct.sidebar_strip_bg, CellColor::Rgb(49, 50, 68)); // surface0
 
         // Status-bar right-hand segments and activity markers: the named roles
         // must default to the literals the renderers used to hardcode.
