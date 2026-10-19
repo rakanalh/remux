@@ -278,6 +278,24 @@ impl Chrome {
         }
     }
 
+    /// The edge a left press at `(x, y)` collapses or expands: the sidebar whose
+    /// chip or strip is there, and nothing for any other position.
+    ///
+    /// Position only, so the client can ask it before it asks anything else
+    /// about a mouse event, whatever owns the screen (a live view included).
+    pub fn collapse_press(
+        &self,
+        term_cols: u16,
+        term_rows: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<SidebarEdge> {
+        match self.pointer_target(term_cols, term_rows, x, y) {
+            PointerTarget::Button(i) | PointerTarget::Strip(i) => Some(self.sidebars[i].edge),
+            _ => None,
+        }
+    }
+
     /// The row the client draws the status bar on, or `None` while the
     /// server's own bar is shown. See [`geometry::status_bar_owned`].
     pub fn status_bar_rect(&self, term_cols: u16, term_rows: u16) -> Option<Rect> {
@@ -2718,5 +2736,42 @@ mod resize_tests {
         cfg.style = SidebarStyle::Flat;
         let c = Chrome::from_config(&[cfg]);
         assert_eq!(c.pointer_target(tc, tr, 29, 3), PointerTarget::Frame(0));
+    }
+
+    #[test]
+    fn only_a_chip_or_a_strip_collapses_on_a_press() {
+        let (tc, tr) = (100, 40);
+        let mut cfg = strippable(SidebarEdge::Left);
+        cfg.style = SidebarStyle::Flat;
+        let mut c = Chrome::from_config(&[cfg]);
+        let bar_rect = c.bar_rects(tc, tr)[0].1;
+        let chip = collapse_button(
+            SidebarStyle::Flat,
+            &c.border_style,
+            SidebarEdge::Left,
+            bar_rect,
+        )
+        .unwrap();
+        assert_eq!(
+            c.collapse_press(tc, tr, chip.x + 1, chip.y),
+            Some(SidebarEdge::Left)
+        );
+        assert_eq!(
+            c.collapse_press(tc, tr, chip.x - 1, chip.y),
+            None,
+            "a panel cell"
+        );
+        assert_eq!(
+            c.collapse_press(tc, tr, bar_rect.width - 1, 2),
+            None,
+            "the divider"
+        );
+        assert_eq!(c.collapse_press(tc, tr, 60, 5), None, "content");
+        c.toggle_edge(SidebarEdge::Left);
+        assert_eq!(
+            c.collapse_press(tc, tr, 0, 7),
+            Some(SidebarEdge::Left),
+            "the strip"
+        );
     }
 }

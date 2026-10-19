@@ -975,26 +975,6 @@ fn content_rect_now(chrome: &crate::client::chrome::Chrome) -> Result<crate::ser
     Ok(chrome.content_rect(c, r))
 }
 
-/// Which panel, if any, a screen coordinate falls inside.
-///
-/// `term_cols`/`term_rows` must come from [`Renderer::size`], not from a fresh
-/// `terminal::size()`: panels are laid out against the front buffer, and
-/// between a SIGWINCH and the `Resize` event the two disagree -- a hit test run
-/// against the new size would resolve against rects that are not on screen yet.
-fn panel_at(
-    chrome: &crate::client::chrome::Chrome,
-    term_cols: u16,
-    term_rows: u16,
-    x: u16,
-    y: u16,
-) -> Option<(usize, usize)> {
-    chrome
-        .panel_rects(term_cols, term_rows)
-        .into_iter()
-        .find(|(_, _, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-        .map(|(si, pi, _)| (si, pi))
-}
-
 /// Which region a mouse gesture belongs to.
 ///
 /// A press claims a region and every event up to the matching release stays
@@ -1373,6 +1353,195 @@ async fn reconcile_push_subscription(
     // re-subscribe (the server forgets the subscription along with the client
     // that held it).
     subscribed.retain(|id| live.contains(id));
+}
+
+/// What a sidebar change needs to repaint, borrowed from the client loop.
+struct SidebarApply<'a> {
+    renderer: &'a mut Renderer,
+    chrome: &'a mut crate::client::chrome::Chrome,
+    mgr: &'a mut ConnectionManager,
+    views: &'a mut [crate::client::view::ClientView],
+    active_view: Option<usize>,
+    input: &'a InputHandler,
+    whichkey: &'a mut WhichKeyPopup,
+    theme: &'a crate::config::theme::Theme,
+    compositor_theme: &'a crate::config::theme::CompositorTheme,
+    view_border_style: &'a crate::config::BorderStyle,
+    which_key_position: &'a crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&'a crate::protocol::PaneRect>,
+    /// The cursor the shell last reported: `(x, y, visible)`.
+    cursor: (u16, u16, bool),
+}
+
+/// Apply a sidebar intent and bring the screen, the server's `Resize`, the
+/// persisted state and any live view into agreement with it.
+///
+/// The one path for the keyboard (`Prefix b ...`) and the mouse (the collapse
+/// chip and a collapsed strip), so both leave identical state, a live view
+/// included.
+async fn apply_sidebar_intent(ctx: SidebarApply<'_>, intent: SidebarIntent) -> Result<()> {
+    let SidebarApply {
+        renderer,
+        chrome,
+        mgr,
+        views,
+        active_view,
+        input,
+        whichkey,
+        theme,
+        compositor_theme,
+        view_border_style,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        cursor: (last_cursor_x, last_cursor_y, last_cursor_visible),
+    } = ctx;
+    let (tc, tr) = renderer.size();
+    // Tear the which-key popup down HERE -- before
+    // the refusal gate below can `continue`, and
+    // unconditionally, the way every other
+    // client-action arm does it.
+    //
+    // This arm used to have no `whichkey` teardown
+    // at all and lean on a side effect: a toggle
+    // that moves the content rect sends a `Resize`,
+    // the server answers with a `FullRender`, and
+    // the full repaint incidentally erased the
+    // popup. Every intent that changes NOTHING --
+    // a toggle for an edge with no sidebar
+    // configured, a cycle with no sidebars, a focus
+    // refused because a view owns the keyboard --
+    // repainted nothing (`Chrome::paint` over zero
+    // panel rects emits zero bytes) and stranded
+    // the popup on screen forever, while the mode
+    // reset underneath it fed the next keystroke
+    // straight to the shell.
+    let tore_down_popup = whichkey.visible;
+    if tore_down_popup {
+        whichkey.hide();
+        renderer.clear_overlay(tc, tr)?;
+    }
+    // FOCUS intents are refused while a view is live.
+    // A panel CAN hold the keyboard there -- a
+    // directional key deliberately hands it one --
+    // so this is a deliberate scope choice, not a
+    // technical impossibility: these name an EDGE
+    // with no regard for where the user is, so
+    // `Prefix b H` would pull them out of a cell
+    // they never left. Lifting it is a decision
+    // about behaviour, not a bug to fix.
+    // TOGGLE is honoured: the view is
+    // composited into the content rect now, and the
+    // panels it would show or hide are on screen next
+    // to it, so a toggle that did nothing would read as
+    // a dropped keypress. Logged either way, because a
+    // no-op that leaves no trace reads as one too.
+    if active_view.is_some() && !matches!(intent, SidebarIntent::Toggle(_)) {
+        log::debug!("sidebar: ignoring {intent:?} -- a view owns the keyboard");
+        // Nothing else runs, so the popup teardown
+        // above needs its own repaint: `paint_view`
+        // is what puts the view's cells and its
+        // cursor back after `clear_overlay`.
+        if tore_down_popup {
+            if let Some(av) = active_view {
+                paint_view(
+                    &mut *renderer,
+                    chrome,
+                    &views[av],
+                    input,
+                    whichkey,
+                    theme,
+                    compositor_theme,
+                    view_border_style,
+                    which_key_position,
+                    viewport_top,
+                    focused_pane_rect,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    let before = chrome.content_rect(tc, tr);
+    // Snapshot of everything that OUTLIVES this
+    // client, so the save below fires on a real
+    // change and only on a real change. Comparing
+    // state rather than naming the intents keeps
+    // this correct for `Focus` (which opens a hidden
+    // sidebar) and for the resize/weight commands a
+    // later phase adds, and keeps a no-op toggle --
+    // including every toggle with no sidebar
+    // configured -- from writing a file at all.
+    let persisted_before = crate::client::sidebar_state::SidebarState::from_chrome(chrome);
+    match intent {
+        SidebarIntent::Toggle(edge) => {
+            chrome.toggle_edge(edge);
+        }
+        SidebarIntent::Focus(edge) => {
+            chrome.focus_edge(edge, tc, tr);
+        }
+        SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
+    }
+    if crate::client::sidebar_state::SidebarState::from_chrome(chrome) != persisted_before {
+        crate::client::sidebar_state::save(chrome);
+    }
+    // Showing or hiding a sidebar moves the content
+    // rect, which is the server's whole world: the
+    // origin and the `Resize` must travel together
+    // (see `sync_content_rect`). Focus/cycle leave
+    // the geometry alone, so nothing is sent.
+    let content = chrome.content_rect(tc, tr);
+    if content != before {
+        sync_content_rect(&mut *renderer, chrome, &content);
+        mgr.send_foreground(ClientMessage::Resize {
+            cols: content.width,
+            rows: content.height,
+        })
+        .await?;
+    }
+    match active_view {
+        // A live view owns the screen: its cells just
+        // changed size with the content rect, so
+        // re-demand their panes and recomposite -- the
+        // same pair the SIGWINCH path runs, for the
+        // same reason. `paint_view` paints the panels.
+        Some(av) => {
+            subscribe_view_cells(mgr, chrome, renderer, &mut views[av], view_border_style).await?;
+            paint_view(
+                &mut *renderer,
+                chrome,
+                &views[av],
+                input,
+                whichkey,
+                theme,
+                compositor_theme,
+                view_border_style,
+                which_key_position,
+                viewport_top,
+                focused_pane_rect,
+            )?;
+        }
+        None => {
+            chrome.paint(
+                renderer,
+                tc,
+                tr,
+                compositor_theme,
+                focused_pane_rect.filter(|_| active_view.is_none()),
+            )?;
+            // `clear_overlay` replays the front
+            // buffer with the cursor hidden, and
+            // only `paint_panel` puts it back --
+            // so with no panel on screen (which is
+            // exactly the no-op case above) the
+            // shell would be left with no cursor.
+            if tore_down_popup {
+                renderer.restore_cursor(last_cursor_x, last_cursor_y, last_cursor_visible)?;
+            }
+            renderer.flush()?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3201,8 +3370,9 @@ async fn run_client_loop(
                         // re-subscribing the view's cells.
                         //
                         // Panels are laid out against the front buffer, so the
-                        // sizes come from `Renderer::size` -- see `panel_at` for
-                        // the SIGWINCH window a fresh `terminal::size()` reopens.
+                        // sizes come from `Renderer::size` -- see
+                        // `Chrome::pointer_target` for the SIGWINCH window a
+                        // fresh `terminal::size()` reopens.
                         if input.mode == Mode::Normal && !input.has_overlay() {
                             let (tc, tr) = renderer.size();
                             match chrome.focused_panel(tc, tr) {
@@ -5548,167 +5718,76 @@ async fn run_client_loop(
                             }
                             InputAction::Sidebar(intent) => {
                                 log::debug!("input: Sidebar {intent:?}");
-                                let (tc, tr) = renderer.size();
-                                // Tear the which-key popup down HERE -- before
-                                // the refusal gate below can `continue`, and
-                                // unconditionally, the way every other
-                                // client-action arm does it.
-                                //
-                                // This arm used to have no `whichkey` teardown
-                                // at all and lean on a side effect: a toggle
-                                // that moves the content rect sends a `Resize`,
-                                // the server answers with a `FullRender`, and
-                                // the full repaint incidentally erased the
-                                // popup. Every intent that changes NOTHING --
-                                // a toggle for an edge with no sidebar
-                                // configured, a cycle with no sidebars, a focus
-                                // refused because a view owns the keyboard --
-                                // repainted nothing (`Chrome::paint` over zero
-                                // panel rects emits zero bytes) and stranded
-                                // the popup on screen forever, while the mode
-                                // reset underneath it fed the next keystroke
-                                // straight to the shell.
-                                let tore_down_popup = whichkey.visible;
-                                if tore_down_popup {
-                                    whichkey.hide();
-                                    renderer.clear_overlay(tc, tr)?;
-                                }
-                                // FOCUS intents are refused while a view is live.
-                                // A panel CAN hold the keyboard there -- a
-                                // directional key deliberately hands it one --
-                                // so this is a deliberate scope choice, not a
-                                // technical impossibility: these name an EDGE
-                                // with no regard for where the user is, so
-                                // `Prefix b H` would pull them out of a cell
-                                // they never left. Lifting it is a decision
-                                // about behaviour, not a bug to fix.
-                                // TOGGLE is honoured: the view is
-                                // composited into the content rect now, and the
-                                // panels it would show or hide are on screen next
-                                // to it, so a toggle that did nothing would read as
-                                // a dropped keypress. Logged either way, because a
-                                // no-op that leaves no trace reads as one too.
-                                if active_view.is_some()
-                                    && !matches!(intent, SidebarIntent::Toggle(_))
-                                {
-                                    log::debug!(
-                                        "sidebar: ignoring {intent:?} -- a view owns the keyboard"
-                                    );
-                                    // Nothing else runs, so the popup teardown
-                                    // above needs its own repaint: `paint_view`
-                                    // is what puts the view's cells and its
-                                    // cursor back after `clear_overlay`.
-                                    if tore_down_popup {
-                                        if let Some(av) = active_view {
-                                            paint_view(
-                                                &mut renderer,
-                                                &chrome,
-                                                &views[av],
-                                                &input,
-                                                &whichkey,
-                                                &theme,
-                                                &compositor_theme,
-                                                &view_border_style,
-                                                &which_key_position,
-                                                viewport_top,
-                                                focused_pane_rect.as_ref(),
-                                            )?;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                let before = chrome.content_rect(tc, tr);
-                                // Snapshot of everything that OUTLIVES this
-                                // client, so the save below fires on a real
-                                // change and only on a real change. Comparing
-                                // state rather than naming the intents keeps
-                                // this correct for `Focus` (which opens a hidden
-                                // sidebar) and for the resize/weight commands a
-                                // later phase adds, and keeps a no-op toggle --
-                                // including every toggle with no sidebar
-                                // configured -- from writing a file at all.
-                                let persisted_before =
-                                    crate::client::sidebar_state::SidebarState::from_chrome(&chrome);
-                                match intent {
-                                    SidebarIntent::Toggle(edge) => {
-                                        chrome.toggle_edge(edge);
-                                    }
-                                    SidebarIntent::Focus(edge) => {
-                                        chrome.focus_edge(edge, tc, tr);
-                                    }
-                                    SidebarIntent::Cycle => chrome.cycle_focus(tc, tr),
-                                }
-                                if crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
-                                    != persisted_before
-                                {
-                                    crate::client::sidebar_state::save(&chrome);
-                                }
-                                // Showing or hiding a sidebar moves the content
-                                // rect, which is the server's whole world: the
-                                // origin and the `Resize` must travel together
-                                // (see `sync_content_rect`). Focus/cycle leave
-                                // the geometry alone, so nothing is sent.
-                                let content = chrome.content_rect(tc, tr);
-                                if content != before {
-                                    sync_content_rect(&mut renderer, &chrome, &content);
-                                    mgr.send_foreground(ClientMessage::Resize {
-                                        cols: content.width,
-                                        rows: content.height,
-                                    })
-                                    .await?;
-                                }
-                                match active_view {
-                                    // A live view owns the screen: its cells just
-                                    // changed size with the content rect, so
-                                    // re-demand their panes and recomposite -- the
-                                    // same pair the SIGWINCH path runs, for the
-                                    // same reason. `paint_view` paints the panels.
-                                    Some(av) => {
-                                        subscribe_view_cells(
-                                            mgr,
-                                            &chrome,
-                                            &renderer,
-                                            &mut views[av],
-                                            &view_border_style,
-                                        )
-                                        .await?;
-                                        paint_view(
-                                            &mut renderer,
-                                            &chrome,
-                                            &views[av],
-                                            &input,
-                                            &whichkey,
-                                            &theme,
-                                            &compositor_theme,
-                                            &view_border_style,
-                                            &which_key_position,
-                                            viewport_top,
-                                            focused_pane_rect.as_ref(),
-                                        )?;
-                                    }
-                                    None => {
-                                        chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
-                                        // `clear_overlay` replays the front
-                                        // buffer with the cursor hidden, and
-                                        // only `paint_panel` puts it back --
-                                        // so with no panel on screen (which is
-                                        // exactly the no-op case above) the
-                                        // shell would be left with no cursor.
-                                        if tore_down_popup {
-                                            renderer.restore_cursor(
-                                                last_cursor_x,
-                                                last_cursor_y,
-                                                last_cursor_visible,
-                                            )?;
-                                        }
-                                        renderer.flush()?;
-                                    }
-                                }
+                                apply_sidebar_intent(
+                                    SidebarApply {
+                                        renderer: &mut renderer,
+                                        chrome: &mut chrome,
+                                        mgr: &mut *mgr,
+                                        views: &mut views,
+                                        active_view,
+                                        input: &input,
+                                        whichkey: &mut whichkey,
+                                        theme: &theme,
+                                        compositor_theme: &compositor_theme,
+                                        view_border_style: &view_border_style,
+                                        which_key_position: &which_key_position,
+                                        viewport_top,
+                                        focused_pane_rect: focused_pane_rect.as_ref(),
+                                        cursor: (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                    },
+                                    intent,
+                                )
+                                .await?;
                             }
                             InputAction::None => {}
                         }
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
+                        // The collapse chip and a collapsed strip answer a left
+                        // press wherever the pointer is, a live view included:
+                        // they are painted over the panes and the view alike, so
+                        // this runs before either consumer is asked. The chip
+                        // lies inside a panel's rect, which is why the panel
+                        // lookup further down cannot be trusted to leave it
+                        // alone.
+                        {
+                            let (tc, tr) = renderer.size();
+                            if matches!(
+                                mouse.kind,
+                                MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                            ) {
+                                if let Some(edge) =
+                                    chrome.collapse_press(tc, tr, mouse.column, mouse.row)
+                                {
+                                    mouse_grab = None;
+                                    apply_sidebar_intent(
+                                        SidebarApply {
+                                            renderer: &mut renderer,
+                                            chrome: &mut chrome,
+                                            mgr: &mut *mgr,
+                                            views: &mut views,
+                                            active_view,
+                                            input: &input,
+                                            whichkey: &mut whichkey,
+                                            theme: &theme,
+                                            compositor_theme: &compositor_theme,
+                                            view_border_style: &view_border_style,
+                                            which_key_position: &which_key_position,
+                                            viewport_top,
+                                            focused_pane_rect: focused_pane_rect.as_ref(),
+                                            cursor: (
+                                                last_cursor_x,
+                                                last_cursor_y,
+                                                last_cursor_visible,
+                                            ),
+                                        },
+                                        SidebarIntent::Toggle(edge),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
                         // A live view owns the screen: mouse events target its
                         // cells, not the (masked) foreground session. Everything
                         // here is routed by CELL GEOMETRY and PANE IDENTITY --
@@ -6045,39 +6124,9 @@ async fn run_client_loop(
                             MouseEventKind::Down(_) => {
                                 if over_frame {
                                     mouse_grab = None;
-                                    // The collapse button and a collapsed strip
-                                    // are the only live parts of a frame. They
-                                    // take the same path as the keyboard toggle
-                                    // (`toggle_edge`), so both leave identical
-                                    // state; everything else on the frame stays
-                                    // swallowed.
-                                    if matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
-                                        if let crate::client::chrome::PointerTarget::Button(si)
-                                        | crate::client::chrome::PointerTarget::Strip(si) = target
-                                        {
-                                            let edge = chrome.sidebars[si].edge;
-                                            let persisted_before =
-                                                crate::client::sidebar_state::SidebarState::from_chrome(&chrome);
-                                            let before = chrome.content_rect(tc, tr);
-                                            chrome.toggle_edge(edge);
-                                            if crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
-                                                != persisted_before
-                                            {
-                                                crate::client::sidebar_state::save(&chrome);
-                                            }
-                                            let content = chrome.content_rect(tc, tr);
-                                            if content != before {
-                                                sync_content_rect(&mut renderer, &chrome, &content);
-                                                mgr.send_foreground(ClientMessage::Resize {
-                                                    cols: content.width,
-                                                    rows: content.height,
-                                                })
-                                                .await?;
-                                            }
-                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
-                                            renderer.flush()?;
-                                        }
-                                    }
+                                    // The collapse chip and a collapsed strip were
+                                    // answered before any routing; what is left of
+                                    // the frame is swallowed.
                                     continue;
                                 }
                                 mouse_grab = Some(at_pointer);
