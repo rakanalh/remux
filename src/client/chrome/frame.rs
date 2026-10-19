@@ -415,8 +415,8 @@ mod tests {
             chars(&g),
             vec!["     │", "     │", "─────│", "     │", "     │"]
         );
-        for r in 0..5 {
-            assert_eq!(g[r][5].fg, t.sidebar_divider_fg);
+        for row in &g {
+            assert_eq!(row[5].fg, t.sidebar_divider_fg);
         }
         assert_eq!(g[2][0].fg, t.sidebar_divider_fg);
 
