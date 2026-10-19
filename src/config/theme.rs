@@ -232,6 +232,18 @@ pub struct ThemeConfig {
     /// does not): the two marks are shown together while the user scrolls the
     /// list, and one that matched a selection bar would read as a second cursor.
     pub sidebar_current_bg: ThemeColor,
+    /// Colour of a `flat` sidebar's divider against the content and of the
+    /// rules between its stacked panels. Meant to sit only just off the
+    /// terminal background.
+    pub sidebar_divider_fg: ThemeColor,
+    /// Background band behind the selected row (both lines of a two-line row)
+    /// in a `flat` sidebar.
+    pub sidebar_selection_bg: ThemeColor,
+    /// Section headers and secondary lines in a `flat` sidebar.
+    pub sidebar_dim_fg: ThemeColor,
+    /// The selected item's name in a `flat` sidebar. Unselected names use
+    /// `status_bar_fg`.
+    pub sidebar_name_selected_fg: ThemeColor,
     pub whichkey_fg: ThemeColor,
     pub whichkey_bg: ThemeColor,
     pub whichkey_key_fg: ThemeColor,
@@ -313,6 +325,10 @@ impl Default for ThemeConfig {
             // darker than the blue focused bar, so the state markers and the
             // label stay readable on it.
             sidebar_current_bg: ThemeColor::Rgb(62, 56, 94),
+            sidebar_divider_fg: ThemeColor::Rgb(49, 50, 68), // surface0
+            sidebar_selection_bg: ThemeColor::Rgb(49, 50, 68), // surface0
+            sidebar_dim_fg: ThemeColor::Rgb(108, 112, 134),  // overlay0
+            sidebar_name_selected_fg: ThemeColor::Rgb(205, 214, 244), // text
 
             // Which-key popup
             whichkey_fg: ThemeColor::Rgb(205, 214, 244), // text
@@ -484,6 +500,10 @@ pub struct CompositorTheme {
     pub tab_inactive_bg: CellColor,
     pub tab_style: TabStyle,
     pub sidebar_current_bg: CellColor,
+    pub sidebar_divider_fg: CellColor,
+    pub sidebar_selection_bg: CellColor,
+    pub sidebar_dim_fg: CellColor,
+    pub sidebar_name_selected_fg: CellColor,
     pub whichkey_fg: CellColor,
     pub whichkey_bg: CellColor,
     pub whichkey_key_fg: CellColor,
@@ -527,6 +547,10 @@ impl CompositorTheme {
             tab_inactive_bg: config.tab_inactive_bg.to_cell_color(),
             tab_style: config.tab_style,
             sidebar_current_bg: config.sidebar_current_bg.to_cell_color(),
+            sidebar_divider_fg: config.sidebar_divider_fg.to_cell_color(),
+            sidebar_selection_bg: config.sidebar_selection_bg.to_cell_color(),
+            sidebar_dim_fg: config.sidebar_dim_fg.to_cell_color(),
+            sidebar_name_selected_fg: config.sidebar_name_selected_fg.to_cell_color(),
             whichkey_fg: config.whichkey_fg.to_cell_color(),
             whichkey_bg: config.whichkey_bg.to_cell_color(),
             whichkey_key_fg: config.whichkey_key_fg.to_cell_color(),
@@ -674,6 +698,10 @@ mod tests {
         assert_eq!(ct.tab_inactive_fg, CellColor::Rgb(147, 153, 178)); // overlay2
         assert_eq!(ct.tab_inactive_bg, CellColor::Indexed(237));
         assert_eq!(ct.sidebar_current_bg, CellColor::Rgb(62, 56, 94));
+        assert_eq!(ct.sidebar_divider_fg, CellColor::Rgb(49, 50, 68)); // surface0
+        assert_eq!(ct.sidebar_selection_bg, CellColor::Rgb(49, 50, 68)); // surface0
+        assert_eq!(ct.sidebar_dim_fg, CellColor::Rgb(108, 112, 134)); // overlay0
+        assert_eq!(ct.sidebar_name_selected_fg, CellColor::Rgb(205, 214, 244)); // text
 
         // Status-bar right-hand segments and activity markers: the named roles
         // must default to the literals the renderers used to hardcode.

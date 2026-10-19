@@ -215,6 +215,12 @@
 # unfocused); the selection wins on a row that is both.
 # sidebar_current_bg = "#3e385e"
 
+# Colours for a sidebar declared with `style = "flat"` (see [[sidebar]] below).
+# sidebar_divider_fg = "#313244"          # the divider and the rules between panels
+# sidebar_selection_bg = "#313244"        # the band behind the selected row
+# sidebar_dim_fg = "#6c7086"              # section headers and an agent row's second line
+# sidebar_name_selected_fg = "#cdd6f4"    # the selected item's name (others use status_bar_fg)
+
 # Background-activity markers on inactive status-bar tabs: `!` for a bell,
 # `●` for output, `✓` for a tab that has gone quiet.
 # tab_bell_fg = "bright_red"
@@ -702,6 +708,17 @@
 #             the default border style.
 #   visible — whether it starts open (default: true). Toggling it at runtime
 #             also persists, so this is only the very first run's state.
+#   style   — "boxed" | "flat" (default: "boxed"). "boxed" frames the sidebar
+#             with the pane border style. "flat" has no frame: a single quiet
+#             divider column (row, for "bottom") against the panes, a lowercase
+#             section header and one column of padding in every panel, a
+#             horizontal rule between stacked panels, and a full-width band
+#             behind the selected row. The agents panel then shows two-line
+#             rows (state dot and name, then the agent). The divider takes one
+#             column of `size`. Colours: `sidebar_divider_fg`,
+#             `sidebar_selection_bg`, `sidebar_dim_fg` and
+#             `sidebar_name_selected_fg` in the theme. An unknown value is a
+#             parse error. Applies on config reload.
 #
 # Runtime state (each sidebar's visibility and size, and each panel's weight)
 # is saved to `$XDG_STATE_HOME/remux/sidebar.json` and restored on the next
