@@ -363,18 +363,24 @@ def panel_rows(screen):
     ]
 
 
+# Rows the panel reserves above its list: the header and one blank row. The
+# list also sits one column in from the panel's edge.
+HEADER_ROWS = 2
+PAD = 1
+
+
 def entry_rows(screen):
     """Just the list rows: everything under the header, up to the first blank."""
     out = []
-    for r in panel_rows(screen)[1:]:
+    for r in panel_rows(screen)[HEADER_ROWS:]:
         if not r.strip():
             break
-        out.append(r)
+        out.append(r[PAD:])
     return out
 
 
 def header(screen):
-    return panel_rows(screen)[0]
+    return panel_rows(screen)[0].strip()
 
 
 def content_rows(screen):

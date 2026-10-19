@@ -500,10 +500,17 @@ def scenario_no_sidebar():
     check_no_panic("no sidebar")
 
 
+# The panel names an untitled agent `session \u00b7 tab` on its first line, so
+# beta's row is found by its session and the separator.
+PANEL_BETA = "beta \u00b7"
+# Column of a panel row's state dot: inside the frame, then one column of padding.
+PANEL_DOT_COL = 2
+
+
 def panel_marker_fg(screen, needle):
     for y, row in enumerate(screen.display):
         if needle in row[:SIDEBAR_W]:
-            return str(screen.buffer[y][1].fg)
+            return str(screen.buffer[y][PANEL_DOT_COL].fg)
     return None
 
 
@@ -515,27 +522,27 @@ def scenario_with_panel():
     child, screen, pump = spawn(env_local("cfg-sidebar"))
     pump(2.5)
     check("5 the panel lists beta, idle",
-          wait_until(pump, lambda: panel_marker_fg(screen, "beta/0") == IDLE),
-          panel_marker_fg(screen, "beta/0"))
+          wait_until(pump, lambda: panel_marker_fg(screen, PANEL_BETA) == IDLE),
+          panel_marker_fg(screen, PANEL_BETA))
     child.send(ALT_A)
     check("5 the switcher opens beside the panel",
           wait_until(pump, lambda: len(switcher_rows(screen)) == 3), switcher_rows(screen))
     check_paint("5 sidebar, open", screen, True, True)
     check("5 the panel is still painted under an open switcher",
-          panel_marker_fg(screen, "beta/0") == IDLE, panel_marker_fg(screen, "beta/0"))
+          panel_marker_fg(screen, PANEL_BETA) == IDLE, panel_marker_fg(screen, PANEL_BETA))
     child.send(ESC)
     wait_until(pump, lambda: not switcher_open(screen), timeout=3.0)
     pump(1.0)
     check_paint("5 sidebar, closed", screen, False, True)
     check("5 the panel survives the popup's teardown",
-          panel_marker_fg(screen, "beta/0") == IDLE, panel_marker_fg(screen, "beta/0"))
+          panel_marker_fg(screen, PANEL_BETA) == IDLE, panel_marker_fg(screen, PANEL_BETA))
     check("5 closing it did not unsubscribe",
           "unsubscribing from the agent list" not in client_log(), client_log()[-800:])
     # beta goes from Idle to NeedsInput AFTER the switcher closed. The panel only
     # hears of that through the push the switcher must not have torn down.
     wires[1].type("block\n")
-    ok = wait_until(pump, lambda: panel_marker_fg(screen, "beta/0") == NEEDS_INPUT)
-    check("5 the panel still receives state changes", ok, panel_marker_fg(screen, "beta/0"))
+    ok = wait_until(pump, lambda: panel_marker_fg(screen, PANEL_BETA) == NEEDS_INPUT)
+    check("5 the panel still receives state changes", ok, panel_marker_fg(screen, PANEL_BETA))
     check("client alive", child.isalive())
     teardown(child, wires)
     check_no_panic("panel")

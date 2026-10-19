@@ -7,6 +7,12 @@
 //! An editor then saves the TARGET, in a directory the link's own directory
 //! watch never sees, so the target's directory is watched as well and an event
 //! on either path reloads.
+//!
+//! Known limits: a chain of links is followed by what `canonicalize` resolves,
+//! so retargeting a link in the middle of a chain is not noticed until the
+//! config's own link path produces an event, and a directory watched for an
+//! earlier target stays watched after the link moves (it only costs events that
+//! no longer match).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -37,22 +43,105 @@ fn keep_leaf(path: &Path) -> PathBuf {
     }
 }
 
-/// Where `link` really points, when it is a symlink that resolves and ends up
-/// somewhere else. `None` for a regular file, and for a dangling link, so both
-/// behave as an unlinked config does.
-fn resolve_target(link: &Path) -> Option<PathBuf> {
-    let target = std::fs::canonicalize(link).ok()?;
-    (keep_leaf(&target) != keep_leaf(link)).then_some(target)
+/// `path` canonicalized as far as it exists: its nearest existing ancestor is
+/// resolved and the part that does not exist yet is appended unchanged.
+fn normalize_lenient(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(ancestor) {
+            return match path.strip_prefix(ancestor) {
+                Ok(rest) => real.join(rest),
+                Err(_) => path.to_path_buf(),
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
-/// Whether a watch event on `event_path` concerns the config: it names the
-/// link path itself, or the canonical `target` the link resolves to.
+/// Where a symlinked config points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    /// The canonical target when the link resolves, otherwise the path the
+    /// link names, which may not exist yet.
+    path: PathBuf,
+    /// The link does not resolve (yet).
+    dangling: bool,
+}
+
+/// The target of `link` and the directory to watch for it, or `None` when
+/// `link` is not a symlink.
 ///
-/// Both sides are normalized with [`keep_leaf`] first, so a reporting spelling
-/// that differs only in how the directory is written still matches.
-fn is_config_path(event_path: &Path, link: &Path, target: Option<&Path>) -> bool {
-    let event = keep_leaf(event_path);
-    event == keep_leaf(link) || target.is_some_and(|t| event == keep_leaf(t))
+/// A live link resolves to its canonical target, whose directory is watched. A
+/// dangling link yields the path it names (a relative one is taken from the
+/// link's directory) and the nearest ancestor that exists, so the target's
+/// creation is seen: when its directory is missing too, that ancestor reports
+/// the directories being made on the way to it.
+fn locate(link: &Path) -> Option<(Target, PathBuf)> {
+    if let Ok(real) = std::fs::canonicalize(link) {
+        if keep_leaf(&real) == keep_leaf(link) {
+            return None;
+        }
+        let dir = real.parent()?.to_path_buf();
+        return Some((
+            Target {
+                path: real,
+                dangling: false,
+            },
+            dir,
+        ));
+    }
+    let named = std::fs::read_link(link).ok()?;
+    let intended = if named.is_absolute() {
+        named
+    } else {
+        link.parent()?.join(named)
+    };
+    let dir = intended
+        .parent()?
+        .ancestors()
+        .find(|a| a.is_dir())?
+        .to_path_buf();
+    Some((
+        Target {
+            path: intended,
+            dangling: true,
+        },
+        dir,
+    ))
+}
+
+/// What a watch event means for the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Classified {
+    /// It names the link path or the target: a reload is due.
+    is_config: bool,
+    /// The link may have moved, appeared or started to resolve: look again.
+    relink: bool,
+}
+
+/// Classify the paths of one event against the link and its current target.
+///
+/// The link, the target and every event path are normalized once per call, so a
+/// backend that reports `/private/var/...` for a `/var/...` config still
+/// matches. An event that names an ancestor of a dangling target also asks for a
+/// re-resolve, because that is how the target's directory appearing is seen.
+fn classify(event_paths: &[PathBuf], link: &Path, target: Option<&Target>) -> Classified {
+    let link_leaf = keep_leaf(link);
+    let target_leaf = target.map(|t| normalize_lenient(&t.path));
+    let mut out = Classified {
+        is_config: false,
+        relink: false,
+    };
+    for path in event_paths {
+        let leaf = keep_leaf(path);
+        let on_link = leaf == link_leaf;
+        let on_target = target_leaf.as_deref() == Some(leaf.as_path());
+        out.is_config |= on_link || on_target;
+        out.relink |= on_link;
+        if let (Some(t), Some(tl)) = (target, target_leaf.as_deref()) {
+            out.relink |= t.dangling && tl.starts_with(&leaf);
+        }
+    }
+    out
 }
 
 /// The watcher and the directories it is watching.
@@ -97,8 +186,9 @@ impl Watching {
 /// If the config path is a symlink, the directory of its target is watched too.
 /// A link created or retargeted after startup is picked up when an event arrives
 /// for the link path in its own directory, which re-resolves it and watches the
-/// new target's directory. A dangling link at startup is not an error: it
-/// behaves like a plain config path until the link starts to resolve.
+/// new target's directory. A link that dangles at startup is followed once its
+/// target appears: the nearest existing ancestor of the target is watched, and
+/// the watch moves down as the missing directories are created.
 ///
 /// Returns `Ok(())` when the watcher is set up. The actual watching happens
 /// asynchronously via the notify crate's event loop.
@@ -122,7 +212,9 @@ fn watch_path<T: Send + 'static>(
     // Create the config directory if it doesn't exist, so we can watch it.
     std::fs::create_dir_all(&config_dir)?;
 
-    let target = Arc::new(Mutex::new(resolve_target(&config_path)));
+    let located = locate(&config_path);
+    let extra_dir = located.as_ref().map(|(_, dir)| dir.clone());
+    let target = Arc::new(Mutex::new(located.map(|(t, _)| t)));
     // The callback asks this thread to look at the link again; see `Watching`
     // for why the callback cannot do it itself.
     let (relink_tx, relink_rx) = std::sync::mpsc::channel::<()>();
@@ -135,26 +227,15 @@ fn watch_path<T: Send + 'static>(
             Err(_) => return,
         };
 
-        // An event on the link itself may mean it was created or retargeted.
-        let link_leaf = keep_leaf(&watched_path);
-        if event.paths.iter().any(|p| keep_leaf(p) == link_leaf) {
+        let current = cb_target.lock().ok().and_then(|t| t.clone());
+        let class = classify(&event.paths, &watched_path, current.as_ref());
+        if class.relink {
             let _ = relink_tx.send(());
         }
 
         // We care about Create and Modify events on the config file.
         let dominated = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
-        if !dominated {
-            return;
-        }
-
-        // Check that the event is for our specific file: the link path, or
-        // where the link points.
-        let current = cb_target.lock().ok().and_then(|t| t.clone());
-        let is_our_file = event
-            .paths
-            .iter()
-            .any(|p| is_config_path(p, &watched_path, current.as_deref()));
-        if !is_our_file {
+        if !dominated || !class.is_config {
             return;
         }
 
@@ -174,10 +255,8 @@ fn watch_path<T: Send + 'static>(
         watched: HashSet::new(),
     };
     watching.watch_dir(&config_dir);
-    if let Some(dir) = target.lock().ok().and_then(|t| t.clone()) {
-        if let Some(parent) = dir.parent() {
-            watching.watch_dir(parent);
-        }
+    if let Some(dir) = extra_dir {
+        watching.watch_dir(&dir);
     }
     if watching.watched.is_empty() {
         anyhow::bail!("cannot watch {}", config_dir.display());
@@ -189,18 +268,19 @@ fn watch_path<T: Send + 'static>(
     let weak = Arc::downgrade(&watching);
     std::thread::spawn(move || {
         while relink_rx.recv().is_ok() {
-            let now = resolve_target(&config_path);
+            // One look answers every request queued behind it.
+            while relink_rx.try_recv().is_ok() {}
+            let now = locate(&config_path);
+            let dir = now.as_ref().map(|(_, dir)| dir.clone());
             if let Ok(mut t) = target.lock() {
-                t.clone_from(&now);
+                *t = now.map(|(t, _)| t);
             }
-            let (Some(dir), Some(watching)) =
-                (now.as_deref().and_then(Path::parent), weak.upgrade())
-            else {
+            let (Some(dir), Some(watching)) = (dir, weak.upgrade()) else {
                 continue;
             };
             let mut guard = watching.lock();
             if let Ok(w) = guard.as_mut() {
-                w.watch_dir(dir);
+                w.watch_dir(&dir);
             }
         }
     });
@@ -235,6 +315,17 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    fn paths(p: &[&Path]) -> Vec<PathBuf> {
+        p.iter().map(|p| p.to_path_buf()).collect()
+    }
+
+    fn live(path: PathBuf) -> Target {
+        Target {
+            path,
+            dangling: false,
+        }
+    }
+
     #[test]
     fn the_link_and_its_target_both_count_as_the_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -245,27 +336,41 @@ mod tests {
         std::fs::write(real.join("config.toml"), "").unwrap();
         let link = cfg.join("config.toml");
         std::os::unix::fs::symlink(real.join("config.toml"), &link).unwrap();
-        let target = resolve_target(&link).expect("a live link resolves");
+        let (target, watch) = locate(&link).expect("a live link resolves");
+        assert!(!target.dangling);
+        assert_eq!(watch, std::fs::canonicalize(&real).unwrap());
 
-        assert!(is_config_path(&link, &link, Some(&target)));
-        assert!(is_config_path(
-            &real.join("config.toml"),
-            &link,
-            Some(&target)
-        ));
-        assert!(!is_config_path(
-            &real.join("other.toml"),
-            &link,
-            Some(&target)
-        ));
-        assert!(!is_config_path(
-            &cfg.join("other.toml"),
-            &link,
-            Some(&target)
-        ));
+        let is_config = |p: &Path, t: Option<&Target>| classify(&paths(&[p]), &link, t).is_config;
+        assert!(is_config(&link, Some(&target)));
+        assert!(is_config(&real.join("config.toml"), Some(&target)));
+        assert!(!is_config(&real.join("other.toml"), Some(&target)));
+        assert!(!is_config(&cfg.join("other.toml"), Some(&target)));
         // Without a target only the link itself counts.
-        assert!(!is_config_path(&real.join("config.toml"), &link, None));
-        assert!(is_config_path(&link, &link, None));
+        assert!(!is_config(&real.join("config.toml"), None));
+        assert!(is_config(&link, None));
+    }
+
+    #[test]
+    fn only_an_event_on_the_link_or_toward_a_dangling_target_asks_to_look_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        let live_target = live(dir.path().join("real.toml"));
+        assert!(classify(&paths(&[&link]), &link, Some(&live_target)).relink);
+        assert!(!classify(&paths(&[&live_target.path]), &link, Some(&live_target)).relink);
+        let dangling = Target {
+            path: dir.path().join("deep/er/config.toml"),
+            dangling: true,
+        };
+        // The directory being made on the way to the target.
+        assert!(classify(&paths(&[&dir.path().join("deep")]), &link, Some(&dangling)).relink);
+        assert!(
+            !classify(
+                &paths(&[&dir.path().join("elsewhere")]),
+                &link,
+                Some(&dangling)
+            )
+            .relink
+        );
     }
 
     #[test]
@@ -277,19 +382,34 @@ mod tests {
         let canonical = std::fs::canonicalize(dir.path())
             .unwrap()
             .join("config.toml");
-        assert!(is_config_path(&canonical, &link, None));
-        assert!(is_config_path(&link, &canonical, None));
+        assert!(classify(&paths(&[&canonical]), &link, None).is_config);
+        assert!(classify(&paths(&[&link]), &canonical, None).is_config);
     }
 
     #[test]
-    fn a_regular_file_and_a_dangling_link_have_no_target() {
+    fn a_regular_file_has_no_target_and_a_dangling_link_names_one() {
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain.toml");
         std::fs::write(&plain, "").unwrap();
-        assert_eq!(resolve_target(&plain), None);
+        assert_eq!(locate(&plain), None);
         let dangling = dir.path().join("dangling.toml");
-        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &dangling).unwrap();
-        assert_eq!(resolve_target(&dangling), None);
+        std::os::unix::fs::symlink("missing.toml", &dangling).unwrap();
+        let (target, watch) = locate(&dangling).expect("a dangling link still names a target");
+        assert!(target.dangling);
+        assert_eq!(target.path, dir.path().join("missing.toml"));
+        assert_eq!(
+            std::fs::canonicalize(&watch).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        // A target whose directory is missing too is watched from the nearest
+        // ancestor that exists.
+        let deeper = dir.path().join("deeper.toml");
+        std::os::unix::fs::symlink("a/b/c.toml", &deeper).unwrap();
+        let (_, watch) = locate(&deeper).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&watch).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
     }
 
     /// Wait for a message, rewriting the file now and then so a slow backend
@@ -364,12 +484,54 @@ mod tests {
         assert!(got.is_some(), "the retargeted link's target is not watched");
     }
 
+    fn start_watching(link: &Path) -> (WatchHandle, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let read = link.to_path_buf();
+        let handle = watch_path(
+            link.to_path_buf(),
+            move || Ok(std::fs::read_to_string(&read)?),
+            tx,
+        )
+        .expect("the watcher starts");
+        (handle, rx)
+    }
+
     #[test]
-    fn a_dangling_link_at_startup_does_not_fail_the_watcher() {
+    fn a_link_dangling_at_startup_is_followed_once_its_target_appears() {
         let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("config.toml");
-        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        assert!(watch_path(link, || Ok(String::new()), tx).is_ok());
+        let real = dir.path().join("dotfiles");
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        let target = real.join("config.toml");
+        let link = cfg.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (_handle, mut rx) = start_watching(&link);
+        let got = expect_reload(&mut rx, |body| std::fs::write(&target, body).unwrap());
+        assert!(
+            got.is_some(),
+            "no reload after the dangling target was created"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_target_directory_does_not_exist_yet_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let target = dir.path().join("dotfiles/remux/config.toml");
+        let link = cfg.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (_handle, mut rx) = start_watching(&link);
+        let got = expect_reload(&mut rx, |body| {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, body).unwrap();
+        });
+        assert!(
+            got.is_some(),
+            "no reload after the target's directories were made"
+        );
     }
 }

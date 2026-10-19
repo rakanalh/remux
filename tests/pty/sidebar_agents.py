@@ -16,8 +16,8 @@ What it covers:
      is the theme's bell colour
   4  Enter jumps across a SESSION boundary -- checked by what appears in the
      content area, not by trusting a label
-  3b the current-pane bar (a full-width row in `sidebar_current_bg`) MARKS the
-     pane the user is in, MOVES when they switch panes, vanishes when they land
+  3b the current-pane bar (a full-width band over both lines of the row, in
+     `sidebar_current_bg`) MARKS the pane the user is in, MOVES when they switch panes, vanishes when they land
      on a pane that is not an agent, and STAYS while the panel itself has focus
      and j/k move the selection. Moving is the point: a bar painted on the first
      row and never updated passes any check that only asks whether one appeared.
@@ -59,6 +59,18 @@ VERBOSE = "-v" in sys.argv
 COLS, ROWS = 100, 30
 SIDEBAR_W = 26
 FRAME = 1  # the sidebar's border is drawn INSIDE the bar
+
+# Inside the panel: the header row and one blank row come first, then every
+# agent takes two rows (name line, then the agent's command), and everything is
+# one column in from the panel's edge.
+HEADER_ROWS = 2
+ROW_H = 2
+PAD = 1
+
+
+def agent_row(i):
+    """Panel row of agent `i`'s first line."""
+    return HEADER_ROWS + ROW_H * i
 
 # No `[agents]` table: the shipped defaults are what is under test.
 CFG = f"""
@@ -251,14 +263,29 @@ def panel_rows(screen):
     ]
 
 
+DOTS = ("\u25cf", "\u25cb")
+
+
 def agent_rows(screen):
-    """Just the agent rows: everything under the header, up to the first blank."""
+    """Each agent's first line (state dot and name), without the padding.
+
+    Stops at the first agent row that does not start with a state dot, so the
+    `no agents` verdict is never counted as an agent.
+    """
     out = []
-    for r in panel_rows(screen)[1:]:
-        if not r.strip():
+    rows = panel_rows(screen)
+    for i in range((len(rows) - HEADER_ROWS) // ROW_H):
+        line = rows[agent_row(i)][PAD:]
+        if not line.startswith(DOTS):
             break
-        out.append(r)
+        out.append(line)
     return out
+
+
+def agent_details(screen):
+    """Each agent's second line, which names the command, in the same order."""
+    rows = panel_rows(screen)
+    return [rows[agent_row(i) + 1].strip() for i in range(len(agent_rows(screen)))]
 
 
 def content_rows(screen):
@@ -279,7 +306,7 @@ def theme_default_rgb(role):
 
 
 CURRENT_BG = theme_default_rgb("sidebar_current_bg")
-FOCUSED_SELECTION_BG = theme_default_rgb("tab_active_bg")
+SELECTION_BG = theme_default_rgb("sidebar_selection_bg")
 
 
 def row_bgs(screen, panel_y):
@@ -288,16 +315,33 @@ def row_bgs(screen, panel_y):
     return [str(line[x].bg) for x in range(FRAME, SIDEBAR_W - FRAME)]
 
 
-def current_rows(screen):
-    """The panel rows painted EDGE TO EDGE in the current-pane colour.
+def agent_bgs(screen, panel_y):
+    """The backgrounds of both lines of the agent whose first line is `panel_y`."""
+    return row_bgs(screen, panel_y) + row_bgs(screen, panel_y + 1)
 
-    Every interior cell, not one: the bar is specified as full width, and a
-    count is the only way to see a second marked row. Read from the panel's
-    own columns, so nothing a pane prints in the content area can match."""
-    return [
-        y for y in range(1, len(panel_rows(screen)))
+
+def current_rows(screen):
+    """The agents whose BOTH lines are painted edge to edge in the current-pane
+    colour, as the panel row of each one's first line.
+
+    Every interior cell of every row, not one: the bar is specified as full
+    width and as spanning both lines of its agent. An agent with only one line
+    painted is reported as its first-line row plus 0.5, so it matches no
+    expected value instead of passing for a bar. Read from the panel's own
+    columns, so nothing a pane prints in the content area can match."""
+    painted = [
+        y for y in range(HEADER_ROWS, len(panel_rows(screen)))
         if all(bg == CURRENT_BG for bg in row_bgs(screen, y))
     ]
+    out = []
+    for i in range((len(panel_rows(screen)) - HEADER_ROWS) // ROW_H):
+        first = agent_row(i)
+        lines = [y for y in (first, first + 1) if y in painted]
+        if len(lines) == ROW_H:
+            out.append(first)
+        elif lines:
+            out.append(first + 0.5)
+    return out
 
 
 def focused_pane_id(w, session):
@@ -331,7 +375,7 @@ def focused_pane_id(w, session):
 
 def marker_fg(screen, panel_y):
     """The colour of the state marker on panel row `panel_y`."""
-    return str(screen.buffer[FRAME + panel_y][FRAME].fg)
+    return str(screen.buffer[FRAME + panel_y][FRAME + PAD].fg)
 
 
 def panel_row_of(screen, needle):
@@ -342,10 +386,10 @@ def panel_row_of(screen, needle):
 
 
 def select_row(child, pump, panel_y):
-    """Put the selection on panel row `panel_y` (row 0 is the header)."""
+    """Put the selection on the agent whose first line is panel row `panel_y`."""
     child.send(b"g")
     pump(0.3)
-    for _ in range(panel_y - 1):
+    for _ in range((panel_y - HEADER_ROWS) // ROW_H):
         child.send(b"j")
         pump(0.12)
 
@@ -432,7 +476,7 @@ def scenario():
 
     rows = panel_rows(screen)
     log("panel:", rows)
-    check("0 the panel headers itself", any(r.startswith("Agents") for r in rows), rows)
+    check("0 the panel headers itself", any(r.strip() == "agents" for r in rows), rows)
 
     # -- 1: every agent pane, across sessions --------------------------------
     ok = wait_until(pump, lambda: len(agent_rows(screen)) == 4)
@@ -441,16 +485,21 @@ def scenario():
           ok and len(listed) == 4, listed)
     check("1 both sessions are named", any("alpha" in r for r in listed)
           and any("beta" in r for r in listed), listed)
+    check("1 each name line is `session \u00b7 tab`",
+          len(listed) == 4 and all(" \u00b7 " in r[2:] for r in listed), listed)
+    check("1 each second line names the agent's command",
+          agent_details(screen) == ["claude"] * len(listed),
+          agent_details(screen))
 
     # -- 2: the unlisted command is absent -----------------------------------
     check("2 a pane running an unlisted command is not listed",
-          all("notanagent" not in r for r in listed), listed)
+          all("notanagent" not in r for r in panel_rows(screen)), panel_rows(screen))
 
     # -- 3: three states, three colours --------------------------------------
     # The default theme's `tab_bell_fg` is Indexed(9) and `tab_activity_fg` is
     # Indexed(11); pyte resolves those to these hexes.
     BELL, ACTIVITY = "ff0000", "ffff00"
-    colours = [marker_fg(screen, y) for y in range(1, 1 + len(listed))]
+    colours = [marker_fg(screen, agent_row(i)) for i in range(len(listed))]
     log("markers:", colours, listed)
     check("3 the three states paint three different colours",
           len(set(colours)) == 3, list(zip(colours, listed)))
@@ -463,8 +512,9 @@ def scenario():
     #
     # alpha tab 0 is [notanagent | spin / ALPHATAG]: notanagent fills the left
     # column, spin and ALPHATAG split the right one. The rows are ordered by
-    # pane id, so spin is panel row 1 and ALPHATAG row 2 (their labels are
-    # identical, `claude alpha/0`, so only the row INDEX tells them apart).
+    # pane id, so spin is the first agent and ALPHATAG the second (their rows
+    # are identical, `alpha \u00b7 <tab>` over `claude`, so only the row INDEX
+    # tells them apart).
     # Every focus move is ground-truthed against the server's tree.
     #
     # A fresh panel's selection sits on row 1, spin's row, and the selection
@@ -472,7 +522,7 @@ def scenario():
     # selection is moved off both rows before spin is visited.
     ids = alpha_pane_ids(seeds[0])
     not_an_agent, spin_id, alpha_id = ids[0], ids[1], ids[2]
-    row_of = {spin_id: 1, alpha_id: 2}
+    row_of = {spin_id: agent_row(0), alpha_id: agent_row(1)}
     log("alpha tab 0 panes:", ids)
 
     def bar_now(label):
@@ -522,21 +572,23 @@ def scenario():
     # and stay visible, which is the whole reason it exists.
     child.send(b"\x1b2")
     pump(0.8)
-    child.send(b"G")  # the selection onto beta's row, off both alpha/0 rows
+    child.send(b"G")  # the selection onto beta's row, off both rows of alpha's first tab
     pump(0.5)
     check("3b the bar shows while the panel has focus",
           current_rows(screen) == [row_of.get(back_on)],
           (current_rows(screen), panel_rows(screen)))
-    last = len(agent_rows(screen))
-    check("3b the focused selection bar is a different colour from it",
-          all(bg == FOCUSED_SELECTION_BG for bg in row_bgs(screen, last)),
-          (row_bgs(screen, last), panel_rows(screen)))
+    last = agent_row(len(agent_rows(screen)) - 1)
+    check("3b the selection bar is a different colour from it, on both lines",
+          all(bg == SELECTION_BG for bg in agent_bgs(screen, last)),
+          (agent_bgs(screen, last), panel_rows(screen)))
     child.send(b"k")
     pump(0.5)
     check("3b j/k move the selection and leave the bar where it is",
           current_rows(screen) == [row_of.get(back_on)]
-          and all(bg == FOCUSED_SELECTION_BG for bg in row_bgs(screen, last - 1)),
-          (current_rows(screen), row_bgs(screen, last - 1), panel_rows(screen)))
+          and all(bg == SELECTION_BG
+                  for bg in agent_bgs(screen, last - ROW_H)),
+          (current_rows(screen), agent_bgs(screen, last - ROW_H),
+           panel_rows(screen)))
     child.send(b"\x1bl")  # leave the sidebar the way it was entered
     pump(0.8)
     back_on = focused_pane_id(seeds[0], "alpha")
@@ -576,8 +628,9 @@ def scenario():
     # wins: the j/k cursor must never be hidden. The pump above already let the
     # tree push land. Then move the selection off to see the bar underneath.
     check("4 the selection bar wins on a row that is also current",
-          current_rows(screen) == [] and "beta" in panel_rows(screen)[y_beta],
-          (current_rows(screen), row_bgs(screen, y_beta), panel_rows(screen)))
+          current_rows(screen) == [] and "beta" in panel_rows(screen)[y_beta]
+          and all(bg == SELECTION_BG for bg in agent_bgs(screen, y_beta)),
+          (current_rows(screen), agent_bgs(screen, y_beta), panel_rows(screen)))
     child.send(b"\x1b2")
     pump(0.5)
     child.send(b"k")
@@ -602,7 +655,7 @@ def scenario():
     # bug. Selecting the LAST row instead would make both rules agree.
     child.send(b"\x1b2")
     pump(0.5)
-    select_row(child, pump, 3)  # panel row 3 = agent index 2 = THIRDTAG
+    select_row(child, pump, agent_row(2))  # agent index 2 = THIRDTAG
     pump(0.4)
 
     # Closed by id from another connection, not by typing: `spin` never reads
@@ -629,7 +682,9 @@ def scenario():
     ok = wait_until(pump, lambda: len(current_rows(screen)) == 1)
     marked = current_rows(screen)
     check("5 the bar follows the jump across the tab boundary",
-          ok and "alpha/1" in panel_rows(screen)[marked[0]],
+          ok and len(marked) == 1
+          and panel_rows(screen)[marked[0]].strip().endswith(("\u00b7 Tab 2", "\u00b7 1"))
+          and "alpha" in panel_rows(screen)[marked[0]],
           (marked, panel_rows(screen)))
 
     check("client still alive", child.isalive())

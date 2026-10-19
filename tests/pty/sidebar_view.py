@@ -82,6 +82,10 @@ visible = true
   weight = 1
 """
 
+# `CFG` with `collapse_to_strip = false`: hiding removes the sidebar outright.
+CFG_NO_STRIP = CFG.replace(
+    "visible = true\n", "visible = true\ncollapse_to_strip = false\n", 1)
+
 # The same sidebar plus a which-key leaf for a FOCUS intent. `SidebarFocus*`
 # has no default binding, and reaching the refusal path below needs the intent
 # to arrive from the which-key TREE (so a popup is up when it is refused), not
@@ -474,14 +478,14 @@ def test_entering_a_view_releases_sidebar_focus():
     return finish(t, name, fails)
 
 
-def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
-    """The panels are on screen next to a live view, so the toggle must work.
+def toggle_in_a_view(name, rundir, config, left_edge):
+    """Toggle the sidebar off and on beside a live view.
 
-    Before this the intent was ignored while a view was up -- invisible then
-    (the view covered the panel), a dropped keypress now.
+    `left_edge` is the column the view's frame must start at while the sidebar
+    is hidden: 1 when a strip stays behind, 0 when `collapse_to_strip = false`
+    removes the sidebar outright.
     """
-    name = "test_toggling_a_sidebar_inside_a_view_reflows_the_cells"
-    t = Tui("/tmp/rmx-sbv5", cols=COLS, rows=ROWS, config=CFG).start()
+    t = Tui(rundir, cols=COLS, rows=ROWS, config=config).start()
     fails = []
     make_two_panes(t)
     compose_view(t)
@@ -495,8 +499,16 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
     if t.has("Placeholder"):
         fails.append("the sidebar is still painted after the toggle")
     box = leftmost_box_column(t)
-    if box != 0:
-        fails.append(f"the view did not expand to column 0 after the toggle: {box}")
+    if box != left_edge:
+        fails.append(
+            f"the view did not expand to column {left_edge} after the toggle: {box}"
+        )
+    strip = any(row[0] == LEFT_STRIP_GLYPH for row in t.rows_text())
+    if strip != (left_edge == 1):
+        fails.append(
+            f"the one-cell strip is {'missing' if left_edge == 1 else 'painted'} "
+            f"after the toggle"
+        )
 
     got = stty_reading(t)
     if got != NO_SIDEBAR_STTY:
@@ -528,6 +540,30 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
         print(f"  after showing the sidebar again the cell reports {back!r}")
 
     return finish(t, name, fails)
+
+
+# The glyph a collapsed LEFT sidebar's strip shows: it points back into the
+# terminal.
+LEFT_STRIP_GLYPH = "\u25b6"
+
+
+def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
+    """The panels are on screen next to a live view, so the toggle must work.
+
+    Before this the intent was ignored while a view was up -- invisible then
+    (the view covered the panel), a dropped keypress now. Hiding leaves a
+    one-cell strip, so the view stops one column short of the terminal's edge.
+    """
+    return toggle_in_a_view(
+        "test_toggling_a_sidebar_inside_a_view_reflows_the_cells",
+        "/tmp/rmx-sbv5", CFG, left_edge=1)
+
+
+def test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width():
+    """`collapse_to_strip = false`: hiding hands the view column 0."""
+    return toggle_in_a_view(
+        "test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width",
+        "/tmp/rmx-sbv5b", CFG_NO_STRIP, left_edge=0)
 
 
 def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
@@ -796,9 +832,9 @@ def test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar():
     # Pin the keyboard on the TOP panel: `files` (the bottom one) acts on Enter
     # by opening a split, and the marker line below ends in one.
     t.send(ALT_K, 0.6)
-    if focused_panel_header(t) != "Agents":
+    if focused_panel_header(t) != "agents":
         fails.append(
-            f"Alt+k did not land on the Agents panel: "
+            f"Alt+k did not land on the agents panel: "
             f"{focused_panel_header(t)!r}"
         )
     t.send(MARKER_CMD.format(7), 1.5)
@@ -1014,7 +1050,7 @@ def test_hiding_the_sidebar_from_inside_it_does_not_strand_the_keyboard():
         return finish(t, name, fails)
 
     t.prefix(b"bl", 1.8)        # the default sidebar group, toggle right
-    if t.has("Agents"):
+    if t.has("agents"):
         fails.append("the sidebar is still painted after the toggle")
     if not t.alive():
         fails.append("the client died hiding the sidebar it was focused in")
@@ -1148,6 +1184,7 @@ if __name__ == "__main__":
         test_clicking_a_view_cell_uses_content_coordinates,
         test_entering_a_view_releases_sidebar_focus,
         test_toggling_a_sidebar_inside_a_view_reflows_the_cells,
+        test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width,
         test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup,
         test_alt_l_at_a_views_right_edge_focuses_the_right_sidebar,
         test_alt_h_from_a_panel_returns_to_the_cell_the_view_left_from,

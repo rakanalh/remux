@@ -122,6 +122,12 @@ size = {SIDEBAR_W}
 visible = true
 {PANEL}{PANEL}"""
 
+# `CFG_ACTIONS` with `collapse_to_strip = false`: hiding removes the sidebar
+# outright instead of leaving a strip.
+CFG_ACTIONS_NO_STRIP = CFG_ACTIONS.replace(
+    "visible = true\n", "visible = true\ncollapse_to_strip = false\n", 1
+)
+
 CFG_NONE = """
 [appearance]
 border_style = "zellij_style"
@@ -293,6 +299,16 @@ def markers(screen, x0=0, x1=SIDEBAR_W):
 
 def focused_rows(screen, x0=0, x1=SIDEBAR_W):
     return [y for (y, m) in markers(screen, x0, x1) if m == "focused"]
+
+
+# The glyph a collapsed LEFT sidebar's strip shows: it points back into the
+# terminal. A RIGHT sidebar's strip shows the mirror image.
+LEFT_STRIP_GLYPH, RIGHT_STRIP_GLYPH = "\u25b6", "\u25c0"
+
+
+def strip_glyph_rows(screen, col, glyph):
+    """The rows whose cell at screen column `col` is the strip's `glyph`."""
+    return [y for y, row in enumerate(screen.display) if row[col] == glyph]
 
 
 ALT_H, ALT_J, ALT_K, ALT_L = b"\x1bh", b"\x1bj", b"\x1bk", b"\x1bl"
@@ -624,13 +640,18 @@ def test_the_sidebar_actions_toggle_focus_and_cycle():
         f"SidebarCycle did not return to the content: {markers(screen)}"
     )
 
-    # Toggle off: the panels go, and the server's frame moves to column 0.
+    # Toggle off: the panels go and leave a one-cell strip, so the server's
+    # frame moves from the sidebar's width to column 1, not to column 0.
     child.send(b"\x1b1")
     pump(1.5)
     assert not markers(screen), f"the sidebar did not hide: {markers(screen)}"
-    assert pane_frame_column(screen) == 0, (
-        "the content rect did not grow into the freed columns:\n"
-        + "\n".join(screen.display[:3])
+    assert strip_glyph_rows(screen, 0, LEFT_STRIP_GLYPH), (
+        "hiding the sidebar left no strip to expand it from:\n"
+        + "\n".join(screen.display[:6])
+    )
+    assert pane_frame_column(screen, 1) == 1 and screen.display[0][0] != "\u256d", (
+        "the content rect did not grow into the freed columns, short of the "
+        "strip:\n" + "\n".join(screen.display[:3])
     )
 
     # Toggle back on.
@@ -652,6 +673,40 @@ def test_the_sidebar_actions_toggle_focus_and_cycle():
     teardown(child, env)
     check_no_panic()
     print("PASS test_the_sidebar_actions_toggle_focus_and_cycle")
+
+
+def test_hiding_without_a_strip_gives_the_content_the_whole_width():
+    """`collapse_to_strip = false`: the old behaviour, still on offer.
+
+    The frame must start at column 0 and no strip glyph may be painted, which
+    is what tells a sidebar that is gone from one that merely looks narrow.
+    """
+    env = make_env(CFG_ACTIONS_NO_STRIP)
+    child, screen, pump = spawn(env)
+    pump(1.5)
+    assert len(markers(screen)) == 2, f"expected two panels: {markers(screen)}"
+
+    child.send(b"\x1b1")
+    pump(1.5)
+    assert not markers(screen), f"the sidebar did not hide: {markers(screen)}"
+    assert pane_frame_column(screen) == 0, (
+        "the content rect did not grow into every freed column:\n"
+        + "\n".join(screen.display[:3])
+    )
+    assert not strip_glyph_rows(screen, 0, LEFT_STRIP_GLYPH), (
+        "a strip was painted although `collapse_to_strip = false`:\n"
+        + "\n".join(screen.display[:6])
+    )
+
+    child.send(b"\x1b1")
+    pump(1.5)
+    assert len(markers(screen)) == 2, (
+        f"the sidebar did not come back: {markers(screen)}"
+    )
+
+    teardown(child, env)
+    check_no_panic()
+    print("PASS test_hiding_without_a_strip_gives_the_content_the_whole_width")
 
 
 def test_the_prefix_chord_also_enters_the_sidebar():
@@ -924,9 +979,13 @@ def test_a_toggled_sidebar_survives_a_client_restart():
         "the hidden sidebar came back after a restart:\n"
         + "\n".join(screen.display[:4])
     )
-    assert pane_frame_column(screen) == 0, (
+    assert pane_frame_column(screen, 1) == 1 and screen.display[0][0] != "\u256d", (
         "the restarted client did not size the content rect for a hidden "
-        "sidebar:\n" + "\n".join(screen.display[:3])
+        "sidebar's strip:\n" + "\n".join(screen.display[:3])
+    )
+    assert strip_glyph_rows(screen, 0, LEFT_STRIP_GLYPH), (
+        "the restarted client drew no strip for the hidden sidebar:\n"
+        + "\n".join(screen.display[:6])
     )
 
     # -- Show it again, restart again: the state is not write-once. --
@@ -1053,6 +1112,10 @@ def test_state_for_an_edge_the_config_no_longer_declares_is_ignored():
     assert not markers(screen, 0, COLS), (
         "state for one edge opened a sidebar on another:\n"
         + "\n".join(screen.display[:4])
+    )
+    assert strip_glyph_rows(screen, COLS - 1, RIGHT_STRIP_GLYPH), (
+        "the closed right sidebar is not the strip its config declares:\n"
+        + "\n".join(screen.display[:6])
     )
     child.send(b"echo nav10\r")
     pump(1.2)
@@ -1371,6 +1434,7 @@ if __name__ == "__main__":
     test_the_prefix_chord_also_enters_the_sidebar()
     test_a_command_chain_intercepts_per_command()
     test_the_sidebar_actions_toggle_focus_and_cycle()
+    test_hiding_without_a_strip_gives_the_content_the_whole_width()
     test_focusing_a_sidebar_that_cannot_fit_is_refused_and_logged()
     test_a_paste_does_not_leak_past_a_focused_sidebar()
     test_a_mixed_chain_does_not_earn_the_directional_exemption()

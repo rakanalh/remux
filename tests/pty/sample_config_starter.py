@@ -144,7 +144,7 @@ def run(mode):
         assert t.alive(), "the client died on the sample config"
         rows = t.rows_text()
 
-        for title in ("Sessions", "Agents"):
+        for title in ("sessions", "agents"):
             assert t.has(title), f"the {title!r} panel never painted\n" + "\n".join(rows)
 
         # Content, not just chrome: each panel has to have something IN it that
