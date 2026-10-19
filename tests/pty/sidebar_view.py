@@ -49,10 +49,17 @@ CONTENT_W = COLS - SIDEBAR_W  # 90
 # and a zellij-style border costs a column on each side of each cell:
 #   content 90 -> two 45-wide cells -> 43 columns of pane inside each
 #   whole terminal 120 -> two 60-wide cells -> 58   (what the bug produced)
+#   strip kept, content 119 -> cells of 60 and 59 -> interiors 58 and 57
 # Rows: 40 - 1 status row - 2 border rows = 37.
 CELL_STTY = "37 43"
 BUGGY_STTY = "37 58"
 NO_SIDEBAR_STTY = "37 58"
+# With the one-cell strip the content is 119 columns, which does not split
+# evenly: the left cell takes the odd column (60 wide, interior 58) and the
+# right one gets 59 (interior 57). `stty_reading` reads the FOCUSED cell, and
+# the first pane is the left one, so the reading is still 58. If the focused
+# cell ever becomes the right one, this value becomes "37 57".
+STRIP_STTY = "37 58"
 
 MARK_A = "AAAA_view_marker"
 MARK_B = "BBBB_view_marker"
@@ -478,12 +485,12 @@ def test_entering_a_view_releases_sidebar_focus():
     return finish(t, name, fails)
 
 
-def toggle_in_a_view(name, rundir, config, left_edge):
+def toggle_in_a_view(name, rundir, config, left_edge, hidden_stty):
     """Toggle the sidebar off and on beside a live view.
 
     `left_edge` is the column the view's frame must start at while the sidebar
     is hidden: 1 when a strip stays behind, 0 when `collapse_to_strip = false`
-    removes the sidebar outright.
+    removes the sidebar outright. `hidden_stty` is the focused cell's size then.
     """
     t = Tui(rundir, cols=COLS, rows=ROWS, config=config).start()
     fails = []
@@ -511,10 +518,10 @@ def toggle_in_a_view(name, rundir, config, left_edge):
         )
 
     got = stty_reading(t)
-    if got != NO_SIDEBAR_STTY:
+    if got != hidden_stty:
         fails.append(
             f"the cells were not re-demanded at the new content width: "
-            f"{got!r}, expected {NO_SIDEBAR_STTY!r}"
+            f"{got!r}, expected {hidden_stty!r}"
         )
     else:
         print(f"  after hiding the sidebar the cell reports {got!r}")
@@ -556,14 +563,16 @@ def test_toggling_a_sidebar_inside_a_view_reflows_the_cells():
     """
     return toggle_in_a_view(
         "test_toggling_a_sidebar_inside_a_view_reflows_the_cells",
-        "/tmp/rmx-sbv5", CFG, left_edge=1)
+        "/tmp/rmx-sbv5", CFG, left_edge=1,
+        hidden_stty=STRIP_STTY)
 
 
 def test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width():
     """`collapse_to_strip = false`: hiding hands the view column 0."""
     return toggle_in_a_view(
         "test_toggling_a_sidebar_without_a_strip_gives_the_view_the_whole_width",
-        "/tmp/rmx-sbv5b", CFG_NO_STRIP, left_edge=0)
+        "/tmp/rmx-sbv5b", CFG_NO_STRIP, left_edge=0,
+        hidden_stty=NO_SIDEBAR_STTY)
 
 
 def test_a_focus_refused_by_a_live_view_does_not_strand_the_which_key_popup():
