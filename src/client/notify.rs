@@ -406,7 +406,20 @@ pub fn notifier_argv(
             body,
             title,
         ],
-        Platform::Linux => &["notify-send", "--app-name=Remux", "--", title, body],
+        Platform::Linux => {
+            return Some(
+                [
+                    "notify-send",
+                    "--app-name=Remux",
+                    "--",
+                    title,
+                    &escape_markup(body),
+                ]
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+            )
+        }
         Platform::Other => return None,
     };
     Some(argv.iter().map(|a| a.to_string()).collect())
@@ -418,6 +431,26 @@ pub fn notifier_argv(
 fn fit(label: &str, verb: &str) -> String {
     let room = MAX_TEXT_CHARS.saturating_sub(verb.chars().count() + 1);
     sanitize(label).chars().take(room).collect()
+}
+
+/// `text` with the characters that start Pango markup escaped.
+///
+/// The notification server renders a `notify-send` BODY as markup, so a pane
+/// title containing `<b>` would change how the text looks and one with a bare
+/// `&` or `<` can make the server drop the body. The summary is plain text in
+/// the specification, so the title is passed as it is. A custom `command` gets
+/// the raw text, because what that program parses is unknown.
+fn escape_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// `text` without control or invisible format characters, cut to
@@ -1076,6 +1109,33 @@ mod tests {
                 Some(strings(&["mine", "T"]))
             );
         }
+    }
+
+    #[test]
+    fn linux_escapes_markup_in_the_body_only() {
+        let argv = notifier_argv(Platform::Linux, None, "a<b>&c", "<b>x</b> & y").unwrap();
+        assert_eq!(
+            argv,
+            strings(&[
+                "notify-send",
+                "--app-name=Remux",
+                "--",
+                "a<b>&c",
+                "&lt;b&gt;x&lt;/b&gt; &amp; y"
+            ])
+        );
+    }
+
+    #[test]
+    fn macos_and_a_custom_command_pass_markup_through_raw() {
+        let mac = notifier_argv(Platform::MacOs, None, "t", "<b>&").unwrap();
+        assert_eq!(mac.last().map(String::as_str), Some("t"));
+        assert!(mac.contains(&"<b>&".to_string()));
+        let command = strings(&["mine", "{body}"]);
+        assert_eq!(
+            notifier_argv(Platform::Linux, Some(&command), "t", "<b>&"),
+            Some(strings(&["mine", "<b>&"]))
+        );
     }
 
     #[test]
