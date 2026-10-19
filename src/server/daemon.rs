@@ -9364,6 +9364,9 @@ async fn handle_session_removed(
             }
         }
     }
+    // Either way the clients that were on `removed` now have a different pane
+    // in front of them, or none.
+    mark_focus_changed();
 }
 
 /// `exit_code` reported with [`SessionEvent::PaneExited`] when the pane's real
