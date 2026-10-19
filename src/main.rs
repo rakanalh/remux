@@ -1269,6 +1269,22 @@ fn focused_pane<'a>(
         .and_then(active_tab_focused_pane)
 }
 
+/// `focus`, the pane the foreground server's session tree last named, if it
+/// still says where the user is.
+///
+/// It is only refreshed by a tree push from the foreground server, so it goes
+/// stale in three ways: the tree is unsubscribed, the connection drops (the
+/// reconcile then forgets it, so both read as "not in `subscribed`"), or another
+/// server comes to the foreground. A stale focus would suppress notifications
+/// for a pane the user is no longer looking at.
+fn current_tree_focus(
+    focus: Option<(ConnId, crate::protocol::PaneId)>,
+    subscribed: &std::collections::HashSet<ConnId>,
+    is_foreground: impl Fn(&ConnId) -> bool,
+) -> Option<(ConnId, crate::protocol::PaneId)> {
+    focus.filter(|(conn, _)| subscribed.contains(conn) && is_foreground(conn))
+}
+
 /// A session's active tab's focused pane. `None` when no tab is marked active
 /// (an older peer) or the active tab marks no focused pane.
 fn active_tab_focused_pane(
@@ -3050,7 +3066,8 @@ async fn run_client_loop(
     let mut notifier =
         crate::client::notify::AgentNotifier::new(config.notifications.clone(), pane_title.clone());
     // The pane the foreground server's session tree last named as focused.
-    // Only updated while something subscribes to the tree.
+    // Only updated while something subscribes to the tree, and dropped by
+    // `current_tree_focus` once it no longer describes the screen.
     let mut tree_focus: Option<(ConnId, crate::protocol::PaneId)> = None;
 
     loop {
@@ -3104,6 +3121,7 @@ async fn run_client_loop(
         // A connection that stopped pushing is forgotten without an `exited`
         // for each of its agents, and its next list is a fresh baseline.
         notifier.retain(|id| agents_subscribed.contains(id));
+        tree_focus = current_tree_focus(tree_focus, &tree_subscribed, |id| mgr.is_foreground(id));
         // In a view the focused cell is what the user is looking at, and it is
         // not the focused pane of any session, so the server's flag cannot
         // know about it.
@@ -7930,6 +7948,50 @@ async fn run_client_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tree_focus {
+        use super::super::current_tree_focus;
+        use crate::client::registry::ConnId;
+        use std::collections::HashSet;
+
+        fn far() -> ConnId {
+            ConnId::Remote("far".to_string())
+        }
+
+        fn subscribed(ids: &[ConnId]) -> HashSet<ConnId> {
+            ids.iter().cloned().collect()
+        }
+
+        #[test]
+        fn a_focus_on_the_subscribed_foreground_server_is_kept() {
+            let kept = current_tree_focus(
+                Some((far(), 3)),
+                &subscribed(&[ConnId::Local, far()]),
+                |c| *c == far(),
+            );
+            assert_eq!(kept, Some((far(), 3)));
+        }
+
+        #[test]
+        fn a_focus_is_dropped_when_the_tree_is_no_longer_subscribed() {
+            // Covers a dropped connection too: the reconcile forgets every
+            // connection that is not live.
+            let kept = current_tree_focus(Some((far(), 3)), &subscribed(&[ConnId::Local]), |c| {
+                *c == far()
+            });
+            assert_eq!(kept, None);
+        }
+
+        #[test]
+        fn a_focus_is_dropped_when_another_server_comes_to_the_foreground() {
+            let kept = current_tree_focus(
+                Some((far(), 3)),
+                &subscribed(&[ConnId::Local, far()]),
+                |c| *c == ConnId::Local,
+            );
+            assert_eq!(kept, None);
+        }
+    }
 
     fn local(name: &str) -> (ConnId, String) {
         (ConnId::Local, name.to_string())
