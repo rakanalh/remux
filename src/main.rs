@@ -6013,23 +6013,33 @@ async fn run_client_loop(
                         // reopen the SIGWINCH-to-`Resize` window the buffer size
                         // exists to close.
                         let (tc, tr) = renderer.size();
-                        let at_pointer = match panel_at(&chrome, tc, tr, mouse.column, mouse.row) {
-                            Some((sidebar, panel)) => MouseGrab::Panel { sidebar, panel },
-                            None => MouseGrab::Content,
+                        let target = chrome.pointer_target(tc, tr, mouse.column, mouse.row);
+                        let at_pointer = match target {
+                            crate::client::chrome::PointerTarget::Panel { sidebar, panel } => {
+                                MouseGrab::Panel { sidebar, panel }
+                            }
+                            _ => MouseGrab::Content,
                         };
                         // The sidebar's FRAME is inside the sidebar and inside
                         // no panel: `panel_rects` returns interiors. An event
                         // there is swallowed, never translated into the content
                         // rect -- clamping a click on a border into the content
                         // would land it on a pane the user did not click, one
-                        // cell away from where they pressed.
+                        // cell away from where they pressed. The collapse chip
+                        // and a collapsed strip count as frame: the chip lies
+                        // inside a panel's rect, but `pointer_target` resolves
+                        // it first, so no panel ever sees it.
                         //
                         // Only routes derived from POSITION consult this. A
                         // gesture already grabbed by the content keeps its grab
                         // when the pointer crosses the frame, exactly as it does
                         // when it crosses a panel.
-                        let over_frame = matches!(at_pointer, MouseGrab::Content)
-                            && chrome.sidebar_at(tc, tr, mouse.column, mouse.row).is_some();
+                        let over_frame = matches!(
+                            target,
+                            crate::client::chrome::PointerTarget::Frame(_)
+                                | crate::client::chrome::PointerTarget::Button(_)
+                                | crate::client::chrome::PointerTarget::Strip(_)
+                        );
                         let route = match mouse.kind {
                             // A press claims the region for the whole gesture.
                             MouseEventKind::Down(_) => {
@@ -6041,9 +6051,10 @@ async fn run_client_loop(
                                     // (`toggle_edge`), so both leave identical
                                     // state; everything else on the frame stays
                                     // swallowed.
-                                    let hit = chrome.bar_hit(tc, tr, mouse.column, mouse.row);
                                     if matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
-                                        if let Some((si, crate::client::chrome::BarHit::Button | crate::client::chrome::BarHit::Strip)) = hit {
+                                        if let crate::client::chrome::PointerTarget::Button(si)
+                                        | crate::client::chrome::PointerTarget::Strip(si) = target
+                                        {
                                             let edge = chrome.sidebars[si].edge;
                                             let persisted_before =
                                                 crate::client::sidebar_state::SidebarState::from_chrome(&chrome);

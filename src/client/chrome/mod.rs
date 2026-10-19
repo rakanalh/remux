@@ -30,6 +30,22 @@ use crate::config::{BorderStyle, StatusBarPosition};
 use crate::protocol::RenderCell;
 use crate::server::layout::{FocusDirection, Rect};
 
+/// Where a pointer position belongs, in the order the client routes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerTarget {
+    /// Not on any sidebar: the server's content.
+    Content,
+    /// Inside a laid-out panel.
+    Panel { sidebar: usize, panel: usize },
+    /// A cell of an expanded sidebar's collapse chip. Wins over the panel the
+    /// chip is drawn inside.
+    Button(usize),
+    /// A cell of a collapsed sidebar's strip.
+    Strip(usize),
+    /// The rest of a sidebar: its frame or divider. Belongs to no panel.
+    Frame(usize),
+}
+
 /// One plugin panel plus its layout weight.
 pub struct Panel {
     pub plugin: Box<dyn SidebarPlugin>,
@@ -234,6 +250,32 @@ impl Chrome {
             x,
             y,
         )
+    }
+
+    /// Where the pointer at `(x, y)` goes.
+    ///
+    /// The collapse chip is asked first. It is drawn over cells inside a
+    /// panel's rect, so a panel-first lookup would hand the click to the panel
+    /// and the chip would never collapse anything. A chip or strip cell is never
+    /// a panel's.
+    pub fn pointer_target(&self, term_cols: u16, term_rows: u16, x: u16, y: u16) -> PointerTarget {
+        match self.bar_hit(term_cols, term_rows, x, y) {
+            Some((i, BarHit::Button)) => return PointerTarget::Button(i),
+            Some((i, BarHit::Strip)) => return PointerTarget::Strip(i),
+            _ => {}
+        }
+        let in_rect = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        if let Some((sidebar, panel, _)) = self
+            .panel_rects(term_cols, term_rows)
+            .into_iter()
+            .find(|(_, _, r)| in_rect(r))
+        {
+            return PointerTarget::Panel { sidebar, panel };
+        }
+        match self.sidebar_at(term_cols, term_rows, x, y) {
+            Some(i) => PointerTarget::Frame(i),
+            None => PointerTarget::Content,
+        }
     }
 
     /// The row the client draws the status bar on, or `None` while the
@@ -2611,5 +2653,70 @@ mod resize_tests {
         let mut legacy = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
         apply(&mut legacy, &old);
         assert_eq!(legacy.bar_rects(100, 30)[0].1.width, 1);
+    }
+
+    #[test]
+    fn the_chip_cells_route_to_the_button_and_their_neighbour_to_the_panel() {
+        let (tc, tr) = (100, 40);
+        for style in [SidebarStyle::Boxed, SidebarStyle::Flat] {
+            for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+                let size = if edge == SidebarEdge::Bottom { 8 } else { 30 };
+                let mut cfg = bar(edge, size, 1);
+                cfg.style = style;
+                let c = Chrome::from_config(&[cfg]);
+                let bar_rect = c.bar_rects(tc, tr)[0].1;
+                let chip = collapse_button(style, &c.border_style, edge, bar_rect).expect("a chip");
+                assert_eq!(chip.width, 3, "{style:?} {edge:?}");
+                // The chip lies inside the panel's rect: only the routing order
+                // keeps the click from the panel.
+                let panel = c.panel_rects(tc, tr)[0].2;
+                assert!(chip.x >= panel.x && chip.x + chip.width <= panel.x + panel.width);
+                for dx in 0..chip.width {
+                    assert_eq!(
+                        c.pointer_target(tc, tr, chip.x + dx, chip.y),
+                        PointerTarget::Button(0),
+                        "{style:?} {edge:?} chip cell {dx}"
+                    );
+                }
+                let beside = if edge == SidebarEdge::Right {
+                    chip.x + chip.width
+                } else {
+                    chip.x - 1
+                };
+                assert_eq!(
+                    c.pointer_target(tc, tr, beside, chip.y),
+                    PointerTarget::Panel {
+                        sidebar: 0,
+                        panel: 0
+                    },
+                    "{style:?} {edge:?} next to the chip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_strip_cell_routes_to_expand_and_content_stays_content() {
+        let (tc, tr) = (100, 40);
+        let mut cfg = strippable(SidebarEdge::Left);
+        cfg.visible = false;
+        let c = Chrome::from_config(&[cfg]);
+        let strip = c.bar_rects(tc, tr)[0].1;
+        for y in strip.y..strip.y + strip.height {
+            assert_eq!(
+                c.pointer_target(tc, tr, strip.x, y),
+                PointerTarget::Strip(0)
+            );
+        }
+        assert_eq!(c.pointer_target(tc, tr, 5, 5), PointerTarget::Content);
+    }
+
+    #[test]
+    fn the_frame_belongs_to_no_panel() {
+        let (tc, tr) = (100, 40);
+        let mut cfg = bar(SidebarEdge::Left, 30, 1);
+        cfg.style = SidebarStyle::Flat;
+        let c = Chrome::from_config(&[cfg]);
+        assert_eq!(c.pointer_target(tc, tr, 29, 3), PointerTarget::Frame(0));
     }
 }
