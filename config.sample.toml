@@ -1064,6 +1064,11 @@
 # the same machine attached to the same server show one notification between
 # them.
 #
+# Which panes are focused in other clients comes from the server. An older
+# server (a remote you have not upgraded) does not say, so only this client's
+# own knowledge skips a notification there: a View cell, or the focused pane
+# while a sessions, agents or files panel is configured.
+#
 # macOS uses `osascript`, Linux `notify-send` (libnotify). `command` replaces
 # either with an argv of your own: an argument that is exactly "{title}" or
 # "{body}" is replaced by that text, and no shell is involved.

@@ -69,6 +69,10 @@ They are on by default, on **macOS** (through `osascript`) and **Linux** (throug
 
 A notification is skipped when the agent's pane is focused in any client attached to its server, and when it is the pane this client is showing you, including a View cell. Two clients on the same machine attached to the same server show one notification between them, not two.
 
+:::note[Older servers]
+The server is what reports which panes are focused in its clients. A server from before desktop notifications, such as a remote you have not upgraded, does not report it, so only this client's own knowledge of where you are can skip a notification for one of its agents. That covers a View cell, and the focused pane while a `sessions`, `agents` or `files` panel is configured. Without such a panel you may get notifications for the pane you are looking at, and a pane focused in another client is never skipped. Upgrade the remote to fix both.
+:::
+
 The title names the agent the same way the agents panel does, followed by the event, for example `claude main/0 needs input`. The body says where it is: `session · tab N`, with the remote's name in front for a remote agent.
 
 Turn it off, pick events, or use another notifier in `[notifications]`. Changes apply when you save the file:
