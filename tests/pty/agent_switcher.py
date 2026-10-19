@@ -78,6 +78,14 @@ visible = true
   weight = 1
 """
 
+# Desktop notifications keep the agent list subscribed on their own, which
+# would hide whether the switcher and the panel manage the subscription
+# correctly (3 and 5). Off in every client config here.
+NOTIFY_OFF = """
+[notifications]
+enabled = false
+"""
+
 REMOTE = """
 [remotes.mini]
 ssh = "whatever"
@@ -158,9 +166,9 @@ def setup_dirs():
     shutil.rmtree(RUN, ignore_errors=True)
     for s in ("run", "run2", "state", "state2", "data", "data2", "bin"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
-    write_config("cfg-none", "")
-    write_config("cfg-sidebar", AGENTS_SIDEBAR)
-    write_config("cfg-remote", REMOTE)
+    write_config("cfg-none", NOTIFY_OFF)
+    write_config("cfg-sidebar", AGENTS_SIDEBAR + NOTIFY_OFF)
+    write_config("cfg-remote", REMOTE + NOTIFY_OFF)
     p = f"{RUN}/bin/claude"
     with open(p, "w") as f:
         f.write(AGENT)

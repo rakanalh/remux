@@ -82,9 +82,14 @@ auto_connect = true
 )
 
 # The regression baseline: a valid config with no `[[sidebar]]` at all.
+# Desktop notifications subscribe to the agent list with no panel at all, so
+# they are off here for 9 to show that the panels alone gate the subscription.
 CFG_NONE = """
 [appearance]
 border_style = "zellij_style"
+
+[notifications]
+enabled = false
 """
 
 FAILURES = []
@@ -543,7 +548,7 @@ def scenario_no_sidebar():
           "SubscribeSessionTree" not in server_log(),
           "the client subscribed with no sessions panel configured")
     # The agents panel's push is gated on its own flag, and the same way. With
-    # no sidebar at all, neither subscription may go out.
+    # no sidebar at all and notifications off, neither subscription may go out.
     check("9 no agents subscription is sent either",
           "SubscribeAgents" not in server_log(),
           "the client subscribed to the agent list with no agents panel configured")
