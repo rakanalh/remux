@@ -8,11 +8,9 @@
 //! watch never sees, so the target's directory is watched as well and an event
 //! on either path reloads.
 //!
-//! Known limits: a chain of links is followed by what `canonicalize` resolves,
+//! Known limit: a chain of links is followed by what `canonicalize` resolves,
 //! so retargeting a link in the middle of a chain is not noticed until the
-//! config's own link path produces an event, and a directory watched for an
-//! earlier target stays watched after the link moves (it only costs events that
-//! no longer match).
+//! config's own link path produces an event.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -153,6 +151,8 @@ fn classify(event_paths: &[PathBuf], link: &Path, target: Option<&Target>) -> Cl
 struct Watching {
     watcher: RecommendedWatcher,
     watched: HashSet<PathBuf>,
+    /// The config's own directory, which is never unwatched.
+    keep: PathBuf,
 }
 
 impl Watching {
@@ -170,7 +170,24 @@ impl Watching {
             Err(e) => log::warn!("config watch: cannot watch {}: {e}", key.display()),
         }
     }
+
+    /// Stop watching a directory that was watched for an earlier target, so a
+    /// superseded ancestor (possibly `$HOME`) does not keep a kernel watch
+    /// running. The config's own directory is kept.
+    fn unwatch_dir(&mut self, dir: &Path) {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if key == self.keep || !self.watched.remove(&key) {
+            return;
+        }
+        if let Err(e) = self.watcher.unwatch(&key) {
+            log::debug!("config watch: cannot unwatch {}: {e}", key.display());
+        }
+    }
 }
+
+/// The most times one look at the link may chase a target directory that
+/// appears while it is being watched, which bounds the loop by path depth.
+const MAX_RELINK_STEPS: usize = 64;
 
 /// Watch the config file for changes, reloading and sending new Config values
 /// through the provided channel.
@@ -187,8 +204,11 @@ impl Watching {
 /// A link created or retargeted after startup is picked up when an event arrives
 /// for the link path in its own directory, which re-resolves it and watches the
 /// new target's directory. A link that dangles at startup is followed once its
-/// target appears: the nearest existing ancestor of the target is watched, and
-/// the watch moves down as the missing directories are created.
+/// target appears: the nearest existing ancestor of the target is watched, the
+/// watch moves down as the missing directories are created (and the ancestor is
+/// unwatched), and the config is reloaded once the link starts to resolve.
+/// Adding a watch only reports what happens afterwards, so every move looks
+/// again until the directory watched is the target's own.
 ///
 /// Returns `Ok(())` when the watcher is set up. The actual watching happens
 /// asynchronously via the notify crate's event loop.
@@ -201,7 +221,7 @@ pub fn watch_config(tx: tokio::sync::mpsc::UnboundedSender<Config>) -> Result<Wa
 /// [`watch_config`] for an explicit path and reload function.
 fn watch_path<T: Send + 'static>(
     config_path: PathBuf,
-    reload: impl Fn() -> Result<T> + Send + 'static,
+    reload: impl Fn() -> Result<T> + Send + Sync + 'static,
     tx: tokio::sync::mpsc::UnboundedSender<T>,
 ) -> Result<WatchHandle> {
     let config_dir = config_path
@@ -212,6 +232,17 @@ fn watch_path<T: Send + 'static>(
     // Create the config directory if it doesn't exist, so we can watch it.
     std::fs::create_dir_all(&config_dir)?;
 
+    // Reloading and sending is shared by the event callback and the re-resolve
+    // thread, which reloads when a dangling link starts to resolve.
+    let emit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || match reload() {
+        Ok(config) => {
+            let _ = tx.send(config);
+        }
+        Err(e) => {
+            log::warn!("failed to reload config: {}", e);
+        }
+    });
+
     let located = locate(&config_path);
     let extra_dir = located.as_ref().map(|(_, dir)| dir.clone());
     let target = Arc::new(Mutex::new(located.map(|(t, _)| t)));
@@ -220,6 +251,7 @@ fn watch_path<T: Send + 'static>(
     let (relink_tx, relink_rx) = std::sync::mpsc::channel::<()>();
 
     let cb_target = Arc::clone(&target);
+    let cb_emit = Arc::clone(&emit);
     let watched_path = config_path.clone();
     let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         let event = match res {
@@ -239,24 +271,17 @@ fn watch_path<T: Send + 'static>(
             return;
         }
 
-        // Attempt to reload.
-        match reload() {
-            Ok(config) => {
-                let _ = tx.send(config);
-            }
-            Err(e) => {
-                log::warn!("failed to reload config: {}", e);
-            }
-        }
+        cb_emit();
     })?;
 
     let mut watching = Watching {
         watcher,
         watched: HashSet::new(),
+        keep: std::fs::canonicalize(&config_dir).unwrap_or_else(|_| config_dir.clone()),
     };
     watching.watch_dir(&config_dir);
-    if let Some(dir) = extra_dir {
-        watching.watch_dir(&dir);
+    if let Some(dir) = &extra_dir {
+        watching.watch_dir(dir);
     }
     if watching.watched.is_empty() {
         anyhow::bail!("cannot watch {}", config_dir.display());
@@ -267,20 +292,50 @@ fn watch_path<T: Send + 'static>(
     // which drops the callback and with it the sender, which ends this thread.
     let weak = Arc::downgrade(&watching);
     std::thread::spawn(move || {
+        // The directory watched for the target, other than the config's own.
+        let mut extra = extra_dir;
         while relink_rx.recv().is_ok() {
             // One look answers every request queued behind it.
             while relink_rx.try_recv().is_ok() {}
-            let now = locate(&config_path);
-            let dir = now.as_ref().map(|(_, dir)| dir.clone());
+            let Some(watching) = weak.upgrade() else {
+                return;
+            };
+            let was_dangling = target
+                .lock()
+                .ok()
+                .and_then(|t| t.as_ref().map(|t| t.dangling))
+                .unwrap_or(false);
+
+            let mut now = locate(&config_path);
+            for _ in 0..MAX_RELINK_STEPS {
+                let Some((_, dir)) = now.clone() else {
+                    break;
+                };
+                if let Ok(mut w) = watching.lock() {
+                    w.watch_dir(&dir);
+                    if let Some(old) = extra.as_ref().filter(|old| **old != dir) {
+                        w.unwatch_dir(old);
+                    }
+                }
+                extra = Some(dir.clone());
+                // The watch reports only what happens from now on. Whatever
+                // appeared while it was being added (the next directory down,
+                // or the file itself) is found by looking again.
+                let again = locate(&config_path);
+                let settled = again.as_ref().map(|(_, d)| d) == Some(&dir);
+                now = again;
+                if settled {
+                    break;
+                }
+            }
+            let live_now = now.as_ref().is_some_and(|(t, _)| !t.dangling);
             if let Ok(mut t) = target.lock() {
                 *t = now.map(|(t, _)| t);
             }
-            let (Some(dir), Some(watching)) = (dir, weak.upgrade()) else {
-                continue;
-            };
-            let mut guard = watching.lock();
-            if let Ok(w) = guard.as_mut() {
-                w.watch_dir(&dir);
+            // The creation that made the link resolve may have happened before
+            // it was watched, so no event is coming for it.
+            if was_dangling && live_now {
+                emit();
             }
         }
     });
@@ -515,23 +570,61 @@ mod tests {
         );
     }
 
+    /// Wait for a reload that nothing is prompting, so a missed event cannot be
+    /// papered over by writing the file again.
+    fn expect_quiet_reload(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(got) = rx.try_recv() {
+                return Some(got);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
     #[test]
-    fn a_link_whose_target_directory_does_not_exist_yet_is_followed() {
+    fn a_target_created_with_its_directories_in_one_burst_is_loaded_without_a_second_write() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("cfg");
         std::fs::create_dir_all(&cfg).unwrap();
         let target = dir.path().join("dotfiles/remux/config.toml");
         let link = cfg.join("config.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-
         let (_handle, mut rx) = start_watching(&link);
-        let got = expect_reload(&mut rx, |body| {
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            std::fs::write(&target, body).unwrap();
-        });
+
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "v1").unwrap();
         assert!(
-            got.is_some(),
-            "no reload after the target's directories were made"
+            expect_quiet_reload(&mut rx).is_some(),
+            "the first version of the config was never loaded"
         );
+    }
+
+    #[test]
+    fn a_superseded_ancestor_watch_is_dropped_once_the_target_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let target = dir.path().join("dotfiles/remux/config.toml");
+        let link = cfg.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (handle, mut rx) = start_watching(&link);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(handle._watching.lock().unwrap().watched.contains(&root));
+
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "v1").unwrap();
+        assert!(expect_quiet_reload(&mut rx).is_some());
+
+        let watched = handle._watching.lock().unwrap().watched.clone();
+        assert!(
+            !watched.contains(&root),
+            "the ancestor is still watched: {watched:?}"
+        );
+        assert!(watched.contains(&std::fs::canonicalize(&cfg).unwrap()));
+        assert!(watched.contains(&std::fs::canonicalize(target.parent().unwrap()).unwrap()));
     }
 }
