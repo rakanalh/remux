@@ -55,6 +55,39 @@ size = 34
 
 Agents are named by your [`pane_title`](/remux/theme/#pane-titles) template. With no template, an agent shows its window title, or `command session/tab` (for example `claude main/1`) when it has none. Agents on a remote are prefixed with the remote's name.
 
+## Desktop notifications
+
+Remux shows a desktop notification when an agent:
+
+| Event | When |
+|---|---|
+| needs input | it moves into the needs-input state |
+| finished | it stops working after at least 3 seconds of work, and stays quiet for 3 more |
+| exited | it leaves its pane (the agent quit or the pane closed), and is still gone 3 seconds later |
+
+They are on by default, on **macOS** (through `osascript`) and **Linux** (through `notify-send`, from libnotify). The client sends them, for agents on the local server and on every connected [remote](/remux/remotes/), so they appear on the machine you are sitting at. Nothing is sent while no client is running.
+
+A notification is skipped when the agent's pane is focused in any client attached to its server, and when it is the pane this client is showing you, including a View cell. Two clients attached to the same server show one notification between them, not two.
+
+The title names the agent the same way the agents panel does, followed by the event, for example `claude main/0 needs input`. The body says where it is: `session · tab N`, with the remote's name in front for a remote agent.
+
+Turn it off, pick events, or use another notifier in `[notifications]`. Changes apply when you save the file:
+
+```toml
+[notifications]
+enabled = true
+needs_input = true
+finished = false
+exited = true
+# command = ["terminal-notifier", "-title", "{title}", "-message", "{body}"]
+```
+
+The notification text comes from the pane's title, which any program in the pane can set, so it is only ever passed to the notifier as a separate argument and never through a shell. In `command`, an argument that is exactly `{title}` or `{body}` is replaced by that text.
+
+:::note[macOS permission]
+Notifications from `osascript` are shown as coming from Script Editor. If none appear, allow notifications for Script Editor in System Settings > Notifications.
+:::
+
 ## Configure detection
 
 ```toml
@@ -127,4 +160,5 @@ A server that cannot detect agents shows `<server>: no detection` in the list (f
 
 - [Sidebars](/remux/sidebars/): dock the agents panel.
 - [Remotes](/remux/remotes/): see agents on other machines.
+- [Configuration reference](/remux/config-reference/#notifications): `[notifications]`.
 - [Theme](/remux/theme/): state colours and `pane_title`.

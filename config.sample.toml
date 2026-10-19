@@ -12,7 +12,7 @@
 #
 # WHEN AN EDIT APPLIES. The client watches this file and applies these on save:
 # keybindings, `which_key_position`, `pane_title`, `tab_style`, [remotes.*],
-# [[sidebar]], and the theme colours of what the client draws (overlays,
+# [[sidebar]], [notifications], and the theme colours of what the client draws (overlays,
 # which-key, sidebars, Views, search highlights). The server reads this file
 # once, at startup, so these need `remux restart`: everything under [general],
 # `border_style`, `default_layout`, `popup_width_pct`/`popup_height_pct`,
@@ -1050,6 +1050,29 @@
 # codex could not be driven as far as an approval. If a pane ever sticks on
 # "needs input", that is the pattern to correct — a state that never decays is
 # the price of matching a prompt that never leaves the screen.
+
+# -----------------------------------------------------------------------------
+# NOTIFICATIONS
+# -----------------------------------------------------------------------------
+# Desktop notifications for the agents in every server this client is connected
+# to, local and remote. The CLIENT sends them, so they appear on the machine you
+# are sitting at, follow THIS file's settings for remote agents too, and stop
+# while no client is running. Applied on save.
+#
+# An agent whose pane is focused in any attached client is skipped, and so is
+# the pane this client is showing you (including a View cell). Two clients
+# attached to the same server show one notification between them.
+#
+# macOS uses `osascript`, Linux `notify-send` (libnotify). `command` replaces
+# either with an argv of your own: an argument that is exactly "{title}" or
+# "{body}" is replaced by that text, and no shell is involved.
+#
+# [notifications]
+# enabled = true        # desktop notifications for agents in any connected server
+# needs_input = true    # the agent is waiting on an approval, question or permission prompt
+# finished = true       # the agent stopped working (3 s of quiet after at least 3 s of work)
+# exited = true         # the agent left its pane
+# command = ["terminal-notifier", "-title", "{title}", "-message", "{body}"]
 
 # -----------------------------------------------------------------------------
 # REMOTES
