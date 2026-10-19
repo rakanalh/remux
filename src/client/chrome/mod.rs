@@ -15,9 +15,9 @@ use anyhow::Result;
 // is a binary crate, so a `pub use` nothing outside `geometry` imports trips
 // `unused_imports` under `-D warnings`.
 pub use geometry::{
-    bar_rects, content_point, content_rect, effective_sizes, frame_size_inset, pane_area,
-    panel_rects, past_the_server_bar, sidebar_frame, status_bar_rect, PanelGeom, SidebarEdge,
-    SidebarGeom, SidebarStyle,
+    bar_rects, content_point, content_rect, effective_sizes, frame_for, inset_for, pane_area,
+    panel_rects, past_the_server_bar, status_bar_rect, PanelGeom, SidebarEdge, SidebarGeom,
+    SidebarStyle,
 };
 
 use crate::client::renderer::Renderer;
@@ -295,7 +295,12 @@ impl Chrome {
                 // this is what the pre-frame code did too (it painted nothing).
                 continue;
             }
-            let f = sidebar_frame(&self.border_style, self.sidebars[si].edge, bar);
+            let f = frame_for(
+                self.sidebars[si].style,
+                &self.border_style,
+                self.sidebars[si].edge,
+                bar,
+            );
             let render_panel = |pi: usize, r: Rect| {
                 let focused = self.focus
                     == ChromeFocus::Sidebar {
@@ -331,14 +336,19 @@ impl Chrome {
                 .collect();
             let active =
                 matches!(self.focus, ChromeFocus::Sidebar { sidebar, .. } if sidebar == si);
-            frame::draw_sidebar_frame(
-                &mut grid,
-                &self.border_style,
-                self.sidebars[si].edge,
-                active,
-                &rules,
-                theme,
-            );
+            match self.sidebars[si].style {
+                SidebarStyle::Boxed => frame::draw_sidebar_frame(
+                    &mut grid,
+                    &self.border_style,
+                    self.sidebars[si].edge,
+                    active,
+                    &rules,
+                    theme,
+                ),
+                SidebarStyle::Flat => {
+                    frame::draw_flat_frame(&mut grid, self.sidebars[si].edge, &rules, theme)
+                }
+            }
             for (pi, r) in panels.iter().copied().zip(mine.iter().copied()) {
                 let cells = render_panel(pi, r);
                 let ox = r.x.saturating_sub(bar.x) as usize;
@@ -807,21 +817,24 @@ impl Chrome {
         // grant less -- it clamps against the content minimum and knows nothing
         // about frames -- which is exactly why the unframed degrade path in
         // `paint` has to keep working.
-        frame_size_inset(&self.border_style, self.sidebars[i].edge)
-            + self.sidebars[i]
-                .panels
-                .iter()
-                .map(|p| {
-                    let (min_cols, min_rows) = p.plugin.min_size();
-                    if vertical {
-                        min_cols
-                    } else {
-                        min_rows
-                    }
-                })
-                .max()
-                .unwrap_or(1)
-                .max(1)
+        inset_for(
+            self.sidebars[i].style,
+            &self.border_style,
+            self.sidebars[i].edge,
+        ) + self.sidebars[i]
+            .panels
+            .iter()
+            .map(|p| {
+                let (min_cols, min_rows) = p.plugin.min_size();
+                if vertical {
+                    min_cols
+                } else {
+                    min_rows
+                }
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Re-target a directional resize at the focused sidebar. Returns `true` if

@@ -259,6 +259,34 @@ pub fn sidebar_frame(style: &BorderStyle, edge: SidebarEdge, bar: Rect) -> Sideb
     }
 }
 
+/// The frame a sidebar gets under its own `style`, given its bar rect.
+///
+/// `Boxed` is [`sidebar_frame`] unchanged. `Flat` reserves exactly what the
+/// tmux seam reserves, one column (or row, for the bottom edge) on the side
+/// facing the panes, and nothing for a box. That reservation is the divider
+/// itself, so the flat inner rect has no one-cell inset on any other side and
+/// does not depend on the pane border style. Reusing the tmux derivation keeps
+/// the "bar too small to carry a seam" fallback in one place.
+pub fn frame_for(
+    style: SidebarStyle,
+    border: &BorderStyle,
+    edge: SidebarEdge,
+    bar: Rect,
+) -> SidebarFrame {
+    match style {
+        SidebarStyle::Boxed => sidebar_frame(border, edge, bar),
+        SidebarStyle::Flat => sidebar_frame(&BorderStyle::TmuxStyle, edge, bar),
+    }
+}
+
+/// [`frame_size_inset`] for a sidebar of the given `style`.
+pub fn inset_for(style: SidebarStyle, border: &BorderStyle, edge: SidebarEdge) -> u16 {
+    match style {
+        SidebarStyle::Boxed => frame_size_inset(border, edge),
+        SidebarStyle::Flat => frame_size_inset(&BorderStyle::TmuxStyle, edge),
+    }
+}
+
 /// How many cells of the axis a sidebar's `size` measures its frame consumes.
 ///
 /// This is what a sidebar's minimum `size` has to clear on top of its plugins'
@@ -454,7 +482,7 @@ pub fn panel_rects(
     let mut out = Vec::new();
     for (i, bar) in bar_rects(sidebars, term_cols, term_rows) {
         let s = &sidebars[i];
-        let frame = sidebar_frame(style, s.edge, bar);
+        let frame = frame_for(s.style, style, s.edge, bar);
         let vertical = !matches!(s.edge, SidebarEdge::Bottom);
         for (pi, rect) in split_panels(frame.interior, &s.panels, vertical, frame.gap) {
             out.push((i, pi, rect));
@@ -972,6 +1000,95 @@ mod tests {
             Rect {
                 width: base.width - 1,
                 ..base
+            }
+        );
+    }
+
+    #[test]
+    fn a_flat_interior_loses_only_the_divider_whatever_the_border_style() {
+        let bar = Rect {
+            x: 10,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+        for border in [BorderStyle::ZellijStyle, BorderStyle::TmuxStyle] {
+            let left = frame_for(SidebarStyle::Flat, &border, SidebarEdge::Left, bar);
+            assert!(left.framed);
+            assert_eq!(left.interior, Rect { width: 29, ..bar });
+            let right = frame_for(SidebarStyle::Flat, &border, SidebarEdge::Right, bar);
+            assert_eq!(
+                right.interior,
+                Rect {
+                    x: 11,
+                    width: 29,
+                    ..bar
+                }
+            );
+            let bottom = frame_for(SidebarStyle::Flat, &border, SidebarEdge::Bottom, bar);
+            assert_eq!(
+                bottom.interior,
+                Rect {
+                    y: 1,
+                    height: 39,
+                    ..bar
+                }
+            );
+            assert_eq!(left.gap, 1);
+        }
+    }
+
+    #[test]
+    fn a_boxed_sidebar_is_framed_exactly_as_before() {
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+        for border in [BorderStyle::ZellijStyle, BorderStyle::TmuxStyle] {
+            for edge in [SidebarEdge::Left, SidebarEdge::Right, SidebarEdge::Bottom] {
+                assert_eq!(
+                    frame_for(SidebarStyle::Boxed, &border, edge, bar),
+                    sidebar_frame(&border, edge, bar)
+                );
+                assert_eq!(
+                    inset_for(SidebarStyle::Boxed, &border, edge),
+                    frame_size_inset(&border, edge)
+                );
+            }
+        }
+        assert_eq!(
+            inset_for(SidebarStyle::Flat, &ZJ, SidebarEdge::Left),
+            1,
+            "a flat sidebar spends one column of its size on the divider"
+        );
+    }
+
+    #[test]
+    fn flat_panels_stack_with_a_one_row_rule_and_no_inset() {
+        let mut flat = sb(SidebarEdge::Left, 30, &[1, 1]);
+        flat.style = SidebarStyle::Flat;
+        let rects = panel_rects(&[flat], 100, 30, &ZJ);
+        assert_eq!(rects.len(), 2);
+        // A 29-row bar, minus one row for the rule, split 14 and 14 (the last
+        // panel takes the remainder, so 14 + 14 = 28).
+        assert_eq!(
+            rects[0].2,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 29,
+                height: 14
+            }
+        );
+        assert_eq!(
+            rects[1].2,
+            Rect {
+                x: 0,
+                y: 15,
+                width: 29,
+                height: 14
             }
         );
     }

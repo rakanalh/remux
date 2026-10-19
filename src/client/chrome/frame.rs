@@ -90,6 +90,50 @@ pub fn draw_sidebar_frame(
     }
 }
 
+/// Draw a flat sidebar's divider and panel rules into `grid`.
+///
+/// The divider takes the seam cells `frame_for` reserved. A rule stops short of
+/// the divider and leaves it unbroken, with no tee glyph, so the divider reads
+/// as one line down the whole sidebar. Both are `sidebar_divider_fg`, and focus
+/// does not change them.
+pub fn draw_flat_frame(
+    grid: &mut [Vec<RenderCell>],
+    edge: SidebarEdge,
+    rules: &[u16],
+    theme: &CompositorTheme,
+) {
+    let h = grid.len();
+    if h == 0 || grid[0].is_empty() {
+        return;
+    }
+    let w = grid[0].len();
+    let fg = &theme.sidebar_divider_fg;
+    match edge {
+        SidebarEdge::Left | SidebarEdge::Right => {
+            if w < 2 {
+                return;
+            }
+            let (seam, x0, x1) = match edge {
+                SidebarEdge::Right => (0, 1, w),
+                _ => (w - 1, 0, w - 1),
+            };
+            draw_divider_column(grid, seam, 0, h, fg, theme);
+            for &r in rules {
+                draw_divider_row(grid, r as usize, x0, x1, fg, theme);
+            }
+        }
+        SidebarEdge::Bottom => {
+            if h < 2 {
+                return;
+            }
+            draw_divider_row(grid, 0, 0, w, fg, theme);
+            for &r in rules {
+                draw_divider_column(grid, r as usize, 1, h, fg, theme);
+            }
+        }
+    }
+}
+
 /// The `├───┤` (or `┬ │ ┴`) rules between a framed sidebar's stacked panels.
 ///
 /// The run itself is the shared divider primitive; only the two junction
@@ -360,5 +404,24 @@ mod tests {
             &t,
         );
         assert_eq!(g[0][3].fg, t.frame_fg);
+    }
+
+    #[test]
+    fn a_flat_frame_is_one_divider_and_rules_that_stop_short_of_it() {
+        let t = theme();
+        let mut g = blank_grid(6, 5, CellColor::Default);
+        draw_flat_frame(&mut g, SidebarEdge::Left, &[2], &t);
+        assert_eq!(
+            chars(&g),
+            vec!["     │", "     │", "─────│", "     │", "     │"]
+        );
+        for r in 0..5 {
+            assert_eq!(g[r][5].fg, t.sidebar_divider_fg);
+        }
+        assert_eq!(g[2][0].fg, t.sidebar_divider_fg);
+
+        let mut g = blank_grid(6, 3, CellColor::Default);
+        draw_flat_frame(&mut g, SidebarEdge::Right, &[1], &t);
+        assert_eq!(chars(&g), vec!["│     ", "│─────", "│     "]);
     }
 }
