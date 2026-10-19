@@ -27,8 +27,9 @@
 
 use crossterm::event::{KeyEvent, MouseEventKind};
 
-use super::nav::{self, NavKey, NavList, HEADER_ROWS};
-use super::{blank_grid, draw_text, PluginAction, PluginEvent, SidebarPlugin};
+use super::nav::{self, ListLayout, NavKey, NavList};
+use super::{blank_grid, draw_text, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
+use crate::client::chrome::SidebarStyle;
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
 use crate::config::theme::CompositorTheme;
@@ -88,6 +89,35 @@ impl AgentRow {
             }
         };
         format!("{} {}", self.entry.command, where_)
+    }
+
+    /// What a flat sidebar shows on a row's first line: a name, and an optional
+    /// dimmer tail.
+    ///
+    /// A name the user gave the pane, a `pane_title` template result or the
+    /// pane's own title is shown whole, as [`AgentRow::label`] shows it. With
+    /// none of those, the location is the name: the session, then ` · ` and the
+    /// tab index. The command is left out because the second line carries it.
+    pub fn flat_name(&self) -> (String, Option<String>) {
+        let titled = self.entry.custom_name.is_some()
+            || self.pane_title.is_some()
+            || self.entry.title.as_deref().is_some_and(|t| !t.is_empty());
+        if titled {
+            return (self.label(), None);
+        }
+        (
+            self.entry.session.clone(),
+            Some(format!(" \u{b7} {}", self.entry.tab_index)),
+        )
+    }
+
+    /// A flat row's second line: the agent, and the host when it runs on a
+    /// remote.
+    pub fn flat_detail(&self) -> String {
+        match &self.conn {
+            ConnId::Local => self.entry.command.clone(),
+            ConnId::Remote(host) => format!("{} \u{b7} {host}", self.entry.command),
+        }
     }
 
     /// Where Enter on this row goes: the client's one jump path, keyed by
@@ -250,6 +280,62 @@ impl AgentsPlugin {
         }
     }
 
+    /// Paint one flat, two-line row at panel row `y`.
+    ///
+    /// Line one is the state dot at the padding column and the name two columns
+    /// after it. Line two sits under the name. The band, when there is one,
+    /// covers both lines edge to edge.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_flat_row(
+        grid: &mut [Vec<RenderCell>],
+        y: u16,
+        cols: u16,
+        row: &AgentRow,
+        band: Option<&CellColor>,
+        name_fg: CellColor,
+        bold: bool,
+        base_bg: &CellColor,
+        theme: &CompositorTheme,
+    ) {
+        let bg = band.unwrap_or(base_bg).clone();
+        if band.is_some() {
+            for line in [y, y + 1] {
+                nav::fill_row(grid, line, cols, &name_fg, &bg);
+            }
+        }
+        let dot = if row.entry.state == AgentState::Idle {
+            "\u{25CB}"
+        } else {
+            "\u{25CF}"
+        };
+        draw_text(
+            grid,
+            1,
+            y,
+            dot,
+            state_fg(row.entry.state, theme),
+            bg.clone(),
+        );
+        let (name, tail) = row.flat_name();
+        draw_text_with(grid, 3, y, &name, name_fg, bg.clone(), bold);
+        if let Some(tail) = tail {
+            let x = 3 + unicode_width::UnicodeWidthStr::width(name.as_str()) as u16;
+            draw_text(grid, x, y, &tail, theme.sidebar_dim_fg.clone(), bg.clone());
+        }
+        draw_text(
+            grid,
+            3,
+            y + 1,
+            &row.flat_detail(),
+            theme.sidebar_dim_fg.clone(),
+            bg,
+        );
+    }
+
+    fn layout(&self) -> ListLayout {
+        self.nav.layout()
+    }
+
     /// Rebuild [`AgentsPlugin::rows`], keeping the selection on the row it was
     /// on.
     fn rebuild(&mut self) {
@@ -280,7 +366,11 @@ impl SidebarPlugin for AgentsPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (12, 3)
+        (12, self.layout().header_rows as u16 + 2)
+    }
+
+    fn set_style(&mut self, style: SidebarStyle) {
+        self.nav.set_layout(ListLayout::for_style(style, 2));
     }
 
     fn wants_agents(&self) -> bool {
@@ -309,7 +399,12 @@ impl SidebarPlugin for AgentsPlugin {
         if grid.is_empty() {
             return grid;
         }
-        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        let layout = self.layout();
+        if layout.flat {
+            nav::draw_flat_header(&mut grid, self.title(), theme, &bg);
+        } else {
+            nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        }
 
         // The notes are CAPPED against the list, not just against the panel.
         // Uncapped, three unsupported remotes beside four blocked agents took
@@ -321,7 +416,7 @@ impl SidebarPlugin for AgentsPlugin {
         // there are none (there is nothing to crowd out), and one summarising
         // line rather than a truncated set when they do not fit: partial lists
         // invite "which servers?" with no way to ask.
-        let capacity = (rows as usize).saturating_sub(HEADER_ROWS);
+        let capacity = (rows as usize).saturating_sub(layout.header_rows);
         let all_notes = self.roster.notes();
         let budget = if self.rows.is_empty() {
             capacity
@@ -342,8 +437,8 @@ impl SidebarPlugin for AgentsPlugin {
             // one look identical, and this one is empty most of the time.
             draw_text(
                 &mut grid,
-                0,
-                HEADER_ROWS as u16,
+                layout.pad(),
+                layout.header_rows as u16,
                 "no agents",
                 theme.status_bar_fg.clone(),
                 bg,
@@ -359,16 +454,28 @@ impl SidebarPlugin for AgentsPlugin {
         // reservation too.
         let note_rows = notes.len();
         let list_height = rows.saturating_sub(note_rows as u16);
-        let list_capacity = (list_height as usize).saturating_sub(HEADER_ROWS);
+        let list_capacity = layout.visible(list_height);
 
         let top = self.nav.top_for(list_height, self.rows.len());
         for i in 0..list_capacity {
             let Some(row) = self.rows.get(top + i) else {
                 break;
             };
-            let y = (HEADER_ROWS + i) as u16;
+            let y = layout.row_of(i);
             let selected = top + i == self.nav.selected();
             let current = self.current.as_ref() == Some(&row.key());
+            if layout.flat {
+                let (fg, sel_bg, bold) = nav::flat_row_colors(theme, focused, selected, &bg);
+                let band = if selected {
+                    Some(sel_bg)
+                } else if current {
+                    Some(theme.sidebar_current_bg.clone())
+                } else {
+                    None
+                };
+                Self::paint_flat_row(&mut grid, y, cols, row, band.as_ref(), fg, bold, &bg, theme);
+                continue;
+            }
             let (fg, mut row_bg) = nav::row_colors(theme, focused, selected, &bg);
             // The selection bar wins on a row that is both, because the j/k
             // cursor must never be hidden. The current-pane bar is drawn even
@@ -398,10 +505,10 @@ impl SidebarPlugin for AgentsPlugin {
         // of the panel when it is not -- either way, on screen.
         let painted = self.rows.len().saturating_sub(top).min(list_capacity);
         for (n, note) in notes.iter().take(note_rows).enumerate() {
-            let y = (HEADER_ROWS + painted + n) as u16;
+            let y = (layout.header_rows + painted * layout.row_height + n) as u16;
             draw_text(
                 &mut grid,
-                0,
+                layout.pad(),
                 y,
                 note,
                 theme.status_bar_fg.clone(),
@@ -1333,5 +1440,184 @@ mod tests {
             rows[3].contains("s10"),
             "the selection must be on screen, got {rows:?}"
         );
+    }
+
+    fn flat_plugin(n: u64) -> AgentsPlugin {
+        let mut p = AgentsPlugin::new();
+        p.set_style(SidebarStyle::Flat);
+        let agents = (1..=n)
+            .map(|i| {
+                let state = match i % 3 {
+                    0 => AgentState::NeedsInput,
+                    1 => AgentState::Working,
+                    _ => AgentState::Idle,
+                };
+                agent(i, "claude", &format!("s{i}"), state)
+            })
+            .collect();
+        p.on_event(&push(ConnId::Local, agents));
+        p
+    }
+
+    /// The panel row each rendered row index of a flat render band, by
+    /// whether every cell carries `sidebar_selection_bg`.
+    fn banded_rows(p: &AgentsPlugin, focused: bool, rows: u16) -> Vec<usize> {
+        let theme = CompositorTheme::default();
+        p.render(24, rows, focused, &theme)
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.iter().all(|c| c.bg == theme.sidebar_selection_bg))
+            .map(|(y, _)| y)
+            .collect()
+    }
+
+    #[test]
+    fn a_flat_item_takes_two_rows_below_a_two_row_header() {
+        let p = flat_plugin(3);
+        let out = painted(&p, 24, 10);
+        assert_eq!(out[0], " agents");
+        assert_eq!(out[1], "");
+        assert_eq!(out[2], " \u{25CF} s1 \u{b7} 0");
+        assert_eq!(out[3], "   claude");
+        assert_eq!(out[4], " \u{25CB} s2 \u{b7} 0");
+        assert_eq!(out[5], "   claude");
+        assert_eq!(out[6], " \u{25CF} s3 \u{b7} 0");
+        assert_eq!(out[7], "   claude");
+        assert_eq!(out.len(), 10);
+    }
+
+    #[test]
+    fn the_flat_header_is_lowercase_bold_and_dim() {
+        let p = flat_plugin(1);
+        let theme = CompositorTheme::default();
+        let grid = p.render(24, 6, true, &theme);
+        assert_eq!(grid[0][1].c, 'a');
+        assert!(grid[0][1].bold);
+        assert_eq!(grid[0][1].fg, theme.sidebar_dim_fg);
+    }
+
+    #[test]
+    fn the_flat_selection_band_covers_both_lines_of_the_item() {
+        let mut p = flat_plugin(3);
+        assert_eq!(banded_rows(&p, true, 10), vec![2, 3]);
+        p.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            banded_rows(&p, true, 10),
+            vec![4, 5],
+            "one j moves the band by one item, which is two rows"
+        );
+        // An unfocused panel still shows where its cursor is.
+        assert_eq!(banded_rows(&p, false, 10), vec![4, 5]);
+    }
+
+    #[test]
+    fn flat_g_and_big_g_move_by_items() {
+        let mut p = flat_plugin(3);
+        p.on_key(key(KeyCode::Char('G')));
+        assert_eq!(banded_rows(&p, true, 10), vec![6, 7]);
+        p.on_key(key(KeyCode::Char('g')));
+        assert_eq!(banded_rows(&p, true, 10), vec![2, 3]);
+        p.on_key(key(KeyCode::Char('k')));
+        assert_eq!(banded_rows(&p, true, 10), vec![6, 7], "k wraps by one item");
+    }
+
+    #[test]
+    fn the_flat_selected_name_is_bold_and_bright_only_with_focus() {
+        let p = flat_plugin(2);
+        let theme = CompositorTheme::default();
+        let focused = p.render(24, 10, true, &theme);
+        assert_eq!(focused[2][3].fg, theme.sidebar_name_selected_fg);
+        assert!(focused[2][3].bold);
+        assert_eq!(focused[4][3].fg, theme.status_bar_fg);
+        assert!(!focused[4][3].bold);
+        let idle = p.render(24, 10, false, &theme);
+        assert_eq!(idle[2][3].fg, theme.status_bar_fg);
+    }
+
+    #[test]
+    fn flat_state_dots_keep_the_state_colours_and_idle_is_hollow() {
+        let p = flat_plugin(3);
+        let theme = CompositorTheme::default();
+        let g = p.render(24, 10, true, &theme);
+        assert_eq!(g[2][1].c, '\u{25CF}');
+        assert_eq!(g[2][1].fg, state_fg(AgentState::Working, &theme));
+        assert_eq!(g[4][1].c, '\u{25CB}');
+        assert_eq!(g[4][1].fg, state_fg(AgentState::Idle, &theme));
+        assert_eq!(g[6][1].fg, state_fg(AgentState::NeedsInput, &theme));
+    }
+
+    #[test]
+    fn a_remote_agent_carries_its_host_on_the_second_line() {
+        let mut p = AgentsPlugin::new();
+        p.set_style(SidebarStyle::Flat);
+        p.on_event(&push(
+            remote("mini"),
+            vec![agent(1, "codex", "main", AgentState::Idle)],
+        ));
+        let out = painted(&p, 24, 6);
+        assert_eq!(out[2], " \u{25CB} main \u{b7} 0");
+        assert_eq!(out[3], "   codex \u{b7} mini");
+    }
+
+    #[test]
+    fn flat_scrolling_is_in_items_and_a_partial_item_is_not_drawn() {
+        let mut p = flat_plugin(5);
+        // 2 header rows + 2 items (4 rows) + 1 spare row that cannot hold a
+        // third item.
+        let rows = 7;
+        for _ in 0..3 {
+            p.on_key(key(KeyCode::Char('j')));
+        }
+        let out = painted(&p, 24, rows);
+        assert_eq!(out.len(), 7);
+        assert!(out[2].contains("s3"), "{out:?}");
+        assert!(out[4].contains("s4"), "{out:?}");
+        assert_eq!(out[6], "");
+        assert_eq!(banded_rows(&p, true, rows), vec![4, 5]);
+    }
+
+    #[test]
+    fn a_click_on_either_line_of_a_flat_item_selects_it() {
+        let down = MouseEventKind::Down(MouseButton::Left);
+        for (item, lines) in [(0usize, [2u16, 3]), (1, [4, 5]), (2, [6, 7])] {
+            for y in lines {
+                let mut p = flat_plugin(3);
+                let _ = painted(&p, 24, 10);
+                // Item 0 starts selected, so a first click on it activates.
+                let expect = if item == 0 {
+                    PluginAction::JumpTo(p.rows[0].jump_target())
+                } else {
+                    PluginAction::Redraw
+                };
+                assert_eq!(p.on_mouse(1, y, down), expect, "item {item} line y={y}");
+                assert_eq!(p.nav.selected(), item);
+            }
+        }
+        let mut p = flat_plugin(3);
+        let _ = painted(&p, 24, 10);
+        assert_eq!(p.on_mouse(1, 0, down), PluginAction::None);
+        assert_eq!(p.on_mouse(1, 1, down), PluginAction::None, "the blank row");
+        assert_eq!(p.on_mouse(1, 8, down), PluginAction::None, "below the list");
+    }
+
+    #[test]
+    fn enter_on_a_flat_item_still_jumps_to_its_pane() {
+        let mut p = flat_plugin(3);
+        p.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            p.on_key(key(KeyCode::Enter)),
+            PluginAction::JumpTo(p.rows[1].jump_target())
+        );
+    }
+
+    #[test]
+    fn the_default_style_renders_as_it_always_did() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(1, "claude", "main", AgentState::Idle)],
+        ));
+        let out = painted(&p, 24, 4);
+        assert_eq!(out[1], "\u{25CF} claude main/0");
     }
 }

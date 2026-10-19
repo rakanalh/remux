@@ -2400,4 +2400,38 @@ mod resize_tests {
         assert!(!intercept_resize(&mut c, Right, 5, 20, 30));
         assert_eq!(c.focus, ChromeFocus::Content);
     }
+
+    fn flat(mut cfg: SidebarConfig) -> SidebarConfig {
+        cfg.style = SidebarStyle::Flat;
+        cfg
+    }
+
+    #[test]
+    fn a_flat_sidebars_divider_belongs_to_no_panel_and_its_panels_start_at_the_edge() {
+        let c = Chrome::from_config(&[flat(bar(SidebarEdge::Left, 30, 1))]);
+        let rects = c.panel_rects(100, 30);
+        assert_eq!(rects.len(), 1);
+        let r = rects[0].2;
+        assert_eq!((r.x, r.y, r.width), (0, 0, 29));
+        // The divider column is inside the sidebar and inside no panel, so a
+        // click on it is swallowed instead of reaching a pane.
+        assert_eq!(c.sidebar_at(100, 30, 29, 5), Some(0));
+        assert!(!rects
+            .iter()
+            .any(|(_, _, r)| 29 >= r.x && 29 < r.x + r.width));
+        // The boxed default still insets by the frame.
+        let boxed = Chrome::from_config(&[bar(SidebarEdge::Left, 30, 1)]);
+        assert_eq!(boxed.panel_rects(100, 30)[0].2.x, 1);
+    }
+
+    #[test]
+    fn the_style_reaches_the_plugins_when_the_chrome_is_built() {
+        let mut cfg = flat(bar(SidebarEdge::Left, 30, 1));
+        cfg.panel[0].plugin = "agents".into();
+        let c = Chrome::from_config(&[cfg]);
+        let theme = CompositorTheme::default();
+        let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
+        let header: String = grid[0].iter().map(|cell| cell.c).collect();
+        assert_eq!(header.trim_end(), " agents");
+    }
 }

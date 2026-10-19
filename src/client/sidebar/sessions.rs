@@ -831,4 +831,30 @@ mod tests {
             .wants_session_tree()
         );
     }
+
+    #[test]
+    fn a_flat_tree_has_a_lowercase_header_a_blank_row_and_one_column_of_padding() {
+        let mut p = SessionsPlugin::new();
+        p.set_style(SidebarStyle::Flat);
+        p.on_event(&local_tree());
+        let out = painted(&p, 24, 8);
+        assert_eq!(out[0], " sessions");
+        assert_eq!(out[1], "");
+        assert!(out[2].starts_with(" \u{25BC}"), "{out:?}");
+    }
+
+    #[test]
+    fn the_flat_band_spans_the_row_and_a_click_resolves_below_the_two_row_header() {
+        let mut p = SessionsPlugin::new();
+        p.set_style(SidebarStyle::Flat);
+        p.on_event(&local_tree());
+        let theme = CompositorTheme::default();
+        let grid = p.render(24, 8, true, &theme);
+        assert!(grid[2].iter().all(|c| c.bg == theme.sidebar_selection_bg));
+        assert!(grid[3].iter().all(|c| c.bg != theme.sidebar_selection_bg));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(p.on_mouse(0, 1, down), PluginAction::None, "the blank row");
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
+        assert_eq!(p.model.selected, 1);
+    }
 }
