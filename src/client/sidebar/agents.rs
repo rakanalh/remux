@@ -37,6 +37,9 @@ use crate::client::tree_model::JumpTarget;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{AgentEntry, AgentState, CellColor, PaneId, RenderCell};
 
+/// Lines per agent row, in every sidebar style.
+const ROW_HEIGHT: usize = 2;
+
 /// One listed agent, and the server it lives on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRow {
@@ -286,7 +289,11 @@ impl AgentsPlugin {
             roster: AgentRoster::new(),
             rows: Vec::new(),
             current: None,
-            nav: NavList::new(),
+            nav: {
+                let mut nav = NavList::new();
+                nav.set_layout(ListLayout::for_style(SidebarStyle::Boxed, ROW_HEIGHT));
+                nav
+            },
             tab_names: HashMap::new(),
         }
     }
@@ -301,20 +308,25 @@ impl AgentsPlugin {
             .map(String::as_str)
     }
 
-    /// Paint one flat, two-line row at panel row `y`.
+    /// Paint one two-line row at panel row `y`.
     ///
     /// Line one is the state dot at the padding column and the name two columns
     /// after it. Line two sits under the name. The band, when there is one,
-    /// covers both lines edge to edge.
+    /// covers both lines edge to edge. `dim_fg` colours the secondary text: the
+    /// theme's dim colour, except on a boxed selection bar, whose own
+    /// foreground has to carry it because the dim colour is unreadable on the
+    /// bar.
     #[allow(clippy::too_many_arguments)]
-    fn paint_flat_row(
+    fn paint_row(
         grid: &mut [Vec<RenderCell>],
         y: u16,
         cols: u16,
+        pad: u16,
         row: &AgentRow,
         tab_name: Option<&str>,
         band: Option<&CellColor>,
         name_fg: CellColor,
+        dim_fg: CellColor,
         bold: bool,
         base_bg: &CellColor,
         theme: &CompositorTheme,
@@ -325,6 +337,9 @@ impl AgentsPlugin {
                 nav::fill_row(grid, line, cols, &name_fg, &bg);
             }
         }
+        // The marker keeps its STATE colour even on the selected row: the
+        // colour is the whole point of the panel, and a selection that
+        // swallowed it would hide the one thing the user came to see.
         let dot = if row.entry.state == AgentState::Idle {
             "\u{25CB}"
         } else {
@@ -332,26 +347,20 @@ impl AgentsPlugin {
         };
         draw_text(
             grid,
-            1,
+            pad,
             y,
             dot,
             state_fg(row.entry.state, theme),
             bg.clone(),
         );
+        let text_x = pad + 2;
         let (name, tail) = row.flat_name(tab_name);
-        draw_text_with(grid, 3, y, &name, name_fg, bg.clone(), bold);
+        draw_text_with(grid, text_x, y, &name, name_fg, bg.clone(), bold);
         if let Some(tail) = tail {
-            let x = 3 + unicode_width::UnicodeWidthStr::width(name.as_str()) as u16;
-            draw_text(grid, x, y, &tail, theme.sidebar_dim_fg.clone(), bg.clone());
+            let x = text_x + unicode_width::UnicodeWidthStr::width(name.as_str()) as u16;
+            draw_text(grid, x, y, &tail, dim_fg.clone(), bg.clone());
         }
-        draw_text(
-            grid,
-            3,
-            y + 1,
-            &row.flat_detail(),
-            theme.sidebar_dim_fg.clone(),
-            bg,
-        );
+        draw_text(grid, text_x, y + 1, &row.flat_detail(), dim_fg, bg);
     }
 
     fn layout(&self) -> ListLayout {
@@ -388,11 +397,12 @@ impl SidebarPlugin for AgentsPlugin {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (12, self.layout().header_rows as u16 + 2)
+        (12, (self.layout().header_rows + ROW_HEIGHT) as u16)
     }
 
     fn set_style(&mut self, style: SidebarStyle) {
-        self.nav.set_layout(ListLayout::for_style(style, 2));
+        self.nav
+            .set_layout(ListLayout::for_style(style, ROW_HEIGHT));
     }
 
     fn wants_agents(&self) -> bool {
@@ -486,6 +496,7 @@ impl SidebarPlugin for AgentsPlugin {
             let y = layout.row_of(i);
             let selected = top + i == self.nav.selected();
             let current = self.current.as_ref() == Some(&row.key());
+            let tab_name = self.tab_name(row);
             if layout.flat {
                 let (fg, sel_bg, bold) = nav::flat_row_colors(theme, focused, selected, &bg);
                 let band = if selected {
@@ -495,44 +506,53 @@ impl SidebarPlugin for AgentsPlugin {
                 } else {
                     None
                 };
-                let tab_name = self.tab_name(row);
-                Self::paint_flat_row(
+                Self::paint_row(
                     &mut grid,
                     y,
                     cols,
+                    layout.pad(),
                     row,
                     tab_name,
                     band.as_ref(),
                     fg,
+                    theme.sidebar_dim_fg.clone(),
                     bold,
                     &bg,
                     theme,
                 );
                 continue;
             }
-            let (fg, mut row_bg) = nav::row_colors(theme, focused, selected, &bg);
+            let (fg, row_bg) = nav::row_colors(theme, focused, selected, &bg);
             // The selection bar wins on a row that is both, because the j/k
             // cursor must never be hidden. The current-pane bar is drawn even
             // while this panel has focus: seeing where you are while scrolling
             // the list is the reason it exists.
-            if current && !selected {
-                row_bg = theme.sidebar_current_bg.clone();
-            }
-            if selected || current {
-                nav::fill_row(&mut grid, y, cols, &fg, &row_bg);
-            }
-            // The marker keeps its STATE colour even on the selected row: the
-            // colour is the whole point of the panel, and a selection that
-            // swallowed it would hide the one thing the user came to see.
-            draw_text(
+            let band = if selected {
+                Some(row_bg)
+            } else if current {
+                Some(theme.sidebar_current_bg.clone())
+            } else {
+                None
+            };
+            let dim_fg = if selected {
+                fg.clone()
+            } else {
+                theme.sidebar_dim_fg.clone()
+            };
+            Self::paint_row(
                 &mut grid,
-                0,
                 y,
-                "\u{25CF}",
-                state_fg(row.entry.state, theme),
-                row_bg.clone(),
+                cols,
+                0,
+                row,
+                tab_name,
+                band.as_ref(),
+                fg,
+                dim_fg,
+                selected,
+                &bg,
+                theme,
             );
-            draw_text(&mut grid, 2, y, &row.label(), fg, row_bg);
         }
 
         // Directly under the last row when the list is short, and at the bottom
@@ -725,9 +745,9 @@ mod tests {
         PluginEvent::FocusedPane { conn, pane_id }
     }
 
-    /// The panel-row index painted edge to edge in `sidebar_current_bg`, and
-    /// how many rows are. At most one row may ever be marked, and a count is
-    /// the only way to see a second one.
+    /// The first panel row painted edge to edge in `sidebar_current_bg`, and
+    /// how many ITEMS are (two panel rows each). At most one item may ever be
+    /// marked, and a count is the only way to see a second one.
     fn current_bar(
         p: &AgentsPlugin,
         cols: u16,
@@ -742,7 +762,7 @@ mod tests {
             .filter(|(_, r)| r.iter().all(|c| c.bg == theme.sidebar_current_bg))
             .map(|(y, _)| y)
             .collect();
-        (marked.first().copied(), marked.len())
+        (marked.first().copied(), marked.len() / 2)
     }
 
     fn unsupported(conn: ConnId) -> PluginEvent {
@@ -795,9 +815,11 @@ mod tests {
                 agent(2, "codex", "play", AgentState::Idle),
             ],
         ));
-        let rows = painted(&p, 24, 5);
-        assert!(rows[1].contains("claude work/0"), "got {:?}", rows[1]);
-        assert!(rows[2].contains("codex play/0"), "got {:?}", rows[2]);
+        let rows = painted(&p, 24, 6);
+        assert_eq!(rows[1], "\u{25CF} work \u{b7} 0");
+        assert_eq!(rows[2], "  claude");
+        assert_eq!(rows[3], "\u{25CB} play \u{b7} 0");
+        assert_eq!(rows[4], "  codex");
     }
 
     #[test]
@@ -807,7 +829,9 @@ mod tests {
             remote("pi"),
             vec![agent(1, "claude", "main", AgentState::Idle)],
         ));
-        assert!(painted(&p, 24, 4)[1].contains("pi:main/0"));
+        let rows = painted(&p, 24, 4);
+        assert_eq!(rows[1], "\u{25CB} main \u{b7} 0");
+        assert_eq!(rows[2], "  claude \u{b7} pi");
     }
 
     #[test]
@@ -871,9 +895,11 @@ mod tests {
             ConnId::Local,
             vec![agent(1, "claude", "here", AgentState::Idle)],
         ));
-        let rows = painted(&p, 24, 5);
-        assert!(rows[1].contains("claude here/0"), "got {:?}", rows[1]);
-        assert!(rows[2].contains("codex pi:far/0"), "got {:?}", rows[2]);
+        let rows = painted(&p, 24, 6);
+        assert!(rows[1].contains("here"), "got {:?}", rows[1]);
+        assert!(rows[2].contains("claude"), "got {:?}", rows[2]);
+        assert!(rows[3].contains("far"), "got {:?}", rows[3]);
+        assert!(rows[4].contains("codex \u{b7} pi"), "got {:?}", rows[4]);
     }
 
     #[test]
@@ -967,9 +993,9 @@ mod tests {
             vec![agent(1, "codex", "far", AgentState::Idle)],
         ));
         p.on_event(&PluginEvent::ConnectionLost { conn: remote("pi") });
-        let rows = painted(&p, 24, 5);
-        assert!(rows[1].contains("claude here/0"));
-        assert_eq!(rows[2], "", "the remote's row is gone");
+        let rows = painted(&p, 24, 6);
+        assert!(rows[1].contains("here"));
+        assert_eq!(rows[3], "", "the remote's row is gone");
     }
 
     #[test]
@@ -983,10 +1009,11 @@ mod tests {
             ],
         ));
         // A render is what tells the panel which window a click lands in.
-        let _ = painted(&p, 24, 5);
+        let _ = painted(&p, 24, 6);
         let down = MouseEventKind::Down(MouseButton::Left);
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
-        assert!(matches!(p.on_mouse(0, 2, down), PluginAction::JumpTo(_)));
+        // The second agent's row is two lines; its second line counts too.
+        assert_eq!(p.on_mouse(0, 4, down), PluginAction::Redraw);
+        assert!(matches!(p.on_mouse(0, 3, down), PluginAction::JumpTo(_)));
         // The header is not a row.
         assert_eq!(p.on_mouse(0, 0, down), PluginAction::None);
     }
@@ -1012,8 +1039,8 @@ mod tests {
         ));
         p.on_event(&unsupported(remote("mac")));
         let rows = painted(&p, 24, 6);
-        assert!(rows[1].contains("claude here/0"), "got {:?}", rows[1]);
-        assert_eq!(rows[2], "mac: no detection", "got {:?}", rows[2]);
+        assert!(rows[1].contains("here"), "got {:?}", rows[1]);
+        assert_eq!(rows[3], "mac: no detection", "got {:?}", rows[3]);
     }
 
     /// The note is an explanation, not a destination.
@@ -1039,7 +1066,7 @@ mod tests {
         );
         // And a click on the note's row selects nothing.
         let down = MouseEventKind::Down(MouseButton::Left);
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::None);
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::None);
     }
 
     /// The note must survive a panel with NO slack. The three tests above all
@@ -1055,15 +1082,16 @@ mod tests {
                 .collect(),
         ));
         p.on_event(&unsupported(ConnId::Local));
-        // Header + 2 rows + the note: the list alone would fill this and more.
+        // Header + one two-line row + the note: the list alone would fill this
+        // and more.
         let rows = painted(&p, 24, 4);
         assert_eq!(
             rows[3], "local: no detection",
             "a full list must not push the explanation off the panel, got {rows:?}"
         );
         assert!(
-            rows[1].contains("claude"),
-            "and the rows still paint: {rows:?}"
+            rows[1].contains("s1") && rows[2].contains("claude"),
+            "and the row still paints: {rows:?}"
         );
     }
 
@@ -1079,12 +1107,12 @@ mod tests {
                 .collect(),
         ));
         p.on_event(&unsupported(ConnId::Local));
-        let _ = painted(&p, 24, 4);
+        let _ = painted(&p, 24, 6);
         let down = MouseEventKind::Down(MouseButton::Left);
-        // Rows are painted at y=1..2; the note is at y=3.
-        assert_eq!(p.on_mouse(0, 2, down), PluginAction::Redraw);
+        // Two rows are painted at y=1..4; the note is at y=5.
+        assert_eq!(p.on_mouse(0, 3, down), PluginAction::Redraw);
         assert_eq!(
-            p.on_mouse(0, 3, down),
+            p.on_mouse(0, 5, down),
             PluginAction::None,
             "the note is not a row, however many rows exist below the fold"
         );
@@ -1103,15 +1131,15 @@ mod tests {
         for host in ["mac1", "mac2", "mac3"] {
             p.on_event(&unsupported(remote(host)));
         }
-        // Four blocked agents and three unsupported remotes in a four-row panel.
-        let rows = painted(&p, 24, 4);
-        let agents_shown = rows[1..].iter().filter(|r| r.contains("claude")).count();
+        // Four blocked agents and three unsupported remotes in a six-row panel.
+        let rows = painted(&p, 24, 6);
+        let agents_shown = rows[1..].iter().filter(|r| r.contains(" \u{b7} 0")).count();
         assert!(
             agents_shown >= 2,
             "the notes took the panel from the agents: {rows:?}"
         );
         assert_eq!(
-            rows[3], "3 servers: no detection",
+            rows[5], "3 servers: no detection",
             "and the three collapse to one line rather than being truncated: {rows:?}"
         );
     }
@@ -1159,9 +1187,9 @@ mod tests {
         ));
         p.on_event(&focus(ConnId::Local, Some(2)));
         assert_eq!(
-            current_bar(&p, 24, 5, false),
-            (Some(2), 1),
-            "pane 2 is the second agent row, at panel row 2, and it is the only mark"
+            current_bar(&p, 24, 8, false),
+            (Some(3), 1),
+            "pane 2 is the second agent, at panel rows 3 and 4, and it is the only mark"
         );
     }
 
@@ -1177,9 +1205,11 @@ mod tests {
         ));
         p.on_event(&focus(ConnId::Local, Some(2)));
         let theme = CompositorTheme::default();
-        let grid = p.render(24, 4, false, &theme);
-        for (x, cell) in grid[2].iter().enumerate() {
-            assert_eq!(cell.bg, theme.sidebar_current_bg, "column {x}");
+        let grid = p.render(24, 6, false, &theme);
+        for line in [3, 4] {
+            for (x, cell) in grid[line].iter().enumerate() {
+                assert_eq!(cell.bg, theme.sidebar_current_bg, "row {line} column {x}");
+            }
         }
     }
 
@@ -1195,11 +1225,11 @@ mod tests {
             ],
         ));
         p.on_event(&focus(ConnId::Local, Some(2)));
-        assert_eq!(current_bar(&p, 24, 5, false).0, Some(2));
+        assert_eq!(current_bar(&p, 24, 8, false).0, Some(3));
         p.on_event(&focus(ConnId::Local, Some(3)));
         assert_eq!(
-            current_bar(&p, 24, 5, false),
-            (Some(3), 1),
+            current_bar(&p, 24, 8, false),
+            (Some(5), 1),
             "the old mark must go, not accumulate"
         );
     }
@@ -1270,8 +1300,8 @@ mod tests {
             ],
         ));
         p.on_event(&focus(ConnId::Local, Some(2)));
-        assert_eq!(current_bar(&p, 24, 5, false), (Some(2), 1), "unfocused");
-        assert_eq!(current_bar(&p, 24, 5, true), (Some(2), 1), "focused");
+        assert_eq!(current_bar(&p, 24, 5, false), (Some(3), 1), "unfocused");
+        assert_eq!(current_bar(&p, 24, 5, true), (Some(3), 1), "focused");
     }
 
     /// Scrolling onto the current row hides its bar under the selection, and
@@ -1289,23 +1319,27 @@ mod tests {
         p.on_event(&focus(ConnId::Local, Some(2)));
         let theme = CompositorTheme::default();
         p.on_key(key(KeyCode::Char('j')));
-        let grid = p.render(24, 4, true, &theme);
-        for (x, cell) in grid[2].iter().enumerate() {
-            assert_eq!(
-                cell.bg, theme.tab_active_bg,
-                "focused selection, column {x}"
-            );
+        let grid = p.render(24, 5, true, &theme);
+        for line in [3, 4] {
+            for (x, cell) in grid[line].iter().enumerate() {
+                assert_eq!(
+                    cell.bg, theme.tab_active_bg,
+                    "focused selection, row {line} column {x}"
+                );
+            }
         }
-        let grid = p.render(24, 4, false, &theme);
-        for (x, cell) in grid[2].iter().enumerate() {
-            assert_eq!(
-                cell.bg, theme.tab_inactive_bg,
-                "unfocused selection, column {x}"
-            );
+        let grid = p.render(24, 5, false, &theme);
+        for line in [3, 4] {
+            for (x, cell) in grid[line].iter().enumerate() {
+                assert_eq!(
+                    cell.bg, theme.tab_inactive_bg,
+                    "unfocused selection, row {line} column {x}"
+                );
+            }
         }
-        assert_eq!(current_bar(&p, 24, 4, true).1, 0);
+        assert_eq!(current_bar(&p, 24, 5, true).1, 0);
         p.on_key(key(KeyCode::Char('k')));
-        assert_eq!(current_bar(&p, 24, 4, true), (Some(2), 1));
+        assert_eq!(current_bar(&p, 24, 5, true), (Some(3), 1));
     }
 
     #[test]
@@ -1318,13 +1352,13 @@ mod tests {
                 agent(2, "claude", "work", AgentState::Idle),
             ],
         ));
-        let unmarked = painted(&p, 24, 4)[2].clone();
+        let unmarked = painted(&p, 24, 5)[3].clone();
         p.on_event(&focus(ConnId::Local, Some(2)));
-        assert_eq!(current_bar(&p, 24, 4, true).0, Some(2));
-        let marked = painted(&p, 24, 4)[2].clone();
+        assert_eq!(current_bar(&p, 24, 5, true).0, Some(3));
+        let marked = painted(&p, 24, 5)[3].clone();
         assert_eq!(marked, unmarked, "the bar changes colour, never text");
         assert!(
-            marked.starts_with("\u{25CF} claude work/0"),
+            marked.starts_with("\u{25CB} work \u{b7} 0"),
             "marker at column 0, label at column 2, got {marked:?}"
         );
     }
@@ -1345,7 +1379,7 @@ mod tests {
                 agent(2, "claude", "b", AgentState::Idle),
             ],
         ));
-        assert_eq!(current_bar(&p, 24, 5, false), (Some(2), 1));
+        assert_eq!(current_bar(&p, 24, 5, false), (Some(3), 1));
     }
 
     /// The panel's standing doctrine: the state colour is the whole point, and
@@ -1362,9 +1396,9 @@ mod tests {
         ));
         p.on_event(&focus(ConnId::Local, Some(2)));
         let theme = CompositorTheme::default();
-        let grid = p.render(20, 4, false, &theme);
-        assert_eq!(grid[2][0].fg, theme.tab_bell_fg);
-        assert_eq!(grid[2][0].bg, theme.sidebar_current_bg);
+        let grid = p.render(20, 5, false, &theme);
+        assert_eq!(grid[3][0].fg, theme.tab_bell_fg);
+        assert_eq!(grid[3][0].bg, theme.sidebar_current_bg);
     }
 
     #[test]
@@ -1404,17 +1438,17 @@ mod tests {
             vec![agent(1, "claude", "far", AgentState::Idle)],
         ));
         // Two machines, both with a pane 1. The mark is on the REMOTE's. The
-        // local pane 1 sits on row 2, off the selection, so a mark that landed
+        // local pane 1 sits at row 3, off the selection, so a mark that landed
         // on it would be visible.
         p.on_event(&focus(remote("pi"), Some(1)));
         assert_eq!(
-            current_bar(&p, 24, 6, false),
-            (Some(3), 1),
-            "row 3 is the remote's pane 1, not the local one at row 2"
+            current_bar(&p, 24, 8, false),
+            (Some(5), 1),
+            "row 5 is the remote's pane 1, not the local one at row 3"
         );
         p.on_event(&PluginEvent::ConnectionLost { conn: remote("pi") });
         assert_eq!(
-            current_bar(&p, 24, 6, false).1,
+            current_bar(&p, 24, 8, false).1,
             0,
             "the local pane 1 is still listed; a mark keyed on the id alone would land on it"
         );
@@ -1436,7 +1470,7 @@ mod tests {
         ));
         p.on_event(&focus(ConnId::Local, Some(1)));
         p.on_event(&PluginEvent::ConnectionLost { conn: remote("pi") });
-        assert_eq!(current_bar(&p, 24, 6, false), (Some(2), 1));
+        assert_eq!(current_bar(&p, 24, 8, false), (Some(3), 1));
     }
 
     /// The foreground moving to another machine replaces the mark rather than
@@ -1456,11 +1490,11 @@ mod tests {
             vec![agent(1, "claude", "far", AgentState::Idle)],
         ));
         p.on_event(&focus(ConnId::Local, Some(1)));
-        assert_eq!(current_bar(&p, 24, 6, false), (Some(2), 1));
+        assert_eq!(current_bar(&p, 24, 8, false), (Some(3), 1));
         p.on_event(&focus(remote("pi"), Some(1)));
         assert_eq!(
-            current_bar(&p, 24, 6, false),
-            (Some(3), 1),
+            current_bar(&p, 24, 8, false),
+            (Some(5), 1),
             "the previous machine's mark must not survive alongside the new one"
         );
     }
@@ -1485,8 +1519,8 @@ mod tests {
             .collect();
         p.on_event(&push(ConnId::Local, many));
         p.on_key(key(KeyCode::Char('G')));
-        // 4 rows tall: header + 3 list rows, showing s8, s9, s10.
-        let rows = painted(&p, 24, 4);
+        // 6 rows tall: header + two two-line items, showing s9 and s10.
+        let rows = painted(&p, 24, 6);
         assert!(
             rows[3].contains("s10"),
             "the selection must be on screen, got {rows:?}"
@@ -1662,14 +1696,15 @@ mod tests {
     }
 
     #[test]
-    fn the_default_style_renders_as_it_always_did() {
+    fn the_default_style_has_two_line_rows_and_no_padding() {
         let mut p = AgentsPlugin::new();
         p.on_event(&push(
             ConnId::Local,
             vec![agent(1, "claude", "main", AgentState::Idle)],
         ));
         let out = painted(&p, 24, 4);
-        assert_eq!(out[1], "\u{25CF} claude main/0");
+        assert_eq!(out[1], "\u{25CB} main \u{b7} 0");
+        assert_eq!(out[2], "  claude");
     }
 
     fn tree_with_tab(conn: ConnId, session: &str, tab: &str) -> PluginEvent {
@@ -1719,13 +1754,13 @@ mod tests {
     }
 
     #[test]
-    fn the_boxed_label_ignores_the_tree() {
+    fn a_boxed_row_names_the_tab_from_the_session_tree() {
         let mut p = AgentsPlugin::new();
         p.on_event(&push(
             ConnId::Local,
             vec![agent(1, "claude", "s1", AgentState::Idle)],
         ));
         p.on_event(&tree_with_tab(ConnId::Local, "s1", "editor"));
-        assert_eq!(painted(&p, 24, 4)[1], "\u{25CF} claude s1/0");
+        assert_eq!(painted(&p, 24, 4)[1], "\u{25CB} s1 \u{b7} editor");
     }
 }

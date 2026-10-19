@@ -52,12 +52,14 @@ pub const HEADER_ROWS: usize = 1;
 
 /// Where a list's rows start and how tall each one is.
 ///
-/// Boxed sidebars have a one-row header and one-line rows, which is what every
-/// function below assumed before flat existed; [`ListLayout::BOXED`] is that and
-/// the plain functions delegate to it. A flat sidebar has a header row plus a
-/// blank row, one column of left padding, and (for the agents panel) rows two
-/// lines tall. The selection, the scroll offset and every count in the
-/// `NavList` are in ITEMS, never in screen rows.
+/// Row height belongs to the panel (the agents panel's rows are two lines in
+/// every style); the header and the padding belong to the style. A boxed
+/// sidebar has a one-row header and no padding, which is what every function
+/// below assumed before flat existed; [`ListLayout::BOXED`] is that with
+/// one-line rows, and the plain functions delegate to it. A flat sidebar has a
+/// header row plus a blank row and one column of left padding. The selection,
+/// the scroll offset and every count in the `NavList` are in ITEMS, never in
+/// screen rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListLayout {
     pub header_rows: usize,
@@ -74,7 +76,10 @@ impl ListLayout {
 
     pub fn for_style(style: SidebarStyle, row_height: usize) -> Self {
         match style {
-            SidebarStyle::Boxed => Self::BOXED,
+            SidebarStyle::Boxed => Self {
+                row_height: row_height.max(1),
+                ..Self::BOXED
+            },
             SidebarStyle::Flat => Self {
                 header_rows: FLAT_HEADER_ROWS,
                 row_height: row_height.max(1),

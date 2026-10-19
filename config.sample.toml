@@ -713,8 +713,7 @@
 #             divider column (row, for "bottom") against the panes, a lowercase
 #             section header and one column of padding in every panel, a
 #             horizontal rule between stacked panels, and a full-width band
-#             behind the selected row. The agents panel then shows two-line
-#             rows (state dot and name, then the agent). The divider takes one
+#             behind the selected row. The divider takes one
 #             column of `size`. Colours: `sidebar_divider_fg`,
 #             `sidebar_selection_bg`, `sidebar_dim_fg` and
 #             `sidebar_name_selected_fg` in the theme. An unknown value is a
@@ -794,8 +793,10 @@
 #   agents      — the panes running an AI coding agent (`claude`, `codex`, ...),
 #                 on the local server and every connected remote, each with a
 #                 colour-coded state: RED needs your input, YELLOW is working,
-#                 dim is idle. `j`/`k`/`g`/`G` move and Enter jumps to that
-#                 pane, wherever it is. Configure WHICH commands count as an
+#                 dim is idle. Each agent takes two lines: the state dot and
+#                 `session · tab`, then the agent (and the host, for a
+#                 remote). `j`/`k`/`g`/`G` move by agent and Enter jumps to
+#                 that pane, wherever it is. Configure WHICH commands count as an
 #                 agent, and what a blocked one looks like, under `[agents]`
 #                 below — the defaults cover `claude`, `codex`, `omp` and
 #                 `opencode` with no setup.
