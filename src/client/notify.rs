@@ -334,7 +334,7 @@ impl AgentNotifier {
             kind,
             conn: conn.clone(),
             pane_id: pane,
-            title: format!("{} {}", row.label(), kind.verb()),
+            title: format!("{} {}", fit(&row.label(), kind.verb()), kind.verb()),
             body: format!("{host}{} · tab {}", entry.session, entry.tab_index + 1),
         })
     }
@@ -410,6 +410,14 @@ pub fn notifier_argv(
         Platform::Other => return None,
     };
     Some(argv.iter().map(|a| a.to_string()).collect())
+}
+
+/// `label` sanitised and cut short enough that `"{label} {verb}"` is within
+/// [`MAX_TEXT_CHARS`], so that a long name never pushes the event out of the
+/// title.
+fn fit(label: &str, verb: &str) -> String {
+    let room = MAX_TEXT_CHARS.saturating_sub(verb.chars().count() + 1);
+    sanitize(label).chars().take(room).collect()
 }
 
 /// `text` without control or invisible format characters, cut to
@@ -583,7 +591,12 @@ pub fn deliver(n: &Notification, config: &NotificationsConfig) {
     let spawned = std::thread::Builder::new()
         .name("remux-notify".to_string())
         .spawn(move || {
-            if !claim(&marker_dir(), &marker, SystemTime::now(), std::process::id()) {
+            if !claim(
+                &marker_dir(),
+                &marker,
+                SystemTime::now(),
+                std::process::id(),
+            ) {
                 log::debug!("notify: another client already sent {marker}");
                 return;
             }
@@ -977,6 +990,21 @@ mod tests {
         n.set_pane_title(Some("{host}{command}@{session}".to_string()));
         let fired = n.observe(&ConnId::Local, &[agent(1, AgentState::NeedsInput)], t0);
         assert_eq!(fired[0].title, "claude@main needs input");
+    }
+
+    #[test]
+    fn a_name_too_long_to_show_keeps_its_event() {
+        let t0 = Instant::now();
+        let mut n = baselined(&ConnId::Local, &[agent(1, AgentState::Working)], t0);
+        let mut entry = agent(1, AgentState::NeedsInput);
+        entry.custom_name = Some("n".repeat(500));
+        let fired = n.observe(&ConnId::Local, &[entry], t0);
+        assert!(
+            fired[0].title.ends_with("n needs input"),
+            "{}",
+            fired[0].title
+        );
+        assert_eq!(fired[0].title.chars().count(), MAX_TEXT_CHARS);
     }
 
     #[test]
