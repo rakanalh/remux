@@ -284,6 +284,11 @@ def pane_frame_column(screen, start=0):
     return screen.display[0].find("\u256d", start)
 
 
+# The placeholder draws the shared header and a blank row, then its marker, so
+# the marker is on the third interior row.
+MARKER_ROW = FRAME + 2
+
+
 # Left sidebar column band, and the rows the placeholder's markers live on.
 def markers(screen, x0=0, x1=SIDEBAR_W):
     """(row_index, "focused"/"idle") for every panel marker on screen."""
@@ -320,7 +325,7 @@ def test_alt_h_enters_the_left_sidebar_and_alt_l_returns():
     child, screen, pump = spawn(env)
     pump(1.5)
 
-    assert markers(screen) == [(FRAME + 1, "idle")], (
+    assert markers(screen) == [(MARKER_ROW, "idle")], (
         f"the panel did not start unfocused: {markers(screen)}"
     )
     child.send(ALT_H)
@@ -412,7 +417,7 @@ def test_alt_j_and_alt_k_walk_stacked_panels():
     child.send(ALT_H)
     pump(1.0)
     first = focused_rows(screen)
-    assert first == [FRAME + 1], f"Alt+h did not focus the top panel: {markers(screen)}"
+    assert first == [MARKER_ROW], f"Alt+h did not focus the top panel: {markers(screen)}"
 
     child.send(ALT_J)
     pump(1.0)

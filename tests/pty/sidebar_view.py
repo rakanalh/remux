@@ -204,7 +204,7 @@ def stty_reading(t):
     t.send("stty size\r", 1.8)
     found = None
     for row in t.rows_text():
-        body = row[SIDEBAR_W:] if row[:SIDEBAR_W].strip() in ("", "Placeholder") else row
+        body = row[SIDEBAR_W:] if row[:SIDEBAR_W].strip() in ("", "placeholder") else row
         for tok in body.split("│"):
             tok = tok.strip()
             parts = tok.split()
@@ -280,7 +280,7 @@ def test_view_paints_inside_the_content_rect():
         )
 
     # And the panel is still there -- the whole point is that it survived.
-    if not t.has("Placeholder"):
+    if not t.has("placeholder"):
         fails.append("the panel stopped rendering once the view took the screen")
     if panel_marker(t) is None:
         fails.append("the panel's body row is gone")
@@ -464,7 +464,7 @@ def test_entering_a_view_releases_sidebar_focus():
     t.prefix(b"wq", 2.0)
     if t.has("View 1"):
         fails.append("`Prefix w q` did not leave the view")
-    if not t.has("Placeholder"):
+    if not t.has("placeholder"):
         fails.append("the panel is gone after leaving the view")
     marker = panel_marker(t)
     if marker is None:
@@ -496,7 +496,7 @@ def toggle_in_a_view(name, rundir, config, left_edge):
         fails.append(f"cell pane size before the toggle {before!r}, expected {CELL_STTY!r}")
 
     t.send(b"\x1b1", 1.5)  # Alt-1 = SidebarToggleLeft
-    if t.has("Placeholder"):
+    if t.has("placeholder"):
         fails.append("the sidebar is still painted after the toggle")
     box = leftmost_box_column(t)
     if box != left_edge:
@@ -521,7 +521,7 @@ def toggle_in_a_view(name, rundir, config, left_edge):
 
     # ...and back.
     t.send(b"\x1b1", 1.5)
-    if not t.has("Placeholder"):
+    if not t.has("placeholder"):
         fails.append("the sidebar did not come back on the second toggle")
     if leftmost_box_column(t, SIDEBAR_W) != SIDEBAR_W:
         fails.append(

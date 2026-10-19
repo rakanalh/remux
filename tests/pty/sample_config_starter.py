@@ -167,7 +167,7 @@ def run(mode):
         )
 
         if mode == "placeholder":
-            assert t.has("Placeholder"), (
+            assert t.has("placeholder"), (
                 "the placeholder panel never painted\n" + "\n".join(rows)
             )
 
