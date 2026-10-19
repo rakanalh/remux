@@ -211,6 +211,18 @@ The built-in patterns:
 
 In TOML, double the backslashes inside a basic string (`"allow once\\s+allow always"`) or use a literal string (`'allow once\s+allow always'`).
 
+## `[notifications]`
+
+Desktop notifications for agents on every connected server. Client-side, applies on save. See [Agents](/remux/agents/#desktop-notifications).
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Send desktop notifications at all. |
+| `needs_input` | boolean | `true` | Notify when an agent starts waiting on an approval, question or permission prompt. |
+| `finished` | boolean | `true` | Notify when an agent stops working: 3 s of quiet after at least 3 s of work. |
+| `exited` | boolean | `true` | Notify when an agent leaves its pane. |
+| `command` | array of strings | unset | Run this instead of `osascript` (macOS) or `notify-send` (Linux). An argument that is exactly `{title}` or `{body}` is replaced by that text. No shell is used. |
+
 ## Related
 
 - [Configuration](/remux/configuration/): file location and reload behaviour

@@ -498,6 +498,7 @@ mod tests {
             title: None,
             custom_name: None,
             cwd: None,
+            focused: false,
         }
     }
 

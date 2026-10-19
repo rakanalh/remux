@@ -33,6 +33,27 @@ def _protocol_version():
 PROTOCOL_VERSION = _protocol_version()
 
 
+def install_notify_shims(bindir):
+    """Put stand-in `osascript` and `notify-send` in `bindir`, and return the
+    log they append their arguments to.
+
+    The client sends a desktop notification whenever an agent in a pane needs
+    input, finishes or exits, and notifications are on by default, so a test
+    that runs a stand-in agent would otherwise pop real notifications on the
+    machine running the suite. The client runs the notifier itself, with the
+    client's own `PATH`, so `bindir` must be first on the CLIENT's `PATH`. A
+    pane's login shell reordering its own `PATH` does not matter here.
+    """
+    os.makedirs(bindir, exist_ok=True)
+    log = os.path.join(bindir, "notifications.log")
+    for name in ("osascript", "notify-send"):
+        path = os.path.join(bindir, name)
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s\\n' \"{name} $*\" >> \"{log}\"\n")
+        os.chmod(path, 0o755)
+    return log
+
+
 class Tui:
     def __init__(self, rundir, cols=120, rows=40, config=None, extra_env=None):
         self.rundir = rundir
@@ -62,6 +83,8 @@ class Tui:
         shutil.rmtree(self.rundir, ignore_errors=True)
         for s in ("run", "state", "data", "config"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
+        shims = f"{self.rundir}/notify-bin"
+        self.notify_log = install_notify_shims(shims)
         if self.config is not None:
             os.makedirs(f"{self.rundir}/config/remux", exist_ok=True)
             with open(f"{self.rundir}/config/remux/config.toml", "w") as f:
@@ -81,6 +104,9 @@ class Tui:
             "XDG_DATA_HOME": f"{self.rundir}/data",
             "XDG_CONFIG_HOME": f"{self.rundir}/config",
         }
+        # Prepended AFTER `extra_env` for the same reason: no caller's `PATH`
+        # can put a real notifier ahead of the stand-ins.
+        env["PATH"] = f"{shims}:" + env.get("PATH", "")
         self.env = env
         self.screen = pyte.Screen(self.cols, self.rows)
         self.stream = pyte.ByteStream(self.screen)

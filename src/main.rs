@@ -1269,6 +1269,22 @@ fn focused_pane<'a>(
         .and_then(active_tab_focused_pane)
 }
 
+/// `focus`, the pane the foreground server's session tree last named, if it
+/// still says where the user is.
+///
+/// It is only refreshed by a tree push from the foreground server, so it goes
+/// stale in three ways: the tree is unsubscribed, the connection drops (the
+/// reconcile then forgets it, so both read as "not in `subscribed`"), or another
+/// server comes to the foreground. A stale focus would suppress notifications
+/// for a pane the user is no longer looking at.
+fn current_tree_focus(
+    focus: Option<(ConnId, crate::protocol::PaneId)>,
+    subscribed: &std::collections::HashSet<ConnId>,
+    is_foreground: impl Fn(&ConnId) -> bool,
+) -> Option<(ConnId, crate::protocol::PaneId)> {
+    focus.filter(|(conn, _)| subscribed.contains(conn) && is_foreground(conn))
+}
+
 /// A session's active tab's focused pane. `None` when no tab is marked active
 /// (an older peer) or the active tab marks no focused pane.
 fn active_tab_focused_pane(
@@ -3045,6 +3061,14 @@ async fn run_client_loop(
     // with the list already on screen when a panel keeps it subscribed.
     let mut agent_roster = crate::client::sidebar::agents::AgentRoster::new();
     agent_roster.set_pane_title(pane_title.clone());
+    // Desktop notifications, fed by the same agent lists. While enabled they
+    // keep the push subscribed on every connection, panel or no panel.
+    let mut notifier =
+        crate::client::notify::AgentNotifier::new(config.notifications.clone(), pane_title.clone());
+    // The pane the foreground server's session tree last named as focused.
+    // Only updated while something subscribes to the tree, and dropped by
+    // `current_tree_focus` once it no longer describes the screen.
+    let mut tree_focus: Option<(ConnId, crate::protocol::PaneId)> = None;
 
     loop {
         // Lay the panels out and act on what they ask for, before anything can
@@ -3065,9 +3089,11 @@ async fn run_client_loop(
             "the session tree",
         )
         .await;
-        // The agents panel and an open agent switcher each need the push; the
-        // server keeps ONE flag per client, so the client decides for both.
-        let agent_push_wanted = wants_agents || input.agent_switch.is_some();
+        // The agents panel, an open agent switcher and desktop notifications
+        // each need the push; the server keeps ONE flag per client, so the
+        // client decides for all three.
+        let agent_push_wanted =
+            wants_agents || input.agent_switch.is_some() || notifier.config().enabled;
         reconcile_push_subscription(
             agent_push_wanted,
             &mut agents_subscribed,
@@ -3077,9 +3103,10 @@ async fn run_client_loop(
         )
         .await;
         if !agent_push_wanted && !agents_subscribed.is_empty() {
-            // The switcher closed and no panel wants the list. Unsubscribing
-            // here, never at the close itself, is what keeps a panel's
-            // subscription alive: this runs only when neither wants it.
+            // The switcher closed, and neither a panel nor notifications want
+            // the list. Unsubscribing here, never at the close itself, is what
+            // keeps the others' subscription alive: this runs only when none of
+            // them wants it.
             for id in &agents_subscribed {
                 log::debug!("agents: unsubscribing from the agent list on {id:?}");
                 if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
@@ -3091,6 +3118,26 @@ async fn run_client_loop(
         // The held lists are only current while subscribed, so a connection
         // that is not must not seed the next switcher with a stale list.
         agent_roster.retain(|id| agents_subscribed.contains(id));
+        // A connection that stopped pushing is forgotten without an `exited`
+        // for each of its agents, and its next list is a fresh baseline.
+        notifier.retain(|id| agents_subscribed.contains(id));
+        tree_focus = current_tree_focus(tree_focus, &tree_subscribed, |id| mgr.is_foreground(id));
+        // In a view the focused cell is what the user is looking at, and it is
+        // not the focused pane of any session, so the server's flag cannot
+        // know about it.
+        notifier.set_local_focus(match active_view {
+            Some(av) => views
+                .get(av)
+                .and_then(|v| v.cells.get(v.focused))
+                .map(|c| (c.conn.clone(), c.pane_id)),
+            None => tree_focus.clone(),
+        });
+        for n in notifier.tick(std::time::Instant::now()) {
+            crate::client::notify::deliver(&n, notifier.config());
+        }
+        let notify_wait = notifier
+            .next_deadline()
+            .map(|due| due.saturating_duration_since(std::time::Instant::now()));
         // How long until some VISIBLE panel wants ticking, computed fresh each
         // pass. `None` -- no sidebar, none visible, or no panel that polls --
         // disables the timer branch below entirely, so a client with no such
@@ -3111,6 +3158,9 @@ async fn run_client_loop(
             // reach. Requests it produces are dispatched there, and their
             // answers repaint through the ordinary server-message arms.
             _ = tokio::time::sleep(panel_poll.unwrap_or_default()), if panel_poll.is_some() => {}
+            // A notification waiting out its settle window. The tick at the
+            // top of the loop fires it.
+            _ = tokio::time::sleep(notify_wait.unwrap_or_default()), if notify_wait.is_some() => {}
             // Keyboard events
             event = event_stream.next() => {
                 match event {
@@ -6777,6 +6827,9 @@ async fn run_client_loop(
                             src, agents.len(), detection_supported
                         );
                         agent_roster.apply(&src, &agents, detection_supported);
+                        for n in notifier.observe(&src, &agents, std::time::Instant::now()) {
+                            crate::client::notify::deliver(&n, notifier.config());
+                        }
                         let switcher_open = input.agent_switch.is_some();
                         if let Some(sw) = input.agent_switch.as_mut() {
                             sw.apply_agents(&src, &agents, detection_supported);
@@ -6931,6 +6984,7 @@ async fn run_client_loop(
                                 // its row, and they must be talking about the
                                 // same pane.
                                 let focused = focused_pane(&folders, &unfiled);
+                                tree_focus = focused.map(|p| (src.clone(), p.id));
                                 chrome.broadcast(
                                     &crate::client::sidebar::PluginEvent::FocusedCwd {
                                         conn: src.clone(),
@@ -7702,6 +7756,9 @@ async fn run_client_loop(
                     mgr.set_look(Look::from_config(&new_config));
                     mgr.announce_look().await;
                     agent_roster.set_pane_title(pane_title.clone());
+                    notifier.set_pane_title(pane_title.clone());
+                    let notify_before = notifier.config().enabled;
+                    notifier.set_config(new_config.notifications.clone());
 
                     // Reconcile the remotes roster (update in place / add new /
                     // drop idle config-removed remotes).
@@ -7810,7 +7867,10 @@ async fn run_client_loop(
                     // The same for the agents push, for the same reasons.
                     let wanted_agents_before = wants_agents;
                     wants_agents = chrome.wants_agents();
-                    if wanted_agents_before && !wants_agents {
+                    let switcher_open = input.agent_switch.is_some();
+                    let push_before = wanted_agents_before || switcher_open || notify_before;
+                    let push_after = wants_agents || switcher_open || notifier.config().enabled;
+                    if push_before && !push_after {
                         for id in &agents_subscribed {
                             log::debug!("sidebar: unsubscribing from the agent list on {id:?}");
                             if let Err(e) = mgr.send(id, ClientMessage::UnsubscribeAgents).await {
@@ -7888,6 +7948,50 @@ async fn run_client_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tree_focus {
+        use super::super::current_tree_focus;
+        use crate::client::registry::ConnId;
+        use std::collections::HashSet;
+
+        fn far() -> ConnId {
+            ConnId::Remote("far".to_string())
+        }
+
+        fn subscribed(ids: &[ConnId]) -> HashSet<ConnId> {
+            ids.iter().cloned().collect()
+        }
+
+        #[test]
+        fn a_focus_on_the_subscribed_foreground_server_is_kept() {
+            let kept = current_tree_focus(
+                Some((far(), 3)),
+                &subscribed(&[ConnId::Local, far()]),
+                |c| *c == far(),
+            );
+            assert_eq!(kept, Some((far(), 3)));
+        }
+
+        #[test]
+        fn a_focus_is_dropped_when_the_tree_is_no_longer_subscribed() {
+            // Covers a dropped connection too: the reconcile forgets every
+            // connection that is not live.
+            let kept = current_tree_focus(Some((far(), 3)), &subscribed(&[ConnId::Local]), |c| {
+                *c == far()
+            });
+            assert_eq!(kept, None);
+        }
+
+        #[test]
+        fn a_focus_is_dropped_when_another_server_comes_to_the_foreground() {
+            let kept = current_tree_focus(
+                Some((far(), 3)),
+                &subscribed(&[ConnId::Local, far()]),
+                |c| *c == ConnId::Local,
+            );
+            assert_eq!(kept, None);
+        }
+    }
 
     fn local(name: &str) -> (ConnId, String) {
         (ConnId::Local, name.to_string())

@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod keybindings;
+pub mod notifications;
 pub mod pane_title;
 pub mod sidebar;
 pub mod theme;
@@ -34,6 +35,9 @@ pub struct Config {
     /// which owns every tab's and view's layout.
     #[serde(default)]
     pub layouts: crate::server::layout::EnabledLayouts,
+    /// Desktop notifications for agents. Read by the CLIENT, which sends them.
+    #[serde(default)]
+    pub notifications: notifications::NotificationsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +326,7 @@ impl Default for Config {
             sidebar: Vec::new(),
             agents: agents::AgentsConfig::default(),
             layouts: crate::server::layout::EnabledLayouts::default(),
+            notifications: notifications::NotificationsConfig::default(),
         }
     }
 }

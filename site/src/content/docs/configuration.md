@@ -56,6 +56,7 @@ Remux is two processes. The **server** owns the sessions, panes and PTYs, and it
 - `[appearance.theme]` colours for what the client draws: the which-key popup, the session manager and other overlays, sidebars, View cells and their status bar, and search highlights
 - `[remotes.*]`
 - `[[sidebar]]`
+- `[notifications]`
 
 **The server reads the file once, at startup.** Run `remux restart` after changing any of these:
 

@@ -1015,6 +1015,17 @@ pub struct AgentEntry {
     /// client's `pane_title` template.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Whether some client attached to this server has the pane in front of it:
+    /// the input target of a session at least one client is attached to. A
+    /// client's desktop notifications skip such a pane, because a person is
+    /// already looking at it.
+    ///
+    /// Any client, not only the recipient, because a notification for an agent
+    /// the user is watching on another terminal is noise. No `PROTOCOL_VERSION`
+    /// bump: an older server omits the field, which decodes as `false`, and the
+    /// client then falls back to its own knowledge of where the user is.
+    #[serde(default)]
+    pub focused: bool,
 }
 
 /// What a client needs to name a pane with its own `[appearance] pane_title`
