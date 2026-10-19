@@ -115,6 +115,8 @@ struct Classified {
     is_config: bool,
     /// The link may have moved, appeared or started to resolve: look again.
     relink: bool,
+    /// It names the target itself, as opposed to the link path.
+    on_target: bool,
 }
 
 /// Classify the paths of one event against the link and its current target.
@@ -129,18 +131,30 @@ fn classify(event_paths: &[PathBuf], link: &Path, target: Option<&Target>) -> Cl
     let mut out = Classified {
         is_config: false,
         relink: false,
+        on_target: false,
     };
     for path in event_paths {
         let leaf = keep_leaf(path);
         let on_link = leaf == link_leaf;
         let on_target = target_leaf.as_deref() == Some(leaf.as_path());
         out.is_config |= on_link || on_target;
+        out.on_target |= on_target;
         out.relink |= on_link;
         if let (Some(t), Some(tl)) = (target, target_leaf.as_deref()) {
             out.relink |= t.dangling && tl.starts_with(&leaf);
         }
     }
     out
+}
+
+/// Whether the callback's own reload should stop the relink thread from
+/// reloading again for the same appearance of the target.
+///
+/// Only a reload that succeeded for an event on the TARGET while the link
+/// dangled counts: an event on the link path says nothing about the target
+/// existing, and a failed reload means the first version was not loaded.
+fn reload_covers_appearance(on_target: bool, dangling: bool, reload_ok: bool) -> bool {
+    on_target && dangling && reload_ok
 }
 
 /// The watcher and the directories it is watching.
@@ -241,12 +255,15 @@ fn watch_path<T: Send + 'static>(
 
     // Reloading and sending is shared by the event callback and the re-resolve
     // thread, which reloads when a dangling link starts to resolve.
-    let emit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || match reload() {
+    // It reports whether the reload succeeded.
+    let emit: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || match reload() {
         Ok(config) => {
             let _ = tx.send(config);
+            true
         }
         Err(e) => {
             log::warn!("failed to reload config: {}", e);
+            false
         }
     });
 
@@ -272,20 +289,22 @@ fn watch_path<T: Send + 'static>(
 
         let current = cb_target.lock().ok().and_then(|t| t.clone());
         let class = classify(&event.paths, &watched_path, current.as_ref());
-        if class.relink {
-            let _ = relink_tx.send(());
-        }
 
         // We care about Create and Modify events on the config file.
         let dominated = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
-        if !dominated || !class.is_config {
-            return;
+        if dominated && class.is_config {
+            let ok = cb_emit();
+            let dangling = current.as_ref().is_some_and(|t| t.dangling);
+            if reload_covers_appearance(class.on_target, dangling, ok) {
+                cb_flag.store(true, Ordering::SeqCst);
+            }
         }
 
-        if current.as_ref().is_some_and(|t| t.dangling) {
-            cb_flag.store(true, Ordering::SeqCst);
+        // After the flag above: the thread clears it while the link still
+        // dangles, and that must never run before this event's own decision.
+        if class.relink {
+            let _ = relink_tx.send(());
         }
-        cb_emit();
     })?;
 
     let mut watching = Watching {
@@ -696,5 +715,22 @@ mod tests {
         assert!(expect_quiet_reload(&mut rx).is_some());
         std::thread::sleep(Duration::from_millis(1500));
         assert!(rx.try_recv().is_err(), "the same appearance reloaded twice");
+    }
+
+    #[test]
+    fn only_a_successful_reload_for_the_target_covers_its_appearance() {
+        assert!(reload_covers_appearance(true, true, true));
+        assert!(
+            !reload_covers_appearance(false, true, true),
+            "an event on the link"
+        );
+        assert!(
+            !reload_covers_appearance(true, false, true),
+            "the link already resolved"
+        );
+        assert!(
+            !reload_covers_appearance(true, true, false),
+            "the reload failed"
+        );
     }
 }
