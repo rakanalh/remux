@@ -33,7 +33,7 @@ use crate::server::compositor::{
 };
 use crate::server::layout::Rect;
 
-use super::geometry::SidebarEdge;
+use super::geometry::{SidebarEdge, SidebarStyle};
 
 /// Draw a sidebar's frame into `grid`, a bar-sized grid indexed
 /// `[row][col]` in bar-local coordinates.
@@ -131,6 +131,61 @@ pub fn draw_flat_frame(
                 draw_divider_column(grid, r as usize, 1, h, fg, theme);
             }
         }
+    }
+}
+
+/// The colour of the glyphs and lines a collapsed or collapsible sidebar draws
+/// for itself: the dim token for a flat sidebar, the inactive frame colour for a
+/// boxed one.
+fn chrome_glyph_fg(style: SidebarStyle, theme: &CompositorTheme) -> crate::protocol::CellColor {
+    match style {
+        SidebarStyle::Flat => theme.sidebar_dim_fg.clone(),
+        SidebarStyle::Boxed => border_fg(theme, false),
+    }
+}
+
+/// Draw the collapse button's glyph at bar-local `(x, y)`.
+pub fn draw_button(
+    grid: &mut [Vec<RenderCell>],
+    x: u16,
+    y: u16,
+    glyph: char,
+    style: SidebarStyle,
+    theme: &CompositorTheme,
+) {
+    let fg = chrome_glyph_fg(style, theme);
+    put_cell(grid, y as usize, x as usize, border_cell(glyph, &fg, theme));
+}
+
+/// Draw a collapsed sidebar's strip into `grid`, which is the strip itself.
+///
+/// The line is the one the expanded sidebar drew against the panes (the flat
+/// divider, or the boxed frame colour). `glyph` is the bar-local cell and the
+/// character that invite expanding.
+pub fn draw_strip(
+    grid: &mut [Vec<RenderCell>],
+    edge: SidebarEdge,
+    style: SidebarStyle,
+    glyph: Option<(u16, u16, char)>,
+    theme: &CompositorTheme,
+) {
+    let h = grid.len();
+    if h == 0 || grid[0].is_empty() {
+        return;
+    }
+    let w = grid[0].len();
+    let line_fg = match style {
+        SidebarStyle::Flat => theme.sidebar_divider_fg.clone(),
+        SidebarStyle::Boxed => border_fg(theme, false),
+    };
+    match edge {
+        SidebarEdge::Left | SidebarEdge::Right => {
+            draw_divider_column(grid, 0, 0, h, &line_fg, theme)
+        }
+        SidebarEdge::Bottom => draw_divider_row(grid, 0, 0, w, &line_fg, theme),
+    }
+    if let Some((x, y, c)) = glyph {
+        draw_button(grid, x, y, c, style, theme);
     }
 }
 
@@ -423,5 +478,50 @@ mod tests {
         let mut g = blank_grid(6, 3, CellColor::Default);
         draw_flat_frame(&mut g, SidebarEdge::Right, &[1], &t);
         assert_eq!(chars(&g), vec!["│     ", "│─────", "│     "]);
+    }
+
+    #[test]
+    fn a_strip_is_the_edge_line_with_the_expand_glyph_on_it() {
+        let t = theme();
+        let mut g = blank_grid(1, 5, CellColor::Default);
+        draw_strip(
+            &mut g,
+            SidebarEdge::Left,
+            SidebarStyle::Flat,
+            Some((0, 4, '\u{BB}')),
+            &t,
+        );
+        assert_eq!(
+            chars(&g),
+            vec!["\u{2502}", "\u{2502}", "\u{2502}", "\u{2502}", "\u{BB}"]
+        );
+        assert_eq!(g[0][0].fg, t.sidebar_divider_fg);
+        assert_eq!(g[4][0].fg, t.sidebar_dim_fg);
+
+        let mut b = blank_grid(6, 1, CellColor::Default);
+        draw_strip(
+            &mut b,
+            SidebarEdge::Bottom,
+            SidebarStyle::Boxed,
+            Some((5, 0, '\u{25B4}')),
+            &t,
+        );
+        assert_eq!(
+            chars(&b),
+            vec!["\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{25B4}"]
+        );
+        assert_eq!(b[0][0].fg, t.frame_fg);
+        assert_eq!(b[0][5].fg, t.frame_fg);
+    }
+
+    #[test]
+    fn the_collapse_button_is_drawn_in_the_styles_dim_colour() {
+        let t = theme();
+        let mut g = blank_grid(4, 4, CellColor::Default);
+        draw_button(&mut g, 3, 2, '\u{AB}', SidebarStyle::Flat, &t);
+        assert_eq!(g[2][3].c, '\u{AB}');
+        assert_eq!(g[2][3].fg, t.sidebar_dim_fg);
+        draw_button(&mut g, 3, 1, '\u{AB}', SidebarStyle::Boxed, &t);
+        assert_eq!(g[1][3].fg, t.frame_fg);
     }
 }

@@ -329,6 +329,7 @@ mod tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -447,6 +448,7 @@ mod tests {
             size,
             visible,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -751,6 +753,7 @@ mod tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,

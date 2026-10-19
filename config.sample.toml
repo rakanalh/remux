@@ -718,6 +718,22 @@
 #             `sidebar_selection_bg`, `sidebar_dim_fg` and
 #             `sidebar_name_selected_fg` in the theme. An unknown value is a
 #             parse error. Applies on config reload.
+#   collapse_to_strip — true | false (default: true). Every expanded sidebar
+#             shows a small button on its inner edge, at the bottom end: `«` on
+#             a left sidebar, `»` on a right one, `▾` on the bottom one. Click
+#             it to collapse the sidebar. With `collapse_to_strip = true` a
+#             collapsed sidebar shrinks to a one-cell strip along its edge (one
+#             column, or one row for "bottom") showing the opposite glyph
+#             (`»`, `«`, `▴`); click anywhere on the strip to expand it again.
+#             The strip is chrome: it holds no panel and never takes the
+#             keyboard, and the panes get the rest of the terminal. The
+#             keyboard does the same: `Prefix b h`/`l`/`j` collapse to and
+#             expand from the strip, and focusing a collapsed sidebar
+#             (`Alt+h`/`Alt+l`, `Prefix b b`) expands it. With `false`,
+#             collapsing hides the sidebar entirely, as before, and only the
+#             keyboard brings it back. A sidebar with `visible = false` starts
+#             as a strip. The strip is dropped, like any sidebar, on a terminal
+#             too small to keep the minimum pane area.
 #
 # Runtime state (each sidebar's visibility and size, and each panel's weight)
 # is saved to `$XDG_STATE_HOME/remux/sidebar.json` and restored on the next

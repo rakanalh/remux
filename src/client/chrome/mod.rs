@@ -14,9 +14,10 @@ use anyhow::Result;
 // `MIN_CONTENT_COLS`/`MIN_CONTENT_ROWS` are deliberately NOT re-exported: this
 // is a binary crate, so a `pub use` nothing outside `geometry` imports trips
 // `unused_imports` under `-D warnings`.
+use geometry::{bar_hit, collapse_button, collapse_glyph, expand_glyph, strip_glyph_cell};
 pub use geometry::{
     bar_rects, content_point, content_rect, effective_sizes, frame_for, inset_for, pane_area,
-    panel_rects, past_the_server_bar, status_bar_rect, PanelGeom, SidebarEdge, SidebarGeom,
+    panel_rects, past_the_server_bar, status_bar_rect, BarHit, PanelGeom, SidebarEdge, SidebarGeom,
     SidebarStyle,
 };
 
@@ -41,6 +42,8 @@ pub struct Sidebar {
     pub size: u16,
     pub visible: bool,
     pub style: SidebarStyle,
+    /// Whether hiding leaves a one-cell strip. See [`SidebarGeom::is_strip`].
+    pub collapse_to_strip: bool,
     pub panels: Vec<Panel>,
     /// Which panel takes keys when this sidebar is focused. Written by the
     /// navigation task (Task 7); tracked here from the start so focus survives
@@ -120,6 +123,7 @@ impl Chrome {
                 size: sc.size,
                 visible: sc.visible,
                 style: sc.style,
+                collapse_to_strip: sc.collapse_to_strip,
                 panels,
                 focused_panel: 0,
             });
@@ -153,6 +157,7 @@ impl Chrome {
                 size: s.size,
                 visible: s.visible,
                 style: s.style,
+                collapse_to_strip: s.collapse_to_strip,
                 panels: s
                     .panels
                     .iter()
@@ -213,6 +218,25 @@ impl Chrome {
             .into_iter()
             .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
             .map(|(i, _)| i)
+    }
+
+    /// What the sidebar bar under a screen point is: an expanded sidebar's
+    /// collapse button or the rest of its frame, or a collapsed sidebar's strip.
+    pub fn bar_hit(
+        &self,
+        term_cols: u16,
+        term_rows: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<(usize, BarHit)> {
+        bar_hit(
+            &self.geoms(),
+            term_cols,
+            term_rows,
+            &self.border_style,
+            x,
+            y,
+        )
     }
 
     /// The row the client draws the status bar on, or `None` while the
@@ -282,6 +306,15 @@ impl Chrome {
     ) -> Result<()> {
         let rects = self.panel_rects(term_cols, term_rows);
         for (si, bar) in self.bar_rects(term_cols, term_rows) {
+            if !self.sidebars[si].visible {
+                let sb = &self.sidebars[si];
+                let glyph = strip_glyph_cell(sb.edge, bar)
+                    .map(|g| (g.x - bar.x, g.y - bar.y, expand_glyph(sb.edge)));
+                let mut grid = blank_grid(bar.width, bar.height, theme.border_bg());
+                frame::draw_strip(&mut grid, sb.edge, sb.style, glyph, theme);
+                renderer.paint_panel(bar, &grid)?;
+                continue;
+            }
             let mine: Vec<Rect> = rects
                 .iter()
                 .filter(|(s, _, _)| *s == si)
@@ -367,6 +400,17 @@ impl Chrome {
                         *slot = cell.clone();
                     }
                 }
+            }
+            let sb = &self.sidebars[si];
+            if let Some(b) = collapse_button(sb.style, &self.border_style, sb.edge, bar) {
+                frame::draw_button(
+                    &mut grid,
+                    b.x - bar.x,
+                    b.y - bar.y,
+                    collapse_glyph(sb.edge),
+                    sb.style,
+                    theme,
+                );
             }
             renderer.paint_panel(bar, &grid)?;
         }
@@ -632,7 +676,7 @@ impl Chrome {
         self.sidebars
             .iter()
             .enumerate()
-            .find(|(i, s)| s.edge == edge && sizes[*i] > 0)
+            .find(|(i, s)| s.edge == edge && s.visible && sizes[*i] > 0)
             .map(|(i, _)| i)
     }
 }
@@ -1186,6 +1230,7 @@ mod focus_tests {
             size,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,
@@ -1203,6 +1248,7 @@ mod focus_tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![PanelConfig {
                 editor: None,
                 command: None,
@@ -1253,6 +1299,7 @@ mod focus_tests {
             size,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: (0..n)
                 .map(|_| PanelConfig {
                     editor: None,
@@ -1339,6 +1386,7 @@ mod focus_tests {
                 size: 30,
                 visible: true,
                 style: Default::default(),
+                collapse_to_strip: false,
                 panel: vec![
                     PanelConfig {
                         editor: None,
@@ -1359,6 +1407,7 @@ mod focus_tests {
                 size: 20,
                 visible: true,
                 style: Default::default(),
+                collapse_to_strip: false,
                 panel: vec![PanelConfig {
                     editor: None,
                     command: None,
@@ -1590,6 +1639,7 @@ mod focus_tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -1881,6 +1931,7 @@ mod focus_tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: vec![
                 PanelConfig {
                     editor: None,
@@ -1979,6 +2030,7 @@ mod resize_tests {
             size,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -2156,6 +2208,7 @@ mod resize_tests {
             size,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: (0..panels)
                 .map(|_| PanelConfig {
                     editor: None,
@@ -2175,6 +2228,7 @@ mod resize_tests {
             size,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panel: weights
                 .iter()
                 .map(|w| PanelConfig {
@@ -2433,5 +2487,125 @@ mod resize_tests {
         let grid = c.sidebars[0].panels[0].plugin.render(28, 6, false, &theme);
         let header: String = grid[0].iter().map(|cell| cell.c).collect();
         assert_eq!(header.trim_end(), " agents");
+    }
+
+    fn strippable(edge: SidebarEdge) -> SidebarConfig {
+        SidebarConfig {
+            collapse_to_strip: true,
+            ..bar(edge, 30, 1)
+        }
+    }
+
+    /// The state a toggle leaves behind, as what the client persists and what
+    /// the server is told.
+    fn observable(c: &Chrome) -> (crate::client::sidebar_state::SidebarState, Rect) {
+        (
+            crate::client::sidebar_state::SidebarState::from_chrome(c),
+            c.content_rect(100, 30),
+        )
+    }
+
+    #[test]
+    fn the_button_and_the_keyboard_collapse_to_the_same_state() {
+        let mut by_mouse = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        let mut by_key = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        let bar = by_mouse.bar_rects(100, 30)[0].1;
+        let b = collapse_button(
+            by_mouse.sidebars[0].style,
+            &by_mouse.border_style,
+            SidebarEdge::Left,
+            bar,
+        )
+        .expect("an expanded sidebar has a button");
+        let (si, hit) = by_mouse.bar_hit(100, 30, b.x, b.y).expect("on the bar");
+        assert_eq!(hit, BarHit::Button);
+        by_mouse.toggle_edge(by_mouse.sidebars[si].edge);
+        by_key.toggle_edge(SidebarEdge::Left);
+        assert_eq!(observable(&by_mouse), observable(&by_key));
+        // Collapsed: a strip, with the panes given the rest.
+        assert_eq!(by_mouse.content_rect(100, 30).x, 1);
+        assert!(by_mouse.panel_rects(100, 30).is_empty());
+
+        // Any cell of the strip expands it again, by either route.
+        let (si, hit) = by_mouse.bar_hit(100, 30, 0, 3).expect("the strip");
+        assert_eq!(hit, BarHit::Strip);
+        by_mouse.toggle_edge(by_mouse.sidebars[si].edge);
+        by_key.toggle_edge(SidebarEdge::Left);
+        assert_eq!(observable(&by_mouse), observable(&by_key));
+        assert_eq!(by_mouse.content_rect(100, 30).x, 30);
+    }
+
+    #[test]
+    fn collapsing_the_focused_sidebar_returns_the_keyboard_to_the_content() {
+        let mut c = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        assert!(c.focus_edge(SidebarEdge::Left, 100, 30));
+        c.toggle_edge(SidebarEdge::Left);
+        assert_eq!(c.focus, ChromeFocus::Content);
+        assert_eq!(c.focused_panel(100, 30), None);
+    }
+
+    #[test]
+    fn a_strip_takes_no_focus_until_focus_edge_expands_it() {
+        let mut c = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        c.toggle_edge(SidebarEdge::Left);
+        assert_eq!(c.sidebar_on(SidebarEdge::Left, 100, 30), None);
+        assert!(c.focus_edge(SidebarEdge::Left, 100, 30));
+        assert!(c.sidebars[0].visible, "focusing a strip expands it");
+        assert_eq!(c.sidebar_on(SidebarEdge::Left, 100, 30), Some(0));
+    }
+
+    #[test]
+    fn without_collapse_to_strip_the_button_hides_the_sidebar_fully() {
+        let mut c = Chrome::from_config(&[bar(SidebarEdge::Left, 30, 1)]);
+        let bar_rect = c.bar_rects(100, 30)[0].1;
+        let b = collapse_button(
+            c.sidebars[0].style,
+            &c.border_style,
+            SidebarEdge::Left,
+            bar_rect,
+        )
+        .expect("the button is shown either way");
+        assert_eq!(
+            c.bar_hit(100, 30, b.x, b.y).map(|(_, h)| h),
+            Some(BarHit::Button)
+        );
+        c.toggle_edge(SidebarEdge::Left);
+        assert!(c.bar_rects(100, 30).is_empty());
+        assert_eq!(c.content_rect(100, 30).x, 0);
+        assert_eq!(c.bar_hit(100, 30, 0, 3), None);
+    }
+
+    #[test]
+    fn a_sidebar_configured_hidden_starts_as_a_strip() {
+        let mut cfg = strippable(SidebarEdge::Right);
+        cfg.visible = false;
+        let c = Chrome::from_config(&[cfg]);
+        assert_eq!(c.bar_rects(100, 30)[0].1.width, 1);
+        assert_eq!(
+            c.bar_hit(100, 30, 99, 4).map(|(_, h)| h),
+            Some(BarHit::Strip)
+        );
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_comes_back_as_a_strip_after_a_restart() {
+        use crate::client::sidebar_state::{apply, load_from, save_to, SidebarState};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sidebar.json");
+        let mut c = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        c.toggle_edge(SidebarEdge::Left);
+        save_to(&path, &SidebarState::from_chrome(&c));
+
+        let mut fresh = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        assert_eq!(fresh.bar_rects(100, 30)[0].1.width, 30);
+        apply(&mut fresh, &load_from(&path));
+        assert_eq!(fresh.bar_rects(100, 30)[0].1.width, 1);
+        // A state file written before this key existed has the same shape.
+        let old = SidebarState::from_json(
+            r#"{"bars":[{"edge":"left","visible":false,"size":30,"weights":[1]}]}"#,
+        );
+        let mut legacy = Chrome::from_config(&[strippable(SidebarEdge::Left)]);
+        apply(&mut legacy, &old);
+        assert_eq!(legacy.bar_rects(100, 30)[0].1.width, 1);
     }
 }

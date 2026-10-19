@@ -14,6 +14,10 @@ fn default_visible() -> bool {
     true
 }
 
+fn default_collapse_to_strip() -> bool {
+    true
+}
+
 fn default_weight() -> u16 {
     1
 }
@@ -76,6 +80,10 @@ pub struct SidebarConfig {
     /// `"boxed"` (the default) or `"flat"`.
     #[serde(default)]
     pub style: SidebarStyle,
+    /// Whether hiding the sidebar leaves a one-cell strip behind (the default)
+    /// or removes it entirely.
+    #[serde(default = "default_collapse_to_strip")]
+    pub collapse_to_strip: bool,
     /// `[[sidebar.panel]]` entries, in stacking order.
     #[serde(default)]
     pub panel: Vec<PanelConfig>,
@@ -149,6 +157,24 @@ style = "flat"
         );
         assert_eq!(cfg[0].style, SidebarStyle::Boxed);
         assert_eq!(cfg[1].style, SidebarStyle::Flat);
+    }
+
+    #[test]
+    fn collapse_to_strip_defaults_to_true() {
+        let cfg = parse(
+            r#"
+[[sidebar]]
+edge = "left"
+size = 30
+
+[[sidebar]]
+edge = "right"
+size = 30
+collapse_to_strip = false
+"#,
+        );
+        assert!(cfg[0].collapse_to_strip);
+        assert!(!cfg[1].collapse_to_strip);
     }
 
     #[test]

@@ -47,7 +47,36 @@ pub struct SidebarGeom {
     pub size: u16,
     pub visible: bool,
     pub style: SidebarStyle,
+    /// Whether a sidebar that is not `visible` shrinks to a one-cell strip
+    /// instead of taking no space.
+    pub collapse_to_strip: bool,
     pub panels: Vec<PanelGeom>,
+}
+
+/// Thickness of a collapsed sidebar's strip: one column for `Left`/`Right`,
+/// one row for `Bottom`.
+pub const STRIP_THICKNESS: u16 = 1;
+
+impl SidebarGeom {
+    /// Whether this sidebar is drawn as a strip: collapsed, and configured to
+    /// leave one behind.
+    pub fn is_strip(&self) -> bool {
+        !self.visible && self.collapse_to_strip
+    }
+
+    /// The size this sidebar asks the layout for, or `None` when it takes no
+    /// space.
+    fn requested(&self) -> Option<u16> {
+        if self.size == 0 {
+            None
+        } else if self.visible {
+            Some(self.size)
+        } else if self.collapse_to_strip {
+            Some(STRIP_THICKNESS)
+        } else {
+            None
+        }
+    }
 }
 
 /// The narrowest content rect we will hand the server.
@@ -63,51 +92,68 @@ pub const MIN_CONTENT_ROWS: u16 = 5;
 pub fn effective_sizes(sidebars: &[SidebarGeom], term_cols: u16, term_rows: u16) -> Vec<u16> {
     let mut sizes = vec![0u16; sidebars.len()];
 
+    // Expanded sidebars are resolved before strips, so a strip can never take
+    // the last column an expanded sidebar was about to be granted. A strip is
+    // one cell and is dropped by the same rule as any sidebar: when granting it
+    // would leave fewer than the minimum content, so a terminal too small for
+    // content is too small for strips as well.
+    let passes = [false, true];
+
     // -- Verticals: share the column budget, left resolved before right. --
     let mut cols_left = term_cols;
-    for (i, s) in sidebars.iter().enumerate() {
-        if !s.visible || s.size == 0 {
-            continue;
+    for strips in passes {
+        for (i, s) in sidebars.iter().enumerate() {
+            let Some(want) = s.requested() else {
+                continue;
+            };
+            if s.is_strip() != strips {
+                continue;
+            }
+            if !matches!(s.edge, SidebarEdge::Left | SidebarEdge::Right) {
+                continue;
+            }
+            let budget = cols_left.saturating_sub(MIN_CONTENT_COLS);
+            let granted = want.min(budget);
+            if granted == 0 {
+                // Logged because there is no other trace: a sidebar restored at a
+                // persisted size that no longer fits simply is not painted, and to
+                // the user that is indistinguishable from the feature being broken.
+                log::debug!(
+                    "sidebar: force-hiding the {:?} sidebar -- size {} does not fit in \
+                     {term_cols}x{term_rows} while keeping {MIN_CONTENT_COLS} content columns",
+                    s.edge,
+                    want
+                );
+                continue;
+            }
+            sizes[i] = granted;
+            cols_left -= granted;
         }
-        if !matches!(s.edge, SidebarEdge::Left | SidebarEdge::Right) {
-            continue;
-        }
-        let budget = cols_left.saturating_sub(MIN_CONTENT_COLS);
-        let granted = s.size.min(budget);
-        if granted == 0 {
-            // Logged because there is no other trace: a sidebar restored at a
-            // persisted size that no longer fits simply is not painted, and to
-            // the user that is indistinguishable from the feature being broken.
-            log::debug!(
-                "sidebar: force-hiding the {:?} sidebar -- size {} does not fit in \
-                 {term_cols}x{term_rows} while keeping {MIN_CONTENT_COLS} content columns",
-                s.edge,
-                s.size
-            );
-            continue;
-        }
-        sizes[i] = granted;
-        cols_left -= granted;
     }
 
     // -- Bottom: takes from the row budget. --
     let mut rows_left = term_rows;
-    for (i, s) in sidebars.iter().enumerate() {
-        if !s.visible || s.size == 0 || s.edge != SidebarEdge::Bottom {
-            continue;
+    for strips in passes {
+        for (i, s) in sidebars.iter().enumerate() {
+            let Some(want) = s.requested() else {
+                continue;
+            };
+            if s.is_strip() != strips || s.edge != SidebarEdge::Bottom {
+                continue;
+            }
+            let budget = rows_left.saturating_sub(MIN_CONTENT_ROWS);
+            let granted = want.min(budget);
+            if granted == 0 {
+                log::debug!(
+                    "sidebar: force-hiding the bottom sidebar -- size {} does not fit in \
+                     {term_cols}x{term_rows} while keeping {MIN_CONTENT_ROWS} content rows",
+                    want
+                );
+                continue;
+            }
+            sizes[i] = granted;
+            rows_left -= granted;
         }
-        let budget = rows_left.saturating_sub(MIN_CONTENT_ROWS);
-        let granted = s.size.min(budget);
-        if granted == 0 {
-            log::debug!(
-                "sidebar: force-hiding the bottom sidebar -- size {} does not fit in \
-                 {term_cols}x{term_rows} while keeping {MIN_CONTENT_ROWS} content rows",
-                s.size
-            );
-            continue;
-        }
-        sizes[i] = granted;
-        rows_left -= granted;
     }
 
     sizes
@@ -482,6 +528,9 @@ pub fn panel_rects(
     let mut out = Vec::new();
     for (i, bar) in bar_rects(sidebars, term_cols, term_rows) {
         let s = &sidebars[i];
+        if s.is_strip() {
+            continue;
+        }
         let frame = frame_for(s.style, style, s.edge, bar);
         let vertical = !matches!(s.edge, SidebarEdge::Bottom);
         for (pi, rect) in split_panels(frame.interior, &s.panels, vertical, frame.gap) {
@@ -574,6 +623,128 @@ fn split_panels(bar: Rect, panels: &[PanelGeom], vertical: bool, gap: u16) -> Ve
     out
 }
 
+/// What a point on a sidebar's bar belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarHit {
+    /// The collapse button of an expanded sidebar.
+    Button,
+    /// Anywhere on a collapsed sidebar's strip.
+    Strip,
+    /// The rest of an expanded sidebar's frame (or its panels, which a caller
+    /// that has already ruled panels out never sees here).
+    Frame,
+}
+
+/// The glyph of an expanded sidebar's collapse button: it points at the edge
+/// the sidebar will retreat to.
+pub fn collapse_glyph(edge: SidebarEdge) -> char {
+    match edge {
+        SidebarEdge::Left => '\u{AB}',
+        SidebarEdge::Right => '\u{BB}',
+        SidebarEdge::Bottom => '\u{25BE}',
+    }
+}
+
+/// The glyph on a collapsed strip: it points back into the terminal.
+pub fn expand_glyph(edge: SidebarEdge) -> char {
+    match edge {
+        SidebarEdge::Left => '\u{BB}',
+        SidebarEdge::Right => '\u{AB}',
+        SidebarEdge::Bottom => '\u{25B4}',
+    }
+}
+
+/// The cell of a bar's inner edge that holds a glyph: the bottom end of a
+/// vertical sidebar's edge line, the right end of the bottom sidebar's.
+///
+/// `inset` steps the cell back along the line, to clear a box corner.
+fn glyph_cell(edge: SidebarEdge, bar: Rect, inset: u16) -> Option<Rect> {
+    let (x, y) = match edge {
+        SidebarEdge::Left => (
+            bar.x + bar.width.checked_sub(1)?,
+            bar.y + bar.height.checked_sub(1 + inset)?,
+        ),
+        SidebarEdge::Right => (bar.x, bar.y + bar.height.checked_sub(1 + inset)?),
+        SidebarEdge::Bottom => (bar.x + bar.width.checked_sub(1 + inset)?, bar.y),
+    };
+    Some(Rect {
+        x,
+        y,
+        width: 1,
+        height: 1,
+    })
+}
+
+/// The one-cell collapse button of an EXPANDED sidebar, in screen coordinates,
+/// or `None` when the bar has no inner edge line to put it on.
+///
+/// The button sits on the line the frame already draws against the panes (the
+/// box's inner border, or the flat divider). A box leaves that line's last cell
+/// to its corner, so under a zellij box the button steps one cell in. It is
+/// drawn and hit-tested from this one rect.
+pub fn collapse_button(
+    style: SidebarStyle,
+    border: &BorderStyle,
+    edge: SidebarEdge,
+    bar: Rect,
+) -> Option<Rect> {
+    let frame = frame_for(style, border, edge, bar);
+    if !frame.framed {
+        return None;
+    }
+    let boxed_corner = style == SidebarStyle::Boxed && matches!(border, BorderStyle::ZellijStyle);
+    let inset = u16::from(boxed_corner);
+    let along = match edge {
+        SidebarEdge::Left | SidebarEdge::Right => bar.height,
+        SidebarEdge::Bottom => bar.width,
+    };
+    // Room for the glyph between the two ends of the line, corners included.
+    if along < 3 + inset {
+        return None;
+    }
+    glyph_cell(edge, bar, inset)
+}
+
+/// The cell of a collapsed strip that carries the expand glyph, in screen
+/// coordinates. The strip is `bar` itself.
+pub fn strip_glyph_cell(edge: SidebarEdge, bar: Rect) -> Option<Rect> {
+    glyph_cell(edge, bar, 0)
+}
+
+/// What the sidebar bar under a screen point is, as `(sidebar_index, hit)`.
+///
+/// Painting and hit-testing both go through [`collapse_button`] and
+/// [`bar_rects`], so a button is clickable exactly where it is drawn.
+pub fn bar_hit(
+    sidebars: &[SidebarGeom],
+    term_cols: u16,
+    term_rows: u16,
+    border: &BorderStyle,
+    x: u16,
+    y: u16,
+) -> Option<(usize, BarHit)> {
+    let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+    for (i, bar) in bar_rects(sidebars, term_cols, term_rows) {
+        if !inside(bar) {
+            continue;
+        }
+        let s = &sidebars[i];
+        if s.is_strip() {
+            return Some((i, BarHit::Strip));
+        }
+        let button = collapse_button(s.style, border, s.edge, bar);
+        return Some((
+            i,
+            if button.is_some_and(inside) {
+                BarHit::Button
+            } else {
+                BarHit::Frame
+            },
+        ));
+    }
+    None
+}
+
 /// The content rect minus the status-bar row -- the rect directional edge tests
 /// must run against, rather than the content rect itself.
 ///
@@ -621,6 +792,7 @@ mod tests {
             size,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panels: weights
                 .iter()
                 .map(|w| PanelGeom {
@@ -1254,6 +1426,7 @@ mod tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panels: vec![
                 PanelGeom {
                     weight: 10,
@@ -1290,6 +1463,7 @@ mod tests {
             size: 30,
             visible: true,
             style: Default::default(),
+            collapse_to_strip: false,
             panels: vec![
                 PanelGeom {
                     weight: 1,
@@ -1551,5 +1725,219 @@ mod tests {
         assert_eq!(content_point(content, 100, 30, 7, 29), (7, 29));
         assert_eq!(content_point(content, 100, 30, 99, 0), (99, 0));
         assert!(!past_the_server_bar(content, 100, 30, 99, 29));
+    }
+
+    fn strip_of(edge: SidebarEdge) -> SidebarGeom {
+        let mut s = sb(edge, 30, &[1]);
+        s.visible = false;
+        s.collapse_to_strip = true;
+        s
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_is_a_one_cell_strip_on_its_edge() {
+        let r = |e| bar_rects(&[strip_of(e)], 100, 30);
+        assert_eq!(
+            r(SidebarEdge::Left)[0].1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 29
+            }
+        );
+        assert_eq!(
+            r(SidebarEdge::Right)[0].1,
+            Rect {
+                x: 99,
+                y: 0,
+                width: 1,
+                height: 29
+            }
+        );
+        assert_eq!(
+            r(SidebarEdge::Bottom)[0].1,
+            Rect {
+                x: 0,
+                y: 28,
+                width: 100,
+                height: 1
+            }
+        );
+        // The panes get the rest of the terminal.
+        assert_eq!(
+            content_rect(&[strip_of(SidebarEdge::Left)], 100, 30),
+            Rect {
+                x: 1,
+                y: 0,
+                width: 99,
+                height: 30
+            }
+        );
+        assert_eq!(
+            content_rect(&[strip_of(SidebarEdge::Bottom)], 100, 30).height,
+            29
+        );
+    }
+
+    #[test]
+    fn without_collapse_to_strip_a_hidden_sidebar_takes_nothing() {
+        let mut s = strip_of(SidebarEdge::Left);
+        s.collapse_to_strip = false;
+        assert!(bar_rects(&[s.clone()], 100, 30).is_empty());
+        assert_eq!(content_rect(&[s], 100, 30).width, 100);
+    }
+
+    #[test]
+    fn a_strip_owns_no_panel() {
+        assert!(panel_rects(&[strip_of(SidebarEdge::Left)], 100, 30, &ZJ).is_empty());
+    }
+
+    #[test]
+    fn strips_on_different_edges_do_not_overlap() {
+        let sbs = [
+            strip_of(SidebarEdge::Left),
+            strip_of(SidebarEdge::Right),
+            strip_of(SidebarEdge::Bottom),
+        ];
+        let bars = bar_rects(&sbs, 100, 30);
+        assert_eq!(bars.len(), 3);
+        // Verticals own the corners; the bottom strip spans what is between.
+        assert_eq!(
+            bars[2].1,
+            Rect {
+                x: 1,
+                y: 28,
+                width: 98,
+                height: 1
+            }
+        );
+        for (i, (_, a)) in bars.iter().enumerate() {
+            for (_, b) in bars.iter().skip(i + 1) {
+                let apart = a.x + a.width <= b.x
+                    || b.x + b.width <= a.x
+                    || a.y + a.height <= b.y
+                    || b.y + b.height <= a.y;
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_strip_is_dropped_by_the_same_rule_as_any_sidebar() {
+        // 20 columns is the content minimum: not even a one-cell strip fits.
+        assert!(bar_rects(&[strip_of(SidebarEdge::Left)], 20, 30).is_empty());
+        assert_eq!(bar_rects(&[strip_of(SidebarEdge::Left)], 21, 30).len(), 1);
+        assert!(bar_rects(&[strip_of(SidebarEdge::Bottom)], 100, 5).is_empty());
+    }
+
+    #[test]
+    fn a_strip_never_starves_an_expanded_sidebar_of_its_budget() {
+        // 40 columns leave 20 to give. The expanded right sidebar asks for 30
+        // and is granted all 20 even though the left strip is listed first.
+        let sbs = [
+            strip_of(SidebarEdge::Left),
+            sb(SidebarEdge::Right, 30, &[1]),
+        ];
+        assert_eq!(effective_sizes(&sbs, 40, 30), vec![0, 20]);
+    }
+
+    #[test]
+    fn the_collapse_button_sits_on_the_inner_edge_line_at_the_bottom_end() {
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 29,
+        };
+        let cell = |style, border: &BorderStyle, edge, bar| {
+            collapse_button(style, border, edge, bar).map(|r| (r.x, r.y))
+        };
+        // Flat: the divider's last cell. Boxed zellij: one in from the corner.
+        assert_eq!(
+            cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, bar),
+            Some((29, 28))
+        );
+        assert_eq!(
+            cell(SidebarStyle::Boxed, &ZJ, SidebarEdge::Left, bar),
+            Some((29, 27))
+        );
+        assert_eq!(
+            cell(
+                SidebarStyle::Boxed,
+                &BorderStyle::TmuxStyle,
+                SidebarEdge::Left,
+                bar
+            ),
+            Some((29, 28))
+        );
+        let right = Rect { x: 70, ..bar };
+        assert_eq!(
+            cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Right, right),
+            Some((70, 28))
+        );
+        let bottom = Rect {
+            x: 0,
+            y: 20,
+            width: 100,
+            height: 8,
+        };
+        assert_eq!(
+            cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Bottom, bottom),
+            Some((99, 20))
+        );
+        assert_eq!(
+            cell(SidebarStyle::Boxed, &ZJ, SidebarEdge::Bottom, bottom),
+            Some((98, 20))
+        );
+        // Too short to carry it.
+        let tiny = Rect { height: 2, ..bar };
+        assert_eq!(cell(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, tiny), None);
+    }
+
+    #[test]
+    fn the_glyphs_point_at_the_edge_and_back() {
+        assert_eq!(collapse_glyph(SidebarEdge::Left), '\u{AB}');
+        assert_eq!(collapse_glyph(SidebarEdge::Right), '\u{BB}');
+        assert_eq!(collapse_glyph(SidebarEdge::Bottom), '\u{25BE}');
+        assert_eq!(expand_glyph(SidebarEdge::Left), '\u{BB}');
+        assert_eq!(expand_glyph(SidebarEdge::Right), '\u{AB}');
+        assert_eq!(expand_glyph(SidebarEdge::Bottom), '\u{25B4}');
+    }
+
+    #[test]
+    fn bar_hit_finds_the_button_the_strip_and_the_rest_of_the_frame() {
+        let mut flat = sb(SidebarEdge::Left, 30, &[1]);
+        flat.style = SidebarStyle::Flat;
+        let sbs = [flat];
+        // The button is where `collapse_button` puts it, no other cell is.
+        let bar = bar_rects(&sbs, 100, 30)[0].1;
+        let b = collapse_button(SidebarStyle::Flat, &ZJ, SidebarEdge::Left, bar).unwrap();
+        for y in 0..29 {
+            for x in 0..30 {
+                let hit = bar_hit(&sbs, 100, 30, &ZJ, x, y).map(|(_, h)| h);
+                let want = if (x, y) == (b.x, b.y) {
+                    BarHit::Button
+                } else {
+                    BarHit::Frame
+                };
+                assert_eq!(hit, Some(want), "({x},{y})");
+            }
+        }
+        assert_eq!(
+            bar_hit(&sbs, 100, 30, &ZJ, 50, 5),
+            None,
+            "content is not chrome"
+        );
+
+        let strips = [strip_of(SidebarEdge::Left)];
+        for y in 0..29 {
+            assert_eq!(
+                bar_hit(&strips, 100, 30, &ZJ, 0, y),
+                Some((0, BarHit::Strip)),
+                "anywhere on the strip, row {y}"
+            );
+        }
+        assert_eq!(bar_hit(&strips, 100, 30, &ZJ, 1, 5), None);
     }
 }

@@ -6035,6 +6035,38 @@ async fn run_client_loop(
                             MouseEventKind::Down(_) => {
                                 if over_frame {
                                     mouse_grab = None;
+                                    // The collapse button and a collapsed strip
+                                    // are the only live parts of a frame. They
+                                    // take the same path as the keyboard toggle
+                                    // (`toggle_edge`), so both leave identical
+                                    // state; everything else on the frame stays
+                                    // swallowed.
+                                    let hit = chrome.bar_hit(tc, tr, mouse.column, mouse.row);
+                                    if matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+                                        if let Some((si, crate::client::chrome::BarHit::Button | crate::client::chrome::BarHit::Strip)) = hit {
+                                            let edge = chrome.sidebars[si].edge;
+                                            let persisted_before =
+                                                crate::client::sidebar_state::SidebarState::from_chrome(&chrome);
+                                            let before = chrome.content_rect(tc, tr);
+                                            chrome.toggle_edge(edge);
+                                            if crate::client::sidebar_state::SidebarState::from_chrome(&chrome)
+                                                != persisted_before
+                                            {
+                                                crate::client::sidebar_state::save(&chrome);
+                                            }
+                                            let content = chrome.content_rect(tc, tr);
+                                            if content != before {
+                                                sync_content_rect(&mut renderer, &chrome, &content);
+                                                mgr.send_foreground(ClientMessage::Resize {
+                                                    cols: content.width,
+                                                    rows: content.height,
+                                                })
+                                                .await?;
+                                            }
+                                            chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                            renderer.flush()?;
+                                        }
+                                    }
                                     continue;
                                 }
                                 mouse_grab = Some(at_pointer);
