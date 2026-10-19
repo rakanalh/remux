@@ -1636,12 +1636,12 @@ async fn handle_client_message(
             // The tree's `client_count` and `is_current` are derived from the
             // client map, so attaching changes what every subscriber renders --
             // not only what this client renders.
-            mark_session_tree_dirty();
+            mark_focus_changed();
             result
         }
         ClientMessage::Detach => {
             handle_detach(client_id, clients).await;
-            mark_session_tree_dirty();
+            mark_focus_changed();
             // Detaching may make this client's active-tab panes no longer
             // session-visible; re-evaluate subscribed panes so any View cell on
             // them flips from the "Active in session" placeholder to live content.
@@ -4349,9 +4349,11 @@ async fn handle_command(
     // structure is exactly a command that may have changed what a subscriber's
     // tree shows. Deliberately here rather than inside `save_if_enabled`, whose
     // body is skipped entirely when `save_sessions = false` -- pushes must not
-    // depend on the persistence toggle.
+    // depend on the persistence toggle. The focus commands (`PaneFocus*`,
+    // `TabGoto`, the session switches) mark nothing themselves, so this is also
+    // the hook that re-pushes the agent list's `focused` flags.
     save_if_enabled(state, panes, config, dormant).await;
-    mark_session_tree_dirty();
+    mark_focus_changed();
 
     Ok(())
 }
@@ -4674,6 +4676,18 @@ fn mark_pane_retitled() {
     mark_agents_dirty();
 }
 
+/// Record that which pane some client has in front of it may have changed: the
+/// tree's `is_current`/`is_active`/`is_focused`, and [`AgentEntry::focused`].
+///
+/// The agent list has to be re-pushed for this even though no agent changed.
+/// A client holds a `finished` or `exited` notification for a settle window and
+/// decides at the end of it whether the pane is focused, from the last list it
+/// was sent, so a list that predates the focus change would decide wrongly.
+fn mark_focus_changed() {
+    mark_session_tree_dirty();
+    mark_agents_dirty();
+}
+
 /// Whether a foreground transition changed who names the pane, logging it
 /// when the source of the name flips back to the shell. The flip to a job is
 /// logged by [`PaneData::settle_title`], once the job has held the foreground
@@ -4883,12 +4897,23 @@ fn agent_rules(config: &Config) -> &'static crate::server::agents::AgentRules {
 async fn collect_agents(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
 ) -> Vec<AgentEntry> {
     let rules = agent_rules(config);
     if rules.is_empty() {
         return Vec::new();
     }
+
+    // Taken and released before `state`: the codebase never nests `clients`
+    // inside `state`, and a sweep that did could deadlock against a handler
+    // that holds `clients` while it waits for `state`.
+    let attached: Vec<String> = {
+        let cls = clients.lock().await;
+        cls.values()
+            .filter_map(|c| c.session_name.clone())
+            .collect()
+    };
 
     // Phase 1: dup the masters, briefly.
     let masters: Vec<(PaneId, std::os::fd::OwnedFd)> = {
@@ -4914,7 +4939,7 @@ async fn collect_agents(
 
     // Phase 3: place each matched pane in the tree, then classify it.
     let mut located: HashMap<PaneId, (String, usize, Option<String>)> = HashMap::new();
-    {
+    let focused = {
         let st = state.lock().await;
         for (name, sess) in &st.sessions {
             for (tab_index, tab) in sess.tabs.iter().enumerate() {
@@ -4926,7 +4951,8 @@ async fn collect_agents(
                 }
             }
         }
-    }
+        focused_panes(&st, &attached)
+    };
 
     let mut entries: Vec<AgentEntry> = Vec::new();
     {
@@ -4970,6 +4996,7 @@ async fn collect_agents(
                 title: pd.name_parts(now).0.map(str::to_string),
                 custom_name,
                 cwd: pd.names.cwd.clone(),
+                focused: focused.contains(&pane_id),
             });
         }
     }
@@ -4980,6 +5007,18 @@ async fn collect_agents(
         (&a.session, a.tab_index, a.pane_id).cmp(&(&b.session, b.tab_index, b.pane_id))
     });
     entries
+}
+
+/// The panes some attached client has in front of it: the input target of each
+/// session in `attached`, which is popup-aware through [`Session::input_target`].
+///
+/// A session's focus is shared by every client attached to it, so one entry per
+/// session name is enough, and a name that no longer resolves marks nothing.
+fn focused_panes(st: &ServerState, attached: &[String]) -> std::collections::HashSet<PaneId> {
+    attached
+        .iter()
+        .filter_map(|name| st.sessions.get(name).and_then(Session::input_target))
+        .collect()
 }
 
 /// Send the agent list to each client in `targets`. Returns whether any listed
@@ -4995,7 +5034,7 @@ async fn send_agents_to(
     if targets.is_empty() {
         return false;
     }
-    let agents = collect_agents(state, panes, config).await;
+    let agents = collect_agents(state, panes, clients, config).await;
     let any_working = agents
         .iter()
         .any(|a| a.state == crate::protocol::AgentState::Working);
@@ -5095,8 +5134,9 @@ async fn handle_client_disconnect(
     }
     // Removing the `ClientConnection` above dropped any session-tree
     // subscription with it -- but it also changed the `client_count` every
-    // *remaining* subscriber displays, so the survivors need a push.
-    mark_session_tree_dirty();
+    // *remaining* subscriber displays, so the survivors need a push. A departed
+    // client also stops focusing whatever pane it was attached to.
+    mark_focus_changed();
 }
 
 async fn handle_request_scrollback(
@@ -6026,7 +6066,7 @@ async fn handle_mouse_click(
                 drop(st);
                 // `PaneTreeEntry::is_focused` is in the pushed payload, so
                 // click-to-focus is a tree change exactly as keyboard focus is.
-                mark_session_tree_dirty();
+                mark_focus_changed();
                 broadcast_full_render(&session_name, state, panes, clients, config, prev_frames)
                     .await;
                 repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames)
@@ -6045,7 +6085,7 @@ async fn handle_mouse_click(
             // this arm has to say so itself. `handle_mouse_click` is reached
             // from `ClientMessage::MouseClick`, never from `handle_command`,
             // whose tail is what marks the tree dirty for every command.
-            mark_session_tree_dirty();
+            mark_focus_changed();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
             repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
         }
@@ -6064,7 +6104,7 @@ async fn handle_mouse_click(
             drop(st);
             // Changes both the stack's active pane and `is_focused`; both are
             // in the pushed payload.
-            mark_session_tree_dirty();
+            mark_focus_changed();
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
             repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
         }
@@ -10998,6 +11038,91 @@ mod tests {
     #[test]
     fn saved_custom_not_restorable_when_none() {
         assert!(!saved_custom_is_restorable(&None, &[1, 2]));
+    }
+
+    mod focused_panes {
+        use super::super::focused_panes;
+        use crate::config::BorderStyle;
+        use crate::server::layout::LayoutMode;
+        use crate::server::session::ServerState;
+
+        fn state_with(sessions: &[&str]) -> ServerState {
+            let mut st = ServerState::new();
+            for name in sessions {
+                st.create_session(
+                    name,
+                    None,
+                    BorderStyle::ZellijStyle,
+                    LayoutMode::default(),
+                    (80, 80),
+                )
+                .unwrap();
+            }
+            st
+        }
+
+        fn attached(names: &[&str]) -> Vec<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        }
+
+        #[test]
+        fn the_focused_pane_of_an_attached_session_is_focused() {
+            let st = state_with(&["main"]);
+            let pane = st.sessions["main"].tabs[0].focused_pane;
+            let focused = focused_panes(&st, &attached(&["main"]));
+            assert!(focused.contains(&pane));
+            assert_eq!(focused.len(), 1);
+        }
+
+        #[test]
+        fn a_session_no_client_is_attached_to_marks_nothing() {
+            let st = state_with(&["main", "other"]);
+            let other = st.sessions["other"].tabs[0].focused_pane;
+            let focused = focused_panes(&st, &attached(&["main"]));
+            assert!(!focused.contains(&other));
+            assert!(focused_panes(&st, &[]).is_empty());
+        }
+
+        #[test]
+        fn the_focused_pane_of_a_tab_in_the_background_is_not_focused() {
+            let mut st = state_with(&["main"]);
+            let first_tab = st.sessions["main"].tabs[0].focused_pane;
+            let second_tab = st
+                .create_tab("main", "Tab 2", LayoutMode::default())
+                .unwrap();
+            st.sessions.get_mut("main").unwrap().active_tab = 1;
+            let focused = focused_panes(&st, &attached(&["main"]));
+            assert!(focused.contains(&second_tab));
+            assert!(!focused.contains(&first_tab));
+        }
+
+        #[test]
+        fn a_visible_popup_takes_the_focus_from_its_tab() {
+            let mut st = state_with(&["main"]);
+            let tab_pane = st.sessions["main"].tabs[0].focused_pane;
+            let sess = st.sessions.get_mut("main").unwrap();
+            sess.popup_pane = Some(999);
+            sess.popup_visible = true;
+            let focused = focused_panes(&st, &attached(&["main"]));
+            assert!(focused.contains(&999));
+            assert!(!focused.contains(&tab_pane));
+        }
+
+        #[test]
+        fn clients_on_different_sessions_each_mark_their_own_pane() {
+            let st = state_with(&["main", "other"]);
+            let main = st.sessions["main"].tabs[0].focused_pane;
+            let other = st.sessions["other"].tabs[0].focused_pane;
+            let focused = focused_panes(&st, &attached(&["main", "other"]));
+            assert!(focused.contains(&main));
+            assert!(focused.contains(&other));
+        }
+
+        #[test]
+        fn a_client_attached_to_a_session_that_is_gone_marks_nothing() {
+            let st = state_with(&["main"]);
+            assert!(focused_panes(&st, &attached(&["deleted"])).is_empty());
+        }
     }
 
     /// The `/proc` parser, which only exists on Linux.
