@@ -4,7 +4,10 @@ Drives the actual client binary through a pseudo-terminal (pexpect) and reads
 the rendered screen with pyte. Spins up an isolated throwaway server (the client
 auto-spawns it) with its own XDG dirs and a short socket path.
 """
-import atexit, os, shutil, signal, subprocess, time, pexpect, pyte
+import atexit, os, shutil, signal, subprocess, sys, time, pexpect, pyte
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import home_guard  # noqa: E402,F401  (installs the real-HOME refusal)
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -81,7 +84,7 @@ class Tui:
         # resolve against whatever directory the harness runs from.
         assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
         shutil.rmtree(self.rundir, ignore_errors=True)
-        for s in ("run", "state", "data", "config"):
+        for s in ("run", "state", "data", "config", "home"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
         shims = f"{self.rundir}/notify-bin"
         self.notify_log = install_notify_shims(shims)
@@ -98,6 +101,11 @@ class Tui:
             "TERM": "xterm-256color",
             "PS1": "$ ",
             "REMUX_ALLOW_NESTED": "1",
+            # The server reads the platform data dir under HOME when the XDG
+            # data dir is empty, so HOME must be throwaway too. A caller may
+            # still override it through `extra_env`; `home_guard` rejects the
+            # real home.
+            "HOME": f"{self.rundir}/home",
             **self.extra_env,
             "XDG_RUNTIME_DIR": f"{self.rundir}/run",
             "XDG_STATE_HOME": f"{self.rundir}/state",

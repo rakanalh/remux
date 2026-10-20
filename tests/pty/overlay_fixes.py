@@ -97,6 +97,7 @@ def base_env(rundir, statedir, datadir, cfgdir):
     return {
         **os.environ,
         "PATH": f"{RUN}/bin:" + os.environ.get("PATH", ""),
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": rundir,
         "XDG_STATE_HOME": statedir,
         "XDG_DATA_HOME": datadir,
@@ -125,7 +126,7 @@ def write_config(name, body):
 
 def setup_dirs(config):
     shutil.rmtree(RUN, ignore_errors=True)
-    for s in ("run", "run2", "state", "state2", "data", "data2", "bin"):
+    for s in ("run", "run2", "state", "state2", "data", "data2", "bin", "home"):
         os.makedirs(f"{RUN}/{s}", mode=0o700, exist_ok=True)
     install_notify_shims(f"{RUN}/bin")
     write_config("cfg", config)

@@ -131,6 +131,7 @@ def env_local():
     return {
         **os.environ,
         "PATH": f"{RUN}/bin:" + os.environ.get("PATH", ""),
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": f"{RUN}/run",
         "XDG_STATE_HOME": f"{RUN}/state",
         "XDG_DATA_HOME": f"{RUN}/data",
@@ -145,7 +146,7 @@ def env_local():
 
 def setup_dirs():
     shutil.rmtree(RUN, ignore_errors=True)
-    for s in ("run", "state", "data", "bin", "cfg"):
+    for s in ("run", "state", "data", "bin", "cfg", "home"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     os.makedirs(f"{RUN}/cfg/remux", exist_ok=True)
     install_notify_shims(f"{RUN}/bin")

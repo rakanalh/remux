@@ -188,13 +188,14 @@ visible = false
 
 def make_env(config: str) -> dict:
     shutil.rmtree(RUNDIR, ignore_errors=True)
-    for sub in ("run", "state", "data", "config"):
+    for sub in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUNDIR}/{sub}", exist_ok=True)
     os.makedirs(f"{RUNDIR}/config/remux", exist_ok=True)
     with open(f"{RUNDIR}/config/remux/config.toml", "w") as fh:
         fh.write(config)
     env = dict(os.environ)
     env.update(
+        HOME=f"{RUNDIR}/home",
         XDG_RUNTIME_DIR=f"{RUNDIR}/run",
         XDG_STATE_HOME=f"{RUNDIR}/state",
         XDG_DATA_HOME=f"{RUNDIR}/data",
