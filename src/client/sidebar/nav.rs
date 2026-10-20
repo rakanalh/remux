@@ -262,34 +262,57 @@ pub fn fill_row(grid: &mut [Vec<RenderCell>], y: u16, cols: u16, fg: &CellColor,
     );
 }
 
-/// The colour of a panel's header: the active frame colour while the panel
-/// holds the keyboard, so the user can tell which of several stacked panels
-/// takes their keys, and the dim colour otherwise.
-pub fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
+/// The colour of a panel's header title: its own accent while the panel holds
+/// the keyboard, so the user can tell which of several stacked panels takes
+/// their keys, and the dim colour otherwise.
+fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
     if focused {
-        theme.frame_active_fg.clone()
+        theme.sidebar_header_active_fg.clone()
     } else {
         theme.sidebar_dim_fg.clone()
     }
 }
 
-/// Paint a panel's header: the title in lowercase and bold, one column in.
+/// The background of a panel's header bar.
+fn header_bg(focused: bool, theme: &CompositorTheme) -> CellColor {
+    if focused {
+        theme.sidebar_header_active_bg.clone()
+    } else {
+        theme.sidebar_header_bg.clone()
+    }
+}
+
+/// Paint a panel's header bar: row 0 filled edge to edge in [`header_bg`], with
+/// `text` bold from column `x`.
+///
+/// The bar spans the same extent as the selection band, and `text` is drawn as
+/// given, so a panel whose header is not a fixed name (the files panel's path)
+/// sits on the same bar.
+pub fn draw_header_bar(
+    grid: &mut [Vec<RenderCell>],
+    x: u16,
+    text: &str,
+    focused: bool,
+    theme: &CompositorTheme,
+) {
+    let Some(cols) = grid.first().map(Vec::len) else {
+        return;
+    };
+    let fg = header_fg(focused, theme);
+    let bg = header_bg(focused, theme);
+    fill_row(grid, 0, cols as u16, &fg, &bg);
+    draw_text_with(grid, x, 0, text, fg, bg, true);
+}
+
+/// Paint a panel's header: the title in lowercase and bold, one column in, on
+/// the header bar.
 pub fn draw_header(
     grid: &mut [Vec<RenderCell>],
     title: &str,
     focused: bool,
     theme: &CompositorTheme,
-    bg: &CellColor,
 ) {
-    draw_text_with(
-        grid,
-        1,
-        0,
-        &title.to_lowercase(),
-        header_fg(focused, theme),
-        bg.clone(),
-        true,
-    );
+    draw_header_bar(grid, 1, &title.to_lowercase(), focused, theme);
 }
 
 /// A cursor and a viewport over a panel's rows.
@@ -468,6 +491,29 @@ pub fn action_for_hit(hit: Hit, selected: &mut usize) -> HitOutcome {
             HitOutcome::Moved
         }
         Hit::Activate(_) => HitOutcome::Activate,
+    }
+}
+
+/// Test helper shared by every panel: row 0 is one bar edge to edge in the
+/// state's bar colour with the title in the state's fg, row 1 has no bar.
+#[cfg(test)]
+pub fn assert_header_bar(grid: &[Vec<RenderCell>], focused: bool, theme: &CompositorTheme) {
+    let (want_bg, want_fg) = if focused {
+        (
+            &theme.sidebar_header_active_bg,
+            &theme.sidebar_header_active_fg,
+        )
+    } else {
+        (&theme.sidebar_header_bg, &theme.sidebar_dim_fg)
+    };
+    for (x, cell) in grid[0].iter().enumerate() {
+        assert_eq!(&cell.bg, want_bg, "header cell {x} (focused={focused})");
+    }
+    let title = grid[0].iter().position(|c| c.c != ' ').expect("a title");
+    assert_eq!(&grid[0][title].fg, want_fg);
+    assert!(grid[0][title].bold);
+    for (x, cell) in grid[1].iter().enumerate() {
+        assert_ne!(&cell.bg, want_bg, "blank row cell {x} carries the bar");
     }
 }
 
@@ -694,5 +740,25 @@ mod tests {
         nav.set_selected(0);
         assert_eq!(nav.top_for(5, 5), 0);
         assert_eq!(nav.hit(2, 5), Hit::Select(1));
+    }
+
+    #[test]
+    fn the_header_bar_spans_the_row_and_follows_focus() {
+        let theme = CompositorTheme::default();
+        for focused in [false, true] {
+            let mut grid = vec![vec![RenderCell::default(); 12]; 3];
+            draw_header(&mut grid, "Agents", focused, &theme);
+            assert_header_bar(&grid, focused, &theme);
+            assert_eq!(grid[0][1].c, 'a', "lowercased, one column in");
+            assert!(
+                grid[2].iter().all(|c| c.bg == RenderCell::default().bg),
+                "rows below the blank row are untouched"
+            );
+        }
+        assert_ne!(
+            header_bg(true, &theme),
+            header_bg(false, &theme),
+            "focus must change the bar"
+        );
     }
 }

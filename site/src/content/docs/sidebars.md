@@ -195,7 +195,7 @@ Each sidebar's collapsed or expanded state, its size, and each panel's weight ar
 
 ## Look
 
-Every panel shares one look, whatever the plugin or style: a column of padding on the left, a lowercase dim header followed by a blank row, and a full-width band behind the selected row. A rule separates stacked panels. The header switches to the active frame colour (`frame_active_fg`) while its panel has the keyboard.
+Every panel shares one look, whatever the plugin or style: a column of padding on the left, a lowercase bold header on a full-width bar followed by a blank row, and a full-width band behind the selected row. A rule separates stacked panels. The bar is dark (`sidebar_header_bg`) with a dim title; while its panel has the keyboard it becomes a solid blue bar (`sidebar_header_active_bg`) with a dark title (`sidebar_header_active_fg`).
 
 `style` changes only the edge against the panes:
 

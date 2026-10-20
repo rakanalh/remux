@@ -433,15 +433,7 @@ impl SidebarPlugin for FilesPlugin {
         let pad = layout.pad();
         // The path is the header here, so it is not lowercased the way a fixed
         // panel name is.
-        draw_text_with(
-            &mut grid,
-            pad,
-            0,
-            &header,
-            nav::header_fg(focused, theme),
-            bg.clone(),
-            true,
-        );
+        nav::draw_header_bar(&mut grid, pad, &header, focused, theme);
 
         // The same budget rule the agents panel arrived at: at most half the
         // rows when there is a list to crowd out, all of them when there is not.
@@ -1617,11 +1609,21 @@ mod tests {
         let theme = CompositorTheme::default();
         assert_eq!(
             p.render(20, 5, true, &theme)[0][1].fg,
-            theme.frame_active_fg
+            theme.sidebar_header_active_fg
         );
         assert_eq!(
             p.render(20, 5, false, &theme)[0][1].fg,
             theme.sidebar_dim_fg
         );
+    }
+
+    #[test]
+    fn the_header_is_a_bar_whose_colours_follow_focus() {
+        let p = at("/w", vec![entry("a", false)]);
+        let theme = CompositorTheme::default();
+        for focused in [false, true] {
+            let grid = p.render(20, 5, focused, &theme);
+            nav::assert_header_bar(&grid, focused, &theme);
+        }
     }
 }

@@ -439,7 +439,7 @@ impl SidebarPlugin for AgentsPlugin {
             return grid;
         }
         let layout = self.layout();
-        nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        nav::draw_header(&mut grid, self.title(), focused, theme);
 
         // The notes are CAPPED against the list, not just against the panel.
         // Uncapped, three unsupported remotes beside four blocked agents took
@@ -1736,11 +1736,21 @@ mod tests {
         let theme = CompositorTheme::default();
         assert_eq!(
             p.render(24, 6, true, &theme)[0][1].fg,
-            theme.frame_active_fg
+            theme.sidebar_header_active_fg
         );
         assert_eq!(
             p.render(24, 6, false, &theme)[0][1].fg,
             theme.sidebar_dim_fg
         );
+    }
+
+    #[test]
+    fn the_header_is_a_bar_whose_colours_follow_focus() {
+        let p = plugin_with(1);
+        let theme = CompositorTheme::default();
+        for focused in [false, true] {
+            let grid = p.render(24, 6, focused, &theme);
+            nav::assert_header_bar(&grid, focused, &theme);
+        }
     }
 }
