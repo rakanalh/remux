@@ -230,8 +230,8 @@
 # collapse chip swaps to `sidebar_header_active_fg` as its background and
 # `sidebar_header_active_bg` as its glyph, so it stays visible.
 # sidebar_header_bg = "#181825"           # unfocused header bar
-# sidebar_header_active_bg = "#45475a"    # focused header bar
-# sidebar_header_active_fg = "#89b4fa"    # focused header title
+# sidebar_header_active_bg = "#89b4fa"    # focused header bar
+# sidebar_header_active_fg = "#1e1e2e"    # focused header title
 
 # The collapse button (a three-cell chip on the last row of an expanded sidebar)
 # and the strip a collapsed sidebar leaves behind. The chip's glyph is drawn

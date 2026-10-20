@@ -1387,6 +1387,53 @@ mod focus_tests {
         }])
     }
 
+    /// Where `paint` draws the bottom sidebar's collapse chip glyph, in screen
+    /// coordinates, and the cell the renderer holds there after a paint.
+    fn painted_chip_glyph(c: &Chrome, theme: &CompositorTheme) -> RenderCell {
+        let (cols, rows) = (60, 20);
+        let mut renderer = Renderer::new(cols, rows);
+        c.paint(&mut renderer, cols, rows, theme, None).unwrap();
+        let (_, bar) = c.bar_rects(cols, rows)[0];
+        let chip = collapse_button(
+            c.sidebars[0].style,
+            &c.border_style,
+            c.sidebars[0].edge,
+            bar,
+        )
+        .expect("a chip");
+        renderer.front_buffer()[chip.y as usize][(chip.x + chip.width / 2) as usize].clone()
+    }
+
+    #[test]
+    fn the_chip_inverts_only_when_the_focused_panel_owns_its_header_row() {
+        let theme = CompositorTheme::default();
+        let mut c = chrome_with_panels(SidebarEdge::Bottom, 6, 2);
+
+        c.focus = ChromeFocus::Content;
+        let idle = painted_chip_glyph(&c, &theme);
+        assert_eq!(idle.bg, theme.sidebar_button_bg);
+
+        // The chip sits at the stack's far end, over the LAST panel's header.
+        c.focus = ChromeFocus::Sidebar {
+            sidebar: 0,
+            panel: 0,
+        };
+        let elsewhere = painted_chip_glyph(&c, &theme);
+        assert_eq!(
+            elsewhere.bg, theme.sidebar_button_bg,
+            "another panel's focus"
+        );
+
+        c.focus = ChromeFocus::Sidebar {
+            sidebar: 0,
+            panel: 1,
+        };
+        let on_bar = painted_chip_glyph(&c, &theme);
+        assert_eq!(on_bar.bg, theme.sidebar_header_active_fg);
+        assert_eq!(on_bar.fg, theme.sidebar_header_active_bg);
+        assert_ne!(on_bar.bg, theme.sidebar_header_active_bg);
+    }
+
     #[test]
     fn toggling_a_sidebar_off_releases_the_keyboard() {
         let mut c = chrome_with(SidebarEdge::Left, 30);

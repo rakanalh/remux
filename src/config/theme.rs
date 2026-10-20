@@ -342,8 +342,8 @@ impl Default for ThemeConfig {
             sidebar_selection_bg: ThemeColor::Rgb(49, 50, 68), // surface0
             sidebar_dim_fg: ThemeColor::Rgb(108, 112, 134),  // overlay0
             sidebar_header_bg: ThemeColor::Rgb(24, 24, 37),  // mantle
-            sidebar_header_active_bg: ThemeColor::Rgb(69, 71, 90), // surface1
-            sidebar_header_active_fg: ThemeColor::Rgb(137, 180, 250), // blue
+            sidebar_header_active_bg: ThemeColor::Rgb(137, 180, 250), // blue
+            sidebar_header_active_fg: ThemeColor::Rgb(30, 30, 46), // base
             sidebar_name_selected_fg: ThemeColor::Rgb(205, 214, 244), // text
             sidebar_button_bg: ThemeColor::Rgb(69, 71, 90),  // surface1
             sidebar_strip_bg: ThemeColor::Rgb(49, 50, 68),   // surface0
@@ -730,8 +730,8 @@ mod tests {
         assert_eq!(ct.sidebar_selection_bg, CellColor::Rgb(49, 50, 68)); // surface0
         assert_eq!(ct.sidebar_dim_fg, CellColor::Rgb(108, 112, 134)); // overlay0
         assert_eq!(ct.sidebar_header_bg, CellColor::Rgb(24, 24, 37)); // mantle
-        assert_eq!(ct.sidebar_header_active_bg, CellColor::Rgb(69, 71, 90)); // surface1
-        assert_eq!(ct.sidebar_header_active_fg, CellColor::Rgb(137, 180, 250)); // blue
+        assert_eq!(ct.sidebar_header_active_bg, CellColor::Rgb(137, 180, 250)); // blue
+        assert_eq!(ct.sidebar_header_active_fg, CellColor::Rgb(30, 30, 46)); // base
         assert_eq!(ct.sidebar_name_selected_fg, CellColor::Rgb(205, 214, 244)); // text
         assert_eq!(ct.sidebar_button_bg, CellColor::Rgb(69, 71, 90)); // surface1
         assert_eq!(ct.sidebar_strip_bg, CellColor::Rgb(49, 50, 68)); // surface0
