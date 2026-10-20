@@ -49,11 +49,11 @@ size = 34
   plugin = "agents"
 ```
 
-`j`/`k`/`g`/`G` move and `Enter` jumps to the pane. The row for the pane you are currently in is highlighted with `sidebar_current_bg`.
+Each agent takes two lines: its name, then a dim line with the command (and ` · host` on a remote). A filled `●` marks an agent that is working or needs input, a hollow `○` one that is idle. `j`/`k`/`g`/`G` move and `Enter` jumps to the pane. The row for the pane you are currently in gets a full-width band in `sidebar_current_bg`, and the selected row one in `sidebar_selection_bg`. See [Sidebars](/remux/sidebars/#agents) for the row layout.
 
 ![The agents panel docked beside the panes](../../assets/screenshots/sidebar-agents.png)
 
-Agents are named by your [`pane_title`](/remux/theme/#pane-titles) template. With no template, an agent shows its window title, or `command session/tab` (for example `claude main/1`) when it has none. Agents on a remote are prefixed with the remote's name.
+In the switcher, agents are named by your [`pane_title`](/remux/theme/#pane-titles) template. With no template, an agent shows its window title, or `command session/tab` (for example `claude main/1`) when it has none. Agents on a remote are prefixed with the remote's name. The panel names an agent `session · tab` unless a template, a pane name or a window title applies, and shows the command on its second line.
 
 ## Desktop notifications
 

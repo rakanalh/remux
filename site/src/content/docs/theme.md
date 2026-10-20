@@ -28,7 +28,7 @@ border_style = "zellij_style"
 | `"zellij_style"` (default) | A box around every pane with its name on the top border |
 | `"tmux_style"` | Minimal dividers between panes, and a tab bar |
 
-`Ctrl-a g` toggles the style of the current session at runtime. [Sidebars](/remux/sidebars/#frames) follow the same style.
+`Ctrl-a g` toggles the style of the current session at runtime. [Sidebars](/remux/sidebars/#look) with the default `boxed` style follow the same style.
 
 ![Panes drawn in tmux style](../../assets/screenshots/border-tmux.png)
 
@@ -160,7 +160,12 @@ session_name_fg = "#94e2d5"
 | `search_count_fg/bg` | The `(n/m)` search-match counter |
 | `search_match_fg/bg`, `search_current_fg/bg` | Search highlights: every match, and the current one |
 | `whichkey_fg`, `whichkey_bg`, `whichkey_key_fg` | The which-key popup and its key column |
-| `sidebar_current_bg` | The agents panel's highlight for the pane you are in. Keep it distinct from `tab_active_bg`/`tab_inactive_bg`, which the panel uses for its selection. |
+| `sidebar_current_bg` | The agents panel's band for the pane you are in. Keep it distinct from `sidebar_selection_bg`; the selection wins on a row that is both. |
+| `sidebar_selection_bg` | The full-width band behind a sidebar panel's selected row (both lines of an agent) |
+| `sidebar_dim_fg` | Panel headers and an agent row's second line |
+| `sidebar_name_selected_fg` | The selected item's name (other names use `status_bar_fg`), and the glyph on the collapse chip |
+| `sidebar_divider_fg` | The divider column of a `flat` sidebar |
+| `sidebar_button_bg`, `sidebar_strip_bg` | The [collapse button](/remux/sidebars/#collapse-to-a-strip) chip, and the whole strip a collapsed sidebar leaves behind |
 
 ![Activity markers on status-bar tabs](../../assets/screenshots/tabs-activity.png)
 

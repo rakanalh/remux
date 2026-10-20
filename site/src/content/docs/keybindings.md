@@ -341,8 +341,8 @@ See [Views](/remux/views/).
 
 | Command | Does |
 |---|---|
-| `SidebarToggleLeft` / `Right` / `Bottom` | Show or hide that sidebar |
-| `SidebarFocusLeft` / `Right` / `Bottom` | Focus that sidebar, opening it if it is hidden |
+| `SidebarToggleLeft` / `Right` / `Bottom` | Collapse that sidebar to a strip, or expand it (hide or show it, with `collapse_to_strip = false`) |
+| `SidebarFocusLeft` / `Right` / `Bottom` | Focus that sidebar, expanding it if it is collapsed or hidden |
 | `SidebarCycle` | Move focus through every panel, then back to the panes |
 
 See [Sidebars](/remux/sidebars/).
