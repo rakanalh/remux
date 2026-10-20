@@ -142,10 +142,10 @@ See [Views](/remux/views/).
 
 | Action | Keys |
 |---|---|
-| Show or hide the left / right / bottom sidebar | `b h` / `b l` / `b j` |
+| Collapse or expand the left / right / bottom sidebar | `b h` / `b l` / `b j` |
 | Cycle focus through the visible panels, then back to the panes | `b b` |
 
-`Alt-h/j/k/l` move into and out of a sidebar the same way they move between panes. See [Sidebars](/remux/sidebars/).
+`Alt-h/j/k/l` move into and out of a sidebar the same way they move between panes, and focusing a collapsed sidebar expands it. See [Sidebars](/remux/sidebars/).
 
 ## Visual mode
 

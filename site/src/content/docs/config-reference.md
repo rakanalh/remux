@@ -65,6 +65,9 @@ Defaults are the Catppuccin Mocha palette. Colours for pane frames, tab chips an
 | `layout_indicator_fg` / `layout_indicator_bg` | `{ ansi = 0 }` / `{ ansi = 245 }` |
 | `search_count_fg` / `search_count_bg` | `{ ansi = 0 }` / `{ ansi = 11 }` |
 | `sidebar_current_bg` | `"#3e385e"` |
+| `sidebar_divider_fg` / `sidebar_selection_bg` | `"#313244"` / `"#313244"` |
+| `sidebar_dim_fg` / `sidebar_name_selected_fg` | `"#6c7086"` / `"#cdd6f4"` |
+| `sidebar_button_bg` / `sidebar_strip_bg` | `"#45475a"` / `"#313244"` |
 | `whichkey_fg` / `whichkey_bg` / `whichkey_key_fg` | `"#cdd6f4"` / `"#181825"` / `"#a6e3a1"` |
 | `separator_fg` | `"#6c7086"` |
 | `pane_label_fg` / `pane_label_bg` | unset / unset (the border's colour, on the terminal's background) |
@@ -146,9 +149,11 @@ A sidebar docked to one edge of the terminal. There are none by default. Declare
 |---|---|---|---|
 | `edge` | `"left"` \| `"right"` \| `"bottom"` | none (required) | Edge to dock to. An unknown value is a parse error. |
 | `size` | integer | none (required) | Starting thickness: columns for `left`/`right`, rows for `bottom`. The frame is drawn inside it. |
-| `visible` | bool | `true` | Whether it starts open. |
+| `visible` | bool | `true` | Whether it starts open. `false` starts it collapsed to a strip (unless `collapse_to_strip` is `false`). |
+| `style` | `"boxed"` \| `"flat"` | `"boxed"` | The edge against the panes: `"boxed"` frames the sidebar in the pane border style, `"flat"` draws one divider column (row, for `bottom`) in `sidebar_divider_fg`. The inside looks the same either way. An unknown value is a parse error. |
+| `collapse_to_strip` | bool | `true` | Collapsing (the chip, or `Ctrl-a b h`/`l`/`j`) leaves a one-cell clickable strip along the edge. `false` hides the sidebar entirely. |
 
-Once you toggle or resize a sidebar, its size, visibility and panel weights are saved to `$XDG_STATE_HOME/remux/sidebar.json` and take precedence over `size` and `visible` on later starts.
+Once you collapse or resize a sidebar, its size, collapsed state and panel weights are saved to `$XDG_STATE_HOME/remux/sidebar.json` and take precedence over `size` and `visible` on later starts.
 
 ### `[[sidebar.panel]]`
 

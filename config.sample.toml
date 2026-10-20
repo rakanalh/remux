@@ -1,7 +1,9 @@
 # =============================================================================
 # Remux Configuration — Complete Reference
 # =============================================================================
-# Place this file at ~/.config/remux/config.toml
+# Place this file at $XDG_CONFIG_HOME/remux/config.toml when that is set to an
+# absolute path; otherwise ~/.config/remux/config.toml on Linux and
+# ~/Library/Application Support/remux/config.toml on macOS.
 #
 # EVERY option below is shown COMMENTED OUT set to its DEFAULT value. This file
 # is therefore a complete reference: copying it verbatim yields exactly the
@@ -620,9 +622,9 @@
 #   ViewDelete                      — Delete the active view for everyone
 #
 # Sidebar commands (client-side chrome; sidebars are declared with [[sidebar]]):
-#   SidebarToggleLeft               — Show/hide the left sidebar
-#   SidebarToggleRight              — Show/hide the right sidebar
-#   SidebarToggleBottom             — Show/hide the bottom sidebar
+#   SidebarToggleLeft               — Collapse/expand the left sidebar
+#   SidebarToggleRight              — Collapse/expand the right sidebar
+#   SidebarToggleBottom             — Collapse/expand the bottom sidebar
 #   SidebarFocusLeft                — Focus the left sidebar, opening it if hidden
 #   SidebarFocusRight               — Focus the right sidebar, opening it if hidden
 #   SidebarFocusBottom              — Focus the bottom sidebar, opening it if hidden
@@ -872,7 +874,7 @@
 # panels (none declared, or every name unknown) is dropped entirely, also with
 # a warning: an empty strip of chrome would just be stolen space.
 #
-# FRAMES. A sidebar is framed in the same border style as the panes beside it
+# FRAMES (`style = "boxed"`, the default). A sidebar is framed in the same border style as the panes beside it
 # (`appearance.border_style`), so it reads as part of the same screen: one frame
 # per SIDEBAR — not one per panel — with a rule between stacked panels. Under
 # "zellij_style" that is a rounded box around the whole sidebar; under
