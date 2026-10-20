@@ -223,6 +223,16 @@
 # sidebar_dim_fg = "#6c7086"              # section headers and an agent row's second line
 # sidebar_name_selected_fg = "#cdd6f4"    # the selected item's name (others use status_bar_fg)
 
+# The header bar: the first row of every sidebar panel, filled edge to edge.
+# Unfocused it is `sidebar_header_bg` with the title in `sidebar_dim_fg`; while
+# the panel holds the keyboard it is `sidebar_header_active_bg` with the title
+# in `sidebar_header_active_fg`. On a focused bar of the bottom sidebar the
+# collapse chip swaps to `sidebar_header_active_fg` as its background and
+# `sidebar_header_active_bg` as its glyph, so it stays visible.
+# sidebar_header_bg = "#181825"           # unfocused header bar
+# sidebar_header_active_bg = "#45475a"    # focused header bar
+# sidebar_header_active_fg = "#89b4fa"    # focused header title
+
 # The collapse button (a three-cell chip on the last row of an expanded sidebar)
 # and the strip a collapsed sidebar leaves behind. The chip's glyph is drawn
 # bold in `sidebar_name_selected_fg`.
@@ -722,8 +732,9 @@
 #             against the panes, in `sidebar_divider_fg`. The divider takes one
 #             column of `size`. Everything inside is the same in both styles:
 #             one column of left padding, a lowercase bold header
-#             (`sidebar_dim_fg`, or `frame_active_fg` while that panel has the
-#             keyboard) and a blank row above each panel's list, a
+#             on a full-width bar (`sidebar_header_bg` and `sidebar_dim_fg`, or
+#             `sidebar_header_active_bg` and `sidebar_header_active_fg` while
+#             that panel has the keyboard) and a blank row above each panel's list, a
 #             rule between stacked panels, and a full-width band
 #             (`sidebar_selection_bg`) behind the selected row. An unknown
 #             value is a parse error. Applies on config reload.

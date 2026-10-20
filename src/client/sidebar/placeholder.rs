@@ -49,7 +49,7 @@ impl SidebarPlugin for PlaceholderPlugin {
         if grid.is_empty() {
             return grid;
         }
-        super::nav::draw_header(&mut grid, self.title(), focused, theme, &bg);
+        super::nav::draw_header(&mut grid, self.title(), focused, theme);
         if rows > super::nav::LIST_HEADER_ROWS as u16 {
             let marker = if focused { "focused" } else { "idle" };
             draw_text(

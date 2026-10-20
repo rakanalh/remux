@@ -471,7 +471,22 @@ impl Chrome {
                     y: b.y - bar.y,
                     ..b
                 };
-                frame::draw_chip(&mut grid, local, collapse_glyph(sb.edge), theme);
+                let on_active_bar = panels.iter().zip(mine.iter()).any(|(&pi, r)| {
+                    self.focus
+                        == ChromeFocus::Sidebar {
+                            sidebar: si,
+                            panel: pi,
+                        }
+                        && r.y == b.y
+                        && (r.x..r.x + r.width).contains(&b.x)
+                });
+                frame::draw_chip(
+                    &mut grid,
+                    local,
+                    collapse_glyph(sb.edge),
+                    on_active_bar,
+                    theme,
+                );
             }
             renderer.paint_panel(bar, &grid)?;
         }

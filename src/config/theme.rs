@@ -240,6 +240,15 @@ pub struct ThemeConfig {
     pub sidebar_selection_bg: ThemeColor,
     /// Section headers and secondary lines in a sidebar panel.
     pub sidebar_dim_fg: ThemeColor,
+    /// Background of a sidebar panel's header bar while the panel does not hold
+    /// the keyboard. The title on it uses `sidebar_dim_fg`.
+    pub sidebar_header_bg: ThemeColor,
+    /// Background of a sidebar panel's header bar while the panel holds the
+    /// keyboard.
+    pub sidebar_header_active_bg: ThemeColor,
+    /// The header title while the panel holds the keyboard. Its own token so a
+    /// theme can recolour it without moving `frame_active_fg`.
+    pub sidebar_header_active_fg: ThemeColor,
     /// The selected item's name in a sidebar panel. Unselected names use
     /// `status_bar_fg`.
     pub sidebar_name_selected_fg: ThemeColor,
@@ -332,6 +341,9 @@ impl Default for ThemeConfig {
             sidebar_divider_fg: ThemeColor::Rgb(49, 50, 68), // surface0
             sidebar_selection_bg: ThemeColor::Rgb(49, 50, 68), // surface0
             sidebar_dim_fg: ThemeColor::Rgb(108, 112, 134),  // overlay0
+            sidebar_header_bg: ThemeColor::Rgb(24, 24, 37),  // mantle
+            sidebar_header_active_bg: ThemeColor::Rgb(69, 71, 90), // surface1
+            sidebar_header_active_fg: ThemeColor::Rgb(137, 180, 250), // blue
             sidebar_name_selected_fg: ThemeColor::Rgb(205, 214, 244), // text
             sidebar_button_bg: ThemeColor::Rgb(69, 71, 90),  // surface1
             sidebar_strip_bg: ThemeColor::Rgb(49, 50, 68),   // surface0
@@ -509,6 +521,9 @@ pub struct CompositorTheme {
     pub sidebar_divider_fg: CellColor,
     pub sidebar_selection_bg: CellColor,
     pub sidebar_dim_fg: CellColor,
+    pub sidebar_header_bg: CellColor,
+    pub sidebar_header_active_bg: CellColor,
+    pub sidebar_header_active_fg: CellColor,
     pub sidebar_name_selected_fg: CellColor,
     pub sidebar_button_bg: CellColor,
     pub sidebar_strip_bg: CellColor,
@@ -558,6 +573,9 @@ impl CompositorTheme {
             sidebar_divider_fg: config.sidebar_divider_fg.to_cell_color(),
             sidebar_selection_bg: config.sidebar_selection_bg.to_cell_color(),
             sidebar_dim_fg: config.sidebar_dim_fg.to_cell_color(),
+            sidebar_header_bg: config.sidebar_header_bg.to_cell_color(),
+            sidebar_header_active_bg: config.sidebar_header_active_bg.to_cell_color(),
+            sidebar_header_active_fg: config.sidebar_header_active_fg.to_cell_color(),
             sidebar_name_selected_fg: config.sidebar_name_selected_fg.to_cell_color(),
             sidebar_button_bg: config.sidebar_button_bg.to_cell_color(),
             sidebar_strip_bg: config.sidebar_strip_bg.to_cell_color(),
@@ -711,6 +729,9 @@ mod tests {
         assert_eq!(ct.sidebar_divider_fg, CellColor::Rgb(49, 50, 68)); // surface0
         assert_eq!(ct.sidebar_selection_bg, CellColor::Rgb(49, 50, 68)); // surface0
         assert_eq!(ct.sidebar_dim_fg, CellColor::Rgb(108, 112, 134)); // overlay0
+        assert_eq!(ct.sidebar_header_bg, CellColor::Rgb(24, 24, 37)); // mantle
+        assert_eq!(ct.sidebar_header_active_bg, CellColor::Rgb(69, 71, 90)); // surface1
+        assert_eq!(ct.sidebar_header_active_fg, CellColor::Rgb(137, 180, 250)); // blue
         assert_eq!(ct.sidebar_name_selected_fg, CellColor::Rgb(205, 214, 244)); // text
         assert_eq!(ct.sidebar_button_bg, CellColor::Rgb(69, 71, 90)); // surface1
         assert_eq!(ct.sidebar_strip_bg, CellColor::Rgb(49, 50, 68)); // surface0

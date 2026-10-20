@@ -139,11 +139,30 @@ pub fn draw_flat_frame(
 ///
 /// Used for the collapse button on an expanded sidebar and for the chip on a
 /// collapsed strip. A one-cell rect is the glyph alone.
-pub fn draw_chip(grid: &mut [Vec<RenderCell>], rect: Rect, glyph: char, theme: &CompositorTheme) {
+///
+/// `on_active_bar` is for a chip sitting on a focused panel's header bar. The
+/// button background defaults to the same surface1 as that bar, so the chip
+/// would vanish; it is drawn inverted instead, with the bar's accent as its
+/// background and the bar's own colour as the glyph.
+pub fn draw_chip(
+    grid: &mut [Vec<RenderCell>],
+    rect: Rect,
+    glyph: char,
+    on_active_bar: bool,
+    theme: &CompositorTheme,
+) {
+    let (fg, bg) = if on_active_bar {
+        (
+            &theme.sidebar_header_active_bg,
+            &theme.sidebar_header_active_fg,
+        )
+    } else {
+        (&theme.sidebar_name_selected_fg, &theme.sidebar_button_bg)
+    };
     for dy in 0..rect.height {
         for dx in 0..rect.width {
-            let mut cell = border_cell(' ', &theme.sidebar_name_selected_fg, theme);
-            cell.bg = theme.sidebar_button_bg.clone();
+            let mut cell = border_cell(' ', fg, theme);
+            cell.bg = bg.clone();
             if dx == rect.width / 2 && dy == rect.height / 2 {
                 cell.c = glyph;
                 cell.bold = true;
@@ -169,7 +188,7 @@ pub fn draw_strip(
         }
     }
     if let Some((rect, glyph)) = chip {
-        draw_chip(grid, rect, glyph, theme);
+        draw_chip(grid, rect, glyph, false, theme);
     }
 }
 
@@ -501,13 +520,37 @@ mod tests {
             width: 3,
             height: 1,
         };
-        draw_chip(&mut g, chip, '\u{25C0}', &t);
+        draw_chip(&mut g, chip, '\u{25C0}', false, &t);
         assert_eq!(chars(&g)[1], "    \u{20}\u{25C0}\u{20} ");
         for cell in &g[1][4..7] {
             assert_eq!(cell.bg, t.sidebar_button_bg);
         }
         assert_eq!(g[1][3].bg, CellColor::Default);
         assert_eq!(g[1][5].fg, t.sidebar_name_selected_fg);
+        assert!(g[1][5].bold);
+    }
+
+    #[test]
+    fn a_chip_on_a_focused_header_bar_is_inverted_against_the_bar() {
+        let t = theme();
+        let mut g = blank_grid(8, 2, CellColor::Default);
+        for cell in &mut g[1] {
+            cell.bg = t.sidebar_header_active_bg.clone();
+        }
+        let chip = Rect {
+            x: 4,
+            y: 1,
+            width: 3,
+            height: 1,
+        };
+        draw_chip(&mut g, chip, '\u{25BC}', true, &t);
+        for cell in &g[1][4..7] {
+            assert_eq!(cell.bg, t.sidebar_header_active_fg);
+            assert_ne!(cell.bg, g[1][3].bg, "the chip must differ from the bar");
+        }
+        assert_eq!(g[1][5].c, '\u{25BC}');
+        assert_eq!(g[1][5].fg, t.sidebar_header_active_bg);
+        assert_ne!(g[1][5].fg, g[1][5].bg);
         assert!(g[1][5].bold);
     }
 }
