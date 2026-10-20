@@ -4,7 +4,7 @@ Drives the actual client binary through a pseudo-terminal (pexpect) and reads
 the rendered screen with pyte. Spins up an isolated throwaway server (the client
 auto-spawns it) with its own XDG dirs and a short socket path.
 """
-import atexit, os, shutil, signal, subprocess, time, pexpect, pyte
+import atexit, os, shutil, signal, subprocess, sys, time, pexpect, pyte
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -52,6 +52,92 @@ def install_notify_shims(bindir):
             f.write(f"#!/bin/sh\nprintf '%s\\n' \"{name} $*\" >> \"{log}\"\n")
         os.chmod(path, 0o755)
     return log
+
+
+# remux names a pane's agent from the PTY foreground process (`tcgetpgrp`). A
+# `#!/bin/sh` stand-in keeps its own name only where the kernel reports the
+# script's basename (Linux `comm`); on macOS the foreground process is `sh`, so
+# the agent is never detected. This wrapper is a real binary under the agent's
+# name that runs `<name>.sh` as a child, so the group leader keeps the name.
+# The child stays in the wrapper's process group (a group kill or tty Ctrl-C
+# reaches both), and the signals below are forwarded so a kill aimed at the
+# wrapper's pid alone does not orphan the script.
+_STANDIN_C = r"""
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile pid_t child;
+
+static void forward(int sig) {
+    if (child > 0) kill(child, sig);
+}
+
+int main(int argc, char **argv) {
+    char script[4096];
+    snprintf(script, sizeof script, "%s.sh", SCRIPT);
+    int fwd[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+    for (unsigned i = 0; i < sizeof fwd / sizeof *fwd; i++) signal(fwd[i], forward);
+    char *args[argc + 3];
+    args[0] = "sh";
+    args[1] = script;
+    for (int i = 1; i < argc; i++) args[i + 1] = argv[i];
+    args[argc + 1] = NULL;
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (unsigned i = 0; i < sizeof fwd / sizeof *fwd; i++) signal(fwd[i], SIG_DFL);
+        execv("/bin/sh", args);
+        _exit(127);
+    }
+    child = pid;
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return 1;
+}
+"""
+
+_standin_cc_warned = False
+
+
+def install_agent_standin(bin_dir, name, script_body):
+    """Install a stand-in agent called `name` in `bin_dir`.
+
+    `script_body` is a `#!/bin/sh` script. It is written as `<name>.sh` and
+    `<name>` is a compiled wrapper that runs it, so process detection sees the
+    agent's name on macOS as well as Linux. Without a C compiler, `<name>` is
+    the script itself (detected on Linux only) and a notice is printed once.
+    """
+    global _standin_cc_warned
+    os.makedirs(bin_dir, exist_ok=True)
+    script = os.path.join(bin_dir, f"{name}.sh")
+    with open(script, "w") as f:
+        f.write(script_body)
+    os.chmod(script, 0o755)
+    target = os.path.join(bin_dir, name)
+    cc = shutil.which("cc")
+    if cc:
+        src = os.path.join(bin_dir, f".{name}-standin.c")
+        with open(src, "w") as f:
+            f.write(_STANDIN_C)
+        r = subprocess.run(
+            [cc, "-O1", f'-DSCRIPT="{os.path.join(bin_dir, name)}"', "-o", target, src],
+            capture_output=True, text=True)
+        os.remove(src)
+        if r.returncode == 0:
+            return target
+        print(f"note: stand-in wrapper compile failed ({r.stderr.strip()[:200]}); "
+              f"using a script stand-in", file=sys.stderr)
+    elif not _standin_cc_warned:
+        print("note: no `cc` on PATH; agent stand-ins are plain scripts "
+              "(not detected on macOS)", file=sys.stderr)
+    _standin_cc_warned = True
+    shutil.copyfile(script, target)
+    os.chmod(target, 0o755)
+    return target
 
 
 class Tui:

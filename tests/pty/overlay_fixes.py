@@ -32,7 +32,7 @@ import pyte
 # The shared stand-ins for the desktop notifier: a run must not pop real
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import install_notify_shims  # noqa: E402
+from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 RUN = "/tmp/rmxov-a1afb"
@@ -130,10 +130,7 @@ def setup_dirs(config):
     install_notify_shims(f"{RUN}/bin")
     write_config("cfg", config)
     write_config("cfg-none", "")
-    p = f"{RUN}/bin/claude"
-    with open(p, "w") as f:
-        f.write(AGENT)
-    os.chmod(p, 0o755)
+    install_agent_standin(f"{RUN}/bin", "claude", AGENT)
     shim = f"{RUN}/bin/ssh"
     with open(shim, "w") as f:
         f.write(
