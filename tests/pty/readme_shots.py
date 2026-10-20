@@ -35,7 +35,7 @@ import pyte
 # The shared stand-ins for the desktop notifier: a run must not pop real
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import install_notify_shims  # noqa: E402
+from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
 import pyte.graphics
 from PIL import Image
 
@@ -718,8 +718,8 @@ def demo_repo(env):
 
 
 def install_standins(env):
-    env.install("claude", AGENT)
-    env.install("codex", AGENT)
+    install_agent_standin(f"{env.run}/bin", "claude", AGENT)
+    install_agent_standin(f"{env.run}/bin", "codex", AGENT)
     env.install("cargo", CARGO)
     env.install("kubectl", KUBECTL)
     env.install("npm", NPM)
