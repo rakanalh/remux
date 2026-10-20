@@ -67,6 +67,8 @@ Defaults are the Catppuccin Mocha palette. Colours for pane frames, tab chips an
 | `sidebar_current_bg` | `"#3e385e"` |
 | `sidebar_divider_fg` / `sidebar_selection_bg` | `"#313244"` / `"#313244"` |
 | `sidebar_dim_fg` / `sidebar_name_selected_fg` | `"#6c7086"` / `"#cdd6f4"` |
+| `sidebar_header_bg` | `"#181825"` |
+| `sidebar_header_active_bg` / `sidebar_header_active_fg` | `"#89b4fa"` / `"#1e1e2e"` |
 | `sidebar_button_bg` / `sidebar_strip_bg` | `"#45475a"` / `"#313244"` |
 | `whichkey_fg` / `whichkey_bg` / `whichkey_key_fg` | `"#cdd6f4"` / `"#181825"` / `"#a6e3a1"` |
 | `separator_fg` | `"#6c7086"` |

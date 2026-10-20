@@ -140,10 +140,11 @@ pub fn draw_flat_frame(
 /// Used for the collapse button on an expanded sidebar and for the chip on a
 /// collapsed strip. A one-cell rect is the glyph alone.
 ///
-/// `on_active_bar` is for a chip sitting on a focused panel's header bar. The
-/// button background defaults to the same surface1 as that bar, so the chip
-/// would vanish; it is drawn inverted instead, with the bar's accent as its
-/// background and the bar's own colour as the glyph.
+/// `on_active_bar` is for a chip sitting on a focused panel's header bar. It is
+/// drawn inverted there, with the bar's title colour as its background and the
+/// bar's own colour as the glyph. `sidebar_button_bg` is a separate token that
+/// a theme can set to any colour, including the bar's, so only a rule built
+/// from the bar's own two colours keeps the chip visible on it.
 pub fn draw_chip(
     grid: &mut [Vec<RenderCell>],
     rect: Rect,

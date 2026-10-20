@@ -162,7 +162,9 @@ session_name_fg = "#94e2d5"
 | `whichkey_fg`, `whichkey_bg`, `whichkey_key_fg` | The which-key popup and its key column |
 | `sidebar_current_bg` | The agents panel's band for the pane you are in. Keep it distinct from `sidebar_selection_bg`; the selection wins on a row that is both. |
 | `sidebar_selection_bg` | The full-width band behind a sidebar panel's selected row (both lines of an agent) |
-| `sidebar_dim_fg` | Panel headers and an agent row's second line |
+| `sidebar_dim_fg` | Panel header titles and an agent row's second line |
+| `sidebar_header_bg` | The full-width header bar of a panel that does not have the keyboard |
+| `sidebar_header_active_bg`, `sidebar_header_active_fg` | The header bar and its title while the panel has the keyboard. A collapse chip on that bar is drawn in these two colours reversed |
 | `sidebar_name_selected_fg` | The selected item's name (other names use `status_bar_fg`), and the glyph on the collapse chip |
 | `sidebar_divider_fg` | The divider column of a `flat` sidebar |
 | `sidebar_button_bg`, `sidebar_strip_bg` | The [collapse button](/remux/sidebars/#collapse-to-a-strip) chip, and the whole strip a collapsed sidebar leaves behind |

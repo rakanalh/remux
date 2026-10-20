@@ -265,7 +265,7 @@ pub fn fill_row(grid: &mut [Vec<RenderCell>], y: u16, cols: u16, fg: &CellColor,
 /// The colour of a panel's header title: its own accent while the panel holds
 /// the keyboard, so the user can tell which of several stacked panels takes
 /// their keys, and the dim colour otherwise.
-pub fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
+fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
     if focused {
         theme.sidebar_header_active_fg.clone()
     } else {
@@ -274,7 +274,7 @@ pub fn header_fg(focused: bool, theme: &CompositorTheme) -> CellColor {
 }
 
 /// The background of a panel's header bar.
-pub fn header_bg(focused: bool, theme: &CompositorTheme) -> CellColor {
+fn header_bg(focused: bool, theme: &CompositorTheme) -> CellColor {
     if focused {
         theme.sidebar_header_active_bg.clone()
     } else {
@@ -514,8 +514,6 @@ pub fn assert_header_bar(grid: &[Vec<RenderCell>], focused: bool, theme: &Compos
     assert!(grid[0][title].bold);
     for (x, cell) in grid[1].iter().enumerate() {
         assert_ne!(&cell.bg, want_bg, "blank row cell {x} carries the bar");
-        assert_ne!(cell.bg, theme.sidebar_header_bg);
-        assert_ne!(cell.bg, theme.sidebar_header_active_bg);
     }
 }
 

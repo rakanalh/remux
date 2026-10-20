@@ -1387,8 +1387,8 @@ mod focus_tests {
         }])
     }
 
-    /// Where `paint` draws the bottom sidebar's collapse chip glyph, in screen
-    /// coordinates, and the cell the renderer holds there after a paint.
+    /// The cell the renderer holds at the centre of the collapse chip after a
+    /// `paint` of the first sidebar.
     fn painted_chip_glyph(c: &Chrome, theme: &CompositorTheme) -> RenderCell {
         let (cols, rows) = (60, 20);
         let mut renderer = Renderer::new(cols, rows);
@@ -1404,6 +1404,16 @@ mod focus_tests {
         renderer.front_buffer()[chip.y as usize][(chip.x + chip.width / 2) as usize].clone()
     }
 
+    fn styled_chrome(edge: SidebarEdge, style: SidebarStyle, size: u16) -> Chrome {
+        let mut c = chrome_with_panels(edge, size, 2);
+        c.sidebars[0].style = style;
+        c
+    }
+
+    fn focus_panel(c: &mut Chrome, panel: usize) {
+        c.focus = ChromeFocus::Sidebar { sidebar: 0, panel };
+    }
+
     #[test]
     fn the_chip_inverts_only_when_the_focused_panel_owns_its_header_row() {
         let theme = CompositorTheme::default();
@@ -1414,24 +1424,51 @@ mod focus_tests {
         assert_eq!(idle.bg, theme.sidebar_button_bg);
 
         // The chip sits at the stack's far end, over the LAST panel's header.
-        c.focus = ChromeFocus::Sidebar {
-            sidebar: 0,
-            panel: 0,
-        };
+        focus_panel(&mut c, 0);
         let elsewhere = painted_chip_glyph(&c, &theme);
         assert_eq!(
             elsewhere.bg, theme.sidebar_button_bg,
             "another panel's focus"
         );
 
-        c.focus = ChromeFocus::Sidebar {
-            sidebar: 0,
-            panel: 1,
-        };
+        focus_panel(&mut c, 1);
         let on_bar = painted_chip_glyph(&c, &theme);
         assert_eq!(on_bar.bg, theme.sidebar_header_active_fg);
         assert_eq!(on_bar.fg, theme.sidebar_header_active_bg);
         assert_ne!(on_bar.bg, theme.sidebar_header_active_bg);
+    }
+
+    /// On a left or right sidebar the chip is on the last row, never over a
+    /// header, even though both stacked panels share its columns.
+    #[test]
+    fn a_side_sidebars_chip_is_never_inverted() {
+        let theme = CompositorTheme::default();
+        for edge in [SidebarEdge::Left, SidebarEdge::Right] {
+            for style in [SidebarStyle::Boxed, SidebarStyle::Flat] {
+                let mut c = styled_chrome(edge, style, 30);
+                for panel in 0..2 {
+                    focus_panel(&mut c, panel);
+                    let chip = painted_chip_glyph(&c, &theme);
+                    assert_eq!(
+                        chip.bg, theme.sidebar_button_bg,
+                        "{edge:?} {style:?} panel {panel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_bottom_sidebars_chip_inverts_on_the_last_panel_only() {
+        let theme = CompositorTheme::default();
+        let mut c = styled_chrome(SidebarEdge::Bottom, SidebarStyle::Flat, 6);
+        focus_panel(&mut c, 0);
+        assert_eq!(painted_chip_glyph(&c, &theme).bg, theme.sidebar_button_bg);
+        focus_panel(&mut c, 1);
+        assert_eq!(
+            painted_chip_glyph(&c, &theme).bg,
+            theme.sidebar_header_active_fg
+        );
     }
 
     #[test]
