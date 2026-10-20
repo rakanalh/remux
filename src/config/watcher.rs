@@ -1,6 +1,6 @@
 //! Config file watching for live-reload.
 //!
-//! This module watches `~/.config/remux/config.toml` for changes and sends
+//! This module watches the config file ([`crate::paths::config_file`]) for changes and sends
 //! the reloaded configuration through a channel when the file is modified.
 //!
 //! The config path may be a symlink (a dotfiles checkout is the usual reason).

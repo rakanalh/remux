@@ -7799,7 +7799,7 @@ async fn run_client_loop(
                 }
             }
             // Config hot-reload (rare, low-priority). Applies client-side
-            // settings live so edits to ~/.config/remux/config.toml don't
+            // settings live so edits to the config file don't
             // require a restart. The channel is kept open by `_cfg_keepalive`,
             // so `None` only appears on a genuine full teardown.
             maybe_cfg = cfg_rx.recv() => {

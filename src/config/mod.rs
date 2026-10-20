@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 // Config root
 // ---------------------------------------------------------------------------
 
-/// Top-level Remux configuration, loaded from `~/.config/remux/config.toml`.
+/// Top-level Remux configuration, loaded from the config file
+/// ([`crate::paths::config_file`]).
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -336,7 +337,7 @@ impl Default for Config {
 // ---------------------------------------------------------------------------
 
 impl Config {
-    /// Load the configuration from `~/.config/remux/config.toml`.
+    /// Load the configuration from the config file ([`crate::paths::config_file`]).
     ///
     /// If the file does not exist, returns the default configuration.
     /// If the file exists but contains invalid TOML, returns an error.
