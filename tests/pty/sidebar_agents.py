@@ -49,7 +49,7 @@ import pyte
 # The shared stand-ins for the desktop notifier: a run must not pop real
 # notifications for this test's agents.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import install_notify_shims  # noqa: E402
+from pty_harness import install_agent_standin, install_notify_shims  # noqa: E402
 
 BIN = os.path.abspath("target/debug/remux")
 RUN = "/tmp/rmx-sba"
@@ -131,6 +131,7 @@ def env_local():
     return {
         **os.environ,
         "PATH": f"{RUN}/bin:" + os.environ.get("PATH", ""),
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": f"{RUN}/run",
         "XDG_STATE_HOME": f"{RUN}/state",
         "XDG_DATA_HOME": f"{RUN}/data",
@@ -145,13 +146,14 @@ def env_local():
 
 def setup_dirs():
     shutil.rmtree(RUN, ignore_errors=True)
-    for s in ("run", "state", "data", "bin", "cfg"):
+    for s in ("run", "state", "data", "bin", "cfg", "home"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     os.makedirs(f"{RUN}/cfg/remux", exist_ok=True)
     install_notify_shims(f"{RUN}/bin")
     with open(f"{RUN}/cfg/remux/config.toml", "w") as f:
         f.write(CFG)
-    for name in ("claude", "notanagent"):
+    install_agent_standin(f"{RUN}/bin", "claude", AGENT)
+    for name in ("notanagent",):
         p = f"{RUN}/bin/{name}"
         with open(p, "w") as f:
             f.write(AGENT)

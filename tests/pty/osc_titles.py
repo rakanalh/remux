@@ -23,7 +23,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pty_harness import Tui, sm_compose_view  # noqa: E402
+from pty_harness import Tui, install_agent_standin, sm_compose_view  # noqa: E402
 
 RUN = "/tmp/rmx-osctp"
 BINDIR = "/tmp/rmx-osctp-bin"
@@ -91,10 +91,7 @@ def in_content(t, needle):
 
 def write_agent():
     os.makedirs(BINDIR, exist_ok=True)
-    p = f"{BINDIR}/claude"
-    with open(p, "w") as f:
-        f.write(AGENT)
-    os.chmod(p, 0o755)
+    install_agent_standin(BINDIR, "claude", AGENT)
 
 
 def start(config, rundir):

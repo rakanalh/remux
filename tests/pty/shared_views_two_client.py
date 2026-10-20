@@ -25,6 +25,7 @@ MARK_B = "BBBB_bravo"
 def env_for():
     return {
         **os.environ,
+        "HOME": f"{RUN}/home",
         "XDG_RUNTIME_DIR": f"{RUN}/run",
         "XDG_STATE_HOME": f"{RUN}/state",
         "XDG_DATA_HOME": f"{RUN}/data",
@@ -39,7 +40,7 @@ def env_for():
 
 def start_server():
     shutil.rmtree(RUN, ignore_errors=True)
-    for s in ("run", "state", "data", "config"):
+    for s in ("run", "state", "data", "config", "home"):
         os.makedirs(f"{RUN}/{s}", exist_ok=True)
     p = subprocess.Popen(
         [BIN, "server"], env=env_for(),
