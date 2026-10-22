@@ -327,9 +327,10 @@ pub fn compose_box(
 pub struct PopupState {
     position: PopupPosition,
     pct: (u8, u8),
-    /// Runtime resizes, per session. A session with no entry uses the config's
+    /// Runtime resizes, per position, so widening a right drawer leaves a later
+    /// float as it was. A position with no entry uses the config's
     /// percentages. Reset whenever a popup config key changes.
-    overrides: HashMap<String, (u8, u8)>,
+    overrides: HashMap<PopupPosition, (u8, u8)>,
     /// The box last announced to the server, with the connection it went to,
     /// so an identical send is skipped.
     last_sent: Option<(ConnId, PopupBox)>,
@@ -379,8 +380,8 @@ impl PopupState {
         true
     }
 
-    fn pct_for(&self, session: &str) -> (u8, u8) {
-        self.overrides.get(session).copied().unwrap_or(self.pct)
+    fn pct_for(&self, position: PopupPosition) -> (u8, u8) {
+        self.overrides.get(&position).copied().unwrap_or(self.pct)
     }
 
     /// Where `session`'s popup goes: where its key put the popup on screen,
@@ -398,7 +399,7 @@ impl PopupState {
     pub fn popup_box(&self, session: &str, window: (u16, u16), content: Rect) -> PopupBox {
         popup_box(
             self.position_for(session),
-            self.pct_for(session),
+            self.pct_for(self.position_for(session)),
             window,
             content,
         )
@@ -463,9 +464,9 @@ impl PopupState {
         let adjust = |cur: u8, delta: i16| -> u8 {
             (cur as i16 + delta).clamp(POPUP_MIN_PCT as i16, POPUP_MAX_PCT as i16) as u8
         };
-        let (w, h) = self.pct_for(session);
+        let (w, h) = self.pct_for(position);
         self.overrides
-            .insert(session.to_string(), (adjust(w, dw), adjust(h, dh)));
+            .insert(position, (adjust(w, dw), adjust(h, dh)));
         true
     }
 
@@ -725,34 +726,46 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_is_per_session_and_clamped() {
-        let mut s = PopupState::from_config(&config_with(PopupPosition::Float, 80, 80));
+    fn a_resize_is_per_position_and_clamped() {
+        use PopupPosition::{Float, Right};
+        let mut s = PopupState::from_config(&config_with(Float, 80, 80));
+        s.toggle("a", Some(Right), false);
+        s.bind_layer("a", Some(7));
         for _ in 0..10 {
-            s.resize("a", 20, 20);
+            s.resize("a", 20, 0);
         }
-        assert_eq!(s.pct_for("a"), (100, 100));
-        assert_eq!(s.pct_for("b"), (80, 80), "another session is unaffected");
+        assert_eq!(s.pct_for(Right), (100, 80));
+        assert_eq!(s.pct_for(Float), (80, 80), "a later float is not widened");
+        // The right drawer of another session is the same position.
+        s.toggle("b", Some(Right), false);
+        s.bind_layer("b", Some(9));
+        assert_eq!(
+            s.popup_box("b", WINDOW, left_sidebar()),
+            popup_box(Right, (100, 80), WINDOW, left_sidebar())
+        );
         for _ in 0..10 {
-            s.resize("a", -20, -20);
+            s.resize("b", -20, 0);
         }
-        assert_eq!(s.pct_for("a"), (20, 20));
+        assert_eq!(s.pct_for(Right), (20, 80));
     }
 
     #[test]
     fn a_changed_popup_key_resets_every_override() {
-        let mut s = PopupState::from_config(&config_with(PopupPosition::Float, 80, 80));
+        use PopupPosition::{Float, Left};
+        let mut s = PopupState::from_config(&config_with(Float, 80, 80));
         s.resize("a", 5, 5);
-        assert!(!s.apply_config(&config_with(PopupPosition::Float, 80, 80)));
+        assert!(!s.apply_config(&config_with(Float, 80, 80)));
         assert_eq!(
-            s.pct_for("a"),
+            s.pct_for(Float),
             (85, 85),
             "an unchanged config keeps overrides"
         );
-        assert!(s.apply_config(&config_with(PopupPosition::Left, 80, 80)));
-        assert_eq!(s.pct_for("a"), (80, 80));
+        assert!(s.apply_config(&config_with(Left, 80, 80)));
+        assert_eq!(s.pct_for(Float), (80, 80));
         s.resize("a", 5, 0);
-        assert!(s.apply_config(&config_with(PopupPosition::Left, 50, 80)));
-        assert_eq!(s.pct_for("a"), (50, 80));
+        assert_eq!(s.pct_for(Left), (85, 80));
+        assert!(s.apply_config(&config_with(Left, 50, 80)));
+        assert_eq!(s.pct_for(Left), (50, 80));
     }
 
     #[test]

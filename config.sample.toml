@@ -108,7 +108,8 @@
 #     ("float", "top", "bottom"). Ignored by "left" and "right".
 # Both are clamped to 20..=100 (default: 80 / 80). While the popup is open the
 # pane-resize keys (`Ctrl-a p R h/j/k/l`) resize it on the axis its position uses;
-# that adjustment lasts until one of these three keys changes. The popup's
+# that adjustment is kept for that position only (widening a right drawer leaves
+# the float as it was) and lasts until one of these three keys changes. The popup's
 # terminal is as large as the smallest popup any client attached to the session
 # asks for.
 # popup_position = "float"
