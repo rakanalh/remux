@@ -12168,6 +12168,38 @@ mod popup_tests {
             rx
         }
 
+        /// Split tab 0's focused pane with a pane running `/bin/sh` in `cwd`.
+        /// The new pane is focused, as a split focuses it.
+        async fn split(&self, cwd: &std::path::Path) -> PaneId {
+            let pane_id = {
+                let mut st = self.state.lock().await;
+                let pane_id = st.next_pane_id();
+                let tab = &mut st.sessions.get_mut("main").unwrap().tabs[0];
+                let focused = tab.focused_pane;
+                tab.layout.split_vertical(focused, pane_id);
+                tab.pane_order.push(pane_id);
+                tab.focus_pane(pane_id);
+                pane_id
+            };
+            spawn_pane(
+                pane_id,
+                50,
+                29,
+                None,
+                &[],
+                Some(cwd),
+                Some(PaneIdentity {
+                    session: "main",
+                    pane: pane_id,
+                }),
+                &self.panes,
+                &self.config,
+            )
+            .await
+            .expect("spawn");
+            pane_id
+        }
+
         /// A second session whose pane runs `/bin/sh` in `cwd`.
         async fn new_session(&self, name: &str, cwd: &std::path::Path) {
             let pane_id = self
@@ -12264,6 +12296,53 @@ mod popup_tests {
         assert_eq!(sess.visible_popup(), Some(first));
         assert!(sess.tabs[1].popup_visible);
         drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_first_toggle_in_a_tab_opens_in_the_focused_panes_cwd() {
+        let a = tempfile::tempdir().expect("dir a");
+        let b = tempfile::tempdir().expect("dir b");
+        let rig = Rig::new(100, 30, None, a.path()).await;
+        let first = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let second = rig.split(b.path()).await;
+        for (focus, dir) in [(second, b.path()), (first, a.path())] {
+            rig.state
+                .lock()
+                .await
+                .sessions
+                .get_mut("main")
+                .unwrap()
+                .tabs[0]
+                .focus_pane(focus);
+            rig.command(RemuxCommand::PopupToggle).await;
+            let popup = rig.popup_of(0).await.expect("popup");
+            let cwd = {
+                let ps = rig.panes.lock().await;
+                persistence::get_pane_cwd(ps[&popup].pty.child_pid)
+            };
+            assert_eq!(
+                cwd.map(std::path::PathBuf::from).map(|p| canonical(&p)),
+                Some(canonical(dir)),
+                "focused pane {focus}"
+            );
+            // Close it and reap it, so the next toggle is a first one again.
+            let taken = rig
+                .state
+                .lock()
+                .await
+                .sessions
+                .get_mut("main")
+                .unwrap()
+                .tabs[0]
+                .take_popup();
+            reap_panes(
+                &taken.into_iter().collect::<Vec<_>>(),
+                &rig.panes,
+                &rig.clients,
+            )
+            .await;
+        }
         rig.finish().await;
     }
 

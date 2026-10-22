@@ -453,10 +453,51 @@ def per_tab_case():
     return fails
 
 
+def popup_line_with(tui, needle):
+    """Whether a line of the float's interior holds `needle` as output: not the
+    typed command or a prompt, which carry the `$`."""
+    rows = list(tui.rows_text())
+    return any(needle in r[17:143] and "$" not in r[17:143] for r in rows[6:41])
+
+
+def in_tab_cwd_case():
+    print("\n== the first popup in a tab opens in the focused pane's directory ==")
+    fails = []
+    check = make_check(fails)
+    dir_a, dir_b = "/tmp/rmxpop/cwdA", "/tmp/rmxpop/cwdB"
+    for d in (dir_a, dir_b):
+        os.makedirs(d, exist_ok=True)
+    tui = start("/tmp/rmxpop/sb_cwd", cfg())
+    try:
+        tui.send(f"cd {dir_a}\r".encode())
+        tui.pump(0.8)
+        # Split: the new pane starts in dir A too, so move it to dir B.
+        tui.prefix(b"pv", 1.8)
+        tui.send(f"cd {dir_b}\r".encode())
+        tui.pump(0.8)
+        # Focus away and back, so pane 2 is focused by a focus key and not
+        # merely because it is the newest pane.
+        tui.send(b"\x1bh", 0.8)
+        tui.send(b"\x1bl", 0.8)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(list(tui.rows_text())[5][16] == "\u256d", "the popup opens")
+        tui.send(b"pwd\r")
+        tui.pump(1.2)
+        check(popup_line_with(tui, dir_b),
+              "the popup starts in the focused pane's directory (dir B)")
+        check(not popup_line_with(tui, dir_a), "not in the first pane's (dir A)")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
 def main():
     all_fails = []
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
-                 live_reload_case, runtime_resize_case, per_tab_case):
+                 live_reload_case, runtime_resize_case, per_tab_case,
+                 in_tab_cwd_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:
