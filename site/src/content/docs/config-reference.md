@@ -25,10 +25,15 @@ Server-side. Needs `remux restart`.
 | `border_style` | `"zellij_style"` \| `"tmux_style"` | `"zellij_style"` | restart | Boxed panes with names in the border, or minimal tmux-style dividers. `Ctrl-a g` toggles it at runtime. |
 | `default_layout` | `"bsp"` \| `"master"` \| `"monocle"` \| `"grid"` \| `"columns"` \| `"rows"` \| `"custom"` | `"bsp"` | restart | Layout every new tab starts in. If `[layouts]` disables it, new tabs use the first enabled layout. |
 | `which_key_position` | `"anchored"` \| `"centered"` \| `"full_width"` | `"anchored"` | live | Where the which-key popup is drawn. |
-| `popup_width_pct` | integer | `80` | restart | Width of the popup terminal, as a percentage of the content area. Clamped to 20–100. |
-| `popup_height_pct` | integer | `80` | restart | Height of the popup terminal, as a percentage of the content area. Clamped to 20–100. |
+| `popup_position` | `"float"` \| `"left"` \| `"right"` \| `"top"` \| `"bottom"` | `"float"` | live | Where the popup terminal sits. `float` is a framed box centred on the whole window, drawn over every sidebar. `top` and `bottom` dock a drawer across the window's full width, over the sidebars; `left` and `right` dock one beside the sidebars. A drawer leaves its outer edge open. The status bar row is never covered. |
+| `popup_width_pct` | integer | `80` | live | Width of the popup terminal, as a percentage of the window's columns for `float`, or of the content area (the window minus the sidebars) for `left` and `right`. Ignored by `top` and `bottom`, which span the window. Clamped to 20–100. |
+| `popup_height_pct` | integer | `80` | live | Height of the popup terminal, as a percentage of the window's rows minus the status bar row, for `float`, `top` and `bottom`. Ignored by `left` and `right`, which run the full content height. Clamped to 20–100. |
 | `pane_title` | string | unset | live | Template pane names are drawn from. Placeholders: `{title}`, `{command}`, `{session}`, `{tab}`, `{cwd}`, `{host}`. Unset shows the pane's title if it has one, else its command. |
 | `status_bar_position` | `"top"` \| `"bottom"` | `"bottom"` | — | **Has no effect.** The status bar is always drawn on the bottom row. |
+
+The popup keys are client settings too. Saving the file moves and resizes an open popup at once, and a runtime resize with the pane-resize keys (`Ctrl-a p R h/j/k/l`) is dropped when any of the three keys changes. The resize keys adjust the popup on the axis its position uses and ignore the other one.
+
+Each tab has its own popup. The first `Alt-p` in a tab starts a shell in the directory of that tab's focused pane, and a popup stays open while you work in other tabs. The popup's terminal is as large as the smallest popup any client attached to the session asks for, so a second, smaller client shrinks it for everyone.
 
 `pane_title` is a client setting: your client sends it to every server it views, remotes included, and each one names panes with it. A name set with `PaneRename` always wins over the template.
 
