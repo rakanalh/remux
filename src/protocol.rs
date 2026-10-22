@@ -668,8 +668,10 @@ pub enum ServerMessage {
         status: Option<StatusInfo>,
         /// The popup terminal's layer, for a client that sent
         /// [`ClientMessage::PopupSize`]; `None` when no popup is visible.
+        /// Boxed so the frame variants stay small enough for the client's
+        /// `Incoming` queue; the wire encoding is the same as unboxed.
         #[serde(default)]
-        popup: Option<PopupCells>,
+        popup: Option<Box<PopupCells>>,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -716,7 +718,7 @@ pub enum ServerMessage {
         status: Option<StatusInfo>,
         /// As [`ServerMessage::FullRender::popup`].
         #[serde(default)]
-        popup: Option<PopupCells>,
+        popup: Option<Box<PopupCells>>,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -2996,11 +2998,11 @@ mod tests {
             viewport_top: 0,
             scroll_offset: 0,
             status: None,
-            popup: Some(layer.clone()),
+            popup: Some(Box::new(layer.clone())),
         };
         let json = serde_json::to_string(&full).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
-            ServerMessage::FullRender { popup, .. } => assert_eq!(popup, Some(layer.clone())),
+            ServerMessage::FullRender { popup, .. } => assert_eq!(popup.as_deref(), Some(&layer)),
             other => panic!("unexpected variant: {other:?}"),
         }
         let diff = ServerMessage::RenderDiff {
@@ -3015,11 +3017,11 @@ mod tests {
             viewport_top: 0,
             scroll_offset: 0,
             status: None,
-            popup: Some(layer.clone()),
+            popup: Some(Box::new(layer.clone())),
         };
         let json = serde_json::to_string(&diff).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
-            ServerMessage::RenderDiff { popup, .. } => assert_eq!(popup, Some(layer)),
+            ServerMessage::RenderDiff { popup, .. } => assert_eq!(popup.as_deref(), Some(&layer)),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
