@@ -22,6 +22,7 @@ use crate::client::input::{
     AgentSwitchOverlay, FolderSelectOverlay, InputAction, InputHandler, Mode, RenameTarget,
     SessionSwitchOverlay, SidebarIntent, TabPickerOverlay, TabPickerTree,
 };
+use crate::client::popup::{HeldLayer, PopupBox, PopupState};
 use crate::client::registry::{ConnId, ConnectionManager, Incoming, RemoteState};
 use crate::client::renderer::Renderer;
 use crate::client::session_manager::{NodeType, SessionManagerAction};
@@ -837,12 +838,16 @@ async fn client_event_loop(
 /// streaming `RenderDiff`s into a socket nobody drains (backpressure).
 async fn switch_to_server(
     mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
     target: &ConnId,
     content: crate::server::layout::Rect,
 ) -> Result<()> {
     if mgr.is_foreground(target) {
         return Ok(());
     }
+    // The popup layer belongs to the server being left. The first frame of the
+    // new foreground brings its own, and repaints what the box covered.
+    renderer.clear_popup();
     // Ensure a remote target is connected before handing off (it usually already
     // is, from expanding its node, but be safe).
     if let ConnId::Remote(name) = target {
@@ -987,7 +992,13 @@ fn content_rect_now(chrome: &crate::client::chrome::Chrome) -> Result<crate::ser
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseGrab {
     Content,
-    Panel { sidebar: usize, panel: usize },
+    Panel {
+        sidebar: usize,
+        panel: usize,
+    },
+    /// The interior of the popup box. A drag that began there keeps feeding the
+    /// popup and is clamped into its interior, never into the content rect.
+    Popup,
 }
 
 /// The focus direction a `PaneFocus*` command asks for, if it is one.
@@ -1121,7 +1132,7 @@ async fn switch_to_target(
     // renderer at it before the target server is told what size to composite.
     let content = content_rect_now(chrome)?;
     sync_content_rect(renderer, chrome, &content);
-    switch_to_server(mgr, &server, content).await?;
+    switch_to_server(mgr, renderer, &server, content).await?;
     // The server's handle_command ignores commands from a client with no
     // attached session, so a remote switch must attach first (a harmless
     // re-attach for local). Attaching alone is what a session-level jump is.
@@ -1636,6 +1647,189 @@ fn sync_content_rect(
         content.height - u16::from(owned && content.height > 0),
     );
     renderer.set_status_row_owned(owned);
+}
+
+/// The key a session's runtime popup resize is kept under: the server and the
+/// session on it, so two servers' sessions of the same name do not share one.
+fn popup_key(attached: &Option<(ConnId, String)>) -> String {
+    match attached {
+        Some((conn, name)) => format!("{conn:?}/{name}"),
+        None => String::new(),
+    }
+}
+
+/// The popup box for the foreground session, in the terminal as the renderer
+/// sees it. The size is the renderer's, not a fresh `terminal::size()`, for the
+/// reason `Renderer::size` gives.
+fn popup_box_now(
+    popup: &PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> PopupBox {
+    let (tc, tr) = renderer.size();
+    popup.popup_box(&popup_key(attached), (tc, tr), chrome.content_rect(tc, tr))
+}
+
+/// What a popup layer changes about what the client knows of the focused pane
+/// and the cursor: both belong to the layer while it is up.
+struct PopupFrame {
+    /// Window-absolute `(x, y, visible, style)`.
+    cursor: (u16, u16, bool, u8),
+    /// The shared interior placed at the box's interior, window-absolute.
+    focused_pane_rect: crate::protocol::PaneRect,
+}
+
+/// Bring the popup box in line with a frame's `popup`: compose the box, show it
+/// and start masking it.
+///
+/// Called FIRST in the frame arms, before the frame is painted, so the frame
+/// skips the cells the box covers. `None` drops the box, and the frame that
+/// follows repaints what it covered.
+fn sync_popup(
+    layer: Option<Box<crate::protocol::PopupCells>>,
+    popup: &PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &mut Renderer,
+    attached: &Option<(ConnId, String)>,
+    theme: &crate::config::theme::CompositorTheme,
+) -> Result<Option<PopupFrame>> {
+    let Some(frame) = layer else {
+        renderer.clear_popup();
+        return Ok(None);
+    };
+    let Some(held) = HeldLayer::from_frame(renderer.held_layer(), &frame) else {
+        renderer.clear_popup();
+        return Ok(None);
+    };
+    let placed = popup_box_now(popup, chrome, renderer, attached);
+    let interior = placed.interior;
+    let cells = crate::client::popup::compose_box(&placed, Some(&held), theme);
+    let cursor = (
+        interior.x + held.cursor_x.min(interior.width.saturating_sub(1)),
+        interior.y + held.cursor_y.min(interior.height.saturating_sub(1)),
+        held.cursor_visible,
+        held.cursor_style,
+    );
+    let focused_pane_rect = crate::protocol::PaneRect {
+        x: interior.x,
+        y: interior.y,
+        width: held.cols.min(interior.width),
+        height: held.rows.min(interior.height),
+        neighbors: crate::protocol::FocusNeighbors::default(),
+    };
+    renderer.set_popup(placed.rect, cells, cursor)?;
+    renderer.set_held_layer(held);
+    Ok(Some(PopupFrame {
+        cursor,
+        focused_pane_rect,
+    }))
+}
+
+/// Tell the foreground server the popup interior this client wants, when it has
+/// not been told for the current box.
+async fn send_popup_size(
+    mgr: &mut ConnectionManager,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> Result<()> {
+    let placed = popup_box_now(popup, chrome, renderer, attached);
+    if let Some((cols, rows)) = popup.announce(mgr.foreground(), &placed) {
+        log::debug!(
+            "popup: PopupSize {cols}x{rows} for the box at {:?}",
+            placed.rect
+        );
+        mgr.send_foreground(ClientMessage::PopupSize { cols, rows })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Where a mouse event lands relative to the popup box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupPointer {
+    /// In the popup's terminal, as interior-local coordinates.
+    Interior(u16, u16),
+    /// On the frame: it belongs to the popup and does nothing.
+    Frame,
+}
+
+/// Where `mouse` lands relative to the popup box, or `None` when the popup has
+/// no claim on it.
+///
+/// The box is over everything, so a press or a wheel step inside it is the
+/// popup's whichever sidebar or pane lies beneath. A drag or release follows
+/// the grab its press made: one that began in the interior keeps feeding the
+/// popup and is clamped into the interior, and one that began elsewhere is not
+/// the popup's even when it crosses the box. With no press behind it, motion
+/// over the box is swallowed.
+fn popup_pointer(
+    popup: &PopupBox,
+    grab: Option<MouseGrab>,
+    mouse: &crossterm::event::MouseEvent,
+) -> Option<PopupPointer> {
+    let inside = |r: &crate::server::layout::Rect| {
+        mouse.column >= r.x
+            && mouse.column < r.x + r.width
+            && mouse.row >= r.y
+            && mouse.row < r.y + r.height
+    };
+    let interior = popup.interior;
+    let local = || {
+        let x = mouse
+            .column
+            .clamp(interior.x, interior.x + interior.width.saturating_sub(1));
+        let y = mouse
+            .row
+            .clamp(interior.y, interior.y + interior.height.saturating_sub(1));
+        PopupPointer::Interior(x - interior.x, y - interior.y)
+    };
+    match mouse.kind {
+        MouseEventKind::Drag(_) | MouseEventKind::Up(_) => match grab {
+            Some(MouseGrab::Popup) => Some(local()),
+            Some(_) => None,
+            None => inside(&popup.rect).then_some(PopupPointer::Frame),
+        },
+        _ if inside(&interior) => Some(local()),
+        _ if inside(&popup.rect) => Some(PopupPointer::Frame),
+        _ => None,
+    }
+}
+
+/// Resize the popup instead of the layout, when a popup is up and the keyboard
+/// is in the content. Returns `true` when the command was consumed.
+///
+/// A `Resize*` while the popup is visible adjusts the popup on the axis its
+/// position uses; the other axis is ignored and logged. It never reaches the
+/// server, which keeps the layout from being resized underneath the popup. The
+/// new box is announced by the next [`send_popup_size`].
+fn intercept_popup_resize(
+    cmd: &RemuxCommand,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> bool {
+    use crate::server::layout::FocusDirection;
+    if renderer.popup_rect().is_none()
+        || !matches!(chrome.focus, crate::client::chrome::ChromeFocus::Content)
+    {
+        return false;
+    }
+    let Some((dir, amount)) = resize_of(cmd) else {
+        return false;
+    };
+    let amount = amount as i16;
+    let (dw, dh) = match dir {
+        FocusDirection::Left => (-amount, 0),
+        FocusDirection::Right => (amount, 0),
+        FocusDirection::Up => (0, -amount),
+        FocusDirection::Down => (0, amount),
+    };
+    popup.resize(&popup_key(attached), dw, dh);
+    true
 }
 
 /// Paint the server's status bar across the terminal's last row, when the
@@ -3031,6 +3225,10 @@ async fn run_client_loop(
     // back.
     let mut prev_sidebar_cfg = config.sidebar.clone();
     let mut which_key_position = config.appearance.which_key_position.clone();
+    // Where the popup terminal sits, and how the user has resized it. The
+    // client places the popup itself; the server only sizes its PTY to what is
+    // announced with `PopupSize`.
+    let mut popup = PopupState::from_config(config);
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
     // cells alias panes across several sessions and machines at once, so there
@@ -3250,6 +3448,12 @@ async fn run_client_loop(
                 dispatch_plugin_request(si, pi, req, mgr).await;
             }
         }
+        // Announce the popup interior the foreground server should size its
+        // popup PTYs to. Done here, once per pass, because everything that
+        // moves the box -- an attach or a server switch, a terminal or sidebar
+        // resize, a config reload, a runtime popup resize -- ends its handling
+        // and comes back to this point, and an unchanged box sends nothing.
+        send_popup_size(mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
         reconcile_push_subscription(
             wants_session_tree,
             &mut tree_subscribed,
@@ -3586,7 +3790,9 @@ async fn run_client_loop(
                                     if crate::client::chrome::intercept_focus(
                                         &mut chrome,
                                         dir,
-                                        focused_pane_rect.as_ref(),
+                                        // The popup layer owns the rect while it
+                                        // is up, and it is not a pane's edge.
+                                        focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
                                         tc,
                                         tr,
                                         &config.appearance.status_bar_position,
@@ -3595,6 +3801,12 @@ async fn run_client_loop(
                                         renderer.flush()?;
                                         continue;
                                     }
+                                }
+                                // While the popup is up and the keyboard is in
+                                // the content, `Resize*` resizes the popup, on
+                                // the client; it never reaches the server.
+                                if intercept_popup_resize(&cmd, &mut popup, &chrome, &renderer, &current_attached) {
+                                    continue;
                                 }
                                 // A focused sidebar re-targets `Resize*` at
                                 // itself: its own size across the edge, its
@@ -3705,7 +3917,7 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref(),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -3714,6 +3926,11 @@ async fn run_client_loop(
                                             renderer.flush()?;
                                             continue;
                                         }
+                                    }
+                                    // Resizes the popup instead, exactly as in the
+                                    // single-command arm.
+                                    if intercept_popup_resize(&cmd, &mut popup, &chrome, &renderer, &current_attached) {
+                                        continue;
                                     }
                                     // Re-targeted at the sidebar exactly as in
                                     // the single-command arm; `continue` skips
@@ -4086,7 +4303,7 @@ async fn run_client_loop(
                                         if crate::client::chrome::intercept_focus(
                                             &mut chrome,
                                             dir,
-                                            focused_pane_rect.as_ref(),
+                                            focused_pane_rect.as_ref().filter(|_| renderer.popup_rect().is_none()),
                                             tc,
                                             tr,
                                             &config.appearance.status_bar_position,
@@ -4101,6 +4318,11 @@ async fn run_client_loop(
                                             consumed = true;
                                         }
                                     }
+                                }
+                                if !consumed {
+                                    // The popup resizes first, exactly as in
+                                    // the `Execute` arm.
+                                    consumed = intercept_popup_resize(&command, &mut popup, &chrome, &renderer, &current_attached);
                                 }
                                 if !consumed {
                                     // A focused sidebar re-targets `Resize*` at
@@ -5130,7 +5352,7 @@ async fn run_client_loop(
                                 // what size to composite.
                                 let content = content_rect_now(&chrome)?;
                                 sync_content_rect(&mut renderer, &chrome, &content);
-                                switch_to_server(mgr, &server, content).await?;
+                                switch_to_server(mgr, &mut renderer, &server, content).await?;
                                 mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                 mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                 if server == ConnId::Local {
@@ -5169,7 +5391,7 @@ async fn run_client_loop(
                                     // what size to composite.
                                     let content = content_rect_now(&chrome)?;
                                     sync_content_rect(&mut renderer, &chrome, &content);
-                                    switch_to_server(mgr, &server, content).await?;
+                                    switch_to_server(mgr, &mut renderer, &server, content).await?;
                                     mgr.send(&server, ClientMessage::Attach { session_name: session.clone() }).await?;
                                     mgr.send(&server, ClientMessage::ModeChanged { mode: "NORMAL".to_string() }).await?;
                                     if server == ConnId::Local {
@@ -5743,6 +5965,42 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
+                        // The popup box is over every sidebar and pane, so it is
+                        // asked before anything else. It is the renderer's box
+                        // that counts: until the next frame replaces it, that is
+                        // what is on screen.
+                        let popup_pointer = if active_view.is_none() && renderer.popup_rect().is_some() {
+                            let placed = popup_box_now(&popup, &chrome, &renderer, &current_attached);
+                            if renderer.popup_rect() == Some(placed.rect) {
+                                popup_pointer(&placed, mouse_grab, &mouse)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        // The frame swallows a press, the start of a drag and
+                        // the wheel, like a sidebar's frame does. A press on it
+                        // still takes the keyboard back from a sidebar.
+                        if popup_pointer == Some(PopupPointer::Frame) {
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                mouse_grab = None;
+                                if let crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel } = chrome.focus {
+                                    chrome.sidebars[sidebar].focused_panel = panel;
+                                    chrome.focus = crate::client::chrome::ChromeFocus::Content;
+                                    let (tc, tr) = renderer.size();
+                                    chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
+                                    renderer.flush()?;
+                                }
+                            }
+                            continue;
+                        }
+                        // Interior-local coordinates, for an event the popup's
+                        // terminal gets.
+                        let popup_local = match popup_pointer {
+                            Some(PopupPointer::Interior(x, y)) => Some((x, y)),
+                            _ => None,
+                        };
                         // The collapse chip and a collapsed strip answer a left
                         // press wherever the pointer is, a live view included:
                         // they are painted over the panes and the view alike, so
@@ -5752,10 +6010,12 @@ async fn run_client_loop(
                         // alone.
                         {
                             let (tc, tr) = renderer.size();
-                            if matches!(
-                                mouse.kind,
-                                MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                            ) {
+                            if popup_local.is_none()
+                                && matches!(
+                                    mouse.kind,
+                                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                                )
+                            {
                                 if let Some(edge) =
                                     chrome.collapse_press(tc, tr, mouse.column, mouse.row)
                                 {
@@ -6123,7 +6383,14 @@ async fn run_client_loop(
                                 | crate::client::chrome::PointerTarget::Button(_)
                                 | crate::client::chrome::PointerTarget::Strip(_)
                         );
-                        let route = match mouse.kind {
+                        let route = if popup_local.is_some() {
+                            // The popup's terminal claims the gesture, however
+                            // many sidebars lie beneath the box.
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                mouse_grab = Some(MouseGrab::Popup);
+                            }
+                            MouseGrab::Popup
+                        } else { match mouse.kind {
                             // A press claims the region for the whole gesture.
                             MouseEventKind::Down(_) => {
                                 if over_frame {
@@ -6141,6 +6408,14 @@ async fn run_client_loop(
                             // press behind it falls back to position.
                             MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
                                 match mouse_grab {
+                                    // The popup went away mid-gesture. What is
+                                    // left of the drag means nothing to the
+                                    // content, and the server never saw its head.
+                                    Some(MouseGrab::Popup) => {
+                                        mouse_grab = None;
+                                        drag_start = None;
+                                        continue;
+                                    }
                                     Some(g) => g,
                                     None if over_frame => continue,
                                     None => at_pointer,
@@ -6150,7 +6425,7 @@ async fn run_client_loop(
                             // on whatever is under the pointer.
                             _ if over_frame => continue,
                             _ => at_pointer,
-                        };
+                        } };
                         if matches!(mouse.kind, MouseEventKind::Up(_)) {
                             mouse_grab = None;
                         }
@@ -6239,16 +6514,21 @@ async fn run_client_loop(
                         // `content_point` for the clamp and for a click on the
                         // client-drawn status bar.
                         let content = chrome.content_rect(tc, tr);
-                        let (cx, cy) = crate::client::chrome::content_point(
-                            content,
-                            tc,
-                            tr,
-                            mouse.column,
-                            mouse.row,
-                        );
+                        let (cx, cy) = popup_local.unwrap_or_else(|| {
+                            crate::client::chrome::content_point(
+                                content,
+                                tc,
+                                tr,
+                                mouse.column,
+                                mouse.row,
+                            )
+                        });
+                        // Every message below says whose coordinates they are.
+                        let popup_flag = popup_local.is_some();
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left)
-                                if crate::client::chrome::past_the_server_bar(
+                                if popup_local.is_none()
+                                    && crate::client::chrome::past_the_server_bar(
                                     content,
                                     tc,
                                     tr,
@@ -6272,7 +6552,7 @@ async fn run_client_loop(
                                         y: cy,
                                         pane_id: None,
                                         release: false,
-                                        popup: false,
+                                        popup: popup_flag,
                                     })
                                     .await?;
                             }
@@ -6289,7 +6569,7 @@ async fn run_client_loop(
                                                 end_y: cy,
                                                 is_final: false,
                                                 pane_id: None,
-                                                popup: false,
+                                                popup: popup_flag,
                                             })
                                             .await?;
                                         last_drag_send = now;
@@ -6308,7 +6588,7 @@ async fn run_client_loop(
                                                 end_y: cy,
                                                 is_final: true,
                                                 pane_id: None,
-                                                popup: false,
+                                                popup: popup_flag,
                                             })
                                             .await?;
                                     } else {
@@ -6324,7 +6604,7 @@ async fn run_client_loop(
                                                 y: cy,
                                                 pane_id: None,
                                                 release: true,
-                                                popup: false,
+                                                popup: popup_flag,
                                             })
                                             .await?;
                                     }
@@ -6351,7 +6631,7 @@ async fn run_client_loop(
                                         x: cx,
                                         y: cy,
                                         up: true,
-                                        popup: false,
+                                        popup: popup_flag,
                                     })
                                     .await?;
                                 }
@@ -6377,7 +6657,7 @@ async fn run_client_loop(
                                         x: cx,
                                         y: cy,
                                         up: false,
-                                        popup: false,
+                                        popup: popup_flag,
                                     })
                                     .await?;
                                 }
@@ -6591,10 +6871,21 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: _ }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer }) => {
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
-                        focused_pane_rect = fpr;
+                        // The popup layer first, so the frame below skips the
+                        // cells the box covers. A View owns the screen, so it
+                        // shows no box.
+                        let popup_frame = if active_view.is_none() {
+                            sync_popup(popup_layer, &popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
+                        } else {
+                            renderer.clear_popup();
+                            None
+                        };
+                        // While the layer is up it owns the focused pane rect
+                        // and the cursor: the server reports neither.
+                        focused_pane_rect = popup_frame.as_ref().map(|f| f.focused_pane_rect).or(fpr);
                         input.application_cursor_keys = ack;
                         input.bracketed_paste = bp;
                         scroll_offset = so;
@@ -6602,6 +6893,8 @@ async fn run_client_loop(
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
                         is_scrolled = srv_so > 0;
+                        let (cursor_x, cursor_y, cursor_visible, cursor_style) =
+                            popup_frame.as_ref().map_or((cursor_x, cursor_y, cursor_visible, cursor_style), |f| f.cursor);
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
@@ -6636,9 +6929,16 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: _ }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer }) => {
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
-                        focused_pane_rect = fpr;
+                        // See the FullRender arm: the popup layer goes first.
+                        let popup_frame = if active_view.is_none() {
+                            sync_popup(popup_layer, &popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
+                        } else {
+                            renderer.clear_popup();
+                            None
+                        };
+                        focused_pane_rect = popup_frame.as_ref().map(|f| f.focused_pane_rect).or(fpr);
                         input.application_cursor_keys = ack;
                         input.bracketed_paste = bp;
                         scroll_offset = so;
@@ -6646,6 +6946,8 @@ async fn run_client_loop(
                         // keep the dedicated highlight coordinate in sync.
                         viewport_top = so;
                         is_scrolled = srv_so > 0;
+                        let (cursor_x, cursor_y, cursor_visible, cursor_style) =
+                            popup_frame.as_ref().map_or((cursor_x, cursor_y, cursor_visible, cursor_style), |f| f.cursor);
                         last_cursor_x = cursor_x;
                         last_cursor_y = cursor_y;
                         last_cursor_visible = cursor_visible;
@@ -6744,7 +7046,7 @@ async fn run_client_loop(
                             renderer.clear_overlay(c, r)?;
                             renderer.flush()?;
                             let content = content_rect_now(&chrome)?;
-                            switch_to_server(mgr, &ConnId::Local, content).await?;
+                            switch_to_server(mgr, &mut renderer, &ConnId::Local, content).await?;
                             mgr.send(&ConnId::Local, ClientMessage::Attach {
                                 session_name: target.clone(),
                             }).await?;
@@ -7855,6 +8157,11 @@ async fn run_client_loop(
                     // Update which-key placement so it changes live too.
                     which_key_position = new_config.appearance.which_key_position.clone();
                     pane_title = new_config.appearance.pane_title.clone();
+                    // The popup's position and size apply live. A changed key
+                    // drops every runtime resize. The box is announced by the
+                    // top of the loop, and the server's answer is the frame
+                    // that rebuilds the layer.
+                    popup.apply_config(&new_config);
                     mgr.set_look(Look::from_config(&new_config));
                     mgr.announce_look().await;
                     agent_roster.set_pane_title(pane_title.clone());
@@ -8437,5 +8744,382 @@ mod tests {
 
         assert_eq!(current, Some(remote));
         assert_eq!(previous, Some(local("a")));
+    }
+
+    /// The popup box: a framed float at (16, 5), 128x37, interior (17, 6, 126, 35).
+    mod popup_client {
+        use super::super::*;
+        use crate::client::chrome::Chrome;
+        use crate::config::sidebar::SidebarConfig;
+        use crate::config::PopupPosition;
+        use crate::protocol::{CellChange, PopupCells, RenderCell};
+        use crate::server::layout::Rect;
+        use crossterm::event::{KeyModifiers, MouseEvent};
+
+        fn float_box() -> PopupBox {
+            crate::client::popup::popup_box(
+                PopupPosition::Float,
+                (80, 80),
+                (160, 48),
+                Rect {
+                    x: 34,
+                    y: 0,
+                    width: 126,
+                    height: 48,
+                },
+            )
+        }
+
+        fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        fn down(column: u16, row: u16) -> MouseEvent {
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+        }
+
+        #[test]
+        fn a_press_inside_the_interior_is_interior_local() {
+            let b = float_box();
+            assert_eq!(
+                popup_pointer(&b, None, &down(17, 6)),
+                Some(PopupPointer::Interior(0, 0))
+            );
+            assert_eq!(
+                popup_pointer(&b, None, &down(20, 10)),
+                Some(PopupPointer::Interior(3, 4))
+            );
+        }
+
+        #[test]
+        fn the_box_claims_a_press_over_a_sidebar() {
+            // Column 20 is inside the 34-column sidebar and inside the float.
+            let b = float_box();
+            assert_eq!(
+                popup_pointer(&b, None, &down(20, 10)),
+                Some(PopupPointer::Interior(3, 4))
+            );
+        }
+
+        #[test]
+        fn a_press_on_the_frame_is_swallowed() {
+            let b = float_box();
+            for (x, y) in [(16, 5), (16, 20), (143, 20), (60, 5), (60, 41)] {
+                assert_eq!(
+                    popup_pointer(&b, None, &down(x, y)),
+                    Some(PopupPointer::Frame),
+                    "({x}, {y})"
+                );
+            }
+            assert_eq!(
+                popup_pointer(&b, None, &mouse(MouseEventKind::ScrollUp, 16, 20)),
+                Some(PopupPointer::Frame),
+                "the wheel too"
+            );
+        }
+
+        #[test]
+        fn outside_the_box_the_popup_has_no_claim() {
+            let b = float_box();
+            for (x, y) in [(15, 5), (144, 20), (60, 4), (60, 42), (0, 0)] {
+                assert_eq!(popup_pointer(&b, None, &down(x, y)), None, "({x}, {y})");
+            }
+        }
+
+        #[test]
+        fn the_wheel_in_the_interior_goes_to_the_popup() {
+            let b = float_box();
+            assert_eq!(
+                popup_pointer(&b, None, &mouse(MouseEventKind::ScrollDown, 30, 12)),
+                Some(PopupPointer::Interior(13, 6))
+            );
+        }
+
+        #[test]
+        fn a_drag_that_began_in_the_popup_clamps_into_the_interior() {
+            let b = float_box();
+            let drag = |x, y| mouse(MouseEventKind::Drag(MouseButton::Left), x, y);
+            let grab = Some(MouseGrab::Popup);
+            // Out over the sidebar, above and below the box.
+            assert_eq!(
+                popup_pointer(&b, grab, &drag(0, 0)),
+                Some(PopupPointer::Interior(0, 0))
+            );
+            assert_eq!(
+                popup_pointer(&b, grab, &drag(159, 47)),
+                Some(PopupPointer::Interior(125, 34))
+            );
+            assert_eq!(
+                popup_pointer(
+                    &b,
+                    grab,
+                    &mouse(MouseEventKind::Up(MouseButton::Left), 0, 0)
+                ),
+                Some(PopupPointer::Interior(0, 0)),
+                "the release too"
+            );
+        }
+
+        #[test]
+        fn a_drag_that_began_elsewhere_is_not_the_popups() {
+            let b = float_box();
+            let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 60, 20);
+            assert_eq!(popup_pointer(&b, Some(MouseGrab::Content), &drag), None);
+            assert_eq!(
+                popup_pointer(
+                    &b,
+                    Some(MouseGrab::Panel {
+                        sidebar: 0,
+                        panel: 0
+                    }),
+                    &drag
+                ),
+                None
+            );
+            // With no press behind it, motion over the box is swallowed.
+            assert_eq!(popup_pointer(&b, None, &drag), Some(PopupPointer::Frame));
+        }
+
+        fn layer(cols: u16, rows: u16, fill: char) -> Box<PopupCells> {
+            let cell = RenderCell {
+                c: fill,
+                ..RenderCell::default()
+            };
+            Box::new(PopupCells {
+                cols,
+                rows,
+                cursor_x: 2,
+                cursor_y: 1,
+                cursor_visible: true,
+                cursor_style: 2,
+                cells: Some(vec![vec![cell; cols as usize]; rows as usize]),
+                changes: Vec::new(),
+            })
+        }
+
+        fn sidebar_chrome() -> Chrome {
+            let cfg: Vec<SidebarConfig> = toml::from_str::<crate::config::Config>(
+                "[[sidebar]]\nedge = \"left\"\nsize = 34\nvisible = true\n[[sidebar.panel]]\nplugin = \"sessions\"\n",
+            )
+            .expect("config")
+            .sidebar;
+            Chrome::from_config(&cfg)
+        }
+
+        fn setup() -> (
+            Renderer,
+            Chrome,
+            PopupState,
+            crate::config::theme::CompositorTheme,
+        ) {
+            (
+                Renderer::new(160, 48),
+                sidebar_chrome(),
+                PopupState::from_config(&Config::default()),
+                crate::config::theme::CompositorTheme::default(),
+            )
+        }
+
+        #[test]
+        fn a_layer_puts_the_box_over_the_sidebar_and_owns_cursor_and_pane_rect() {
+            let (mut renderer, chrome, popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let frame = sync_popup(
+                Some(layer(4, 2, 'x')),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap()
+            .expect("a popup frame");
+            let rect = renderer.popup_rect().expect("the box is up");
+            assert_eq!(
+                rect,
+                Rect {
+                    x: 16,
+                    y: 5,
+                    width: 128,
+                    height: 37
+                },
+                "over the sidebar's columns"
+            );
+            // The cursor is the layer's, offset to the interior origin (17, 6).
+            assert_eq!(frame.cursor, (19, 7, true, 2));
+            // The pane rect is the SHARED interior, not the box's.
+            let r = frame.focused_pane_rect;
+            assert_eq!((r.x, r.y, r.width, r.height), (17, 6, 4, 2));
+            assert_eq!(renderer.rect_origin(), (0, 0));
+        }
+
+        #[test]
+        fn a_later_diff_is_applied_to_the_held_layer() {
+            let (mut renderer, chrome, popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let mut diff = layer(4, 2, 'x');
+            diff.cells = None;
+            diff.changes = vec![CellChange {
+                x: 1,
+                y: 0,
+                cell: RenderCell {
+                    c: 'q',
+                    ..RenderCell::default()
+                },
+            }];
+            sync_popup(
+                Some(diff),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(renderer.held_layer().unwrap().cells[0][1].c, 'q');
+            assert_eq!(renderer.held_layer().unwrap().cells[0][0].c, 'x');
+        }
+
+        #[test]
+        fn no_layer_drops_the_box() {
+            let (mut renderer, chrome, popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert!(
+                sync_popup(None, &popup, &chrome, &mut renderer, &attached, &theme)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(renderer.popup_rect(), None);
+            assert!(renderer.held_layer().is_none());
+        }
+
+        #[test]
+        fn a_diff_with_nothing_to_apply_it_to_drops_the_box() {
+            let (mut renderer, chrome, popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let mut diff = layer(4, 2, 'x');
+            diff.cells = None;
+            assert!(sync_popup(
+                Some(diff),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(renderer.popup_rect(), None);
+        }
+
+        #[test]
+        fn switching_server_drops_the_layer() {
+            // `switch_to_server` clears the box before the new foreground is
+            // handed the screen.
+            let (mut renderer, chrome, popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            renderer.clear_popup();
+            assert_eq!(renderer.popup_rect(), None);
+        }
+
+        #[test]
+        fn a_resize_while_the_popup_is_up_resizes_the_popup_not_the_layout() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            // No popup up: the command is not the popup's.
+            assert!(!intercept_popup_resize(
+                &RemuxCommand::ResizeRight(5),
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let before = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(intercept_popup_resize(
+                &RemuxCommand::ResizeRight(5),
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+            let after = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(after.rect.width > before.rect.width);
+            // Not a resize: left alone.
+            assert!(!intercept_popup_resize(
+                &RemuxCommand::PaneFocusLeft,
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+        }
+
+        #[test]
+        fn a_drawer_consumes_a_resize_on_the_axis_it_ignores_without_changing() {
+            let (mut renderer, chrome, _, theme) = setup();
+            let mut config = Config::default();
+            config.appearance.popup_position = PopupPosition::Left;
+            let mut popup = PopupState::from_config(&config);
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let before = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(intercept_popup_resize(
+                &RemuxCommand::ResizeDown(5),
+                &mut popup,
+                &chrome,
+                &renderer,
+                &attached
+            ));
+            assert_eq!(popup_box_now(&popup, &chrome, &renderer, &attached), before);
+        }
     }
 }

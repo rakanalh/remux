@@ -637,6 +637,128 @@ pub fn draw_zellij_box(
     }
 }
 
+/// The edge of a docked box that is left open, so the box reads as growing out
+/// of that side of the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Draw a zellij-style box with one edge left open: the open edge is not drawn
+/// at all, and the two edges that adjoin it run to the rect's boundary as plain
+/// lines with no corner there. The corners at the closed end stay rounded.
+///
+/// For a rect that must be a drawer, not a window: the content next to the open
+/// edge is the rect's own, so the cells on the open edge belong to the interior
+/// (see `client::popup`, which insets the interior by 0 on that side).
+///
+/// Shares [`border_cell`] and the corner glyphs with [`draw_zellij_box`], and
+/// has the same bounds-checking contract.
+pub fn draw_zellij_box_open(
+    buffer: &mut [Vec<RenderCell>],
+    rect: Rect,
+    open: OpenEdge,
+    border_fg: &CellColor,
+    theme: &CompositorTheme,
+) {
+    let x = rect.x as usize;
+    let y = rect.y as usize;
+    let w = rect.width as usize;
+    let h = rect.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let cell = |c: char| border_cell(c, border_fg, theme);
+    let (right, bottom) = (x + w - 1, y + h - 1);
+
+    // Which edges and corners exist.
+    let top = open != OpenEdge::Top;
+    let bottom_edge = open != OpenEdge::Bottom;
+    let left = open != OpenEdge::Left;
+    let right_edge = open != OpenEdge::Right;
+
+    // Horizontal edges run the whole width, except that a closed side column
+    // carries the corner instead of a rule.
+    let (first_col, last_col) = (x + usize::from(left), right + 1 - usize::from(right_edge));
+    for col in first_col..last_col {
+        if top {
+            set_cell(buffer, y, col, cell(BOX_HORIZONTAL));
+        }
+        if bottom_edge {
+            set_cell(buffer, bottom, col, cell(BOX_HORIZONTAL));
+        }
+    }
+    // Vertical edges run the whole height, except that a closed end carries the
+    // corner instead of a rule.
+    let (first_row, last_row) = (y + usize::from(top), bottom + 1 - usize::from(bottom_edge));
+    for row in first_row..last_row {
+        if left {
+            set_cell(buffer, row, x, cell(BOX_VERTICAL));
+        }
+        if right_edge {
+            set_cell(buffer, row, right, cell(BOX_VERTICAL));
+        }
+    }
+    // Corners exist only where both of their edges do.
+    if top && left {
+        set_cell(buffer, y, x, cell(BOX_TOP_LEFT));
+    }
+    if top && right_edge {
+        set_cell(buffer, y, right, cell(BOX_TOP_RIGHT));
+    }
+    if bottom_edge && left {
+        set_cell(buffer, bottom, x, cell(BOX_BOTTOM_LEFT));
+    }
+    if bottom_edge && right_edge {
+        set_cell(buffer, bottom, right, cell(BOX_BOTTOM_RIGHT));
+    }
+}
+
+/// [`draw_zellij_box_open`] plus the title chip, for a box that wears a name.
+///
+/// The title sits on the top row, except for a box open at the top, where it
+/// sits on the bottom row: that row is the one the open box shows its edge on.
+/// It is overlaid exactly as [`draw_zellij_border`] overlays a pane's title, in
+/// the columns the row has for it (the ones that are not a corner).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_zellij_border_open(
+    buffer: &mut [Vec<RenderCell>],
+    rect: Rect,
+    open: OpenEdge,
+    border_fg: &CellColor,
+    stack_info: &Option<(Vec<String>, Vec<PaneId>, usize)>,
+    pane_id: PaneId,
+    mode: &str,
+    theme: &CompositorTheme,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    draw_zellij_box_open(buffer, rect, open, border_fg, theme);
+
+    let (x, y) = (rect.x as usize, rect.y as usize);
+    let (w, h) = (rect.width as usize, rect.height as usize);
+    let row = if open == OpenEdge::Top { y + h - 1 } else { y };
+    // The title runs between the row's corners; a corner is absent on the side
+    // that is open, so the run reaches the boundary there.
+    let first = x + usize::from(open != OpenEdge::Left);
+    let last = x + w - usize::from(open != OpenEdge::Right);
+    let top_content = build_top_border_content(
+        stack_info,
+        pane_id,
+        border_fg,
+        mode,
+        last.saturating_sub(first),
+        theme,
+    );
+    for (col, cell) in (first..last).zip(top_content.iter()) {
+        set_cell(buffer, row, col, cell.clone());
+    }
+}
+
 /// Draw a vertical divider run: `│` down `col`, rows `y0..y1`.
 ///
 /// Shared by the tmux pane dividers and the client's sidebar seam so the glyph
@@ -4005,5 +4127,186 @@ mod tests {
             .expect("activity marker present");
         assert_eq!(buffer[23][marker_col].fg, theme.tab_activity_fg);
         assert_ne!(buffer[23][marker_col].fg, theme.tab_inactive_fg);
+    }
+
+    // -- Open-edge boxes ------------------------------------------------------
+
+    fn grid(w: usize, h: usize) -> Vec<Vec<RenderCell>> {
+        vec![vec![RenderCell::default(); w]; h]
+    }
+
+    fn glyphs(buf: &[Vec<RenderCell>]) -> Vec<String> {
+        buf.iter()
+            .map(|row| row.iter().map(|c| c.c).collect())
+            .collect()
+    }
+
+    #[test]
+    fn an_open_box_agrees_with_the_closed_box_on_its_closed_edges() {
+        // A popup with no open edge uses `draw_zellij_box`, so an open-edge box
+        // must differ from it only on the open side.
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let rect = Rect {
+            x: 1,
+            y: 1,
+            width: 6,
+            height: 4,
+        };
+        let mut full = grid(8, 6);
+        draw_zellij_box(&mut full, rect, &fg, &theme);
+        let mut open = grid(8, 6);
+        draw_zellij_box_open(&mut open, rect, OpenEdge::Bottom, &fg, &theme);
+        // Rows above the open (bottom) edge agree with the closed box.
+        assert_eq!(full[1], open[1], "top edge");
+        assert_eq!(full[2], open[2], "side edges");
+    }
+
+    #[test]
+    fn an_open_top_leaves_the_top_row_off_and_runs_the_sides_to_the_boundary() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 4,
+        };
+        let mut buf = grid(6, 4);
+        draw_zellij_box_open(&mut buf, rect, OpenEdge::Top, &fg, &theme);
+        assert_eq!(
+            glyphs(&buf),
+            vec![
+                "\u{2502}    \u{2502}".to_string(),
+                "\u{2502}    \u{2502}".to_string(),
+                "\u{2502}    \u{2502}".to_string(),
+                "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256F}".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_open_bottom_keeps_its_top_corners_and_runs_the_sides_to_the_bottom() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 4,
+        };
+        let mut buf = grid(6, 4);
+        draw_zellij_box_open(&mut buf, rect, OpenEdge::Bottom, &fg, &theme);
+        let g = glyphs(&buf);
+        assert_eq!(g[0], "\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E}");
+        assert_eq!(g[1], "\u{2502}    \u{2502}");
+        assert_eq!(g[3], "\u{2502}    \u{2502}", "no corner on the open row");
+    }
+
+    #[test]
+    fn an_open_left_leaves_the_left_column_to_the_interior() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 4,
+        };
+        let mut buf = grid(6, 4);
+        draw_zellij_box_open(&mut buf, rect, OpenEdge::Left, &fg, &theme);
+        let g = glyphs(&buf);
+        // Horizontal rules run to column 0 with no corner there.
+        assert_eq!(g[0], "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E}");
+        assert_eq!(g[1], "     \u{2502}");
+        assert_eq!(g[2], "     \u{2502}");
+        assert_eq!(g[3], "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256F}");
+    }
+
+    #[test]
+    fn an_open_right_leaves_the_right_column_to_the_interior() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 4,
+        };
+        let mut buf = grid(6, 4);
+        draw_zellij_box_open(&mut buf, rect, OpenEdge::Right, &fg, &theme);
+        let g = glyphs(&buf);
+        assert_eq!(g[0], "\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
+        assert_eq!(g[1], "\u{2502}     ");
+        assert_eq!(g[3], "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
+    }
+
+    #[test]
+    fn the_open_box_is_clipped_to_the_buffer_not_a_panic() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let mut buf = grid(3, 2);
+        draw_zellij_box_open(
+            &mut buf,
+            Rect {
+                x: 1,
+                y: 0,
+                width: 20,
+                height: 20,
+            },
+            OpenEdge::Top,
+            &fg,
+            &theme,
+        );
+    }
+
+    #[test]
+    fn an_open_boxs_title_sits_on_the_top_row_except_when_the_top_is_open() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let stack = Some((vec!["term".to_string()], vec![7], 0usize));
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 5,
+        };
+        let title_row = |open: OpenEdge| -> Vec<usize> {
+            let mut buf = grid(16, 5);
+            draw_zellij_border_open(&mut buf, rect, open, &fg, &stack, 7, "NORMAL", &theme);
+            (0..5)
+                .filter(|&y| buf[y].iter().any(|c| c.c == 't'))
+                .collect()
+        };
+        assert_eq!(title_row(OpenEdge::Bottom), vec![0]);
+        assert_eq!(title_row(OpenEdge::Left), vec![0]);
+        assert_eq!(title_row(OpenEdge::Right), vec![0]);
+        assert_eq!(title_row(OpenEdge::Top), vec![4]);
+    }
+
+    #[test]
+    fn an_open_boxs_title_never_covers_a_corner() {
+        let theme = CompositorTheme::default();
+        let fg = border_fg(&theme, true);
+        let stack = Some((vec!["a long title".to_string()], vec![7], 0usize));
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
+        let mut buf = grid(8, 4);
+        draw_zellij_border_open(
+            &mut buf,
+            rect,
+            OpenEdge::Bottom,
+            &fg,
+            &stack,
+            7,
+            "N",
+            &theme,
+        );
+        assert_eq!(buf[0][0].c, BOX_TOP_LEFT);
+        assert_eq!(buf[0][7].c, BOX_TOP_RIGHT);
     }
 }

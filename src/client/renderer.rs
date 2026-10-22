@@ -34,6 +34,7 @@ fn printable_text(text: &str) -> String {
 }
 
 use crate::client::input::{SelectionMode, VisualState};
+use crate::client::popup::HeldLayer;
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
 use crate::server::compositor::{box_bottom_line, box_top_line_titled, BOX_VERTICAL};
@@ -42,6 +43,109 @@ use crate::server::layout::Rect;
 // ---------------------------------------------------------------------------
 // Renderer
 // ---------------------------------------------------------------------------
+
+/// The popup box: a layer the client draws over everything else.
+///
+/// It is a MASK, not part of the front buffer. The front buffer keeps what
+/// belongs under the box (the server frame, the sidebars), and every write that
+/// would land inside `rect` is skipped, neither emitted nor stored, so the box
+/// is never overdrawn and never has to be repainted from beneath. Dropping the
+/// layer lifts the mask; the server answers that with a full frame, which
+/// repaints what the box covered.
+struct PopupBuf {
+    /// The box in window coordinates, frame included.
+    rect: Rect,
+    /// The box's cells, `rect.height` rows of `rect.width` cells.
+    cells: Vec<Vec<RenderCell>>,
+    /// The popup's cursor, window-absolute: `(x, y, visible, style)`.
+    cursor: (u16, u16, bool, u8),
+    /// The server's layer this box was composed from. The next frame's diff is
+    /// applied to it, so it lives and dies with the box.
+    held: Option<HeldLayer>,
+}
+
+/// SGR state for the cells of one row, so a run of cells emits only what
+/// changes between them. Starts from the state a row reset leaves.
+#[derive(Default)]
+struct RowStyle {
+    fg: Option<CellColor>,
+    bg: Option<CellColor>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    hyperlink: Option<String>,
+}
+
+impl RowStyle {
+    fn new() -> Self {
+        RowStyle {
+            fg: Some(CellColor::Default),
+            bg: Some(CellColor::Default),
+            ..RowStyle::default()
+        }
+    }
+
+    /// Queue `cell`'s attributes, its glyph and its combining marks. A
+    /// width-0 continuation cell is the caller's to skip.
+    fn emit<W: Write>(&mut self, out: &mut W, cell: &RenderCell) -> Result<()> {
+        if self.fg.as_ref() != Some(&cell.fg) {
+            queue!(out, SetForegroundColor(cell_color_to_crossterm(&cell.fg)))?;
+            self.fg = Some(cell.fg.clone());
+        }
+        if self.bg.as_ref() != Some(&cell.bg) {
+            queue!(out, SetBackgroundColor(cell_color_to_crossterm(&cell.bg)))?;
+            self.bg = Some(cell.bg.clone());
+        }
+        if cell.bold != self.bold {
+            let attr = if cell.bold {
+                Attribute::Bold
+            } else {
+                Attribute::NormalIntensity
+            };
+            queue!(out, SetAttribute(attr))?;
+            self.bold = cell.bold;
+        }
+        if cell.italic != self.italic {
+            let attr = if cell.italic {
+                Attribute::Italic
+            } else {
+                Attribute::NoItalic
+            };
+            queue!(out, SetAttribute(attr))?;
+            self.italic = cell.italic;
+        }
+        if cell.underline != self.underline {
+            let attr = if cell.underline {
+                Attribute::Underlined
+            } else {
+                Attribute::NoUnderline
+            };
+            queue!(out, SetAttribute(attr))?;
+            self.underline = cell.underline;
+        }
+        if cell.hyperlink.as_deref() != self.hyperlink.as_deref() {
+            match &cell.hyperlink {
+                Some(uri) => queue!(out, Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri))))?,
+                None => queue!(out, Print("\x1b]8;;\x1b\\"))?,
+            }
+            self.hyperlink = cell.hyperlink.clone();
+        }
+        queue!(out, Print(printable(cell.c)))?;
+        for m in &cell.combining {
+            queue!(out, Print(printable(*m)))?;
+        }
+        Ok(())
+    }
+
+    /// Close an open hyperlink and reset, so nothing carries into the next row.
+    fn end_row<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        if self.hyperlink.is_some() {
+            queue!(out, Print("\x1b]8;;\x1b\\"))?;
+        }
+        queue!(out, SetAttribute(Attribute::Reset))?;
+        Ok(())
+    }
+}
 
 /// The client-side renderer that maintains a front buffer and uses crossterm
 /// to draw changes to the actual terminal.
@@ -91,7 +195,15 @@ pub struct Renderer {
     /// hides the cursor while it draws and re-issues this afterwards. Without
     /// it the panel's `Hide` and the frame's `Show` land in the same flush and
     /// the cursor stays hidden for as long as a sidebar is visible.
-    last_cursor: (u16, u16, bool, u8),
+    ///
+    /// The fifth field is whether `(x, y)` is already a WINDOW-absolute position
+    /// rather than content-relative. It is while the popup layer is up: the
+    /// popup can sit over a sidebar, where no content-relative coordinate
+    /// reaches.
+    last_cursor: (u16, u16, bool, u8, bool),
+    /// The popup box the client draws itself, over everything else, while the
+    /// server has a popup visible. See [`PopupBuf`].
+    popup: Option<PopupBuf>,
     /// Whether the client draws the status bar itself, in which case a server
     /// frame's LAST row (the server's bar) is never painted. See
     /// `chrome::geometry::status_bar_owned`.
@@ -117,7 +229,8 @@ impl Renderer {
             origin_y: 0,
             content_cols: cols,
             content_rows: rows,
-            last_cursor: (0, 0, false, 0),
+            last_cursor: (0, 0, false, 0, false),
+            popup: None,
             status_row_owned: false,
             frame_rows: 0,
             frame_status_row: Vec::new(),
@@ -151,6 +264,162 @@ impl Renderer {
     /// The current content origin.
     pub fn origin(&self) -> (u16, u16) {
         (self.origin_x, self.origin_y)
+    }
+
+    /// The origin a server-frame-relative coordinate is offset by to reach the
+    /// screen: the content origin, except while the popup layer is up. Then the
+    /// coordinates the client holds (the focused pane rect, the visual cursor)
+    /// are window-absolute, because the popup can sit over a sidebar, and no
+    /// offset applies.
+    pub fn rect_origin(&self) -> (u16, u16) {
+        if self.popup.is_some() {
+            (0, 0)
+        } else {
+            self.origin()
+        }
+    }
+
+    /// The popup box, in window coordinates, while the layer is up.
+    pub fn popup_rect(&self) -> Option<Rect> {
+        self.popup.as_ref().map(|p| p.rect)
+    }
+
+    /// Whether a write of a `width`-wide cell at screen `(sx, sy)` would touch
+    /// the popup box. A wide glyph straddling the box's edge counts as covered:
+    /// printing it would overdraw the box, and skipping only its half would
+    /// leave half a glyph.
+    fn masked(&self, sx: usize, sy: usize, width: u8) -> bool {
+        let Some(popup) = &self.popup else {
+            return false;
+        };
+        let r = popup.rect;
+        let (x0, y0) = (r.x as usize, r.y as usize);
+        let (x1, y1) = (x0 + r.width as usize, y0 + r.height as usize);
+        sy >= y0 && sy < y1 && sx < x1 && sx + (width.max(1) as usize) > x0
+    }
+
+    /// The cell on screen at `(sx, sy)`: the popup's while the box covers it,
+    /// else the front buffer's. What overlays that read the screen back (the
+    /// visual selection, a search highlight, a copy) must ask this instead of
+    /// the front buffer, which never holds the box.
+    fn cell_at(&self, sx: usize, sy: usize) -> Option<&RenderCell> {
+        if let Some(popup) = &self.popup {
+            let r = popup.rect;
+            let (x0, y0) = (r.x as usize, r.y as usize);
+            if sx >= x0 && sy >= y0 {
+                if let Some(cell) = popup.cells.get(sy - y0).and_then(|row| row.get(sx - x0)) {
+                    return Some(cell);
+                }
+            }
+        }
+        self.front.get(sy).and_then(|row| row.get(sx))
+    }
+
+    /// Put the popup box on screen and start masking it.
+    ///
+    /// `rect` and `cursor` are window-absolute and `cells` is the box's own grid.
+    /// Against the box already shown at the same rect, only the cells that
+    /// changed are emitted; anywhere else the whole box is. Call this BEFORE the
+    /// frame the box belongs to is painted: that frame then skips the box.
+    pub fn set_popup(
+        &mut self,
+        rect: Rect,
+        cells: Vec<Vec<RenderCell>>,
+        cursor: (u16, u16, bool, u8),
+    ) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.set_popup_into(&mut stdout, rect, cells, cursor)
+    }
+
+    /// The body of [`Renderer::set_popup`], parameterised over the sink for the
+    /// same reason as [`Renderer::paint_panel_into`].
+    fn set_popup_into<W: Write>(
+        &mut self,
+        out: &mut W,
+        rect: Rect,
+        cells: Vec<Vec<RenderCell>>,
+        cursor: (u16, u16, bool, u8),
+    ) -> Result<()> {
+        let previous = self
+            .popup
+            .take()
+            .filter(|p| p.rect == rect)
+            .map(|p| p.cells);
+        self.popup = Some(PopupBuf {
+            rect,
+            cells,
+            cursor,
+            held: None,
+        });
+        self.paint_popup_into(out, previous.as_deref())
+    }
+
+    /// Emit the popup box: every cell, or only those that differ from `previous`.
+    fn paint_popup_into<W: Write>(
+        &self,
+        out: &mut W,
+        previous: Option<&[Vec<RenderCell>]>,
+    ) -> Result<()> {
+        let Some(popup) = &self.popup else {
+            return Ok(());
+        };
+        queue!(out, Print("\x1b[?2026h"))?;
+        queue!(out, cursor::Hide)?;
+        for (ry, row) in popup.cells.iter().enumerate() {
+            let sy = popup.rect.y as usize + ry;
+            if ry >= popup.rect.height as usize || sy >= self.rows as usize {
+                break;
+            }
+            // Same reset discipline as `paint_panel_into`.
+            queue!(out, SetAttribute(Attribute::Reset))?;
+            let mut style = RowStyle::new();
+            let mut at_cursor = false;
+            for (rx, cell) in row.iter().enumerate() {
+                let sx = popup.rect.x as usize + rx;
+                if rx >= popup.rect.width as usize || sx >= self.cols as usize {
+                    break;
+                }
+                let unchanged = previous
+                    .and_then(|p| p.get(ry))
+                    .and_then(|prow| prow.get(rx))
+                    == Some(cell);
+                // A continuation cell leaves the terminal's cursor where its
+                // lead's two-column print put it.
+                if cell.width == 0 {
+                    continue;
+                }
+                if unchanged {
+                    at_cursor = false;
+                    continue;
+                }
+                if !at_cursor {
+                    queue!(out, MoveTo(sx as u16, sy as u16))?;
+                    at_cursor = true;
+                }
+                style.emit(out, cell)?;
+            }
+            style.end_row(out)?;
+        }
+        queue!(out, Print("\x1b[?2026l"))?;
+        Ok(())
+    }
+
+    /// Remember the server layer the box was composed from.
+    pub fn set_held_layer(&mut self, layer: HeldLayer) {
+        if let Some(popup) = &mut self.popup {
+            popup.held = Some(layer);
+        }
+    }
+
+    /// The server layer the box was composed from, while the box is up.
+    pub fn held_layer(&self) -> Option<&HeldLayer> {
+        self.popup.as_ref().and_then(|p| p.held.as_ref())
+    }
+
+    /// Drop the popup box. Nothing is painted over the cells it covered: the
+    /// server answers a vanished layer with a full frame, which does.
+    pub fn clear_popup(&mut self) {
+        self.popup = None;
     }
 
     /// Set the size of the content rect, in cells.
@@ -196,7 +465,16 @@ impl Renderer {
     /// panel. The content rect is never zero-sized in practice
     /// (`chrome::geometry` guarantees it), so the `saturating_sub` floors here
     /// only matter for a degenerate rect that has no content to draw anyway.
-    fn cursor_screen_pos(&self, x: u16, y: u16) -> (u16, u16) {
+    ///
+    /// An `absolute` position is a window position already and is only clamped
+    /// to the terminal.
+    fn cursor_screen_pos(&self, x: u16, y: u16, absolute: bool) -> (u16, u16) {
+        if absolute {
+            return (
+                x.min(self.cols.saturating_sub(1)),
+                y.min(self.rows.saturating_sub(1)),
+            );
+        }
         let (right, bottom) = self.content_edges();
         (
             x.saturating_add(self.origin_x)
@@ -218,7 +496,15 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
-        self.last_cursor = (cursor_x, cursor_y, cursor_visible, cursor_style);
+        self.last_cursor = match &self.popup {
+            // The popup owns the cursor while it is up, wherever the server
+            // reported its own.
+            Some(popup) => {
+                let (x, y, visible, style) = popup.cursor;
+                (x, y, visible, style, true)
+            }
+            None => (cursor_x, cursor_y, cursor_visible, cursor_style, false),
+        };
         self.queue_remembered_cursor(out)
     }
 
@@ -227,9 +513,9 @@ impl Renderer {
     /// The remembered position is content-relative, so it is offset here --
     /// otherwise the hardware cursor lands in a left sidebar.
     fn queue_remembered_cursor<W: Write>(&self, out: &mut W) -> Result<()> {
-        let (x, y, visible, style) = self.last_cursor;
+        let (x, y, visible, style, absolute) = self.last_cursor;
         if visible {
-            let (sx, sy) = self.cursor_screen_pos(x, y);
+            let (sx, sy) = self.cursor_screen_pos(x, y, absolute);
             queue!(
                 out,
                 MoveTo(sx, sy),
@@ -310,6 +596,9 @@ impl Renderer {
             let mut last_italic = false;
             let mut last_underline = false;
             let mut last_hyperlink: Option<String> = None;
+            // Set after a skipped run, so the next emitted cell is preceded by
+            // the move that puts the terminal's cursor back on it.
+            let mut need_move = false;
 
             for (x, cell) in row.iter().enumerate() {
                 let sx = x + ox;
@@ -321,6 +610,16 @@ impl Renderer {
                 // already advanced the physical cursor by 2, so skip it.
                 if cell.width == 0 {
                     continue;
+                }
+
+                // The popup box covers this cell: neither emit nor store it.
+                if self.masked(sx, sy, cell.width) {
+                    need_move = true;
+                    continue;
+                }
+                if need_move {
+                    queue!(stdout, MoveTo(sx as u16, sy as u16))?;
+                    need_move = false;
                 }
 
                 // Apply style changes only when needed.
@@ -397,10 +696,14 @@ impl Renderer {
             // background back, so spaces are equivalent to the clear.
             let painted = (ox + row.len()).min(content_right);
             if painted < content_right {
-                for sx in painted..content_right {
-                    self.front[sy][sx] = RenderCell::default();
+                if self.popup.is_some() {
+                    self.blank_span(&mut stdout, sy, painted, content_right, true)?;
+                } else {
+                    for sx in painted..content_right {
+                        self.front[sy][sx] = RenderCell::default();
+                    }
+                    queue!(stdout, Print(" ".repeat(content_right - painted)))?;
                 }
-                queue!(stdout, Print(" ".repeat(content_right - painted)))?;
             }
         }
 
@@ -414,6 +717,10 @@ impl Renderer {
         if first_blank < content_bottom && ox < content_right {
             queue!(stdout, ResetColor)?;
             for sy in first_blank..content_bottom {
+                if self.popup.is_some() {
+                    self.blank_span(&mut stdout, sy, ox, content_right, false)?;
+                    continue;
+                }
                 queue!(stdout, MoveTo(self.origin_x, sy as u16))?;
                 queue!(stdout, Print(" ".repeat(content_right - ox)))?;
                 for sx in ox..content_right {
@@ -445,6 +752,9 @@ impl Renderer {
                 if sx >= content_right {
                     break;
                 }
+                if self.masked(sx, sy, cell.width) {
+                    continue;
+                }
                 self.front[sy][sx] = cell.clone();
             }
         }
@@ -452,6 +762,33 @@ impl Renderer {
         // End synchronized output.
         queue!(stdout, Print("\x1b[?2026l"))?;
 
+        Ok(())
+    }
+
+    /// Blank `x0..x1` on screen row `sy`, leaving what the popup box covers
+    /// alone. `positioned` says the terminal's cursor is already on `x0`.
+    fn blank_span<W: Write>(
+        &mut self,
+        out: &mut W,
+        sy: usize,
+        x0: usize,
+        x1: usize,
+        positioned: bool,
+    ) -> Result<()> {
+        queue!(out, ResetColor)?;
+        let mut at_cursor = positioned;
+        for sx in x0..x1 {
+            if self.masked(sx, sy, 1) {
+                at_cursor = false;
+                continue;
+            }
+            if !at_cursor {
+                queue!(out, MoveTo(sx as u16, sy as u16))?;
+                at_cursor = true;
+            }
+            queue!(out, Print(' '))?;
+            self.front[sy][sx] = RenderCell::default();
+        }
         Ok(())
     }
 
@@ -496,6 +833,10 @@ impl Renderer {
             let sx = change.x as usize + self.origin_x as usize;
             let sy = change.y as usize + self.origin_y as usize;
             if sx >= content_right || sy >= content_bottom {
+                continue;
+            }
+            // The popup box covers this cell: neither emit nor store it.
+            if self.masked(sx, sy, change.cell.width) {
                 continue;
             }
 
@@ -600,6 +941,12 @@ impl Renderer {
             pane_x,
             pane_y
         );
+        // The server withholds scroll renders from a client that holds a
+        // popup layer, because the shift would move the pane under the box.
+        if self.popup.is_some() {
+            log::warn!("renderer: ignoring a scroll render while the popup layer is up");
+            return Ok(());
+        }
         let mut stdout = io::stdout().lock();
         queue!(stdout, cursor::Hide)?;
 
@@ -855,15 +1202,27 @@ impl Renderer {
             let mut last_italic = false;
             let mut last_underline = false;
             let mut last_hyperlink: Option<String> = None;
+            // Set after a skipped run, so the next emitted cell is preceded by
+            // the move that puts the terminal's cursor back on it.
+            let mut need_move = false;
 
             for (rx, cell) in row.iter().enumerate() {
                 let sx = rect.x as usize + rx;
                 if rx >= rect.width as usize || sx >= self.cols as usize {
                     break;
                 }
+                // The popup box covers this cell: neither emit nor store it.
+                if self.masked(sx, sy, cell.width) {
+                    need_move = true;
+                    continue;
+                }
                 if cell.width == 0 {
                     self.front[sy][sx] = cell.clone();
                     continue;
+                }
+                if need_move {
+                    queue!(out, MoveTo(sx as u16, sy as u16))?;
+                    need_move = false;
                 }
                 if cell.fg != last_fg {
                     queue!(out, SetForegroundColor(cell_color_to_crossterm(&cell.fg)))?;
@@ -959,6 +1318,9 @@ impl Renderer {
         // withhold. `frame_rows` is restored too, because the diffs that follow
         // still describe the last server frame.
         let saved_status = (self.status_row_owned, self.frame_rows);
+        // The front buffer never holds the popup box, so it is replayed whole
+        // and the box is put back on top afterwards.
+        let popup = self.popup.take();
         self.status_row_owned = false;
         // The frame here IS the whole terminal, so the content rect must be the
         // whole terminal too -- otherwise the clears would treat the panel
@@ -975,6 +1337,9 @@ impl Renderer {
         self.content_rows = saved.3;
         self.last_cursor = saved_cursor;
         (self.status_row_owned, self.frame_rows) = saved_status;
+        self.popup = popup;
+        let mut stdout = io::stdout().lock();
+        self.paint_popup_into(&mut stdout, None)?;
         res
     }
 
@@ -995,6 +1360,9 @@ impl Renderer {
         self.content_cols = cols;
         self.content_rows = rows;
         self.status_row_owned = false;
+        // The box was placed for the old size; the next frame brings a layer
+        // for the new one.
+        self.popup = None;
         self.front = vec![vec![RenderCell::default(); cols as usize]; rows as usize];
         // Clear the terminal to avoid stale content from old layout.
         let mut stdout = io::stdout().lock();
@@ -1050,8 +1418,9 @@ impl Renderer {
         // below are ABSOLUTE. Offsetting here fixes the whole function at once:
         // the front-buffer repaint, the selection highlight, and the block
         // cursor all derive from these two values.
-        let pane_ox = visual_state.pane_offset_x.saturating_add(self.origin_x);
-        let pane_oy = visual_state.pane_offset_y.saturating_add(self.origin_y);
+        let (origin_x, origin_y) = self.rect_origin();
+        let pane_ox = visual_state.pane_offset_x.saturating_add(origin_x);
+        let pane_oy = visual_state.pane_offset_y.saturating_add(origin_y);
         let pane_w = visual_state.visible_cols;
         let pane_h = visual_state.visible_rows;
 
@@ -1068,7 +1437,6 @@ impl Renderer {
             if screen_y >= self.front.len() || screen_y >= self.rows as usize {
                 break;
             }
-            let row = &self.front[screen_y];
             queue!(stdout, MoveTo(pane_ox, screen_y as u16), ResetColor)?;
             let mut last_bold = false;
             let mut last_italic = false;
@@ -1076,10 +1444,12 @@ impl Renderer {
             let mut last_hyperlink: Option<String> = None;
             for pane_x in 0..pane_w {
                 let screen_x = pane_ox as usize + pane_x;
-                if screen_x >= self.cols as usize || screen_x >= row.len() {
+                if screen_x >= self.cols as usize {
                     break;
                 }
-                let cell = &row[screen_x];
+                let Some(cell) = self.cell_at(screen_x, screen_y) else {
+                    break;
+                };
                 // Skip the continuation cell of a wide glyph: the preceding
                 // width-2 Print already advanced the physical cursor by 2.
                 if cell.width == 0 {
@@ -1177,11 +1547,9 @@ impl Renderer {
                     if screen_x >= self.cols as usize {
                         break;
                     }
-                    let row = &self.front[screen_y];
-                    if screen_x >= row.len() {
+                    let Some(cell) = self.cell_at(screen_x, screen_y) else {
                         break;
-                    }
-                    let cell = &row[screen_x];
+                    };
                     // Skip the continuation cell of a wide glyph: the preceding
                     // width-2 lead was printed inverted and already covers both
                     // physical columns, so printing here would misalign the
@@ -1227,8 +1595,7 @@ impl Renderer {
         if cursor_screen_row < self.rows && cursor_screen_col < self.cols {
             let row_idx = cursor_screen_row as usize;
             let col_idx = cursor_screen_col as usize;
-            if row_idx < self.front.len() && col_idx < self.front[row_idx].len() {
-                let cell = &self.front[row_idx][col_idx];
+            if let Some(cell) = self.cell_at(col_idx, row_idx) {
                 let is_in_selection = selection_range.is_some_and(|_| true);
 
                 if selection_range.is_none() || !is_in_selection {
@@ -1279,8 +1646,9 @@ impl Renderer {
 
         // Content-relative in, absolute out: `self.front` is the full terminal,
         // so without the origin a copy would lift text out of a sidebar panel.
-        let pane_ox = visual_state.pane_offset_x.saturating_add(self.origin_x) as usize;
-        let pane_oy = visual_state.pane_offset_y.saturating_add(self.origin_y) as usize;
+        let (origin_x, origin_y) = self.rect_origin();
+        let pane_ox = visual_state.pane_offset_x.saturating_add(origin_x) as usize;
+        let pane_oy = visual_state.pane_offset_y.saturating_add(origin_y) as usize;
         let pane_h = visual_state.visible_rows;
         let pane_w = visual_state.visible_cols;
 
@@ -1300,11 +1668,13 @@ impl Renderer {
             if screen_y >= self.front.len() {
                 continue;
             }
-            let row = &self.front[screen_y];
+            let row_len = self.front[screen_y].len();
 
             // Extract only the pane's columns from the composited row.
-            let pane_row_len = pane_w.min(row.len().saturating_sub(pane_ox));
-            let pane_row: Vec<&RenderCell> = (0..pane_row_len).map(|c| &row[pane_ox + c]).collect();
+            let pane_row_len = pane_w.min(row_len.saturating_sub(pane_ox));
+            let pane_row: Vec<&RenderCell> = (0..pane_row_len)
+                .filter_map(|c| self.cell_at(pane_ox + c, screen_y))
+                .collect();
 
             // Collect glyph chars, skipping the width-0 continuation cell that
             // follows a wide glyph (its char is a blank placeholder). A wide
@@ -1527,8 +1897,9 @@ impl Renderer {
         // coordinate derived from it below must be absolute. `viewport_top` is
         // deliberately NOT offset -- it is a scrollback LINE index compared
         // against match line numbers, not a screen coordinate.
-        let pane_x = pr.x.saturating_add(self.origin_x) as usize;
-        let pane_y = pr.y.saturating_add(self.origin_y) as usize;
+        let (origin_x, origin_y) = self.rect_origin();
+        let pane_x = pr.x.saturating_add(origin_x) as usize;
+        let pane_y = pr.y.saturating_add(origin_y) as usize;
 
         // The visible line range in scrollback coordinates.
         let visible_start = viewport_top;
@@ -1563,12 +1934,7 @@ impl Renderer {
                     break;
                 }
 
-                let cell_char =
-                    if screen_y < self.front.len() && screen_x < self.front[screen_y].len() {
-                        self.front[screen_y][screen_x].c
-                    } else {
-                        ' '
-                    };
+                let cell_char = self.cell_at(screen_x, screen_y).map_or(' ', |c| c.c);
 
                 queue!(
                     stdout,
@@ -1611,12 +1977,17 @@ impl Renderer {
         // `paint_panel` after this must restore THIS state, not the one the
         // last server frame reported. The style is left as remembered -- this
         // entry point never carried one.
-        self.last_cursor = (x, y, visible, self.last_cursor.3);
+        //
+        // While the popup layer is up the caller holds window-absolute
+        // coordinates (see `last_cursor`).
+        let absolute = self.popup.is_some();
+        self.last_cursor = (x, y, visible, self.last_cursor.3, absolute);
         let mut stdout = io::stdout().lock();
         if visible {
-            // `x`/`y` are the last server-reported position, i.e.
-            // content-relative: offset them or the cursor lands in a sidebar.
-            let (sx, sy) = self.cursor_screen_pos(x, y);
+            // Without a popup `x`/`y` are the last server-reported position,
+            // i.e. content-relative: offset them or the cursor lands in a
+            // sidebar.
+            let (sx, sy) = self.cursor_screen_pos(x, y, absolute);
             queue!(stdout, MoveTo(sx, sy), cursor::Show)?;
         } else {
             queue!(stdout, cursor::Hide)?;
@@ -2484,5 +2855,291 @@ mod origin_tests {
         assert_eq!(r.content_size(), (30, 10));
         assert_eq!(r.front_buffer().len(), 10);
         assert_eq!(r.front_buffer()[0].len(), 30);
+    }
+
+    // -- The popup box --------------------------------------------------------
+
+    fn boxed(width: u16, height: u16, c: char) -> Vec<Vec<RenderCell>> {
+        vec![vec![cell(c); width as usize]; height as usize]
+    }
+
+    fn rect(x: u16, y: u16, width: u16, height: u16) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A 10x4 terminal showing `AAAAAAAAAA` on every row, with a 4x2 popup box
+    /// of `P` at (2, 1).
+    fn with_box() -> Renderer {
+        let mut r = Renderer::new(10, 4);
+        r.render_full(&grid("AAAAAAAAAA", 4), 0, 0, false, 0)
+            .unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        r.set_popup_into(
+            &mut sink,
+            rect(2, 1, 4, 2),
+            boxed(4, 2, 'P'),
+            (3, 2, true, 2),
+        )
+        .unwrap();
+        r
+    }
+
+    fn front_row(r: &Renderer, y: usize) -> String {
+        r.front_buffer()[y].iter().map(|c| c.c).collect()
+    }
+
+    #[test]
+    fn a_full_render_skips_the_cells_the_box_covers() {
+        let mut r = with_box();
+        r.render_full(&grid("BBBBBBBBBB", 4), 0, 0, false, 0)
+            .unwrap();
+        assert_eq!(front_row(&r, 0), "BBBBBBBBBB");
+        // Inside the box the front buffer keeps what was there before.
+        assert_eq!(front_row(&r, 1), "BBAAAABBBB");
+        assert_eq!(front_row(&r, 2), "BBAAAABBBB");
+        assert_eq!(front_row(&r, 3), "BBBBBBBBBB");
+    }
+
+    #[test]
+    fn a_diff_skips_the_cells_the_box_covers() {
+        let mut r = with_box();
+        let at = |x, y| CellChange {
+            x,
+            y,
+            cell: cell('Z'),
+        };
+        r.render_diff(&[at(3, 1), at(0, 1), at(6, 2)], 0, 0, false, 0)
+            .unwrap();
+        assert_eq!(front_row(&r, 1), "ZAAAAAAAAA", "(3,1) is under the box");
+        assert_eq!(front_row(&r, 2), "AAAAAAZAAA");
+    }
+
+    #[test]
+    fn a_panel_paint_skips_the_box_and_moves_the_cursor_past_it() {
+        let mut r = with_box();
+        let mut out: Vec<u8> = Vec::new();
+        r.paint_panel_into(
+            &mut out,
+            rect(0, 1, 10, 1),
+            &[grid("0123456789", 1)[0].clone()],
+        )
+        .unwrap();
+        let emitted = String::from_utf8_lossy(&out).to_string();
+        assert_eq!(
+            front_row(&r, 1),
+            "01AAAA6789",
+            "the box's cells are not stored"
+        );
+        assert!(emitted.contains("01"), "{emitted:?}");
+        assert!(
+            !emitted.contains("234") && !emitted.contains("345"),
+            "{emitted:?}"
+        );
+        // The terminal's cursor is moved to the first cell after the box
+        // (row 2, column 7 in 1-based terms).
+        assert!(emitted.contains("\x1b[2;7H6789"), "{emitted:?}");
+    }
+
+    #[test]
+    fn a_wide_glyph_straddling_the_edge_counts_as_covered() {
+        let mut r = with_box();
+        let wide = RenderCell {
+            c: '\u{4e2d}',
+            width: 2,
+            ..RenderCell::default()
+        };
+        let cont = RenderCell {
+            c: ' ',
+            width: 0,
+            ..RenderCell::default()
+        };
+        // The lead is just left of the box (x = 1), its continuation inside it.
+        r.render_diff(
+            &[
+                CellChange {
+                    x: 1,
+                    y: 1,
+                    cell: wide,
+                },
+                CellChange {
+                    x: 2,
+                    y: 1,
+                    cell: cont,
+                },
+            ],
+            0,
+            0,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(front_row(&r, 1), "AAAAAAAAAA");
+    }
+
+    #[test]
+    fn the_box_owns_the_cursor_in_window_coordinates() {
+        let mut r = with_box();
+        // A content origin that would shift a content-relative cursor.
+        r.set_origin(4, 0);
+        r.set_content_size(6, 4);
+        r.render_full(&grid("BBBBBB", 4), 50, 50, true, 1).unwrap();
+        assert_eq!(r.last_cursor, (3, 2, true, 2, true));
+        let mut out: Vec<u8> = Vec::new();
+        r.queue_remembered_cursor(&mut out).unwrap();
+        let emitted = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            emitted.contains("\x1b[3;4H"),
+            "no origin offset applies: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_cursor_is_clamped_to_the_terminal() {
+        let mut r = Renderer::new(10, 4);
+        let mut sink: Vec<u8> = Vec::new();
+        r.set_popup_into(
+            &mut sink,
+            rect(0, 0, 4, 2),
+            boxed(4, 2, 'P'),
+            (99, 99, true, 0),
+        )
+        .unwrap();
+        r.render_full(&grid("AAAAAAAAAA", 4), 0, 0, false, 0)
+            .unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        r.queue_remembered_cursor(&mut out).unwrap();
+        assert!(
+            String::from_utf8_lossy(&out).contains("\x1b[4;10H"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn dropping_the_layer_lifts_the_mask() {
+        let mut r = with_box();
+        r.clear_popup();
+        assert_eq!(r.popup_rect(), None);
+        r.render_full(&grid("BBBBBBBBBB", 4), 0, 0, false, 0)
+            .unwrap();
+        assert_eq!(front_row(&r, 1), "BBBBBBBBBB");
+        assert_eq!(r.rect_origin(), r.origin());
+        // The cursor is the frame's again.
+        r.render_full(&grid("BBBBBBBBBB", 4), 7, 2, true, 0)
+            .unwrap();
+        assert_eq!(r.last_cursor, (7, 2, true, 0, false));
+    }
+
+    #[test]
+    fn a_resize_drops_the_layer() {
+        let mut r = with_box();
+        r.resize(12, 5);
+        assert_eq!(r.popup_rect(), None);
+    }
+
+    #[test]
+    fn rect_origin_is_zero_while_the_layer_is_up() {
+        let mut r = with_box();
+        r.set_origin(4, 1);
+        assert_eq!(r.origin(), (4, 1));
+        assert_eq!(r.rect_origin(), (0, 0));
+    }
+
+    #[test]
+    fn repaint_all_keeps_the_layer_and_the_front_buffer_intact() {
+        let mut r = with_box();
+        r.repaint_all().unwrap();
+        assert_eq!(r.popup_rect(), Some(rect(2, 1, 4, 2)));
+        assert_eq!(front_row(&r, 1), "AAAAAAAAAA", "the box is never stored");
+    }
+
+    #[test]
+    fn the_box_is_emitted_whole_and_then_only_where_it_changed() {
+        let mut r = Renderer::new(10, 4);
+        let mut first: Vec<u8> = Vec::new();
+        r.set_popup_into(
+            &mut first,
+            rect(2, 1, 4, 2),
+            boxed(4, 2, 'P'),
+            (0, 0, false, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&first).matches('P').count(),
+            8,
+            "the first paint covers the box"
+        );
+        let mut next = boxed(4, 2, 'P');
+        next[1][2] = cell('Q');
+        let mut second: Vec<u8> = Vec::new();
+        r.set_popup_into(
+            &mut second,
+            rect(2, 1, 4, 2),
+            next.clone(),
+            (0, 0, false, 0),
+        )
+        .unwrap();
+        let emitted = String::from_utf8_lossy(&second).to_string();
+        assert_eq!(emitted.matches('Q').count(), 1);
+        assert_eq!(emitted.matches('P').count(), 0, "unchanged cells stay put");
+        // A box that moved is emitted whole again.
+        let mut third: Vec<u8> = Vec::new();
+        r.set_popup_into(&mut third, rect(3, 1, 4, 2), next, (0, 0, false, 0))
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&third).matches('P').count(), 7);
+    }
+
+    #[test]
+    fn a_scroll_render_is_ignored_while_the_layer_is_up() {
+        let mut r = with_box();
+        let before = r.front_buffer().to_vec();
+        r.render_scroll(
+            0,
+            0,
+            10,
+            4,
+            1,
+            &[grid("ZZZZZZZZZZ", 1)[0].clone()],
+            0,
+            0,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(r.front_buffer(), before.as_slice());
+    }
+
+    #[test]
+    fn overlays_that_read_the_screen_read_the_box_where_it_covers() {
+        let r = with_box();
+        assert_eq!(r.cell_at(3, 1).map(|c| c.c), Some('P'));
+        assert_eq!(r.cell_at(0, 1).map(|c| c.c), Some('A'));
+        // A copy out of the popup returns the popup's text.
+        let mut vs = VisualState::with_cols(2, 2, 4);
+        vs.pane_offset_x = 2;
+        vs.pane_offset_y = 1;
+        vs.cursor_row = 0;
+        vs.cursor_col = 0;
+        vs.start_char_selection();
+        vs.cursor_col = 3;
+        assert_eq!(r.extract_text(&vs), "PPPP");
+    }
+
+    #[test]
+    fn a_blank_fill_under_a_box_leaves_the_box_alone() {
+        let mut r = with_box();
+        // A frame narrower than the content rect blanks its remainder.
+        r.render_full(&grid("BB", 4), 0, 0, false, 0).unwrap();
+        assert_eq!(front_row(&r, 0), "BB        ");
+        assert_eq!(
+            front_row(&r, 1),
+            "BBAAAA    ",
+            "the box's cells are untouched"
+        );
     }
 }

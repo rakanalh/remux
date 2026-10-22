@@ -556,8 +556,10 @@ impl Chrome {
         let h = pane.height as usize + 2 * BORDER_INSET as usize;
 
         // Server frames are blitted at the content origin, so the reported rect
-        // is content-relative and the ring must be moved by it.
-        let (ox, oy) = renderer.origin();
+        // is content-relative and the ring must be moved by it. While the popup
+        // layer is up the rect is the popup's and window-absolute instead, and
+        // `rect_origin` is zero.
+        let (ox, oy) = renderer.rect_origin();
         let (ax, ay) = (ox as usize + rx as usize, oy as usize + ry as usize);
 
         // Clipped to the content rect, not the terminal: a ring that ran past it
