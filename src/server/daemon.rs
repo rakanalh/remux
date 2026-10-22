@@ -4001,7 +4001,17 @@ async fn handle_command(
                             );
                             return Ok(());
                         }
-                        tab.focus_pane(pane_id);
+                        // The tab's visible popup owns input, and hiding it
+                        // returns input to `focused_pane`. Moving that here would
+                        // send the user somewhere else when the popup closes, so
+                        // the switch lands on the tab and its popup only.
+                        if tab.popup_visible {
+                            log::debug!(
+                                "SessionSwitchPane: tab {tab_index} of '{session}' has its popup up, pane {pane_id} is not focused"
+                            );
+                        } else {
+                            tab.focus_pane(pane_id);
+                        }
                     }
                     session::debug_check_invariant(sess, "SessionSwitchPane");
                 }
@@ -12299,6 +12309,101 @@ mod popup_tests {
         let sess = &st.sessions["main"];
         assert_eq!(sess.visible_popup(), Some(first));
         assert!(sess.tabs[1].popup_visible);
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_popup_returns_input_to_the_pane_focused_before_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let left = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let middle = rig.split(dir.path()).await;
+        rig.split(dir.path()).await;
+        let focused = || {
+            let state = rig.state.clone();
+            async move { state.lock().await.sessions["main"].tabs[0].focused_pane }
+        };
+        let focus = |pane: PaneId| {
+            let state = rig.state.clone();
+            async move {
+                state.lock().await.sessions.get_mut("main").unwrap().tabs[0].focus_pane(pane);
+            }
+        };
+        let click_left = || {
+            let (state, panes, clients, config, pf) = (
+                rig.state.clone(),
+                rig.panes.clone(),
+                rig.clients.clone(),
+                rig.config.clone(),
+                rig.prev_frames.clone(),
+            );
+            async move {
+                for release in [false, true] {
+                    handle_mouse_click(
+                        CLIENT, 2, 5, release, false, &state, &panes, &clients, &config, &pf,
+                    )
+                    .await
+                    .expect("click");
+                }
+            }
+        };
+        let switch_to_left = RemuxCommand::SessionSwitchPane {
+            session: "main".to_string(),
+            tab_index: 0,
+            pane_id: left,
+        };
+
+        // Each action does move the focus while no popup is up, so a pass below
+        // is not a miss.
+        focus(middle).await;
+        rig.command(RemuxCommand::PaneFocusLeft).await;
+        assert_eq!(focused().await, left, "a focus key");
+        focus(middle).await;
+        click_left().await;
+        assert_eq!(focused().await, left, "a click on a pane");
+        focus(middle).await;
+        rig.command(switch_to_left.clone()).await;
+        assert_eq!(focused().await, left, "an agent or session-tree switch");
+
+        focus(middle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        for cmd in [
+            RemuxCommand::PaneFocusLeft,
+            RemuxCommand::PaneFocusRight,
+            RemuxCommand::PaneStackNext,
+            RemuxCommand::PaneStackPrev,
+            RemuxCommand::SetMaster,
+            RemuxCommand::LayoutNext,
+            switch_to_left.clone(),
+            RemuxCommand::SessionSwitchTab {
+                session: "main".to_string(),
+                tab_index: 0,
+            },
+        ] {
+            rig.command(cmd.clone()).await;
+            assert_eq!(focused().await, middle, "{cmd:?} while the popup is up");
+        }
+        click_left().await;
+        assert_eq!(
+            focused().await,
+            middle,
+            "a click outside the box is swallowed"
+        );
+        // A tab switch away and back.
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        assert_eq!(focused().await, middle, "a tab switch away and back");
+
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[0];
+        assert!(!tab.popup_visible);
+        assert_eq!(
+            tab.input_target(),
+            middle,
+            "input is back on the middle pane"
+        );
         drop(st);
         rig.finish().await;
     }

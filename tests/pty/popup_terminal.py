@@ -511,6 +511,57 @@ def toggle_position_case():
     return fails
 
 
+def output_at(tui, needle):
+    """`(x, y)` of `needle` on screen. Markers are printed as `FOC$((40+n))`,
+    so the output text never appears in the typed command."""
+    for y, row in enumerate(tui.rows_text()):
+        x = row.find(needle)
+        if x >= 0:
+            return (x, y)
+    return None
+
+
+def focus_return_case():
+    print("\n== closing the popup returns input to the pane focused before it ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_focus", POPUP_KEYS + cfg())
+    try:
+        # Three panes; the newest is focused. Alt-h moves to another one.
+        tui.prefix(b"pv", 1.8)
+        tui.prefix(b"pv", 1.8)
+        tui.send(b"\x1bh", 0.8)
+        tui.send(b"echo FOC$((40+2))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "FOC42")
+        check(home is not None, f"the focused pane printed its marker at {home}")
+        for n, (label, key) in enumerate([("Alt-p", ALT_P),
+                                          ("PopupToggle right", ALT_BACKSLASH)]):
+            tui.send(key)
+            tui.pump(1.8)
+            rows = list(tui.rows_text())
+            check(rows[5][16] == "\u256d" or right_open(rows), f"{label} opens the popup")
+            tui.send(key)
+            tui.pump(1.8)
+            marker = f"FOC{43 + n}"
+            tui.send(f"echo FOC$((40+{3 + n}))\r".encode())
+            tui.pump(1.0)
+            at = output_at(tui, marker)
+            rows = list(tui.rows_text())
+            # The same column with no pane divider between them: the same pane,
+            # not one stacked below it.
+            same_pane = (at is not None and home is not None and at[0] == home[0]
+                         and at[1] > home[1]
+                         and all(rows[y][home[0]] != "\u2500"
+                                 for y in range(home[1], at[1])))
+            check(same_pane,
+                  f"after {label} closes, typing lands in that pane ({at} below {home})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
 def popup_line_with(tui, needle):
     """Whether a line of the float's interior holds `needle` as output: not the
     typed command or a prompt, which carry the `$`."""
@@ -555,7 +606,7 @@ def main():
     all_fails = []
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
                  live_reload_case, runtime_resize_case, per_tab_case,
-                 in_tab_cwd_case, toggle_position_case):
+                 in_tab_cwd_case, toggle_position_case, focus_return_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:
