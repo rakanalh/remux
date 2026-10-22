@@ -5904,6 +5904,7 @@ async fn run_client_loop(
                                                 y: cy,
                                                 pane_id: Some(cell.pane_id),
                                                 release: false,
+                                                popup: false,
                                             },
                                         )
                                         .await?;
@@ -5939,6 +5940,7 @@ async fn run_client_loop(
                                                     end_y: ey,
                                                     is_final: true,
                                                     pane_id: Some(pane_id),
+                                                    popup: false,
                                                 },
                                             )
                                             .await?;
@@ -5961,6 +5963,7 @@ async fn run_client_loop(
                                                     y: ey,
                                                     pane_id: Some(pane_id),
                                                     release: true,
+                                                    popup: false,
                                                 },
                                             )
                                             .await?;
@@ -6065,6 +6068,7 @@ async fn run_client_loop(
                                                     end_y: ey,
                                                     is_final: false,
                                                     pane_id: Some(pane_id),
+                                                    popup: false,
                                                 },
                                             )
                                             .await?;
@@ -6268,6 +6272,7 @@ async fn run_client_loop(
                                         y: cy,
                                         pane_id: None,
                                         release: false,
+                                        popup: false,
                                     })
                                     .await?;
                             }
@@ -6284,6 +6289,7 @@ async fn run_client_loop(
                                                 end_y: cy,
                                                 is_final: false,
                                                 pane_id: None,
+                                                popup: false,
                                             })
                                             .await?;
                                         last_drag_send = now;
@@ -6302,6 +6308,7 @@ async fn run_client_loop(
                                                 end_y: cy,
                                                 is_final: true,
                                                 pane_id: None,
+                                                popup: false,
                                             })
                                             .await?;
                                     } else {
@@ -6317,6 +6324,7 @@ async fn run_client_loop(
                                                 y: cy,
                                                 pane_id: None,
                                                 release: true,
+                                                popup: false,
                                             })
                                             .await?;
                                     }
@@ -6343,6 +6351,7 @@ async fn run_client_loop(
                                         x: cx,
                                         y: cy,
                                         up: true,
+                                        popup: false,
                                     })
                                     .await?;
                                 }
@@ -6368,6 +6377,7 @@ async fn run_client_loop(
                                         x: cx,
                                         y: cy,
                                         up: false,
+                                        popup: false,
                                     })
                                     .await?;
                                 }
@@ -6581,7 +6591,7 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: _ }) => {
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
                         focused_pane_rect = fpr;
@@ -6626,7 +6636,7 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: _ }) => {
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         focused_pane_rect = fpr;
                         input.application_cursor_keys = ack;

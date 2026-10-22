@@ -146,12 +146,18 @@ pub struct AppearanceConfig {
     pub theme: theme::ThemeConfig,
     /// Placement style for the which-key hint popup.
     pub which_key_position: WhichKeyPosition,
-    /// Width of the popup terminal as a percentage of the session's content
-    /// area. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT` (20..=100) when a
-    /// session is created, and adjustable at runtime with the resize commands.
+    /// Where the popup terminal sits; see [`PopupPosition`]. Applied by the
+    /// client, which hot-reloads it.
+    pub popup_position: PopupPosition,
+    /// Width of the popup terminal as a percentage of the window (`float`) or
+    /// of the content area (`left`, `right`). Ignored by `top` and `bottom`,
+    /// which span the window. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT`
+    /// (20..=100).
     pub popup_width_pct: u8,
-    /// Height of the popup terminal as a percentage of the session's content
-    /// area. Clamped like `popup_width_pct`.
+    /// Height of the popup terminal as a percentage of the window rows minus
+    /// the status bar row (`float`, `top`, `bottom`). Ignored by `left` and
+    /// `right`, which run the full content height. Clamped like
+    /// `popup_width_pct`.
     pub popup_height_pct: u8,
     /// The template a pane is named by; see [`pane_title`]. `None` names a
     /// pane by its settled window title, else its foreground command.
@@ -166,11 +172,29 @@ impl Default for AppearanceConfig {
             default_layout: DefaultLayout::default(),
             theme: theme::ThemeConfig::default(),
             which_key_position: WhichKeyPosition::default(),
+            popup_position: PopupPosition::default(),
             popup_width_pct: 80,
             popup_height_pct: 80,
             pane_title: None,
         }
     }
+}
+
+/// Where the popup terminal is drawn.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PopupPosition {
+    /// A fully framed box centered on the whole window, over every sidebar.
+    #[default]
+    Float,
+    /// A drawer docked to the left edge of the content area.
+    Left,
+    /// A drawer docked to the right edge of the content area.
+    Right,
+    /// A drawer docked to the top of the window, over the sidebars.
+    Top,
+    /// A drawer docked above the status bar row, over the sidebars.
+    Bottom,
 }
 
 /// Placement style for the which-key hint popup.
@@ -670,11 +694,41 @@ mod tests {
             default_layout: _,
             theme: _,
             which_key_position: _,
+            popup_position: _,
             popup_width_pct: _,
             popup_height_pct: _,
             pane_title: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
+    }
+
+    #[test]
+    fn popup_position_defaults_to_float() {
+        assert_eq!(
+            Config::default().appearance.popup_position,
+            PopupPosition::Float
+        );
+    }
+
+    #[test]
+    fn popup_position_parses_every_value() {
+        for (value, want) in [
+            ("float", PopupPosition::Float),
+            ("left", PopupPosition::Left),
+            ("right", PopupPosition::Right),
+            ("top", PopupPosition::Top),
+            ("bottom", PopupPosition::Bottom),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[appearance]\npopup_position = \"{value}\"\n")).unwrap();
+            assert_eq!(config.appearance.popup_position, want, "{value}");
+        }
+    }
+
+    #[test]
+    fn popup_position_rejects_an_unknown_value() {
+        let err = toml::from_str::<Config>("[appearance]\npopup_position = \"middle\"\n");
+        assert!(err.is_err());
     }
 
     #[test]

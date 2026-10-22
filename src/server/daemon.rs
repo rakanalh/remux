@@ -1610,6 +1610,7 @@ async fn handle_client_message(
             end_y,
             is_final,
             pane_id,
+            popup: _,
         } => {
             log::debug!(
                 "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final}, pane_id={pane_id:?})"
@@ -1873,6 +1874,7 @@ async fn handle_client_message(
             y,
             pane_id,
             release,
+            popup: _,
         } => match pane_id {
             Some(pid) => {
                 handle_pane_mouse_click(client_id, pid, x, y, release, state, panes, clients).await
@@ -1899,6 +1901,7 @@ async fn handle_client_message(
             end_y,
             is_final,
             pane_id,
+            popup: _,
         } => match pane_id {
             Some(pid) => {
                 handle_pane_mouse_drag(
@@ -1924,6 +1927,7 @@ async fn handle_client_message(
                 .await
             }
         },
+        ClientMessage::PopupSize { cols: _, rows: _ } => Ok(()),
         ClientMessage::ScrollDelta { delta } => {
             // No coordinates, so this scrolls whichever pane owns input.
             handle_scroll_delta(
@@ -1938,7 +1942,7 @@ async fn handle_client_message(
             )
             .await
         }
-        ClientMessage::MouseScroll { x, y, up } => {
+        ClientMessage::MouseScroll { x, y, up, popup: _ } => {
             handle_mouse_scroll(
                 client_id,
                 x,
@@ -8503,6 +8507,7 @@ async fn send_full_render_to_client(
                     viewport_top,
                     scroll_offset,
                     status: status.clone(),
+                    popup: None,
                 }
             } else {
                 ServerMessage::RenderDiff {
@@ -8517,6 +8522,7 @@ async fn send_full_render_to_client(
                     viewport_top,
                     scroll_offset,
                     status: status.clone(),
+                    popup: None,
                 }
             }
         }
@@ -8532,6 +8538,7 @@ async fn send_full_render_to_client(
             viewport_top,
             scroll_offset,
             status: status.clone(),
+            popup: None,
         },
     };
     let _ = tx.send(msg);
@@ -8762,6 +8769,7 @@ async fn broadcast_full_render(
                         // `scroll_offset == 0` filter above).
                         scroll_offset: 0,
                         status: status.clone(),
+                        popup: None,
                     }
                 } else {
                     log::debug!(
@@ -8781,6 +8789,7 @@ async fn broadcast_full_render(
                         viewport_top,
                         scroll_offset: 0,
                         status: status.clone(),
+                        popup: None,
                     }
                 }
             }
@@ -8800,6 +8809,7 @@ async fn broadcast_full_render(
                     viewport_top,
                     scroll_offset: 0,
                     status: status.clone(),
+                    popup: None,
                 }
             }
         };
