@@ -1259,30 +1259,24 @@ pub fn intercept_focus(
             let Some(si) = chrome.sidebar_on(edge, term_cols, term_rows) else {
                 return false;
             };
-            // Enter the panel nearest the departing pane along the stack axis.
             let rects = chrome.panel_rects(term_cols, term_rows);
-            let mine: Vec<_> = rects.iter().filter(|(s, _, _)| *s == si).collect();
-            let Some(&&(_, fallback, _)) = mine.first() else {
+            let mine: Vec<usize> = rects
+                .iter()
+                .filter(|(s, _, _)| *s == si)
+                .map(|(_, p, _)| *p)
+                .collect();
+            let Some(&first) = mine.first() else {
                 // The sidebar takes space but every panel was dropped for being
                 // below its minimum: there is nothing to focus. Forward.
                 return false;
             };
-            let pi = match edge {
-                SidebarEdge::Left | SidebarEdge::Right => {
-                    let center = content.y + rect.y + rect.height / 2;
-                    mine.iter()
-                        .find(|(_, _, r)| center >= r.y && center < r.y + r.height)
-                        .map(|(_, p, _)| *p)
-                        .unwrap_or(fallback)
-                }
-                SidebarEdge::Bottom => {
-                    let center = content.x + rect.x + rect.width / 2;
-                    mine.iter()
-                        .find(|(_, _, r)| center >= r.x && center < r.x + r.width)
-                        .map(|(_, p, _)| *p)
-                        .unwrap_or(fallback)
-                }
-            };
+            // Return to the panel the user last left, as `focus_edge` does, and
+            // fall back to the first one. Picking by the departing pane's
+            // position instead makes the landing panel depend on the pane
+            // layout: a full-height pane always lands on whichever panel spans
+            // the middle row, never on the remembered one.
+            let want = chrome.sidebars[si].focused_panel;
+            let pi = if mine.contains(&want) { want } else { first };
             chrome.focus = ChromeFocus::Sidebar {
                 sidebar: si,
                 panel: pi,
@@ -1722,26 +1716,79 @@ mod focus_tests {
         ));
     }
 
-    #[test]
-    fn a_pane_entering_a_stacked_sidebar_lands_on_the_panel_beside_it() {
-        // Two stacked panels over 30 rows: panel 0 is rows 0..15, panel 1 is
-        // 15..30. A pane in the LOWER half of the content must enter panel 1.
-        let mut c = chrome_with_panels(SidebarEdge::Left, 30, 2);
-        let lower = PaneRect {
-            x: 1,
-            y: 16,
-            width: 68,
-            height: 12,
-            ..Default::default()
-        };
+    fn enter_left(c: &mut Chrome, pane: &PaneRect) {
         assert!(intercept_focus(
-            &mut c,
+            c,
             FocusDirection::Left,
-            Some(&lower),
+            Some(pane),
             100,
             30,
             &StatusBarPosition::Bottom
         ));
+    }
+
+    #[test]
+    fn entering_a_stacked_sidebar_lands_on_the_first_panel_by_default() {
+        // Panel 1 spans the lower half, beside both of these panes.
+        let mut c = chrome_with_panels(SidebarEdge::Left, 30, 2);
+        for pane in [
+            PaneRect {
+                x: 1,
+                y: 1,
+                width: 68,
+                height: 27,
+                ..Default::default()
+            },
+            PaneRect {
+                x: 1,
+                y: 16,
+                width: 68,
+                height: 12,
+                ..Default::default()
+            },
+        ] {
+            enter_left(&mut c, &pane);
+            assert_eq!(
+                c.focus,
+                ChromeFocus::Sidebar {
+                    sidebar: 0,
+                    panel: 0
+                }
+            );
+            c.leave_sidebar();
+        }
+    }
+
+    #[test]
+    fn entering_a_stacked_sidebar_returns_to_the_panel_last_left() {
+        let mut c = chrome_with_panels(SidebarEdge::Left, 30, 2);
+        let top = PaneRect {
+            x: 1,
+            y: 1,
+            width: 68,
+            height: 12,
+            ..Default::default()
+        };
+        enter_left(&mut c, &top);
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Down,
+            None,
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert!(intercept_focus(
+            &mut c,
+            FocusDirection::Right,
+            None,
+            100,
+            30,
+            &StatusBarPosition::Bottom
+        ));
+        assert_eq!(c.focus, ChromeFocus::Content);
+
+        enter_left(&mut c, &top);
         assert_eq!(
             c.focus,
             ChromeFocus::Sidebar {
