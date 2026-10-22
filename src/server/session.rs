@@ -1258,9 +1258,11 @@ impl ServerState {
         let mut deleted_sessions = Vec::new();
         for session_id in &folder.session_ids {
             if let Some(session) = self.sessions.remove(session_id) {
+                // Every tab's popup too, for the reason `delete_session` gives.
                 let mut pane_ids = Vec::new();
                 for tab in &session.tabs {
                     pane_ids.extend(layout::all_pane_ids(&tab.layout));
+                    pane_ids.extend(tab.popup_pane);
                 }
                 deleted_sessions.push((session_id.clone(), pane_ids));
             }
@@ -3207,6 +3209,19 @@ mod popup_invariant_tests {
         assert!(
             panes.contains(&popup),
             "popup pane {popup} must be reclaimed, got {panes:?}"
+        );
+    }
+
+    #[test]
+    fn delete_folder_cascade_returns_every_tabs_popup_pane() {
+        let (mut st, _, popup) = state_with_popup_on(2, false, true);
+        st.create_folder("work").expect("create_folder");
+        st.move_session("main", Some("work")).expect("move_session");
+        let deleted = st.delete_folder_cascade("work").expect("cascade");
+        let panes: Vec<PaneId> = deleted.into_iter().flat_map(|(_, panes)| panes).collect();
+        assert!(
+            panes.contains(&popup),
+            "a hidden popup on a non-active tab {popup} must be reclaimed, got {panes:?}"
         );
     }
 
