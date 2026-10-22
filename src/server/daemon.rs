@@ -8540,11 +8540,18 @@ async fn handle_popup_size(
     if before != Some(after) {
         resize_session_panes(&session_name, state, panes, clients, config).await?;
         // Every client's popup layer changed size, which each answers with a
-        // full frame of its own.
+        // full frame of its own. The sender is one of them, so this is its
+        // answer too, unless the broadcast skipped it (it does so for a client
+        // whose input pane is scrolled). Every frame sent stores a baseline, so
+        // a sender still without one was not answered.
         invalidate_session_baselines(&session_name, clients, prev_frames).await;
         broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        if prev_frames.lock().await.contains_key(&client_id) {
+            return Ok(());
+        }
+    } else {
+        prev_frames.lock().await.remove(&client_id);
     }
-    prev_frames.lock().await.remove(&client_id);
     send_full_render_to_client(
         client_id,
         &session_name,
@@ -12294,6 +12301,13 @@ mod popup_tests {
         send(&rig, 60, 12).await;
         assert_eq!(rig.screen_size(popup).await, (60, 12));
         let frames = rig.drain();
+        let full_renders = |frames: &[ServerMessage]| {
+            frames
+                .iter()
+                .filter(|m| matches!(m, ServerMessage::FullRender { .. }))
+                .count()
+        };
+        assert_eq!(full_renders(&frames), 1, "one answer, not two");
         let Some(ServerMessage::FullRender {
             popup: layer,
             focused_pane_rect,
@@ -12316,12 +12330,7 @@ mod popup_tests {
         send(&rig, 60, 12).await;
         assert_eq!(rig.screen_size(popup).await, (60, 12));
         let frames = rig.drain();
-        assert!(
-            frames
-                .iter()
-                .any(|m| matches!(m, ServerMessage::FullRender { .. })),
-            "always a full render"
-        );
+        assert_eq!(full_renders(&frames), 1, "always a full render");
         assert!(!frames
             .iter()
             .any(|m| matches!(m, ServerMessage::RenderDiff { .. })));
@@ -12384,6 +12393,50 @@ mod popup_tests {
         rig.command(RemuxCommand::PopupToggle).await;
         let fresh = rig.popup_of(1).await.expect("fresh popup");
         assert_ne!(fresh, hidden);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_sender_scrolled_in_its_popup_is_still_answered_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        // Give the popup history and scroll the sender into it. The broadcast
+        // skips a client whose input pane is scrolled.
+        {
+            let mut ps = rig.panes.lock().await;
+            let lines: String = (0..40).map(|i| format!("line {i}\r\n")).collect();
+            ps.get_mut(&popup)
+                .unwrap()
+                .screen
+                .process_output(lines.as_bytes());
+        }
+        rig.clients
+            .lock()
+            .await
+            .get_mut(&CLIENT)
+            .unwrap()
+            .set_scroll(popup, 3);
+        rig.drain();
+        handle_popup_size(
+            CLIENT,
+            (60, 12),
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("popup size");
+        assert_eq!(rig.screen_size(popup).await, (60, 12));
+        let full_renders = rig
+            .drain()
+            .into_iter()
+            .filter(|m| matches!(m, ServerMessage::FullRender { .. }))
+            .count();
+        assert_eq!(full_renders, 1, "the size change is answered exactly once");
         rig.finish().await;
     }
 
