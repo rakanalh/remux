@@ -1722,7 +1722,7 @@ fn sync_popup(
         neighbors: crate::protocol::FocusNeighbors::default(),
     };
     renderer.set_popup(placed.rect, cells, cursor);
-    renderer.set_held_layer(held);
+    renderer.set_held_layer(held, placed);
     Ok(Some(PopupFocus {
         cursor,
         focused_pane_rect,
@@ -1799,6 +1799,28 @@ fn popup_pointer(
         _ if inside(&popup.rect) => Some(PopupPointer::Frame),
         _ => None,
     }
+}
+
+/// [`popup_pointer`] against the box on screen, `on_screen`, while `wanted` is
+/// the box the client now asks the server for.
+///
+/// The two differ between a change that moves the box (a config reload, a
+/// runtime resize) and the server's answer, which is what replaces the box on
+/// screen. Until then an event the visible box claims is swallowed: its
+/// interior no longer matches the size the client asked for, and letting it
+/// fall through would hand it to whatever lies beneath the box.
+fn popup_hit(
+    on_screen: Option<PopupBox>,
+    wanted: &PopupBox,
+    grab: Option<MouseGrab>,
+    mouse: &crossterm::event::MouseEvent,
+) -> Option<PopupPointer> {
+    let on_screen = on_screen?;
+    let hit = popup_pointer(&on_screen, grab, mouse)?;
+    if on_screen != *wanted {
+        return Some(PopupPointer::Frame);
+    }
+    Some(hit)
 }
 
 /// Resize the popup instead of the layout, when a popup is up and the keyboard
@@ -5972,13 +5994,9 @@ async fn run_client_loop(
                         // asked before anything else. It is the renderer's box
                         // that counts: until the next frame replaces it, that is
                         // what is on screen.
-                        let popup_pointer = if active_view.is_none() && renderer.popup_rect().is_some() {
-                            let placed = popup_box_now(&popup, &chrome, &renderer, &current_attached);
-                            if renderer.popup_rect() == Some(placed.rect) {
-                                popup_pointer(&placed, mouse_grab, &mouse)
-                            } else {
-                                None
-                            }
+                        let popup_pointer = if active_view.is_none() && renderer.popup_box().is_some() {
+                            let wanted = popup_box_now(&popup, &chrome, &renderer, &current_attached);
+                            popup_hit(renderer.popup_box(), &wanted, mouse_grab, &mouse)
                         } else {
                             None
                         };
@@ -5995,6 +6013,11 @@ async fn run_client_loop(
                                     chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref())?;
                                     renderer.flush()?;
                                 }
+                            }
+                            // A release swallowed while the box on screen is
+                            // stale still ends the drag its press began.
+                            if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                                mouse_grab = None;
                             }
                             continue;
                         }
@@ -9061,6 +9084,57 @@ mod tests {
             .unwrap();
             renderer.clear_popup();
             assert_eq!(renderer.popup_rect(), None);
+        }
+
+        #[test]
+        fn the_box_on_screen_is_hit_tested_and_swallows_until_the_wanted_one_replaces_it() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &float_box(), None, &down(20, 10)),
+                None,
+                "no box on screen"
+            );
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let shown = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert_eq!(renderer.popup_box(), Some(shown));
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &shown, None, &down(20, 10)),
+                Some(PopupPointer::Interior(3, 4))
+            );
+
+            // A reload makes it a left drawer, before the server has answered
+            // the new size: the float is still what is on screen.
+            let mut config = Config::default();
+            config.appearance.popup_position = PopupPosition::Left;
+            assert!(popup.apply_config(&config));
+            let wanted = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert_ne!(wanted, shown);
+            // (20, 10) is over the sidebar, inside the float but outside the
+            // drawer: it must not reach the sidebar beneath the visible box.
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, None, &down(20, 10)),
+                Some(PopupPointer::Frame)
+            );
+            // Outside the box on screen the popup has no claim.
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, None, &down(150, 2)),
+                None
+            );
+            // A drag the popup grabbed is swallowed too, release included.
+            let up = mouse(MouseEventKind::Up(MouseButton::Left), 150, 2);
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, Some(MouseGrab::Popup), &up),
+                Some(PopupPointer::Frame)
+            );
         }
 
         #[test]

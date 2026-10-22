@@ -34,7 +34,7 @@ fn printable_text(text: &str) -> String {
 }
 
 use crate::client::input::{SelectionMode, VisualState};
-use crate::client::popup::HeldLayer;
+use crate::client::popup::{HeldLayer, PopupBox};
 use crate::client::whichkey::DrawCommand;
 use crate::protocol::{CellChange, CellColor, RenderCell};
 use crate::server::compositor::{box_bottom_line, box_top_line_titled, BOX_VERTICAL};
@@ -62,6 +62,10 @@ struct PopupBuf {
     /// The server's layer this box was composed from. The next frame's diff is
     /// applied to it, so it lives and dies with the box.
     held: Option<HeldLayer>,
+    /// Where the box is, as placed when `held` was composed into it. Mouse
+    /// events are hit-tested against this, the box the user sees, rather than
+    /// the box the config now asks for.
+    placed: Option<PopupBox>,
     /// What of the box the terminal does not show yet. `None` once it does.
     pending: Option<PendingPaint>,
 }
@@ -406,6 +410,7 @@ impl Renderer {
             cells,
             cursor,
             held: None,
+            placed: None,
             pending: Some(pending),
         });
     }
@@ -469,11 +474,18 @@ impl Renderer {
         Ok(())
     }
 
-    /// Remember the server layer the box was composed from.
-    pub fn set_held_layer(&mut self, layer: HeldLayer) {
+    /// Remember the server layer the box was composed from, and where it was
+    /// placed.
+    pub fn set_held_layer(&mut self, layer: HeldLayer, placed: PopupBox) {
         if let Some(popup) = &mut self.popup {
             popup.held = Some(layer);
+            popup.placed = Some(placed);
         }
+    }
+
+    /// The box on screen, while the layer is up.
+    pub fn popup_box(&self) -> Option<PopupBox> {
+        self.popup.as_ref().and_then(|p| p.placed)
     }
 
     /// The server layer the box was composed from, while the box is up.
