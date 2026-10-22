@@ -1698,16 +1698,19 @@ fn sync_popup(
         renderer.clear_popup();
         return Ok(None);
     };
-    let Some(held) = HeldLayer::from_frame(renderer.held_layer(), &frame) else {
+    let placed = popup_box_now(popup, chrome, renderer, attached);
+    // A frame that leaves the layer as it was, for a box that has not moved,
+    // can only have moved the cursor: the box on screen is already right.
+    let unchanged =
+        frame.cells.is_none() && frame.changes.is_empty() && renderer.popup_box() == Some(placed);
+    let Some(held) = HeldLayer::from_frame(renderer.take_held_layer(), &frame) else {
         // Without a held layer no later diff applies either, so ask for the
         // full one rather than show nothing until the box next moves.
         renderer.clear_popup();
         popup.reannounce();
         return Ok(None);
     };
-    let placed = popup_box_now(popup, chrome, renderer, attached);
     let interior = placed.interior;
-    let cells = crate::client::popup::compose_box(&placed, Some(&held), theme);
     let cursor = (
         interior.x + held.cursor_x.min(interior.width.saturating_sub(1)),
         interior.y + held.cursor_y.min(interior.height.saturating_sub(1)),
@@ -1721,7 +1724,12 @@ fn sync_popup(
         height: held.rows.min(interior.height),
         neighbors: crate::protocol::FocusNeighbors::default(),
     };
-    renderer.set_popup(placed.rect, cells, cursor);
+    if unchanged {
+        renderer.set_popup_cursor(cursor);
+    } else {
+        let cells = crate::client::popup::compose_box(&placed, Some(&held), theme);
+        renderer.set_popup(placed.rect, cells, cursor);
+    }
     renderer.set_held_layer(held, placed);
     Ok(Some(PopupFocus {
         cursor,
@@ -9018,6 +9026,42 @@ mod tests {
             .unwrap();
             assert_eq!(renderer.held_layer().unwrap().cells[0][1].c, 'q');
             assert_eq!(renderer.held_layer().unwrap().cells[0][0].c, 'x');
+        }
+
+        #[test]
+        fn a_frame_that_changes_nothing_in_the_layer_only_moves_the_cursor() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let grid = renderer.popup_cells().unwrap().as_ptr();
+            let mut idle = layer(4, 2, 'x');
+            idle.cells = None;
+            idle.cursor_x = 3;
+            let frame = sync_popup(
+                Some(idle),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap()
+            .expect("still up");
+            assert_eq!(
+                renderer.popup_cells().unwrap().as_ptr(),
+                grid,
+                "the box grid is not rebuilt"
+            );
+            assert_eq!(frame.cursor, (20, 7, true, 2));
+            assert_eq!(renderer.held_layer().unwrap().cursor_x, 3);
         }
 
         #[test]

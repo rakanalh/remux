@@ -232,11 +232,12 @@ impl HeldLayer {
     /// The layer a frame's `popup` describes, given the layer held before it.
     ///
     /// A set `cells` replaces the layer. Otherwise `changes` are applied to the
-    /// held layer, which is only meaningful when it has the frame's size. The
+    /// held layer in place, which is only meaningful when it has the frame's
+    /// size. The
     /// server sends a full layer whenever the size changes or the layer
     /// appears, so a diff that does not fit is a broken frame: `None` tells the
     /// caller to drop the layer rather than show a wrong one.
-    pub fn from_frame(held: Option<&HeldLayer>, frame: &PopupCells) -> Option<HeldLayer> {
+    pub fn from_frame(held: Option<HeldLayer>, frame: &PopupCells) -> Option<HeldLayer> {
         let mut layer = match (&frame.cells, held) {
             (Some(cells), _) => HeldLayer {
                 cols: frame.cols,
@@ -247,9 +248,7 @@ impl HeldLayer {
                 cursor_visible: false,
                 cursor_style: 0,
             },
-            (None, Some(held)) if (held.cols, held.rows) == (frame.cols, frame.rows) => {
-                held.clone()
-            }
+            (None, Some(held)) if (held.cols, held.rows) == (frame.cols, frame.rows) => held,
             (None, _) => {
                 log::warn!(
                     "popup: a layer diff for {}x{} does not fit the layer held, dropping it",
@@ -728,7 +727,7 @@ mod tests {
             .expect("layer");
         assert_eq!(a.cells[0][1].c, 'b');
         assert_eq!((a.cursor_x, a.cursor_y, a.cursor_visible), (1, 0, true));
-        let b = HeldLayer::from_frame(Some(&a), &frame(1, 1, Some(vec![vec![cell('z')]])))
+        let b = HeldLayer::from_frame(Some(a), &frame(1, 1, Some(vec![vec![cell('z')]])))
             .expect("layer");
         assert_eq!((b.cols, b.rows), (1, 1));
     }
@@ -744,7 +743,7 @@ mod tests {
             y: 0,
             cell: cell('q'),
         });
-        let next = HeldLayer::from_frame(Some(&held), &diff).expect("layer");
+        let next = HeldLayer::from_frame(Some(held), &diff).expect("layer");
         assert_eq!(next.cells[0][0].c, 'a');
         assert_eq!(next.cells[0][1].c, 'q');
     }
@@ -756,7 +755,7 @@ mod tests {
         let held =
             HeldLayer::from_frame(None, &frame(1, 1, Some(vec![vec![cell('a')]]))).expect("layer");
         assert_eq!(
-            HeldLayer::from_frame(Some(&held), &diff),
+            HeldLayer::from_frame(Some(held), &diff),
             None,
             "size differs"
         );

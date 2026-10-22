@@ -483,6 +483,12 @@ impl Renderer {
         }
     }
 
+    /// The box's own grid, while the layer is up.
+    #[cfg(test)]
+    pub fn popup_cells(&self) -> Option<&[Vec<RenderCell>]> {
+        self.popup.as_ref().map(|p| p.cells.as_slice())
+    }
+
     /// The box on screen, while the layer is up.
     pub fn popup_box(&self) -> Option<PopupBox> {
         self.popup.as_ref().and_then(|p| p.placed)
@@ -491,6 +497,19 @@ impl Renderer {
     /// The server layer the box was composed from, while the box is up.
     pub fn held_layer(&self) -> Option<&HeldLayer> {
         self.popup.as_ref().and_then(|p| p.held.as_ref())
+    }
+
+    /// Take the held layer out, to apply the next frame to it without a copy.
+    /// [`Renderer::set_held_layer`] puts it back.
+    pub fn take_held_layer(&mut self) -> Option<HeldLayer> {
+        self.popup.as_mut().and_then(|p| p.held.take())
+    }
+
+    /// Move the popup's cursor, leaving the box as it is.
+    pub fn set_popup_cursor(&mut self, cursor: (u16, u16, bool, u8)) {
+        if let Some(popup) = &mut self.popup {
+            popup.cursor = cursor;
+        }
     }
 
     /// Drop the popup box. Nothing is painted over the cells it covered: the
