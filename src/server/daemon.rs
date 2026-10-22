@@ -4346,7 +4346,11 @@ async fn handle_command(
                     let tab = &mut sess.tabs[tab_idx];
                     match tab.detach_pane(pane_id) {
                         Some(nf) => {
-                            tab.focus_pane(nf);
+                            // As in `close_pane`: only the focused pane closing
+                            // moves focus.
+                            if tab.focused_pane == pane_id {
+                                tab.focus_pane(nf);
+                            }
                             tab.rebuild_if_automatic();
                             session::debug_check_invariant(sess, "PaneCloseById");
                         }
@@ -10105,7 +10109,11 @@ async fn close_pane(
             }
 
             if let Some(nf) = tab.detach_pane(pane_id) {
-                tab.focus_pane(nf);
+                // `nf` is what the tree shows in the closed pane's place, not a
+                // focus decision: only the focused pane closing moves focus.
+                if tab.focused_pane == pane_id {
+                    tab.focus_pane(nf);
+                }
                 tab.rebuild_if_automatic();
                 session::debug_check_invariant(sess, "close_pane");
                 CloseAction::Broadcast
@@ -12185,10 +12193,15 @@ mod popup_tests {
         /// Split tab 0's focused pane with a pane running `/bin/sh` in `cwd`.
         /// The new pane is focused, as a split focuses it.
         async fn split(&self, cwd: &std::path::Path) -> PaneId {
+            self.split_tab(0, cwd).await
+        }
+
+        /// [`Rig::split`] on tab `tab`.
+        async fn split_tab(&self, tab: usize, cwd: &std::path::Path) -> PaneId {
             let pane_id = {
                 let mut st = self.state.lock().await;
                 let pane_id = st.next_pane_id();
-                let tab = &mut st.sessions.get_mut("main").unwrap().tabs[0];
+                let tab = &mut st.sessions.get_mut("main").unwrap().tabs[tab];
                 let focused = tab.focused_pane;
                 tab.layout.split_vertical(focused, pane_id);
                 tab.pane_order.push(pane_id);
@@ -12424,6 +12437,62 @@ mod popup_tests {
             middle,
             "input is back on the middle pane"
         );
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_pane_closing_that_was_not_focused_leaves_the_focus_alone() {
+        for popup_up in [false, true] {
+            let dir = tempfile::tempdir().expect("dir");
+            let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+            // The right pane's survivor in the tree is the middle one, so a close
+            // that refocused the survivor would land there, not on the left.
+            let left = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+            rig.split(dir.path()).await;
+            let right = rig.split(dir.path()).await;
+            let focus = rig.state.clone();
+            focus.lock().await.sessions.get_mut("main").unwrap().tabs[0].focus_pane(left);
+            if popup_up {
+                rig.command(RemuxCommand::PopupToggle(None)).await;
+            }
+            close_pane(
+                right,
+                &rig.state,
+                &rig.panes,
+                &rig.clients,
+                &rig.config,
+                &rig.prev_frames,
+            )
+            .await;
+            let st = rig.state.lock().await;
+            let tab = &st.sessions["main"].tabs[0];
+            assert!(!tab.pane_order.contains(&right));
+            assert_eq!(tab.focused_pane, left, "popup up: {popup_up}");
+            drop(st);
+            rig.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_background_tabs_unfocused_pane_leaves_its_focus_alone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let first = rig.new_tab(dir.path()).await;
+        rig.split_tab(1, dir.path()).await;
+        let third = rig.split_tab(1, dir.path()).await;
+        let focus = rig.state.clone();
+        focus.lock().await.sessions.get_mut("main").unwrap().tabs[1].focus_pane(first);
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        rig.command(RemuxCommand::PaneCloseById {
+            session: "main".to_string(),
+            pane_id: third,
+        })
+        .await;
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[1];
+        assert!(!tab.pane_order.contains(&third));
+        assert_eq!(tab.focused_pane, first);
         drop(st);
         rig.finish().await;
     }
