@@ -539,6 +539,14 @@ impl Chrome {
         if !matches!(self.border_style, BorderStyle::ZellijStyle) {
             return Ok(());
         }
+        // While the popup layer is up, `focused_pane_rect` is the popup's
+        // interior, and the box's frame is drawn by the client already in the
+        // focused colour. The front buffer never holds that frame, only what is
+        // under the box, so the ring check below can only ever match a stale
+        // pane border hidden by the box.
+        if renderer.popup_rect().is_some() {
+            return Ok(());
+        }
         let Some(pane) = focused_pane_rect else {
             return Ok(());
         };
@@ -556,10 +564,8 @@ impl Chrome {
         let h = pane.height as usize + 2 * BORDER_INSET as usize;
 
         // Server frames are blitted at the content origin, so the reported rect
-        // is content-relative and the ring must be moved by it. While the popup
-        // layer is up the rect is the popup's and window-absolute instead, and
-        // `rect_origin` is zero.
-        let (ox, oy) = renderer.rect_origin();
+        // is content-relative and the ring must be moved by it.
+        let (ox, oy) = renderer.origin();
         let (ax, ay) = (ox as usize + rx as usize, oy as usize + ry as usize);
 
         // Clipped to the content rect, not the terminal: a ring that ran past it

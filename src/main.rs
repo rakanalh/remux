@@ -1673,7 +1673,7 @@ fn popup_box_now(
 
 /// What a popup layer changes about what the client knows of the focused pane
 /// and the cursor: both belong to the layer while it is up.
-struct PopupFrame {
+struct PopupFocus {
     /// Window-absolute `(x, y, visible, style)`.
     cursor: (u16, u16, bool, u8),
     /// The shared interior placed at the box's interior, window-absolute.
@@ -1693,7 +1693,7 @@ fn sync_popup(
     renderer: &mut Renderer,
     attached: &Option<(ConnId, String)>,
     theme: &crate::config::theme::CompositorTheme,
-) -> Result<Option<PopupFrame>> {
+) -> Result<Option<PopupFocus>> {
     let Some(frame) = layer else {
         renderer.clear_popup();
         return Ok(None);
@@ -1720,7 +1720,7 @@ fn sync_popup(
     };
     renderer.set_popup(placed.rect, cells, cursor);
     renderer.set_held_layer(held);
-    Ok(Some(PopupFrame {
+    Ok(Some(PopupFocus {
         cursor,
         focused_pane_rect,
     }))

@@ -6006,8 +6006,8 @@ struct MousePopup {
 /// * `local` (the client sent `popup: true`): the rect is the layer's own
 ///   `(0, 0, cols, rows)` with no inset.
 /// * A client that places the popup itself, with screen coordinates: no rect.
-/// * A client that does not: the rect of the float the server drew for it, and
-///   the layout panes' own inset rule, as before.
+/// * A client that does not: the rect of the float the server drew for it, with
+///   the inset [`pane_inset`] gives a layout pane of that rect.
 fn mouse_popup(
     layer: Option<&PopupLayer>,
     local: bool,
