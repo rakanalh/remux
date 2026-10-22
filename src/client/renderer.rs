@@ -537,6 +537,28 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_full_into(
+            &mut stdout,
+            cells,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+        )
+    }
+
+    /// The body of [`Renderer::render_full`], parameterised over the sink for
+    /// the same reason as [`Renderer::paint_panel_into`].
+    fn render_full_into<W: Write>(
+        &mut self,
+        out: &mut W,
+        cells: &[Vec<RenderCell>],
+        cursor_x: u16,
+        cursor_y: u16,
+        cursor_visible: bool,
+        cursor_style: u8,
+    ) -> Result<()> {
         self.frame_rows = cells.len();
         let cells = match cells.split_last() {
             Some((status, body)) if self.status_row_owned => {
@@ -566,14 +588,12 @@ impl Renderer {
         // allowed to paint over a panel and persist that into the front buffer.
         let (content_right, content_bottom) = self.content_edges();
 
-        let mut stdout = io::stdout().lock();
-
         // Bracket the whole frame in synchronized output (DEC 2026) so the
         // outer terminal displays it atomically instead of tearing.
-        queue!(stdout, Print("\x1b[?2026h"))?;
+        queue!(out, Print("\x1b[?2026h"))?;
 
         // Hide cursor during rendering to avoid flicker.
-        queue!(stdout, cursor::Hide)?;
+        queue!(out, cursor::Hide)?;
 
         for (y, row) in cells.iter().enumerate() {
             let sy = y + oy;
@@ -587,8 +607,8 @@ impl Renderer {
             // bold/italic/underline from a previous row visible on leading cells.
             // Emitted before the MoveTo so the assumption holds at the content
             // origin's column, not just at column 0.
-            queue!(stdout, SetAttribute(Attribute::Reset))?;
-            queue!(stdout, MoveTo(self.origin_x, sy as u16))?;
+            queue!(out, SetAttribute(Attribute::Reset))?;
+            queue!(out, MoveTo(self.origin_x, sy as u16))?;
 
             let mut last_fg = CellColor::Default;
             let mut last_bg = CellColor::Default;
@@ -618,73 +638,66 @@ impl Renderer {
                     continue;
                 }
                 if need_move {
-                    queue!(stdout, MoveTo(sx as u16, sy as u16))?;
+                    queue!(out, MoveTo(sx as u16, sy as u16))?;
                     need_move = false;
                 }
 
                 // Apply style changes only when needed.
                 if cell.fg != last_fg {
-                    queue!(
-                        stdout,
-                        SetForegroundColor(cell_color_to_crossterm(&cell.fg))
-                    )?;
+                    queue!(out, SetForegroundColor(cell_color_to_crossterm(&cell.fg)))?;
                     last_fg = cell.fg.clone();
                 }
                 if cell.bg != last_bg {
-                    queue!(
-                        stdout,
-                        SetBackgroundColor(cell_color_to_crossterm(&cell.bg))
-                    )?;
+                    queue!(out, SetBackgroundColor(cell_color_to_crossterm(&cell.bg)))?;
                     last_bg = cell.bg.clone();
                 }
                 if cell.bold != last_bold {
                     if cell.bold {
-                        queue!(stdout, SetAttribute(Attribute::Bold))?;
+                        queue!(out, SetAttribute(Attribute::Bold))?;
                     } else {
-                        queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+                        queue!(out, SetAttribute(Attribute::NormalIntensity))?;
                     }
                     last_bold = cell.bold;
                 }
                 if cell.italic != last_italic {
                     if cell.italic {
-                        queue!(stdout, SetAttribute(Attribute::Italic))?;
+                        queue!(out, SetAttribute(Attribute::Italic))?;
                     } else {
-                        queue!(stdout, SetAttribute(Attribute::NoItalic))?;
+                        queue!(out, SetAttribute(Attribute::NoItalic))?;
                     }
                     last_italic = cell.italic;
                 }
                 if cell.underline != last_underline {
                     if cell.underline {
-                        queue!(stdout, SetAttribute(Attribute::Underlined))?;
+                        queue!(out, SetAttribute(Attribute::Underlined))?;
                     } else {
-                        queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
+                        queue!(out, SetAttribute(Attribute::NoUnderline))?;
                     }
                     last_underline = cell.underline;
                 }
                 if cell.hyperlink.as_deref() != last_hyperlink.as_deref() {
                     match &cell.hyperlink {
-                        Some(uri) => queue!(
-                            stdout,
-                            Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri)))
-                        )?,
-                        None => queue!(stdout, Print("\x1b]8;;\x1b\\"))?,
+                        Some(uri) => {
+                            queue!(out, Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri))))?
+                        }
+                        None => queue!(out, Print("\x1b]8;;\x1b\\"))?,
                     }
                     last_hyperlink = cell.hyperlink.clone();
                 }
 
-                queue!(stdout, Print(printable(cell.c)))?;
+                queue!(out, Print(printable(cell.c)))?;
                 // Combining marks are zero-width; the terminal composes them onto
                 // the base glyph just printed without advancing the cursor.
                 for m in &cell.combining {
-                    queue!(stdout, Print(printable(*m)))?;
+                    queue!(out, Print(printable(*m)))?;
                 }
             }
 
             // Close any open hyperlink so links never span rows on the wire.
             if last_hyperlink.is_some() {
-                queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
+                queue!(out, Print("\x1b]8;;\x1b\\"))?;
             }
-            queue!(stdout, ResetColor)?;
+            queue!(out, ResetColor)?;
 
             // A row may be shorter than the content area (the frame is sized to
             // the MIN across attached clients, so a larger client would leave
@@ -697,12 +710,14 @@ impl Renderer {
             let painted = (ox + row.len()).min(content_right);
             if painted < content_right {
                 if self.popup.is_some() {
-                    self.blank_span(&mut stdout, sy, painted, content_right, true)?;
+                    // A masked tail left the terminal's cursor before the box,
+                    // not after the last cell of the row.
+                    self.blank_span(out, sy, painted, content_right, !need_move)?;
                 } else {
                     for sx in painted..content_right {
                         self.front[sy][sx] = RenderCell::default();
                     }
-                    queue!(stdout, Print(" ".repeat(content_right - painted)))?;
+                    queue!(out, Print(" ".repeat(content_right - painted)))?;
                 }
             }
         }
@@ -715,14 +730,14 @@ impl Renderer {
         // sidebar's cells on these rows.
         let first_blank = (oy + cells.len()).min(self.rows as usize);
         if first_blank < content_bottom && ox < content_right {
-            queue!(stdout, ResetColor)?;
+            queue!(out, ResetColor)?;
             for sy in first_blank..content_bottom {
                 if self.popup.is_some() {
-                    self.blank_span(&mut stdout, sy, ox, content_right, false)?;
+                    self.blank_span(out, sy, ox, content_right, false)?;
                     continue;
                 }
-                queue!(stdout, MoveTo(self.origin_x, sy as u16))?;
-                queue!(stdout, Print(" ".repeat(content_right - ox)))?;
+                queue!(out, MoveTo(self.origin_x, sy as u16))?;
+                queue!(out, Print(" ".repeat(content_right - ox)))?;
                 for sx in ox..content_right {
                     self.front[sy][sx] = RenderCell::default();
                 }
@@ -731,13 +746,7 @@ impl Renderer {
 
         // Update cursor. The reported position is content-relative, so it has
         // to be offset -- otherwise the hardware cursor lands in a left sidebar.
-        self.queue_cursor(
-            &mut stdout,
-            cursor_x,
-            cursor_y,
-            cursor_visible,
-            cursor_style,
-        )?;
+        self.queue_cursor(out, cursor_x, cursor_y, cursor_visible, cursor_style)?;
 
         // Blit into the front buffer at the origin. NEVER `self.front = cells.to_vec()`
         // -- the front buffer is the FULL terminal, including sidebar columns, and
@@ -760,7 +769,7 @@ impl Renderer {
         }
 
         // End synchronized output.
-        queue!(stdout, Print("\x1b[?2026l"))?;
+        queue!(out, Print("\x1b[?2026l"))?;
 
         Ok(())
     }
@@ -2891,6 +2900,61 @@ mod origin_tests {
 
     fn front_row(r: &Renderer, y: usize) -> String {
         r.front_buffer()[y].iter().map(|c| c.c).collect()
+    }
+
+    /// A terminal fed everything a renderer emits, to check what the user
+    /// would see rather than what the renderer believes it painted.
+    struct Term(crate::screen::Screen);
+
+    impl Term {
+        fn new(cols: u16, rows: u16) -> Term {
+            Term(crate::screen::Screen::new(cols, rows, 0))
+        }
+
+        fn feed(&mut self, bytes: &[u8]) {
+            self.0.process_output(bytes);
+        }
+
+        fn row(&self, y: usize) -> String {
+            self.0.grid[y]
+                .cells
+                .iter()
+                .filter(|c| c.width != 0)
+                .map(|c| c.c)
+                .collect()
+        }
+    }
+
+    /// [`with_box`], with everything it emitted already on a [`Term`].
+    fn with_box_on_screen() -> (Renderer, Term) {
+        let mut r = Renderer::new(10, 4);
+        let mut term = Term::new(10, 4);
+        let mut out: Vec<u8> = Vec::new();
+        r.render_full_into(&mut out, &grid("AAAAAAAAAA", 4), 0, 0, false, 0)
+            .unwrap();
+        r.set_popup_into(
+            &mut out,
+            rect(2, 1, 4, 2),
+            boxed(4, 2, 'P'),
+            (3, 2, true, 2),
+        )
+        .unwrap();
+        term.feed(&out);
+        (r, term)
+    }
+
+    #[test]
+    fn a_rows_blank_remainder_after_a_masked_tail_lands_past_the_box() {
+        let (mut r, mut term) = with_box_on_screen();
+        // The frame ends exactly at the box's right edge, so its last cells on
+        // rows 1 and 2 are masked and the remainder starts just past the box.
+        let mut out: Vec<u8> = Vec::new();
+        r.render_full_into(&mut out, &grid("BBBBBB", 4), 0, 0, false, 0)
+            .unwrap();
+        term.feed(&out);
+        assert_eq!(term.row(1), "BBPPPP    ");
+        assert_eq!(term.row(2), "BBPPPP    ");
+        assert_eq!(term.row(3), "BBBBBB    ");
     }
 
     #[test]
