@@ -458,7 +458,7 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 
 #### Popup keys
 
-`PopupToggle` takes an optional position, so separate keys can open the popup in different places. Every popup key is a plain show/hide toggle: a hidden popup opens at the position its key names (or at `popup_position` with none), and while the popup is visible ANY popup key closes it rather than moving it. Each tab's popup remembers the position it was opened at until it is closed. These are an example, not defaults:
+`PopupToggle` takes an optional position, so separate keys can open the popup in different places. Every popup key is a plain show/hide toggle: a hidden popup opens at the position its key names (or at `popup_position` with none), and while the popup is visible ANY popup key closes it rather than moving it. Each tab's popup remembers the position it was opened at until it is closed. A View shows no popup, so popup keys do nothing inside one. These are an example, not defaults:
 
 ```toml
 [keybindings.command]

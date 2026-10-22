@@ -228,7 +228,7 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 
 ### Popup keys
 
-`PopupToggle` takes an optional position, so you can bind separate keys that open the popup in different places. Every popup key is a plain show/hide toggle: when the popup is hidden, the key opens it at the position it names (or at `popup_position` when it names none); when the popup is visible, any popup key closes it, whatever position it names. Each tab's popup keeps the position it was opened at until it is closed. The leader chord `Prefix p o` stays a plain toggle. These bindings are an example, not defaults:
+`PopupToggle` takes an optional position, so you can bind separate keys that open the popup in different places. Every popup key is a plain show/hide toggle: when the popup is hidden, the key opens it at the position it names (or at `popup_position` when it names none); when the popup is visible, any popup key closes it, whatever position it names. Each tab's popup keeps the position it was opened at until it is closed. A View shows no popup, so popup keys do nothing inside one. The leader chord `Prefix p o` stays a plain toggle. These bindings are an example, not defaults:
 
 ```toml
 [keybindings.command]

@@ -1780,7 +1780,19 @@ fn popup_size_to_send(
     size
 }
 
+/// What a command is to [`prepare_popup_toggle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupToggleStep {
+    /// Not a `PopupToggle`: forward it as it is.
+    NotAToggle,
+    /// A `PopupToggle` that must not reach the server.
+    Swallow,
+    /// A `PopupToggle`, stripped of its position, to forward.
+    Forward,
+}
+
 /// Ready a `PopupToggle` for the foreground server, which learns no position.
+/// Returns `true` when the command must not be sent.
 ///
 /// The position the key named is recorded here instead, and when the toggle
 /// opens the popup the box it opens is announced FIRST, so the server spawns
@@ -1793,18 +1805,42 @@ async fn prepare_popup_toggle(
     chrome: &crate::client::chrome::Chrome,
     renderer: &Renderer,
     attached: &Option<(ConnId, String)>,
-) -> Result<()> {
-    let RemuxCommand::PopupToggle(position) = cmd else {
-        return Ok(());
-    };
-    let visible = renderer.popup_box().is_some();
-    log::debug!("popup: toggle position={position:?} visible={visible}");
-    popup.toggle(&popup_key(attached), *position, visible);
-    if !visible {
+    view_active: bool,
+) -> Result<bool> {
+    let step = plan_popup_toggle(cmd, popup, renderer, attached, view_active);
+    if step == PopupToggleStep::Forward && popup.is_opening() {
         send_popup_size(mgr, popup, chrome, renderer, attached).await?;
     }
+    Ok(step == PopupToggleStep::Swallow)
+}
+
+/// The decision [`prepare_popup_toggle`] acts on, and the state it records.
+///
+/// - While a View is up, a popup key is swallowed. The View owns the screen and
+///   shows no popup, so the client cannot tell an open from a close, and a
+///   recorded open would place whichever popup next appears.
+/// - A popup on screen, or one whose open is still waiting for its first
+///   layer, counts as visible, so a second key pressed before that layer
+///   closes it rather than recording a second open.
+fn plan_popup_toggle(
+    cmd: &mut RemuxCommand,
+    popup: &mut PopupState,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+    view_active: bool,
+) -> PopupToggleStep {
+    let RemuxCommand::PopupToggle(position) = cmd else {
+        return PopupToggleStep::NotAToggle;
+    };
+    if view_active {
+        log::debug!("popup: toggle position={position:?} ignored while a View is up");
+        return PopupToggleStep::Swallow;
+    }
+    let visible = renderer.popup_box().is_some() || popup.is_opening();
+    log::debug!("popup: toggle position={position:?} visible={visible}");
+    popup.toggle(&popup_key(attached), *position, visible);
     *position = None;
-    Ok(())
+    PopupToggleStep::Forward
 }
 
 /// Where a mouse event lands relative to the popup box.
@@ -3911,8 +3947,7 @@ async fn run_client_loop(
                                 // Handle SendKey: forward raw bytes to PTY.
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
                                     mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
-                                } else {
-                                    prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
+                                } else if !prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                     mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                 }
                                 // Notify server of current mode if it changed.
@@ -4034,8 +4069,7 @@ async fn run_client_loop(
                                     }
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
-                                    } else {
-                                        prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
+                                    } else if !prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
                                         mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                     }
                                 }
@@ -4431,8 +4465,9 @@ async fn run_client_loop(
                                     // Not in a view: send to the foreground server.
                                     // These are never SessionDetach/SendKey and the
                                     // mode stays Command, so no ModeChanged is needed.
-                                    prepare_popup_toggle(&mut command, mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
-                                    mgr.send_foreground(ClientMessage::Command(command)).await?;
+                                    if !prepare_popup_toggle(&mut command, mgr, &mut popup, &chrome, &renderer, &current_attached, active_view.is_some()).await? {
+                                        mgr.send_foreground(ClientMessage::Command(command)).await?;
+                                    }
                                 }
                                 // Keep the which-key popup open so the user can
                                 // keep resizing (re-shown over the repainted view
@@ -9222,6 +9257,57 @@ mod tests {
             assert_eq!(
                 popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
                 None
+            );
+        }
+
+        #[test]
+        fn a_popup_key_inside_a_view_is_swallowed() {
+            let (renderer, chrome, mut popup, _) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let mut cmd = RemuxCommand::PopupToggle(Some(PopupPosition::Right));
+            assert_eq!(
+                plan_popup_toggle(&mut cmd, &mut popup, &renderer, &attached, true),
+                PopupToggleStep::Swallow
+            );
+            assert!(!popup.is_opening(), "nothing is recorded as an open");
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::Full
+            );
+        }
+
+        #[test]
+        fn a_second_popup_key_before_the_first_layer_closes_it() {
+            let (renderer, chrome, mut popup, _) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let mut open = RemuxCommand::PopupToggle(Some(PopupPosition::Right));
+            assert_eq!(
+                plan_popup_toggle(&mut open, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::Forward
+            );
+            assert_eq!(
+                open,
+                RemuxCommand::PopupToggle(None),
+                "the server learns no position"
+            );
+            assert!(popup.is_opening());
+            let mut again = RemuxCommand::PopupToggle(Some(PopupPosition::Bottom));
+            assert_eq!(
+                plan_popup_toggle(&mut again, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::Forward
+            );
+            assert!(
+                !popup.is_opening(),
+                "the second key closes the popup being opened"
+            );
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::Full
+            );
+            let mut other = RemuxCommand::TabNew;
+            assert_eq!(
+                plan_popup_toggle(&mut other, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::NotAToggle
             );
         }
 
