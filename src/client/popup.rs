@@ -421,6 +421,14 @@ impl PopupState {
         }
     }
 
+    /// Forget the positions of `session`'s popups that are not in `live`, the
+    /// popups its server still has. A popup dies with its tab or its shell, or
+    /// is hidden by another client, without this client's key closing it.
+    pub fn prune(&mut self, session: &str, live: &[PaneId]) {
+        self.named
+            .retain(|(s, pane), _| s != session || live.contains(pane));
+    }
+
     /// Note which popup's layer `session`'s frames now carry, if any. The
     /// first layer after an opening toggle takes that toggle's position.
     pub fn bind_layer(&mut self, session: &str, pane: Option<PaneId>) {
@@ -845,6 +853,27 @@ mod tests {
         // The same popup id on another server is another popup.
         s.bind_layer("b", Some(7));
         assert_eq!(frame_of(&s, "b"), PopupFrame::Full);
+    }
+
+    #[test]
+    fn a_record_goes_when_the_server_no_longer_has_its_popup() {
+        let mut s = PopupState::from_config(&Config::default());
+        for (session, pane, position) in [
+            ("a", 7, PopupPosition::Right),
+            ("a", 9, PopupPosition::Bottom),
+            ("b", 9, PopupPosition::Left),
+        ] {
+            s.toggle(session, Some(position), false);
+            s.bind_layer(session, Some(pane));
+        }
+        // Session "a" now has popup 7 only: 9 closed with its tab.
+        s.prune("a", &[7]);
+        assert_eq!(s.named.len(), 2, "{:?}", s.named);
+        assert!(s.named.contains_key(&("a".to_string(), 7)));
+        assert!(
+            s.named.contains_key(&("b".to_string(), 9)),
+            "another session is untouched"
+        );
     }
 
     #[test]

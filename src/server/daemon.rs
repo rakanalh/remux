@@ -8891,6 +8891,9 @@ async fn send_full_render_to_client(
         }
     }
 
+    // Read before `prev_frames` is locked, to keep the lock order of the render
+    // paths: never `state` under `prev_frames`.
+    let live_popups = session_popups(session_name, state).await;
     // The baseline must equal what this client has on screen, because the next
     // broadcast diffs against it. A `FullRender` and a `RenderDiff` both leave
     // the client showing exactly what `frame_message` stores, so both save it.
@@ -8906,6 +8909,7 @@ async fn send_full_render_to_client(
         viewport_top,
         scroll_offset,
         status,
+        live_popups,
     };
     let (msg, stored) = frame_message(placed, &meta, baseline, &format!("client_id={client_id}"));
     let _ = tx.send(msg);
@@ -9099,6 +9103,8 @@ async fn broadcast_full_render(
         shared
     };
 
+    // As in `send_full_render_to_client`: read before `prev_frames` is locked.
+    let live_popups = session_popups(session_name, state).await;
     let mut pf = prev_frames.lock().await;
     for (cid, tx, force_full, asking) in targets {
         // Force a full render when this client has no baseline yet, or when its
@@ -9128,6 +9134,7 @@ async fn broadcast_full_render(
             viewport_top,
             scroll_offset: 0,
             status: status.clone(),
+            live_popups: live_popups.clone(),
         };
         let (msg, stored) = frame_message(
             placed,
@@ -9557,6 +9564,16 @@ struct FrameMeta {
     viewport_top: usize,
     scroll_offset: usize,
     status: Option<StatusInfo>,
+    live_popups: Vec<PaneId>,
+}
+
+/// Every popup pane `session_name` has, on any tab, visible or not.
+async fn session_popups(session_name: &str, state: &Arc<Mutex<ServerState>>) -> Vec<PaneId> {
+    let st = state.lock().await;
+    st.sessions
+        .get(session_name)
+        .map(|s| s.tabs.iter().filter_map(|t| t.popup_pane).collect())
+        .unwrap_or_default()
 }
 
 /// Put the popup into the frame for one client.
@@ -9745,6 +9762,7 @@ fn frame_message(
             viewport_top: meta.viewport_top,
             scroll_offset: meta.scroll_offset,
             status: meta.status.clone(),
+            live_popups: meta.live_popups.clone(),
             popup: placed.layer.map(|layer| {
                 popup_cells(
                     layer,
@@ -9771,6 +9789,7 @@ fn frame_message(
                 scroll_offset: meta.scroll_offset,
                 status: meta.status.clone(),
                 popup: placed.layer.map(|layer| popup_cells(layer, None)),
+                live_popups: meta.live_popups.clone(),
             }
         }
     };
@@ -11728,6 +11747,7 @@ mod popup_tests {
             viewport_top: 0,
             scroll_offset: 0,
             status: None,
+            live_popups: Vec::new(),
         }
     }
 
@@ -12513,6 +12533,34 @@ mod popup_tests {
         assert_eq!(tab.pane_order.len(), 2, "the pane is created");
         assert_eq!(tab.focused_pane, before);
         drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn every_frame_lists_the_sessions_live_popups() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let first = rig.popup_of(0).await.expect("popup");
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let second = rig.popup_of(1).await.expect("popup");
+        // Hidden: still alive, so still listed.
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.drain();
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        let mut live = rig
+            .drain()
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::FullRender { live_popups, .. }
+                | ServerMessage::RenderDiff { live_popups, .. } => Some(live_popups),
+                _ => None,
+            })
+            .next_back()
+            .expect("a frame");
+        live.sort();
+        assert_eq!(live, vec![first, second]);
         rig.finish().await;
     }
 

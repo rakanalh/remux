@@ -143,7 +143,8 @@ pub enum ConnDescriptor {
 /// (interior-local coordinates). They are self-gating: a server sends a layer
 /// only to a client that has sent `PopupSize`, and a client sets the mouse flag
 /// only while it holds a layer, so an old client on a new server never sees
-/// either. The layer itself carries `pane_id`, also `#[serde(default)]`.
+/// either. The layer itself carries `pane_id`, and both frames carry
+/// `live_popups`, the session's popup panes, both also `#[serde(default)]`.
 ///
 /// Within 18, before any release, [`RemuxCommand::PopupToggle`] became a
 /// newtype variant carrying an optional position, so its JSON changed from the
@@ -676,6 +677,10 @@ pub enum ServerMessage {
         /// `Incoming` queue; the wire encoding is the same as unboxed.
         #[serde(default)]
         popup: Option<Box<PopupCells>>,
+        /// The pane ids of every popup the session has, visible or hidden, so
+        /// a client can forget what it keeps about a popup that is gone.
+        #[serde(default)]
+        live_popups: Vec<PaneId>,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -723,6 +728,10 @@ pub enum ServerMessage {
         /// As [`ServerMessage::FullRender::popup`].
         #[serde(default)]
         popup: Option<Box<PopupCells>>,
+        /// The pane ids of every popup the session has, visible or hidden, so
+        /// a client can forget what it keeps about a popup that is gone.
+        #[serde(default)]
+        live_popups: Vec<PaneId>,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -2064,6 +2073,7 @@ mod tests {
             scroll_offset: 0,
             status: Some(info.clone()),
             popup: None,
+            live_popups: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -2934,12 +2944,22 @@ mod tests {
         }
         let full = r#"{"FullRender":{"cells":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
         match serde_json::from_str::<ServerMessage>(full).unwrap() {
-            ServerMessage::FullRender { popup, .. } => assert_eq!(popup, None),
+            ServerMessage::FullRender {
+                popup, live_popups, ..
+            } => {
+                assert_eq!(popup, None);
+                assert!(live_popups.is_empty());
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
         let diff = r#"{"RenderDiff":{"changes":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
         match serde_json::from_str::<ServerMessage>(diff).unwrap() {
-            ServerMessage::RenderDiff { popup, .. } => assert_eq!(popup, None),
+            ServerMessage::RenderDiff {
+                popup, live_popups, ..
+            } => {
+                assert_eq!(popup, None);
+                assert!(live_popups.is_empty());
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }
@@ -3029,6 +3049,7 @@ mod tests {
             scroll_offset: 0,
             status: None,
             popup: Some(Box::new(layer.clone())),
+            live_popups: vec![7],
         };
         let json = serde_json::to_string(&full).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -3048,6 +3069,7 @@ mod tests {
             scroll_offset: 0,
             status: None,
             popup: Some(Box::new(layer.clone())),
+            live_popups: vec![7],
         };
         let json = serde_json::to_string(&diff).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {

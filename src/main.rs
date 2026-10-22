@@ -6992,12 +6992,13 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups }) => {
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
                         // The popup layer first, so the frame below skips the
                         // cells the box covers. A View owns the screen, so it
                         // shows no box.
+                        popup.prune(&popup_key(&current_attached), &live_popups);
                         let popup_frame = if active_view.is_none() {
                             sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
                         } else {
@@ -7050,9 +7051,10 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups }) => {
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         // See the FullRender arm: the popup layer goes first.
+                        popup.prune(&popup_key(&current_attached), &live_popups);
                         let popup_frame = if active_view.is_none() {
                             sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
                         } else {
