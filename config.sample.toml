@@ -395,6 +395,14 @@
 # "Alt-p" = "PopupToggle"
 # "Alt-m" = "SetMaster"
 # "Alt-Space" = "LayoutNext"
+#
+# Popup keys. `PopupToggle` takes an optional position, so separate keys can
+# open the popup in different places. Every popup key is a show/hide toggle:
+# a hidden popup opens where its key says (or at `popup_position` with none),
+# and while it is visible ANY popup key closes it. An example, NOT defaults:
+# "Alt-p"  = "PopupToggle"
+# "Alt--"  = "PopupToggle bottom"
+# "Alt-\\" = "PopupToggle right"
 
 # --- Command-mode leader tree (defaults) ---
 # The tables below mirror the built-in leader (Ctrl-a) tree. They are shown for
@@ -636,7 +644,10 @@
 #   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
 #   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
-#   PopupToggle                     — Toggle the floating popup terminal
+#   PopupToggle [position]          — Toggle the popup terminal. A hidden popup opens
+#                                     at the position ("float", "left", "right",
+#                                     "top", "bottom"; default popup_position); a
+#                                     visible one closes, whatever position is named
 #
 # View commands (client-side; a view's cells alias real panes on any machine):
 #   ViewNew                         — Create a new view (prompts for a name)

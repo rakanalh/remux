@@ -1694,10 +1694,14 @@ fn sync_popup(
     attached: &Option<(ConnId, String)>,
     theme: &crate::config::theme::CompositorTheme,
 ) -> Result<Option<PopupFocus>> {
+    let key = popup_key(attached);
     let Some(frame) = layer else {
         renderer.clear_popup();
+        popup.bind_layer(&key, None);
         return Ok(None);
     };
+    // Before the box is placed: which popup this is decides where it goes.
+    popup.bind_layer(&key, Some(frame.pane_id));
     let placed = popup_box_now(popup, chrome, renderer, attached);
     // A frame that leaves the layer as it was, for a box that has not moved,
     // can only have moved the cursor: the box on screen is already right.
@@ -1707,6 +1711,7 @@ fn sync_popup(
         // Without a held layer no later diff applies either, so ask for the
         // full one rather than show nothing until the box next moves.
         renderer.clear_popup();
+        popup.bind_layer(&key, None);
         popup.reannounce();
         return Ok(None);
     };
@@ -1755,6 +1760,33 @@ async fn send_popup_size(
         mgr.send_foreground(ClientMessage::PopupSize { cols, rows })
             .await?;
     }
+    Ok(())
+}
+
+/// Ready a `PopupToggle` for the foreground server, which learns no position.
+///
+/// The position the key named is recorded here instead, and when the toggle
+/// opens the popup the box it opens is announced FIRST, so the server spawns
+/// or shows the popup at that size rather than resizing it a frame later. A
+/// visible popup is closed by any popup key, so then nothing is announced.
+async fn prepare_popup_toggle(
+    cmd: &mut RemuxCommand,
+    mgr: &mut ConnectionManager,
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+) -> Result<()> {
+    let RemuxCommand::PopupToggle(position) = cmd else {
+        return Ok(());
+    };
+    let visible = renderer.popup_box().is_some();
+    log::debug!("popup: toggle position={position:?} visible={visible}");
+    popup.toggle(&popup_key(attached), *position, visible);
+    if !visible {
+        send_popup_size(mgr, popup, chrome, renderer, attached).await?;
+    }
+    *position = None;
     Ok(())
 }
 
@@ -3751,7 +3783,7 @@ async fn run_client_loop(
                                     mgr.send_foreground(ClientMessage::Input { data }).await?;
                                 }
                             }
-                            InputAction::Execute(cmd) => {
+                            InputAction::Execute(mut cmd) => {
                                 log::debug!("input: Execute cmd={:?}", cmd);
                                 // Border style is a display preference honored by
                                 // BOTH renderers: flip the client-local view style
@@ -3863,6 +3895,7 @@ async fn run_client_loop(
                                 if let RemuxCommand::SendKey(ref bytes) = cmd {
                                     mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
                                 } else {
+                                    prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
                                     mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                 }
                                 // Notify server of current mode if it changed.
@@ -3897,7 +3930,7 @@ async fn run_client_loop(
                                     renderer.clear_overlay(cols, rows)?;
                                     renderer.flush()?;
                                 }
-                                for cmd in cmds {
+                                for mut cmd in cmds {
                                     if matches!(cmd, RemuxCommand::SessionDetach) {
                                         return Ok(());
                                     }
@@ -3985,6 +4018,7 @@ async fn run_client_loop(
                                     if let RemuxCommand::SendKey(ref bytes) = cmd {
                                         mgr.send_foreground(ClientMessage::Input { data: bytes.clone() }).await?;
                                     } else {
+                                        prepare_popup_toggle(&mut cmd, mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
                                         mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                                     }
                                 }
@@ -4278,7 +4312,7 @@ async fn run_client_loop(
                                 renderer.flush()?;
                             }
                             InputAction::ExecuteAndShowWhichKey {
-                                command,
+                                mut command,
                                 label,
                                 entries,
                                 shortcuts,
@@ -4380,6 +4414,7 @@ async fn run_client_loop(
                                     // Not in a view: send to the foreground server.
                                     // These are never SessionDetach/SendKey and the
                                     // mode stays Command, so no ModeChanged is needed.
+                                    prepare_popup_toggle(&mut command, mgr, &mut popup, &chrome, &renderer, &current_attached).await?;
                                     mgr.send_foreground(ClientMessage::Command(command)).await?;
                                 }
                                 // Keep the which-key popup open so the user can
@@ -8925,6 +8960,7 @@ mod tests {
                 ..RenderCell::default()
             };
             Box::new(PopupCells {
+                pane_id: 7,
                 cols,
                 rows,
                 cursor_x: 2,
@@ -9062,6 +9098,65 @@ mod tests {
             );
             assert_eq!(frame.cursor, (20, 7, true, 2));
             assert_eq!(renderer.held_layer().unwrap().cursor_x, 3);
+        }
+
+        #[test]
+        fn a_layer_opened_by_a_named_key_is_placed_where_the_key_said() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            popup.toggle(&popup_key(&attached), Some(PopupPosition::Right), false);
+            for _ in 0..2 {
+                sync_popup(
+                    Some(layer(4, 2, 'x')),
+                    &mut popup,
+                    &chrome,
+                    &mut renderer,
+                    &attached,
+                    &theme,
+                )
+                .unwrap();
+                assert_eq!(
+                    renderer.popup_box().map(|b| b.frame),
+                    Some(crate::client::popup::PopupFrame::OpenRight)
+                );
+            }
+            // Another tab's popup, opened plainly: the configured float.
+            let mut other = layer(4, 2, 'y');
+            other.pane_id = 9;
+            sync_popup(
+                Some(other),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                renderer.popup_box().map(|b| b.frame),
+                Some(crate::client::popup::PopupFrame::Full)
+            );
+            // Back on the first tab, its popup is still on the right.
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                renderer.popup_box().map(|b| b.frame),
+                Some(crate::client::popup::PopupFrame::OpenRight)
+            );
+            // Closed: the next box is the configured float again.
+            popup.toggle(&popup_key(&attached), None, true);
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            assert_eq!(
+                popup_box_now(&popup, &chrome, &renderer, &attached).frame,
+                crate::client::popup::PopupFrame::Full
+            );
         }
 
         #[test]

@@ -3046,7 +3046,10 @@ async fn handle_command(
     }
 
     match cmd {
-        RemuxCommand::PopupToggle => {
+        RemuxCommand::PopupToggle(position) => {
+            if position.is_some() {
+                log::debug!("server: PopupToggle position={position:?} ignored, the client places the popup");
+            }
             // Lazily spawn the active tab's popup pane on that tab's first
             // use, then just flip visibility. The pane is registered in the pane
             // map ONLY -- never in `tab.pane_order`, never in a layout tree.
@@ -9664,6 +9667,7 @@ fn popup_cells(layer: &PopupLayer, prev: Option<&[Vec<RenderCell>]>) -> Box<Popu
         _ => (Some(layer.cells.clone()), Vec::new()),
     };
     Box::new(PopupCells {
+        pane_id: layer.pane_id,
         cols: layer.cols,
         rows: layer.rows,
         cursor_x: layer.cursor_x,
@@ -12260,10 +12264,10 @@ mod popup_tests {
         let b = tempfile::tempdir().expect("dir b");
         let rig = Rig::new(100, 30, None, a.path()).await;
 
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let first = rig.popup_of(0).await.expect("tab 0 popup");
         rig.new_tab(b.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let second = rig.popup_of(1).await.expect("tab 1 popup");
         assert_ne!(first, second);
 
@@ -12315,7 +12319,7 @@ mod popup_tests {
                 .unwrap()
                 .tabs[0]
                 .focus_pane(focus);
-            rig.command(RemuxCommand::PopupToggle).await;
+            rig.command(RemuxCommand::PopupToggle(None)).await;
             let popup = rig.popup_of(0).await.expect("popup");
             let cwd = {
                 let ps = rig.panes.lock().await;
@@ -12364,7 +12368,7 @@ mod popup_tests {
                 serde_json::to_string(&st.sessions["main"].tabs[0].layout).unwrap()
             }
         };
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let before = layout_json(&rig).await;
         rig.command(RemuxCommand::ResizeRight(5)).await;
         assert_eq!(
@@ -12373,7 +12377,7 @@ mod popup_tests {
             "no-op while the popup is up"
         );
 
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         rig.command(RemuxCommand::ResizeRight(5)).await;
         assert_ne!(
             layout_json(&rig).await,
@@ -12387,7 +12391,7 @@ mod popup_tests {
     async fn popup_size_resizes_the_pty_and_always_answers_the_sender_with_a_full_render() {
         let dir = tempfile::tempdir().expect("dir");
         let mut rig = Rig::new(100, 30, None, dir.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let popup = rig.popup_of(0).await.expect("popup");
         rig.drain();
 
@@ -12448,10 +12452,10 @@ mod popup_tests {
     async fn resizing_sizes_a_non_active_tabs_popup_too() {
         let dir = tempfile::tempdir().expect("dir");
         let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let first = rig.popup_of(0).await.expect("popup");
         rig.new_tab(dir.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let second = rig.popup_of(1).await.expect("popup");
         // A tab switch does not resize a popup: both are already the shared size.
         assert_eq!(rig.screen_size(first).await, rig.screen_size(second).await);
@@ -12475,7 +12479,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("dir");
         let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
         rig.new_tab(dir.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let hidden = rig.popup_of(1).await.expect("tab 1 popup");
         rig.command(RemuxCommand::TabGoto(0)).await;
 
@@ -12497,7 +12501,7 @@ mod popup_tests {
         assert!(!rig.panes.lock().await.contains_key(&hidden));
         // The next toggle on that tab spawns a fresh popup.
         rig.command(RemuxCommand::TabGoto(1)).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let fresh = rig.popup_of(1).await.expect("fresh popup");
         assert_ne!(fresh, hidden);
         rig.finish().await;
@@ -12507,7 +12511,7 @@ mod popup_tests {
     async fn a_sender_scrolled_in_its_popup_is_still_answered_once() {
         let dir = tempfile::tempdir().expect("dir");
         let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let popup = rig.popup_of(0).await.expect("popup");
         // Give the popup history and scroll the sender into it. The broadcast
         // skips a client whose input pane is scrolled.
@@ -12551,7 +12555,7 @@ mod popup_tests {
     async fn a_popup_already_at_the_shared_size_is_not_resized_again() {
         let dir = tempfile::tempdir().expect("dir");
         let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
-        rig.command(RemuxCommand::PopupToggle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
         let popup = rig.popup_of(0).await.expect("popup");
         let resize = |rig: &Rig| {
             let (state, panes, clients, config) = (
@@ -12634,7 +12638,7 @@ mod popup_tests {
             let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
             let mut survivor = rig.add_client(2, 100, 30, Some((70, 14))).await;
             rig.new_session("other", dir.path()).await;
-            rig.command(RemuxCommand::PopupToggle).await;
+            rig.command(RemuxCommand::PopupToggle(None)).await;
             let popup = rig.popup_of(0).await.expect("popup");
             assert_eq!(rig.screen_size(popup).await, (50, 10), "{how:?}");
             while survivor.try_recv().is_ok() {}

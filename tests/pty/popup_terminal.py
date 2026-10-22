@@ -453,6 +453,64 @@ def per_tab_case():
     return fails
 
 
+# The user's own popup keys (not defaults): every one is a show/hide toggle.
+POPUP_KEYS = """[keybindings.command]
+"Alt-p" = "PopupToggle"
+"Alt--" = "PopupToggle bottom"
+"Alt-\\\\" = "PopupToggle right"
+"""
+ALT_MINUS = b"\x1b-"
+ALT_BACKSLASH = b"\x1b\\"
+
+
+def bottom_open(rows):
+    """The bottom drawer, (0, 10, 160, 37): its top-left corner at (0, 10)."""
+    return rows[10][0] == "\u256d"
+
+
+def right_open(rows):
+    """The right drawer, (60, 0, 100, 47): its top-left corner at (60, 0)."""
+    return rows[0][60] == "\u256d"
+
+
+def toggle_position_case():
+    print("\n== a popup key opens where it says and any popup key closes ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_keys", POPUP_KEYS + cfg())
+    try:
+        tui.send(ALT_MINUS)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(bottom_open(rows), "Alt-- opens the popup at the bottom")
+        check(not right_open(rows), "and not on the right")
+        tui.send(ALT_BACKSLASH)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(not bottom_open(rows) and not right_open(rows),
+              "Alt-\\ while it is open closes it rather than moving it")
+        tui.send(ALT_BACKSLASH)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(right_open(rows), "Alt-\\ opens it on the right")
+        check(not bottom_open(rows), "and not at the bottom")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        rows = list(tui.rows_text())
+        check(not bottom_open(rows) and not right_open(rows),
+              "Alt-p while it is open closes it")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(list(tui.rows_text())[5][16] == "\u256d",
+              "Alt-p opens it at the configured float")
+        check(tui.alive(), "the client is alive")
+        logs = tui.log("client") + tui.log("server")
+        check("panic" not in logs.lower(), "no panic in the logs")
+    finally:
+        tui.kill()
+    return fails
+
+
 def popup_line_with(tui, needle):
     """Whether a line of the float's interior holds `needle` as output: not the
     typed command or a prompt, which carry the `$`."""
@@ -497,7 +555,7 @@ def main():
     all_fails = []
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
                  live_reload_case, runtime_resize_case, per_tab_case,
-                 in_tab_cwd_case):
+                 in_tab_cwd_case, toggle_position_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:

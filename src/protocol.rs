@@ -143,7 +143,11 @@ pub enum ConnDescriptor {
 /// (interior-local coordinates). They are self-gating: a server sends a layer
 /// only to a client that has sent `PopupSize`, and a client sets the mouse flag
 /// only while it holds a layer, so an old client on a new server never sees
-/// either.
+/// either. The layer itself carries `pane_id`, also `#[serde(default)]`.
+///
+/// Within 18, before any release, [`RemuxCommand::PopupToggle`] became a
+/// newtype variant carrying an optional position, so its JSON changed from the
+/// bare `"PopupToggle"`. A client always sends it with `None`.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -1222,6 +1226,10 @@ impl Default for RenderCell {
 /// holds; a client treats a set `cells` as a replacement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PopupCells {
+    /// The popup's pane. One popup per tab, so this tells a client which tab's
+    /// popup the layer is, to keep the position a key opened it at.
+    #[serde(default)]
+    pub pane_id: PaneId,
     pub cols: u16,
     pub rows: u16,
     pub cursor_x: u16,
@@ -1382,11 +1390,15 @@ pub enum RemuxCommand {
     },
     PaneRename(String),
     PaneToggleZoom,
-    /// Show/hide the session's popup terminal -- a floating, centered pane drawn
-    /// on top of the layout. One popup per session, shared by every attached
-    /// client; the pane is spawned lazily on the first toggle and its shell keeps
-    /// running while hidden.
-    PopupToggle,
+    /// Show/hide the active tab's popup terminal, drawn over the layout. One
+    /// popup per tab, shared by every attached client; the pane is spawned
+    /// lazily on the tab's first toggle and its shell keeps running while
+    /// hidden.
+    ///
+    /// The position is where the CLIENT opens the popup (`None`: its configured
+    /// `popup_position`). Placement is client-side, so a client forwards this
+    /// with `None` and the server ignores the field.
+    PopupToggle(Option<crate::config::PopupPosition>),
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -1567,7 +1579,7 @@ impl RemuxCommand {
             | RemuxCommand::PaneUnstackDown
             | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
-            | RemuxCommand::PopupToggle
+            | RemuxCommand::PopupToggle(_)
             | RemuxCommand::ResizeLeft(_)
             | RemuxCommand::ResizeRight(_)
             | RemuxCommand::ResizeUp(_)
@@ -1862,7 +1874,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
-            ActionSpec::server("PopupToggle"),
+            ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
             ActionSpec::server("ResizeRight").arg("<amount>", "5"),
             ActionSpec::server("ResizeUp").arg("<amount>", "5"),
@@ -2807,7 +2819,7 @@ mod tests {
             RemuxCommand::PaneUnstackDown => Some("PaneUnstackDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
-            RemuxCommand::PopupToggle => Some("PopupToggle"),
+            RemuxCommand::PopupToggle(_) => Some("PopupToggle"),
             RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
             RemuxCommand::ResizeRight(_) => Some("ResizeRight"),
             RemuxCommand::ResizeUp(_) => Some("ResizeUp"),
@@ -2932,6 +2944,23 @@ mod tests {
         }
     }
 
+    /// The client places the popup, so it forwards `PopupToggle` without the
+    /// position its key named.
+    #[test]
+    fn popup_toggle_round_trips_with_and_without_a_position() {
+        for cmd in [
+            RemuxCommand::PopupToggle(None),
+            RemuxCommand::PopupToggle(Some(crate::config::PopupPosition::Bottom)),
+        ] {
+            let msg = ClientMessage::Command(cmd.clone());
+            let json = serde_json::to_string(&msg).unwrap();
+            match serde_json::from_str::<ClientMessage>(&json).unwrap() {
+                ClientMessage::Command(back) => assert_eq!(back, cmd, "{json}"),
+                other => panic!("unexpected variant: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn popup_mouse_flag_round_trips() {
         let click = ClientMessage::MouseClick {
@@ -2973,6 +3002,7 @@ mod tests {
     #[test]
     fn popup_cells_round_trip_on_both_frames() {
         let layer = PopupCells {
+            pane_id: 7,
             cols: 2,
             rows: 1,
             cursor_x: 1,
@@ -3032,7 +3062,7 @@ mod tests {
     fn classified_names_are_registry_names() {
         for cmd in [
             RemuxCommand::EnterSearchMode,
-            RemuxCommand::PopupToggle,
+            RemuxCommand::PopupToggle(None),
             RemuxCommand::SendKey(vec![1]),
             RemuxCommand::SessionSwitchLast,
         ] {

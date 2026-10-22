@@ -181,7 +181,7 @@ impl Default for AppearanceConfig {
 }
 
 /// Where the popup terminal is drawn.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PopupPosition {
     /// A fully framed box centered on the whole window, over every sidebar.
@@ -195,6 +195,21 @@ pub enum PopupPosition {
     Top,
     /// A drawer docked above the status bar row, over the sidebars.
     Bottom,
+}
+
+impl PopupPosition {
+    /// The position a `popup_position` value or a `PopupToggle` argument
+    /// names, in the config's own spelling.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "float" => Some(PopupPosition::Float),
+            "left" => Some(PopupPosition::Left),
+            "right" => Some(PopupPosition::Right),
+            "top" => Some(PopupPosition::Top),
+            "bottom" => Some(PopupPosition::Bottom),
+            _ => None,
+        }
+    }
 }
 
 /// Placement style for the which-key hint popup.
