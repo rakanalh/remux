@@ -1405,7 +1405,15 @@ impl RemuxServer {
                     }
                     Ok(None) => {
                         log::info!("client {client_id} disconnected");
-                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        handle_client_disconnect(
+                            client_id,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -1415,7 +1423,15 @@ impl RemuxServer {
                     }
                     Err(e) => {
                         log::error!("error reading from client {client_id}: {e}");
-                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        handle_client_disconnect(
+                            client_id,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -1663,7 +1679,7 @@ async fn handle_client_message(
             result
         }
         ClientMessage::Detach => {
-            handle_detach(client_id, clients).await;
+            handle_detach(client_id, state, panes, clients, config, prev_frames).await;
             mark_focus_changed();
             // Detaching may make this client's active-tab panes no longer
             // session-visible; re-evaluate subscribed panes so any View cell on
@@ -2460,7 +2476,7 @@ async fn handle_attach(
         }
     }
 
-    let (cols, rows) = {
+    let (cols, rows, left) = {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
             if client.session_name.as_deref() != Some(session_name) {
@@ -2475,12 +2491,18 @@ async fn handle_attach(
                 client.prev_scroll_offset = 0;
                 client.prev_scroll_pane = None;
             }
-            client.session_name = Some(session_name.to_string());
-            (client.cols, client.rows)
+            let left = client
+                .session_name
+                .replace(session_name.to_string())
+                .filter(|old| old != session_name);
+            (client.cols, client.rows, left)
         } else {
             return Ok(());
         }
     };
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
+    }
 
     log::debug!("server: client_id={client_id} attach session={session_name:?} dims={cols}x{rows}");
 
@@ -2542,11 +2564,22 @@ async fn handle_attach(
     Ok(())
 }
 
-async fn handle_detach(client_id: u64, clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>) {
+async fn handle_detach(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
     log::debug!("server: client_id={client_id} detach");
-    let mut cls = clients.lock().await;
-    if let Some(client) = cls.get_mut(&client_id) {
-        client.session_name = None;
+    let left = {
+        let mut cls = clients.lock().await;
+        cls.get_mut(&client_id)
+            .and_then(|client| client.session_name.take())
+    };
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
     }
 }
 
@@ -3701,7 +3734,7 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionDetach => {
-            handle_detach(client_id, clients).await;
+            handle_detach(client_id, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionList => {
             handle_list_sessions(client_id, state, clients).await?;
@@ -3861,12 +3894,16 @@ async fn handle_command(
         }
         RemuxCommand::SessionSwitchTab { session, tab_index } => {
             // Attach the client to the specified session and switch to the tab.
-            {
-                let mut cls = clients.lock().await;
-                if let Some(client) = cls.get_mut(&client_id) {
-                    client.session_name = Some(session.clone());
-                }
-            }
+            switch_client_session(
+                client_id,
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
             {
                 let mut st = state.lock().await;
                 if let Err(e) = st.goto_tab(&session, tab_index) {
@@ -3906,12 +3943,16 @@ async fn handle_command(
             pane_id,
         } => {
             // Attach to session, switch tab, and focus pane.
-            {
-                let mut cls = clients.lock().await;
-                if let Some(client) = cls.get_mut(&client_id) {
-                    client.session_name = Some(session.clone());
-                }
-            }
+            switch_client_session(
+                client_id,
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
             {
                 let mut st = state.lock().await;
                 if let Err(e) = st.goto_tab(&session, tab_index) {
@@ -5112,19 +5153,25 @@ async fn handle_kill_session(
 /// is not supposed to kill anything.
 async fn handle_client_disconnect(
     client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
     log::debug!("server: client_id={client_id} disconnected, removing from client map");
-    {
+    let left = {
         let mut cls = clients.lock().await;
-        cls.remove(&client_id);
-    }
+        cls.remove(&client_id).and_then(|c| c.session_name)
+    };
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
     {
         let mut pf = prev_frames.lock().await;
         pf.remove(&client_id);
+    }
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
     }
     // Removing the `ClientConnection` above dropped any session-tree
     // subscription with it -- but it also changed the `client_count` every
@@ -7620,7 +7667,7 @@ async fn resize_session_panes(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
-    _config: &Arc<Config>,
+    config: &Arc<Config>,
 ) -> Result<()> {
     // Home allotments from the session's active-tab layout (the size the panes
     // get from attached clients viewing this session).
@@ -7674,41 +7721,109 @@ async fn resize_session_panes(
             }
         }
     }
-    // Size every tab's popup PTY to the session's shared popup interior, so a
-    // tab switch never resizes a popup. A dedicated step, deliberately NOT
-    // folded into `active_tab_content_sizes`: that function means "the active
-    // tab's panes" and feeds the View-cell size fold, which the popup (which no
-    // View cell can reference) has no business entering.
-    {
-        let popups: Vec<PaneId> = {
-            let st = state.lock().await;
-            st.sessions
-                .get(session_name)
-                .map(|s| s.tabs.iter().filter_map(|t| t.popup_pane).collect())
-                .unwrap_or_default()
-        };
-        if !popups.is_empty() {
-            let (inner_cols, inner_rows) =
-                session_popup_interior(session_name, clients, _config).await;
-            let mut ps = panes.lock().await;
-            for popup_id in popups {
-                if let Some(pane_data) = ps.get_mut(&popup_id) {
-                    log::debug!(
-                        "resize_session_panes: popup pane_id={popup_id} pty/screen resize to cols={inner_cols} rows={inner_rows}"
-                    );
-                    let _ = pane_data.pty.resize(inner_cols, inner_rows);
-                    pane_data.screen.resize(inner_cols, inner_rows);
-                }
-            }
-        }
-    }
+    resize_session_popups(session_name, state, panes, clients, config).await;
 
     // A resize can change active-tab membership / attachment for this or other
     // sessions (tab switch, attach), flipping which subscribed panes are
     // session-visible; re-evaluate every subscribed pane so cells that just
     // gained or lost visibility flip live. Cheap: only live View cells subscribe.
-    refresh_subscribed_panes(state, panes, clients, _config).await;
+    refresh_subscribed_panes(state, panes, clients, config).await;
     Ok(())
+}
+
+/// Size every tab's popup PTY to the session's shared popup interior, so a tab
+/// switch never resizes a popup. Returns whether any popup changed size.
+///
+/// A dedicated step, deliberately NOT folded into `active_tab_content_sizes`:
+/// that function means "the active tab's panes" and feeds the View-cell size
+/// fold, which the popup (which no View cell can reference) has no business
+/// entering.
+///
+/// A popup already at the shared size is left alone. `Pty::resize` signals
+/// SIGWINCH unconditionally, and a terminal resize reaches here twice (the
+/// `Resize`, then the `PopupSize` for the new box), so without the check the
+/// popup's shell would redraw once for a size it already had.
+async fn resize_session_popups(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Config,
+) -> bool {
+    let popups: Vec<PaneId> = {
+        let st = state.lock().await;
+        st.sessions
+            .get(session_name)
+            .map(|s| s.tabs.iter().filter_map(|t| t.popup_pane).collect())
+            .unwrap_or_default()
+    };
+    if popups.is_empty() {
+        return false;
+    }
+    let (inner_cols, inner_rows) = session_popup_interior(session_name, clients, config).await;
+    let mut changed = false;
+    let mut ps = panes.lock().await;
+    for popup_id in popups {
+        let Some(pane_data) = ps.get_mut(&popup_id) else {
+            continue;
+        };
+        if (pane_data.screen.cols, pane_data.screen.rows) == (inner_cols, inner_rows) {
+            continue;
+        }
+        log::debug!(
+            "resize_session_popups: popup pane_id={popup_id} pty/screen resize to cols={inner_cols} rows={inner_rows}"
+        );
+        let _ = pane_data.pty.resize(inner_cols, inner_rows);
+        pane_data.screen.resize(inner_cols, inner_rows);
+        changed = true;
+    }
+    changed
+}
+
+/// Attach `client_id` to `session_name` for a command that names its target,
+/// refitting the popups of the session it leaves.
+async fn switch_client_session(
+    client_id: u64,
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let left = {
+        let mut cls = clients.lock().await;
+        cls.get_mut(&client_id).and_then(|client| {
+            client
+                .session_name
+                .replace(session_name.to_string())
+                .filter(|old| old != session_name)
+        })
+    };
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
+    }
+}
+
+/// Bring `session_name`'s popups in line with the clients still attached to it,
+/// after one of them left: detached, disconnected or attached elsewhere.
+///
+/// The shared popup interior is the minimum over attached clients, so the
+/// departure of the client that asked for the smallest one grows it. Nothing
+/// else would resize the popups until the next resize of a client left behind.
+async fn refit_popups_after_leave(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    if resize_session_popups(session_name, state, panes, clients, config).await {
+        log::debug!("server: a client left '{session_name}', its popups were resized");
+        invalidate_session_baselines(session_name, clients, prev_frames).await;
+        broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    }
 }
 
 /// The content (blit) size each pane in a session's active tab gets from the
@@ -11865,6 +11980,41 @@ mod popup_tests {
 
     const CLIENT: u64 = 1;
 
+    /// A client attached to `session`, as the handshake leaves one.
+    fn connection(
+        session: &str,
+        cols: u16,
+        rows: u16,
+        want: Option<(u16, u16)>,
+        tx: mpsc::UnboundedSender<ServerMessage>,
+    ) -> ClientConnection {
+        ClientConnection {
+            session_name: Some(session.to_string()),
+            tx,
+            cols,
+            rows,
+            mode: "NORMAL".to_string(),
+            mouse_selection: None,
+            search_info: None,
+            session_scroll: HashMap::new(),
+            prev_scroll_offset: 0,
+            prev_scroll_pane: None,
+            needs_full_render: false,
+            drag: None,
+            autoscroll_repeat: None,
+            subscribed_panes: HashMap::new(),
+            pane_scroll: HashMap::new(),
+            pane_selection: HashMap::new(),
+            pane_drag: None,
+            pane_autoscroll_repeat: None,
+            session_tree_subscribed: false,
+            agents_subscribed: false,
+            naming: None,
+            tab_style: None,
+            popup_want: want,
+        }
+    }
+
     impl Rig {
         /// One session "main" whose first pane runs `/bin/sh` in `cwd`, and one
         /// attached client of `cols` x `rows`.
@@ -11902,34 +12052,10 @@ mod popup_tests {
             .expect("spawn");
             let (tx, rx) = mpsc::unbounded_channel();
             let clients = Arc::new(Mutex::new(HashMap::new()));
-            clients.lock().await.insert(
-                CLIENT,
-                ClientConnection {
-                    session_name: Some("main".to_string()),
-                    tx,
-                    cols,
-                    rows,
-                    mode: "NORMAL".to_string(),
-                    mouse_selection: None,
-                    search_info: None,
-                    session_scroll: HashMap::new(),
-                    prev_scroll_offset: 0,
-                    prev_scroll_pane: None,
-                    needs_full_render: false,
-                    drag: None,
-                    autoscroll_repeat: None,
-                    subscribed_panes: HashMap::new(),
-                    pane_scroll: HashMap::new(),
-                    pane_selection: HashMap::new(),
-                    pane_drag: None,
-                    pane_autoscroll_repeat: None,
-                    session_tree_subscribed: false,
-                    agents_subscribed: false,
-                    naming: None,
-                    tab_style: None,
-                    popup_want: want,
-                },
-            );
+            clients
+                .lock()
+                .await
+                .insert(CLIENT, connection("main", cols, rows, want, tx));
             Rig {
                 state,
                 panes,
@@ -11988,6 +12114,49 @@ mod popup_tests {
             .await
             .expect("spawn");
             pane_id
+        }
+
+        /// Attach another client of `cols` x `rows` to "main". Returns what it
+        /// is sent.
+        async fn add_client(
+            &self,
+            id: u64,
+            cols: u16,
+            rows: u16,
+            want: Option<(u16, u16)>,
+        ) -> mpsc::UnboundedReceiver<ServerMessage> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.clients
+                .lock()
+                .await
+                .insert(id, connection("main", cols, rows, want, tx));
+            rx
+        }
+
+        /// A second session whose pane runs `/bin/sh` in `cwd`.
+        async fn new_session(&self, name: &str, cwd: &std::path::Path) {
+            let pane_id = self
+                .state
+                .lock()
+                .await
+                .create_session(name, None, BorderStyle::ZellijStyle, LayoutMode::default())
+                .expect("session");
+            spawn_pane(
+                pane_id,
+                100,
+                29,
+                None,
+                &[],
+                Some(cwd),
+                Some(PaneIdentity {
+                    session: name,
+                    pane: pane_id,
+                }),
+                &self.panes,
+                &self.config,
+            )
+            .await
+            .expect("spawn");
         }
 
         async fn popup_of(&self, tab: usize) -> Option<PaneId> {
@@ -12216,5 +12385,121 @@ mod popup_tests {
         let fresh = rig.popup_of(1).await.expect("fresh popup");
         assert_ne!(fresh, hidden);
         rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_popup_already_at_the_shared_size_is_not_resized_again() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        let resize = |rig: &Rig| {
+            let (state, panes, clients, config) = (
+                rig.state.clone(),
+                rig.panes.clone(),
+                rig.clients.clone(),
+                rig.config.clone(),
+            );
+            async move { resize_session_popups("main", &state, &panes, &clients, &config).await }
+        };
+        // A terminal resize reaches here with the want the client had before
+        // its box changed: the popup is already that size.
+        assert!(!resize(&rig).await, "no SIGWINCH for a size the popup has");
+        rig.clients
+            .lock()
+            .await
+            .get_mut(&CLIENT)
+            .unwrap()
+            .popup_want = Some((60, 12));
+        assert!(resize(&rig).await);
+        assert_eq!(rig.screen_size(popup).await, (60, 12));
+        rig.finish().await;
+    }
+
+    /// The ways a client stops counting towards a session it shared.
+    #[derive(Debug, Clone, Copy)]
+    enum Leave {
+        Detach,
+        Disconnect,
+        AttachAway,
+        SwitchTabAway,
+        SwitchPaneAway,
+    }
+
+    #[tokio::test]
+    async fn a_client_leaving_resizes_the_popup_to_the_clients_left() {
+        for how in [
+            Leave::Detach,
+            Leave::Disconnect,
+            Leave::AttachAway,
+            Leave::SwitchTabAway,
+            Leave::SwitchPaneAway,
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+            let mut survivor = rig.add_client(2, 100, 30, Some((70, 14))).await;
+            rig.new_session("other", dir.path()).await;
+            rig.command(RemuxCommand::PopupToggle).await;
+            let popup = rig.popup_of(0).await.expect("popup");
+            assert_eq!(rig.screen_size(popup).await, (50, 10), "{how:?}");
+            while survivor.try_recv().is_ok() {}
+
+            match how {
+                Leave::Detach => rig.command(RemuxCommand::SessionDetach).await,
+                Leave::Disconnect => {
+                    handle_client_disconnect(
+                        CLIENT,
+                        &rig.state,
+                        &rig.panes,
+                        &rig.clients,
+                        &rig.config,
+                        &rig.prev_frames,
+                    )
+                    .await
+                }
+                Leave::AttachAway => handle_attach(
+                    CLIENT,
+                    "other",
+                    &rig.state,
+                    &rig.panes,
+                    &rig.clients,
+                    &rig.config,
+                    &rig.prev_frames,
+                    &rig.dormant,
+                )
+                .await
+                .expect("attach"),
+                Leave::SwitchTabAway => {
+                    rig.command(RemuxCommand::SessionSwitchTab {
+                        session: "other".to_string(),
+                        tab_index: 0,
+                    })
+                    .await
+                }
+                Leave::SwitchPaneAway => {
+                    let pane_id = rig.state.lock().await.sessions["other"].tabs[0].focused_pane;
+                    rig.command(RemuxCommand::SessionSwitchPane {
+                        session: "other".to_string(),
+                        tab_index: 0,
+                        pane_id,
+                    })
+                    .await
+                }
+            }
+
+            assert_eq!(rig.screen_size(popup).await, (70, 14), "{how:?}");
+            let mut layers = Vec::new();
+            while let Ok(m) = survivor.try_recv() {
+                if let ServerMessage::FullRender { popup: Some(l), .. } = m {
+                    layers.push((l.cols, l.rows));
+                }
+            }
+            assert_eq!(
+                layers.last(),
+                Some(&(70, 14)),
+                "{how:?}: the client left behind is repainted at the new size"
+            );
+            rig.finish().await;
+        }
     }
 }
