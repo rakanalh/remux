@@ -167,7 +167,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `h` `j` `k` `l` | `PaneFocusLeft/Down/Up/Right` | |
 | `H` `J` `K` `L` | `PaneMoveLeft/Down/Up/Right` | |
 | `z` | `PaneToggleZoom` | |
-| `o` | `PopupToggle` | Floating popup terminal |
+| `o` | `PopupToggle` | Popup terminal |
 | `m` | `SetMaster` | |
 | `r` | `PaneRename` | Prompts for a name |
 | `t` | `PaneMoveToTab` | Opens a tab picker |
@@ -282,7 +282,7 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneToggleZoom` | Zoom or unzoom the focused pane |
 | `PaneRename` | Rename the focused pane (prompts) |
 | `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |
-| `PopupToggle` | Show or hide the session's floating popup terminal |
+| `PopupToggle` | Show or hide the active tab's popup terminal |
 | `ResizeLeft` / `Right` / `Up` / `Down` `[amount]` | Resize the focused pane by `amount` cells (default `1`) |
 | `SetMaster` | Make the focused pane the master pane |
 

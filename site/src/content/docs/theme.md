@@ -11,10 +11,10 @@ Some of what you see is drawn by the client and some by the server, and that dec
 
 | Applies when you save | Needs `remux restart` |
 |---|---|
-| `pane_title`, `tab_style`, `which_key_position` | `border_style`, `default_layout`, `popup_width_pct`, `popup_height_pct` |
+| `pane_title`, `tab_style`, `which_key_position`, `popup_position`, `popup_width_pct`, `popup_height_pct` | `border_style`, `default_layout` |
 | Colours of what the client draws: overlays, which-key, sidebars, Views, search highlights | Colours of what the server draws: pane borders, tab strips and the status bar in ordinary tabs |
 
-`border_style`, `default_layout` and the popup size are applied when a session or tab is created, so after a restart they affect new sessions and tabs.
+`border_style` and `default_layout` are applied when a session or tab is created, so after a restart they affect new sessions and tabs.
 
 ## Border style
 
@@ -104,15 +104,18 @@ The popup opens as soon as you press the prefix. `timeout_ms` under `[modes.comm
 
 ![Which-key popup, full width](../../assets/screenshots/whichkey-full-width.png)
 
-## Popup size
+## Popup position and size
 
-The floating popup terminal (`Alt-p`) is sized as a percentage of the session's content area, clamped to 20–100:
+The popup terminal (`Alt-p`) is a `float` centered over the whole window by default, or a drawer docked to the `left`, `right`, `top` or `bottom`. Its size is a percentage, clamped to 20–100. A float uses both. `top` and `bottom` use only the height, `left` and `right` only the width:
 
 ```toml
 [appearance]
+popup_position = "float"
 popup_width_pct = 80
 popup_height_pct = 80
 ```
+
+Saving the file moves and resizes an open popup. See [Config reference](/remux/config-reference/) for what each percentage is a percentage of.
 
 ## Status bar position
 

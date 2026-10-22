@@ -57,6 +57,7 @@ Remux is two processes. The **server** owns the sessions, panes and PTYs, and it
 
 - `[keybindings.command]` (the leader, the command tree and the Alt shortcuts) and `[keybindings.session_manager]`
 - `appearance.which_key_position`
+- `appearance.popup_position`, `popup_width_pct` and `popup_height_pct`
 - `appearance.pane_title` and `appearance.theme.tab_style`, which the client sends to every server it views
 - `[appearance.theme]` colours for what the client draws: the which-key popup, the session manager and other overlays, sidebars, View cells and their status bar, and search highlights
 - `[remotes.*]`
@@ -66,7 +67,7 @@ Remux is two processes. The **server** owns the sessions, panes and PTYs, and it
 **The server reads the file once, at startup.** Run `remux restart` after changing any of these:
 
 - everything under `[general]`
-- `appearance.border_style`, `default_layout`, `popup_width_pct`, `popup_height_pct`
+- `appearance.border_style`, `default_layout`
 - `[layouts]`
 - `[agents]`
 - `[appearance.theme]` colours for what the server draws: pane frames, tab chips and the status bar

@@ -388,7 +388,7 @@ def runtime_resize_case():
         tui.send(ALT_P)
         tui.pump(1.8)
         before = top_right_corner(list(tui.rows_text())[0], SIDEBAR_W)
-        check(before == 96, f"the drawer is 63 wide before ({before})")
+        check(before == 96, f"the drawer's right corner is at column 96 before ({before})")
         # Ctrl-a p R l: the sticky resize group, one step to the right.
         tui.prefix(b"pR", 0.8)
         tui.send(b"l", 1.2)
