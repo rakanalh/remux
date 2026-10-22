@@ -62,6 +62,20 @@ struct PopupBuf {
     /// The server's layer this box was composed from. The next frame's diff is
     /// applied to it, so it lives and dies with the box.
     held: Option<HeldLayer>,
+    /// What of the box the terminal does not show yet. `None` once it does.
+    pending: Option<PendingPaint>,
+}
+
+/// The part of the popup box still to be emitted.
+///
+/// The box is emitted by the next frame paint, inside that frame's
+/// synchronized-output bracket. A bracket of its own would let the terminal
+/// show the box over the previous frame for one refresh.
+enum PendingPaint {
+    /// Every cell: the terminal shows none of this box.
+    Whole,
+    /// The cells that differ from these, which the terminal shows now.
+    Since(Vec<Vec<RenderCell>>),
 }
 
 /// SGR state for the cells of one row, so a run of cells emits only what
@@ -369,43 +383,42 @@ impl Renderer {
         self.front.get(sy).and_then(|row| row.get(sx))
     }
 
-    /// Put the popup box on screen and start masking it.
+    /// Put the popup box up and start masking it.
     ///
     /// `rect` and `cursor` are window-absolute and `cells` is the box's own grid.
-    /// Against the box already shown at the same rect, only the cells that
-    /// changed are emitted; anywhere else the whole box is. Call this BEFORE the
-    /// frame the box belongs to is painted: that frame then skips the box.
+    /// Nothing is emitted here: the next [`Renderer::render_full`] or
+    /// [`Renderer::render_diff`] emits the box inside its own bracket. Against
+    /// the box already shown at the same rect, only the cells that changed are
+    /// emitted; anywhere else the whole box is. Call this BEFORE the frame the
+    /// box belongs to is painted: that frame then skips the box.
     pub fn set_popup(
         &mut self,
         rect: Rect,
         cells: Vec<Vec<RenderCell>>,
         cursor: (u16, u16, bool, u8),
-    ) -> Result<()> {
-        let mut stdout = io::stdout().lock();
-        self.set_popup_into(&mut stdout, rect, cells, cursor)
-    }
-
-    /// The body of [`Renderer::set_popup`], parameterised over the sink for the
-    /// same reason as [`Renderer::paint_panel_into`].
-    fn set_popup_into<W: Write>(
-        &mut self,
-        out: &mut W,
-        rect: Rect,
-        cells: Vec<Vec<RenderCell>>,
-        cursor: (u16, u16, bool, u8),
-    ) -> Result<()> {
-        let previous = self
-            .popup
-            .take()
-            .filter(|p| p.rect == rect)
-            .map(|p| p.cells);
+    ) {
+        let pending = match self.popup.take() {
+            Some(p) if p.rect == rect => p.pending.unwrap_or(PendingPaint::Since(p.cells)),
+            _ => PendingPaint::Whole,
+        };
         self.popup = Some(PopupBuf {
             rect,
             cells,
             cursor,
             held: None,
+            pending: Some(pending),
         });
-        self.paint_popup_into(out, previous.as_deref())
+    }
+
+    /// Emit whatever of the popup box the terminal does not show yet.
+    fn paint_pending_popup_into<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        let Some(pending) = self.popup.as_mut().and_then(|p| p.pending.take()) else {
+            return Ok(());
+        };
+        match pending {
+            PendingPaint::Whole => self.paint_popup_into(out, None),
+            PendingPaint::Since(previous) => self.paint_popup_into(out, Some(&previous)),
+        }
     }
 
     /// Emit the popup box: every cell, or only those that differ from `previous`.
@@ -417,7 +430,6 @@ impl Renderer {
         let Some(popup) = &self.popup else {
             return Ok(());
         };
-        queue!(out, Print("\x1b[?2026h"))?;
         queue!(out, cursor::Hide)?;
         for (ry, row) in popup.cells.iter().enumerate() {
             let sy = popup.rect.y as usize + ry;
@@ -454,7 +466,6 @@ impl Renderer {
             }
             style.end_row(out)?;
         }
-        queue!(out, Print("\x1b[?2026l"))?;
         Ok(())
     }
 
@@ -806,6 +817,9 @@ impl Renderer {
             }
         }
 
+        // The box this frame skips, in the same bracket as the frame.
+        self.paint_pending_popup_into(out)?;
+
         // Update cursor. The reported position is content-relative, so it has
         // to be offset -- otherwise the hardware cursor lands in a left sidebar.
         self.queue_cursor(out, cursor_x, cursor_y, cursor_visible, cursor_style)?;
@@ -1002,6 +1016,9 @@ impl Renderer {
                 self.front[sy][sx] = change.cell.clone();
             }
         }
+
+        // The box this frame skips, in the same bracket as the frame.
+        self.paint_pending_popup_into(out)?;
 
         // Update cursor. The reported position is content-relative, so it has
         // to be offset -- otherwise the hardware cursor lands in a left sidebar.
@@ -1410,6 +1427,13 @@ impl Renderer {
     /// restore the whole screen. Overlay teardown must call this instead, or
     /// the sidebars are erased.
     pub fn repaint_all(&mut self) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.repaint_all_into(&mut stdout)
+    }
+
+    /// The body of [`Renderer::repaint_all`], parameterised over the sink for
+    /// the same reason as [`Renderer::paint_panel_into`].
+    fn repaint_all_into<W: Write>(&mut self, out: &mut W) -> Result<()> {
         let saved = (
             self.origin_x,
             self.origin_y,
@@ -1426,9 +1450,12 @@ impl Renderer {
         // withhold. `frame_rows` is restored too, because the diffs that follow
         // still describe the last server frame.
         let saved_status = (self.status_row_owned, self.frame_rows);
-        // The front buffer never holds the popup box, so it is replayed whole
-        // and the box is put back on top afterwards.
-        let popup = self.popup.take();
+        // The front buffer never holds the popup box, and what it holds under
+        // the box is stale, so the mask stays up for the replay. The replay then
+        // emits the whole box in its own bracket.
+        if let Some(popup) = &mut self.popup {
+            popup.pending = Some(PendingPaint::Whole);
+        }
         self.status_row_owned = false;
         // The frame here IS the whole terminal, so the content rect must be the
         // whole terminal too -- otherwise the clears would treat the panel
@@ -1438,16 +1465,13 @@ impl Renderer {
         self.content_cols = self.cols;
         self.content_rows = self.rows;
         let cells = self.front.clone();
-        let res = self.render_full(&cells, 0, 0, false, 0);
+        let res = self.render_full_into(out, &cells, 0, 0, false, 0);
         self.origin_x = saved.0;
         self.origin_y = saved.1;
         self.content_cols = saved.2;
         self.content_rows = saved.3;
         self.last_cursor = saved_cursor;
         (self.status_row_owned, self.frame_rows) = saved_status;
-        self.popup = popup;
-        let mut stdout = io::stdout().lock();
-        self.paint_popup_into(&mut stdout, None)?;
         res
     }
 
@@ -2986,15 +3010,22 @@ mod origin_tests {
         let mut r = Renderer::new(10, 4);
         r.render_full(&grid("AAAAAAAAAA", 4), 0, 0, false, 0)
             .unwrap();
-        let mut sink: Vec<u8> = Vec::new();
-        r.set_popup_into(
-            &mut sink,
-            rect(2, 1, 4, 2),
-            boxed(4, 2, 'P'),
-            (3, 2, true, 2),
-        )
-        .unwrap();
+        show(&mut r, rect(2, 1, 4, 2), boxed(4, 2, 'P'), (3, 2, true, 2));
         r
+    }
+
+    /// Put a box up and emit it, as the frame after `set_popup` does. Returns
+    /// what was emitted.
+    fn show(
+        r: &mut Renderer,
+        rect: Rect,
+        cells: Vec<Vec<RenderCell>>,
+        cursor: (u16, u16, bool, u8),
+    ) -> String {
+        r.set_popup(rect, cells, cursor);
+        let mut out: Vec<u8> = Vec::new();
+        r.render_diff_into(&mut out, &[], 0, 0, false, 0).unwrap();
+        String::from_utf8_lossy(&out).to_string()
     }
 
     fn front_row(r: &Renderer, y: usize) -> String {
@@ -3031,14 +3062,9 @@ mod origin_tests {
         let mut out: Vec<u8> = Vec::new();
         r.render_full_into(&mut out, &grid("AAAAAAAAAA", 4), 0, 0, false, 0)
             .unwrap();
-        r.set_popup_into(
-            &mut out,
-            rect(2, 1, 4, 2),
-            boxed(4, 2, 'P'),
-            (3, 2, true, 2),
-        )
-        .unwrap();
         term.feed(&out);
+        let shown = show(&mut r, rect(2, 1, 4, 2), boxed(4, 2, 'P'), (3, 2, true, 2));
+        term.feed(shown.as_bytes());
         (r, term)
     }
 
@@ -3217,14 +3243,7 @@ mod origin_tests {
     #[test]
     fn an_absolute_cursor_is_clamped_to_the_terminal() {
         let mut r = Renderer::new(10, 4);
-        let mut sink: Vec<u8> = Vec::new();
-        r.set_popup_into(
-            &mut sink,
-            rect(0, 0, 4, 2),
-            boxed(4, 2, 'P'),
-            (99, 99, true, 0),
-        )
-        .unwrap();
+        r.set_popup(rect(0, 0, 4, 2), boxed(4, 2, 'P'), (99, 99, true, 0));
         r.render_full(&grid("AAAAAAAAAA", 4), 0, 0, false, 0)
             .unwrap();
         let mut out: Vec<u8> = Vec::new();
@@ -3267,47 +3286,66 @@ mod origin_tests {
     }
 
     #[test]
-    fn repaint_all_keeps_the_layer_and_the_front_buffer_intact() {
-        let mut r = with_box();
-        r.repaint_all().unwrap();
+    fn repaint_all_never_replays_under_the_box_and_repaints_it_in_the_same_bracket() {
+        let (mut r, mut term) = with_box_on_screen();
+        let mut out: Vec<u8> = Vec::new();
+        r.repaint_all_into(&mut out).unwrap();
+        term.feed(&out);
+        let emitted = String::from_utf8_lossy(&out).to_string();
         assert_eq!(r.popup_rect(), Some(rect(2, 1, 4, 2)));
         assert_eq!(front_row(&r, 1), "AAAAAAAAAA", "the box is never stored");
+        assert_eq!(
+            emitted.matches('A').count(),
+            40 - 8,
+            "the stale cells under the box are not replayed"
+        );
+        assert_eq!(emitted.matches('P').count(), 8, "the box is re-emitted");
+        assert_eq!(emitted.matches("\x1b[?2026h").count(), 1, "{emitted:?}");
+        assert_eq!(emitted.matches("\x1b[?2026l").count(), 1, "{emitted:?}");
+        assert_eq!(term.row(1), "AAPPPPAAAA");
+    }
+
+    #[test]
+    fn the_box_is_emitted_inside_its_frames_sync_bracket() {
+        let mut r = Renderer::new(10, 4);
+        let mut out: Vec<u8> = Vec::new();
+        r.render_full_into(&mut out, &grid("AAAAAAAAAA", 4), 0, 0, false, 0)
+            .unwrap();
+        r.set_popup(rect(2, 1, 4, 2), boxed(4, 2, 'P'), (3, 2, true, 2));
+        let mut frame: Vec<u8> = Vec::new();
+        r.render_diff_into(&mut frame, &[], 0, 0, false, 0).unwrap();
+        let emitted = String::from_utf8_lossy(&frame).to_string();
+        assert_eq!(emitted.matches('P').count(), 8, "{emitted:?}");
+        assert_eq!(emitted.matches("\x1b[?2026h").count(), 1, "{emitted:?}");
+        let opened = emitted.find("\x1b[?2026h").unwrap();
+        let closed = emitted.find("\x1b[?2026l").unwrap();
+        assert!(
+            opened < emitted.find('P').unwrap() && emitted.rfind('P').unwrap() < closed,
+            "{emitted:?}"
+        );
+        // Emitted once: the next frame has nothing of the box left to send.
+        let mut next: Vec<u8> = Vec::new();
+        r.render_diff_into(&mut next, &[], 0, 0, false, 0).unwrap();
+        assert_eq!(String::from_utf8_lossy(&next).matches('P').count(), 0);
     }
 
     #[test]
     fn the_box_is_emitted_whole_and_then_only_where_it_changed() {
         let mut r = Renderer::new(10, 4);
-        let mut first: Vec<u8> = Vec::new();
-        r.set_popup_into(
-            &mut first,
-            rect(2, 1, 4, 2),
-            boxed(4, 2, 'P'),
-            (0, 0, false, 0),
-        )
-        .unwrap();
+        let first = show(&mut r, rect(2, 1, 4, 2), boxed(4, 2, 'P'), (0, 0, false, 0));
         assert_eq!(
-            String::from_utf8_lossy(&first).matches('P').count(),
+            first.matches('P').count(),
             8,
             "the first paint covers the box"
         );
         let mut next = boxed(4, 2, 'P');
         next[1][2] = cell('Q');
-        let mut second: Vec<u8> = Vec::new();
-        r.set_popup_into(
-            &mut second,
-            rect(2, 1, 4, 2),
-            next.clone(),
-            (0, 0, false, 0),
-        )
-        .unwrap();
-        let emitted = String::from_utf8_lossy(&second).to_string();
+        let emitted = show(&mut r, rect(2, 1, 4, 2), next.clone(), (0, 0, false, 0));
         assert_eq!(emitted.matches('Q').count(), 1);
         assert_eq!(emitted.matches('P').count(), 0, "unchanged cells stay put");
         // A box that moved is emitted whole again.
-        let mut third: Vec<u8> = Vec::new();
-        r.set_popup_into(&mut third, rect(3, 1, 4, 2), next, (0, 0, false, 0))
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&third).matches('P').count(), 7);
+        let third = show(&mut r, rect(3, 1, 4, 2), next, (0, 0, false, 0));
+        assert_eq!(third.matches('P').count(), 7);
     }
 
     #[test]

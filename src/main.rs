@@ -1718,7 +1718,7 @@ fn sync_popup(
         height: held.rows.min(interior.height),
         neighbors: crate::protocol::FocusNeighbors::default(),
     };
-    renderer.set_popup(placed.rect, cells, cursor)?;
+    renderer.set_popup(placed.rect, cells, cursor);
     renderer.set_held_layer(held);
     Ok(Some(PopupFrame {
         cursor,
