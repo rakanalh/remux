@@ -1688,7 +1688,7 @@ struct PopupFocus {
 /// follows repaints what it covered.
 fn sync_popup(
     layer: Option<Box<crate::protocol::PopupCells>>,
-    popup: &PopupState,
+    popup: &mut PopupState,
     chrome: &crate::client::chrome::Chrome,
     renderer: &mut Renderer,
     attached: &Option<(ConnId, String)>,
@@ -1699,7 +1699,10 @@ fn sync_popup(
         return Ok(None);
     };
     let Some(held) = HeldLayer::from_frame(renderer.held_layer(), &frame) else {
+        // Without a held layer no later diff applies either, so ask for the
+        // full one rather than show nothing until the box next moves.
         renderer.clear_popup();
+        popup.reannounce();
         return Ok(None);
     };
     let placed = popup_box_now(popup, chrome, renderer, attached);
@@ -6878,7 +6881,7 @@ async fn run_client_loop(
                         // cells the box covers. A View owns the screen, so it
                         // shows no box.
                         let popup_frame = if active_view.is_none() {
-                            sync_popup(popup_layer, &popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
+                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
                         } else {
                             renderer.clear_popup();
                             None
@@ -6933,7 +6936,7 @@ async fn run_client_loop(
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         // See the FullRender arm: the popup layer goes first.
                         let popup_frame = if active_view.is_none() {
-                            sync_popup(popup_layer, &popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
+                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
                         } else {
                             renderer.clear_popup();
                             None
@@ -8927,11 +8930,11 @@ mod tests {
 
         #[test]
         fn a_layer_puts_the_box_over_the_sidebar_and_owns_cursor_and_pane_rect() {
-            let (mut renderer, chrome, popup, theme) = setup();
+            let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
             let frame = sync_popup(
                 Some(layer(4, 2, 'x')),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -8960,11 +8963,11 @@ mod tests {
 
         #[test]
         fn a_later_diff_is_applied_to_the_held_layer() {
-            let (mut renderer, chrome, popup, theme) = setup();
+            let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
             sync_popup(
                 Some(layer(4, 2, 'x')),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -8983,7 +8986,7 @@ mod tests {
             }];
             sync_popup(
                 Some(diff),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -8996,11 +8999,11 @@ mod tests {
 
         #[test]
         fn no_layer_drops_the_box() {
-            let (mut renderer, chrome, popup, theme) = setup();
+            let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
             sync_popup(
                 Some(layer(4, 2, 'x')),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -9008,7 +9011,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                sync_popup(None, &popup, &chrome, &mut renderer, &attached, &theme)
+                sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme)
                     .unwrap()
                     .is_none()
             );
@@ -9017,14 +9020,17 @@ mod tests {
         }
 
         #[test]
-        fn a_diff_with_nothing_to_apply_it_to_drops_the_box() {
-            let (mut renderer, chrome, popup, theme) = setup();
+        fn a_diff_with_nothing_to_apply_it_to_drops_the_box_and_asks_again() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
+            let placed = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert!(popup.announce(&ConnId::Local, &placed).is_some());
+            assert!(popup.announce(&ConnId::Local, &placed).is_none());
             let mut diff = layer(4, 2, 'x');
             diff.cells = None;
             assert!(sync_popup(
                 Some(diff),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -9033,17 +9039,20 @@ mod tests {
             .unwrap()
             .is_none());
             assert_eq!(renderer.popup_rect(), None);
+            // The next pass re-announces the box, and the server answers that
+            // with a full frame that carries the whole layer.
+            assert!(popup.announce(&ConnId::Local, &placed).is_some());
         }
 
         #[test]
         fn switching_server_drops_the_layer() {
             // `switch_to_server` clears the box before the new foreground is
             // handed the screen.
-            let (mut renderer, chrome, popup, theme) = setup();
+            let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
             sync_popup(
                 Some(layer(4, 2, 'x')),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -9068,7 +9077,7 @@ mod tests {
             ));
             sync_popup(
                 Some(layer(4, 2, 'x')),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,
@@ -9104,7 +9113,7 @@ mod tests {
             let attached = Some((ConnId::Local, "main".to_string()));
             sync_popup(
                 Some(layer(4, 2, 'x')),
-                &popup,
+                &mut popup,
                 &chrome,
                 &mut renderer,
                 &attached,

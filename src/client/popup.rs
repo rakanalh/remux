@@ -404,6 +404,14 @@ impl PopupState {
         true
     }
 
+    /// Forget what was announced, so the next [`PopupState::announce`] sends
+    /// again. The server answers every announcement with a full frame, which
+    /// carries the whole layer: this is how a client that had to drop its layer
+    /// gets it back.
+    pub fn reannounce(&mut self) {
+        self.last_sent = None;
+    }
+
     /// The interior to ask `conn` for, or `None` when it was already told for
     /// this box.
     ///
