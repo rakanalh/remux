@@ -371,8 +371,16 @@ impl Tab {
 
     /// Focus a pane that was just added to this tab. This releases the zoom,
     /// because a zoom would hide the new arrangement behind one pane.
+    ///
+    /// While the tab's popup is visible the focus stays where it is: hiding
+    /// the popup returns input to `focused_pane`, which is the pane the user
+    /// was on before the popup opened, not one added from elsewhere meanwhile.
     pub fn focus_new_pane(&mut self, pane: PaneId) {
         self.zoomed_pane = None;
+        if self.popup_visible {
+            log::debug!("session: pane {pane} added under a visible popup, focus stays");
+            return;
+        }
         self.focus_pane(pane);
     }
 
@@ -3223,6 +3231,43 @@ mod popup_invariant_tests {
             panes.contains(&popup),
             "a hidden popup on a non-active tab {popup} must be reclaimed, got {panes:?}"
         );
+    }
+
+    #[test]
+    fn a_new_pane_in_a_tab_with_its_popup_up_takes_no_focus() {
+        for visible in [false, true] {
+            let (mut st, _, _) = state_with_popup(2, visible);
+            let new_id = st.next_pane_id();
+            let tab = &mut st.sessions.get_mut("main").unwrap().tabs[0];
+            let before = tab.focused_pane;
+            tab.zoomed_pane = Some(before);
+            tab.pane_order.push(new_id);
+            tab.place_auto(new_id);
+            tab.focus_new_pane(new_id);
+            assert_eq!(tab.zoomed_pane, None, "the zoom is released either way");
+            let want = if visible { before } else { new_id };
+            assert_eq!(tab.focused_pane, want, "popup visible: {visible}");
+        }
+    }
+
+    #[test]
+    fn a_pane_moved_into_a_tab_with_its_popup_up_takes_no_focus() {
+        // The popup is up on tab 1, which is not the active tab, so the move
+        // is allowed.
+        let (mut st, _, _) = state_with_popup_on(2, true, true);
+        let sess = &st.sessions["main"];
+        let (target, before) = (sess.tabs[1].id, sess.tabs[1].focused_pane);
+        let moved = sess.tabs[0].focused_pane;
+        st.move_pane_to_tab(
+            "main",
+            moved,
+            MoveTarget::Tab(target),
+            LayoutMode::default(),
+        )
+        .expect("move");
+        let tab = &st.sessions["main"].tabs[1];
+        assert!(tab.pane_order.contains(&moved));
+        assert_eq!(tab.focused_pane, before);
     }
 
     // -- The converse: normal panes and the popup don't contaminate ---------

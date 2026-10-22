@@ -12498,6 +12498,25 @@ mod popup_tests {
     }
 
     #[tokio::test]
+    async fn pane_new_in_tab_with_its_popup_up_leaves_the_focus_alone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let before = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.command(RemuxCommand::PaneNewInTab {
+            session: "main".to_string(),
+            tab_index: 0,
+        })
+        .await;
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[0];
+        assert_eq!(tab.pane_order.len(), 2, "the pane is created");
+        assert_eq!(tab.focused_pane, before);
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
     async fn the_first_toggle_in_a_tab_opens_in_the_focused_panes_cwd() {
         let a = tempfile::tempdir().expect("dir a");
         let b = tempfile::tempdir().expect("dir b");
