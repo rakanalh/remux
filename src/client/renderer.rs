@@ -287,7 +287,7 @@ impl Renderer {
     /// Whether a write of a `width`-wide cell at screen `(sx, sy)` would touch
     /// the popup box. A wide glyph straddling the box's edge counts as covered:
     /// printing it would overdraw the box, and skipping only its half would
-    /// leave half a glyph.
+    /// leave half a glyph. Its other half is [`Renderer::uncovered_half`].
     fn masked(&self, sx: usize, sy: usize, width: u8) -> bool {
         let Some(popup) = &self.popup else {
             return false;
@@ -296,6 +296,60 @@ impl Renderer {
         let (x0, y0) = (r.x as usize, r.y as usize);
         let (x1, y1) = (x0 + r.width as usize, y0 + r.height as usize);
         sy >= y0 && sy < y1 && sx < x1 && sx + (width.max(1) as usize) > x0
+    }
+
+    /// The column of a wide glyph at `(sx, sy)` that lies outside the box, when
+    /// the box covers only its other column.
+    ///
+    /// The glyph is not printed (see [`Renderer::masked`]), so whatever that
+    /// column showed before would stay on screen. The paint paths print a blank
+    /// there and store a default cell, which is what the screen then shows.
+    fn uncovered_half(&self, sx: usize, sy: usize, width: u8) -> Option<usize> {
+        let r = self.popup.as_ref()?.rect;
+        let (x0, y0) = (r.x as usize, r.y as usize);
+        let (x1, y1) = (x0 + r.width as usize, y0 + r.height as usize);
+        if width != 2 || sy < y0 || sy >= y1 {
+            return None;
+        }
+        if sx + 1 == x0 {
+            Some(sx)
+        } else if sx + 1 == x1 {
+            Some(x1)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the cell at `(sx, sy)` is the continuation of a wide glyph the
+    /// box covers. Its lead's [`Renderer::uncovered_half`] already blanked and
+    /// stored this column, so it must be neither stored nor drawn.
+    fn lead_masked(&self, sx: usize, sy: usize, width: u8) -> bool {
+        width == 0 && sx > 0 && self.masked(sx - 1, sy, 2)
+    }
+
+    /// Blank the uncovered half of a masked wide glyph at `(sx, sy)` on screen
+    /// and in the front buffer, when it has one before `right`. Leaves the
+    /// terminal's SGR state reset, and returns whether it printed.
+    fn blank_uncovered_half<W: Write>(
+        &mut self,
+        out: &mut W,
+        sx: usize,
+        sy: usize,
+        width: u8,
+        right: usize,
+    ) -> Result<bool> {
+        let Some(ux) = self.uncovered_half(sx, sy, width).filter(|&ux| ux < right) else {
+            return Ok(false);
+        };
+        queue!(
+            out,
+            Print("\x1b]8;;\x1b\\"),
+            SetAttribute(Attribute::Reset),
+            MoveTo(ux as u16, sy as u16),
+            Print(' ')
+        )?;
+        self.front[sy][ux] = RenderCell::default();
+        Ok(true)
     }
 
     /// The cell on screen at `(sx, sy)`: the popup's while the box covers it,
@@ -634,6 +688,14 @@ impl Renderer {
 
                 // The popup box covers this cell: neither emit nor store it.
                 if self.masked(sx, sy, cell.width) {
+                    if self.blank_uncovered_half(out, sx, sy, cell.width, content_right)? {
+                        last_fg = CellColor::Default;
+                        last_bg = CellColor::Default;
+                        last_bold = false;
+                        last_italic = false;
+                        last_underline = false;
+                        last_hyperlink = None;
+                    }
                     need_move = true;
                     continue;
                 }
@@ -761,7 +823,16 @@ impl Renderer {
                 if sx >= content_right {
                     break;
                 }
+                if self.lead_masked(sx, sy, cell.width) {
+                    continue;
+                }
                 if self.masked(sx, sy, cell.width) {
+                    if let Some(ux) = self
+                        .uncovered_half(sx, sy, cell.width)
+                        .filter(|&ux| ux < content_right)
+                    {
+                        self.front[sy][ux] = RenderCell::default();
+                    }
                     continue;
                 }
                 self.front[sy][sx] = cell.clone();
@@ -810,19 +881,40 @@ impl Renderer {
         cursor_visible: bool,
         cursor_style: u8,
     ) -> Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_diff_into(
+            &mut stdout,
+            changes,
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+        )
+    }
+
+    /// The body of [`Renderer::render_diff`], parameterised over the sink for
+    /// the same reason as [`Renderer::paint_panel_into`].
+    fn render_diff_into<W: Write>(
+        &mut self,
+        out: &mut W,
+        changes: &[CellChange],
+        cursor_x: u16,
+        cursor_y: u16,
+        cursor_visible: bool,
+        cursor_style: u8,
+    ) -> Result<()> {
         log::debug!(
             "renderer: render_diff changes={} cursor=({},{})",
             changes.len(),
             cursor_x,
             cursor_y
         );
-        let mut stdout = io::stdout().lock();
 
         // Bracket the whole frame in synchronized output (DEC 2026) so the
         // outer terminal displays it atomically instead of tearing.
-        queue!(stdout, Print("\x1b[?2026h"))?;
+        queue!(out, Print("\x1b[?2026h"))?;
 
-        queue!(stdout, cursor::Hide)?;
+        queue!(out, cursor::Hide)?;
 
         // Same bound as render_full's paint loop and blit: a diff built for a
         // previous, larger geometry must be clipped to the content rect rather
@@ -845,7 +937,11 @@ impl Renderer {
                 continue;
             }
             // The popup box covers this cell: neither emit nor store it.
+            if self.lead_masked(sx, sy, change.cell.width) {
+                continue;
+            }
             if self.masked(sx, sy, change.cell.width) {
+                self.blank_uncovered_half(out, sx, sy, change.cell.width, content_right)?;
                 continue;
             }
 
@@ -855,7 +951,7 @@ impl Renderer {
             // correct width and don't re-print stale content.
             if change.cell.width != 0 {
                 queue!(
-                    stdout,
+                    out,
                     MoveTo(sx as u16, sy as u16),
                     SetForegroundColor(cell_color_to_crossterm(&change.cell.fg)),
                     SetBackgroundColor(cell_color_to_crossterm(&change.cell.bg)),
@@ -867,19 +963,19 @@ impl Renderer {
                 // cell following a bold one renders correctly regardless of how the
                 // terminal treats the trailing ResetColor.
                 if change.cell.bold {
-                    queue!(stdout, SetAttribute(Attribute::Bold))?;
+                    queue!(out, SetAttribute(Attribute::Bold))?;
                 } else {
-                    queue!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+                    queue!(out, SetAttribute(Attribute::NormalIntensity))?;
                 }
                 if change.cell.italic {
-                    queue!(stdout, SetAttribute(Attribute::Italic))?;
+                    queue!(out, SetAttribute(Attribute::Italic))?;
                 } else {
-                    queue!(stdout, SetAttribute(Attribute::NoItalic))?;
+                    queue!(out, SetAttribute(Attribute::NoItalic))?;
                 }
                 if change.cell.underline {
-                    queue!(stdout, SetAttribute(Attribute::Underlined))?;
+                    queue!(out, SetAttribute(Attribute::Underlined))?;
                 } else {
-                    queue!(stdout, SetAttribute(Attribute::NoUnderline))?;
+                    queue!(out, SetAttribute(Attribute::NoUnderline))?;
                 }
 
                 // Each change repositions the cursor, so there is no per-row
@@ -887,21 +983,18 @@ impl Renderer {
                 // link before Print and close it after so it can't leak to the
                 // next moved-cursor position.
                 if let Some(uri) = &change.cell.hyperlink {
-                    queue!(
-                        stdout,
-                        Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri)))
-                    )?;
+                    queue!(out, Print(format!("\x1b]8;;{}\x1b\\", printable_text(uri))))?;
                 }
 
-                queue!(stdout, Print(printable(change.cell.c)))?;
+                queue!(out, Print(printable(change.cell.c)))?;
                 // Combining marks compose onto the base glyph just printed.
                 for m in &change.cell.combining {
-                    queue!(stdout, Print(printable(*m)))?;
+                    queue!(out, Print(printable(*m)))?;
                 }
                 if change.cell.hyperlink.is_some() {
-                    queue!(stdout, Print("\x1b]8;;\x1b\\"))?;
+                    queue!(out, Print("\x1b]8;;\x1b\\"))?;
                 }
-                queue!(stdout, ResetColor)?;
+                queue!(out, ResetColor)?;
             }
 
             // Update front buffer (always, even for skipped continuation cells).
@@ -912,16 +1005,10 @@ impl Renderer {
 
         // Update cursor. The reported position is content-relative, so it has
         // to be offset -- otherwise the hardware cursor lands in a left sidebar.
-        self.queue_cursor(
-            &mut stdout,
-            cursor_x,
-            cursor_y,
-            cursor_visible,
-            cursor_style,
-        )?;
+        self.queue_cursor(out, cursor_x, cursor_y, cursor_visible, cursor_style)?;
 
         // End synchronized output.
-        queue!(stdout, Print("\x1b[?2026l"))?;
+        queue!(out, Print("\x1b[?2026l"))?;
 
         Ok(())
     }
@@ -1221,7 +1308,19 @@ impl Renderer {
                     break;
                 }
                 // The popup box covers this cell: neither emit nor store it.
+                if self.lead_masked(sx, sy, cell.width) {
+                    continue;
+                }
                 if self.masked(sx, sy, cell.width) {
+                    let right = (rect.x as usize + rect.width as usize).min(self.cols as usize);
+                    if self.blank_uncovered_half(out, sx, sy, cell.width, right)? {
+                        last_fg = CellColor::Default;
+                        last_bg = CellColor::Default;
+                        last_bold = false;
+                        last_italic = false;
+                        last_underline = false;
+                        last_hyperlink = None;
+                    }
                     need_move = true;
                     continue;
                 }
@@ -3009,40 +3108,93 @@ mod origin_tests {
         assert!(emitted.contains("\x1b[2;7H6789"), "{emitted:?}");
     }
 
-    #[test]
-    fn a_wide_glyph_straddling_the_edge_counts_as_covered() {
-        let mut r = with_box();
-        let wide = RenderCell {
-            c: '\u{4e2d}',
+    fn wide(c: char) -> RenderCell {
+        RenderCell {
+            c,
             width: 2,
             ..RenderCell::default()
-        };
-        let cont = RenderCell {
+        }
+    }
+
+    fn continuation() -> RenderCell {
+        RenderCell {
             c: ' ',
             width: 0,
             ..RenderCell::default()
-        };
-        // The lead is just left of the box (x = 1), its continuation inside it.
-        r.render_diff(
-            &[
-                CellChange {
-                    x: 1,
-                    y: 1,
-                    cell: wide,
-                },
-                CellChange {
-                    x: 2,
-                    y: 1,
-                    cell: cont,
-                },
-            ],
-            0,
-            0,
-            false,
-            0,
-        )
-        .unwrap();
-        assert_eq!(front_row(&r, 1), "AAAAAAAAAA");
+        }
+    }
+
+    /// A wide glyph whose lead is at `x` on row 1, as a diff.
+    fn wide_at(x: u16) -> [CellChange; 2] {
+        [
+            CellChange {
+                x,
+                y: 1,
+                cell: wide('\u{4e2d}'),
+            },
+            CellChange {
+                x: x + 1,
+                y: 1,
+                cell: continuation(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_wide_glyph_straddling_the_edge_is_not_drawn_and_its_outer_half_is_blanked() {
+        // The box covers columns 2..6. A lead at 1 has its continuation under
+        // the box's left edge; a lead at 5 has its continuation just past the
+        // right edge.
+        for (x, front, screen) in [
+            (1, "A AAAAAAAA", "A PPPPAAAA"),
+            (5, "AAAAAA AAA", "AAPPPP AAA"),
+        ] {
+            let (mut r, mut term) = with_box_on_screen();
+            let mut out: Vec<u8> = Vec::new();
+            r.render_diff_into(&mut out, &wide_at(x), 0, 0, false, 0)
+                .unwrap();
+            term.feed(&out);
+            assert_eq!(front_row(&r, 1), front, "lead at {x}: front buffer");
+            assert_eq!(term.row(1), screen, "lead at {x}: screen");
+        }
+    }
+
+    #[test]
+    fn a_full_render_blanks_the_outer_half_of_a_straddling_wide_glyph() {
+        for (x, front, screen) in [
+            (1, "B AAAABBBB", "B PPPPBBBB"),
+            (5, "BBAAAA BBB", "BBPPPP BBB"),
+        ] {
+            let (mut r, mut term) = with_box_on_screen();
+            let mut frame = grid("BBBBBBBBBB", 4);
+            frame[1][x] = wide('\u{4e2d}');
+            frame[1][x + 1] = continuation();
+            let mut out: Vec<u8> = Vec::new();
+            r.render_full_into(&mut out, &frame, 0, 0, false, 0)
+                .unwrap();
+            term.feed(&out);
+            assert_eq!(front_row(&r, 1), front, "lead at {x}: front buffer");
+            assert_eq!(term.row(1), screen, "lead at {x}: screen");
+        }
+    }
+
+    #[test]
+    fn a_panel_paint_blanks_the_outer_half_of_a_straddling_wide_glyph() {
+        for (x, front, screen) in [
+            (1, "0 AAAA6789", "0 PPPP6789"),
+            (5, "01AAAA 789", "01PPPP 789"),
+        ] {
+            let (mut r, mut term) = with_box_on_screen();
+            let mut row = grid("0123456789", 1).remove(0);
+            row[x] = wide('\u{4e2d}');
+            row[x + 1] = continuation();
+            let mut out: Vec<u8> = Vec::new();
+            r.paint_panel_into(&mut out, rect(0, 1, 10, 1), &[row])
+                .unwrap();
+            term.feed(&out);
+            assert_eq!(front_row(&r, 1), front, "lead at {x}: front buffer");
+            assert_eq!(term.row(1), screen, "lead at {x}: screen");
+        }
     }
 
     #[test]
