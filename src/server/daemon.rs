@@ -12268,38 +12268,58 @@ mod popup_tests {
         std::fs::canonicalize(p).expect("canonicalize")
     }
 
+    /// The cwd of `pane`'s shell, once it reads as `dir`, or what it last read
+    /// after a few seconds. A pane's shell changes directory after the fork,
+    /// so a read straight after `spawn_pane` can still see the daemon's own.
+    async fn cwd_once_in(
+        rig: &Rig,
+        pane: PaneId,
+        dir: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let want = canonical(dir);
+        let mut last = None;
+        for _ in 0..100 {
+            last = {
+                let ps = rig.panes.lock().await;
+                persistence::get_pane_cwd(ps[&pane].pty.child_pid)
+            }
+            .map(|c| canonical(std::path::Path::new(&c)));
+            if last.as_ref() == Some(&want) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        last
+    }
+
     #[tokio::test]
     async fn toggling_on_two_tabs_spawns_two_popups_in_each_tabs_focused_cwd() {
         let a = tempfile::tempdir().expect("dir a");
         let b = tempfile::tempdir().expect("dir b");
         let rig = Rig::new(100, 30, None, a.path()).await;
 
+        let pane_a = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        assert_eq!(
+            cwd_once_in(&rig, pane_a, a.path()).await,
+            Some(canonical(a.path()))
+        );
         rig.command(RemuxCommand::PopupToggle(None)).await;
         let first = rig.popup_of(0).await.expect("tab 0 popup");
-        rig.new_tab(b.path()).await;
+        let pane_b = rig.new_tab(b.path()).await;
+        assert_eq!(
+            cwd_once_in(&rig, pane_b, b.path()).await,
+            Some(canonical(b.path()))
+        );
         rig.command(RemuxCommand::PopupToggle(None)).await;
         let second = rig.popup_of(1).await.expect("tab 1 popup");
         assert_ne!(first, second);
 
-        let cwd_of = |pane: PaneId| {
-            let panes = rig.panes.clone();
-            async move {
-                let ps = panes.lock().await;
-                persistence::get_pane_cwd(ps[&pane].pty.child_pid)
-            }
-        };
         assert_eq!(
-            cwd_of(first)
-                .await
-                .map(std::path::PathBuf::from)
-                .map(|p| canonical(&p)),
+            cwd_once_in(&rig, first, a.path()).await,
             Some(canonical(a.path()))
         );
         assert_eq!(
-            cwd_of(second)
-                .await
-                .map(std::path::PathBuf::from)
-                .map(|p| canonical(&p)),
+            cwd_once_in(&rig, second, b.path()).await,
             Some(canonical(b.path()))
         );
 
@@ -12416,6 +12436,7 @@ mod popup_tests {
         let first = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
         let second = rig.split(b.path()).await;
         for (focus, dir) in [(second, b.path()), (first, a.path())] {
+            assert_eq!(cwd_once_in(&rig, focus, dir).await, Some(canonical(dir)));
             rig.state
                 .lock()
                 .await
@@ -12426,12 +12447,8 @@ mod popup_tests {
                 .focus_pane(focus);
             rig.command(RemuxCommand::PopupToggle(None)).await;
             let popup = rig.popup_of(0).await.expect("popup");
-            let cwd = {
-                let ps = rig.panes.lock().await;
-                persistence::get_pane_cwd(ps[&popup].pty.child_pid)
-            };
             assert_eq!(
-                cwd.map(std::path::PathBuf::from).map(|p| canonical(&p)),
+                cwd_once_in(&rig, popup, dir).await,
                 Some(canonical(dir)),
                 "focused pane {focus}"
             );
