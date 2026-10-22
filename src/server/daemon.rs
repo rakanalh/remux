@@ -2824,6 +2824,32 @@ async fn client_input_target(
     Some((session_name, pane_id))
 }
 
+/// The largest terminal a client may report, in columns and rows.
+///
+/// A size is only a claim the client makes, and every frame the server builds
+/// for a session allocates its cells at the smallest size reported. These caps
+/// sit far past any real terminal, so they only bound what a broken or hostile
+/// client can make the server allocate.
+const MAX_TERMINAL_COLS: u16 = 2048;
+const MAX_TERMINAL_ROWS: u16 = 1024;
+
+/// `(cols, rows)` from a client's `what` message, clamped to `1..=` the
+/// terminal maximum on each axis.
+fn clamp_client_size(what: &str, cols: u16, rows: u16) -> (u16, u16) {
+    let clamped = (
+        cols.clamp(1, MAX_TERMINAL_COLS),
+        rows.clamp(1, MAX_TERMINAL_ROWS),
+    );
+    if clamped != (cols, rows) {
+        log::warn!(
+            "server: {what} {cols}x{rows} is out of range, clamped to {}x{}",
+            clamped.0,
+            clamped.1
+        );
+    }
+    clamped
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_resize(
     client_id: u64,
@@ -2835,6 +2861,7 @@ async fn handle_resize(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    let (cols, rows) = clamp_client_size("Resize", cols, rows);
     let session_name = {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
@@ -8515,6 +8542,7 @@ async fn handle_popup_size(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    let (cols, rows) = clamp_client_size("PopupSize", cols, rows);
     let session_name = {
         let cls = clients.lock().await;
         match cls.get(&client_id) {
@@ -8529,7 +8557,7 @@ async fn handle_popup_size(
     {
         let mut cls = clients.lock().await;
         if let Some(c) = cls.get_mut(&client_id) {
-            c.popup_want = Some((cols.max(1), rows.max(1)));
+            c.popup_want = Some((cols, rows));
         }
     }
     log::debug!("server: PopupSize client_id={client_id} want={cols}x{rows}");
@@ -12466,6 +12494,41 @@ mod popup_tests {
             .popup_want = Some((60, 12));
         assert!(resize(&rig).await);
         assert_eq!(rig.screen_size(popup).await, (60, 12));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn client_sizes_are_clamped_to_the_terminal_maximum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        handle_resize(
+            CLIENT,
+            u16::MAX,
+            0,
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("resize");
+        handle_popup_size(
+            CLIENT,
+            (0, u16::MAX),
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("popup size");
+        let cls = rig.clients.lock().await;
+        let client = &cls[&CLIENT];
+        assert_eq!((client.cols, client.rows), (MAX_TERMINAL_COLS, 1));
+        assert_eq!(client.popup_want, Some((1, MAX_TERMINAL_ROWS)));
+        drop(cls);
         rig.finish().await;
     }
 
