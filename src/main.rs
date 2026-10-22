@@ -1751,16 +1751,33 @@ async fn send_popup_size(
     renderer: &Renderer,
     attached: &Option<(ConnId, String)>,
 ) -> Result<()> {
-    let placed = popup_box_now(popup, chrome, renderer, attached);
-    if let Some((cols, rows)) = popup.announce(mgr.foreground(), &placed) {
-        log::debug!(
-            "popup: PopupSize {cols}x{rows} for the box at {:?}",
-            placed.rect
-        );
+    let conn = mgr.foreground().clone();
+    if let Some((cols, rows)) = popup_size_to_send(popup, chrome, renderer, attached, &conn) {
         mgr.send_foreground(ClientMessage::PopupSize { cols, rows })
             .await?;
     }
     Ok(())
+}
+
+/// The body of [`send_popup_size`] without the send: the interior to announce
+/// to `conn`, if any.
+fn popup_size_to_send(
+    popup: &mut PopupState,
+    chrome: &crate::client::chrome::Chrome,
+    renderer: &Renderer,
+    attached: &Option<(ConnId, String)>,
+    conn: &ConnId,
+) -> Option<(u16, u16)> {
+    let placed = popup_box_now(popup, chrome, renderer, attached);
+    let active = renderer.popup_box().is_some() || popup.is_opening();
+    let size = popup.announce(conn, &placed, active);
+    if let Some((cols, rows)) = size {
+        log::debug!(
+            "popup: PopupSize {cols}x{rows} for the box at {:?}",
+            placed.rect
+        );
+    }
+    size
 }
 
 /// Ready a `PopupToggle` for the foreground server, which learns no position.
@@ -9160,6 +9177,55 @@ mod tests {
         }
 
         #[test]
+        fn a_tab_switch_away_from_a_named_popup_and_back_announces_nothing() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let conn = ConnId::Local;
+            // The first box the server hears of, at attach.
+            assert!(popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn).is_some());
+            // Tab 1: open on the right. The open announces the drawer.
+            popup.toggle(&popup_key(&attached), Some(PopupPosition::Right), false);
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                Some((99, 45))
+            );
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                None
+            );
+            // Tab 2 has no popup: its frames carry no layer.
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                None,
+                "no float is announced for a tab with no popup"
+            );
+            // Back on tab 1: the drawer, at the size it already has.
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
+                None
+            );
+        }
+
+        #[test]
         fn no_layer_drops_the_box() {
             let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
@@ -9186,8 +9252,8 @@ mod tests {
             let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
             let placed = popup_box_now(&popup, &chrome, &renderer, &attached);
-            assert!(popup.announce(&ConnId::Local, &placed).is_some());
-            assert!(popup.announce(&ConnId::Local, &placed).is_none());
+            assert!(popup.announce(&ConnId::Local, &placed, true).is_some());
+            assert!(popup.announce(&ConnId::Local, &placed, true).is_none());
             let mut diff = layer(4, 2, 'x');
             diff.cells = None;
             assert!(sync_popup(
@@ -9203,7 +9269,7 @@ mod tests {
             assert_eq!(renderer.popup_rect(), None);
             // The next pass re-announces the box, and the server answers that
             // with a full frame that carries the whole layer.
-            assert!(popup.announce(&ConnId::Local, &placed).is_some());
+            assert!(popup.announce(&ConnId::Local, &placed, true).is_some());
         }
 
         #[test]

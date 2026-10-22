@@ -511,6 +511,32 @@ def toggle_position_case():
     return fails
 
 
+def tab_switch_no_resize_case():
+    print("\n== a tab switch does not resize a popup opened at a named position ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_noresize", POPUP_KEYS + cfg())
+
+    def popup_resizes():
+        return tui.log("server").count("resize_session_popups: popup pane_id=")
+
+    try:
+        tui.send(ALT_BACKSLASH)
+        tui.pump(1.8)
+        check(right_open(list(tui.rows_text())), "tab 1's popup opens on the right")
+        before = popup_resizes()
+        tui.prefix(b"tn", 1.8)
+        tui.prefix(b"t1", 1.8)
+        check(right_open(list(tui.rows_text())), "back on tab 1 it is still on the right")
+        after = popup_resizes()
+        check(after == before,
+              f"no popup PTY resize across the switch ({before} -> {after})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
 def output_at(tui, needle):
     """`(x, y)` of `needle` on screen. Markers are printed as `FOC$((40+n))`,
     so the output text never appears in the typed command."""
@@ -606,7 +632,8 @@ def main():
     all_fails = []
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
                  live_reload_case, runtime_resize_case, per_tab_case,
-                 in_tab_cwd_case, toggle_position_case, focus_return_case):
+                 in_tab_cwd_case, toggle_position_case, focus_return_case,
+                 tab_switch_no_resize_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:

@@ -469,18 +469,36 @@ impl PopupState {
         self.last_sent = None;
     }
 
+    /// Whether a toggle this client sent to open a popup is still waiting for
+    /// that popup's first layer.
+    pub fn is_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
     /// The interior to ask `conn` for, or `None` when it was already told for
-    /// this box.
+    /// this box, or when nothing needs a new one.
     ///
     /// The comparison is on the whole box, not only its interior: a box that
     /// moved while keeping its size still has to be announced, because the
     /// answer to a [`crate::protocol::ClientMessage::PopupSize`] is the full
     /// frame that repaints what the old box masked away.
-    pub fn announce(&mut self, conn: &ConnId, popup: &PopupBox) -> Option<(u16, u16)> {
+    ///
+    /// `active` says a popup is on screen or opening. Without one, a connection
+    /// already told a box is told nothing new. The popups of a session share
+    /// one terminal size, so announcing the configured box for a tab with no
+    /// popup would resize every other tab's popup, and resize it back when the
+    /// user returns. A connection told nothing yet is still told, because until
+    /// then the server draws the popup for this client itself.
+    pub fn announce(
+        &mut self,
+        conn: &ConnId,
+        popup: &PopupBox,
+        active: bool,
+    ) -> Option<(u16, u16)> {
         if self
             .last_sent
             .as_ref()
-            .is_some_and(|(c, b)| c == conn && b == popup)
+            .is_some_and(|(c, b)| c == conn && (b == popup || !active))
         {
             return None;
         }
@@ -733,12 +751,32 @@ mod tests {
     fn an_identical_box_is_not_announced_twice_to_one_connection() {
         let mut s = PopupState::from_config(&Config::default());
         let b = boxed(PopupPosition::Float, left_sidebar());
-        assert_eq!(s.announce(&ConnId::Local, &b), Some((126, 35)));
-        assert_eq!(s.announce(&ConnId::Local, &b), None);
+        assert_eq!(s.announce(&ConnId::Local, &b, true), Some((126, 35)));
+        assert_eq!(s.announce(&ConnId::Local, &b, true), None);
         // Another server has not been told.
         let far = ConnId::Remote("far".to_string());
-        assert_eq!(s.announce(&far, &b), Some((126, 35)));
-        assert_eq!(s.announce(&ConnId::Local, &b), Some((126, 35)));
+        assert_eq!(s.announce(&far, &b, true), Some((126, 35)));
+        assert_eq!(s.announce(&ConnId::Local, &b, true), Some((126, 35)));
+    }
+
+    #[test]
+    fn no_box_is_announced_while_no_popup_is_up_or_opening() {
+        let mut s = PopupState::from_config(&Config::default());
+        let right = boxed(PopupPosition::Right, left_sidebar());
+        let float = boxed(PopupPosition::Float, left_sidebar());
+        // The first box a connection hears of is always announced: until it
+        // has one, the server treats this client as one that cannot place
+        // the popup, and draws a float itself.
+        assert!(s.announce(&ConnId::Local, &right, false).is_some());
+        // Then, with no popup on screen and none opening, another box (a tab
+        // without a popup falls back to the config's) is not: it would resize
+        // the popups of every other tab in the session.
+        assert_eq!(s.announce(&ConnId::Local, &float, false), None);
+        // A popup up or opening is announced as before.
+        assert!(s.announce(&ConnId::Local, &float, true).is_some());
+        // Another server has not been told anything yet.
+        let far = ConnId::Remote("far".to_string());
+        assert!(s.announce(&far, &right, false).is_some());
     }
 
     #[test]
@@ -753,8 +791,8 @@ mod tests {
             (left.interior.width, left.interior.height),
             (right.interior.width, right.interior.height)
         );
-        assert!(s.announce(&ConnId::Local, &left).is_some());
-        assert!(s.announce(&ConnId::Local, &right).is_some());
+        assert!(s.announce(&ConnId::Local, &left, true).is_some());
+        assert!(s.announce(&ConnId::Local, &right, true).is_some());
     }
 
     fn frame_of(s: &PopupState, session: &str) -> PopupFrame {
