@@ -201,14 +201,8 @@ impl PopupPosition {
     /// The position a `popup_position` value or a `PopupToggle` argument
     /// names, in the config's own spelling.
     pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "float" => Some(PopupPosition::Float),
-            "left" => Some(PopupPosition::Left),
-            "right" => Some(PopupPosition::Right),
-            "top" => Some(PopupPosition::Top),
-            "bottom" => Some(PopupPosition::Bottom),
-            _ => None,
-        }
+        use serde::de::value::{Error, StrDeserializer};
+        Self::deserialize(StrDeserializer::<Error>::new(name)).ok()
     }
 }
 
@@ -738,6 +732,22 @@ mod tests {
                 toml::from_str(&format!("[appearance]\npopup_position = \"{value}\"\n")).unwrap();
             assert_eq!(config.appearance.popup_position, want, "{value}");
         }
+    }
+
+    #[test]
+    fn popup_position_parse_agrees_with_the_config_spelling() {
+        use PopupPosition::*;
+        for position in [Float, Left, Right, Top, Bottom] {
+            let json = serde_json::to_string(&position).unwrap();
+            let name = json.trim_matches('"');
+            assert_eq!(PopupPosition::parse(name), Some(position), "{name}");
+        }
+        assert_eq!(PopupPosition::parse("sideways"), None);
+        assert_eq!(
+            PopupPosition::parse("Float"),
+            None,
+            "the spelling is snake_case"
+        );
     }
 
     #[test]
