@@ -1413,26 +1413,79 @@ fn blit_screen(buffer: &mut [Vec<RenderCell>], screen: &Screen, rect: Rect, scro
 // Popup terminal overlay
 // ---------------------------------------------------------------------------
 
-/// Draw the session's popup terminal on top of an already-composited buffer,
+/// A popup terminal's contents and cursor, interior-local: cell `(0, 0)` is the
+/// top-left of the popup's terminal, with no frame around it.
+///
+/// A client that places the popup itself receives this as the wire
+/// [`crate::protocol::PopupCells`]. For a client that does not, the server
+/// frames it with [`draw_popup`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PopupLayer {
+    pub pane_id: PaneId,
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<Vec<RenderCell>>,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_visible: bool,
+    pub cursor_style: u8,
+}
+
+/// Render a popup pane's screen into a [`PopupLayer`] the size of the screen.
+///
+/// A drag-selection over the popup highlights here, at zero inset: the
+/// selection is stored in the popup pane's content coordinates, and the layer
+/// has no frame to offset them by.
+pub fn render_popup_layer(
+    pane_id: PaneId,
+    screen: &Screen,
+    scroll_offset: usize,
+    selection: Option<&MouseSelection>,
+) -> PopupLayer {
+    let (cols, rows) = (screen.cols, screen.rows);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows,
+    };
+    let mut cells = vec![vec![RenderCell::default(); cols as usize]; rows as usize];
+    blit_screen(&mut cells, screen, rect, scroll_offset);
+    if let Some(sel) = selection {
+        if sel.pane_id == pane_id {
+            apply_selection_highlight(&mut cells, sel, &rect, &BorderStyle::TmuxStyle);
+        }
+    }
+    PopupLayer {
+        pane_id,
+        cols,
+        rows,
+        cells,
+        cursor_x: screen.cursor_x.min(cols.saturating_sub(1)),
+        cursor_y: screen.cursor_y.min(rows.saturating_sub(1)),
+        cursor_visible: screen.cursor_visible,
+        cursor_style: screen.cursor_style,
+    }
+}
+
+/// Draw a popup layer, framed, on top of an already-composited buffer,
 /// returning the popup's interior (content) rect.
 ///
-/// Deliberately a **post-pass over the finished frame** rather than a layout
-/// participant: the popup floats above whatever the normal pass produced -- a
-/// plain layout, or a zoomed pane's single-pane substitution -- without changing
-/// any pane's rect. It steals no space; it only paints over.
+/// Used for a client that does not place the popup itself. It is a **post-pass
+/// over the finished frame** rather than a layout participant: the popup floats
+/// above whatever the normal pass produced without changing any pane's rect.
+/// It steals no space; it only paints over.
 ///
 /// The whole rect is cleared first so nothing from the layout underneath bleeds
-/// through when the popup's PTY is momentarily smaller than its interior.
-#[allow(clippy::too_many_arguments)]
+/// through when the layer is smaller than the interior. The layer is anchored at
+/// the interior's top-left, so a prompt does not move when the layer's size
+/// changes.
 pub fn draw_popup(
     buffer: &mut [Vec<RenderCell>],
     rect: Rect,
-    pane_id: PaneId,
-    screen: &Screen,
+    layer: &PopupLayer,
     title: &str,
     mode: &str,
-    scroll_offset: usize,
-    selection: Option<&MouseSelection>,
     theme: &CompositorTheme,
 ) -> Rect {
     if rect.width == 0 || rect.height == 0 {
@@ -1455,31 +1508,48 @@ pub fn draw_popup(
     // Too small for a frame: paint content edge-to-edge (mirrors
     // `draw_zellij_panes`' small-rect fallback, via the SAME threshold).
     if !fits_zellij_border(rect.width, rect.height) {
-        blit_screen(buffer, screen, rect, scroll_offset);
+        copy_layer(buffer, layer, rect);
         return rect;
     }
 
     // The interior comes from the one definition of a style's content rect,
     // not from a local `+1 / -2`.
     let interior = pane_content_rect(&BorderStyle::ZellijStyle, rect, false);
-    blit_screen(buffer, screen, interior, scroll_offset);
+    copy_layer(buffer, layer, interior);
 
     // The frame is a zellij pane's frame -- the same box, the same title
     // treatment -- because a popup floats OVER those panes and any difference
     // reads as a bug. `draw_zellij_border` is box + title overlay, which is
     // exactly what this used to spell out for itself.
-    let stack_info = Some((vec![title.to_string()], vec![pane_id], 0usize));
-    draw_zellij_border(buffer, rect, &border_fg, &stack_info, pane_id, mode, theme);
-
-    // A drag-selection inside the popup highlights against the popup's own rect
-    // (the layout pass can't: the popup pane is in no layout tree).
-    if let Some(sel) = selection {
-        if sel.pane_id == pane_id {
-            apply_selection_highlight(buffer, sel, &rect, &BorderStyle::ZellijStyle);
-        }
-    }
+    let stack_info = Some((vec![title.to_string()], vec![layer.pane_id], 0usize));
+    draw_zellij_border(
+        buffer,
+        rect,
+        &border_fg,
+        &stack_info,
+        layer.pane_id,
+        mode,
+        theme,
+    );
 
     interior
+}
+
+/// Copy `layer` into `buffer` with its top-left at `interior`'s, clipped to the
+/// interior and to the buffer.
+fn copy_layer(buffer: &mut [Vec<RenderCell>], layer: &PopupLayer, interior: Rect) {
+    let rows = layer.rows.min(interior.height) as usize;
+    let cols = layer.cols.min(interior.width) as usize;
+    for (row, line) in layer.cells.iter().take(rows).enumerate() {
+        for (col, cell) in line.iter().take(cols).enumerate() {
+            set_cell(
+                buffer,
+                interior.y as usize + row,
+                interior.x as usize + col,
+                cell.clone(),
+            );
+        }
+    }
 }
 
 /// A single pane's rendered screen plus the cursor/DECCKM state a View cell
@@ -2251,6 +2321,7 @@ mod tests {
     fn a_popups_frame_is_a_zellij_panes_frame() {
         let theme = CompositorTheme::default();
         let screen = Screen::new(10, 4, 100);
+        let layer = render_popup_layer(7, &screen, 0, None);
         let rect = Rect {
             x: 1,
             y: 1,
@@ -2258,9 +2329,7 @@ mod tests {
             height: 6,
         };
         let mut popup = vec![vec![RenderCell::default(); 16]; 10];
-        draw_popup(
-            &mut popup, rect, 7, &screen, "term", "NORMAL", 0, None, &theme,
-        );
+        draw_popup(&mut popup, rect, &layer, "term", "NORMAL", &theme);
 
         let mut pane = vec![vec![RenderCell::default(); 16]; 10];
         let stack = Some((vec!["term".to_string()], vec![7], 0usize));
@@ -2295,6 +2364,7 @@ mod tests {
     fn a_popups_interior_is_the_shared_content_rect() {
         let theme = CompositorTheme::default();
         let screen = Screen::new(10, 4, 100);
+        let layer = render_popup_layer(7, &screen, 0, None);
         let rect = Rect {
             x: 1,
             y: 1,
@@ -2302,9 +2372,7 @@ mod tests {
             height: 6,
         };
         let mut buf = vec![vec![RenderCell::default(); 16]; 10];
-        let interior = draw_popup(
-            &mut buf, rect, 7, &screen, "term", "NORMAL", 0, None, &theme,
-        );
+        let interior = draw_popup(&mut buf, rect, &layer, "term", "NORMAL", &theme);
         // LITERAL numbers, not `pane_content_rect(...)`. Comparing against the
         // very function `draw_popup` calls is a tautology: re-inline the old
         // `+1 / -2` and it would still pass. These numbers fail against a
