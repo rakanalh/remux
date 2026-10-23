@@ -6341,6 +6341,11 @@ async fn handle_mouse_click(
             !renders_below,
         )
         .await?;
+    // The broadcast above skips a client scrolled back in the pane the popup
+    // covered, so a press with no arm of its own repaints that requester here.
+    if dismissed && !renders_below {
+        repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
+    }
     let popup_pane = if dismissed { None } else { popup.pane };
 
     // A pane whose application asked for mouse events gets the press/release
@@ -12720,24 +12725,6 @@ mod popup_tests {
         rig.finish().await;
     }
 
-    #[tokio::test]
-    async fn a_press_off_every_region_only_hides_the_popup() {
-        for want in [Some((50, 10)), None] {
-            let dir = tempfile::tempdir().expect("dir");
-            let rig = Rig::new(100, 30, want, dir.path()).await;
-            let (_left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
-
-            press(&rig, u16::MAX, u16::MAX, false).await;
-            assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
-
-            // With the popup already hidden, the same press changes nothing:
-            // it must never open it.
-            press(&rig, u16::MAX, u16::MAX, false).await;
-            assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
-            rig.finish().await;
-        }
-    }
-
     fn renders(msgs: &[ServerMessage]) -> usize {
         msgs.iter()
             .filter(|m| {
@@ -12747,6 +12734,59 @@ mod popup_tests {
                 )
             })
             .count()
+    }
+
+    #[tokio::test]
+    async fn a_press_off_every_region_only_hides_the_popup() {
+        for want in [Some((50, 10)), None] {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut rig = Rig::new(100, 30, want, dir.path()).await;
+            let (_left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
+
+            rig.drain();
+            press(&rig, u16::MAX, u16::MAX, false).await;
+            assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
+            assert_eq!(renders(&rig.drain()), 1, "the frame without the popup");
+
+            // With the popup already hidden, the same press changes nothing:
+            // it must never open it, and there is nothing to render.
+            press(&rig, u16::MAX, u16::MAX, false).await;
+            assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
+            assert_eq!(renders(&rig.drain()), 0, "{want:?}");
+            rig.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_press_off_every_region_repaints_a_client_scrolled_under_the_popup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let (_left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
+        {
+            let mut ps = rig.panes.lock().await;
+            let lines: String = (0..80).map(|i| format!("line {i}\r\n")).collect();
+            ps.get_mut(&middle)
+                .unwrap()
+                .screen
+                .process_output(lines.as_bytes());
+        }
+        rig.clients
+            .lock()
+            .await
+            .get_mut(&CLIENT)
+            .unwrap()
+            .set_scroll(middle, 3);
+        rig.drain();
+
+        press(&rig, u16::MAX, u16::MAX, false).await;
+
+        assert!(!focus_and_popup(&rig).await.1);
+        assert_eq!(
+            renders(&rig.drain()),
+            1,
+            "the scrolled requester is sent the frame without the popup"
+        );
+        rig.finish().await;
     }
 
     #[tokio::test]
