@@ -997,9 +997,32 @@ mod tests {
             Pty::spawn(80, 24, Some("/bin/sh"), &[], None, None).expect("failed to spawn PTY");
         pty.write_input(b"exit\n").expect("write_input failed");
 
-        // Wait for the child to exit.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let status = pty.try_wait().expect("try_wait failed");
+        // Keep draining the master while waiting. On macOS a session leader
+        // cannot finish exiting while its output (the echo and "logout") sits
+        // unread in the master, so a test that only polls `try_wait` never sees
+        // the exit. The server's reader drains the master in the same way.
+        let master = pty.master_fd.as_raw_fd();
+        let flags = fcntl(master, FcntlArg::F_GETFL).expect("F_GETFL failed");
+        fcntl(
+            master,
+            FcntlArg::F_SETFL(
+                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+            ),
+        )
+        .expect("F_SETFL failed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        let status = loop {
+            let _ = nix::unistd::read(master, &mut buf);
+            if let Some(status) = pty.try_wait().expect("try_wait failed") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(status.is_some(), "child should have exited");
     }
 
