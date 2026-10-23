@@ -1658,6 +1658,24 @@ fn popup_key(attached: &Option<(ConnId, String)>) -> String {
     }
 }
 
+/// The session a server frame belongs to, as `(server, session)`.
+///
+/// Usually the attached one, but not always: the attachment changes when the
+/// `Attach` is sent, so a frame the server sent for the session being left can
+/// still arrive after it. Its popup bookkeeping (which popups are alive, which
+/// one is on screen) is that session's, and filing it under the new one would
+/// drop the new session's records. A frame with no status bar description, from
+/// a server too old to send one, is taken as the attached session's.
+fn frame_attached(
+    current: &Option<(ConnId, String)>,
+    status: Option<&crate::server::compositor::StatusInfo>,
+) -> Option<(ConnId, String)> {
+    match (current, status) {
+        (Some((conn, _)), Some(status)) => Some((conn.clone(), status.session_name.clone())),
+        _ => current.clone(),
+    }
+}
+
 /// The popup box for the foreground session, in the terminal as the renderer
 /// sees it. The size is the renderer's, not a fresh `terminal::size()`, for the
 /// reason `Renderer::size` gives.
@@ -6997,9 +7015,10 @@ async fn run_client_loop(
                         // The popup layer first, so the frame below skips the
                         // cells the box covers. A View owns the screen, so it
                         // shows no box.
-                        popup.prune(&popup_key(&current_attached), &live_popups);
+                        let frame_session = frame_attached(&current_attached, status.as_ref());
+                        popup.prune(&popup_key(&frame_session), &live_popups);
                         let popup_frame = if active_view.is_none() {
-                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
+                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &frame_session, &compositor_theme)?
                         } else {
                             renderer.clear_popup();
                             None
@@ -7053,9 +7072,10 @@ async fn run_client_loop(
                     Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups }) => {
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         // See the FullRender arm: the popup layer goes first.
-                        popup.prune(&popup_key(&current_attached), &live_popups);
+                        let frame_session = frame_attached(&current_attached, status.as_ref());
+                        popup.prune(&popup_key(&frame_session), &live_popups);
                         let popup_frame = if active_view.is_none() {
-                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &current_attached, &compositor_theme)?
+                            sync_popup(popup_layer, &mut popup, &chrome, &mut renderer, &frame_session, &compositor_theme)?
                         } else {
                             renderer.clear_popup();
                             None
@@ -9301,6 +9321,69 @@ mod tests {
                 crate::client::popup::PopupFrame::OpenRight,
                 "still the drawer it was last placed as"
             );
+        }
+
+        fn status_of(session: &str) -> crate::server::compositor::StatusInfo {
+            crate::server::compositor::StatusInfo {
+                mode: "NORMAL".to_string(),
+                session_name: session.to_string(),
+                tabs: Vec::new(),
+                layout_mode: "bsp".to_string(),
+                search_info: None,
+            }
+        }
+
+        #[test]
+        fn a_stale_frame_from_the_session_left_leaves_the_new_sessions_records() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let main = Some((ConnId::Local, "main".to_string()));
+            let other = Some((ConnId::Local, "other".to_string()));
+            // "other" left a popup open on the right; then "main" opened one at
+            // the bottom.
+            popup.toggle(&popup_key(&other), Some(PopupPosition::Right), false);
+            popup.bind_layer(&popup_key(&other), Some(9));
+            popup.toggle(&popup_key(&main), Some(PopupPosition::Bottom), false);
+            popup.bind_layer(&popup_key(&main), Some(7));
+            // The user attaches to "other". A frame "main" queued before the
+            // switch arrives after it.
+            let current = other.clone();
+            let status = status_of("main");
+            let attached = frame_attached(&current, Some(&status));
+            assert_eq!(attached, main, "the frame is main's");
+            popup.prune(&popup_key(&attached), &[7]);
+            let mut stale = layer(4, 2, 'x');
+            stale.pane_id = 7;
+            sync_popup(
+                Some(stale),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            // other's frame, with its popup 9, still finds it on the right.
+            let status = status_of("other");
+            let attached = frame_attached(&current, Some(&status));
+            popup.prune(&popup_key(&attached), &[9]);
+            let mut own = layer(4, 2, 'y');
+            own.pane_id = 9;
+            sync_popup(
+                Some(own),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert_eq!(
+                renderer.popup_box().map(|b| b.frame),
+                Some(crate::client::popup::PopupFrame::OpenRight)
+            );
+            // A server too old to describe its bar sends no status: the frame
+            // is taken as the attached session's, as before.
+            assert_eq!(frame_attached(&current, None), current);
         }
 
         #[test]
