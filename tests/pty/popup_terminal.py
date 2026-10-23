@@ -629,6 +629,160 @@ def focus_return_case():
     return fails
 
 
+def sgr_click(col, row):
+    """A left press and release at 0-based `(col, row)`; SGR is 1-based."""
+    return (f"\x1b[<0;{col + 1};{row + 1}M".encode()
+            + f"\x1b[<0;{col + 1};{row + 1}m".encode())
+
+
+def popup_open(tui):
+    return list(tui.rows_text())[5][16] == "\u256d"
+
+
+def dismiss_case():
+    print("\n== a click outside the box, or Alt-hjkl, closes the popup and acts ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_dismiss", cfg())
+    try:
+        # Three panes, newest on the right; Alt-h makes the middle one current.
+        tui.prefix(b"pv", 1.8)
+        tui.prefix(b"pv", 1.8)
+        tui.send(b"\x1bh", 0.8)
+        tui.send(b"echo DIS$((40+2))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "DIS42")
+        check(home is not None, f"the middle pane printed its marker at {home}")
+
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "Alt-p opens the popup")
+        # Row 2 is above the float (it starts at row 5) and inside the left pane.
+        tui.send(sgr_click(40, 2), 1.5)
+        check(not popup_open(tui), "a click on the left pane closes the popup")
+        tui.send(b"echo DIS$((40+3))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "DIS43")
+        check(not popup_open(tui) and at is not None and home is not None
+              and at[0] < home[0],
+              f"and the click focused it: typing lands left of the middle pane ({at} vs {home})")
+
+        # Alt-l returns to the middle pane; from there the popup is opened.
+        tui.send(b"\x1bl", 0.8)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens again")
+        tui.send(b"\x1bl", 1.5)
+        check(not popup_open(tui), "Alt-l closes the popup")
+        tui.send(b"echo DIS$((40+4))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "DIS44")
+        check(not popup_open(tui) and at is not None and home is not None
+              and at[0] > home[0],
+              f"and moves focus to the right neighbour ({at} vs {home})")
+
+        # Nothing to the right: the popup still closes, and focus stays.
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens on the right pane")
+        tui.send(b"\x1bl", 1.5)
+        check(not popup_open(tui), "Alt-l with no right neighbour closes the popup")
+        tui.send(b"echo DIS$((40+5))\r")
+        tui.pump(1.0)
+        again = output_at(tui, "DIS45")
+        check(again is not None and at is not None and again[0] == at[0],
+              f"and keeps the pane ({again} vs {at})")
+
+        # A sidebar answers its own press; the popup closes for it too.
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens before a sidebar press")
+        tui.send(sgr_click(5, 10), 1.5)
+        check(not popup_open(tui), "a click on the sidebar closes the popup")
+
+        # The sidebar's own frame and the bar's tail past the server bar are
+        # answered by the client too; each closes the popup. A press on the
+        # content first takes the keyboard back from the sidebar.
+        for label, (cx, cy) in [("the sidebar's frame", (SIDEBAR_W - 1, 2)),
+                                ("the bar's tail", (SB_COLS - 1, SB_ROWS - 1))]:
+            tui.send(sgr_click(130, 2), 0.8)
+            tui.send(ALT_P)
+            tui.pump(1.8)
+            check(popup_open(tui), f"the popup opens before a press on {label}")
+            tui.send(sgr_click(cx, cy), 1.5)
+            check(not popup_open(tui), f"a press on {label} closes the popup")
+
+        # A press on the popup's frame is swallowed. The sidebar holds the
+        # keyboard after its press, so a press on the content takes it back.
+        tui.send(sgr_click(130, 2), 0.8)
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens before a frame press")
+        tui.send(sgr_click(16, 20), 1.0)
+        check(popup_open(tui), "a click on the popup's frame leaves it open")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def tab_click_case():
+    print("\n== a click on a tab switches tabs and leaves the popup of the tab left ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_tabclick", cfg())
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        tui.send(b"echo TABCLICK_MARK\r")
+        tui.pump(1.0)
+        tui.prefix(b"tn", 1.8)
+        tui.prefix(b"t1", 1.8)
+        check(popup_open(tui) and tui.has("TABCLICK_MARK"),
+              "tab 1's popup is up with its marker")
+        # The sidebar is shown, so the client draws the bar on the last row.
+        bar = list(tui.rows_text())[SB_ROWS - 1]
+        x = bar.find("Tab 2")
+        check(x >= 0, f"tab 2's label is on the bar ({bar.strip()!r})")
+        tui.send(sgr_click(x + 1, SB_ROWS - 1), 1.8)
+        check(not popup_open(tui) and not tui.has("TABCLICK_MARK"),
+              "the click switched to tab 2, which has no popup")
+        tui.prefix(b"t1", 1.8)
+        check(popup_open(tui) and tui.has("TABCLICK_MARK"),
+              "back on tab 1 its popup is still up")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def focus_key_sidebar_case():
+    print("\n== a focus key with the popup up never enters a sidebar ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_focuskey", cfg())
+    try:
+        tui.send(b"echo EDGE$((40+1))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "EDGE41")
+        check(home is not None and home[0] >= SIDEBAR_W,
+              f"the pane is right of the sidebar ({home})")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens")
+        tui.send(b"\x1bh", 1.5)
+        check(not popup_open(tui), "Alt-h at the left edge closes the popup")
+        tui.send(b"echo EDGE$((40+2))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "EDGE42")
+        check(at is not None and home is not None and at[0] == home[0],
+              f"and the keyboard is still in the pane, not the sidebar ({at})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
 def popup_line_with(tui, needle):
     """Whether a line of the float's interior holds `needle` as output: not the
     typed command or a prompt, which carry the `$`."""
@@ -674,7 +828,8 @@ def main():
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
                  live_reload_case, runtime_resize_case, per_tab_case,
                  in_tab_cwd_case, toggle_position_case, focus_return_case,
-                 tab_switch_no_resize_case, sized_float_case):
+                 tab_switch_no_resize_case, sized_float_case, dismiss_case,
+                 tab_click_case, focus_key_sidebar_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:

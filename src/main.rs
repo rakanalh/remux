@@ -1964,6 +1964,57 @@ fn popup_hit(
     Some(hit)
 }
 
+/// Whether `mouse` dismisses the popup: a left press the popup has no claim on,
+/// with a popup box on screen or an open still waiting for its first layer.
+///
+/// Only a press does. The wheel acts on what is under the pointer, so the popup
+/// stays, and a drag or release belongs to the press that began it.
+///
+/// A dismissing press also cancels a pending open. The server hides the popup
+/// the press finds, one the user may not have seen yet, so the open this client
+/// is waiting on will not happen, and the next popup key must open a popup, not
+/// read as a close of one.
+fn dismisses_popup(
+    popup: &mut PopupState,
+    popup_on_screen: bool,
+    pointer: Option<PopupPointer>,
+    mouse: &crossterm::event::MouseEvent,
+) -> bool {
+    let up = popup_on_screen || popup.is_opening();
+    let dismisses =
+        up && pointer.is_none() && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    if dismisses {
+        popup.cancel_opening();
+    }
+    dismisses
+}
+
+/// The message that closes the popup for a press the client answers itself
+/// (a sidebar, its frame or collapse chip, the bar's tail), so the press has no
+/// server message of its own to carry the close. A press the server gets closes
+/// the popup there instead, in the handler that acts on the press.
+///
+/// A `PopupToggle` would flip the popup, and the client's view of it lags the
+/// server's by a frame: sent after another client's close, or after this
+/// client's own earlier close, it would open the popup again. A press at
+/// `(u16::MAX, u16::MAX)` hits no pane, tab or stack label, so the server only
+/// runs the popup's dismissal, which hides and never opens. It also clears the
+/// client's content selection, as a press anywhere else in the content does.
+fn popup_dismiss_message() -> ClientMessage {
+    ClientMessage::MouseClick {
+        x: u16::MAX,
+        y: u16::MAX,
+        pane_id: None,
+        release: false,
+        popup: false,
+    }
+}
+
+async fn dismiss_popup(mgr: &mut ConnectionManager) -> Result<()> {
+    log::debug!("popup: closing for a press outside the box");
+    mgr.send_foreground(popup_dismiss_message()).await
+}
+
 /// Resize the popup instead of the layout, when a popup is up and the keyboard
 /// is in the content. Returns `true` when the command was consumed.
 ///
@@ -6143,6 +6194,17 @@ async fn run_client_loop(
                         } else {
                             None
                         };
+                        // A left press the popup has no claim on closes it. The
+                        // server does that itself for a press it is sent; the
+                        // sites below that answer a press on the client call
+                        // `dismiss_popup`.
+                        let popup_dismiss = active_view.is_none()
+                            && dismisses_popup(
+                                &mut popup,
+                                renderer.popup_box().is_some(),
+                                popup_pointer,
+                                &mouse,
+                            );
                         // The frame swallows a press, the start of a drag and
                         // the wheel, like a sidebar's frame does. A press on it
                         // still takes the keyboard back from a sidebar.
@@ -6189,6 +6251,9 @@ async fn run_client_loop(
                                     chrome.collapse_press(tc, tr, mouse.column, mouse.row)
                                 {
                                     mouse_grab = None;
+                                    if popup_dismiss {
+                                        dismiss_popup(mgr).await?;
+                                    }
                                     apply_sidebar_intent(
                                         SidebarApply {
                                             renderer: &mut renderer,
@@ -6564,6 +6629,9 @@ async fn run_client_loop(
                             MouseEventKind::Down(_) => {
                                 if over_frame {
                                     mouse_grab = None;
+                                    if popup_dismiss {
+                                        dismiss_popup(mgr).await?;
+                                    }
                                     // The collapse chip and a collapsed strip were
                                     // answered before any routing; what is left of
                                     // the frame is swallowed.
@@ -6624,6 +6692,9 @@ async fn run_client_loop(
                                 .row
                                 .clamp(rect.y, rect.y + rect.height.saturating_sub(1))
                                 - rect.y;
+                            if popup_dismiss {
+                                dismiss_popup(mgr).await?;
+                            }
                             let focus_before = chrome.focus;
                             // Only a press moves focus: the wheel and a drag
                             // that merely crosses a panel must not steal it.
@@ -6710,6 +6781,9 @@ async fn run_client_loop(
                                 // column, inside the last tab when tabs fill it.
                                 // No press also means the release sends nothing.
                                 drag_start = None;
+                                if popup_dismiss {
+                                    dismiss_popup(mgr).await?;
+                                }
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 log::debug!("mouse: click at ({}, {})", cx, cy);
@@ -9768,6 +9842,72 @@ mod tests {
                 popup_hit(renderer.popup_box(), &wanted, Some(MouseGrab::Popup), &up),
                 Some(PopupPointer::Frame)
             );
+        }
+
+        #[test]
+        fn only_a_left_press_outside_the_box_dismisses_the_popup() {
+            let b = float_box();
+            let pointer = |m: &MouseEvent| popup_pointer(&b, None, m);
+            let mut state = PopupState::from_config(&Config::default());
+            let outside = down(150, 2);
+            assert!(dismisses_popup(
+                &mut state,
+                true,
+                pointer(&outside),
+                &outside
+            ));
+
+            let interior = down(20, 10);
+            let frame = down(16, 5);
+            for m in [&interior, &frame] {
+                assert!(!dismisses_popup(&mut state, true, pointer(m), m), "{m:?}");
+            }
+
+            let right = mouse(MouseEventKind::Down(MouseButton::Right), 150, 2);
+            let wheel = mouse(MouseEventKind::ScrollUp, 150, 2);
+            let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 150, 2);
+            let up = mouse(MouseEventKind::Up(MouseButton::Left), 150, 2);
+            for m in [&right, &wheel, &drag, &up] {
+                assert!(!dismisses_popup(&mut state, true, pointer(m), m), "{m:?}");
+            }
+
+            assert!(
+                !dismisses_popup(&mut state, false, None, &outside),
+                "no popup on screen"
+            );
+        }
+
+        #[test]
+        fn a_press_before_the_first_layer_cancels_the_pending_open() {
+            let mut state = PopupState::from_config(&Config::default());
+            state.toggle("main", None, false);
+            assert!(state.is_opening());
+
+            // No box on screen yet, so the popup has no claim on the press.
+            let outside = down(150, 2);
+            assert!(dismisses_popup(&mut state, false, None, &outside));
+            assert!(!state.is_opening(), "the open the server cancelled");
+
+            // Without a pending open there is nothing to dismiss.
+            assert!(!dismisses_popup(&mut state, false, None, &outside));
+        }
+
+        #[test]
+        fn a_press_the_client_answers_closes_the_popup_without_toggling_it() {
+            match popup_dismiss_message() {
+                ClientMessage::MouseClick {
+                    x,
+                    y,
+                    pane_id,
+                    release,
+                    popup,
+                } => {
+                    assert_eq!((x, y), (u16::MAX, u16::MAX), "off every region");
+                    assert_eq!(pane_id, None);
+                    assert!(!release && !popup, "a plain press");
+                }
+                other => panic!("expected a press that only dismisses, got {other:?}"),
+            }
         }
 
         #[test]
