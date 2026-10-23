@@ -442,6 +442,12 @@ impl PopupState {
         }
     }
 
+    /// Drop an open still waiting for its first layer, because the server hid
+    /// the popup before this client saw it.
+    pub fn cancel_opening(&mut self) {
+        self.opening = None;
+    }
+
     /// Move everything kept for session `old` to `new`, after a rename.
     pub fn rename_session(&mut self, old: &str, new: &str) {
         let moved: Vec<((String, PaneId), PopupPlacement)> = self

@@ -1965,18 +1965,28 @@ fn popup_hit(
 }
 
 /// Whether `mouse` dismisses the popup: a left press the popup has no claim on,
-/// with a popup box on screen.
+/// with a popup box on screen or an open still waiting for its first layer.
 ///
 /// Only a press does. The wheel acts on what is under the pointer, so the popup
 /// stays, and a drag or release belongs to the press that began it.
+///
+/// A dismissing press also cancels a pending open. The server hides the popup
+/// the press finds, one the user may not have seen yet, so the open this client
+/// is waiting on will not happen, and the next popup key must open a popup, not
+/// read as a close of one.
 fn dismisses_popup(
+    popup: &mut PopupState,
     popup_on_screen: bool,
     pointer: Option<PopupPointer>,
     mouse: &crossterm::event::MouseEvent,
 ) -> bool {
-    popup_on_screen
-        && pointer.is_none()
-        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    let up = popup_on_screen || popup.is_opening();
+    let dismisses =
+        up && pointer.is_none() && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    if dismisses {
+        popup.cancel_opening();
+    }
+    dismisses
 }
 
 /// The message that closes the popup for a press the client answers itself
@@ -6188,11 +6198,13 @@ async fn run_client_loop(
                         // server does that itself for a press it is sent; the
                         // sites below that answer a press on the client call
                         // `dismiss_popup`.
-                        let popup_dismiss = dismisses_popup(
-                            active_view.is_none() && renderer.popup_box().is_some(),
-                            popup_pointer,
-                            &mouse,
-                        );
+                        let popup_dismiss = active_view.is_none()
+                            && dismisses_popup(
+                                &mut popup,
+                                renderer.popup_box().is_some(),
+                                popup_pointer,
+                                &mouse,
+                            );
                         // The frame swallows a press, the start of a drag and
                         // the wheel, like a sidebar's frame does. A press on it
                         // still takes the keyboard back from a sidebar.
@@ -9836,13 +9848,19 @@ mod tests {
         fn only_a_left_press_outside_the_box_dismisses_the_popup() {
             let b = float_box();
             let pointer = |m: &MouseEvent| popup_pointer(&b, None, m);
+            let mut state = PopupState::from_config(&Config::default());
             let outside = down(150, 2);
-            assert!(dismisses_popup(true, pointer(&outside), &outside));
+            assert!(dismisses_popup(
+                &mut state,
+                true,
+                pointer(&outside),
+                &outside
+            ));
 
             let interior = down(20, 10);
             let frame = down(16, 5);
             for m in [&interior, &frame] {
-                assert!(!dismisses_popup(true, pointer(m), m), "{m:?}");
+                assert!(!dismisses_popup(&mut state, true, pointer(m), m), "{m:?}");
             }
 
             let right = mouse(MouseEventKind::Down(MouseButton::Right), 150, 2);
@@ -9850,13 +9868,28 @@ mod tests {
             let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 150, 2);
             let up = mouse(MouseEventKind::Up(MouseButton::Left), 150, 2);
             for m in [&right, &wheel, &drag, &up] {
-                assert!(!dismisses_popup(true, pointer(m), m), "{m:?}");
+                assert!(!dismisses_popup(&mut state, true, pointer(m), m), "{m:?}");
             }
 
             assert!(
-                !dismisses_popup(false, None, &outside),
+                !dismisses_popup(&mut state, false, None, &outside),
                 "no popup on screen"
             );
+        }
+
+        #[test]
+        fn a_press_before_the_first_layer_cancels_the_pending_open() {
+            let mut state = PopupState::from_config(&Config::default());
+            state.toggle("main", None, false);
+            assert!(state.is_opening());
+
+            // No box on screen yet, so the popup has no claim on the press.
+            let outside = down(150, 2);
+            assert!(dismisses_popup(&mut state, false, None, &outside));
+            assert!(!state.is_opening(), "the open the server cancelled");
+
+            // Without a pending open there is nothing to dismiss.
+            assert!(!dismisses_popup(&mut state, false, None, &outside));
         }
 
         #[test]

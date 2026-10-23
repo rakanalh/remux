@@ -2974,17 +2974,30 @@ async fn handle_command(
         };
         if popup_visible {
             match cmd {
-                // A directional focus key dismisses the popup and then runs as
-                // it would have with no popup up, stepping from `focused_pane`,
-                // the pane the user was on before the popup opened. Hiding
-                // here, in the same handler, leaves no window between the close
-                // and the move for another message to land in.
+                // A directional focus key dismisses the popup and then steps
+                // focus among the tab's panes from `focused_pane`, the pane the
+                // user was on before the popup opened. Hiding here, in the same
+                // handler, leaves no window between the close and the move for
+                // another message to land in. The step is the server's: a
+                // client forwards the key only while no sidebar is to take it,
+                // because with the popup up the client does not treat the
+                // focused pane as being at an edge. So the key never moves the
+                // keyboard into a sidebar. The focus handler below sends the
+                // frame, so the hide does not.
                 RemuxCommand::PaneFocusLeft
                 | RemuxCommand::PaneFocusRight
                 | RemuxCommand::PaneFocusUp
                 | RemuxCommand::PaneFocusDown => {
-                    hide_visible_popup(&session_name, state, panes, clients, config, prev_frames)
-                        .await?;
+                    hide_visible_popup(
+                        &session_name,
+                        state,
+                        panes,
+                        clients,
+                        config,
+                        prev_frames,
+                        false,
+                    )
+                    .await?;
                 }
                 // Close closes the popup (resolved via the popup-aware
                 // `input_target` below). Resize is NOT rerouted: the client owns
@@ -6172,6 +6185,10 @@ async fn disarm_autoscroll(clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 /// line: the layout sizes come back, and no diff baseline keeps popup cells.
 /// Returns whether a popup was hidden.
 ///
+/// `render` sends the clients the frame without the popup. A caller that
+/// broadcasts a frame itself right after passes `false`, so the clients get one
+/// frame and not two.
+///
 /// For an action that dismisses the popup and then acts as if it had not been
 /// there. `PopupToggle` cannot serve, because it flips: run after another
 /// client's close, it would open the popup again.
@@ -6182,6 +6199,7 @@ async fn hide_visible_popup(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
+    render: bool,
 ) -> Result<bool> {
     let hidden = {
         let mut st = state.lock().await;
@@ -6201,7 +6219,9 @@ async fn hide_visible_popup(
         log::debug!("server: popup of session={session_name:?} dismissed");
         resize_session_panes(session_name, state, panes, clients, config).await?;
         invalidate_session_baselines(session_name, clients, prev_frames).await;
-        broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+        if render {
+            broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+        }
     }
     Ok(hidden)
 }
@@ -6300,11 +6320,27 @@ async fn handle_mouse_click(
     // above has said so. Done in this handler, so the focus change below sees
     // the popup already hidden. A release never dismisses: it ends a gesture
     // whose press already had its say.
+    //
+    // A press on a tab label only switches tabs. Each tab keeps its popup, as
+    // it does across a keyboard tab switch, so the tab left keeps its popup up.
+    //
+    // The arms below send the frame after a focus change or a stack label
+    // press, so only a press with no such arm renders here.
     let on_popup = matches!(target, ClickTarget::Pane(id) if popup.pane == Some(id));
-    let dismissed = !release
-        && popup.pane.is_some()
-        && !on_popup
-        && hide_visible_popup(&session_name, state, panes, clients, config, prev_frames).await?;
+    let dismisses =
+        !release && popup.pane.is_some() && !on_popup && !matches!(target, ClickTarget::Tab(_));
+    let renders_below = matches!(target, ClickTarget::Pane(_) | ClickTarget::StackLabel(_));
+    let dismissed = dismisses
+        && hide_visible_popup(
+            &session_name,
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+            !renders_below,
+        )
+        .await?;
     let popup_pane = if dismissed { None } else { popup.pane };
 
     // A pane whose application asked for mouse events gets the press/release
@@ -6351,7 +6387,9 @@ async fn handle_mouse_click(
                 Some(t) => t,
                 None => return Ok(()),
             };
-            if tab.focused_pane != pane_id {
+            // A dismissed popup leaves the frame to this arm, even when the
+            // pane clicked already had the focus.
+            if tab.focused_pane != pane_id || dismissed {
                 tab.focus_pane(pane_id);
                 drop(st);
                 // `PaneTreeEntry::is_focused` is in the pushed payload, so
@@ -12698,6 +12736,111 @@ mod popup_tests {
             assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
             rig.finish().await;
         }
+    }
+
+    fn renders(msgs: &[ServerMessage]) -> usize {
+        msgs.iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    ServerMessage::FullRender { .. } | ServerMessage::RenderDiff { .. }
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_click_on_a_tab_switches_to_it_and_leaves_the_popup_of_the_tab_it_left() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        assert!(rig.state.lock().await.sessions["main"].tabs[0].popup_visible);
+
+        let tab_x = {
+            let (cols, rows, mode, naming, theme) = {
+                let cls = rig.clients.lock().await;
+                let c = &cls[&CLIENT];
+                (
+                    c.cols,
+                    c.rows,
+                    c.mode.clone(),
+                    c.naming(),
+                    c.theme(&rig.config),
+                )
+            };
+            let hit = build_composite(
+                "main",
+                cols,
+                rows,
+                &mode,
+                &rig.state,
+                &rig.panes,
+                &rig.config,
+                None,
+                None,
+                &HashMap::new(),
+                &theme,
+                &naming,
+            )
+            .await
+            .6;
+            let region = hit
+                .tab_regions
+                .iter()
+                .find(|r| r.tab_index == 1)
+                .expect("tab 1 label");
+            (region.x_start, region.y)
+        };
+
+        press(&rig, tab_x.0, tab_x.1, false).await;
+
+        let st = rig.state.lock().await;
+        let sess = &st.sessions["main"];
+        assert_eq!(sess.active_tab, 1, "the click switched tabs");
+        assert!(
+            sess.tabs[0].popup_visible,
+            "the tab left keeps its popup, as a keyboard tab switch does"
+        );
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_focus_key_with_the_popup_up_renders_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        three_panes_popup_up(&rig, dir.path()).await;
+        rig.drain();
+
+        rig.command(RemuxCommand::PaneFocusRight).await;
+
+        assert_eq!(renders(&rig.drain()), 1);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn an_outside_click_renders_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        three_panes_popup_up(&rig, dir.path()).await;
+        // On the pane that already has focus, and on another one.
+        for x in [60, RIGHT_X] {
+            rig.state
+                .lock()
+                .await
+                .sessions
+                .get_mut("main")
+                .unwrap()
+                .tabs[0]
+                .popup_visible = true;
+            rig.drain();
+            press(&rig, x, 5, false).await;
+            assert_eq!(renders(&rig.drain()), 1, "click at x={x}");
+            assert!(!focus_and_popup(&rig).await.1);
+        }
+        rig.finish().await;
     }
 
     #[tokio::test]

@@ -726,6 +726,63 @@ def dismiss_case():
     return fails
 
 
+def tab_click_case():
+    print("\n== a click on a tab switches tabs and leaves the popup of the tab left ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_tabclick", cfg())
+    try:
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        tui.send(b"echo TABCLICK_MARK\r")
+        tui.pump(1.0)
+        tui.prefix(b"tn", 1.8)
+        tui.prefix(b"t1", 1.8)
+        check(popup_open(tui) and tui.has("TABCLICK_MARK"),
+              "tab 1's popup is up with its marker")
+        # The sidebar is shown, so the client draws the bar on the last row.
+        bar = list(tui.rows_text())[SB_ROWS - 1]
+        x = bar.find("Tab 2")
+        check(x >= 0, f"tab 2's label is on the bar ({bar.strip()!r})")
+        tui.send(sgr_click(x + 1, SB_ROWS - 1), 1.8)
+        check(not popup_open(tui) and not tui.has("TABCLICK_MARK"),
+              "the click switched to tab 2, which has no popup")
+        tui.prefix(b"t1", 1.8)
+        check(popup_open(tui) and tui.has("TABCLICK_MARK"),
+              "back on tab 1 its popup is still up")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
+def focus_key_sidebar_case():
+    print("\n== a focus key with the popup up never enters a sidebar ==")
+    fails = []
+    check = make_check(fails)
+    tui = start("/tmp/rmxpop/sb_focuskey", cfg())
+    try:
+        tui.send(b"echo EDGE$((40+1))\r")
+        tui.pump(1.0)
+        home = output_at(tui, "EDGE41")
+        check(home is not None and home[0] >= SIDEBAR_W,
+              f"the pane is right of the sidebar ({home})")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(popup_open(tui), "the popup opens")
+        tui.send(b"\x1bh", 1.5)
+        check(not popup_open(tui), "Alt-h at the left edge closes the popup")
+        tui.send(b"echo EDGE$((40+2))\r")
+        tui.pump(1.0)
+        at = output_at(tui, "EDGE42")
+        check(at is not None and home is not None and at[0] == home[0],
+              f"and the keyboard is still in the pane, not the sidebar ({at})")
+        check(tui.alive(), "the client is alive")
+    finally:
+        tui.kill()
+    return fails
+
+
 def popup_line_with(tui, needle):
     """Whether a line of the float's interior holds `needle` as output: not the
     typed command or a prompt, which carry the `$`."""
@@ -771,7 +828,8 @@ def main():
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
                  live_reload_case, runtime_resize_case, per_tab_case,
                  in_tab_cwd_case, toggle_position_case, focus_return_case,
-                 tab_switch_no_resize_case, sized_float_case, dismiss_case):
+                 tab_switch_no_resize_case, sized_float_case, dismiss_case,
+                 tab_click_case, focus_key_sidebar_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:
