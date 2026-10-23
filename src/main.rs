@@ -1964,6 +1964,38 @@ fn popup_hit(
     Some(hit)
 }
 
+/// Whether `mouse` dismisses the popup: a left press the popup has no claim on,
+/// with a popup box on screen.
+///
+/// Only a press does. The wheel acts on what is under the pointer, so the popup
+/// stays, and a drag or release belongs to the press that began it.
+fn dismisses_popup(
+    popup_on_screen: bool,
+    pointer: Option<PopupPointer>,
+    mouse: &crossterm::event::MouseEvent,
+) -> bool {
+    popup_on_screen
+        && pointer.is_none()
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+}
+
+/// Close the popup for a press the client answers itself (a sidebar, its
+/// frame or collapse chip, the bar's tail), so the press has no server message
+/// to carry the close. A press the server gets closes the popup there instead,
+/// in the handler that acts on the press.
+async fn dismiss_popup(
+    mgr: &mut ConnectionManager,
+    popup: &mut PopupState,
+    attached: &Option<(ConnId, String)>,
+) -> Result<()> {
+    if popup.dismiss(&popup_key(attached)) {
+        log::debug!("popup: closing for a press outside the box");
+        mgr.send_foreground(ClientMessage::Command(RemuxCommand::PopupToggle(None)))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Resize the popup instead of the layout, when a popup is up and the keyboard
 /// is in the content. Returns `true` when the command was consumed.
 ///
@@ -6143,6 +6175,15 @@ async fn run_client_loop(
                         } else {
                             None
                         };
+                        // A left press the popup has no claim on closes it. The
+                        // server does that itself for a press it is sent; the
+                        // sites below that answer a press on the client call
+                        // `dismiss_popup`.
+                        let popup_dismiss = dismisses_popup(
+                            active_view.is_none() && renderer.popup_box().is_some(),
+                            popup_pointer,
+                            &mouse,
+                        );
                         // The frame swallows a press, the start of a drag and
                         // the wheel, like a sidebar's frame does. A press on it
                         // still takes the keyboard back from a sidebar.
@@ -6189,6 +6230,9 @@ async fn run_client_loop(
                                     chrome.collapse_press(tc, tr, mouse.column, mouse.row)
                                 {
                                     mouse_grab = None;
+                                    if popup_dismiss {
+                                        dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                    }
                                     apply_sidebar_intent(
                                         SidebarApply {
                                             renderer: &mut renderer,
@@ -6564,6 +6608,9 @@ async fn run_client_loop(
                             MouseEventKind::Down(_) => {
                                 if over_frame {
                                     mouse_grab = None;
+                                    if popup_dismiss {
+                                        dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                    }
                                     // The collapse chip and a collapsed strip were
                                     // answered before any routing; what is left of
                                     // the frame is swallowed.
@@ -6624,6 +6671,9 @@ async fn run_client_loop(
                                 .row
                                 .clamp(rect.y, rect.y + rect.height.saturating_sub(1))
                                 - rect.y;
+                            if popup_dismiss {
+                                dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                            }
                             let focus_before = chrome.focus;
                             // Only a press moves focus: the wheel and a drag
                             // that merely crosses a panel must not steal it.
@@ -6710,6 +6760,9 @@ async fn run_client_loop(
                                 // column, inside the last tab when tabs fill it.
                                 // No press also means the release sends nothing.
                                 drag_start = None;
+                                if popup_dismiss {
+                                    dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                }
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 log::debug!("mouse: click at ({}, {})", cx, cy);
@@ -9768,6 +9821,62 @@ mod tests {
                 popup_hit(renderer.popup_box(), &wanted, Some(MouseGrab::Popup), &up),
                 Some(PopupPointer::Frame)
             );
+        }
+
+        #[test]
+        fn only_a_left_press_outside_the_box_dismisses_the_popup() {
+            let b = float_box();
+            let pointer = |m: &MouseEvent| popup_pointer(&b, None, m);
+            let outside = down(150, 2);
+            assert!(dismisses_popup(true, pointer(&outside), &outside));
+
+            let interior = down(20, 10);
+            let frame = down(16, 5);
+            for m in [&interior, &frame] {
+                assert!(!dismisses_popup(true, pointer(m), m), "{m:?}");
+            }
+
+            let right = mouse(MouseEventKind::Down(MouseButton::Right), 150, 2);
+            let wheel = mouse(MouseEventKind::ScrollUp, 150, 2);
+            let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 150, 2);
+            let up = mouse(MouseEventKind::Up(MouseButton::Left), 150, 2);
+            for m in [&right, &wheel, &drag, &up] {
+                assert!(!dismisses_popup(true, pointer(m), m), "{m:?}");
+            }
+
+            assert!(
+                !dismisses_popup(false, None, &outside),
+                "no popup on screen"
+            );
+        }
+
+        #[test]
+        fn a_second_press_before_the_close_lands_does_not_toggle_the_popup_open_again() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            let key = popup_key(&attached);
+            assert!(popup.dismiss(&key), "the first press sends the close");
+            assert!(!popup.dismiss(&key), "the layer is still up");
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            sync_popup(
+                Some(layer(4, 2, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &attached,
+                &theme,
+            )
+            .unwrap();
+            assert!(popup.dismiss(&key), "a popup opened since closes again");
         }
 
         #[test]

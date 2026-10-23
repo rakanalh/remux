@@ -38,6 +38,8 @@ Several panes can share one position in a layout as a **stack**. Only one pane o
 
 Each tab has one **popup terminal**, a scratch shell drawn over the layout instead of taking a slot in it. Toggle it with `Alt-p`. The first toggle in a tab starts a shell in the directory of that tab's focused pane. It keeps running while hidden, so you get the same shell and history back each time, and a tab you leave with its popup open still has it open when you return. By default it floats over the whole window, sidebars included. `popup_position` docks it to an edge instead.
 
+A left click outside the popup closes it, and the click then does what it would have done with no popup there: it focuses the pane, switches the tab or drives the sidebar. A click on the popup's border does nothing, and a click inside goes to the shell. `Alt-h`, `Alt-j`, `Alt-k` and `Alt-l` also close the popup and move focus one step from the pane you were on before it opened; when no pane lies that way the popup still closes and focus stays. The mouse wheel does not close the popup: it scrolls whatever is under the pointer. The popup is shared by every client attached to the session, so a close from one terminal closes it for all.
+
 ## Layouts
 
 Each tab has a **layout** that decides where its panes go. The automatic layouts (BSP, Master, Monocle, Grid, Columns and Rows) place panes for you; `Alt-Space` cycles through them. As soon as you split or resize by hand, the tab switches to **Custom**, which keeps exactly the arrangement you made. See [Layouts](/remux/layouts/).
