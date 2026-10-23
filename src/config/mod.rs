@@ -206,6 +206,122 @@ impl PopupPosition {
     }
 }
 
+/// A popup's size in percent, as a `PopupToggle` key gives it. An axis left
+/// `None` uses the configured percentage.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct PopupSize {
+    pub width: Option<u8>,
+    pub height: Option<u8>,
+}
+
+/// Where a `PopupToggle` key opens the popup, and how big.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct PopupPlacement {
+    pub position: PopupPosition,
+    pub size: Option<PopupSize>,
+}
+
+impl From<PopupPosition> for PopupPlacement {
+    fn from(position: PopupPosition) -> Self {
+        PopupPlacement {
+            position,
+            size: None,
+        }
+    }
+}
+
+impl PopupPlacement {
+    /// The placement a `PopupToggle` key's arguments name: `None` for no
+    /// arguments, else a position and an optional size in percent.
+    ///
+    /// A float takes `N` (both axes) or `WxH`. A docked position takes one
+    /// number, for the axis it sizes (`left` and `right` the width, `top` and
+    /// `bottom` the height), because the other axis is not used and a second
+    /// number would be silently ignored. Each number is clamped to the range
+    /// of `popup_width_pct` and `popup_height_pct`.
+    ///
+    /// The error is the end of the sentence "action 'PopupToggle' has ...".
+    pub fn from_args(args: &[String]) -> Result<Option<Self>, String> {
+        let Some(first) = args.first() else {
+            return Ok(None);
+        };
+        let Some(position) = PopupPosition::parse(first) else {
+            return Err(
+                if first.split('x').all(|part| parse_percent(part).is_some()) {
+                    format!("a size '{first}' that needs a position before it")
+                } else {
+                    format!(
+                    "an invalid position '{first}' (expected float, left, right, top or bottom)"
+                )
+                },
+            );
+        };
+        let Some(text) = args.get(1) else {
+            return Ok(Some(position.into()));
+        };
+        if let Some(extra) = args.get(2) {
+            return Err(format!("an unexpected argument '{extra}' after the size"));
+        }
+        let invalid = || {
+            format!("an invalid size '{text}' (expected a percentage such as 80, or WxH such as 80x60 for a float)")
+        };
+        let size = match (text.split_once('x'), position) {
+            (None, PopupPosition::Float) => {
+                let pct = parse_percent(text).ok_or_else(invalid)?;
+                PopupSize {
+                    width: Some(pct),
+                    height: Some(pct),
+                }
+            }
+            (None, docked) => {
+                let pct = Some(parse_percent(text).ok_or_else(invalid)?);
+                match docked {
+                    PopupPosition::Left | PopupPosition::Right => PopupSize {
+                        width: pct,
+                        height: None,
+                    },
+                    _ => PopupSize {
+                        width: None,
+                        height: pct,
+                    },
+                }
+            }
+            (Some((w, h)), PopupPosition::Float) => PopupSize {
+                width: Some(parse_percent(w).ok_or_else(invalid)?),
+                height: Some(parse_percent(h).ok_or_else(invalid)?),
+            },
+            (Some((w, h)), docked) => {
+                // Name the axis in the message only for a well-formed WxH.
+                if parse_percent(w).is_none() || parse_percent(h).is_none() {
+                    return Err(invalid());
+                }
+                let axis = match docked {
+                    PopupPosition::Left | PopupPosition::Right => "width",
+                    _ => "height",
+                };
+                return Err(format!(
+                    "a size '{text}' for '{first}' that takes one number, the {axis}"
+                ));
+            }
+        };
+        Ok(Some(PopupPlacement {
+            position,
+            size: Some(size),
+        }))
+    }
+}
+
+/// A percentage of digits only, clamped to the popup range. A number too big
+/// for `u32` is a run of digits and clamps like any other large one.
+fn parse_percent(text: &str) -> Option<u8> {
+    use crate::server::layout::{POPUP_MAX_PCT, POPUP_MIN_PCT};
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pct = text.parse::<u32>().unwrap_or(u32::MAX);
+    Some(pct.clamp(POPUP_MIN_PCT as u32, POPUP_MAX_PCT as u32) as u8)
+}
+
 /// Placement style for the which-key hint popup.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -748,6 +864,93 @@ mod tests {
             None,
             "the spelling is snake_case"
         );
+    }
+
+    fn args(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn placement(position: PopupPosition, width: Option<u8>, height: Option<u8>) -> PopupPlacement {
+        PopupPlacement {
+            position,
+            size: Some(PopupSize { width, height }),
+        }
+    }
+
+    #[test]
+    fn popup_toggle_args_name_a_position_and_an_optional_size() {
+        use PopupPosition::*;
+        let ok = |text: &str| PopupPlacement::from_args(&args(text));
+        assert_eq!(ok(""), Ok(None));
+        assert_eq!(ok("right"), Ok(Some(Right.into())));
+        assert_eq!(
+            ok("float 80"),
+            Ok(Some(placement(Float, Some(80), Some(80))))
+        );
+        assert_eq!(
+            ok("float 80x60"),
+            Ok(Some(placement(Float, Some(80), Some(60))))
+        );
+        assert_eq!(ok("right 40"), Ok(Some(placement(Right, Some(40), None))));
+        assert_eq!(ok("left 40"), Ok(Some(placement(Left, Some(40), None))));
+        assert_eq!(ok("bottom 30"), Ok(Some(placement(Bottom, None, Some(30)))));
+        assert_eq!(ok("top 30"), Ok(Some(placement(Top, None, Some(30)))));
+    }
+
+    #[test]
+    fn a_popup_size_is_clamped_to_the_config_range() {
+        use PopupPosition::*;
+        let ok = |text: &str| PopupPlacement::from_args(&args(text));
+        assert_eq!(
+            ok("float 5"),
+            Ok(Some(placement(Float, Some(20), Some(20))))
+        );
+        assert_eq!(
+            ok("float 0"),
+            Ok(Some(placement(Float, Some(20), Some(20))))
+        );
+        assert_eq!(
+            ok("float 250x10"),
+            Ok(Some(placement(Float, Some(100), Some(20))))
+        );
+        assert_eq!(
+            ok("right 1000"),
+            Ok(Some(placement(Right, Some(100), None)))
+        );
+        assert_eq!(
+            ok("float 99999999999"),
+            Ok(Some(placement(Float, Some(100), Some(100)))),
+            "a number too big for a machine word still clamps"
+        );
+    }
+
+    #[test]
+    fn a_bad_popup_toggle_argument_is_a_named_error() {
+        let err = |text: &str| PopupPlacement::from_args(&args(text)).unwrap_err();
+        for (text, want) in [
+            ("sideways", "invalid position 'sideways'"),
+            ("80", "size '80' that needs a position before it"),
+            ("80x60", "size '80x60' that needs a position before it"),
+            ("float wide", "invalid size 'wide'"),
+            ("float 80x", "invalid size '80x'"),
+            ("float x60", "invalid size 'x60'"),
+            ("float 80x60x40", "invalid size '80x60x40'"),
+            ("float -5", "invalid size '-5'"),
+            ("float 8.5", "invalid size '8.5'"),
+            ("float 80%", "invalid size '80%'"),
+            (
+                "right 80x60",
+                "size '80x60' for 'right' that takes one number, the width",
+            ),
+            (
+                "bottom 80x60",
+                "size '80x60' for 'bottom' that takes one number, the height",
+            ),
+            ("float 80 60", "unexpected argument '60'"),
+        ] {
+            let message = err(text);
+            assert!(message.contains(want), "{text:?}: {message}");
+        }
     }
 
     #[test]

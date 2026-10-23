@@ -35,7 +35,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
 - **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement); turn any of them off under `[layouts]`.
-- **Popup terminal** — a scratch terminal drawn over the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`), or bind keys that open it at a given position (`"Alt--" = "PopupToggle bottom"`, see [Popup keys](#popup-keys)); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per tab — the first toggle in a tab starts a shell in that tab's focused pane's directory, and each tab keeps its own popup open or closed. `popup_position` puts it as a `float` centered over the whole window, sidebars included (the default), or as a drawer on the `left`, `right`, `top` or `bottom`; `popup_width_pct` / `popup_height_pct` (default 80×80) size it, and the pane-resize keys resize it while open, for that position only. Position and size apply on save. Two tabs whose popups are open at different positions share one popup terminal size, so switching between them resizes the popups (programs inside redraw, as on any terminal resize). It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
+- **Popup terminal** — a scratch terminal drawn over the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`), or bind keys that open it at a given position (`"Alt--" = "PopupToggle bottom"`, see [Popup keys](#popup-keys)); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per tab — the first toggle in a tab starts a shell in that tab's focused pane's directory, and each tab keeps its own popup open or closed. `popup_position` puts it as a `float` centered over the whole window, sidebars included (the default), or as a drawer on the `left`, `right`, `top` or `bottom`; `popup_width_pct` / `popup_height_pct` (default 80×80) size it, and the pane-resize keys resize it while open, for that key's position and size only. Position and size apply on save. Two tabs whose popups are open at different positions share one popup terminal size, so switching between them resizes the popups (programs inside redraw, as on any terminal resize). It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout.
 - **Login-shell panes** — new panes spawn their shell as a login shell so your profile/rc files run as expected.
 - **Two rendering styles** — **Zellij style** (rounded box borders with pane names) and **Tmux style** (minimal dividers). Toggle live with `Ctrl-a g`.
 
@@ -458,13 +458,15 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 
 #### Popup keys
 
-`PopupToggle` takes an optional position, so separate keys can open the popup in different places. Every popup key is a plain show/hide toggle: a hidden popup opens at the position its key names (or at `popup_position` with none), and while the popup is visible ANY popup key closes it rather than moving it. Each tab's popup remembers the position it was opened at until it is closed. A View shows no popup, so popup keys do nothing inside one. These are an example, not defaults:
+`PopupToggle` takes an optional position, so separate keys can open the popup in different places. Every popup key is a plain show/hide toggle: a hidden popup opens at the position its key names (or at `popup_position` with none), and while the popup is visible ANY popup key closes it rather than moving it. Each tab's popup remembers the position and size it was opened at until it is closed. A key can also give the popup a size, in percent: `PopupToggle float 80` is 80% of the window on both axes, `PopupToggle float 80x60` is 80% wide and 60% high, and a drawer takes one number for the axis it sizes, `PopupToggle right 40` (width) or `PopupToggle bottom 30` (height). A size always follows a position, a drawer given `WxH` is a config error, and numbers are clamped to 20–100 like `popup_width_pct`. A key with no size uses `popup_width_pct` / `popup_height_pct`. The pane-resize keys adjust the popup on top of its key's size, and only for popups opened by a key with that same position and size. A View shows no popup, so popup keys do nothing inside one. These are an example, not defaults:
 
 ```toml
 [keybindings.command]
 "Alt-p"  = "PopupToggle"
 "Alt--"  = "PopupToggle bottom"
 "Alt-\\" = "PopupToggle right"
+"Alt-f"  = "PopupToggle float 90x70"
+"Alt-]"  = "PopupToggle right 40"
 ```
 
 ### Visual mode
@@ -581,7 +583,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `ToggleStyle` | — | Toggle border rendering between Zellij and Tmux styles. |
 | `LayoutNext` | — | Cycle the layout mode (BSP → Master → Monocle → Grid → Columns → Rows), skipping any disabled under `[layouts]`, then back to a remembered Custom arrangement. |
 | `SetMaster` | — | Make the focused pane the master pane (Master layout). |
-| `PopupToggle` | `[float\|left\|right\|top\|bottom]` | Show/hide the active tab's popup terminal (created on first use, kept running while hidden). A hidden popup opens at the named position, or at `popup_position` with none; a visible one closes, whatever position the key names. |
+| `PopupToggle` | `[float\|left\|right\|top\|bottom] [size]` | Show/hide the active tab's popup terminal (created on first use, kept running while hidden). A hidden popup opens at the named position, or at `popup_position` with none, sized by `size` (percent: `80` or `80x60` for a float, one number for a drawer's axis) or by `popup_width_pct` / `popup_height_pct` with none; a visible one closes, whatever the key names. |
 | `ViewNew` | `[name]` | Create a view and enter it (prompts when no name is given). |
 | `ViewAddPane` | — | Add the focused pane to a view (opens the view picker). |
 | `ViewRename` | `<name>` | Rename the current view. |

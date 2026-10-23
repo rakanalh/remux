@@ -986,10 +986,15 @@ fn action_problem(action: &str) -> Option<String> {
     let name = tokens.first()?;
     match action_spec(name) {
         None => Some(format!("unknown action '{name}'")),
-        Some(_) if name == "PopupToggle" && resolve_action(action).is_none() => Some(format!(
-            "action 'PopupToggle' has an invalid position '{}' (expected float, left, right, top or bottom)",
-            tokens.get(1).map(String::as_str).unwrap_or_default()
-        )),
+        Some(_) if name == "PopupToggle" && resolve_action(action).is_none() => {
+            let reason = match crate::config::PopupPlacement::from_args(&tokens[1..]) {
+                Err(reason) => reason,
+                // `resolve_action` builds the command from the same parse, so
+                // it cannot fail where `from_args` succeeds.
+                Ok(_) => "arguments that do not resolve".to_string(),
+            };
+            Some(format!("action 'PopupToggle' has {reason}"))
+        }
         Some(_) if resolve_action(action).is_none() => {
             Some(format!("action '{name}' is missing a required argument"))
         }
@@ -1093,12 +1098,9 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
-        "PopupToggle" => match args.first() {
-            None => Some(RemuxCommand::PopupToggle(None)),
-            Some(arg) => {
-                crate::config::PopupPosition::parse(arg).map(|p| RemuxCommand::PopupToggle(Some(p)))
-            }
-        },
+        "PopupToggle" => crate::config::PopupPlacement::from_args(args)
+            .ok()
+            .map(RemuxCommand::PopupToggle),
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterNormal" => Some(RemuxCommand::EnterNormal),
         "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),
@@ -1713,7 +1715,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_command(&format!("PopupToggle {arg}")),
-                Some(RemuxCommand::PopupToggle(Some(position))),
+                Some(RemuxCommand::PopupToggle(Some(position.into()))),
                 "{arg}"
             );
         }
@@ -1734,6 +1736,72 @@ mod tests {
             problems[0].contains("'PopupToggle' has an invalid position 'sideways'"),
             "{problems:#?}"
         );
+    }
+
+    #[test]
+    fn parse_command_popup_toggle_takes_an_optional_size() {
+        use crate::config::{PopupPlacement, PopupPosition::*, PopupSize};
+        let size = |position, width, height| {
+            Some(RemuxCommand::PopupToggle(Some(PopupPlacement {
+                position,
+                size: Some(PopupSize { width, height }),
+            })))
+        };
+        assert_eq!(
+            parse_command("PopupToggle float 80"),
+            size(Float, Some(80), Some(80))
+        );
+        assert_eq!(
+            parse_command("PopupToggle float 80x60"),
+            size(Float, Some(80), Some(60))
+        );
+        assert_eq!(
+            parse_command("PopupToggle right 40"),
+            size(Right, Some(40), None)
+        );
+        assert_eq!(
+            parse_command("PopupToggle bottom 30"),
+            size(Bottom, None, Some(30))
+        );
+        assert_eq!(
+            parse_command("PopupToggle float 5"),
+            size(Float, Some(20), Some(20)),
+            "clamped"
+        );
+        for bad in [
+            "PopupToggle 80",
+            "PopupToggle float wide",
+            "PopupToggle right 80x60",
+            "PopupToggle float 80 60",
+        ] {
+            assert_eq!(parse_command(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bad_popup_size_is_a_named_config_error() {
+        for (action, want) in [
+            (
+                "PopupToggle 80",
+                "'PopupToggle' has a size '80' that needs a position before it",
+            ),
+            (
+                "PopupToggle float wide",
+                "'PopupToggle' has an invalid size 'wide'",
+            ),
+            (
+                "PopupToggle right 80x60",
+                "'PopupToggle' has a size '80x60' for 'right' that takes one number, the width",
+            ),
+        ] {
+            let toml_str = format!("\"Alt-p\" = \"{action}\"\n");
+            let value: toml::Value = toml_str.parse().unwrap();
+            let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+            let tree = KeybindingTree::from_toml(&toml::Value::Table(Default::default())).unwrap();
+            let problems = unresolved_actions(&tree, &shortcuts);
+            assert_eq!(problems.len(), 1, "{action}: {problems:#?}");
+            assert!(problems[0].contains(want), "{action}: {problems:#?}");
+        }
     }
 
     #[test]

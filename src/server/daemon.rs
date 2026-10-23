@@ -2094,11 +2094,11 @@ async fn handle_client_message(
             {
                 let mut cls = clients.lock().await;
                 if let Some(conn) = cls.get_mut(&client_id) {
-                    let demand = if size_demand {
-                        Some((cols, rows))
-                    } else {
-                        None
-                    };
+                    // The demand is only a claim, like a Resize. Only a size
+                    // that is used is clamped, so a placeholder size on a
+                    // subscription with no demand is not logged as bad.
+                    let demand =
+                        size_demand.then(|| clamp_client_size("SubscribePane", cols, rows));
                     // A FRESH subscribe starts at the live view with nothing
                     // selected. A RE-subscribe of a pane this client already
                     // watches does not: the client re-subscribes its cells
@@ -13013,6 +13013,41 @@ mod popup_tests {
         assert_eq!((client.cols, client.rows), (MAX_TERMINAL_COLS, 1));
         assert_eq!(client.popup_want, Some((1, MAX_TERMINAL_ROWS)));
         drop(cls);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_pane_subscription_demand_is_clamped_to_the_terminal_maximum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let pane_id = *rig.panes.lock().await.keys().next().expect("pane");
+        let subscribe = |cols, rows, size_demand| ClientMessage::SubscribePane {
+            pane_id,
+            cols,
+            rows,
+            size_demand,
+        };
+        for (msg, want) in [
+            (subscribe(u16::MAX, 0, true), Some((MAX_TERMINAL_COLS, 1))),
+            (subscribe(0, u16::MAX, true), Some((1, MAX_TERMINAL_ROWS))),
+            (subscribe(80, 24, true), Some((80, 24))),
+            (subscribe(u16::MAX, u16::MAX, false), None),
+        ] {
+            handle_client_message(
+                CLIENT,
+                msg,
+                &rig.state,
+                &rig.panes,
+                &rig.clients,
+                &rig.config,
+                &rig.prev_frames,
+                &rig.dormant,
+            )
+            .await
+            .expect("subscribe");
+            let cls = rig.clients.lock().await;
+            assert_eq!(cls[&CLIENT].subscribed_panes.get(&pane_id), Some(&want));
+        }
         rig.finish().await;
     }
 

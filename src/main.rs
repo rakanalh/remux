@@ -1834,14 +1834,15 @@ enum PopupToggleStep {
     NotAToggle,
     /// A `PopupToggle` that must not reach the server.
     Swallow,
-    /// A `PopupToggle`, stripped of its position, to forward.
+    /// A `PopupToggle`, stripped of its position and size, to forward.
     Forward,
 }
 
-/// Ready a `PopupToggle` for the foreground server, which learns no position.
+/// Ready a `PopupToggle` for the foreground server, which learns neither the
+/// position nor the size.
 /// Returns `true` when the command must not be sent.
 ///
-/// The position the key named is recorded here instead, and when the toggle
+/// The placement the key named is recorded here instead, and when the toggle
 /// opens the popup the box it opens is announced FIRST, so the server spawns
 /// or shows the popup at that size rather than resizing it a frame later. A
 /// visible popup is closed by any popup key, so then nothing is announced.
@@ -1876,17 +1877,17 @@ fn plan_popup_toggle(
     attached: &Option<(ConnId, String)>,
     view_active: bool,
 ) -> PopupToggleStep {
-    let RemuxCommand::PopupToggle(position) = cmd else {
+    let RemuxCommand::PopupToggle(placement) = cmd else {
         return PopupToggleStep::NotAToggle;
     };
     if view_active {
-        log::debug!("popup: toggle position={position:?} ignored while a View is up");
+        log::debug!("popup: toggle placement={placement:?} ignored while a View is up");
         return PopupToggleStep::Swallow;
     }
     let visible = renderer.popup_box().is_some() || popup.is_opening();
-    log::debug!("popup: toggle position={position:?} visible={visible}");
-    popup.toggle(&popup_key(attached), *position, visible);
-    *position = None;
+    log::debug!("popup: toggle placement={placement:?} visible={visible}");
+    popup.toggle(&popup_key(attached), *placement, visible);
+    *placement = None;
     PopupToggleStep::Forward
 }
 
@@ -9210,7 +9211,11 @@ mod tests {
         fn a_layer_opened_by_a_named_key_is_placed_where_the_key_said() {
             let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
-            popup.toggle(&popup_key(&attached), Some(PopupPosition::Right), false);
+            popup.toggle(
+                &popup_key(&attached),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
             for _ in 0..2 {
                 sync_popup(
                     Some(layer(4, 2, 'x')),
@@ -9279,7 +9284,11 @@ mod tests {
             // The first box the server hears of, at attach.
             assert!(popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn).is_some());
             // Tab 1: open on the right. The open announces the drawer.
-            popup.toggle(&popup_key(&attached), Some(PopupPosition::Right), false);
+            popup.toggle(
+                &popup_key(&attached),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
             assert_eq!(
                 popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
                 Some((99, 45))
@@ -9326,7 +9335,11 @@ mod tests {
             let (mut renderer, chrome, mut popup, theme) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
             let conn = ConnId::Local;
-            popup.toggle(&popup_key(&attached), Some(PopupPosition::Right), false);
+            popup.toggle(
+                &popup_key(&attached),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
             assert_eq!(
                 popup_size_to_send(&mut popup, &chrome, &renderer, &attached, &conn),
                 Some((99, 45))
@@ -9373,9 +9386,9 @@ mod tests {
             let other = Some((ConnId::Local, "other".to_string()));
             // "other" left a popup open on the right; then "main" opened one at
             // the bottom.
-            popup.toggle(&popup_key(&other), Some(PopupPosition::Right), false);
+            popup.toggle(&popup_key(&other), Some(PopupPosition::Right.into()), false);
             popup.bind_layer(&popup_key(&other), Some(9));
-            popup.toggle(&popup_key(&main), Some(PopupPosition::Bottom), false);
+            popup.toggle(&popup_key(&main), Some(PopupPosition::Bottom.into()), false);
             popup.bind_layer(&popup_key(&main), Some(7));
             // The user attaches to "other". A frame "main" queued before the
             // switch arrives after it.
@@ -9436,13 +9449,13 @@ mod tests {
                 sync_popup(Some(l), popup, &chrome, renderer, &attached, &theme).unwrap();
             };
             // Tab 1: a right drawer.
-            popup.toggle(&key, Some(PopupPosition::Right), false);
+            popup.toggle(&key, Some(PopupPosition::Right.into()), false);
             let right = send(&mut popup, &renderer).expect("right announced");
             show(&mut popup, &mut renderer, 7);
             // Tab 2: no popup at first, then a bottom drawer.
             sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
             assert_eq!(send(&mut popup, &renderer), None);
-            popup.toggle(&key, Some(PopupPosition::Bottom), false);
+            popup.toggle(&key, Some(PopupPosition::Bottom.into()), false);
             let bottom = send(&mut popup, &renderer).expect("bottom announced");
             assert_ne!(bottom, right);
             show(&mut popup, &mut renderer, 9);
@@ -9490,7 +9503,11 @@ mod tests {
             let mut current = Some((ConnId::Local, "main".to_string()));
             let mut previous = Some((ConnId::Local, "old".to_string()));
             let conn = ConnId::Local;
-            popup.toggle(&popup_key(&current), Some(PopupPosition::Right), false);
+            popup.toggle(
+                &popup_key(&current),
+                Some(PopupPosition::Right.into()),
+                false,
+            );
             assert_eq!(
                 popup_size_to_send(&mut popup, &chrome, &renderer, &current, &conn),
                 Some((99, 45))
@@ -9564,7 +9581,7 @@ mod tests {
         fn a_popup_key_inside_a_view_is_swallowed() {
             let (renderer, chrome, mut popup, _) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
-            let mut cmd = RemuxCommand::PopupToggle(Some(PopupPosition::Right));
+            let mut cmd = RemuxCommand::PopupToggle(Some(PopupPosition::Right.into()));
             assert_eq!(
                 plan_popup_toggle(&mut cmd, &mut popup, &renderer, &attached, true),
                 PopupToggleStep::Swallow
@@ -9580,7 +9597,7 @@ mod tests {
         fn a_second_popup_key_before_the_first_layer_closes_it() {
             let (renderer, chrome, mut popup, _) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
-            let mut open = RemuxCommand::PopupToggle(Some(PopupPosition::Right));
+            let mut open = RemuxCommand::PopupToggle(Some(PopupPosition::Right.into()));
             assert_eq!(
                 plan_popup_toggle(&mut open, &mut popup, &renderer, &attached, false),
                 PopupToggleStep::Forward
@@ -9591,7 +9608,7 @@ mod tests {
                 "the server learns no position"
             );
             assert!(popup.is_opening());
-            let mut again = RemuxCommand::PopupToggle(Some(PopupPosition::Bottom));
+            let mut again = RemuxCommand::PopupToggle(Some(PopupPosition::Bottom.into()));
             assert_eq!(
                 plan_popup_toggle(&mut again, &mut popup, &renderer, &attached, false),
                 PopupToggleStep::Forward
@@ -9608,6 +9625,31 @@ mod tests {
             assert_eq!(
                 plan_popup_toggle(&mut other, &mut popup, &renderer, &attached, false),
                 PopupToggleStep::NotAToggle
+            );
+        }
+
+        #[test]
+        fn a_sized_popup_key_opens_at_its_size_and_the_server_learns_neither() {
+            let (renderer, chrome, mut popup, _) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let plain = popup_box_now(&popup, &chrome, &renderer, &attached);
+            let mut open = RemuxCommand::PopupToggle(Some(crate::config::PopupPlacement {
+                position: PopupPosition::Float,
+                size: Some(crate::config::PopupSize {
+                    width: Some(30),
+                    height: Some(30),
+                }),
+            }));
+            assert_eq!(
+                plan_popup_toggle(&mut open, &mut popup, &renderer, &attached, false),
+                PopupToggleStep::Forward
+            );
+            assert_eq!(open, RemuxCommand::PopupToggle(None));
+            let sized = popup_box_now(&popup, &chrome, &renderer, &attached);
+            assert_eq!(sized.frame, crate::client::popup::PopupFrame::Full);
+            assert!(
+                sized.rect.width < plain.rect.width && sized.rect.height < plain.rect.height,
+                "{sized:?} should be smaller than {plain:?}"
             );
         }
 
