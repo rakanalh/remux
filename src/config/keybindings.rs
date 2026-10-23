@@ -987,11 +987,13 @@ fn action_problem(action: &str) -> Option<String> {
     match action_spec(name) {
         None => Some(format!("unknown action '{name}'")),
         Some(_) if name == "PopupToggle" && resolve_action(action).is_none() => {
-            let error = crate::config::PopupPlacement::from_args(&tokens[1..]).err();
-            Some(format!(
-                "action 'PopupToggle' has {}",
-                error.unwrap_or_default()
-            ))
+            let reason = match crate::config::PopupPlacement::from_args(&tokens[1..]) {
+                Err(reason) => reason,
+                // `resolve_action` builds the command from the same parse, so
+                // it cannot fail where `from_args` succeeds.
+                Ok(_) => "arguments that do not resolve".to_string(),
+            };
+            Some(format!("action 'PopupToggle' has {reason}"))
         }
         Some(_) if resolve_action(action).is_none() => {
             Some(format!("action '{name}' is missing a required argument"))

@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_is_per_position_and_clamped() {
+    fn a_resize_is_per_placement_and_clamped() {
         use PopupPosition::{Float, Right};
         let mut s = PopupState::from_config(&config_with(Float, 80, 80));
         s.toggle("a", Some(Right.into()), false);

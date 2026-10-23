@@ -1877,17 +1877,17 @@ fn plan_popup_toggle(
     attached: &Option<(ConnId, String)>,
     view_active: bool,
 ) -> PopupToggleStep {
-    let RemuxCommand::PopupToggle(position) = cmd else {
+    let RemuxCommand::PopupToggle(placement) = cmd else {
         return PopupToggleStep::NotAToggle;
     };
     if view_active {
-        log::debug!("popup: toggle position={position:?} ignored while a View is up");
+        log::debug!("popup: toggle placement={placement:?} ignored while a View is up");
         return PopupToggleStep::Swallow;
     }
     let visible = renderer.popup_box().is_some() || popup.is_opening();
-    log::debug!("popup: toggle position={position:?} visible={visible}");
-    popup.toggle(&popup_key(attached), *position, visible);
-    *position = None;
+    log::debug!("popup: toggle placement={placement:?} visible={visible}");
+    popup.toggle(&popup_key(attached), *placement, visible);
+    *placement = None;
     PopupToggleStep::Forward
 }
 
