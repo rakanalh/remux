@@ -356,8 +356,6 @@ pub struct PopupState {
     /// moved box would resize every other tab's popup, and resize it back when
     /// the user returns. A session that never placed a popup uses the config.
     last_placed: HashMap<String, Option<PopupPlacement>>,
-    /// A close sent by [`PopupState::dismiss`] whose frame has not arrived.
-    closing: bool,
 }
 
 impl PopupState {
@@ -374,7 +372,6 @@ impl PopupState {
             on_screen: None,
             opening: None,
             last_placed: HashMap::new(),
-            closing: false,
         }
     }
 
@@ -435,7 +432,6 @@ impl PopupState {
     /// goes with it. Otherwise the popup opens at `placement` (`None`: the
     /// configured one), which binds to the popup when its first layer arrives.
     pub fn toggle(&mut self, session: &str, placement: Option<PopupPlacement>, visible: bool) {
-        self.closing = false;
         if visible {
             if let Some(pane) = self.on_screen {
                 self.named.remove(&(session.to_string(), pane));
@@ -444,21 +440,6 @@ impl PopupState {
         } else {
             self.opening = Some(placement);
         }
-    }
-
-    /// Record a close this client is about to send because a press landed
-    /// outside the popup, for `session`. Returns whether to send it.
-    ///
-    /// The server flips visibility on `PopupToggle`, so a second close sent
-    /// before the first one's frame arrives would open the popup again. The
-    /// close is pending until a frame arrives with no layer.
-    pub fn dismiss(&mut self, session: &str) -> bool {
-        if self.closing {
-            return false;
-        }
-        self.toggle(session, None, true);
-        self.closing = true;
-        true
     }
 
     /// Move everything kept for session `old` to `new`, after a rename.
@@ -498,9 +479,6 @@ impl PopupState {
         if let Some(pane) = pane {
             let named = self.named.get(&(session.to_string(), pane)).copied();
             self.last_placed.insert(session.to_string(), named);
-        }
-        if pane.is_none() {
-            self.closing = false;
         }
         self.on_screen = pane;
     }

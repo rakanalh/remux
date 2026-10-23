@@ -12683,6 +12683,24 @@ mod popup_tests {
     }
 
     #[tokio::test]
+    async fn a_press_off_every_region_only_hides_the_popup() {
+        for want in [Some((50, 10)), None] {
+            let dir = tempfile::tempdir().expect("dir");
+            let rig = Rig::new(100, 30, want, dir.path()).await;
+            let (_left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
+
+            press(&rig, u16::MAX, u16::MAX, false).await;
+            assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
+
+            // With the popup already hidden, the same press changes nothing:
+            // it must never open it.
+            press(&rig, u16::MAX, u16::MAX, false).await;
+            assert_eq!(focus_and_popup(&rig).await, (middle, false), "{want:?}");
+            rig.finish().await;
+        }
+    }
+
+    #[tokio::test]
     async fn a_focus_key_closes_the_popup_and_steps_from_the_pane_focused_before_it() {
         for (cmd, expect_right) in [
             (RemuxCommand::PaneFocusRight, true),

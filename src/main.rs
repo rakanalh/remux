@@ -1979,21 +1979,30 @@ fn dismisses_popup(
         && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
 }
 
-/// Close the popup for a press the client answers itself (a sidebar, its
-/// frame or collapse chip, the bar's tail), so the press has no server message
-/// to carry the close. A press the server gets closes the popup there instead,
-/// in the handler that acts on the press.
-async fn dismiss_popup(
-    mgr: &mut ConnectionManager,
-    popup: &mut PopupState,
-    attached: &Option<(ConnId, String)>,
-) -> Result<()> {
-    if popup.dismiss(&popup_key(attached)) {
-        log::debug!("popup: closing for a press outside the box");
-        mgr.send_foreground(ClientMessage::Command(RemuxCommand::PopupToggle(None)))
-            .await?;
+/// The message that closes the popup for a press the client answers itself
+/// (a sidebar, its frame or collapse chip, the bar's tail), so the press has no
+/// server message of its own to carry the close. A press the server gets closes
+/// the popup there instead, in the handler that acts on the press.
+///
+/// A `PopupToggle` would flip the popup, and the client's view of it lags the
+/// server's by a frame: sent after another client's close, or after this
+/// client's own earlier close, it would open the popup again. A press at
+/// `(u16::MAX, u16::MAX)` hits no pane, tab or stack label, so the server only
+/// runs the popup's dismissal, which hides and never opens. It also clears the
+/// client's content selection, as a press anywhere else in the content does.
+fn popup_dismiss_message() -> ClientMessage {
+    ClientMessage::MouseClick {
+        x: u16::MAX,
+        y: u16::MAX,
+        pane_id: None,
+        release: false,
+        popup: false,
     }
-    Ok(())
+}
+
+async fn dismiss_popup(mgr: &mut ConnectionManager) -> Result<()> {
+    log::debug!("popup: closing for a press outside the box");
+    mgr.send_foreground(popup_dismiss_message()).await
 }
 
 /// Resize the popup instead of the layout, when a popup is up and the keyboard
@@ -6231,7 +6240,7 @@ async fn run_client_loop(
                                 {
                                     mouse_grab = None;
                                     if popup_dismiss {
-                                        dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                        dismiss_popup(mgr).await?;
                                     }
                                     apply_sidebar_intent(
                                         SidebarApply {
@@ -6609,7 +6618,7 @@ async fn run_client_loop(
                                 if over_frame {
                                     mouse_grab = None;
                                     if popup_dismiss {
-                                        dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                        dismiss_popup(mgr).await?;
                                     }
                                     // The collapse chip and a collapsed strip were
                                     // answered before any routing; what is left of
@@ -6672,7 +6681,7 @@ async fn run_client_loop(
                                 .clamp(rect.y, rect.y + rect.height.saturating_sub(1))
                                 - rect.y;
                             if popup_dismiss {
-                                dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                dismiss_popup(mgr).await?;
                             }
                             let focus_before = chrome.focus;
                             // Only a press moves focus: the wheel and a drag
@@ -6761,7 +6770,7 @@ async fn run_client_loop(
                                 // No press also means the release sends nothing.
                                 drag_start = None;
                                 if popup_dismiss {
-                                    dismiss_popup(mgr, &mut popup, &current_attached).await?;
+                                    dismiss_popup(mgr).await?;
                                 }
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
@@ -9851,32 +9860,21 @@ mod tests {
         }
 
         #[test]
-        fn a_second_press_before_the_close_lands_does_not_toggle_the_popup_open_again() {
-            let (mut renderer, chrome, mut popup, theme) = setup();
-            let attached = Some((ConnId::Local, "main".to_string()));
-            sync_popup(
-                Some(layer(4, 2, 'x')),
-                &mut popup,
-                &chrome,
-                &mut renderer,
-                &attached,
-                &theme,
-            )
-            .unwrap();
-            let key = popup_key(&attached);
-            assert!(popup.dismiss(&key), "the first press sends the close");
-            assert!(!popup.dismiss(&key), "the layer is still up");
-            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
-            sync_popup(
-                Some(layer(4, 2, 'x')),
-                &mut popup,
-                &chrome,
-                &mut renderer,
-                &attached,
-                &theme,
-            )
-            .unwrap();
-            assert!(popup.dismiss(&key), "a popup opened since closes again");
+        fn a_press_the_client_answers_closes_the_popup_without_toggling_it() {
+            match popup_dismiss_message() {
+                ClientMessage::MouseClick {
+                    x,
+                    y,
+                    pane_id,
+                    release,
+                    popup,
+                } => {
+                    assert_eq!((x, y), (u16::MAX, u16::MAX), "off every region");
+                    assert_eq!(pane_id, None);
+                    assert!(!release && !popup, "a plain press");
+                }
+                other => panic!("expected a press that only dismisses, got {other:?}"),
+            }
         }
 
         #[test]

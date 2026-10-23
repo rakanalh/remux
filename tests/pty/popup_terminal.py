@@ -700,6 +700,18 @@ def dismiss_case():
         tui.send(sgr_click(5, 10), 1.5)
         check(not popup_open(tui), "a click on the sidebar closes the popup")
 
+        # The sidebar's own frame and the bar's tail past the server bar are
+        # answered by the client too; each closes the popup. A press on the
+        # content first takes the keyboard back from the sidebar.
+        for label, (cx, cy) in [("the sidebar's frame", (SIDEBAR_W - 1, 2)),
+                                ("the bar's tail", (SB_COLS - 1, SB_ROWS - 1))]:
+            tui.send(sgr_click(130, 2), 0.8)
+            tui.send(ALT_P)
+            tui.pump(1.8)
+            check(popup_open(tui), f"the popup opens before a press on {label}")
+            tui.send(sgr_click(cx, cy), 1.5)
+            check(not popup_open(tui), f"a press on {label} closes the popup")
+
         # A press on the popup's frame is swallowed. The sidebar holds the
         # keyboard after its press, so a press on the content takes it back.
         tui.send(sgr_click(130, 2), 0.8)
