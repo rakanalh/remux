@@ -986,6 +986,10 @@ fn action_problem(action: &str) -> Option<String> {
     let name = tokens.first()?;
     match action_spec(name) {
         None => Some(format!("unknown action '{name}'")),
+        Some(_) if name == "PopupToggle" && resolve_action(action).is_none() => Some(format!(
+            "action 'PopupToggle' has an invalid position '{}' (expected float, left, right, top or bottom)",
+            tokens.get(1).map(String::as_str).unwrap_or_default()
+        )),
         Some(_) if resolve_action(action).is_none() => {
             Some(format!("action '{name}' is missing a required argument"))
         }
@@ -1089,7 +1093,12 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
-        "PopupToggle" => Some(RemuxCommand::PopupToggle),
+        "PopupToggle" => match args.first() {
+            None => Some(RemuxCommand::PopupToggle(None)),
+            Some(arg) => {
+                crate::config::PopupPosition::parse(arg).map(|p| RemuxCommand::PopupToggle(Some(p)))
+            }
+        },
         "SessionSave" => Some(RemuxCommand::SessionSave),
         "EnterNormal" => Some(RemuxCommand::EnterNormal),
         "EnterCommandMode" => Some(RemuxCommand::EnterCommandMode),
@@ -1686,6 +1695,72 @@ mod tests {
     #[test]
     fn parse_command_tab_goto_missing_arg() {
         assert_eq!(parse_command("TabGoto"), None);
+    }
+
+    #[test]
+    fn parse_command_popup_toggle_takes_an_optional_position() {
+        use crate::config::PopupPosition::*;
+        assert_eq!(
+            parse_command("PopupToggle"),
+            Some(RemuxCommand::PopupToggle(None))
+        );
+        for (arg, position) in [
+            ("float", Float),
+            ("left", Left),
+            ("right", Right),
+            ("top", Top),
+            ("bottom", Bottom),
+        ] {
+            assert_eq!(
+                parse_command(&format!("PopupToggle {arg}")),
+                Some(RemuxCommand::PopupToggle(Some(position))),
+                "{arg}"
+            );
+        }
+        assert_eq!(parse_command("PopupToggle sideways"), None);
+    }
+
+    #[test]
+    fn a_bad_popup_position_is_a_named_config_error() {
+        let toml_str = r#"
+            "Alt-p" = "PopupToggle sideways"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+        let tree = KeybindingTree::from_toml(&toml::Value::Table(Default::default())).unwrap();
+        let problems = unresolved_actions(&tree, &shortcuts);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("'PopupToggle' has an invalid position 'sideways'"),
+            "{problems:#?}"
+        );
+    }
+
+    #[test]
+    fn the_popup_example_bindings_parse() {
+        // The bindings the docs show, as TOML writes them.
+        let toml_str = r#"
+            "Alt-p" = "PopupToggle"
+            "Alt--" = "PopupToggle bottom"
+            "Alt-\\" = "PopupToggle right"
+        "#;
+        let value: toml::Value = toml_str.parse().unwrap();
+        let shortcuts = ShortcutBindings::from_toml(&value).unwrap();
+        for (c, command) in [
+            ('p', "PopupToggle"),
+            ('-', "PopupToggle bottom"),
+            ('\\', "PopupToggle right"),
+        ] {
+            assert!(
+                matches!(
+                    shortcuts.bindings.get(&alt_key(c)),
+                    Some(InterceptAction::Command(v)) if v == &[command.to_string()]
+                ),
+                "Alt-{c}"
+            );
+        }
+        let tree = KeybindingTree::from_toml(&toml::Value::Table(Default::default())).unwrap();
+        assert!(unresolved_actions(&tree, &shortcuts).is_empty());
     }
 
     #[test]

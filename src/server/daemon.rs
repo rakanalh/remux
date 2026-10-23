@@ -23,8 +23,8 @@ use crate::protocol::*;
 use crate::screen::Screen;
 use crate::server::browse;
 use crate::server::compositor::{
-    composite, fits_zellij_border, hit_test, is_multi_stack, pane_content_rect, ClickTarget,
-    HitRegions, MouseSelection, StatusInfo,
+    composite, draw_popup, fits_zellij_border, hit_test, is_multi_stack, pane_content_rect,
+    render_popup_layer, ClickTarget, HitRegions, MouseSelection, PopupLayer, StatusInfo,
 };
 use crate::server::layout::{
     self, CustomLayout, EnabledLayouts, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
@@ -50,7 +50,21 @@ pub type DormantStore = Arc<Mutex<PersistedState>>;
 /// differently-sized clients. All render paths composite at one consistent
 /// session render size (min over attached clients), so a given client never
 /// mixes differently-sized frames.
-pub type PrevFrameCache = Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>;
+pub type PrevFrameCache = Arc<Mutex<HashMap<u64, PrevFrame>>>;
+
+/// What a client was last sent, which is what its next frame is diffed against.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrevFrame {
+    /// The frame's cells. For a client that does not place the popup itself,
+    /// these include the popup the server drew into them.
+    pub cells: Vec<Vec<RenderCell>>,
+    /// The popup layer a client that places the popup itself holds, with its
+    /// `(cols, rows)`. `None` when no layer is up.
+    pub popup: Option<PrevLayer>,
+}
+
+/// The popup layer a client holds: its `(cols, rows)` and its cells.
+pub type PrevLayer = ((u16, u16), Vec<Vec<RenderCell>>);
 
 /// The name of the process with this pid, e.g. `"zsh"` or `"claude"`.
 ///
@@ -872,12 +886,12 @@ struct ClientConnection {
     /// in eviction-stable absolute coordinates so edge auto-scroll doesn't drift.
     drag: Option<DragSession>,
     /// Armed when a drag is resting on a scrollable content edge: stores the last
-    /// drag coordinates `(start_x, start_y, end_x, end_y)` so the per-client
+    /// drag coordinates `(start_x, start_y, end_x, end_y, popup_local)` so the per-client
     /// reader loop can replay the edge-scroll step on a repeating timer while the
     /// pointer is held still (terminals stop emitting drag events without motion).
     /// `None` disarms the timer -- set at construction, on click, on release, and
     /// whenever the scroll reaches its bound.
-    autoscroll_repeat: Option<(u16, u16, u16, u16)>,
+    autoscroll_repeat: Option<(u16, u16, u16, u16, bool)>,
     /// Panes this client has subscribed to via `SubscribePane`, mapped to the
     /// subscribing cell's size demand: `Some((cols, rows))` for a cell that
     /// SHOWS the pane and so demands it reflow to fit, or `None` for a
@@ -932,6 +946,12 @@ struct ClientConnection {
     /// [`ClientMessage::TabStyle`]. `None` until it says, and for ever for an
     /// older client or the CLI.
     tab_style: Option<TabStyle>,
+    /// The popup interior this client asked for with
+    /// [`ClientMessage::PopupSize`]. `None` for a client that never asked (an
+    /// older client, or the CLI): the server then draws the popup into its
+    /// frames itself, as a framed float, and sizes the popup PTY so that
+    /// float's interior fits.
+    popup_want: Option<(u16, u16)>,
 }
 
 impl ClientConnection {
@@ -981,7 +1001,7 @@ pub struct RemuxServer {
     next_client_id: Arc<AtomicU64>,
     /// Previous composite frame per client (keyed by `client_id`), for diff
     /// computation. See [`PrevFrameCache`].
-    prev_frames: Arc<Mutex<HashMap<u64, Vec<Vec<RenderCell>>>>>,
+    prev_frames: PrevFrameCache,
     /// Dormant (saved-but-not-live) sessions awaiting resurrection. See
     /// [`DormantStore`].
     dormant: DormantStore,
@@ -1309,6 +1329,7 @@ impl RemuxServer {
                     agents_subscribed: false,
                     naming: None,
                     tab_style: None,
+                    popup_want: None,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -1384,7 +1405,15 @@ impl RemuxServer {
                     }
                     Ok(None) => {
                         log::info!("client {client_id} disconnected");
-                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        handle_client_disconnect(
+                            client_id,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -1394,7 +1423,15 @@ impl RemuxServer {
                     }
                     Err(e) => {
                         log::error!("error reading from client {client_id}: {e}");
-                        handle_client_disconnect(client_id, &clients, &prev_frames).await;
+                        handle_client_disconnect(
+                            client_id,
+                            &state,
+                            &panes,
+                            &clients,
+                            &config,
+                            &prev_frames,
+                        )
+                        .await;
                         // A hard disconnect of the client that made a pane
                         // session-visible must flip any View cell on that pane
                         // from the "Active in session" placeholder to live
@@ -1433,7 +1470,7 @@ impl RemuxServer {
                         None => break,
                     }
                 };
-                if let Some((sx, sy, ex, ey)) = armed {
+                if let Some((sx, sy, ex, ey, popup_local)) = armed {
                     if let Err(e) = handle_mouse_drag(
                         client_id,
                         sx,
@@ -1441,6 +1478,7 @@ impl RemuxServer {
                         ex,
                         ey,
                         false,
+                        popup_local,
                         &ts_state,
                         &ts_panes,
                         &ts_clients,
@@ -1610,6 +1648,7 @@ async fn handle_client_message(
             end_y,
             is_final,
             pane_id,
+            popup: _,
         } => {
             log::debug!(
                 "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final}, pane_id={pane_id:?})"
@@ -1640,7 +1679,7 @@ async fn handle_client_message(
             result
         }
         ClientMessage::Detach => {
-            handle_detach(client_id, clients).await;
+            handle_detach(client_id, state, panes, clients, config, prev_frames).await;
             mark_focus_changed();
             // Detaching may make this client's active-tab panes no longer
             // session-visible; re-evaluate subscribed panes so any View cell on
@@ -1873,6 +1912,7 @@ async fn handle_client_message(
             y,
             pane_id,
             release,
+            popup,
         } => match pane_id {
             Some(pid) => {
                 handle_pane_mouse_click(client_id, pid, x, y, release, state, panes, clients).await
@@ -1883,6 +1923,7 @@ async fn handle_client_message(
                     x,
                     y,
                     release,
+                    popup,
                     state,
                     panes,
                     clients,
@@ -1899,6 +1940,7 @@ async fn handle_client_message(
             end_y,
             is_final,
             pane_id,
+            popup,
         } => match pane_id {
             Some(pid) => {
                 handle_pane_mouse_drag(
@@ -1915,6 +1957,7 @@ async fn handle_client_message(
                     end_x,
                     end_y,
                     is_final,
+                    popup,
                     state,
                     panes,
                     clients,
@@ -1924,6 +1967,18 @@ async fn handle_client_message(
                 .await
             }
         },
+        ClientMessage::PopupSize { cols, rows } => {
+            handle_popup_size(
+                client_id,
+                (cols, rows),
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
+        }
         ClientMessage::ScrollDelta { delta } => {
             // No coordinates, so this scrolls whichever pane owns input.
             handle_scroll_delta(
@@ -1938,12 +1993,13 @@ async fn handle_client_message(
             )
             .await
         }
-        ClientMessage::MouseScroll { x, y, up } => {
+        ClientMessage::MouseScroll { x, y, up, popup } => {
             handle_mouse_scroll(
                 client_id,
                 x,
                 y,
                 up,
+                popup,
                 state,
                 panes,
                 clients,
@@ -2420,7 +2476,7 @@ async fn handle_attach(
         }
     }
 
-    let (cols, rows) = {
+    let (cols, rows, left) = {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
             if client.session_name.as_deref() != Some(session_name) {
@@ -2435,12 +2491,18 @@ async fn handle_attach(
                 client.prev_scroll_offset = 0;
                 client.prev_scroll_pane = None;
             }
-            client.session_name = Some(session_name.to_string());
-            (client.cols, client.rows)
+            let left = client
+                .session_name
+                .replace(session_name.to_string())
+                .filter(|old| old != session_name);
+            (client.cols, client.rows, left)
         } else {
             return Ok(());
         }
     };
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
+    }
 
     log::debug!("server: client_id={client_id} attach session={session_name:?} dims={cols}x{rows}");
 
@@ -2502,11 +2564,36 @@ async fn handle_attach(
     Ok(())
 }
 
-async fn handle_detach(client_id: u64, clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>) {
+/// Tell every client that session `old` is now `new`. A client keeps the
+/// names of the sessions it is attached to and was last on, and keys its popup
+/// state by them, and frames only ever name the session as it is now.
+fn announce_session_rename(cls: &HashMap<u64, ClientConnection>, old: &str, new: &str) {
+    for client in cls.values() {
+        let _ = client
+            .tx
+            .send(ServerMessage::Event(SessionEvent::SessionRenamed {
+                old: old.to_string(),
+                new: new.to_string(),
+            }));
+    }
+}
+
+async fn handle_detach(
+    client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
     log::debug!("server: client_id={client_id} detach");
-    let mut cls = clients.lock().await;
-    if let Some(client) = cls.get_mut(&client_id) {
-        client.session_name = None;
+    let left = {
+        let mut cls = clients.lock().await;
+        cls.get_mut(&client_id)
+            .and_then(|client| client.session_name.take())
+    };
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
     }
 }
 
@@ -2751,6 +2838,32 @@ async fn client_input_target(
     Some((session_name, pane_id))
 }
 
+/// The largest terminal a client may report, in columns and rows.
+///
+/// A size is only a claim the client makes, and every frame the server builds
+/// for a session allocates its cells at the smallest size reported. These caps
+/// sit far past any real terminal, so they only bound what a broken or hostile
+/// client can make the server allocate.
+const MAX_TERMINAL_COLS: u16 = 2048;
+const MAX_TERMINAL_ROWS: u16 = 1024;
+
+/// `(cols, rows)` from a client's `what` message, clamped to `1..=` the
+/// terminal maximum on each axis.
+fn clamp_client_size(what: &str, cols: u16, rows: u16) -> (u16, u16) {
+    let clamped = (
+        cols.clamp(1, MAX_TERMINAL_COLS),
+        rows.clamp(1, MAX_TERMINAL_ROWS),
+    );
+    if clamped != (cols, rows) {
+        log::warn!(
+            "server: {what} {cols}x{rows} is out of range, clamped to {}x{}",
+            clamped.0,
+            clamped.1
+        );
+    }
+    clamped
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_resize(
     client_id: u64,
@@ -2762,6 +2875,7 @@ async fn handle_resize(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    let (cols, rows) = clamp_client_size("Resize", cols, rows);
     let session_name = {
         let mut cls = clients.lock().await;
         if let Some(client) = cls.get_mut(&client_id) {
@@ -2840,8 +2954,9 @@ async fn handle_command(
     // -- Popup command guard -----------------------------------------------
     //
     // **THE layout-mutation chokepoint, and the structural half of the hard
-    // invariant.** While the popup is visible it is the input target, so a
-    // layout-mutating command would run with the popup as its subject -- and
+    // invariant.** While the active tab's popup is visible it is the input
+    // target, so a layout-mutating command would run with the popup as its
+    // subject -- and
     // `PaneMove*` (swap_panes / relocate_pane_to_edge), `SetMaster` (promotes a
     // pane), `LayoutNext` (rebuilds from `pane_order`) and the stack ops
     // (splice nodes) would each be a route for the popup pane to get captured by
@@ -2849,67 +2964,20 @@ async fn handle_command(
     // popup subject; the other half of the invariant is that nothing ever
     // *inserts* the popup id into `pane_order` or a tree in the first place.
     //
-    // Three-way, in order: reroute -> block -> pass.
+    // Two-way: block -> pass.
     if !session_name.is_empty() {
         let popup_visible = {
             let st = state.lock().await;
             st.sessions
                 .get(&session_name)
-                .map(|s| s.popup_visible && s.popup_pane.is_some())
-                .unwrap_or(false)
+                .is_some_and(|s| s.visible_popup().is_some())
         };
         if popup_visible {
             match cmd {
-                // Reroute: resize adjusts the popup's own size; close closes the
-                // popup (resolved via the popup-aware `input_target` below).
-                RemuxCommand::ResizeLeft(_)
-                | RemuxCommand::ResizeRight(_)
-                | RemuxCommand::ResizeUp(_)
-                | RemuxCommand::ResizeDown(_) => {
-                    let (dw, dh) = match cmd {
-                        RemuxCommand::ResizeLeft(a) => (-(a as i16), 0),
-                        RemuxCommand::ResizeRight(a) => (a as i16, 0),
-                        RemuxCommand::ResizeUp(a) => (0, -(a as i16)),
-                        RemuxCommand::ResizeDown(a) => (0, a as i16),
-                        _ => unreachable!(),
-                    };
-                    // This arm renders and returns, so it never reaches the
-                    // snap below `match cmd`. Without this the popup could be
-                    // resized under a scrolled client and the broadcast at the
-                    // bottom of the arm would skip it -- the same silent-command
-                    // defect, reached by the one route that gets past the guard.
-                    // The rule itself still lives only in `returns_to_live_tail`.
-                    if cmd.returns_to_live_tail(&session_name) {
-                        snap_client_to_live_tail(
-                            client_id,
-                            state,
-                            panes,
-                            clients,
-                            config,
-                            prev_frames,
-                        )
-                        .await;
-                    }
-                    {
-                        let mut st = state.lock().await;
-                        if let Some(sess) = st.sessions.get_mut(&session_name) {
-                            let new_size = sess.resize_popup(dw, dh);
-                            log::debug!("server: popup resize -> {new_size:?}");
-                        }
-                    }
-                    resize_session_panes(&session_name, state, panes, clients, config).await?;
-                    invalidate_session_baselines(&session_name, clients, prev_frames).await;
-                    broadcast_full_render(
-                        &session_name,
-                        state,
-                        panes,
-                        clients,
-                        config,
-                        prev_frames,
-                    )
-                    .await;
-                    return Ok(());
-                }
+                // Close closes the popup (resolved via the popup-aware
+                // `input_target` below). Resize is NOT rerouted: the client owns
+                // the popup's size and adjusts it itself, so the server only
+                // keeps the layout from being resized underneath the popup.
                 // Block: everything that reshapes the layout tree, `pane_order`,
                 // or `zoomed_pane`. Two deliberate additions beyond the layout
                 // mutators: `PaneNew` (it pushes to `pane_order`, and the user is
@@ -2918,7 +2986,11 @@ async fn handle_command(
                 // accumulate a hidden rename whose border cursor is suppressed by
                 // the popup's cursor override, with the user's keystrokes going
                 // to the popup's shell instead.
-                RemuxCommand::PaneRename(_)
+                RemuxCommand::ResizeLeft(_)
+                | RemuxCommand::ResizeRight(_)
+                | RemuxCommand::ResizeUp(_)
+                | RemuxCommand::ResizeDown(_)
+                | RemuxCommand::PaneRename(_)
                 | RemuxCommand::PaneFocusLeft
                 | RemuxCommand::PaneFocusRight
                 | RemuxCommand::PaneFocusUp
@@ -2949,8 +3021,8 @@ async fn handle_command(
                     return Ok(());
                 }
                 // Pass: PopupToggle, PaneClose (popup-aware target), tab
-                // switching (the popup is session-scoped and survives it), and
-                // everything non-layout.
+                // switching (each tab keeps its own popup), and everything
+                // non-layout.
                 _ => {}
             }
         }
@@ -2988,37 +3060,47 @@ async fn handle_command(
     }
 
     match cmd {
-        RemuxCommand::PopupToggle => {
-            // Lazily spawn the popup pane on first use, then just flip
-            // visibility. The pane is registered in the pane map ONLY -- never in
-            // `tab.pane_order`, never in a layout tree.
+        RemuxCommand::PopupToggle(position) => {
+            if position.is_some() {
+                log::debug!("server: PopupToggle position={position:?} ignored, the client places the popup");
+            }
+            // Lazily spawn the active tab's popup pane on that tab's first
+            // use, then just flip visibility. The pane is registered in the pane
+            // map ONLY -- never in `tab.pane_order`, never in a layout tree.
             let (spawn, source_pane_id) = {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
                     Some(s) => s,
                     None => return Ok(()),
                 };
-                let source = sess.tabs.get(sess.active_tab).map(|t| t.focused_pane);
-                match sess.popup_pane {
+                let active_tab = sess.active_tab;
+                let Some(tab) = sess.tabs.get_mut(active_tab) else {
+                    return Ok(());
+                };
+                let source = Some(tab.focused_pane);
+                match tab.popup_pane {
                     Some(existing) => {
-                        sess.popup_visible = !sess.popup_visible;
+                        tab.popup_visible = !tab.popup_visible;
                         log::debug!(
-                            "server: PopupToggle session={session_name:?} pane_id={existing} visible={}",
-                            sess.popup_visible
+                            "server: PopupToggle session={session_name:?} tab={active_tab} pane_id={existing} visible={}",
+                            tab.popup_visible
                         );
                         (None, source)
                     }
                     None => {
                         let new_id = st.next_pane_id();
                         // Re-borrow: `next_pane_id` needed `st` mutably.
-                        let sess = match st.sessions.get_mut(&session_name) {
-                            Some(s) => s,
-                            None => return Ok(()),
+                        let Some(tab) = st
+                            .sessions
+                            .get_mut(&session_name)
+                            .and_then(|s| s.tabs.get_mut(active_tab))
+                        else {
+                            return Ok(());
                         };
-                        sess.popup_pane = Some(new_id);
-                        sess.popup_visible = true;
+                        tab.popup_pane = Some(new_id);
+                        tab.popup_visible = true;
                         log::debug!(
-                            "server: PopupToggle session={session_name:?} spawned popup pane_id={new_id}"
+                            "server: PopupToggle session={session_name:?} tab={active_tab} spawned popup pane_id={new_id}"
                         );
                         (Some(new_id), source)
                     }
@@ -3032,24 +3114,12 @@ async fn handle_command(
                         .and_then(|id| panes_lock.get(&id))
                         .and_then(|p| persistence::get_pane_cwd(p.pty.child_pid))
                 };
-                let area = Rect {
-                    x: 0,
-                    y: 0,
-                    width: cols,
-                    height: rows.saturating_sub(1),
-                };
-                let popup_size = {
-                    let st = state.lock().await;
-                    st.sessions
-                        .get(&session_name)
-                        .map(|s| s.popup_size)
-                        .unwrap_or((80, 80))
-                };
-                let rect = layout::popup_rect(area, popup_size);
-                spawn_pane(
+                let (interior_cols, interior_rows) =
+                    session_popup_interior(&session_name, clients, config).await;
+                if let Err(e) = spawn_pane(
                     new_id,
-                    rect.width.saturating_sub(2).max(1),
-                    rect.height.saturating_sub(2).max(1),
+                    interior_cols,
+                    interior_rows,
                     None,
                     &[],
                     focused_cwd.as_deref().map(std::path::Path::new),
@@ -3060,7 +3130,26 @@ async fn handle_command(
                     panes,
                     config,
                 )
-                .await?;
+                .await
+                {
+                    // The tab was given the popup before the spawn. Left there,
+                    // it would be a visible popup with no pane: the guard would
+                    // block the layout, input would go nowhere, and the next
+                    // toggle would only hide it. Looked up by id, because the
+                    // active tab may have changed while the spawn was awaited.
+                    let mut st = state.lock().await;
+                    if let Some(tab) = st
+                        .sessions
+                        .get_mut(&session_name)
+                        .and_then(|s| s.tabs.iter_mut().find(|t| t.popup_pane == Some(new_id)))
+                    {
+                        tab.take_popup();
+                    }
+                    log::error!(
+                        "server: PopupToggle session={session_name:?} popup pane_id={new_id} failed to spawn: {e:#}"
+                    );
+                    return Err(e);
+                }
                 start_pty_forwarding(
                     &session_name,
                     state,
@@ -3073,8 +3162,9 @@ async fn handle_command(
                 .await;
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
-            // Showing/hiding the popup repaints a large region; force a clean
-            // full render so no diff baseline can keep stale popup cells.
+            // Showing/hiding the popup changes the layer every asking client
+            // holds; force a clean full render so no diff baseline can keep
+            // stale popup cells.
             invalidate_session_baselines(&session_name, clients, prev_frames).await;
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
@@ -3516,6 +3606,9 @@ async fn handle_command(
             if let Some(popup) = &moved.source_removed {
                 reap_panes(popup, panes, clients).await;
             }
+            if let Some(popup) = moved.source_tab_popup {
+                reap_panes(&[popup], panes, clients).await;
+            }
             if moved.target_session != session_name {
                 // A client of the source that scrolled the pane back would
                 // otherwise keep that offset for a pane it can no longer see.
@@ -3704,7 +3797,7 @@ async fn handle_command(
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionDetach => {
-            handle_detach(client_id, clients).await;
+            handle_detach(client_id, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::SessionList => {
             handle_list_sessions(client_id, state, clients).await?;
@@ -3721,6 +3814,7 @@ async fn handle_command(
                     client.session_name = Some(new_name.clone());
                 }
             }
+            announce_session_rename(&cls, &session_name, &new_name);
         }
         RemuxCommand::PaneRename(name) => {
             let name = crate::config::pane_title::sanitize_label(&name);
@@ -3864,12 +3958,16 @@ async fn handle_command(
         }
         RemuxCommand::SessionSwitchTab { session, tab_index } => {
             // Attach the client to the specified session and switch to the tab.
-            {
-                let mut cls = clients.lock().await;
-                if let Some(client) = cls.get_mut(&client_id) {
-                    client.session_name = Some(session.clone());
-                }
-            }
+            switch_client_session(
+                client_id,
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
             {
                 let mut st = state.lock().await;
                 if let Err(e) = st.goto_tab(&session, tab_index) {
@@ -3909,12 +4007,16 @@ async fn handle_command(
             pane_id,
         } => {
             // Attach to session, switch tab, and focus pane.
-            {
-                let mut cls = clients.lock().await;
-                if let Some(client) = cls.get_mut(&client_id) {
-                    client.session_name = Some(session.clone());
-                }
-            }
+            switch_client_session(
+                client_id,
+                &session,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await;
             {
                 let mut st = state.lock().await;
                 if let Err(e) = st.goto_tab(&session, tab_index) {
@@ -3933,7 +4035,17 @@ async fn handle_command(
                             );
                             return Ok(());
                         }
-                        tab.focus_pane(pane_id);
+                        // The tab's visible popup owns input, and hiding it
+                        // returns input to `focused_pane`. Moving that here would
+                        // send the user somewhere else when the popup closes, so
+                        // the switch lands on the tab and its popup only.
+                        if tab.popup_visible {
+                            log::debug!(
+                                "SessionSwitchPane: tab {tab_index} of '{session}' has its popup up, pane {pane_id} is not focused"
+                            );
+                        } else {
+                            tab.focus_pane(pane_id);
+                        }
                     }
                     session::debug_check_invariant(sess, "SessionSwitchPane");
                 }
@@ -4151,6 +4263,7 @@ async fn handle_command(
                         client.session_name = Some(new.clone());
                     }
                 }
+                announce_session_rename(&cls, &old, &new);
             }
         }
         RemuxCommand::FolderRename { old, new } => {
@@ -4245,6 +4358,7 @@ async fn handle_command(
                 // at least the active tab also exists, so the session can never
                 // be emptied here — the last-session/switch/disconnect branch is
                 // unreachable and intentionally omitted.
+                let mut to_reap = vec![pane_id];
                 {
                     let mut st = state.lock().await;
                     let sess = match st.sessions.get_mut(&session) {
@@ -4267,7 +4381,11 @@ async fn handle_command(
                     let tab = &mut sess.tabs[tab_idx];
                     match tab.detach_pane(pane_id) {
                         Some(nf) => {
-                            tab.focus_pane(nf);
+                            // As in `close_pane`: only the focused pane closing
+                            // moves focus.
+                            if tab.focused_pane == pane_id {
+                                tab.focus_pane(nf);
+                            }
                             tab.rebuild_if_automatic();
                             session::debug_check_invariant(sess, "PaneCloseById");
                         }
@@ -4276,14 +4394,14 @@ async fn handle_command(
                             // Adjust active_tab if it sat after the removed tab
                             // (close_pane never does this — it only removes the
                             // active tab itself).
-                            sess.tabs.remove(tab_idx);
+                            to_reap.extend(sess.tabs.remove(tab_idx).take_popup());
                             if tab_idx < sess.active_tab {
                                 sess.active_tab -= 1;
                             }
                         }
                     }
                 }
-                reap_panes(&[pane_id], panes, clients).await;
+                reap_panes(&to_reap, panes, clients).await;
                 refresh_target_session(&session, state, panes, clients, config, prev_frames)
                     .await?;
             }
@@ -4379,11 +4497,7 @@ async fn handle_create_session(
         let mut st = state.lock().await;
         let border_style = config.appearance.border_style.clone();
         let layout_mode = config.new_tab_layout();
-        let popup_size = (
-            config.appearance.popup_width_pct,
-            config.appearance.popup_height_pct,
-        );
-        st.create_session(name, folder, border_style, layout_mode, popup_size)?
+        st.create_session(name, folder, border_style, layout_mode)?
     };
     log::debug!("server: CreateSession name={name:?} folder={folder:?} pane_id={pane_id}");
     spawn_pane(
@@ -5118,19 +5232,25 @@ async fn handle_kill_session(
 /// is not supposed to kill anything.
 async fn handle_client_disconnect(
     client_id: u64,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) {
     log::debug!("server: client_id={client_id} disconnected, removing from client map");
-    {
+    let left = {
         let mut cls = clients.lock().await;
-        cls.remove(&client_id);
-    }
+        cls.remove(&client_id).and_then(|c| c.session_name)
+    };
     // Drop this client's diff baseline so the per-client cache doesn't grow
     // unbounded as clients come and go.
     {
         let mut pf = prev_frames.lock().await;
         pf.remove(&client_id);
+    }
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
     }
     // Removing the `ClientConnection` above dropped any session-tree
     // subscription with it -- but it also changed the `client_count` every
@@ -5387,22 +5507,23 @@ fn mouse_route(screen: &Screen, gesture: MouseGesture, copy_mode: bool) -> Mouse
     }
 }
 
-/// Map a full-screen coordinate into the 1-based, content-relative coordinates
-/// a mouse report carries, applying the same border inset the compositor drew
-/// the pane with. Shared by every session-scoped forwarding site; the
-/// pane-scoped ones receive content coordinates already (the client owns a
-/// View cell's geometry) and only add the 1-based bias.
-fn report_coords(config: &Config, pane_rect: Rect, x: u16, y: u16) -> (u16, u16) {
-    let border_offset: u16 = match config.appearance.border_style {
+/// The width of the border a layout pane's content sits inside, on each side:
+/// what the compositor drew the pane with.
+fn pane_inset(config: &Config, pane_rect: Rect) -> u16 {
+    match config.appearance.border_style {
         BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
         _ => 0,
-    };
-    let col = x
-        .saturating_sub(pane_rect.x + border_offset)
-        .saturating_add(1);
-    let row = y
-        .saturating_sub(pane_rect.y + border_offset)
-        .saturating_add(1);
+    }
+}
+
+/// Map a full-screen coordinate into the 1-based, content-relative coordinates
+/// a mouse report carries, applying the `inset` the content sits inside
+/// `pane_rect` with. Shared by every session-scoped forwarding site; the
+/// pane-scoped ones receive content coordinates already (the client owns a
+/// View cell's geometry) and only add the 1-based bias.
+fn report_coords(pane_rect: Rect, inset: u16, x: u16, y: u16) -> (u16, u16) {
+    let col = x.saturating_sub(pane_rect.x + inset).saturating_add(1);
+    let row = y.saturating_sub(pane_rect.y + inset).saturating_add(1);
     (col, row)
 }
 
@@ -5764,13 +5885,14 @@ async fn handle_mouse_scroll(
     x: u16,
     y: u16,
     up: bool,
+    popup_local: bool,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode, naming, theme) = {
+    let (session_name, cols, rows, mode, naming, theme, asking) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -5783,6 +5905,7 @@ async fn handle_mouse_scroll(
             client.mode.clone(),
             client.naming(),
             client.theme(config),
+            client.popup_want.is_some(),
         )
     };
     let session_name = match session_name {
@@ -5792,7 +5915,7 @@ async fn handle_mouse_scroll(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup, _status) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, mut hit_regions, pane_rects, _ack, _bp, layer, _status) =
         build_composite(
             &session_name,
             cols,
@@ -5809,9 +5932,27 @@ async fn handle_mouse_scroll(
         )
         .await;
 
+    // A client that sent interior-local coordinates did so because it held a
+    // popup layer; if the popup is gone by now those coordinates mean nothing
+    // to the layout, so the event is dropped.
+    if popup_local && layer.is_none() {
+        return Ok(());
+    }
+    let popup = mouse_popup(layer.as_ref(), popup_local, asking, (cols, rows), config);
+    if let Some((rect, _)) = popup.hit {
+        // Stack/tab labels the popup covers must stop being clickable, or a
+        // click inside the popup could activate a hidden pane behind it.
+        hit_regions.stack_regions.retain(|r| {
+            !(r.y >= rect.y
+                && r.y < rect.y + rect.height
+                && r.x_end > rect.x
+                && r.x_start < rect.x + rect.width)
+        });
+    }
+
     // Find the pane under the cursor; fall back to whichever pane owns input
     // (the popup while it is up, else the active tab's focused pane).
-    let target = hit_test_with_popup(x, y, &hit_regions, &pane_rects, popup);
+    let target = hit_test_with_popup(x, y, &hit_regions, &pane_rects, &popup);
     let target_pane = match target {
         ClickTarget::Pane(id) => id,
         _ => {
@@ -5828,7 +5969,7 @@ async fn handle_mouse_scroll(
     };
 
     // Find the target pane's rect for coordinate mapping.
-    let pane_rect = match rect_of_pane(&pane_rects, popup, target_pane) {
+    let (pane_rect, inset) = match rect_of_pane(&pane_rects, &popup, config, target_pane) {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -5842,7 +5983,7 @@ async fn handle_mouse_scroll(
 
     match route {
         MouseRoute::App { sgr, .. } => {
-            let (col, row) = report_coords(config, pane_rect, x, y);
+            let (col, row) = report_coords(pane_rect, inset, x, y);
             let bytes = wheel_report(sgr, up, col, row);
             log::debug!(
                 "server: MouseScroll->app client_id={client_id} pane_id={target_pane} sgr={sgr} up={up} col={col} row={row}"
@@ -5896,6 +6037,72 @@ fn alt_scroll_arrows(app_cursor: bool, up: bool, lines: u16) -> Vec<u8> {
     bytes
 }
 
+/// How the active tab's popup takes part in one mouse event.
+struct MousePopup {
+    /// The popup pane while the popup is visible. The "popup owns input" guards
+    /// key on this, whether or not the event can hit the popup.
+    pane: Option<PaneId>,
+    /// The popup's rect in the event's coordinate space and the inset of its
+    /// content inside that rect. `None` for a client that places the popup
+    /// itself but sent screen coordinates: it has no rect the server could
+    /// hit-test against.
+    hit: Option<(Rect, u16)>,
+    /// The event's coordinates are interior-local, so the popup is its target
+    /// with no hit test.
+    local: bool,
+}
+
+/// Resolve [`MousePopup`] for a client from the layer `build_composite`
+/// returned.
+///
+/// * `local` (the client sent `popup: true`): the rect is the layer's own
+///   `(0, 0, cols, rows)` with no inset.
+/// * A client that places the popup itself, with screen coordinates: no rect.
+/// * A client that does not: the rect of the float the server drew for it, with
+///   the inset [`pane_inset`] gives a layout pane of that rect.
+fn mouse_popup(
+    layer: Option<&PopupLayer>,
+    local: bool,
+    asking: bool,
+    (cols, rows): (u16, u16),
+    config: &Config,
+) -> MousePopup {
+    let Some(layer) = layer else {
+        return MousePopup {
+            pane: None,
+            hit: None,
+            local: false,
+        };
+    };
+    let hit = if local {
+        Some((
+            Rect {
+                x: 0,
+                y: 0,
+                width: layer.cols,
+                height: layer.rows,
+            },
+            0,
+        ))
+    } else if asking {
+        None
+    } else {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: rows.saturating_sub(1),
+        };
+        let rect = layout::popup_rect(area, legacy_popup_pct(config));
+        Some((rect, pane_inset(config, rect)))
+    };
+    MousePopup {
+        pane: Some(layer.pane_id),
+        hit,
+        local,
+    }
+}
+
 /// Popup-aware hit test: **the mouse chokepoint.**
 ///
 /// The popup floats above everything, so any coordinate inside its rect resolves
@@ -5907,32 +6114,38 @@ fn hit_test_with_popup(
     y: u16,
     regions: &HitRegions,
     pane_rects: &[(PaneId, Rect)],
-    popup: Option<(PaneId, Rect)>,
+    popup: &MousePopup,
 ) -> ClickTarget {
-    if let Some((pane_id, r)) = popup {
-        if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
+    if let Some(pane_id) = popup.pane {
+        if popup.local {
             return ClickTarget::Pane(pane_id);
+        }
+        if let Some((r, _)) = popup.hit {
+            if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
+                return ClickTarget::Pane(pane_id);
+            }
         }
     }
     hit_test(x, y, regions, pane_rects)
 }
 
-/// The screen rect of `pane_id` for coordinate mapping, popup included. The
-/// popup is never in `pane_rects`, so it must be resolved separately.
+/// The screen rect of `pane_id` for coordinate mapping and the inset of its
+/// content, popup included. The popup is never in `pane_rects`, so it must be
+/// resolved separately. A client that places the popup itself has no popup rect
+/// for a screen-coordinate event, so the popup resolves to `None` there.
 fn rect_of_pane(
     pane_rects: &[(PaneId, Rect)],
-    popup: Option<(PaneId, Rect)>,
+    popup: &MousePopup,
+    config: &Config,
     pane_id: PaneId,
-) -> Option<Rect> {
-    if let Some((pid, r)) = popup {
-        if pid == pane_id {
-            return Some(r);
-        }
+) -> Option<(Rect, u16)> {
+    if popup.pane == Some(pane_id) {
+        return popup.hit;
     }
     pane_rects
         .iter()
         .find(|(id, _)| *id == pane_id)
-        .map(|(_, r)| *r)
+        .map(|(_, r)| (*r, pane_inset(config, *r)))
 }
 
 /// Disarm the drag-autoscroll repeat timer for a client. Called from the early
@@ -5953,13 +6166,14 @@ async fn handle_mouse_click(
     x: u16,
     y: u16,
     release: bool,
+    popup_local: bool,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
-    let (session_name, cols, rows, mode, naming, theme) = {
+    let (session_name, cols, rows, mode, naming, theme, asking) = {
         let mut cls = clients.lock().await;
         let client = match cls.get_mut(&client_id) {
             Some(c) => c,
@@ -5983,6 +6197,7 @@ async fn handle_mouse_click(
             client.mode.clone(),
             client.naming(),
             client.theme(config),
+            client.popup_want.is_some(),
         )
     };
     let session_name = match session_name {
@@ -5992,7 +6207,7 @@ async fn handle_mouse_click(
 
     // Build composite to get hit regions and pane rects.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup, _status) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, mut hit_regions, pane_rects, _ack, _bp, layer, _status) =
         build_composite(
             &session_name,
             cols,
@@ -6009,7 +6224,25 @@ async fn handle_mouse_click(
         )
         .await;
 
-    let target = hit_test_with_popup(x, y, &hit_regions, &pane_rects, popup);
+    // A client that sent interior-local coordinates did so because it held a
+    // popup layer; if the popup is gone by now those coordinates mean nothing
+    // to the layout, so the event is dropped.
+    if popup_local && layer.is_none() {
+        return Ok(());
+    }
+    let popup = mouse_popup(layer.as_ref(), popup_local, asking, (cols, rows), config);
+    if let Some((rect, _)) = popup.hit {
+        // Stack/tab labels the popup covers must stop being clickable, or a
+        // click inside the popup could activate a hidden pane behind it.
+        hit_regions.stack_regions.retain(|r| {
+            !(r.y >= rect.y
+                && r.y < rect.y + rect.height
+                && r.x_end > rect.x
+                && r.x_start < rect.x + rect.width)
+        });
+    }
+
+    let target = hit_test_with_popup(x, y, &hit_regions, &pane_rects, &popup);
     log::debug!(
         "server: MouseClick client_id={client_id} x={x} y={y} release={release} target={target:?}"
     );
@@ -6021,14 +6254,14 @@ async fn handle_mouse_click(
     // only the popup's own pane may be driven -- the same rule the focus arms
     // below apply, and forwarding to a pane hidden behind the popup would break
     // it.
-    let popup_pane = popup.map(|(pid, _)| pid);
+    let popup_pane = popup.pane;
     if let ClickTarget::Pane(pane_id) = target {
         if popup_pane.is_none() || popup_pane == Some(pane_id) {
-            if let (Some(MouseRoute::App { sgr, motion }), Some(rect)) = (
+            if let (Some(MouseRoute::App { sgr, motion }), Some((rect, inset))) = (
                 route_of_pane(panes, pane_id, MouseGesture::Button, mode == COPY_MODE).await,
-                rect_of_pane(&pane_rects, popup, pane_id),
+                rect_of_pane(&pane_rects, &popup, config, pane_id),
             ) {
-                let (col, row) = report_coords(config, rect, x, y);
+                let (col, row) = report_coords(rect, inset, x, y);
                 let phase = if release {
                     ButtonPhase::Release
                 } else {
@@ -6048,9 +6281,9 @@ async fn handle_mouse_click(
         // While the popup is up it already owns input, and moving the layout's
         // focus underneath it would silently change where input lands once the
         // popup hides. So pane/stack-label clicks are no-ops (stack labels also
-        // mutate the layout tree). Tab clicks still work: the popup is
-        // session-scoped and deliberately survives a tab switch.
-        ClickTarget::Pane(_) | ClickTarget::StackLabel(_) if popup.is_some() => {}
+        // mutate the layout tree). Tab clicks still work: each tab keeps its own
+        // popup, so a tab switch leaves it as it was.
+        ClickTarget::Pane(_) | ClickTarget::StackLabel(_) if popup.pane.is_some() => {}
         ClickTarget::Pane(pane_id) => {
             let mut st = state.lock().await;
             let sess = match st.sessions.get_mut(&session_name) {
@@ -6167,6 +6400,7 @@ async fn handle_mouse_drag(
     end_x: u16,
     end_y: u16,
     is_final: bool,
+    popup_local: bool,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -6174,9 +6408,9 @@ async fn handle_mouse_drag(
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
     log::debug!(
-        "server: MouseDrag client_id={client_id} start=({start_x},{start_y}) end=({end_x},{end_y}) is_final={is_final}"
+        "server: MouseDrag client_id={client_id} start=({start_x},{start_y}) end=({end_x},{end_y}) is_final={is_final} popup={popup_local}"
     );
-    let (session_name, cols, rows, mode, naming, theme) = {
+    let (session_name, cols, rows, mode, naming, theme, asking) = {
         let cls = clients.lock().await;
         let client = match cls.get(&client_id) {
             Some(c) => c,
@@ -6189,6 +6423,7 @@ async fn handle_mouse_drag(
             client.mode.clone(),
             client.naming(),
             client.theme(config),
+            client.popup_want.is_some(),
         )
     };
     let session_name = match session_name {
@@ -6201,7 +6436,7 @@ async fn handle_mouse_drag(
 
     // Build composite to get pane rects for coordinate mapping.
     update_auto_pane_names(&session_name, state, panes).await;
-    let (_cells, _cx, _cy, _cv, _cs, _fpr, hit_regions, pane_rects, _ack, _bp, popup, _status) =
+    let (_cells, _cx, _cy, _cv, _cs, _fpr, mut hit_regions, pane_rects, _ack, _bp, layer, _status) =
         build_composite(
             &session_name,
             cols,
@@ -6218,8 +6453,27 @@ async fn handle_mouse_drag(
         )
         .await;
 
+    // A client that sent interior-local coordinates did so because it held a
+    // popup layer; if the popup is gone by now those coordinates mean nothing
+    // to the layout, so the event is dropped.
+    if popup_local && layer.is_none() {
+        disarm_autoscroll(clients, client_id).await;
+        return Ok(());
+    }
+    let popup = mouse_popup(layer.as_ref(), popup_local, asking, (cols, rows), config);
+    if let Some((rect, _)) = popup.hit {
+        // Stack/tab labels the popup covers must stop being clickable, or a
+        // click inside the popup could activate a hidden pane behind it.
+        hit_regions.stack_regions.retain(|r| {
+            !(r.y >= rect.y
+                && r.y < rect.y + rect.height
+                && r.x_end > rect.x
+                && r.x_start < rect.x + rect.width)
+        });
+    }
+
     // Find which pane the drag started in (the popup first, when it is up).
-    let start_target = hit_test_with_popup(start_x, start_y, &hit_regions, &pane_rects, popup);
+    let start_target = hit_test_with_popup(start_x, start_y, &hit_regions, &pane_rects, &popup);
     let target_pane = match start_target {
         ClickTarget::Pane(id) => id,
         _ => {
@@ -6229,7 +6483,7 @@ async fn handle_mouse_drag(
     };
 
     // Find the pane's rect for coordinate mapping.
-    let pane_rect = match rect_of_pane(&pane_rects, popup, target_pane) {
+    let (pane_rect, inset) = match rect_of_pane(&pane_rects, &popup, config, target_pane) {
         Some(r) => r,
         None => {
             disarm_autoscroll(clients, client_id).await;
@@ -6251,7 +6505,7 @@ async fn handle_mouse_drag(
         };
     if let MouseRoute::App { sgr, motion } = route {
         disarm_autoscroll(clients, client_id).await;
-        let (col, row) = report_coords(config, pane_rect, end_x, end_y);
+        let (col, row) = report_coords(pane_rect, inset, end_x, end_y);
         let phase = if is_final {
             ButtonPhase::Release
         } else {
@@ -6264,11 +6518,8 @@ async fn handle_mouse_drag(
     // repeat timer for a scroll that can never finish.
     let may_scroll = matches!(route, MouseRoute::Remux { scrollback: true });
 
-    // Compute border offset based on style.
-    let border_offset: u16 = match config.appearance.border_style {
-        BorderStyle::ZellijStyle if fits_zellij_border(pane_rect.width, pane_rect.height) => 1,
-        _ => 0,
-    };
+    // The inset the content sits inside the rect with.
+    let border_offset: u16 = inset;
     let content_width = pane_rect.width.saturating_sub(border_offset * 2);
     let content_height = pane_rect.height.saturating_sub(border_offset * 2);
 
@@ -6422,7 +6673,7 @@ async fn handle_mouse_drag(
                 && ((at_top && new_offset < screen_max_scroll_offset)
                     || (at_bottom && new_offset > 0))
             {
-                Some((start_x, start_y, end_x, end_y))
+                Some((start_x, start_y, end_x, end_y, popup_local))
             } else {
                 None
             };
@@ -7407,6 +7658,14 @@ resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Set in a test to make every `spawn_pane` in that task fail, as a real
+    /// PTY or fork failure would. Task-local, so tests running in parallel
+    /// never see each other's.
+    static SPAWN_FAILS: bool;
+}
+
 /// Spawn the PTY for `pane_id` and register it.
 ///
 /// `args` is the command's argument vector after argv[0], and is empty for
@@ -7442,6 +7701,10 @@ async fn spawn_pane(
          ({} arg(s)) cwd={cwd:?} identity={identity:?}",
         args.len()
     );
+    #[cfg(test)]
+    if SPAWN_FAILS.try_with(|fails| *fails).unwrap_or(false) {
+        anyhow::bail!("spawn_pane pane_id={pane_id}: injected failure");
+    }
     let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd, identity)?;
     // The reader gets its OWN descriptor (a dup), so the fd number cannot be
     // reissued to a later PTY while the reader's epoll registration still
@@ -7495,7 +7758,7 @@ async fn resize_session_panes(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
-    _config: &Arc<Config>,
+    config: &Arc<Config>,
 ) -> Result<()> {
     // Home allotments from the session's active-tab layout (the size the panes
     // get from attached clients viewing this session).
@@ -7549,54 +7812,109 @@ async fn resize_session_panes(
             }
         }
     }
-    // Size the popup's PTY to its rect interior. A dedicated step, deliberately
-    // NOT folded into `active_tab_content_sizes`: that function means "the active
-    // tab's panes" and feeds the View-cell size fold, which the popup (which no
-    // View cell can reference) has no business entering. The rect derives from
-    // `session_render_size`, i.e. min-across-attached-clients, like every other
-    // pane.
-    {
-        let popup = {
-            let st = state.lock().await;
-            st.sessions
-                .get(session_name)
-                .and_then(|s| s.popup_pane.map(|id| (id, s.popup_size)))
-        };
-        if let Some((popup_id, popup_size)) = popup {
-            let (cols, rows) = session_render_size(session_name, clients).await;
-            let area = Rect {
-                x: 0,
-                y: 0,
-                width: cols,
-                height: rows.saturating_sub(1),
-            };
-            let rect = layout::popup_rect(area, popup_size);
-            // Interior = rect minus the 1-cell frame, matching `draw_popup`
-            // (the SAME threshold, so the PTY is never sized to a region that
-            // was not painted).
-            let (inner_cols, inner_rows) = if fits_zellij_border(rect.width, rect.height) {
-                (rect.width - 2, rect.height - 2)
-            } else {
-                (rect.width, rect.height)
-            };
-            let (inner_cols, inner_rows) = (inner_cols.max(1), inner_rows.max(1));
-            let mut ps = panes.lock().await;
-            if let Some(pane_data) = ps.get_mut(&popup_id) {
-                log::debug!(
-                    "resize_session_panes: popup pane_id={popup_id} pty/screen resize to cols={inner_cols} rows={inner_rows}"
-                );
-                let _ = pane_data.pty.resize(inner_cols, inner_rows);
-                pane_data.screen.resize(inner_cols, inner_rows);
-            }
-        }
-    }
+    resize_session_popups(session_name, state, panes, clients, config).await;
 
     // A resize can change active-tab membership / attachment for this or other
     // sessions (tab switch, attach), flipping which subscribed panes are
     // session-visible; re-evaluate every subscribed pane so cells that just
     // gained or lost visibility flip live. Cheap: only live View cells subscribe.
-    refresh_subscribed_panes(state, panes, clients, _config).await;
+    refresh_subscribed_panes(state, panes, clients, config).await;
     Ok(())
+}
+
+/// Size every tab's popup PTY to the session's shared popup interior, so a tab
+/// switch never resizes a popup. Returns whether any popup changed size.
+///
+/// A dedicated step, deliberately NOT folded into `active_tab_content_sizes`:
+/// that function means "the active tab's panes" and feeds the View-cell size
+/// fold, which the popup (which no View cell can reference) has no business
+/// entering.
+///
+/// A popup already at the shared size is left alone. `Pty::resize` signals
+/// SIGWINCH unconditionally, and a terminal resize reaches here twice (the
+/// `Resize`, then the `PopupSize` for the new box), so without the check the
+/// popup's shell would redraw once for a size it already had.
+async fn resize_session_popups(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Config,
+) -> bool {
+    let popups: Vec<PaneId> = {
+        let st = state.lock().await;
+        st.sessions
+            .get(session_name)
+            .map(|s| s.tabs.iter().filter_map(|t| t.popup_pane).collect())
+            .unwrap_or_default()
+    };
+    if popups.is_empty() {
+        return false;
+    }
+    let (inner_cols, inner_rows) = session_popup_interior(session_name, clients, config).await;
+    let mut changed = false;
+    let mut ps = panes.lock().await;
+    for popup_id in popups {
+        let Some(pane_data) = ps.get_mut(&popup_id) else {
+            continue;
+        };
+        if (pane_data.screen.cols, pane_data.screen.rows) == (inner_cols, inner_rows) {
+            continue;
+        }
+        log::debug!(
+            "resize_session_popups: popup pane_id={popup_id} pty/screen resize to cols={inner_cols} rows={inner_rows}"
+        );
+        let _ = pane_data.pty.resize(inner_cols, inner_rows);
+        pane_data.screen.resize(inner_cols, inner_rows);
+        changed = true;
+    }
+    changed
+}
+
+/// Attach `client_id` to `session_name` for a command that names its target,
+/// refitting the popups of the session it leaves.
+async fn switch_client_session(
+    client_id: u64,
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let left = {
+        let mut cls = clients.lock().await;
+        cls.get_mut(&client_id).and_then(|client| {
+            client
+                .session_name
+                .replace(session_name.to_string())
+                .filter(|old| old != session_name)
+        })
+    };
+    if let Some(left) = left {
+        refit_popups_after_leave(&left, state, panes, clients, config, prev_frames).await;
+    }
+}
+
+/// Bring `session_name`'s popups in line with the clients still attached to it,
+/// after one of them left: detached, disconnected or attached elsewhere.
+///
+/// The shared popup interior is the minimum over attached clients, so the
+/// departure of the client that asked for the smallest one grows it. Nothing
+/// else would resize the popups until the next resize of a client left behind.
+async fn refit_popups_after_leave(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    if resize_session_popups(session_name, state, panes, clients, config).await {
+        log::debug!("server: a client left '{session_name}', its popups were resized");
+        invalidate_session_baselines(session_name, clients, prev_frames).await;
+        broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    }
 }
 
 /// The content (blit) size each pane in a session's active tab gets from the
@@ -7882,6 +8200,70 @@ async fn session_render_size(
         .min()
         .unwrap_or(24);
     (cols, rows)
+}
+
+/// The interior of the framed float a client that never sent
+/// [`ClientMessage::PopupSize`] is drawn, for a composite of `cols` x `rows`.
+/// The server draws that float itself, so it is also the size that client's
+/// popup terminal has to fit.
+fn legacy_popup_interior(cols: u16, rows: u16, config: &Config) -> (u16, u16) {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows.saturating_sub(1),
+    };
+    let rect = layout::popup_rect(area, legacy_popup_pct(config));
+    // The SAME threshold `draw_popup` frames with, so the PTY is never sized
+    // to a region that was not painted.
+    let (inner_cols, inner_rows) = if fits_zellij_border(rect.width, rect.height) {
+        (rect.width - 2, rect.height - 2)
+    } else {
+        (rect.width, rect.height)
+    };
+    (inner_cols.max(1), inner_rows.max(1))
+}
+
+/// The `(width_pct, height_pct)` a legacy client's float is sized with.
+fn legacy_popup_pct(config: &Config) -> (u8, u8) {
+    (
+        config.appearance.popup_width_pct,
+        config.appearance.popup_height_pct,
+    )
+}
+
+/// The terminal size every popup of a session runs at: the smallest interior
+/// any attached client asks for. A client that never asked contributes the
+/// interior of its legacy float. With no client attached it falls back to the
+/// 80x24 render size, like [`session_render_size`].
+fn shared_popup_interior(
+    wants: &[Option<(u16, u16)>],
+    render_size: (u16, u16),
+    config: &Config,
+) -> (u16, u16) {
+    let legacy = || legacy_popup_interior(render_size.0, render_size.1, config);
+    wants
+        .iter()
+        .map(|want| want.unwrap_or_else(legacy))
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+        .unwrap_or_else(legacy)
+}
+
+/// [`shared_popup_interior`] over the clients attached to `session_name`.
+async fn session_popup_interior(
+    session_name: &str,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Config,
+) -> (u16, u16) {
+    let render_size = session_render_size(session_name, clients).await;
+    let wants: Vec<Option<(u16, u16)>> = {
+        let cls = clients.lock().await;
+        cls.values()
+            .filter(|c| c.session_name.as_deref() == Some(session_name))
+            .map(|c| c.popup_want)
+            .collect()
+    };
+    shared_popup_interior(&wants, render_size, config)
 }
 
 /// Where a pane is, for a View cell's label: its session's and tab's names,
@@ -8206,6 +8588,76 @@ async fn invalidate_session_baselines(
     }
 }
 
+/// Record the popup interior a client wants and bring the popup PTYs and every
+/// affected client in line with it.
+///
+/// The popup terminal is sized to the smallest interior any attached client
+/// asks for, so this only resizes when the shared interior actually changed.
+/// The sender is ALWAYS answered with a full render from a cleared baseline,
+/// even when nothing changed on the server: the sender's box may have moved,
+/// and it has masked away stale content under the old box that only a full
+/// frame repaints.
+async fn handle_popup_size(
+    client_id: u64,
+    (cols, rows): (u16, u16),
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let (cols, rows) = clamp_client_size("PopupSize", cols, rows);
+    let session_name = {
+        let cls = clients.lock().await;
+        match cls.get(&client_id) {
+            Some(c) => c.session_name.clone(),
+            None => return Ok(()),
+        }
+    };
+    let before = match &session_name {
+        Some(name) => Some(session_popup_interior(name, clients, config).await),
+        None => None,
+    };
+    {
+        let mut cls = clients.lock().await;
+        if let Some(c) = cls.get_mut(&client_id) {
+            c.popup_want = Some((cols, rows));
+        }
+    }
+    log::debug!("server: PopupSize client_id={client_id} want={cols}x{rows}");
+    let Some(session_name) = session_name else {
+        return Ok(());
+    };
+    let after = session_popup_interior(&session_name, clients, config).await;
+    if before != Some(after) {
+        resize_session_panes(&session_name, state, panes, clients, config).await?;
+        // Every client's popup layer changed size, which each answers with a
+        // full frame of its own. The sender is one of them, so this is its
+        // answer too, unless the broadcast skipped it (it does so for a client
+        // whose input pane is scrolled). Every frame sent stores a baseline, so
+        // a sender still without one was not answered.
+        invalidate_session_baselines(&session_name, clients, prev_frames).await;
+        broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
+        if prev_frames.lock().await.contains_key(&client_id) {
+            return Ok(());
+        }
+    } else {
+        prev_frames.lock().await.remove(&client_id);
+    }
+    send_full_render_to_client(
+        client_id,
+        &session_name,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+        RenderCtx::default(),
+    )
+    .await;
+    Ok(())
+}
+
 /// What the caller of [`send_full_render_to_client`] already knows, so the
 /// render can skip work the caller has done or afford a cheaper message.
 ///
@@ -8255,7 +8707,7 @@ async fn send_full_render_to_client(
     log::debug!(
         "server: send_full_render_to_client client_id={client_id} session={session_name:?} dims={cols}x{rows}"
     );
-    let (mode, selection, client_search_info, client_scroll, naming, theme) = {
+    let (mode, selection, client_search_info, client_scroll, naming, theme, asking) = {
         let cls = clients.lock().await;
         let client = cls.get(&client_id);
         let mode = client
@@ -8270,7 +8722,8 @@ async fn send_full_render_to_client(
         let theme = client
             .map(|c| c.theme(config))
             .unwrap_or_else(|| config.compositor_theme());
-        (mode, selection, si, scroll, naming, theme)
+        let asking = client.is_some_and(|c| c.popup_want.is_some());
+        (mode, selection, si, scroll, naming, theme, asking)
     };
     // The pane that owns input is the one the wire's single `scroll_offset`
     // describes: the client gates its `ScrollReset` on that field, and the
@@ -8311,7 +8764,7 @@ async fn send_full_render_to_client(
         _pane_rects,
         application_cursor_keys,
         bracketed_paste,
-        _popup,
+        mut popup_layer,
         status,
     ) = build_composite(
         session_name,
@@ -8328,11 +8781,26 @@ async fn send_full_render_to_client(
         &naming,
     )
     .await;
+    // A scrolled pane that owns input has no live cursor to show.
     let cursor_visible = if scroll_offset > 0 {
+        if let Some(layer) = popup_layer.as_mut() {
+            layer.cursor_visible = false;
+        }
         false
     } else {
         cursor_visible
     };
+    let placed = place_popup(
+        &cells,
+        (cursor_x, cursor_y, cursor_visible, cursor_style),
+        focused_pane_rect,
+        popup_layer.as_ref(),
+        asking,
+        (cols, rows),
+        &mode,
+        &theme,
+        config,
+    );
 
     // Compute viewport_top: the scrollback line index of the first displayed line.
     let viewport_top = {
@@ -8348,8 +8816,10 @@ async fn send_full_render_to_client(
                         // Scrolled: blit_screen_scrolled computes
                         // view_top = total - scroll_offset - pane_h
                         let total = p.screen.total_lines();
-                        let pane_h = focused_pane_rect
-                            .map(|r| r.height as usize)
+                        let pane_h = placed
+                            .layer
+                            .map(|l| l.rows as usize)
+                            .or(placed.focused_pane_rect.map(|r| r.height as usize))
                             .unwrap_or(rows.saturating_sub(1) as usize);
                         total.saturating_sub(scroll_offset).saturating_sub(pane_h)
                     }
@@ -8385,24 +8855,14 @@ async fn send_full_render_to_client(
         let delta = scroll_offset as i64 - prev_so as i64;
         let abs_delta = delta.unsigned_abs() as usize;
 
-        // The client's render_scroll is a no-op when abs_delta >= pane_height
-        // (it expects the caller to fall back to a full repaint), so only use a
-        // ScrollRender when the delta is strictly smaller than the focused
-        // pane's content height; otherwise send a FullRender.
-        //
-        // At the very top of history (viewport_top == 0, i.e. scroll_offset has
-        // reached max_offset so the first scrollback line is the top visible
-        // row) force a FullRender instead of an incremental ScrollRender. This
-        // guarantees the client's on-screen buffer is repainted authoritatively
-        // at the scroll boundary rather than relying on an accumulated series of
-        // incremental shifts to have landed the earliest lines exactly right.
-        let use_scroll_render = same_pane
-            && scroll_offset > 0
-            && prev_so > 0
-            && viewport_top > 0
-            && abs_delta > 0
-            && abs_delta <= 10
-            && focused_pane_rect.is_some_and(|r| abs_delta < r.height as usize);
+        let use_scroll_render = scroll_render_allowed(
+            same_pane,
+            scroll_offset,
+            prev_so,
+            viewport_top,
+            abs_delta,
+            &placed,
+        );
 
         log::debug!(
             "server: render decision client_id={client_id} scroll_offset={scroll_offset} prev_so={prev_so} delta={delta} use_scroll_render={use_scroll_render}"
@@ -8414,7 +8874,14 @@ async fn send_full_render_to_client(
     if use_scroll_render {
         // `use_scroll_render` already required a rect, so this branch cannot be
         // reached without one.
-        if let Some(fpr) = focused_pane_rect {
+        if let Some(fpr) = placed.focused_pane_rect {
+            let cells = &placed.cells;
+            let (cursor_x, cursor_y, cursor_visible, cursor_style) = (
+                placed.cursor_x,
+                placed.cursor_y,
+                placed.cursor_visible,
+                placed.cursor_style,
+            );
             let px = fpr.x as usize;
             let py = fpr.y as usize;
             let pw = fpr.width as usize;
@@ -8471,71 +8938,29 @@ async fn send_full_render_to_client(
         }
     }
 
+    // Read before `prev_frames` is locked, to keep the lock order of the render
+    // paths: never `state` under `prev_frames`.
+    let live_popups = session_popups(session_name, state).await;
     // The baseline must equal what this client has on screen, because the next
     // broadcast diffs against it. A `FullRender` and a `RenderDiff` both leave
-    // the client showing exactly `cells`, so both save it.
+    // the client showing exactly what `frame_message` stores, so both save it.
     let mut pf = prev_frames.lock().await;
     let baseline = if ctx.diff_against_baseline && !ctx.force_full {
         pf.get(&client_id)
     } else {
         None
     };
-    // `compute_diff` never clears cells that exist only in a larger previous
-    // frame, so a diff across a size change would leave stale content on the
-    // rows the new frame does not reach.
-    let size_changed = baseline.is_some_and(|prev: &Vec<Vec<RenderCell>>| {
-        prev.len() != cells.len() || prev.first().map(Vec::len) != cells.first().map(Vec::len)
-    });
-    let threshold = cells.len() * cells.first().map(Vec::len).unwrap_or(0) / 2;
-    let msg = match baseline {
-        Some(prev_cells) if !size_changed => {
-            let changes = compute_diff(prev_cells, &cells);
-            if changes.len() > threshold {
-                ServerMessage::FullRender {
-                    cells: cells.clone(),
-                    cursor_x,
-                    cursor_y,
-                    cursor_visible,
-                    cursor_style,
-                    focused_pane_rect,
-                    application_cursor_keys,
-                    bracketed_paste,
-                    viewport_top,
-                    scroll_offset,
-                    status: status.clone(),
-                }
-            } else {
-                ServerMessage::RenderDiff {
-                    changes,
-                    cursor_x,
-                    cursor_y,
-                    cursor_visible,
-                    cursor_style,
-                    focused_pane_rect,
-                    application_cursor_keys,
-                    bracketed_paste,
-                    viewport_top,
-                    scroll_offset,
-                    status: status.clone(),
-                }
-            }
-        }
-        _ => ServerMessage::FullRender {
-            cells: cells.clone(),
-            cursor_x,
-            cursor_y,
-            cursor_visible,
-            cursor_style,
-            focused_pane_rect,
-            application_cursor_keys,
-            bracketed_paste,
-            viewport_top,
-            scroll_offset,
-            status: status.clone(),
-        },
+    let meta = FrameMeta {
+        application_cursor_keys,
+        bracketed_paste,
+        viewport_top,
+        scroll_offset,
+        status,
+        live_popups,
     };
+    let (msg, stored) = frame_message(placed, &meta, baseline, &format!("client_id={client_id}"));
     let _ = tx.send(msg);
-    pf.insert(client_id, cells);
+    pf.insert(client_id, stored);
 }
 
 async fn broadcast_full_render(
@@ -8590,7 +9015,7 @@ async fn broadcast_full_render(
         pane_rects,
         application_cursor_keys,
         bracketed_paste,
-        popup,
+        popup_layer,
         status,
     ) = build_composite(
         session_name,
@@ -8644,7 +9069,7 @@ async fn broadcast_full_render(
     let visible_panes: Vec<PaneId> = pane_rects
         .iter()
         .map(|(id, _)| *id)
-        .chain(popup.map(|(id, _)| id))
+        .chain(popup_layer.as_ref().map(|layer| layer.pane_id))
         .collect();
     let input_target = {
         let st = state.lock().await;
@@ -8701,7 +9126,7 @@ async fn broadcast_full_render(
     };
 
     let mut per_client: Vec<(u64, bool)> = Vec::new();
-    let targets: Vec<(u64, mpsc::UnboundedSender<ServerMessage>, bool)> = {
+    let targets: Vec<(u64, mpsc::UnboundedSender<ServerMessage>, bool, bool)> = {
         let mut cls = clients.lock().await;
         let mut shared = Vec::new();
         for (id, c) in cls.iter_mut() {
@@ -8719,15 +9144,16 @@ async fn broadcast_full_render(
             {
                 per_client.push((*id, force_full));
             } else {
-                shared.push((*id, c.tx.clone(), force_full));
+                shared.push((*id, c.tx.clone(), force_full, c.popup_want.is_some()));
             }
         }
         shared
     };
 
-    let threshold = cols as usize * rows as usize / 2;
+    // As in `send_full_render_to_client`: read before `prev_frames` is locked.
+    let live_popups = session_popups(session_name, state).await;
     let mut pf = prev_frames.lock().await;
-    for (cid, tx, force_full) in targets {
+    for (cid, tx, force_full, asking) in targets {
         // Force a full render when this client has no baseline yet, or when its
         // baseline's dimensions differ from the current frame (a size change,
         // e.g. after another client of a different size attached/detached).
@@ -8736,75 +9162,35 @@ async fn broadcast_full_render(
         // A client that just returned from scrolling must get a full repaint;
         // its diff baseline may not match its on-screen state.
         let baseline = if force_full { None } else { pf.get(&cid) };
-        let size_changed = baseline.is_some_and(|prev| {
-            prev.len() != cells.len() || prev.first().map(Vec::len) != cells.first().map(Vec::len)
-        });
-        let msg = match baseline {
-            Some(prev_cells) if !size_changed => {
-                let changes = compute_diff(prev_cells, &cells);
-                if changes.len() > threshold {
-                    log::debug!(
-                        "server: broadcast client_id={cid} render=Full (diff {} changes > threshold {})",
-                        changes.len(),
-                        threshold
-                    );
-                    ServerMessage::FullRender {
-                        cells: cells.clone(),
-                        cursor_x,
-                        cursor_y,
-                        cursor_visible,
-                        cursor_style,
-                        focused_pane_rect,
-                        application_cursor_keys,
-                        bracketed_paste,
-                        viewport_top,
-                        // Only live-tail clients are targeted here (see the
-                        // `scroll_offset == 0` filter above).
-                        scroll_offset: 0,
-                        status: status.clone(),
-                    }
-                } else {
-                    log::debug!(
-                        "server: broadcast client_id={cid} render=Diff ({} changes, threshold {})",
-                        changes.len(),
-                        threshold
-                    );
-                    ServerMessage::RenderDiff {
-                        changes,
-                        cursor_x,
-                        cursor_y,
-                        cursor_visible,
-                        cursor_style,
-                        focused_pane_rect,
-                        application_cursor_keys,
-                        bracketed_paste,
-                        viewport_top,
-                        scroll_offset: 0,
-                        status: status.clone(),
-                    }
-                }
-            }
-            _ => {
-                log::debug!(
-                    "server: broadcast client_id={cid} render=Full (no baseline or size changed)"
-                );
-                ServerMessage::FullRender {
-                    cells: cells.clone(),
-                    cursor_x,
-                    cursor_y,
-                    cursor_visible,
-                    cursor_style,
-                    focused_pane_rect,
-                    application_cursor_keys,
-                    bracketed_paste,
-                    viewport_top,
-                    scroll_offset: 0,
-                    status: status.clone(),
-                }
-            }
+        let placed = place_popup(
+            &cells,
+            (cursor_x, cursor_y, cursor_visible, cursor_style),
+            focused_pane_rect,
+            popup_layer.as_ref(),
+            asking,
+            (cols, rows),
+            &mode,
+            &theme,
+            config,
+        );
+        // Only live-tail clients are targeted here (see the `scroll_offset == 0`
+        // filter above).
+        let meta = FrameMeta {
+            application_cursor_keys,
+            bracketed_paste,
+            viewport_top,
+            scroll_offset: 0,
+            status: status.clone(),
+            live_popups: live_popups.clone(),
         };
+        let (msg, stored) = frame_message(
+            placed,
+            &meta,
+            baseline,
+            &format!("broadcast client_id={cid}"),
+        );
         let _ = tx.send(msg);
-        pf.insert(cid, cells.clone());
+        pf.insert(cid, stored);
     }
     // Released before the per-client renders: `send_full_render_to_client`
     // takes this lock itself.
@@ -8918,11 +9304,11 @@ async fn build_composite(
     Vec<(PaneId, Rect)>,
     bool, // application_cursor_keys
     bool, // bracketed_paste
-    // The visible popup as `(popup_pane, popup_rect)`. Deliberately NOT folded
-    // into `pane_rects`: that stays the layout's own rects (popup-independent),
-    // so callers can hit-test the popup FIRST without the overlay ever
-    // masquerading as a layout pane.
-    Option<(PaneId, Rect)>,
+    // The active tab's visible popup, rendered interior-local. It is NOT drawn
+    // into the frame: the cursor, the focused pane rect and `pane_rects` all
+    // describe the layout as if no popup were up, and [`place_popup`] puts the
+    // layer over the frame per client.
+    Option<PopupLayer>,
     // What the status bar row shows. `None` only when there is no session or
     // tab to describe, which is also when the frame is blank.
     Option<StatusInfo>,
@@ -9027,17 +9413,11 @@ async fn build_composite(
         search_info,
     };
 
-    // The visible popup (if any), resolved once. `popup_rect` derives from
-    // `area` alone, so it is independent of the layout AND of the zoom
-    // substitution below.
-    let popup = sess
-        .popup_pane
-        .filter(|_| sess.popup_visible)
-        .filter(|id| ps.contains_key(id))
-        .map(|id| (id, layout::popup_rect(area, sess.popup_size)));
+    // The visible popup (if any), resolved once.
+    let popup = tab.visible_popup().filter(|id| ps.contains_key(id));
 
     // The pane that owns input: the popup while it is up, else the focused one.
-    let input_pane = popup.map(|(id, _)| id).unwrap_or(tab.focused_pane);
+    let input_pane = popup.unwrap_or(tab.focused_pane);
 
     // Clamp here rather than on every mutation of the client's map: an offset
     // can outlive the scrollback it addressed (eviction, or a resize whose
@@ -9057,7 +9437,7 @@ async fn build_composite(
         })
         .collect();
 
-    let (mut cells, mut hit_regions) = composite(
+    let (cells, hit_regions) = composite(
         &effective_layout,
         &pane_screens,
         area,
@@ -9072,38 +9452,18 @@ async fn build_composite(
         compositor_theme,
     );
 
-    // -- Popup overlay pass ------------------------------------------------
-    //
-    // Runs AFTER the normal composite (including the zoom `effective_layout`
-    // substitution), painting the popup on top of the finished frame. No pane
-    // rect changes, so the popup steals no space and zoom state is untouched.
-    // Yields the popup's interior rect, which then drives the reported cursor
-    // and the client's focused-pane rect.
-    let popup_interior = popup.map(|(popup_id, prect)| {
-        let popup_screen = ps
-            .get(&popup_id)
-            .map(|p| &p.screen)
-            .expect("popup pane presence checked above");
-        let interior = crate::server::compositor::draw_popup(
-            &mut cells,
-            prect,
+    // The popup layer is a separate buffer, NOT a post-pass over `cells`: a
+    // client that places the popup itself draws it over its own sidebars, which
+    // the composite never contains. No pane rect changes, so the popup steals no
+    // space and zoom state is untouched.
+    let popup_layer = popup.and_then(|popup_id| {
+        let popup_screen = &ps.get(&popup_id)?.screen;
+        Some(render_popup_layer(
             popup_id,
             popup_screen,
-            "popup",
-            mode,
             scroll_offsets.get(&popup_id).copied().unwrap_or(0),
             selection,
-            compositor_theme,
-        );
-        // Stack/tab labels the popup covers must stop being clickable, or a
-        // click inside the popup could activate a hidden pane behind it.
-        hit_regions.stack_regions.retain(|r| {
-            !(r.y >= prect.y
-                && r.y < prect.y + prect.height
-                && r.x_end > prect.x
-                && r.x_start < prect.x + prect.width)
-        });
-        interior
+        ))
     });
 
     // If there is an active rename, place the cursor in the pane's border
@@ -9154,85 +9514,52 @@ async fn build_composite(
             (rect, x_off, y_off, x_off_end, y_off_end)
         });
 
-    // Build the focused pane rect for the client (content area, excluding
-    // borders). While the popup is up, the content the user is working in IS the
-    // popup interior, so report that instead.
-    let focused_pane_rect = match popup_interior {
-        Some(interior) => Some(PaneRect {
-            x: interior.x,
-            y: interior.y,
-            width: interior.width,
-            height: interior.height,
-            // The server refuses `PaneFocus*` while the popup is up.
-            neighbors: FocusNeighbors::default(),
-        }),
-        None => {
-            // `tab.layout`, not `effective_layout`, because the `PaneFocus*`
-            // handler walks the unzoomed tree: a zoomed pane fills the area, but
-            // the handler still moves focus (and the zoom) to its real neighbours.
-            let has =
-                |dir| layout::focus_target(&tab.layout, area, tab.focused_pane, dir, 0).is_some();
-            let neighbors = FocusNeighbors {
-                left: has(layout::FocusDirection::Left),
-                right: has(layout::FocusDirection::Right),
-                up: has(layout::FocusDirection::Up),
-                down: has(layout::FocusDirection::Down),
-            };
-            focused_rect_and_offsets.map(|(rect, x_off, y_off, x_off_end, y_off_end)| PaneRect {
-                x: rect.x + x_off,
-                y: rect.y + y_off,
-                width: rect.width.saturating_sub(x_off + x_off_end),
-                height: rect.height.saturating_sub(y_off + y_off_end),
-                neighbors,
-            })
-        }
+    // The focused pane's rect for the client (content area, excluding borders),
+    // as if no popup were up. `place_popup` replaces it while a popup is.
+    //
+    // `tab.layout`, not `effective_layout`, because the `PaneFocus*` handler
+    // walks the unzoomed tree: a zoomed pane fills the area, but the handler
+    // still moves focus (and the zoom) to its real neighbours.
+    let focused_pane_rect = {
+        let has = |dir| layout::focus_target(&tab.layout, area, tab.focused_pane, dir, 0).is_some();
+        let neighbors = FocusNeighbors {
+            left: has(layout::FocusDirection::Left),
+            right: has(layout::FocusDirection::Right),
+            up: has(layout::FocusDirection::Up),
+            down: has(layout::FocusDirection::Down),
+        };
+        focused_rect_and_offsets.map(|(rect, x_off, y_off, x_off_end, y_off_end)| PaneRect {
+            x: rect.x + x_off,
+            y: rect.y + y_off,
+            width: rect.width.saturating_sub(x_off + x_off_end),
+            height: rect.height.saturating_sub(y_off + y_off_end),
+            neighbors,
+        })
     };
 
-    // Cursor: the popup wins outright when visible (the user is looking at it),
-    // ahead of both an in-progress rename and the focused pane -- this replaces
-    // the layout cursor wholesale rather than composing with it, so it is
-    // correct over a zoomed pane too.
-    let (cursor_x, cursor_y, cursor_visible, cursor_style) =
-        if let (Some(interior), Some((pid, _))) = (popup_interior, popup) {
-            match ps.get(&pid) {
-                Some(pane_data) => (
-                    interior.x
-                        + std::cmp::min(
-                            pane_data.screen.cursor_x,
-                            interior.width.saturating_sub(1),
-                        ),
-                    interior.y
-                        + std::cmp::min(
-                            pane_data.screen.cursor_y,
-                            interior.height.saturating_sub(1),
-                        ),
-                    pane_data.screen.cursor_visible,
-                    pane_data.screen.cursor_style,
-                ),
-                None => (0, 0, false, 0),
-            }
-        } else if let Some(rc) = rename_cursor {
-            (rc.0, rc.1, rc.2, 0u8)
-        } else if let Some(pane_data) = ps.get(&tab.focused_pane) {
-            if let Some((rect, x_off, y_off, x_off_end, y_off_end)) = focused_rect_and_offsets {
-                let content_w = rect.width.saturating_sub(x_off + x_off_end);
-                let content_h = rect.height.saturating_sub(y_off + y_off_end);
-                (
-                    rect.x
-                        + x_off
-                        + std::cmp::min(pane_data.screen.cursor_x, content_w.saturating_sub(1)),
-                    rect.y
-                        + y_off
-                        + std::cmp::min(pane_data.screen.cursor_y, content_h.saturating_sub(1)),
-                    pane_data.screen.cursor_visible,
-                    pane_data.screen.cursor_style,
-                )
-            } else {
-                (0, 0, false, 0)
-            }
+    // Cursor of the layout: an in-progress rename ahead of the focused pane.
+    let (cursor_x, cursor_y, cursor_visible, cursor_style) = if let Some(rc) = rename_cursor {
+        (rc.0, rc.1, rc.2, 0u8)
+    } else if let Some(pane_data) = ps.get(&tab.focused_pane) {
+        if let Some((rect, x_off, y_off, x_off_end, y_off_end)) = focused_rect_and_offsets {
+            let content_w = rect.width.saturating_sub(x_off + x_off_end);
+            let content_h = rect.height.saturating_sub(y_off + y_off_end);
+            (
+                rect.x
+                    + x_off
+                    + std::cmp::min(pane_data.screen.cursor_x, content_w.saturating_sub(1)),
+                rect.y
+                    + y_off
+                    + std::cmp::min(pane_data.screen.cursor_y, content_h.saturating_sub(1)),
+                pane_data.screen.cursor_visible,
+                pane_data.screen.cursor_style,
+            )
         } else {
             (0, 0, false, 0)
-        };
+        }
+    } else {
+        (0, 0, false, 0)
+    };
 
     // DECCKM follows input, so it comes from the popup while it owns input.
     let application_cursor_keys = ps
@@ -9257,9 +9584,267 @@ async fn build_composite(
         pane_rects,
         application_cursor_keys,
         bracketed_paste,
-        popup,
+        popup_layer,
         Some(status_info),
     )
+}
+
+/// A frame as one client receives it, after [`place_popup`].
+struct PlacedFrame<'a> {
+    /// The cells the client is sent and diffed against. Borrowed from the shared
+    /// composite unless the server had to draw a popup into them.
+    cells: std::borrow::Cow<'a, [Vec<RenderCell>]>,
+    cursor_x: u16,
+    cursor_y: u16,
+    cursor_visible: bool,
+    cursor_style: u8,
+    focused_pane_rect: Option<PaneRect>,
+    /// The popup layer, set only for a client that places the popup itself.
+    /// A client that does not has the popup drawn into `cells` instead.
+    layer: Option<&'a PopupLayer>,
+}
+
+/// What a frame carries besides its cells, the same for every client.
+struct FrameMeta {
+    application_cursor_keys: bool,
+    bracketed_paste: bool,
+    viewport_top: usize,
+    scroll_offset: usize,
+    status: Option<StatusInfo>,
+    live_popups: Vec<PaneId>,
+}
+
+/// Every popup pane `session_name` has, on any tab, visible or not.
+async fn session_popups(session_name: &str, state: &Arc<Mutex<ServerState>>) -> Vec<PaneId> {
+    let st = state.lock().await;
+    st.sessions
+        .get(session_name)
+        .map(|s| s.tabs.iter().filter_map(|t| t.popup_pane).collect())
+        .unwrap_or_default()
+}
+
+/// Put the popup into the frame for one client.
+///
+/// `cursor` and `focused_pane_rect` are the layout's, as if no popup were up.
+///
+/// * No popup: the frame is untouched and borrowed.
+/// * A client that never sent `PopupSize` (`asking == false`): the server draws
+///   the full-framed float into a copy of the frame, at the rect the config's
+///   percentages give, and reports the popup's interior and cursor instead of
+///   the layout's. The copy is what gets diffed and stored, so the baseline
+///   stays equal to what this client has on screen.
+/// * A client that asked: the frame stays as it is and the layer travels
+///   beside it. The client owns the cursor and the focused pane rect while it
+///   holds a layer, so they are reported as hidden and absent.
+#[allow(clippy::too_many_arguments)]
+fn place_popup<'a>(
+    cells: &'a [Vec<RenderCell>],
+    cursor: (u16, u16, bool, u8),
+    focused_pane_rect: Option<PaneRect>,
+    layer: Option<&'a PopupLayer>,
+    asking: bool,
+    (cols, rows): (u16, u16),
+    mode: &str,
+    theme: &CompositorTheme,
+    config: &Config,
+) -> PlacedFrame<'a> {
+    let (cursor_x, cursor_y, cursor_visible, cursor_style) = cursor;
+    let Some(layer) = layer else {
+        return PlacedFrame {
+            cells: std::borrow::Cow::Borrowed(cells),
+            cursor_x,
+            cursor_y,
+            cursor_visible,
+            cursor_style,
+            focused_pane_rect,
+            layer: None,
+        };
+    };
+    if asking {
+        return PlacedFrame {
+            cells: std::borrow::Cow::Borrowed(cells),
+            cursor_x,
+            cursor_y,
+            cursor_visible: false,
+            cursor_style,
+            focused_pane_rect: None,
+            layer: Some(layer),
+        };
+    }
+    let mut drawn = cells.to_vec();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows.saturating_sub(1),
+    };
+    let rect = layout::popup_rect(area, legacy_popup_pct(config));
+    let interior = draw_popup(&mut drawn, rect, layer, "popup", mode, theme);
+    PlacedFrame {
+        cells: std::borrow::Cow::Owned(drawn),
+        cursor_x: interior.x + layer.cursor_x.min(interior.width.saturating_sub(1)),
+        cursor_y: interior.y + layer.cursor_y.min(interior.height.saturating_sub(1)),
+        cursor_visible: layer.cursor_visible,
+        cursor_style: layer.cursor_style,
+        focused_pane_rect: Some(PaneRect {
+            x: interior.x,
+            y: interior.y,
+            width: interior.width,
+            height: interior.height,
+            // The server refuses `PaneFocus*` while the popup is up.
+            neighbors: FocusNeighbors::default(),
+        }),
+        layer: None,
+    }
+}
+
+/// Whether a scroll step can go out as a `ScrollRender`, which tells the client
+/// to shift the pixels it has by a delta, instead of a whole frame.
+///
+/// The client's `render_scroll` is a no-op when `abs_delta` reaches the pane's
+/// height (it expects the caller to fall back to a full repaint), so the delta
+/// must be strictly smaller than the focused pane's content height.
+///
+/// At the very top of history (`viewport_top == 0`, i.e. the scroll offset has
+/// reached its maximum so the first scrollback line is the top visible row) a
+/// `FullRender` is forced. That repaints the client authoritatively at the
+/// scroll boundary instead of relying on an accumulated series of incremental
+/// shifts to have landed the earliest lines exactly right.
+///
+/// Never while the popup owns input for a client that places it itself: the
+/// shift would scroll the layout pane underneath the layer. A client the server
+/// draws the popup for keeps the incremental scroll, because the popup is then
+/// part of its frame.
+fn scroll_render_allowed(
+    same_pane: bool,
+    scroll_offset: usize,
+    prev_scroll_offset: usize,
+    viewport_top: usize,
+    abs_delta: usize,
+    placed: &PlacedFrame<'_>,
+) -> bool {
+    same_pane
+        && placed.layer.is_none()
+        && scroll_offset > 0
+        && prev_scroll_offset > 0
+        && viewport_top > 0
+        && abs_delta > 0
+        && abs_delta <= 10
+        && placed
+            .focused_pane_rect
+            .is_some_and(|r| abs_delta < r.height as usize)
+}
+
+/// The wire form of a popup layer: all of it when `prev` is `None`, else only
+/// what changed against the layer the client already holds.
+fn popup_cells(layer: &PopupLayer, prev: Option<&[Vec<RenderCell>]>) -> Box<PopupCells> {
+    let changes = prev.map(|prev| compute_diff(prev, &layer.cells));
+    let threshold = layer.cols as usize * layer.rows as usize / 2;
+    let (cells, changes) = match changes {
+        Some(changes) if changes.len() <= threshold => (None, changes),
+        _ => (Some(layer.cells.clone()), Vec::new()),
+    };
+    Box::new(PopupCells {
+        pane_id: layer.pane_id,
+        cols: layer.cols,
+        rows: layer.rows,
+        cursor_x: layer.cursor_x,
+        cursor_y: layer.cursor_y,
+        cursor_visible: layer.cursor_visible,
+        cursor_style: layer.cursor_style,
+        cells,
+        changes,
+    })
+}
+
+/// The message that brings a client from `baseline` to `placed`, and the
+/// baseline to store once it is sent.
+///
+/// A diff is only sent when it can be exact: the baseline must exist and match
+/// in size, and the popup layer must neither appear, disappear nor change size.
+/// `compute_diff` never clears cells that exist only in a larger previous
+/// frame, and a layer transition repaints the region the client masked away
+/// under the box, so each of those sends a `FullRender`.
+fn frame_message(
+    placed: PlacedFrame<'_>,
+    meta: &FrameMeta,
+    baseline: Option<&PrevFrame>,
+    log_tag: &str,
+) -> (ServerMessage, PrevFrame) {
+    let cells = &placed.cells;
+    let layer_size = placed.layer.map(|l| (l.cols, l.rows));
+    let usable = baseline.filter(|prev| {
+        let same_size = prev.cells.len() == cells.len()
+            && prev.cells.first().map(Vec::len) == cells.first().map(Vec::len);
+        let same_layer = prev.popup.as_ref().map(|(size, _)| *size) == layer_size;
+        same_size && same_layer
+    });
+    let threshold = cells.len() * cells.first().map(Vec::len).unwrap_or(0) / 2;
+    let diff = usable.and_then(|prev| {
+        let changes = compute_diff(&prev.cells, cells);
+        if changes.len() > threshold {
+            log::debug!(
+                "server: {log_tag} render=Full (diff {} changes > threshold {threshold})",
+                changes.len()
+            );
+            None
+        } else {
+            log::debug!(
+                "server: {log_tag} render=Diff ({} changes, threshold {threshold})",
+                changes.len()
+            );
+            Some((prev, changes))
+        }
+    });
+    let msg = match diff {
+        Some((prev, changes)) => ServerMessage::RenderDiff {
+            changes,
+            cursor_x: placed.cursor_x,
+            cursor_y: placed.cursor_y,
+            cursor_visible: placed.cursor_visible,
+            cursor_style: placed.cursor_style,
+            focused_pane_rect: placed.focused_pane_rect,
+            application_cursor_keys: meta.application_cursor_keys,
+            bracketed_paste: meta.bracketed_paste,
+            viewport_top: meta.viewport_top,
+            scroll_offset: meta.scroll_offset,
+            status: meta.status.clone(),
+            live_popups: meta.live_popups.clone(),
+            popup: placed.layer.map(|layer| {
+                popup_cells(
+                    layer,
+                    prev.popup.as_ref().map(|(_, cells)| cells.as_slice()),
+                )
+            }),
+        },
+        None => {
+            if usable.is_none() {
+                log::debug!(
+                    "server: {log_tag} render=Full (no baseline, size changed or popup layer changed)"
+                );
+            }
+            ServerMessage::FullRender {
+                cells: cells.to_vec(),
+                cursor_x: placed.cursor_x,
+                cursor_y: placed.cursor_y,
+                cursor_visible: placed.cursor_visible,
+                cursor_style: placed.cursor_style,
+                focused_pane_rect: placed.focused_pane_rect,
+                application_cursor_keys: meta.application_cursor_keys,
+                bracketed_paste: meta.bracketed_paste,
+                viewport_top: meta.viewport_top,
+                scroll_offset: meta.scroll_offset,
+                status: meta.status.clone(),
+                popup: placed.layer.map(|layer| popup_cells(layer, None)),
+                live_popups: meta.live_popups.clone(),
+            }
+        }
+    };
+    let stored = PrevFrame {
+        cells: placed.cells.into_owned(),
+        popup: placed.layer.map(|l| ((l.cols, l.rows), l.cells.clone())),
+    };
+    (msg, stored)
 }
 
 fn compute_diff(prev: &[Vec<RenderCell>], curr: &[Vec<RenderCell>]) -> Vec<CellChange> {
@@ -9571,8 +10156,11 @@ async fn close_pane(
         // it) and leave a dead PTY behind with the popup still "open". This is
         // both the `PaneClose`-while-popup-open path and the popup shell's own
         // exit path, and it must work from any tab.
-        let action = if sess.popup_pane == Some(pane_id) {
-            sess.take_popup();
+        // A hidden popup's shell can exit while another tab is active, so the
+        // owner is looked up among ALL tabs.
+        let popup_owner = sess.tabs.iter().position(|t| t.popup_pane == Some(pane_id));
+        let action = if let Some(owner) = popup_owner {
+            sess.tabs[owner].take_popup();
             log::debug!("server: close_pane closed popup pane_id={pane_id}");
             CloseAction::Broadcast
         } else {
@@ -9587,7 +10175,11 @@ async fn close_pane(
             }
 
             if let Some(nf) = tab.detach_pane(pane_id) {
-                tab.focus_pane(nf);
+                // `nf` is what the tree shows in the closed pane's place, not a
+                // focus decision: only the focused pane closing moves focus.
+                if tab.focused_pane == pane_id {
+                    tab.focus_pane(nf);
+                }
                 tab.rebuild_if_automatic();
                 session::debug_check_invariant(sess, "close_pane");
                 CloseAction::Broadcast
@@ -9595,7 +10187,7 @@ async fn close_pane(
                 // Last pane in the tab was closed. Close the tab.
                 let tab_idx = sess.active_tab;
                 if sess.tabs.len() > 1 {
-                    sess.tabs.remove(tab_idx);
+                    also_reap.extend(sess.tabs.remove(tab_idx).take_popup());
                     if sess.active_tab >= sess.tabs.len() {
                         sess.active_tab = sess.tabs.len().saturating_sub(1);
                     }
@@ -9657,7 +10249,7 @@ async fn start_pty_forwarding(
         // forwarding task (and never show output) unless added here. Doing it
         // here keeps every existing call site correct; the `forwarding_started`
         // guard below makes the repeat safe.
-        ids.extend(sess.popup_pane);
+        ids.extend(tab.popup_pane);
         ids
     };
 
@@ -10571,7 +11163,6 @@ mod tests {
                 *folder,
                 crate::config::BorderStyle::ZellijStyle,
                 Default::default(),
-                (80, 80),
             )
             .unwrap();
         }
@@ -11052,14 +11643,8 @@ mod tests {
         fn state_with(sessions: &[&str]) -> ServerState {
             let mut st = ServerState::new();
             for name in sessions {
-                st.create_session(
-                    name,
-                    None,
-                    BorderStyle::ZellijStyle,
-                    LayoutMode::default(),
-                    (80, 80),
-                )
-                .unwrap();
+                st.create_session(name, None, BorderStyle::ZellijStyle, LayoutMode::default())
+                    .unwrap();
             }
             st
         }
@@ -11103,9 +11688,9 @@ mod tests {
         fn a_visible_popup_takes_the_focus_from_its_tab() {
             let mut st = state_with(&["main"]);
             let tab_pane = st.sessions["main"].tabs[0].focused_pane;
-            let sess = st.sessions.get_mut("main").unwrap();
-            sess.popup_pane = Some(999);
-            sess.popup_visible = true;
+            let tab = &mut st.sessions.get_mut("main").unwrap().tabs[0];
+            tab.popup_pane = Some(999);
+            tab.popup_visible = true;
             let focused = focused_panes(&st, &attached(&["main"]));
             assert!(focused.contains(&999));
             assert!(!focused.contains(&tab_pane));
@@ -11163,6 +11748,1358 @@ mod tests {
             assert_eq!(pgid_from_stat("42 (sh"), None);
             assert_eq!(pgid_from_stat("42 (sh) S 7"), None);
             assert_eq!(pgid_from_stat("42 (sh) S 7 notanumber"), None);
+        }
+    }
+}
+
+/// Tests for where the popup is sized, drawn and clicked, and for the per-tab
+/// popup lifecycle through the real command handlers.
+#[cfg(test)]
+mod popup_tests {
+    use super::*;
+    use crate::server::layout::LayoutMode;
+
+    fn config() -> Config {
+        Config::default()
+    }
+
+    fn cell(c: char) -> RenderCell {
+        RenderCell {
+            c,
+            ..RenderCell::default()
+        }
+    }
+
+    fn layer(cols: u16, rows: u16, fill: char) -> PopupLayer {
+        PopupLayer {
+            pane_id: 9,
+            cols,
+            rows,
+            cells: vec![vec![cell(fill); cols as usize]; rows as usize],
+            cursor_x: 1,
+            cursor_y: 0,
+            cursor_visible: true,
+            cursor_style: 3,
+        }
+    }
+
+    fn blank_frame(cols: u16, rows: u16) -> Vec<Vec<RenderCell>> {
+        vec![vec![cell('.'); cols as usize]; rows as usize]
+    }
+
+    fn meta() -> FrameMeta {
+        FrameMeta {
+            application_cursor_keys: false,
+            bracketed_paste: true,
+            viewport_top: 0,
+            scroll_offset: 0,
+            status: None,
+            live_popups: Vec::new(),
+        }
+    }
+
+    fn place<'a>(
+        cells: &'a [Vec<RenderCell>],
+        layer: Option<&'a PopupLayer>,
+        asking: bool,
+    ) -> PlacedFrame<'a> {
+        place_popup(
+            cells,
+            (5, 6, true, 1),
+            Some(PaneRect {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 4,
+                neighbors: FocusNeighbors::default(),
+            }),
+            layer,
+            asking,
+            (cells[0].len() as u16, cells.len() as u16),
+            "NORMAL",
+            &CompositorTheme::default(),
+            &config(),
+        )
+    }
+
+    // -- Shared popup interior ------------------------------------------------
+
+    #[test]
+    fn the_shared_interior_is_the_smallest_any_client_asks_for() {
+        let cfg = config();
+        let got = shared_popup_interior(&[Some((100, 30)), Some((80, 40))], (160, 48), &cfg);
+        assert_eq!(got, (80, 30));
+    }
+
+    #[test]
+    fn a_legacy_client_contributes_its_framed_floats_interior() {
+        let cfg = config();
+        // popup_rect of a 160x47 area at 80% is 128x37; the frame takes 2 each.
+        assert_eq!(legacy_popup_interior(160, 48, &cfg), (126, 35));
+        let got = shared_popup_interior(&[None, Some((200, 100))], (160, 48), &cfg);
+        assert_eq!(got, (126, 35));
+        let got = shared_popup_interior(&[None, Some((50, 10))], (160, 48), &cfg);
+        assert_eq!(got, (50, 10));
+    }
+
+    #[test]
+    fn with_no_client_the_shared_interior_falls_back_to_the_80x24_float() {
+        let cfg = config();
+        assert_eq!(
+            shared_popup_interior(&[], (80, 24), &cfg),
+            legacy_popup_interior(80, 24, &cfg)
+        );
+    }
+
+    // -- Placing the popup ----------------------------------------------------
+
+    #[test]
+    fn no_popup_leaves_the_frame_borrowed_and_untouched() {
+        let cells = blank_frame(20, 10);
+        let placed = place(&cells, None, true);
+        assert!(matches!(placed.cells, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            (placed.cursor_x, placed.cursor_y, placed.cursor_visible),
+            (5, 6, true)
+        );
+        assert!(placed.focused_pane_rect.is_some());
+        assert!(placed.layer.is_none());
+    }
+
+    #[test]
+    fn a_client_that_asked_keeps_the_frame_and_gets_the_layer_beside_it() {
+        let cells = blank_frame(20, 10);
+        let l = layer(6, 3, 'x');
+        let placed = place(&cells, Some(&l), true);
+        assert!(matches!(placed.cells, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(placed.cells.as_ref(), cells.as_slice());
+        assert!(placed.layer.is_some());
+        // The layer owns the cursor and the focused pane rect.
+        assert!(!placed.cursor_visible);
+        assert_eq!(placed.focused_pane_rect, None);
+    }
+
+    #[test]
+    fn a_legacy_client_gets_the_framed_float_with_the_layer_top_left_in_it() {
+        let cells = blank_frame(60, 20);
+        let l = layer(6, 3, 'x');
+        let placed = place(&cells, Some(&l), false);
+        assert!(placed.layer.is_none(), "the layer is drawn into the frame");
+        // popup_rect of 60x19 at 80% is 48x15 at (6, 2); interior (7,3) 46x13.
+        let interior_x = 7usize;
+        let interior_y = 3usize;
+        for dy in 0..3 {
+            for dx in 0..6 {
+                assert_eq!(placed.cells[interior_y + dy][interior_x + dx].c, 'x');
+            }
+        }
+        // The interior beyond the (smaller) layer is the clear fill, not the
+        // layout underneath.
+        assert_eq!(placed.cells[interior_y][interior_x + 6].c, ' ');
+        assert_eq!(placed.cells[interior_y + 3][interior_x].c, ' ');
+        // The frame is drawn around it.
+        assert_eq!(placed.cells[2][6].c, '\u{256D}');
+        // The layout outside the box is untouched.
+        assert_eq!(placed.cells[0][0].c, '.');
+        // The cursor and focused rect are the popup's.
+        assert_eq!(
+            (placed.cursor_x, placed.cursor_y),
+            (interior_x as u16 + 1, interior_y as u16)
+        );
+        assert_eq!(placed.cursor_style, 3);
+        let fpr = placed.focused_pane_rect.expect("popup interior");
+        assert_eq!((fpr.x, fpr.y), (7, 3));
+    }
+
+    // -- What a frame carries -------------------------------------------------
+
+    fn prev_of(placed: PlacedFrame<'_>) -> PrevFrame {
+        frame_message(placed, &meta(), None, "test").1
+    }
+
+    #[test]
+    fn a_first_frame_is_full_and_carries_the_whole_layer() {
+        let cells = blank_frame(20, 10);
+        let l = layer(4, 2, 'x');
+        let (msg, stored) = frame_message(place(&cells, Some(&l), true), &meta(), None, "test");
+        let ServerMessage::FullRender { popup, .. } = msg else {
+            panic!("expected a FullRender");
+        };
+        let popup = popup.expect("layer");
+        assert_eq!((popup.cols, popup.rows), (4, 2));
+        assert_eq!(popup.cells, Some(l.cells.clone()));
+        assert_eq!(stored.popup, Some(((4, 2), l.cells.clone())));
+    }
+
+    #[test]
+    fn the_same_size_layer_is_sent_as_a_diff() {
+        let cells = blank_frame(20, 10);
+        let l = layer(40, 20, 'x');
+        let prev = prev_of(place(&cells, Some(&l), true));
+        let mut changed = l.clone();
+        changed.cells[0][0] = cell('y');
+        let (msg, _) = frame_message(
+            place(&cells, Some(&changed), true),
+            &meta(),
+            Some(&prev),
+            "t",
+        );
+        let ServerMessage::RenderDiff { popup, changes, .. } = msg else {
+            panic!("expected a RenderDiff");
+        };
+        assert!(changes.is_empty(), "the frame itself did not change");
+        let popup = popup.expect("layer");
+        assert_eq!(popup.cells, None);
+        assert_eq!(popup.changes.len(), 1);
+        assert_eq!((popup.changes[0].x, popup.changes[0].y), (0, 0));
+    }
+
+    #[test]
+    fn a_layer_that_changes_size_forces_a_full_render_with_the_whole_layer() {
+        let cells = blank_frame(20, 10);
+        let prev = prev_of(place(&cells, Some(&layer(4, 2, 'x')), true));
+        let bigger = layer(5, 3, 'x');
+        let (msg, _) = frame_message(
+            place(&cells, Some(&bigger), true),
+            &meta(),
+            Some(&prev),
+            "t",
+        );
+        let ServerMessage::FullRender { popup, .. } = msg else {
+            panic!("a size change must repaint the uncovered region");
+        };
+        assert_eq!(popup.expect("layer").cells, Some(bigger.cells));
+    }
+
+    #[test]
+    fn a_layer_that_appears_or_disappears_forces_a_full_render() {
+        let cells = blank_frame(20, 10);
+        let none = prev_of(place(&cells, None, true));
+        let l = layer(4, 2, 'x');
+        let (msg, stored) = frame_message(place(&cells, Some(&l), true), &meta(), Some(&none), "t");
+        assert!(matches!(msg, ServerMessage::FullRender { .. }), "appear");
+        let (msg, _) = frame_message(place(&cells, None, true), &meta(), Some(&stored), "t");
+        let ServerMessage::FullRender { popup, .. } = msg else {
+            panic!("disappear must be a FullRender");
+        };
+        assert_eq!(popup, None, "a hidden popup travels as None");
+    }
+
+    #[test]
+    fn an_unchanged_frame_and_layer_diff_to_nothing() {
+        let cells = blank_frame(20, 10);
+        let l = layer(4, 2, 'x');
+        let prev = prev_of(place(&cells, Some(&l), true));
+        let (msg, _) = frame_message(place(&cells, Some(&l), true), &meta(), Some(&prev), "t");
+        let ServerMessage::RenderDiff { changes, popup, .. } = msg else {
+            panic!("expected a RenderDiff");
+        };
+        assert!(changes.is_empty());
+        let popup = popup.expect("layer");
+        assert!(popup.changes.is_empty() && popup.cells.is_none());
+    }
+
+    #[test]
+    fn a_legacy_frames_baseline_is_the_blitted_frame() {
+        let cells = blank_frame(60, 20);
+        let l = layer(6, 3, 'x');
+        let prev = prev_of(place(&cells, Some(&l), false));
+        assert_eq!(prev.popup, None);
+        assert_eq!(prev.cells[3][7].c, 'x', "the popup is in the stored frame");
+        // The same popup again diffs to nothing against that baseline.
+        let (msg, _) = frame_message(place(&cells, Some(&l), false), &meta(), Some(&prev), "t");
+        let ServerMessage::RenderDiff { changes, popup, .. } = msg else {
+            panic!("expected a RenderDiff");
+        };
+        assert!(changes.is_empty());
+        assert_eq!(popup, None);
+    }
+
+    // -- The ScrollRender gate ------------------------------------------------
+
+    #[test]
+    fn scroll_render_is_withheld_from_a_client_that_places_the_popup_itself() {
+        let cells = blank_frame(60, 20);
+        let l = layer(6, 3, 'x');
+        let legacy = place(&cells, Some(&l), false);
+        let asking = place(&cells, Some(&l), true);
+        // A step of 1 within a pane taller than the step.
+        assert!(scroll_render_allowed(true, 3, 2, 10, 1, &legacy));
+        assert!(!scroll_render_allowed(true, 3, 2, 10, 1, &asking));
+        // With no popup an asking client scrolls incrementally as before.
+        let none = place(&cells, None, true);
+        assert!(scroll_render_allowed(true, 3, 2, 10, 1, &none));
+    }
+
+    // -- Mouse ----------------------------------------------------------------
+
+    #[test]
+    fn a_popup_click_is_interior_local_with_zero_inset() {
+        let l = layer(40, 10, 'x');
+        let popup = mouse_popup(Some(&l), true, true, (160, 48), &config());
+        assert!(popup.local);
+        let (rect, inset) = popup.hit.expect("local rect");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (0, 0, 40, 10));
+        assert_eq!(inset, 0);
+        // (0,0) is the first cell, so the 1-based report is (1,1).
+        assert_eq!(report_coords(rect, inset, 0, 0), (1, 1));
+        assert_eq!(report_coords(rect, inset, 3, 2), (4, 3));
+    }
+
+    #[test]
+    fn a_screen_click_from_a_client_that_placed_the_popup_has_no_popup_rect() {
+        let l = layer(40, 10, 'x');
+        let popup = mouse_popup(Some(&l), false, true, (160, 48), &config());
+        assert_eq!(popup.pane, Some(9), "the popup still owns input");
+        assert!(popup.hit.is_none());
+        let regions = HitRegions::default();
+        let rects = [(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 160,
+                height: 47,
+            },
+        )];
+        assert_eq!(
+            hit_test_with_popup(10, 10, &regions, &rects, &popup),
+            ClickTarget::Pane(1),
+            "the layout underneath, not the popup"
+        );
+    }
+
+    #[test]
+    fn a_legacy_client_hits_the_composite_float_with_its_frame_inset() {
+        let l = layer(40, 10, 'x');
+        let popup = mouse_popup(Some(&l), false, false, (160, 48), &config());
+        let (rect, inset) = popup.hit.expect("legacy rect");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (16, 5, 128, 37));
+        assert_eq!(inset, 1);
+        let regions = HitRegions::default();
+        assert_eq!(
+            hit_test_with_popup(20, 10, &regions, &[], &popup),
+            ClickTarget::Pane(9)
+        );
+    }
+
+    #[test]
+    fn a_local_event_without_a_layer_is_not_treated_as_a_popup() {
+        let popup = mouse_popup(None, true, true, (160, 48), &config());
+        assert!(!popup.local);
+        assert_eq!(popup.pane, None);
+    }
+
+    // -- Real handlers, real PTYs ---------------------------------------------
+
+    struct Rig {
+        state: Arc<Mutex<ServerState>>,
+        panes: Arc<Mutex<HashMap<PaneId, PaneData>>>,
+        clients: Arc<Mutex<HashMap<u64, ClientConnection>>>,
+        config: Arc<Config>,
+        prev_frames: PrevFrameCache,
+        dormant: DormantStore,
+        rx: mpsc::UnboundedReceiver<ServerMessage>,
+    }
+
+    const CLIENT: u64 = 1;
+
+    /// A client attached to `session`, as the handshake leaves one.
+    fn connection(
+        session: &str,
+        cols: u16,
+        rows: u16,
+        want: Option<(u16, u16)>,
+        tx: mpsc::UnboundedSender<ServerMessage>,
+    ) -> ClientConnection {
+        ClientConnection {
+            session_name: Some(session.to_string()),
+            tx,
+            cols,
+            rows,
+            mode: "NORMAL".to_string(),
+            mouse_selection: None,
+            search_info: None,
+            session_scroll: HashMap::new(),
+            prev_scroll_offset: 0,
+            prev_scroll_pane: None,
+            needs_full_render: false,
+            drag: None,
+            autoscroll_repeat: None,
+            subscribed_panes: HashMap::new(),
+            pane_scroll: HashMap::new(),
+            pane_selection: HashMap::new(),
+            pane_drag: None,
+            pane_autoscroll_repeat: None,
+            session_tree_subscribed: false,
+            agents_subscribed: false,
+            naming: None,
+            tab_style: None,
+            popup_want: want,
+        }
+    }
+
+    impl Rig {
+        /// One session "main" whose first pane runs `/bin/sh` in `cwd`, and one
+        /// attached client of `cols` x `rows`.
+        async fn new(cols: u16, rows: u16, want: Option<(u16, u16)>, cwd: &std::path::Path) -> Rig {
+            let mut cfg = Config::default();
+            cfg.general.default_shell = Some("/bin/sh".to_string());
+            let config = Arc::new(cfg);
+            let state = Arc::new(Mutex::new(ServerState::new()));
+            let panes = Arc::new(Mutex::new(HashMap::new()));
+            let pane_id = state
+                .lock()
+                .await
+                .create_session(
+                    "main",
+                    None,
+                    BorderStyle::ZellijStyle,
+                    LayoutMode::default(),
+                )
+                .expect("session");
+            spawn_pane(
+                pane_id,
+                cols,
+                rows - 1,
+                None,
+                &[],
+                Some(cwd),
+                Some(PaneIdentity {
+                    session: "main",
+                    pane: pane_id,
+                }),
+                &panes,
+                &config,
+            )
+            .await
+            .expect("spawn");
+            let (tx, rx) = mpsc::unbounded_channel();
+            let clients = Arc::new(Mutex::new(HashMap::new()));
+            clients
+                .lock()
+                .await
+                .insert(CLIENT, connection("main", cols, rows, want, tx));
+            Rig {
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames: Arc::new(Mutex::new(HashMap::new())),
+                dormant: Arc::new(Mutex::new(PersistedState {
+                    state: ServerState::new(),
+                    pane_cwds: HashMap::new(),
+                })),
+                rx,
+            }
+        }
+
+        async fn command(&self, cmd: RemuxCommand) {
+            handle_command(
+                CLIENT,
+                cmd,
+                &self.state,
+                &self.panes,
+                &self.clients,
+                &self.config,
+                &self.prev_frames,
+                &self.dormant,
+            )
+            .await
+            .expect("command");
+        }
+
+        /// A second tab whose pane runs `/bin/sh` in `cwd`; it becomes active.
+        async fn new_tab(&self, cwd: &std::path::Path) -> PaneId {
+            let pane_id = self
+                .state
+                .lock()
+                .await
+                .create_tab("main", "Tab 2", LayoutMode::default())
+                .expect("tab");
+            let (cols, rows) = {
+                let cls = self.clients.lock().await;
+                (cls[&CLIENT].cols, cls[&CLIENT].rows)
+            };
+            spawn_pane(
+                pane_id,
+                cols,
+                rows - 1,
+                None,
+                &[],
+                Some(cwd),
+                Some(PaneIdentity {
+                    session: "main",
+                    pane: pane_id,
+                }),
+                &self.panes,
+                &self.config,
+            )
+            .await
+            .expect("spawn");
+            pane_id
+        }
+
+        /// Attach another client of `cols` x `rows` to "main". Returns what it
+        /// is sent.
+        async fn add_client(
+            &self,
+            id: u64,
+            cols: u16,
+            rows: u16,
+            want: Option<(u16, u16)>,
+        ) -> mpsc::UnboundedReceiver<ServerMessage> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.clients
+                .lock()
+                .await
+                .insert(id, connection("main", cols, rows, want, tx));
+            rx
+        }
+
+        /// Split tab 0's focused pane with a pane running `/bin/sh` in `cwd`.
+        /// The new pane is focused, as a split focuses it.
+        async fn split(&self, cwd: &std::path::Path) -> PaneId {
+            self.split_tab(0, cwd).await
+        }
+
+        /// [`Rig::split`] on tab `tab`.
+        async fn split_tab(&self, tab: usize, cwd: &std::path::Path) -> PaneId {
+            let pane_id = {
+                let mut st = self.state.lock().await;
+                let pane_id = st.next_pane_id();
+                let tab = &mut st.sessions.get_mut("main").unwrap().tabs[tab];
+                let focused = tab.focused_pane;
+                tab.layout.split_vertical(focused, pane_id);
+                tab.pane_order.push(pane_id);
+                tab.focus_pane(pane_id);
+                pane_id
+            };
+            spawn_pane(
+                pane_id,
+                50,
+                29,
+                None,
+                &[],
+                Some(cwd),
+                Some(PaneIdentity {
+                    session: "main",
+                    pane: pane_id,
+                }),
+                &self.panes,
+                &self.config,
+            )
+            .await
+            .expect("spawn");
+            pane_id
+        }
+
+        /// A second session whose pane runs `/bin/sh` in `cwd`.
+        async fn new_session(&self, name: &str, cwd: &std::path::Path) {
+            let pane_id = self
+                .state
+                .lock()
+                .await
+                .create_session(name, None, BorderStyle::ZellijStyle, LayoutMode::default())
+                .expect("session");
+            spawn_pane(
+                pane_id,
+                100,
+                29,
+                None,
+                &[],
+                Some(cwd),
+                Some(PaneIdentity {
+                    session: name,
+                    pane: pane_id,
+                }),
+                &self.panes,
+                &self.config,
+            )
+            .await
+            .expect("spawn");
+        }
+
+        async fn popup_of(&self, tab: usize) -> Option<PaneId> {
+            self.state.lock().await.sessions["main"].tabs[tab].popup_pane
+        }
+
+        async fn screen_size(&self, pane: PaneId) -> (u16, u16) {
+            let ps = self.panes.lock().await;
+            let s = &ps[&pane].screen;
+            (s.cols, s.rows)
+        }
+
+        fn drain(&mut self) -> Vec<ServerMessage> {
+            let mut out = Vec::new();
+            while let Ok(m) = self.rx.try_recv() {
+                out.push(m);
+            }
+            out
+        }
+
+        async fn finish(self) {
+            let ids: Vec<PaneId> = self.panes.lock().await.keys().copied().collect();
+            reap_panes(&ids, &self.panes, &self.clients).await;
+        }
+    }
+
+    fn canonical(p: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(p).expect("canonicalize")
+    }
+
+    /// The cwd of `pane`'s shell, once it reads as `dir`, or what it last read
+    /// after a few seconds. A pane's shell changes directory after the fork,
+    /// so a read straight after `spawn_pane` can still see the daemon's own.
+    async fn cwd_once_in(
+        rig: &Rig,
+        pane: PaneId,
+        dir: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let want = canonical(dir);
+        let mut last = None;
+        for _ in 0..100 {
+            last = {
+                let ps = rig.panes.lock().await;
+                persistence::get_pane_cwd(ps[&pane].pty.child_pid)
+            }
+            .map(|c| canonical(std::path::Path::new(&c)));
+            if last.as_ref() == Some(&want) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        last
+    }
+
+    #[tokio::test]
+    async fn toggling_on_two_tabs_spawns_two_popups_in_each_tabs_focused_cwd() {
+        let a = tempfile::tempdir().expect("dir a");
+        let b = tempfile::tempdir().expect("dir b");
+        let rig = Rig::new(100, 30, None, a.path()).await;
+
+        let pane_a = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        assert_eq!(
+            cwd_once_in(&rig, pane_a, a.path()).await,
+            Some(canonical(a.path()))
+        );
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let first = rig.popup_of(0).await.expect("tab 0 popup");
+        let pane_b = rig.new_tab(b.path()).await;
+        assert_eq!(
+            cwd_once_in(&rig, pane_b, b.path()).await,
+            Some(canonical(b.path()))
+        );
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let second = rig.popup_of(1).await.expect("tab 1 popup");
+        assert_ne!(first, second);
+
+        assert_eq!(
+            cwd_once_in(&rig, first, a.path()).await,
+            Some(canonical(a.path()))
+        );
+        assert_eq!(
+            cwd_once_in(&rig, second, b.path()).await,
+            Some(canonical(b.path()))
+        );
+
+        // Leaving tab 1 and coming back finds both popups as they were.
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        let st = rig.state.lock().await;
+        let sess = &st.sessions["main"];
+        assert_eq!(sess.visible_popup(), Some(first));
+        assert!(sess.tabs[1].popup_visible);
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_popup_returns_input_to_the_pane_focused_before_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let left = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let middle = rig.split(dir.path()).await;
+        rig.split(dir.path()).await;
+        let focused = || {
+            let state = rig.state.clone();
+            async move { state.lock().await.sessions["main"].tabs[0].focused_pane }
+        };
+        let focus = |pane: PaneId| {
+            let state = rig.state.clone();
+            async move {
+                state.lock().await.sessions.get_mut("main").unwrap().tabs[0].focus_pane(pane);
+            }
+        };
+        let click_left = || {
+            let (state, panes, clients, config, pf) = (
+                rig.state.clone(),
+                rig.panes.clone(),
+                rig.clients.clone(),
+                rig.config.clone(),
+                rig.prev_frames.clone(),
+            );
+            async move {
+                for release in [false, true] {
+                    handle_mouse_click(
+                        CLIENT, 2, 5, release, false, &state, &panes, &clients, &config, &pf,
+                    )
+                    .await
+                    .expect("click");
+                }
+            }
+        };
+        let switch_to_left = RemuxCommand::SessionSwitchPane {
+            session: "main".to_string(),
+            tab_index: 0,
+            pane_id: left,
+        };
+
+        // Each action does move the focus while no popup is up, so a pass below
+        // is not a miss.
+        focus(middle).await;
+        rig.command(RemuxCommand::PaneFocusLeft).await;
+        assert_eq!(focused().await, left, "a focus key");
+        focus(middle).await;
+        click_left().await;
+        assert_eq!(focused().await, left, "a click on a pane");
+        focus(middle).await;
+        rig.command(switch_to_left.clone()).await;
+        assert_eq!(focused().await, left, "an agent or session-tree switch");
+
+        focus(middle).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        for cmd in [
+            RemuxCommand::PaneFocusLeft,
+            RemuxCommand::PaneFocusRight,
+            RemuxCommand::PaneStackNext,
+            RemuxCommand::PaneStackPrev,
+            RemuxCommand::SetMaster,
+            RemuxCommand::LayoutNext,
+            switch_to_left.clone(),
+            RemuxCommand::SessionSwitchTab {
+                session: "main".to_string(),
+                tab_index: 0,
+            },
+        ] {
+            rig.command(cmd.clone()).await;
+            assert_eq!(focused().await, middle, "{cmd:?} while the popup is up");
+        }
+        click_left().await;
+        assert_eq!(
+            focused().await,
+            middle,
+            "a click outside the box is swallowed"
+        );
+        // A tab switch away and back.
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        assert_eq!(focused().await, middle, "a tab switch away and back");
+
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[0];
+        assert!(!tab.popup_visible);
+        assert_eq!(
+            tab.input_target(),
+            middle,
+            "input is back on the middle pane"
+        );
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_pane_closing_that_was_not_focused_leaves_the_focus_alone() {
+        for popup_up in [false, true] {
+            let dir = tempfile::tempdir().expect("dir");
+            let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+            // The right pane's survivor in the tree is the middle one, so a close
+            // that refocused the survivor would land there, not on the left.
+            let left = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+            rig.split(dir.path()).await;
+            let right = rig.split(dir.path()).await;
+            let focus = rig.state.clone();
+            focus.lock().await.sessions.get_mut("main").unwrap().tabs[0].focus_pane(left);
+            if popup_up {
+                rig.command(RemuxCommand::PopupToggle(None)).await;
+            }
+            close_pane(
+                right,
+                &rig.state,
+                &rig.panes,
+                &rig.clients,
+                &rig.config,
+                &rig.prev_frames,
+            )
+            .await;
+            let st = rig.state.lock().await;
+            let tab = &st.sessions["main"].tabs[0];
+            assert!(!tab.pane_order.contains(&right));
+            assert_eq!(tab.focused_pane, left, "popup up: {popup_up}");
+            drop(st);
+            rig.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_background_tabs_unfocused_pane_leaves_its_focus_alone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let first = rig.new_tab(dir.path()).await;
+        rig.split_tab(1, dir.path()).await;
+        let third = rig.split_tab(1, dir.path()).await;
+        let focus = rig.state.clone();
+        focus.lock().await.sessions.get_mut("main").unwrap().tabs[1].focus_pane(first);
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        rig.command(RemuxCommand::PaneCloseById {
+            session: "main".to_string(),
+            pane_id: third,
+        })
+        .await;
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[1];
+        assert!(!tab.pane_order.contains(&third));
+        assert_eq!(tab.focused_pane, first);
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn pane_new_in_tab_with_its_popup_up_leaves_the_focus_alone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let before = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.command(RemuxCommand::PaneNewInTab {
+            session: "main".to_string(),
+            tab_index: 0,
+        })
+        .await;
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[0];
+        assert_eq!(tab.pane_order.len(), 2, "the pane is created");
+        assert_eq!(tab.focused_pane, before);
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn every_frame_lists_the_sessions_live_popups() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let first = rig.popup_of(0).await.expect("popup");
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let second = rig.popup_of(1).await.expect("popup");
+        // Hidden: still alive, so still listed.
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.drain();
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        let mut live = rig
+            .drain()
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::FullRender { live_popups, .. }
+                | ServerMessage::RenderDiff { live_popups, .. } => Some(live_popups),
+                _ => None,
+            })
+            .next_back()
+            .expect("a frame");
+        live.sort();
+        assert_eq!(live, vec![first, second]);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_popup_that_fails_to_spawn_leaves_no_popup_behind() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let result = SPAWN_FAILS
+            .scope(
+                true,
+                handle_command(
+                    CLIENT,
+                    RemuxCommand::PopupToggle(None),
+                    &rig.state,
+                    &rig.panes,
+                    &rig.clients,
+                    &rig.config,
+                    &rig.prev_frames,
+                    &rig.dormant,
+                ),
+            )
+            .await;
+        assert!(result.is_err(), "the failure is still reported");
+        {
+            let st = rig.state.lock().await;
+            let tab = &st.sessions["main"].tabs[0];
+            assert_eq!(tab.popup_pane, None);
+            assert!(!tab.popup_visible);
+        }
+        // With the phantom gone, the layout is not locked and the next toggle
+        // spawns a popup.
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("a fresh popup");
+        assert!(rig.panes.lock().await.contains_key(&popup));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_rename_is_announced_to_every_client() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let mut other = rig.add_client(2, 100, 30, None).await;
+        let renamed = |events: Vec<ServerMessage>| {
+            events.into_iter().find_map(|m| match m {
+                ServerMessage::Event(SessionEvent::SessionRenamed { old, new }) => Some((old, new)),
+                _ => None,
+            })
+        };
+        rig.command(RemuxCommand::SessionRename("work".to_string()))
+            .await;
+        let expected = Some(("main".to_string(), "work".to_string()));
+        assert_eq!(renamed(rig.drain()), expected);
+        let mut seen = Vec::new();
+        while let Ok(m) = other.try_recv() {
+            seen.push(m);
+        }
+        assert_eq!(
+            renamed(seen),
+            expected,
+            "a client attached elsewhere hears too"
+        );
+        rig.command(RemuxCommand::SessionRenameByName {
+            old: "work".to_string(),
+            new: "play".to_string(),
+        })
+        .await;
+        assert_eq!(
+            renamed(rig.drain()),
+            Some(("work".to_string(), "play".to_string()))
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_first_toggle_in_a_tab_opens_in_the_focused_panes_cwd() {
+        let a = tempfile::tempdir().expect("dir a");
+        let b = tempfile::tempdir().expect("dir b");
+        let rig = Rig::new(100, 30, None, a.path()).await;
+        let first = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let second = rig.split(b.path()).await;
+        for (focus, dir) in [(second, b.path()), (first, a.path())] {
+            assert_eq!(cwd_once_in(&rig, focus, dir).await, Some(canonical(dir)));
+            rig.state
+                .lock()
+                .await
+                .sessions
+                .get_mut("main")
+                .unwrap()
+                .tabs[0]
+                .focus_pane(focus);
+            rig.command(RemuxCommand::PopupToggle(None)).await;
+            let popup = rig.popup_of(0).await.expect("popup");
+            assert_eq!(
+                cwd_once_in(&rig, popup, dir).await,
+                Some(canonical(dir)),
+                "focused pane {focus}"
+            );
+            // Close it and reap it, so the next toggle is a first one again.
+            let taken = rig
+                .state
+                .lock()
+                .await
+                .sessions
+                .get_mut("main")
+                .unwrap()
+                .tabs[0]
+                .take_popup();
+            reap_panes(
+                &taken.into_iter().collect::<Vec<_>>(),
+                &rig.panes,
+                &rig.clients,
+            )
+            .await;
+        }
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn resize_commands_do_not_touch_the_layout_while_the_popup_is_up() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        {
+            let mut st = rig.state.lock().await;
+            let tab = &mut st.sessions.get_mut("main").unwrap().tabs[0];
+            let focused = tab.focused_pane;
+            tab.layout.split_vertical(focused, 77);
+            tab.pane_order.push(77);
+        }
+        let layout_json = |rig: &Rig| {
+            let state = rig.state.clone();
+            async move {
+                let st = state.lock().await;
+                serde_json::to_string(&st.sessions["main"].tabs[0].layout).unwrap()
+            }
+        };
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let before = layout_json(&rig).await;
+        rig.command(RemuxCommand::ResizeRight(5)).await;
+        assert_eq!(
+            layout_json(&rig).await,
+            before,
+            "no-op while the popup is up"
+        );
+
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.command(RemuxCommand::ResizeRight(5)).await;
+        assert_ne!(
+            layout_json(&rig).await,
+            before,
+            "the same command resizes once the popup is hidden"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn popup_size_resizes_the_pty_and_always_answers_the_sender_with_a_full_render() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        rig.drain();
+
+        let send = |rig: &Rig, cols, rows| {
+            let (state, panes, clients, config, pf) = (
+                rig.state.clone(),
+                rig.panes.clone(),
+                rig.clients.clone(),
+                rig.config.clone(),
+                rig.prev_frames.clone(),
+            );
+            async move {
+                handle_popup_size(CLIENT, (cols, rows), &state, &panes, &clients, &config, &pf)
+                    .await
+                    .expect("popup size")
+            }
+        };
+        send(&rig, 60, 12).await;
+        assert_eq!(rig.screen_size(popup).await, (60, 12));
+        let frames = rig.drain();
+        let full_renders = |frames: &[ServerMessage]| {
+            frames
+                .iter()
+                .filter(|m| matches!(m, ServerMessage::FullRender { .. }))
+                .count()
+        };
+        assert_eq!(full_renders(&frames), 1, "one answer, not two");
+        let Some(ServerMessage::FullRender {
+            popup: layer,
+            focused_pane_rect,
+            ..
+        }) = frames.into_iter().rev().find(|m| {
+            matches!(
+                m,
+                ServerMessage::FullRender { .. } | ServerMessage::RenderDiff { .. }
+            )
+        })
+        else {
+            panic!("the sender must be answered with a full render");
+        };
+        let layer = layer.expect("an asking client gets the layer");
+        assert_eq!((layer.cols, layer.rows), (60, 12));
+        assert_eq!(focused_pane_rect, None);
+
+        // The same size again changes nothing on the server and is still
+        // answered with a full render.
+        send(&rig, 60, 12).await;
+        assert_eq!(rig.screen_size(popup).await, (60, 12));
+        let frames = rig.drain();
+        assert_eq!(full_renders(&frames), 1, "always a full render");
+        assert!(!frames
+            .iter()
+            .any(|m| matches!(m, ServerMessage::RenderDiff { .. })));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn resizing_sizes_a_non_active_tabs_popup_too() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let first = rig.popup_of(0).await.expect("popup");
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let second = rig.popup_of(1).await.expect("popup");
+        // A tab switch does not resize a popup: both are already the shared size.
+        assert_eq!(rig.screen_size(first).await, rig.screen_size(second).await);
+
+        rig.command(RemuxCommand::TabGoto(0)).await;
+        {
+            let mut cls = rig.clients.lock().await;
+            cls.get_mut(&CLIENT).unwrap().popup_want = Some((70, 14));
+        }
+        // The active tab is now tab 0; tab 1's popup is on a background tab.
+        resize_session_panes("main", &rig.state, &rig.panes, &rig.clients, &rig.config)
+            .await
+            .expect("resize");
+        assert_eq!(rig.screen_size(first).await, (70, 14));
+        assert_eq!(rig.screen_size(second).await, (70, 14));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_hidden_popups_shell_exiting_clears_it_on_a_non_active_tab() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let hidden = rig.popup_of(1).await.expect("tab 1 popup");
+        rig.command(RemuxCommand::TabGoto(0)).await;
+
+        close_pane(
+            hidden,
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await;
+
+        let st = rig.state.lock().await;
+        assert_eq!(st.sessions["main"].tabs[1].popup_pane, None);
+        assert!(!st.sessions["main"].tabs[1].popup_visible);
+        assert_eq!(st.sessions["main"].tabs.len(), 2, "the tab itself stays");
+        drop(st);
+        assert!(!rig.panes.lock().await.contains_key(&hidden));
+        // The next toggle on that tab spawns a fresh popup.
+        rig.command(RemuxCommand::TabGoto(1)).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let fresh = rig.popup_of(1).await.expect("fresh popup");
+        assert_ne!(fresh, hidden);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_sender_scrolled_in_its_popup_is_still_answered_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        // Give the popup history and scroll the sender into it. The broadcast
+        // skips a client whose input pane is scrolled.
+        {
+            let mut ps = rig.panes.lock().await;
+            let lines: String = (0..40).map(|i| format!("line {i}\r\n")).collect();
+            ps.get_mut(&popup)
+                .unwrap()
+                .screen
+                .process_output(lines.as_bytes());
+        }
+        rig.clients
+            .lock()
+            .await
+            .get_mut(&CLIENT)
+            .unwrap()
+            .set_scroll(popup, 3);
+        rig.drain();
+        handle_popup_size(
+            CLIENT,
+            (60, 12),
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("popup size");
+        assert_eq!(rig.screen_size(popup).await, (60, 12));
+        let full_renders = rig
+            .drain()
+            .into_iter()
+            .filter(|m| matches!(m, ServerMessage::FullRender { .. }))
+            .count();
+        assert_eq!(full_renders, 1, "the size change is answered exactly once");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_hidden_clients_refreshed_want_lifts_the_shared_size() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let _other = rig.add_client(2, 160, 48, Some((70, 14))).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        assert_eq!(rig.screen_size(popup).await, (50, 10), "capped by client 1");
+        // Client 1's terminal grows while the popup is hidden, and it announces
+        // the box it would now place.
+        handle_popup_size(
+            CLIENT,
+            (90, 20),
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("popup size");
+        assert_eq!(rig.screen_size(popup).await, (70, 14), "no longer capped");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_popup_already_at_the_shared_size_is_not_resized_again() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        let resize = |rig: &Rig| {
+            let (state, panes, clients, config) = (
+                rig.state.clone(),
+                rig.panes.clone(),
+                rig.clients.clone(),
+                rig.config.clone(),
+            );
+            async move { resize_session_popups("main", &state, &panes, &clients, &config).await }
+        };
+        // A terminal resize reaches here with the want the client had before
+        // its box changed: the popup is already that size.
+        assert!(!resize(&rig).await, "no SIGWINCH for a size the popup has");
+        rig.clients
+            .lock()
+            .await
+            .get_mut(&CLIENT)
+            .unwrap()
+            .popup_want = Some((60, 12));
+        assert!(resize(&rig).await);
+        assert_eq!(rig.screen_size(popup).await, (60, 12));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn client_sizes_are_clamped_to_the_terminal_maximum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        handle_resize(
+            CLIENT,
+            u16::MAX,
+            0,
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("resize");
+        handle_popup_size(
+            CLIENT,
+            (0, u16::MAX),
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("popup size");
+        let cls = rig.clients.lock().await;
+        let client = &cls[&CLIENT];
+        assert_eq!((client.cols, client.rows), (MAX_TERMINAL_COLS, 1));
+        assert_eq!(client.popup_want, Some((1, MAX_TERMINAL_ROWS)));
+        drop(cls);
+        rig.finish().await;
+    }
+
+    /// The ways a client stops counting towards a session it shared.
+    #[derive(Debug, Clone, Copy)]
+    enum Leave {
+        Detach,
+        Disconnect,
+        AttachAway,
+        SwitchTabAway,
+        SwitchPaneAway,
+    }
+
+    #[tokio::test]
+    async fn a_client_leaving_resizes_the_popup_to_the_clients_left() {
+        for how in [
+            Leave::Detach,
+            Leave::Disconnect,
+            Leave::AttachAway,
+            Leave::SwitchTabAway,
+            Leave::SwitchPaneAway,
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+            let mut survivor = rig.add_client(2, 100, 30, Some((70, 14))).await;
+            rig.new_session("other", dir.path()).await;
+            rig.command(RemuxCommand::PopupToggle(None)).await;
+            let popup = rig.popup_of(0).await.expect("popup");
+            assert_eq!(rig.screen_size(popup).await, (50, 10), "{how:?}");
+            while survivor.try_recv().is_ok() {}
+
+            match how {
+                Leave::Detach => rig.command(RemuxCommand::SessionDetach).await,
+                Leave::Disconnect => {
+                    handle_client_disconnect(
+                        CLIENT,
+                        &rig.state,
+                        &rig.panes,
+                        &rig.clients,
+                        &rig.config,
+                        &rig.prev_frames,
+                    )
+                    .await
+                }
+                Leave::AttachAway => handle_attach(
+                    CLIENT,
+                    "other",
+                    &rig.state,
+                    &rig.panes,
+                    &rig.clients,
+                    &rig.config,
+                    &rig.prev_frames,
+                    &rig.dormant,
+                )
+                .await
+                .expect("attach"),
+                Leave::SwitchTabAway => {
+                    rig.command(RemuxCommand::SessionSwitchTab {
+                        session: "other".to_string(),
+                        tab_index: 0,
+                    })
+                    .await
+                }
+                Leave::SwitchPaneAway => {
+                    let pane_id = rig.state.lock().await.sessions["other"].tabs[0].focused_pane;
+                    rig.command(RemuxCommand::SessionSwitchPane {
+                        session: "other".to_string(),
+                        tab_index: 0,
+                        pane_id,
+                    })
+                    .await
+                }
+            }
+
+            assert_eq!(rig.screen_size(popup).await, (70, 14), "{how:?}");
+            let mut layers = Vec::new();
+            while let Ok(m) = survivor.try_recv() {
+                if let ServerMessage::FullRender { popup: Some(l), .. } = m {
+                    layers.push((l.cols, l.rows));
+                }
+            }
+            assert_eq!(
+                layers.last(),
+                Some(&(70, 14)),
+                "{how:?}: the client left behind is repainted at the new size"
+            );
+            rig.finish().await;
         }
     }
 }

@@ -167,7 +167,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `h` `j` `k` `l` | `PaneFocusLeft/Down/Up/Right` | |
 | `H` `J` `K` `L` | `PaneMoveLeft/Down/Up/Right` | |
 | `z` | `PaneToggleZoom` | |
-| `o` | `PopupToggle` | Floating popup terminal |
+| `o` | `PopupToggle` | Popup terminal |
 | `m` | `SetMaster` | |
 | `r` | `PaneRename` | Prompts for a name |
 | `t` | `PaneMoveToTab` | Opens a tab picker |
@@ -226,6 +226,17 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 | `Alt-m` | `SetMaster` |
 | `Alt-Space` | `LayoutNext` |
 
+### Popup keys
+
+`PopupToggle` takes an optional position, so you can bind separate keys that open the popup in different places. Every popup key is a plain show/hide toggle: when the popup is hidden, the key opens it at the position it names (or at `popup_position` when it names none); when the popup is visible, any popup key closes it, whatever position it names. Each tab's popup keeps the position it was opened at until it is closed. A View shows no popup, so popup keys do nothing inside one. The leader chord `Prefix p o` stays a plain toggle. These bindings are an example, not defaults:
+
+```toml
+[keybindings.command]
+"Alt-p"  = "PopupToggle"
+"Alt--"  = "PopupToggle bottom"
+"Alt-\\" = "PopupToggle right"
+```
+
 ## Session manager chords
 
 Inside the session manager (`Prefix x m`), one- or two-key chords act on the selected row. Rebind them under `[keybindings.session_manager]`:
@@ -282,7 +293,7 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneToggleZoom` | Zoom or unzoom the focused pane |
 | `PaneRename` | Rename the focused pane (prompts) |
 | `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |
-| `PopupToggle` | Show or hide the session's floating popup terminal |
+| `PopupToggle [float\|left\|right\|top\|bottom]` | Show or hide the active tab's popup terminal. A hidden popup opens at the named position, or at `popup_position` with none; a visible one closes, whatever position the key names |
 | `ResizeLeft` / `Right` / `Up` / `Down` `[amount]` | Resize the focused pane by `amount` cells (default `1`) |
 | `SetMaster` | Make the focused pane the master pane |
 

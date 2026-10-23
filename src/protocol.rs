@@ -129,7 +129,29 @@ pub enum ConnDescriptor {
 /// session from the caller's `REMUX_SESSION`, which is stale for a pane moved
 /// to another session. The failure is a new pane in the wrong session, not a
 /// dropped connection, so only the handshake can catch it.
-pub const PROTOCOL_VERSION: u32 = 17;
+///
+/// 17 -> 18: client-placed popup terminal. Adds [`ClientMessage::PopupSize`],
+/// the interior the client wants for its foreground session's popups. An old
+/// server cannot decode it and would drop the connection, so the bump turns that
+/// into a refused handshake.
+///
+/// 18 also carries three `#[serde(default)]` riders, added without a bump of
+/// their own because they decode both ways: `popup` on
+/// [`ServerMessage::FullRender`] and [`ServerMessage::RenderDiff`] (the popup
+/// layer, [`PopupCells`]), and `popup` on [`ClientMessage::MouseClick`],
+/// [`ClientMessage::MouseDrag`] and [`ClientMessage::MouseScroll`]
+/// (interior-local coordinates). They are self-gating: a server sends a layer
+/// only to a client that has sent `PopupSize`, and a client sets the mouse flag
+/// only while it holds a layer, so an old client on a new server never sees
+/// either. The layer itself carries `pane_id`, and both frames carry
+/// `live_popups`, the session's popup panes, both also `#[serde(default)]`.
+///
+/// Within 18, before any release, [`RemuxCommand::PopupToggle`] became a
+/// newtype variant carrying an optional position, so its JSON changed from the
+/// bare `"PopupToggle"`. A client always sends it with `None`. 18 also added
+/// [`SessionEvent::SessionRenamed`], so a client keys its popup state by the
+/// session's current name.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -272,6 +294,11 @@ pub enum ClientMessage {
         pane_id: Option<PaneId>,
         #[serde(default)]
         release: bool,
+        /// `x`/`y` are interior-local to the popup layer the client holds, so
+        /// the server targets the active tab's popup with no hit test. Only a
+        /// client that was sent a [`PopupCells`] layer sets it.
+        #[serde(default)]
+        popup: bool,
     },
     /// A mouse drag selection from start to end coordinates.
     ///
@@ -297,11 +324,21 @@ pub enum ClientMessage {
         is_final: bool,
         #[serde(default)]
         pane_id: Option<PaneId>,
+        /// As [`ClientMessage::MouseClick::popup`].
+        #[serde(default)]
+        popup: bool,
     },
     /// A mouse wheel event at the given full-screen 0-based coordinates.
     /// `up` is true for wheel-up, false for wheel-down. The server decides
     /// whether to forward it to the pane's application or scroll remux.
-    MouseScroll { x: u16, y: u16, up: bool },
+    /// `popup` is as [`ClientMessage::MouseClick::popup`].
+    MouseScroll {
+        x: u16,
+        y: u16,
+        up: bool,
+        #[serde(default)]
+        popup: bool,
+    },
     /// Request the scrollback content for the active pane (for search).
     RequestScrollback,
     /// Send search match info to the server for status bar display.
@@ -363,6 +400,16 @@ pub enum ClientMessage {
     TabStyle {
         style: crate::config::theme::TabStyle,
     },
+    /// The interior, in cells, this client wants for its foreground session's
+    /// popup terminals.
+    ///
+    /// The client places and frames the popup itself, so the server only needs
+    /// the size of the terminal inside it. The popup PTY is sized to the
+    /// smallest interior any attached client asks for. Sending this also tells
+    /// the server to deliver the popup as a [`PopupCells`] layer instead of
+    /// drawing it into the frame. The answer is always a full render, because a
+    /// client whose box moved has stale content under the old box.
+    PopupSize { cols: u16, rows: u16 },
     /// Materialize a dormant (saved-but-not-live) session into a live session
     /// by name, reusing the startup restore path. Only meaningful when the
     /// server was started with `save_sessions = true` and
@@ -626,6 +673,16 @@ pub enum ServerMessage {
         /// reasoning `DirectoryListing::home` records for being added at 11.
         #[serde(default)]
         status: Option<StatusInfo>,
+        /// The popup terminal's layer, for a client that sent
+        /// [`ClientMessage::PopupSize`]; `None` when no popup is visible.
+        /// Boxed so the frame variants stay small enough for the client's
+        /// `Incoming` queue; the wire encoding is the same as unboxed.
+        #[serde(default)]
+        popup: Option<Box<PopupCells>>,
+        /// The pane ids of every popup the session has, visible or hidden, so
+        /// a client can forget what it keeps about a popup that is gone.
+        #[serde(default)]
+        live_popups: Vec<PaneId>,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -670,6 +727,13 @@ pub enum ServerMessage {
         /// As [`ServerMessage::FullRender::status`].
         #[serde(default)]
         status: Option<StatusInfo>,
+        /// As [`ServerMessage::FullRender::popup`].
+        #[serde(default)]
+        popup: Option<Box<PopupCells>>,
+        /// The pane ids of every popup the session has, visible or hidden, so
+        /// a client can forget what it keeps about a popup that is gone.
+        #[serde(default)]
+        live_popups: Vec<PaneId>,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -1165,6 +1229,30 @@ impl Default for RenderCell {
     }
 }
 
+/// The popup terminal's contents and cursor, interior-local.
+///
+/// While a client holds one, the frame's `focused_pane_rect` is `None` and its
+/// `cursor_visible` is `false`, because this layer owns both. `cells` is set on
+/// a full layer and `changes` on a diff against the layer the client already
+/// holds; a client treats a set `cells` as a replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PopupCells {
+    /// The popup's pane. One popup per tab, so this tells a client which tab's
+    /// popup the layer is, to keep the position a key opened it at.
+    #[serde(default)]
+    pub pane_id: PaneId,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_visible: bool,
+    pub cursor_style: u8,
+    #[serde(default)]
+    pub cells: Option<Vec<Vec<RenderCell>>>,
+    #[serde(default)]
+    pub changes: Vec<CellChange>,
+}
+
 /// A single changed cell for diff-based rendering.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CellChange {
@@ -1313,11 +1401,15 @@ pub enum RemuxCommand {
     },
     PaneRename(String),
     PaneToggleZoom,
-    /// Show/hide the session's popup terminal -- a floating, centered pane drawn
-    /// on top of the layout. One popup per session, shared by every attached
-    /// client; the pane is spawned lazily on the first toggle and its shell keeps
-    /// running while hidden.
-    PopupToggle,
+    /// Show/hide the active tab's popup terminal, drawn over the layout. One
+    /// popup per tab, shared by every attached client; the pane is spawned
+    /// lazily on the tab's first toggle and its shell keeps running while
+    /// hidden.
+    ///
+    /// The position is where the CLIENT opens the popup (`None`: its configured
+    /// `popup_position`). Placement is client-side, so a client forwards this
+    /// with `None` and the server ignores the field.
+    PopupToggle(Option<crate::config::PopupPosition>),
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -1498,7 +1590,7 @@ impl RemuxCommand {
             | RemuxCommand::PaneUnstackDown
             | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
-            | RemuxCommand::PopupToggle
+            | RemuxCommand::PopupToggle(_)
             | RemuxCommand::ResizeLeft(_)
             | RemuxCommand::ResizeRight(_)
             | RemuxCommand::ResizeUp(_)
@@ -1793,7 +1885,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
-            ActionSpec::server("PopupToggle"),
+            ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
             ActionSpec::server("ResizeRight").arg("<amount>", "5"),
             ActionSpec::server("ResizeUp").arg("<amount>", "5"),
@@ -1886,7 +1978,16 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
 pub enum SessionEvent {
     SessionCreated(String),
     SessionDeleted(String),
-    PaneExited { pane_id: PaneId, exit_code: i32 },
+    /// A session was renamed. Sent to every client, so one that names the
+    /// session anywhere (the attached session, the last one) can follow it.
+    SessionRenamed {
+        old: String,
+        new: String,
+    },
+    PaneExited {
+        pane_id: PaneId,
+        exit_code: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,6 +2083,8 @@ mod tests {
             viewport_top: 0,
             scroll_offset: 0,
             status: Some(info.clone()),
+            popup: None,
+            live_popups: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -2146,6 +2249,7 @@ mod tests {
             y: 10,
             pane_id: None,
             release: false,
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2156,7 +2260,9 @@ mod tests {
                 y,
                 pane_id,
                 release,
+                popup,
             } => {
+                assert!(!popup);
                 assert_eq!(x, 42);
                 assert_eq!(y, 10);
                 assert_eq!(pane_id, None);
@@ -2177,6 +2283,7 @@ mod tests {
             y: 5,
             pane_id: Some(9),
             release: true,
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2268,6 +2375,7 @@ mod tests {
             end_y: 4,
             is_final: true,
             pane_id: Some(77),
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2366,6 +2474,7 @@ mod tests {
             end_y: 7,
             is_final: false,
             pane_id: None,
+            popup: false,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
@@ -2731,7 +2840,7 @@ mod tests {
             RemuxCommand::PaneUnstackDown => Some("PaneUnstackDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
-            RemuxCommand::PopupToggle => Some("PopupToggle"),
+            RemuxCommand::PopupToggle(_) => Some("PopupToggle"),
             RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
             RemuxCommand::ResizeRight(_) => Some("ResizeRight"),
             RemuxCommand::ResizeUp(_) => Some("ResizeUp"),
@@ -2800,13 +2909,193 @@ mod tests {
         }
     }
 
+    fn decode_client(msg: &ClientMessage) -> ClientMessage {
+        let encoded = encode_message(msg).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        serde_json::from_slice(&encoded[4..4 + len]).unwrap()
+    }
+
+    /// 18 is the version that introduces `PopupSize`; a peer on 17 cannot
+    /// decode it, so the handshake has to refuse that pairing.
+    #[test]
+    fn protocol_version_is_18_for_popup_size() {
+        assert_eq!(PROTOCOL_VERSION, 18);
+    }
+
+    #[test]
+    fn popup_size_round_trips() {
+        match decode_client(&ClientMessage::PopupSize {
+            cols: 126,
+            rows: 35,
+        }) {
+            ClientMessage::PopupSize { cols, rows } => assert_eq!((cols, rows), (126, 35)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The three mouse riders and the frame layer are `#[serde(default)]`, so a
+    /// payload from a peer that predates them decodes to `false`/`None`.
+    #[test]
+    fn popup_riders_default_when_absent() {
+        let click = br#"{"MouseClick":{"x":1,"y":2,"pane_id":null,"release":false}}"#;
+        match serde_json::from_slice::<ClientMessage>(click).unwrap() {
+            ClientMessage::MouseClick { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let drag =
+            br#"{"MouseDrag":{"start_x":0,"start_y":0,"end_x":1,"end_y":1,"is_final":true}}"#;
+        match serde_json::from_slice::<ClientMessage>(drag).unwrap() {
+            ClientMessage::MouseDrag { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let scroll = br#"{"MouseScroll":{"x":1,"y":2,"up":true}}"#;
+        match serde_json::from_slice::<ClientMessage>(scroll).unwrap() {
+            ClientMessage::MouseScroll { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let full = r#"{"FullRender":{"cells":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
+        match serde_json::from_str::<ServerMessage>(full).unwrap() {
+            ServerMessage::FullRender {
+                popup, live_popups, ..
+            } => {
+                assert_eq!(popup, None);
+                assert!(live_popups.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let diff = r#"{"RenderDiff":{"changes":[],"cursor_x":0,"cursor_y":0,"cursor_visible":true,"cursor_style":0,"focused_pane_rect":null}}"#;
+        match serde_json::from_str::<ServerMessage>(diff).unwrap() {
+            ServerMessage::RenderDiff {
+                popup, live_popups, ..
+            } => {
+                assert_eq!(popup, None);
+                assert!(live_popups.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// The client places the popup, so it forwards `PopupToggle` without the
+    /// position its key named.
+    #[test]
+    fn popup_toggle_round_trips_with_and_without_a_position() {
+        for cmd in [
+            RemuxCommand::PopupToggle(None),
+            RemuxCommand::PopupToggle(Some(crate::config::PopupPosition::Bottom)),
+        ] {
+            let msg = ClientMessage::Command(cmd.clone());
+            let json = serde_json::to_string(&msg).unwrap();
+            match serde_json::from_str::<ClientMessage>(&json).unwrap() {
+                ClientMessage::Command(back) => assert_eq!(back, cmd, "{json}"),
+                other => panic!("unexpected variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn popup_mouse_flag_round_trips() {
+        let click = ClientMessage::MouseClick {
+            x: 3,
+            y: 4,
+            pane_id: None,
+            release: false,
+            popup: true,
+        };
+        match decode_client(&click) {
+            ClientMessage::MouseClick { popup, x, y, .. } => assert!(popup && x == 3 && y == 4),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let drag = ClientMessage::MouseDrag {
+            start_x: 0,
+            start_y: 1,
+            end_x: 2,
+            end_y: 3,
+            is_final: false,
+            pane_id: None,
+            popup: true,
+        };
+        match decode_client(&drag) {
+            ClientMessage::MouseDrag { popup, .. } => assert!(popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let scroll = ClientMessage::MouseScroll {
+            x: 1,
+            y: 1,
+            up: false,
+            popup: true,
+        };
+        match decode_client(&scroll) {
+            ClientMessage::MouseScroll { popup, .. } => assert!(popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn popup_cells_round_trip_on_both_frames() {
+        let layer = PopupCells {
+            pane_id: 7,
+            cols: 2,
+            rows: 1,
+            cursor_x: 1,
+            cursor_y: 0,
+            cursor_visible: true,
+            cursor_style: 2,
+            cells: Some(vec![vec![RenderCell::default(), RenderCell::default()]]),
+            changes: vec![CellChange {
+                x: 0,
+                y: 0,
+                cell: RenderCell::default(),
+            }],
+        };
+        let full = ServerMessage::FullRender {
+            cells: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            cursor_style: 0,
+            focused_pane_rect: None,
+            application_cursor_keys: false,
+            bracketed_paste: true,
+            viewport_top: 0,
+            scroll_offset: 0,
+            status: None,
+            popup: Some(Box::new(layer.clone())),
+            live_popups: vec![7],
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::FullRender { popup, .. } => assert_eq!(popup.as_deref(), Some(&layer)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let diff = ServerMessage::RenderDiff {
+            changes: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: false,
+            cursor_style: 0,
+            focused_pane_rect: None,
+            application_cursor_keys: false,
+            bracketed_paste: true,
+            viewport_top: 0,
+            scroll_offset: 0,
+            status: None,
+            popup: Some(Box::new(layer.clone())),
+            live_popups: vec![7],
+        };
+        let json = serde_json::to_string(&diff).unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::RenderDiff { popup, .. } => assert_eq!(popup.as_deref(), Some(&layer)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
     /// Nothing bindable is missing from the registry: a variant classified as
     /// bindable must be listed.
     #[test]
     fn classified_names_are_registry_names() {
         for cmd in [
             RemuxCommand::EnterSearchMode,
-            RemuxCommand::PopupToggle,
+            RemuxCommand::PopupToggle(None),
             RemuxCommand::SendKey(vec![1]),
             RemuxCommand::SessionSwitchLast,
         ] {

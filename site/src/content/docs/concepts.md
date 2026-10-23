@@ -36,7 +36,7 @@ Several panes can share one position in a layout as a **stack**. Only one pane o
 
 ### The popup terminal
 
-Each session has one **popup terminal**, a scratch shell that floats over the layout instead of taking a slot in it. Toggle it with `Alt-p`. It keeps running while hidden, so you get the same shell and history back each time.
+Each tab has one **popup terminal**, a scratch shell drawn over the layout instead of taking a slot in it. Toggle it with `Alt-p`. The first toggle in a tab starts a shell in the directory of that tab's focused pane. It keeps running while hidden, so you get the same shell and history back each time, and a tab you leave with its popup open still has it open when you return. By default it floats over the whole window, sidebars included. `popup_position` docks it to an edge instead.
 
 ## Layouts
 

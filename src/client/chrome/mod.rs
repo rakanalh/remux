@@ -539,6 +539,14 @@ impl Chrome {
         if !matches!(self.border_style, BorderStyle::ZellijStyle) {
             return Ok(());
         }
+        // While the popup layer is up, `focused_pane_rect` is the popup's
+        // interior, and the box's frame is drawn by the client already in the
+        // focused colour. The front buffer never holds that frame, only what is
+        // under the box, so the ring check below can only ever match a stale
+        // pane border hidden by the box.
+        if renderer.popup_rect().is_some() {
+            return Ok(());
+        }
         let Some(pane) = focused_pane_rect else {
             return Ok(());
         };
