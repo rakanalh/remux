@@ -12810,6 +12810,32 @@ mod popup_tests {
     }
 
     #[tokio::test]
+    async fn a_hidden_clients_refreshed_want_lifts_the_shared_size() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let _other = rig.add_client(2, 160, 48, Some((70, 14))).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("popup");
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        assert_eq!(rig.screen_size(popup).await, (50, 10), "capped by client 1");
+        // Client 1's terminal grows while the popup is hidden, and it announces
+        // the box it would now place.
+        handle_popup_size(
+            CLIENT,
+            (90, 20),
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("popup size");
+        assert_eq!(rig.screen_size(popup).await, (70, 14), "no longer capped");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
     async fn a_popup_already_at_the_shared_size_is_not_resized_again() {
         let dir = tempfile::tempdir().expect("dir");
         let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;

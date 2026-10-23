@@ -344,6 +344,13 @@ pub struct PopupState {
     /// A toggle this client sent to open a popup, until its first layer
     /// arrives: the position it named, or `None` for the configured one.
     opening: Option<Option<PopupPosition>>,
+    /// Per session, the position of the popup it last placed: the one a key
+    /// named, or `None` for one that follows the config. It is where the box
+    /// stays while no popup is up, so a tab without a popup, or a close, does
+    /// not move the box. The popups of a session share one terminal size, so a
+    /// moved box would resize every other tab's popup, and resize it back when
+    /// the user returns. A session that never placed a popup uses the config.
+    last_placed: HashMap<String, Option<PopupPosition>>,
 }
 
 impl PopupState {
@@ -359,6 +366,7 @@ impl PopupState {
             named: HashMap::new(),
             on_screen: None,
             opening: None,
+            last_placed: HashMap::new(),
         }
     }
 
@@ -385,12 +393,13 @@ impl PopupState {
     }
 
     /// Where `session`'s popup goes: where its key put the popup on screen,
-    /// or where a toggle on its way to the server is opening one, else the
-    /// configured position.
+    /// or where a toggle on its way to the server is opening one, else where
+    /// the session last placed one, else the configured position.
     fn position_for(&self, session: &str) -> PopupPosition {
-        let named = match self.on_screen {
-            Some(pane) => self.named.get(&(session.to_string(), pane)).copied(),
-            None => self.opening.flatten(),
+        let named = match (self.on_screen, self.opening) {
+            (Some(pane), _) => self.named.get(&(session.to_string(), pane)).copied(),
+            (None, Some(opening)) => opening,
+            (None, None) => self.last_placed.get(session).copied().flatten(),
         };
         named.unwrap_or(self.position)
     }
@@ -441,6 +450,10 @@ impl PopupState {
                 None => self.named.remove(&key),
             };
         }
+        if let Some(pane) = pane {
+            let named = self.named.get(&(session.to_string(), pane)).copied();
+            self.last_placed.insert(session.to_string(), named);
+        }
         self.on_screen = pane;
     }
 
@@ -485,29 +498,22 @@ impl PopupState {
     }
 
     /// The interior to ask `conn` for, or `None` when it was already told for
-    /// this box, or when nothing needs a new one.
+    /// this box.
     ///
     /// The comparison is on the whole box, not only its interior: a box that
     /// moved while keeping its size still has to be announced, because the
     /// answer to a [`crate::protocol::ClientMessage::PopupSize`] is the full
     /// frame that repaints what the old box masked away.
     ///
-    /// `active` says a popup is on screen or opening. Without one, a connection
-    /// already told a box is told nothing new. The popups of a session share
-    /// one terminal size, so announcing the configured box for a tab with no
-    /// popup would resize every other tab's popup, and resize it back when the
-    /// user returns. A connection told nothing yet is still told, because until
-    /// then the server draws the popup for this client itself.
-    pub fn announce(
-        &mut self,
-        conn: &ConnId,
-        popup: &PopupBox,
-        active: bool,
-    ) -> Option<(u16, u16)> {
+    /// A box is announced whether or not a popup is up: the server sizes the
+    /// session's popups to the smallest box any client wants, so a want left
+    /// stale while this client's popup is hidden would cap every other
+    /// client's popup.
+    pub fn announce(&mut self, conn: &ConnId, popup: &PopupBox) -> Option<(u16, u16)> {
         if self
             .last_sent
             .as_ref()
-            .is_some_and(|(c, b)| c == conn && (b == popup || !active))
+            .is_some_and(|(c, b)| c == conn && b == popup)
         {
             return None;
         }
@@ -772,32 +778,49 @@ mod tests {
     fn an_identical_box_is_not_announced_twice_to_one_connection() {
         let mut s = PopupState::from_config(&Config::default());
         let b = boxed(PopupPosition::Float, left_sidebar());
-        assert_eq!(s.announce(&ConnId::Local, &b, true), Some((126, 35)));
-        assert_eq!(s.announce(&ConnId::Local, &b, true), None);
+        assert_eq!(s.announce(&ConnId::Local, &b), Some((126, 35)));
+        assert_eq!(s.announce(&ConnId::Local, &b), None);
         // Another server has not been told.
         let far = ConnId::Remote("far".to_string());
-        assert_eq!(s.announce(&far, &b, true), Some((126, 35)));
-        assert_eq!(s.announce(&ConnId::Local, &b, true), Some((126, 35)));
+        assert_eq!(s.announce(&far, &b), Some((126, 35)));
+        assert_eq!(s.announce(&ConnId::Local, &b), Some((126, 35)));
     }
 
     #[test]
-    fn no_box_is_announced_while_no_popup_is_up_or_opening() {
+    fn a_hidden_popup_keeps_the_box_it_was_last_placed_at() {
         let mut s = PopupState::from_config(&Config::default());
-        let right = boxed(PopupPosition::Right, left_sidebar());
-        let float = boxed(PopupPosition::Float, left_sidebar());
-        // The first box a connection hears of is always announced: until it
-        // has one, the server treats this client as one that cannot place
-        // the popup, and draws a float itself.
-        assert!(s.announce(&ConnId::Local, &right, false).is_some());
-        // Then, with no popup on screen and none opening, another box (a tab
-        // without a popup falls back to the config's) is not: it would resize
-        // the popups of every other tab in the session.
-        assert_eq!(s.announce(&ConnId::Local, &float, false), None);
-        // A popup up or opening is announced as before.
-        assert!(s.announce(&ConnId::Local, &float, true).is_some());
-        // Another server has not been told anything yet.
-        let far = ConnId::Remote("far".to_string());
-        assert!(s.announce(&far, &right, false).is_some());
+        // Never shown: the configured float, as before.
+        assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
+        s.toggle("a", Some(PopupPosition::Right), false);
+        s.bind_layer("a", Some(7));
+        // A tab with no popup: the box stays the right drawer, so the server is
+        // told nothing new and resizes no popup.
+        s.bind_layer("a", None);
+        assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
+        // Closed, too: the hidden popup's terminal keeps the drawer's size
+        // until the next open says otherwise.
+        s.bind_layer("a", Some(7));
+        s.toggle("a", None, true);
+        s.bind_layer("a", None);
+        assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
+        // Another session has its own.
+        assert_eq!(frame_of(&s, "b"), PopupFrame::Full);
+        // A plain open replaces it with the config's, and so does a plain
+        // popup shown on another tab.
+        s.toggle("a", None, false);
+        s.bind_layer("a", Some(9));
+        s.bind_layer("a", None);
+        assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
+    }
+
+    #[test]
+    fn a_hidden_plain_popup_follows_a_config_reload() {
+        let mut s = PopupState::from_config(&Config::default());
+        s.toggle("a", None, false);
+        s.bind_layer("a", Some(7));
+        s.bind_layer("a", None);
+        assert!(s.apply_config(&config_with(PopupPosition::Left, 80, 80)));
+        assert_eq!(frame_of(&s, "a"), PopupFrame::OpenLeft);
     }
 
     #[test]
@@ -812,8 +835,8 @@ mod tests {
             (left.interior.width, left.interior.height),
             (right.interior.width, right.interior.height)
         );
-        assert!(s.announce(&ConnId::Local, &left, true).is_some());
-        assert!(s.announce(&ConnId::Local, &right, true).is_some());
+        assert!(s.announce(&ConnId::Local, &left).is_some());
+        assert!(s.announce(&ConnId::Local, &right).is_some());
     }
 
     fn frame_of(s: &PopupState, session: &str) -> PopupFrame {
@@ -830,11 +853,12 @@ mod tests {
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
         s.bind_layer("a", Some(7));
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
-        // A key naming another position closes it rather than moving it.
+        // A key naming another position closes it rather than moving it. The
+        // box stays where it was placed, so the hidden popup is not resized.
         s.toggle("a", Some(PopupPosition::Bottom), true);
         s.bind_layer("a", None);
-        assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
-        // And the record went with it: reopened plain, it is the config's.
+        assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
+        // But the record went with it: reopened plain, it is the config's.
         s.toggle("a", None, false);
         s.bind_layer("a", Some(7));
         assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
@@ -854,9 +878,9 @@ mod tests {
         let mut s = PopupState::from_config(&Config::default());
         s.toggle("a", Some(PopupPosition::Right), false);
         s.bind_layer("a", Some(7));
-        // Another tab, with no popup up.
+        // Another tab, with no popup up: the box stays the drawer last placed.
         s.bind_layer("a", None);
-        assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
+        assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
         s.toggle("a", Some(PopupPosition::Bottom), false);
         s.bind_layer("a", Some(9));
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenBottom);
