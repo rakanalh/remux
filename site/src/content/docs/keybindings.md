@@ -228,13 +228,15 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 
 ### Popup keys
 
-`PopupToggle` takes an optional position, so you can bind separate keys that open the popup in different places. Every popup key is a plain show/hide toggle: when the popup is hidden, the key opens it at the position it names (or at `popup_position` when it names none); when the popup is visible, any popup key closes it, whatever position it names. Each tab's popup keeps the position it was opened at until it is closed. A View shows no popup, so popup keys do nothing inside one. The leader chord `Prefix p o` stays a plain toggle. These bindings are an example, not defaults:
+`PopupToggle` takes an optional position, so you can bind separate keys that open the popup in different places. Every popup key is a plain show/hide toggle: when the popup is hidden, the key opens it at the position it names (or at `popup_position` when it names none); when the popup is visible, any popup key closes it, whatever position it names. Each tab's popup keeps the position and size it was opened at until it is closed. A key can also give the popup a size, in percent: `PopupToggle float 80` is 80% of the window on both axes, `PopupToggle float 80x60` is 80% wide and 60% high, and a drawer takes one number for the axis it sizes, `PopupToggle right 40` (width) or `PopupToggle bottom 30` (height). A size always follows a position, a drawer given `WxH` is a config error, and numbers are clamped to 20–100 like `popup_width_pct`. A key with no size uses `popup_width_pct` / `popup_height_pct`. The pane-resize keys adjust the popup on top of its key's size, and only for popups opened by a key with that same position and size. A View shows no popup, so popup keys do nothing inside one. The leader chord `Prefix p o` stays a plain toggle. These bindings are an example, not defaults:
 
 ```toml
 [keybindings.command]
 "Alt-p"  = "PopupToggle"
 "Alt--"  = "PopupToggle bottom"
 "Alt-\\" = "PopupToggle right"
+"Alt-f"  = "PopupToggle float 90x70"
+"Alt-]"  = "PopupToggle right 40"
 ```
 
 ## Session manager chords
@@ -293,7 +295,7 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneToggleZoom` | Zoom or unzoom the focused pane |
 | `PaneRename` | Rename the focused pane (prompts) |
 | `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |
-| `PopupToggle [float\|left\|right\|top\|bottom]` | Show or hide the active tab's popup terminal. A hidden popup opens at the named position, or at `popup_position` with none; a visible one closes, whatever position the key names |
+| `PopupToggle [float\|left\|right\|top\|bottom] [size]` | Show or hide the active tab's popup terminal. A hidden popup opens at the named position, or at `popup_position` with none, sized by `size` in percent (`80` or `80x60` for a float, one number for a drawer's axis) or by `popup_width_pct` / `popup_height_pct` with none; a visible one closes, whatever the key names |
 | `ResizeLeft` / `Right` / `Up` / `Down` `[amount]` | Resize the focused pane by `amount` cells (default `1`) |
 | `SetMaster` | Make the focused pane the master pane |
 

@@ -511,6 +511,47 @@ def toggle_position_case():
     return fails
 
 
+SIZED_KEYS = """[keybindings.command]
+"Alt-p" = "PopupToggle float 80"
+"Alt-o" = "PopupToggle"
+"""
+ALT_O = b"\x1bo"
+
+
+def sized_float_case():
+    print("\n== a size on the popup key replaces the config percentages ==")
+    fails = []
+    check = make_check(fails)
+    # popup_width_pct = popup_height_pct = 45 is what a plain open uses.
+    tui = start("/tmp/rmxpop/sb_sized", SIZED_KEYS + cfg(wpct=45, hpct=45))
+    try:
+        # 80% of 160 columns and of 47 rows (the window minus the status row),
+        # centred on the whole window.
+        sized = {"x": 16, "y": 5, "width": 128, "height": 37}
+        # 45% of the same, centred.
+        plain = {"x": 44, "y": 13, "width": 72, "height": 21}
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        found = boxes_in(list(tui.rows_text()), SB_COLS)
+        check(sized in found, f"Alt-p (float 80) opens an 80% float; boxes: {found}")
+        check(plain not in found, "and not the configured 45%")
+        tui.send(ALT_P)
+        tui.pump(1.8)
+        check(sized not in boxes_in(list(tui.rows_text()), SB_COLS),
+              "Alt-p while it is open closes it")
+        tui.send(ALT_O)
+        tui.pump(1.8)
+        found = boxes_in(list(tui.rows_text()), SB_COLS)
+        check(plain in found, f"a plain key opens the configured 45% float; boxes: {found}")
+        check(sized not in found, "and not the 80% one")
+        check(tui.alive(), "the client is alive")
+        logs = tui.log("client") + tui.log("server")
+        check("panic" not in logs.lower(), "no panic in the logs")
+    finally:
+        tui.kill()
+    return fails
+
+
 def tab_switch_no_resize_case():
     print("\n== a tab switch does not resize a popup opened at a named position ==")
     fails = []
@@ -633,7 +674,7 @@ def main():
     for case in (no_sidebar_case, float_over_sidebar_case, left_case, top_case,
                  live_reload_case, runtime_resize_case, per_tab_case,
                  in_tab_cwd_case, toggle_position_case, focus_return_case,
-                 tab_switch_no_resize_case):
+                 tab_switch_no_resize_case, sized_float_case):
         all_fails += [f"{case.__name__}: {f}" for f in case()]
     print(f"\n{'FAILED: ' + str(len(all_fails)) if all_fails else 'ALL PASS'}")
     for f in all_fails:

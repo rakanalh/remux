@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use crate::client::registry::ConnId;
-use crate::config::{Config, PopupPosition};
+use crate::config::{Config, PopupPlacement, PopupPosition};
 use crate::protocol::{PaneId, PopupCells, RenderCell};
 use crate::server::compositor::{
     border_fg, draw_zellij_border, draw_zellij_border_open, fits_zellij_border, OpenEdge,
@@ -327,30 +327,35 @@ pub fn compose_box(
 pub struct PopupState {
     position: PopupPosition,
     pct: (u8, u8),
-    /// Runtime resizes, per position, so widening a right drawer leaves a later
-    /// float as it was. A position with no entry uses the config's
-    /// percentages. Reset whenever a popup config key changes.
-    overrides: HashMap<PopupPosition, (u8, u8)>,
+    /// Runtime resizes, per placement (position and key size), so widening a
+    /// right drawer leaves a later float as it was, and a float opened by
+    /// `PopupToggle float 80` is not resized with a plain one. The value is
+    /// the absolute percentages, so it replaces that placement's base, which
+    /// is why the key has to include the key size: the same override applied
+    /// to another base would resize it by a different amount. A placement
+    /// with no entry uses its base. Reset whenever a popup config key changes.
+    overrides: HashMap<PopupPlacement, (u8, u8)>,
     /// The box last announced to the server, with the connection it went to,
     /// so an identical send is skipped.
     last_sent: Option<(ConnId, PopupBox)>,
-    /// Where a popup opened by a `PopupToggle <position>` key sits, by session
-    /// and popup pane. There is one popup per tab, so this is per tab, and a
-    /// respawned popup has a new id, so a record never outlives its popup. A
-    /// popup with no entry follows `position`.
-    named: HashMap<(String, PaneId), PopupPosition>,
+    /// Where, and at what size, a popup opened by a `PopupToggle <position>
+    /// [size]` key sits, by session and popup pane. There is one popup per
+    /// tab, so this is per tab, and a respawned popup has a new id, so a record
+    /// never outlives its popup. A popup with no entry follows `position` and
+    /// the config's percentages.
+    named: HashMap<(String, PaneId), PopupPlacement>,
     /// The popup whose layer is on screen.
     on_screen: Option<PaneId>,
     /// A toggle this client sent to open a popup, until its first layer
-    /// arrives: the position it named, or `None` for the configured one.
-    opening: Option<Option<PopupPosition>>,
-    /// Per session, the position of the popup it last placed: the one a key
+    /// arrives: the placement it named, or `None` for the configured one.
+    opening: Option<Option<PopupPlacement>>,
+    /// Per session, the placement of the popup it last placed: the one a key
     /// named, or `None` for one that follows the config. It is where the box
     /// stays while no popup is up, so a tab without a popup, or a close, does
     /// not move the box. The popups of a session share one terminal size, so a
     /// moved box would resize every other tab's popup, and resize it back when
     /// the user returns. A session that never placed a popup uses the config.
-    last_placed: HashMap<String, Option<PopupPosition>>,
+    last_placed: HashMap<String, Option<PopupPlacement>>,
 }
 
 impl PopupState {
@@ -388,56 +393,62 @@ impl PopupState {
         true
     }
 
-    fn pct_for(&self, position: PopupPosition) -> (u8, u8) {
-        self.overrides.get(&position).copied().unwrap_or(self.pct)
+    /// The percentages for `placement`: its runtime resize, else its base,
+    /// which is the key's size on each axis it gives and the config's on the
+    /// rest.
+    fn pct_for(&self, placement: impl Into<PopupPlacement>) -> (u8, u8) {
+        let placement = placement.into();
+        self.overrides.get(&placement).copied().unwrap_or_else(|| {
+            let size = placement.size.unwrap_or_default();
+            (
+                size.width.unwrap_or(self.pct.0),
+                size.height.unwrap_or(self.pct.1),
+            )
+        })
     }
 
-    /// Where `session`'s popup goes: where its key put the popup on screen,
-    /// or where a toggle on its way to the server is opening one, else where
-    /// the session last placed one, else the configured position.
-    fn position_for(&self, session: &str) -> PopupPosition {
+    /// Where `session`'s popup goes, and how big: what its key put on screen,
+    /// or what a toggle on its way to the server is opening, else what the
+    /// session last placed, else the configured position and percentages.
+    fn placement_for(&self, session: &str) -> PopupPlacement {
         let named = match (self.on_screen, self.opening) {
             (Some(pane), _) => self.named.get(&(session.to_string(), pane)).copied(),
             (None, Some(opening)) => opening,
             (None, None) => self.last_placed.get(session).copied().flatten(),
         };
-        named.unwrap_or(self.position)
+        named.unwrap_or(self.position.into())
     }
 
     /// The box for `session`.
     pub fn popup_box(&self, session: &str, window: (u16, u16), content: Rect) -> PopupBox {
-        popup_box(
-            self.position_for(session),
-            self.pct_for(self.position_for(session)),
-            window,
-            content,
-        )
+        let placement = self.placement_for(session);
+        popup_box(placement.position, self.pct_for(placement), window, content)
     }
 
     /// Record a `PopupToggle` this client is about to send for `session`.
     ///
     /// Every popup key is a plain show/hide toggle: with the popup `visible`
     /// it closes, whatever position the key names, and the popup's record
-    /// goes with it. Otherwise the popup opens at `position` (`None`: the
+    /// goes with it. Otherwise the popup opens at `placement` (`None`: the
     /// configured one), which binds to the popup when its first layer arrives.
-    pub fn toggle(&mut self, session: &str, position: Option<PopupPosition>, visible: bool) {
+    pub fn toggle(&mut self, session: &str, placement: Option<PopupPlacement>, visible: bool) {
         if visible {
             if let Some(pane) = self.on_screen {
                 self.named.remove(&(session.to_string(), pane));
             }
             self.opening = None;
         } else {
-            self.opening = Some(position);
+            self.opening = Some(placement);
         }
     }
 
     /// Move everything kept for session `old` to `new`, after a rename.
     pub fn rename_session(&mut self, old: &str, new: &str) {
-        let moved: Vec<((String, PaneId), PopupPosition)> = self
+        let moved: Vec<((String, PaneId), PopupPlacement)> = self
             .named
             .iter()
             .filter(|((s, _), _)| s == old)
-            .map(|((_, pane), position)| ((new.to_string(), *pane), *position))
+            .map(|((_, pane), placement)| ((new.to_string(), *pane), *placement))
             .collect();
         self.named.retain(|(s, _), _| s != old);
         self.named.extend(moved);
@@ -446,7 +457,7 @@ impl PopupState {
         }
     }
 
-    /// Forget the positions of `session`'s popups that are not in `live`, the
+    /// Forget the placements of `session`'s popups that are not in `live`, the
     /// popups its server still has. A popup dies with its tab or its shell, or
     /// is hidden by another client, without this client's key closing it.
     pub fn prune(&mut self, session: &str, live: &[PaneId]) {
@@ -455,13 +466,13 @@ impl PopupState {
     }
 
     /// Note which popup's layer `session`'s frames now carry, if any. The
-    /// first layer after an opening toggle takes that toggle's position.
+    /// first layer after an opening toggle takes that toggle's placement.
     pub fn bind_layer(&mut self, session: &str, pane: Option<PaneId>) {
-        if let (Some(pane), Some(position)) = (pane, self.opening) {
+        if let (Some(pane), Some(placement)) = (pane, self.opening) {
             self.opening = None;
             let key = (session.to_string(), pane);
-            match position {
-                Some(position) => self.named.insert(key, position),
+            match placement {
+                Some(placement) => self.named.insert(key, placement),
                 None => self.named.remove(&key),
             };
         }
@@ -476,7 +487,8 @@ impl PopupState {
     /// position uses. Returns `false` when the position does not use that axis,
     /// in which case nothing changes.
     pub fn resize(&mut self, session: &str, dw: i16, dh: i16) -> bool {
-        let position = self.position_for(session);
+        let placement = self.placement_for(session);
+        let position = placement.position;
         let uses_width = matches!(
             position,
             PopupPosition::Float | PopupPosition::Left | PopupPosition::Right
@@ -492,9 +504,9 @@ impl PopupState {
         let adjust = |cur: u8, delta: i16| -> u8 {
             (cur as i16 + delta).clamp(POPUP_MIN_PCT as i16, POPUP_MAX_PCT as i16) as u8
         };
-        let (w, h) = self.pct_for(position);
+        let (w, h) = self.pct_for(placement);
         self.overrides
-            .insert(position, (adjust(w, dw), adjust(h, dh)));
+            .insert(placement, (adjust(w, dw), adjust(h, dh)));
         true
     }
 
@@ -540,6 +552,7 @@ impl PopupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PopupSize;
     use crate::protocol::CellChange;
 
     const WINDOW: (u16, u16) = (160, 48);
@@ -750,7 +763,7 @@ mod tests {
     fn a_resize_is_per_position_and_clamped() {
         use PopupPosition::{Float, Right};
         let mut s = PopupState::from_config(&config_with(Float, 80, 80));
-        s.toggle("a", Some(Right), false);
+        s.toggle("a", Some(Right.into()), false);
         s.bind_layer("a", Some(7));
         for _ in 0..10 {
             s.resize("a", 20, 0);
@@ -758,7 +771,7 @@ mod tests {
         assert_eq!(s.pct_for(Right), (100, 80));
         assert_eq!(s.pct_for(Float), (80, 80), "a later float is not widened");
         // The right drawer of another session is the same position.
-        s.toggle("b", Some(Right), false);
+        s.toggle("b", Some(Right.into()), false);
         s.bind_layer("b", Some(9));
         assert_eq!(
             s.popup_box("b", WINDOW, left_sidebar()),
@@ -806,7 +819,7 @@ mod tests {
         let mut s = PopupState::from_config(&Config::default());
         // Never shown: the configured float, as before.
         assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
-        s.toggle("a", Some(PopupPosition::Right), false);
+        s.toggle("a", Some(PopupPosition::Right.into()), false);
         s.bind_layer("a", Some(7));
         // A tab with no popup: the box stays the right drawer, so the server is
         // told nothing new and resizes no popup.
@@ -862,7 +875,7 @@ mod tests {
     fn a_named_open_places_the_popup_there_and_any_key_closes_it() {
         let mut s = PopupState::from_config(&Config::default());
         assert_eq!(frame_of(&s, "a"), PopupFrame::Full);
-        s.toggle("a", Some(PopupPosition::Right), false);
+        s.toggle("a", Some(PopupPosition::Right.into()), false);
         // Before the server's first layer, the box is the one being opened, so
         // the PopupSize sent ahead of the toggle sizes the right drawer.
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
@@ -870,7 +883,7 @@ mod tests {
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
         // A key naming another position closes it rather than moving it. The
         // box stays where it was placed, so the hidden popup is not resized.
-        s.toggle("a", Some(PopupPosition::Bottom), true);
+        s.toggle("a", Some(PopupPosition::Bottom.into()), true);
         s.bind_layer("a", None);
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
         // But the record went with it: reopened plain, it is the config's.
@@ -891,12 +904,12 @@ mod tests {
     #[test]
     fn each_tabs_popup_keeps_the_position_it_was_opened_at() {
         let mut s = PopupState::from_config(&Config::default());
-        s.toggle("a", Some(PopupPosition::Right), false);
+        s.toggle("a", Some(PopupPosition::Right.into()), false);
         s.bind_layer("a", Some(7));
         // Another tab, with no popup up: the box stays the drawer last placed.
         s.bind_layer("a", None);
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenRight);
-        s.toggle("a", Some(PopupPosition::Bottom), false);
+        s.toggle("a", Some(PopupPosition::Bottom.into()), false);
         s.bind_layer("a", Some(9));
         assert_eq!(frame_of(&s, "a"), PopupFrame::OpenBottom);
         // Back on the first tab, whose popup is still open.
@@ -915,7 +928,7 @@ mod tests {
             ("a", 9, PopupPosition::Bottom),
             ("b", 9, PopupPosition::Left),
         ] {
-            s.toggle(session, Some(position), false);
+            s.toggle(session, Some(position.into()), false);
             s.bind_layer(session, Some(pane));
         }
         // Session "a" now has popup 7 only: 9 closed with its tab.
@@ -931,10 +944,161 @@ mod tests {
     #[test]
     fn a_runtime_resize_uses_the_axis_of_the_position_on_screen() {
         let mut s = PopupState::from_config(&config_with(PopupPosition::Float, 50, 50));
-        s.toggle("a", Some(PopupPosition::Left), false);
+        s.toggle("a", Some(PopupPosition::Left.into()), false);
         s.bind_layer("a", Some(7));
         assert!(!s.resize("a", 0, 10), "a left drawer ignores its height");
         assert!(s.resize("a", 10, 0));
+    }
+
+    // -- A size given by the key ----------------------------------------------
+
+    fn sized(position: PopupPosition, width: Option<u8>, height: Option<u8>) -> PopupPlacement {
+        PopupPlacement {
+            position,
+            size: Some(PopupSize { width, height }),
+        }
+    }
+
+    /// Open `placement` on `session` as popup `pane`.
+    fn open(s: &mut PopupState, session: &str, pane: PaneId, placement: Option<PopupPlacement>) {
+        s.toggle(session, placement, false);
+        s.bind_layer(session, Some(pane));
+    }
+
+    #[test]
+    fn a_key_size_replaces_the_config_percentages_for_that_popup_only() {
+        use PopupPosition::Float;
+        let mut s = PopupState::from_config(&config_with(Float, 45, 45));
+        let at = |s: &PopupState| s.popup_box("a", WINDOW, left_sidebar());
+        // Opening: the box is already the sized one, so the PopupSize sent
+        // ahead of the toggle sizes the popup.
+        s.toggle("a", Some(sized(Float, Some(80), Some(60))), false);
+        assert_eq!(at(&s), popup_box(Float, (80, 60), WINDOW, left_sidebar()));
+        s.bind_layer("a", Some(7));
+        assert_eq!(at(&s), popup_box(Float, (80, 60), WINDOW, left_sidebar()));
+        // A plain open, and a position with no size, use the config.
+        s.toggle("a", None, true);
+        open(&mut s, "a", 8, None);
+        assert_eq!(at(&s), popup_box(Float, (45, 45), WINDOW, left_sidebar()));
+        s.toggle("a", None, true);
+        open(&mut s, "a", 9, Some(Float.into()));
+        assert_eq!(at(&s), popup_box(Float, (45, 45), WINDOW, left_sidebar()));
+    }
+
+    #[test]
+    fn a_docked_key_size_sets_the_axis_the_position_uses() {
+        use PopupPosition::{Bottom, Right};
+        let mut s = PopupState::from_config(&config_with(PopupPosition::Float, 80, 80));
+        open(&mut s, "a", 7, Some(sized(Right, Some(40), None)));
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()),
+            popup_box(Right, (40, 80), WINDOW, left_sidebar())
+        );
+        s.toggle("a", None, true);
+        open(&mut s, "a", 8, Some(sized(Bottom, None, Some(30))));
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()),
+            popup_box(Bottom, (80, 30), WINDOW, left_sidebar())
+        );
+    }
+
+    #[test]
+    fn a_runtime_resize_adjusts_on_top_of_the_key_size() {
+        use PopupPosition::Float;
+        let mut s = PopupState::from_config(&config_with(Float, 45, 45));
+        open(&mut s, "a", 7, Some(sized(Float, Some(80), Some(60))));
+        assert!(s.resize("a", 5, -10));
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()),
+            popup_box(Float, (85, 50), WINDOW, left_sidebar())
+        );
+        // Another popup of the same position and size is resized with it, and
+        // one with another size, or none, is not.
+        assert_eq!(s.pct_for(sized(Float, Some(80), Some(60))), (85, 50));
+        assert_eq!(s.pct_for(sized(Float, Some(80), Some(80))), (80, 80));
+        assert_eq!(s.pct_for(Float), (45, 45), "a plain float is not resized");
+    }
+
+    #[test]
+    fn a_key_size_survives_a_config_reload_and_its_resize_does_not() {
+        use PopupPosition::Float;
+        let mut s = PopupState::from_config(&config_with(Float, 45, 45));
+        open(&mut s, "a", 7, Some(sized(Float, Some(80), Some(60))));
+        s.resize("a", 5, 5);
+        assert!(s.apply_config(&config_with(Float, 50, 50)));
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()),
+            popup_box(Float, (80, 60), WINDOW, left_sidebar()),
+            "the key's size is not the config's, and the override is gone"
+        );
+        // Hidden, it still keeps its box.
+        s.bind_layer("a", None);
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()),
+            popup_box(Float, (80, 60), WINDOW, left_sidebar())
+        );
+    }
+
+    #[test]
+    fn a_hidden_popup_keeps_the_size_it_was_placed_at() {
+        use PopupPosition::Right;
+        let mut s = PopupState::from_config(&Config::default());
+        open(&mut s, "a", 7, Some(sized(Right, Some(40), None)));
+        s.bind_layer("a", None);
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()),
+            popup_box(Right, (40, 80), WINDOW, left_sidebar())
+        );
+        // Closed by a key, the box stays until the next open says otherwise.
+        s.bind_layer("a", Some(7));
+        s.toggle("a", None, true);
+        s.bind_layer("a", None);
+        assert_eq!(
+            s.popup_box("a", WINDOW, left_sidebar()).rect.width,
+            popup_box(Right, (40, 80), WINDOW, left_sidebar())
+                .rect
+                .width
+        );
+    }
+
+    #[test]
+    fn a_sized_record_is_pruned_and_renamed_with_its_position() {
+        use PopupPosition::{Float, Right};
+        let mut s = PopupState::from_config(&Config::default());
+        open(&mut s, "a", 7, Some(sized(Right, Some(40), None)));
+        open(&mut s, "a", 9, Some(sized(Float, Some(50), Some(50))));
+        s.rename_session("a", "z");
+        assert_eq!(
+            s.named.get(&("z".to_string(), 7)),
+            Some(&sized(Right, Some(40), None))
+        );
+        assert_eq!(
+            s.named.get(&("z".to_string(), 9)),
+            Some(&sized(Float, Some(50), Some(50)))
+        );
+        assert!(!s.named.keys().any(|(session, _)| session == "a"));
+        s.bind_layer("z", Some(7));
+        assert_eq!(
+            s.popup_box("z", WINDOW, left_sidebar()),
+            popup_box(Right, (40, 80), WINDOW, left_sidebar()),
+            "the renamed session still places its popup by the key's size"
+        );
+        s.prune("z", &[7]);
+        assert_eq!(s.named.len(), 1, "{:?}", s.named);
+        assert!(s.named.contains_key(&("z".to_string(), 7)));
+    }
+
+    #[test]
+    fn a_renamed_hidden_session_keeps_the_size_it_last_placed() {
+        use PopupPosition::Right;
+        let mut s = PopupState::from_config(&Config::default());
+        open(&mut s, "a", 7, Some(sized(Right, Some(40), None)));
+        s.bind_layer("a", None);
+        s.rename_session("a", "z");
+        assert_eq!(
+            s.popup_box("z", WINDOW, left_sidebar()),
+            popup_box(Right, (40, 80), WINDOW, left_sidebar())
+        );
     }
 
     // -- The layer ------------------------------------------------------------

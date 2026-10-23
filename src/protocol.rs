@@ -147,8 +147,9 @@ pub enum ConnDescriptor {
 /// `live_popups`, the session's popup panes, both also `#[serde(default)]`.
 ///
 /// Within 18, before any release, [`RemuxCommand::PopupToggle`] became a
-/// newtype variant carrying an optional position, so its JSON changed from the
-/// bare `"PopupToggle"`. A client always sends it with `None`. 18 also added
+/// newtype variant carrying an optional placement (a position and an optional
+/// size), so its JSON changed from the bare `"PopupToggle"`. A client always
+/// sends it with `None`, so the placement never crosses the wire. 18 also added
 /// [`SessionEvent::SessionRenamed`], so a client keys its popup state by the
 /// session's current name.
 pub const PROTOCOL_VERSION: u32 = 18;
@@ -1406,10 +1407,11 @@ pub enum RemuxCommand {
     /// lazily on the tab's first toggle and its shell keeps running while
     /// hidden.
     ///
-    /// The position is where the CLIENT opens the popup (`None`: its configured
-    /// `popup_position`). Placement is client-side, so a client forwards this
-    /// with `None` and the server ignores the field.
-    PopupToggle(Option<crate::config::PopupPosition>),
+    /// The placement is where, and how big, the CLIENT opens the popup (`None`:
+    /// its configured `popup_position` and percentages). Placement is
+    /// client-side, so a client forwards this with `None` and the server
+    /// ignores the field.
+    PopupToggle(Option<crate::config::PopupPlacement>),
 
     // -- Resize commands ----------------------------------------------------
     ResizeLeft(u16),
@@ -1885,7 +1887,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
-            ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom]", "right"),
+            ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom] [size]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
             ActionSpec::server("ResizeRight").arg("<amount>", "5"),
             ActionSpec::server("ResizeUp").arg("<amount>", "5"),
@@ -2981,7 +2983,7 @@ mod tests {
     fn popup_toggle_round_trips_with_and_without_a_position() {
         for cmd in [
             RemuxCommand::PopupToggle(None),
-            RemuxCommand::PopupToggle(Some(crate::config::PopupPosition::Bottom)),
+            RemuxCommand::PopupToggle(Some(crate::config::PopupPosition::Bottom.into())),
         ] {
             let msg = ClientMessage::Command(cmd.clone());
             let json = serde_json::to_string(&msg).unwrap();
