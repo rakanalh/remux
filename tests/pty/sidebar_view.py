@@ -643,10 +643,15 @@ RIGHT_X0 = COLS - RIGHT_W  # 90
 # A colour nothing else in the default theme uses, so "the active border colour
 # appears in the sidebar's columns" cannot be satisfied by anything but focus.
 ACTIVE_FG = "ff00aa"
+# A focused panel's header is a solid bar in `sidebar_header_active_bg`, not
+# text in the frame colour, so the theme pins that colour to one nothing else
+# on screen uses.
+HEADER_ACTIVE_BG = "00aaff"
 
 CFG_RIGHT = f"""
 [appearance.theme]
 frame_active_fg = "#{ACTIVE_FG}"
+sidebar_header_active_bg = "#{HEADER_ACTIVE_BG}"
 
 [[sidebar]]
 edge = "right"
@@ -698,25 +703,25 @@ def sidebar_has_keyboard(t):
 
 
 def focused_panel_header(t):
-    """The header row of the right sidebar's panel that paints as FOCUSED.
+    """The title of the right sidebar's panel whose header bar is painted FOCUSED.
 
-    `nav::draw_header` colours a panel's title with
-    `compositor::border_fg(theme, focused)`, so a header carrying the active
-    colour is the panel the chrome believes has the keyboard -- and it is what
-    the user reads to find out where their keys are going. Narrower than
-    `sidebar_has_keyboard`, which the sidebar's own frame also satisfies.
+    `nav::draw_header_bar` fills a focused panel's header with
+    `sidebar_header_active_bg`, so a bar in that colour is the panel the chrome
+    believes has the keyboard -- and it is what the user reads to find out where
+    their keys are going. Narrower than `sidebar_has_keyboard`, which the
+    sidebar's own frame also satisfies.
+
+    Returns None when no header is focused. When several are, returns their
+    titles joined with `|`, so a caller comparing against one title fails.
     """
+    titles = []
     for y in range(t.rows):
+        # One column inside the frame, which is itself not part of the bar.
+        if str(t.screen.buffer[y][RIGHT_X0 + 1].bg) != HEADER_ACTIVE_BG:
+            continue
         row = t.rows_text()[y]
-        for x in range(RIGHT_X0, min(COLS, t.cols)):
-            if str(t.screen.buffer[y][x].fg) != ACTIVE_FG:
-                continue
-            if t.screen.buffer[y][x].data.strip() in ("", *BOX):
-                continue
-            # The sidebar is framed in the border style, so its bar carries a
-            # box glyph on each side of the header text.
-            return row[RIGHT_X0:].strip("".join(BOX) + " ")
-    return None
+        titles.append(row[RIGHT_X0:].strip("".join(BOX) + " "))
+    return "|".join(titles) if titles else None
 
 
 def focused_cell_span(t):
