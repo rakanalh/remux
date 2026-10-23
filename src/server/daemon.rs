@@ -3102,7 +3102,7 @@ async fn handle_command(
                 };
                 let (interior_cols, interior_rows) =
                     session_popup_interior(&session_name, clients, config).await;
-                spawn_pane(
+                if let Err(e) = spawn_pane(
                     new_id,
                     interior_cols,
                     interior_rows,
@@ -3116,7 +3116,26 @@ async fn handle_command(
                     panes,
                     config,
                 )
-                .await?;
+                .await
+                {
+                    // The tab was given the popup before the spawn. Left there,
+                    // it would be a visible popup with no pane: the guard would
+                    // block the layout, input would go nowhere, and the next
+                    // toggle would only hide it. Looked up by id, because the
+                    // active tab may have changed while the spawn was awaited.
+                    let mut st = state.lock().await;
+                    if let Some(tab) = st
+                        .sessions
+                        .get_mut(&session_name)
+                        .and_then(|s| s.tabs.iter_mut().find(|t| t.popup_pane == Some(new_id)))
+                    {
+                        tab.take_popup();
+                    }
+                    log::error!(
+                        "server: PopupToggle session={session_name:?} popup pane_id={new_id} failed to spawn: {e:#}"
+                    );
+                    return Err(e);
+                }
                 start_pty_forwarding(
                     &session_name,
                     state,
@@ -7623,6 +7642,14 @@ resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Set in a test to make every `spawn_pane` in that task fail, as a real
+    /// PTY or fork failure would. Task-local, so tests running in parallel
+    /// never see each other's.
+    static SPAWN_FAILS: bool;
+}
+
 /// Spawn the PTY for `pane_id` and register it.
 ///
 /// `args` is the command's argument vector after argv[0], and is empty for
@@ -7658,6 +7685,10 @@ async fn spawn_pane(
          ({} arg(s)) cwd={cwd:?} identity={identity:?}",
         args.len()
     );
+    #[cfg(test)]
+    if SPAWN_FAILS.try_with(|fails| *fails).unwrap_or(false) {
+        anyhow::bail!("spawn_pane pane_id={pane_id}: injected failure");
+    }
     let pty_instance = Pty::spawn(cols, rows, cmd, args, cwd, identity)?;
     // The reader gets its OWN descriptor (a dup), so the fd number cannot be
     // reissued to a later PTY while the reader's epoll registration still
@@ -12561,6 +12592,40 @@ mod popup_tests {
             .expect("a frame");
         live.sort();
         assert_eq!(live, vec![first, second]);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_popup_that_fails_to_spawn_leaves_no_popup_behind() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let result = SPAWN_FAILS
+            .scope(
+                true,
+                handle_command(
+                    CLIENT,
+                    RemuxCommand::PopupToggle(None),
+                    &rig.state,
+                    &rig.panes,
+                    &rig.clients,
+                    &rig.config,
+                    &rig.prev_frames,
+                    &rig.dormant,
+                ),
+            )
+            .await;
+        assert!(result.is_err(), "the failure is still reported");
+        {
+            let st = rig.state.lock().await;
+            let tab = &st.sessions["main"].tabs[0];
+            assert_eq!(tab.popup_pane, None);
+            assert!(!tab.popup_visible);
+        }
+        // With the phantom gone, the layout is not locked and the next toggle
+        // spawns a popup.
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        let popup = rig.popup_of(0).await.expect("a fresh popup");
+        assert!(rig.panes.lock().await.contains_key(&popup));
         rig.finish().await;
     }
 
