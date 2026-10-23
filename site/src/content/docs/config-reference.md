@@ -31,7 +31,7 @@ Server-side. Needs `remux restart`.
 | `pane_title` | string | unset | live | Template pane names are drawn from. Placeholders: `{title}`, `{command}`, `{session}`, `{tab}`, `{cwd}`, `{host}`. Unset shows the pane's title if it has one, else its command. |
 | `status_bar_position` | `"top"` \| `"bottom"` | `"bottom"` | — | **Has no effect.** The status bar is always drawn on the bottom row. |
 
-The popup keys are client settings too. Saving the file moves and resizes an open popup at once, and a runtime resize with the pane-resize keys (`Ctrl-a p R h/j/k/l`) is dropped when any of the three keys changes. The resize keys adjust the popup on the axis its position uses and ignore the other one. A runtime resize belongs to the position it was made at: widening a right drawer leaves the float as it was.
+The popup keys are client settings too. Saving the file moves and resizes an open popup at once, and a runtime resize with the pane-resize keys (`Ctrl-a p R h/j/k/l`) is dropped when any of the three keys changes. The resize keys adjust the popup on the axis its position uses and ignore the other one. A runtime resize belongs to the position it was made at: widening a right drawer leaves the float as it was. Two tabs whose popups are open at different positions share one popup terminal size, so switching between them resizes the popups (programs inside redraw, as on any terminal resize).
 
 Each tab has its own popup. The first `Alt-p` in a tab starts a shell in the directory of that tab's focused pane, and a popup stays open while you work in other tabs. The popup's terminal is as large as the smallest popup any client attached to the session asks for, so a second, smaller client shrinks it for everyone.
 

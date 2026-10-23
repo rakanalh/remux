@@ -9387,6 +9387,40 @@ mod tests {
         }
 
         #[test]
+        fn switching_between_two_open_popups_at_different_positions_announces_each_box() {
+            // Accepted: one terminal size per session, so two tabs whose popups
+            // are open at different positions resize the popups on a switch.
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let attached = Some((ConnId::Local, "main".to_string()));
+            let conn = ConnId::Local;
+            let key = popup_key(&attached);
+            let send = |popup: &mut PopupState, renderer: &Renderer| {
+                popup_size_to_send(popup, &chrome, renderer, &attached, &conn)
+            };
+            let show = |popup: &mut PopupState, renderer: &mut Renderer, pane: u64| {
+                let mut l = layer(4, 2, 'x');
+                l.pane_id = pane;
+                sync_popup(Some(l), popup, &chrome, renderer, &attached, &theme).unwrap();
+            };
+            // Tab 1: a right drawer.
+            popup.toggle(&key, Some(PopupPosition::Right), false);
+            let right = send(&mut popup, &renderer).expect("right announced");
+            show(&mut popup, &mut renderer, 7);
+            // Tab 2: no popup at first, then a bottom drawer.
+            sync_popup(None, &mut popup, &chrome, &mut renderer, &attached, &theme).unwrap();
+            assert_eq!(send(&mut popup, &renderer), None);
+            popup.toggle(&key, Some(PopupPosition::Bottom), false);
+            let bottom = send(&mut popup, &renderer).expect("bottom announced");
+            assert_ne!(bottom, right);
+            show(&mut popup, &mut renderer, 9);
+            // Each switch between the two announces the box it shows.
+            show(&mut popup, &mut renderer, 7);
+            assert_eq!(send(&mut popup, &renderer), Some(right));
+            show(&mut popup, &mut renderer, 9);
+            assert_eq!(send(&mut popup, &renderer), Some(bottom));
+        }
+
+        #[test]
         fn a_popup_key_inside_a_view_is_swallowed() {
             let (renderer, chrome, mut popup, _) = setup();
             let attached = Some((ConnId::Local, "main".to_string()));
