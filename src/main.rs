@@ -1659,17 +1659,20 @@ fn popup_key(attached: &Option<(ConnId, String)>) -> String {
 }
 
 /// Follow the rename of session `old` to `new` on server `conn`: in the
-/// attached and the last session, and in the popup state kept under the name.
+/// attached and the last session, in the local session a fallback re-attaches
+/// to, and in the popup state kept under the name.
 ///
 /// The attachment is otherwise only set by a switch, so without this every
 /// popup lookup that starts from it would use the old name while the frames use
-/// the new one, and the two would place different boxes.
+/// the new one, and the two would place different boxes. A fallback to the old
+/// local name would attach to a session that no longer exists under it.
 fn apply_session_rename(
     conn: &ConnId,
     old: &str,
     new: &str,
     current: &mut Option<(ConnId, String)>,
     previous: &mut Option<(ConnId, String)>,
+    last_local: &mut Option<String>,
     popup: &mut PopupState,
 ) {
     let old_key = popup_key(&Some((conn.clone(), old.to_string())));
@@ -1679,6 +1682,9 @@ fn apply_session_rename(
         if c == conn && name == old {
             *name = new.to_string();
         }
+    }
+    if matches!(conn, ConnId::Local) && last_local.as_deref() == Some(old) {
+        *last_local = Some(new.to_string());
     }
 }
 
@@ -7788,7 +7794,7 @@ async fn run_client_loop(
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: src={:?} {:?}", src, event);
                         if let crate::protocol::SessionEvent::SessionRenamed { old, new } = &event {
-                            apply_session_rename(&src, old, new, &mut current_attached, &mut previous_attached, &mut popup);
+                            apply_session_rename(&src, old, new, &mut current_attached, &mut previous_attached, &mut last_local_session, &mut popup);
                         }
                         // A pane the SERVER reports dead is deliberately NOT
                         // foreground-scoped: a view cell can alias a pane on any
@@ -9448,6 +9454,37 @@ mod tests {
         }
 
         #[test]
+        fn a_local_rename_renames_the_session_a_fallback_reattaches_to() {
+            let (_, _, mut popup, _) = setup();
+            let far = ConnId::Remote("far".to_string());
+            let mut current = Some((far.clone(), "work".to_string()));
+            let mut previous = None;
+            let mut last_local = Some("work".to_string());
+            // A session of the same name on a remote is not the local one.
+            apply_session_rename(
+                &far,
+                "work",
+                "play",
+                &mut current,
+                &mut previous,
+                &mut last_local,
+                &mut popup,
+            );
+            assert_eq!(last_local.as_deref(), Some("work"));
+            apply_session_rename(
+                &ConnId::Local,
+                "work",
+                "home",
+                &mut current,
+                &mut previous,
+                &mut last_local,
+                &mut popup,
+            );
+            assert_eq!(last_local.as_deref(), Some("home"));
+            assert_eq!(current, Some((far, "play".to_string())));
+        }
+
+        #[test]
         fn renaming_the_attached_session_keeps_its_named_popup_where_it_is() {
             let (mut renderer, chrome, mut popup, theme) = setup();
             let mut current = Some((ConnId::Local, "main".to_string()));
@@ -9468,12 +9505,14 @@ mod tests {
             )
             .unwrap();
 
+            let mut last_local = Some("main".to_string());
             apply_session_rename(
                 &conn,
                 "main",
                 "work",
                 &mut current,
                 &mut previous,
+                &mut last_local,
                 &mut popup,
             );
             assert_eq!(current, Some((ConnId::Local, "work".to_string())));
