@@ -2564,6 +2564,20 @@ async fn handle_attach(
     Ok(())
 }
 
+/// Tell every client that session `old` is now `new`. A client keeps the
+/// names of the sessions it is attached to and was last on, and keys its popup
+/// state by them, and frames only ever name the session as it is now.
+fn announce_session_rename(cls: &HashMap<u64, ClientConnection>, old: &str, new: &str) {
+    for client in cls.values() {
+        let _ = client
+            .tx
+            .send(ServerMessage::Event(SessionEvent::SessionRenamed {
+                old: old.to_string(),
+                new: new.to_string(),
+            }));
+    }
+}
+
 async fn handle_detach(
     client_id: u64,
     state: &Arc<Mutex<ServerState>>,
@@ -3800,6 +3814,7 @@ async fn handle_command(
                     client.session_name = Some(new_name.clone());
                 }
             }
+            announce_session_rename(&cls, &session_name, &new_name);
         }
         RemuxCommand::PaneRename(name) => {
             let name = crate::config::pane_title::sanitize_label(&name);
@@ -4248,6 +4263,7 @@ async fn handle_command(
                         client.session_name = Some(new.clone());
                     }
                 }
+                announce_session_rename(&cls, &old, &new);
             }
         }
         RemuxCommand::FolderRename { old, new } => {
@@ -12626,6 +12642,42 @@ mod popup_tests {
         rig.command(RemuxCommand::PopupToggle(None)).await;
         let popup = rig.popup_of(0).await.expect("a fresh popup");
         assert!(rig.panes.lock().await.contains_key(&popup));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_rename_is_announced_to_every_client() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let mut other = rig.add_client(2, 100, 30, None).await;
+        let renamed = |events: Vec<ServerMessage>| {
+            events.into_iter().find_map(|m| match m {
+                ServerMessage::Event(SessionEvent::SessionRenamed { old, new }) => Some((old, new)),
+                _ => None,
+            })
+        };
+        rig.command(RemuxCommand::SessionRename("work".to_string()))
+            .await;
+        let expected = Some(("main".to_string(), "work".to_string()));
+        assert_eq!(renamed(rig.drain()), expected);
+        let mut seen = Vec::new();
+        while let Ok(m) = other.try_recv() {
+            seen.push(m);
+        }
+        assert_eq!(
+            renamed(seen),
+            expected,
+            "a client attached elsewhere hears too"
+        );
+        rig.command(RemuxCommand::SessionRenameByName {
+            old: "work".to_string(),
+            new: "play".to_string(),
+        })
+        .await;
+        assert_eq!(
+            renamed(rig.drain()),
+            Some(("work".to_string(), "play".to_string()))
+        );
         rig.finish().await;
     }
 

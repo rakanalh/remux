@@ -1658,6 +1658,30 @@ fn popup_key(attached: &Option<(ConnId, String)>) -> String {
     }
 }
 
+/// Follow the rename of session `old` to `new` on server `conn`: in the
+/// attached and the last session, and in the popup state kept under the name.
+///
+/// The attachment is otherwise only set by a switch, so without this every
+/// popup lookup that starts from it would use the old name while the frames use
+/// the new one, and the two would place different boxes.
+fn apply_session_rename(
+    conn: &ConnId,
+    old: &str,
+    new: &str,
+    current: &mut Option<(ConnId, String)>,
+    previous: &mut Option<(ConnId, String)>,
+    popup: &mut PopupState,
+) {
+    let old_key = popup_key(&Some((conn.clone(), old.to_string())));
+    let new_key = popup_key(&Some((conn.clone(), new.to_string())));
+    popup.rename_session(&old_key, &new_key);
+    for (c, name) in [current, previous].into_iter().flatten() {
+        if c == conn && name == old {
+            *name = new.to_string();
+        }
+    }
+}
+
 /// The session a server frame belongs to, as `(server, session)`.
 ///
 /// Usually the attached one, but not always: the attachment changes when the
@@ -7763,6 +7787,9 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::Event(event)) => {
                         log::debug!("server event: src={:?} {:?}", src, event);
+                        if let crate::protocol::SessionEvent::SessionRenamed { old, new } = &event {
+                            apply_session_rename(&src, old, new, &mut current_attached, &mut previous_attached, &mut popup);
+                        }
                         // A pane the SERVER reports dead is deliberately NOT
                         // foreground-scoped: a view cell can alias a pane on any
                         // connected server, and the whole point of the event is
@@ -9418,6 +9445,80 @@ mod tests {
             assert_eq!(send(&mut popup, &renderer), Some(right));
             show(&mut popup, &mut renderer, 9);
             assert_eq!(send(&mut popup, &renderer), Some(bottom));
+        }
+
+        #[test]
+        fn renaming_the_attached_session_keeps_its_named_popup_where_it_is() {
+            let (mut renderer, chrome, mut popup, theme) = setup();
+            let mut current = Some((ConnId::Local, "main".to_string()));
+            let mut previous = Some((ConnId::Local, "old".to_string()));
+            let conn = ConnId::Local;
+            popup.toggle(&popup_key(&current), Some(PopupPosition::Right), false);
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &current, &conn),
+                Some((99, 45))
+            );
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &current,
+                &theme,
+            )
+            .unwrap();
+
+            apply_session_rename(
+                &conn,
+                "main",
+                "work",
+                &mut current,
+                &mut previous,
+                &mut popup,
+            );
+            assert_eq!(current, Some((ConnId::Local, "work".to_string())));
+            assert_eq!(
+                previous,
+                Some((ConnId::Local, "old".to_string())),
+                "only the renamed one"
+            );
+
+            // The next frame names the new session.
+            let status = status_of("work");
+            let frame_session = frame_attached(&current, Some(&status));
+            assert_eq!(frame_session, current);
+            popup.prune(&popup_key(&frame_session), &[7]);
+            sync_popup(
+                Some(layer(99, 45, 'x')),
+                &mut popup,
+                &chrome,
+                &mut renderer,
+                &frame_session,
+                &theme,
+            )
+            .unwrap();
+            let wanted = popup_box_now(&popup, &chrome, &renderer, &current);
+            assert_eq!(
+                wanted.frame,
+                crate::client::popup::PopupFrame::OpenRight,
+                "the position survives"
+            );
+            assert_eq!(
+                renderer.popup_box(),
+                Some(wanted),
+                "placed and wanted agree"
+            );
+            assert_eq!(
+                popup_size_to_send(&mut popup, &chrome, &renderer, &current, &conn),
+                None,
+                "the announced box is the one already sent"
+            );
+            let inside = down(wanted.interior.x, wanted.interior.y);
+            assert_eq!(
+                popup_hit(renderer.popup_box(), &wanted, None, &inside),
+                Some(PopupPointer::Interior(0, 0)),
+                "the mouse reaches the popup"
+            );
         }
 
         #[test]

@@ -148,7 +148,9 @@ pub enum ConnDescriptor {
 ///
 /// Within 18, before any release, [`RemuxCommand::PopupToggle`] became a
 /// newtype variant carrying an optional position, so its JSON changed from the
-/// bare `"PopupToggle"`. A client always sends it with `None`.
+/// bare `"PopupToggle"`. A client always sends it with `None`. 18 also added
+/// [`SessionEvent::SessionRenamed`], so a client keys its popup state by the
+/// session's current name.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -1976,7 +1978,16 @@ pub fn command_names() -> Vec<(&'static str, Option<&'static str>)> {
 pub enum SessionEvent {
     SessionCreated(String),
     SessionDeleted(String),
-    PaneExited { pane_id: PaneId, exit_code: i32 },
+    /// A session was renamed. Sent to every client, so one that names the
+    /// session anywhere (the attached session, the last one) can follow it.
+    SessionRenamed {
+        old: String,
+        new: String,
+    },
+    PaneExited {
+        pane_id: PaneId,
+        exit_code: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------

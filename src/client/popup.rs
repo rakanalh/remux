@@ -431,6 +431,21 @@ impl PopupState {
         }
     }
 
+    /// Move everything kept for session `old` to `new`, after a rename.
+    pub fn rename_session(&mut self, old: &str, new: &str) {
+        let moved: Vec<((String, PaneId), PopupPosition)> = self
+            .named
+            .iter()
+            .filter(|((s, _), _)| s == old)
+            .map(|((_, pane), position)| ((new.to_string(), *pane), *position))
+            .collect();
+        self.named.retain(|(s, _), _| s != old);
+        self.named.extend(moved);
+        if let Some(last) = self.last_placed.remove(old) {
+            self.last_placed.insert(new.to_string(), last);
+        }
+    }
+
     /// Forget the positions of `session`'s popups that are not in `live`, the
     /// popups its server still has. A popup dies with its tab or its shell, or
     /// is hidden by another client, without this client's key closing it.
