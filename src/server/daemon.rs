@@ -2967,11 +2967,14 @@ async fn handle_command(
     //
     // Two-way: block -> pass.
     if !session_name.is_empty() {
-        let popup_visible = {
+        let (popup_visible, zoomed) = {
             let st = state.lock().await;
-            st.sessions
-                .get(&session_name)
-                .is_some_and(|s| s.visible_popup().is_some())
+            let sess = st.sessions.get(&session_name);
+            (
+                sess.is_some_and(|s| s.visible_popup().is_some()),
+                sess.and_then(|s| s.tabs.get(s.active_tab))
+                    .is_some_and(|t| t.zoomed_pane.is_some()),
+            )
         };
         if popup_visible {
             match cmd {
@@ -2991,6 +2994,11 @@ async fn handle_command(
                 // under its own lock, so another client cannot reopen it in
                 // between.
                 RemuxCommand::PaneToggleZoom if config.zoom.mode == ZoomMode::Float => {}
+                // Releasing a zoom is always allowed, so a fullscreen zoom taken
+                // before the popup opened is not stuck. Only taking a new
+                // fullscreen zoom is refused, by the block list below.
+                RemuxCommand::PaneToggleZoom | RemuxCommand::PaneToggleZoomFullscreen if zoomed => {
+                }
                 RemuxCommand::PaneFocusLeft
                 | RemuxCommand::PaneFocusRight
                 | RemuxCommand::PaneFocusUp
@@ -14408,6 +14416,37 @@ mod popup_tests {
             None
         );
         rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_zoom_taken_before_the_popup_can_still_be_released_while_it_is_up() {
+        for (mode, release) in [
+            (
+                crate::config::ZoomMode::Fullscreen,
+                RemuxCommand::PaneToggleZoom,
+            ),
+            (
+                crate::config::ZoomMode::Float,
+                RemuxCommand::PaneToggleZoomFullscreen,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+            rig.config = float_rig_config(mode);
+            three_panes(&rig, dir.path()).await;
+            rig.command(RemuxCommand::PaneToggleZoomFullscreen).await;
+            rig.command(RemuxCommand::PopupToggle(None)).await;
+            assert!(rig.state.lock().await.sessions["main"].tabs[0].popup_visible);
+
+            rig.command(release.clone()).await;
+
+            let st = rig.state.lock().await;
+            let tab = &st.sessions["main"].tabs[0];
+            assert_eq!(tab.zoomed_pane, None, "{release:?} in {mode:?} mode");
+            assert!(tab.popup_visible, "the popup stays up");
+            drop(st);
+            rig.finish().await;
+        }
     }
 
     #[tokio::test]
