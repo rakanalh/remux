@@ -264,7 +264,7 @@ The server decides what a right click on a pane does:
 - A pane whose application asked for mouse events (modes 1000, 1002 or 1003) gets the right button as button 2, in SGR or the legacy encoding, and no menu opens.
 - Any other pane opens the menu.
 - The border of a pane always opens the menu, even when the application tracks the mouse, because the application cannot see its border.
-- Inside the popup terminal, a right click goes to the popup's application when it tracks the mouse and does nothing otherwise. While the popup is up, a right click on a pane outside it does nothing.
+- Inside the popup terminal, a right click goes to the popup's application when it tracks the mouse and does nothing otherwise. While the popup or a float zoom is up, a right click on a pane outside it does nothing. A right click on a float-zoomed pane opens its menu, which offers `Unzoom`.
 - In Visual mode, while a key chord is pending, and while a prompt or the session manager is open, a right click does nothing.
 
 Opening the menu on a pane or a tab first moves focus to it, so the menu's commands act on what you clicked. Escaping the menu leaves the focus where the click put it. A right click inside a live [view](/remux/views/) is not handled yet.

@@ -6623,6 +6623,7 @@ async fn handle_mouse_button(
             client_id,
             target,
             &popup,
+            hit_regions.float.map(|(id, _)| id),
             &pane_rects,
             (x, y),
             release,
@@ -6783,6 +6784,7 @@ async fn right_click_target(
     client_id: u64,
     target: ClickTarget,
     popup: &MousePopup,
+    float_pane: Option<PaneId>,
     pane_rects: &[(PaneId, Rect)],
     at: (u16, u16),
     release: bool,
@@ -6796,8 +6798,11 @@ async fn right_click_target(
     let (x, y) = at;
     match target {
         ClickTarget::Pane(pane_id) => {
-            let in_popup = popup.pane == Some(pane_id);
-            if popup.pane.is_some() && !in_popup {
+            // A float zoom fills `popup.pane` too, but it is a pane of the
+            // layout: its frame opens the menu and its interior routes like any
+            // pane's, and a pane outside it is refused only while it floats.
+            let in_popup = popup.pane == Some(pane_id) && float_pane != Some(pane_id);
+            if popup.pane.is_some() && popup.pane != Some(pane_id) {
                 return Ok(());
             }
             let (Some(route), Some((rect, inset))) = (
@@ -14691,6 +14696,65 @@ mod popup_tests {
             assert_eq!(focused, middle, "{mode}: focus did not move");
             rig.finish().await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_right_click_inside_a_float_zoom_offers_unzoom_and_keeps_the_float() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        let (rect, _) = float_box();
+        rig.drain();
+
+        right(&rig, rect.x + 3, rect.y + 3, false, false).await;
+
+        let found = menus(&rig.drain());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(matches!(
+            found[0].2,
+            crate::protocol::ContextTarget::Pane { pane_id, zoomed: true, .. } if pane_id == middle
+        ));
+        assert_eq!(float_of(&rig).await, Some(middle));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_fullscreen_zoomed_pane_offers_unzoom() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoom).await;
+        rig.drain();
+
+        right(&rig, 40, 10, false, false).await;
+
+        let found = menus(&rig.drain());
+        assert!(
+            matches!(
+                found.as_slice(),
+                [(_, _, crate::protocol::ContextTarget::Pane { pane_id, zoomed: true, .. })]
+                    if *pane_id == middle
+            ),
+            "{found:?}"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_float_zooms_frame_opens_the_menu_even_for_a_tracking_app() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, middle).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        let (rect, _) = float_box();
+        rig.drain();
+
+        right(&rig, rect.x + 4, rect.y, false, false).await;
+
+        assert_eq!(menus(&rig.drain()).len(), 1);
+        rig.finish().await;
     }
 
     #[tokio::test]
