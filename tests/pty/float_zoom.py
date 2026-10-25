@@ -73,7 +73,7 @@ def box_corners(t):
 
 
 def main():
-    t = Tui("/tmp/rmxfloat/pty", cols=COLS, rows=ROWS, config=CONFIG)
+    t = Tui(f"/tmp/rmxfloat/pty-{os.getpid()}", cols=COLS, rows=ROWS, config=CONFIG)
     try:
         t.start()
         t.pump(1.6)
