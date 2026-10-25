@@ -7,6 +7,7 @@
 //! turns a click or a key into an action.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::style::Color;
 
 use crate::client::registry::ConnId;
 use crate::client::sidebar::PluginRequest;
@@ -384,13 +385,25 @@ impl ContextMenu {
                 (false, true) => (fg, bg),
                 (false, false) => (crossterm::style::Color::DarkGrey, bg),
             };
+            // The border cells keep the frame's style on every row, so a
+            // highlight, a dimmed row or the confirm step stays between them.
+            let y = r.y + 1 + i as u16;
+            let side = |x: u16| DrawCommand {
+                x,
+                y,
+                text: "\u{2502}".to_string(),
+                fg,
+                bg,
+            };
+            out.push(side(r.x));
             out.push(DrawCommand {
-                x: r.x,
-                y: r.y + 1 + i as u16,
-                text: format!("\u{2502}{}\u{2502}", row_text(item, inner)),
+                x: r.x + 1,
+                y,
+                text: row_text(item, inner),
                 fg: row_fg,
                 bg: row_bg,
             });
+            out.push(side(r.x + r.width.saturating_sub(1)));
         }
         out.push(DrawCommand {
             x: r.x,
@@ -861,16 +874,76 @@ mod tests {
         );
     }
 
+    /// The `(fg, bg)` the cell at `(x, y)` is drawn with, from the draw commands
+    /// as the renderer applies them: each paints its text from `x` rightwards.
+    fn style_at(cmds: &[DrawCommand], x: u16, y: u16) -> Option<(Color, Color)> {
+        cmds.iter()
+            .find(|c| c.y == y && x >= c.x && usize::from(x - c.x) < c.text.chars().count())
+            .map(|c| (c.fg, c.bg))
+    }
+
+    #[test]
+    fn a_highlighted_row_never_paints_over_the_border() {
+        let theme = Theme::default();
+        let border = (theme.whichkey_fg, theme.whichkey_bg);
+        let mut items = three();
+        items[2].enabled = false;
+        let mut m = ContextMenu::open(items, (4, 3), (80, 24)).unwrap();
+        let r = m.rect();
+        // The highlight on each row in turn, and the confirm step, which swaps
+        // the rows for a pair.
+        let mut menus = Vec::new();
+        for _ in 0..2 {
+            menus.push(m.clone());
+            m.key(key(KeyCode::Char('j')));
+        }
+        let mut confirm = ContextMenu::open(
+            vec![cmd("Close", RemuxCommand::PaneClose).confirm()],
+            (4, 3),
+            (80, 24),
+        )
+        .unwrap();
+        confirm.key(key(KeyCode::Enter));
+        menus.push(confirm);
+        for menu in menus {
+            let cmds = menu.render(&theme);
+            let r = menu.rect();
+            for row in r.y + 1..r.y + r.height - 1 {
+                assert_eq!(
+                    style_at(&cmds, r.x, row),
+                    Some(border),
+                    "left border, row {row}"
+                );
+                assert_eq!(
+                    style_at(&cmds, r.x + r.width - 1, row),
+                    Some(border),
+                    "right border, row {row}"
+                );
+            }
+        }
+        // The highlight itself is still drawn, inside.
+        let cmds = m.render(&theme);
+        let highlighted = m.selected().unwrap() as u16;
+        assert_ne!(
+            style_at(&cmds, r.x + 1, r.y + 1 + highlighted),
+            Some(border)
+        );
+    }
+
     #[test]
     fn rows_show_the_hint_right_aligned_inside_the_frame() {
         let m = ContextMenu::open(three(), (0, 0), (80, 24)).unwrap();
         let cmds = m.render(&Theme::default());
-        assert_eq!(cmds.len(), 5);
-        let widths: Vec<usize> = cmds.iter().map(|c| c.text.chars().count()).collect();
-        assert!(
-            widths.iter().all(|&w| w == usize::from(m.rect().width)),
-            "{widths:?}"
-        );
-        assert!(cmds[2].text.contains("Split right") && cmds[2].text.contains("Alt-v \u{2502}"));
+        let r = m.rect();
+        let row_text = |y: u16| -> String {
+            let mut cells: Vec<&DrawCommand> = cmds.iter().filter(|c| c.y == y).collect();
+            cells.sort_by_key(|c| c.x);
+            cells.iter().map(|c| c.text.as_str()).collect()
+        };
+        for y in r.y..r.y + r.height {
+            assert_eq!(row_text(y).chars().count(), usize::from(r.width), "row {y}");
+        }
+        let split = row_text(r.y + 2);
+        assert!(split.contains("Split right") && split.ends_with("Alt-v \u{2502}"));
     }
 }
