@@ -7,7 +7,6 @@
 //! turns a click or a key into an action.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use crossterm::style::Color;
 
 use crate::client::registry::ConnId;
 use crate::client::sidebar::PluginRequest;
@@ -538,6 +537,7 @@ fn row_text(item: &MenuItem, inner: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::style::Color;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
