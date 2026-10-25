@@ -25,7 +25,7 @@ use crate::server::browse;
 use crate::server::compositor::{
     composite, draw_popup, fits_zellij_border, float_zoom_box, hit_test, is_multi_stack,
     pane_content_rect, render_popup_layer, ClickTarget, HitRegions, MouseSelection, PopupLayer,
-    StatusInfo,
+    StatusInfo, NO_FOCUSED_PANE,
 };
 use crate::server::layout::{
     self, CustomLayout, EnabledLayouts, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
@@ -2985,34 +2985,12 @@ async fn handle_command(
                 // focused pane as being at an edge. So the key never moves the
                 // keyboard into a sidebar. The focus handler below sends the
                 // frame, so the hide does not.
-                // A float zoom is the one zoom that takes the popup's place, so
-                // asking for it closes the popup and goes on. The toggle arm
-                // sees the popup already hidden. A fullscreen `PaneToggleZoom`
-                // stays refused, as it always was.
-                RemuxCommand::PaneToggleZoomFloat => {
-                    hide_visible_popup(
-                        &session_name,
-                        state,
-                        panes,
-                        clients,
-                        config,
-                        prev_frames,
-                        false,
-                    )
-                    .await?;
-                }
-                RemuxCommand::PaneToggleZoom if config.zoom.mode == ZoomMode::Float => {
-                    hide_visible_popup(
-                        &session_name,
-                        state,
-                        panes,
-                        clients,
-                        config,
-                        prev_frames,
-                        false,
-                    )
-                    .await?;
-                }
+                // A float zoom takes the popup's place. `PaneToggleZoomFloat`
+                // is not in the block list below, and `PaneToggleZoom` is only
+                // when the mode is fullscreen. The toggle arm closes the popup
+                // under its own lock, so another client cannot reopen it in
+                // between.
+                RemuxCommand::PaneToggleZoom if config.zoom.mode == ZoomMode::Float => {}
                 RemuxCommand::PaneFocusLeft
                 | RemuxCommand::PaneFocusRight
                 | RemuxCommand::PaneFocusUp
@@ -4102,6 +4080,12 @@ async fn handle_command(
                                 "SessionSwitchPane: tab {tab_index} of '{session}' has its popup up, pane {pane_id} is not focused"
                             );
                         } else {
+                            // A float zoom snaps back and the switch then acts,
+                            // as a click outside the box does. Without this the
+                            // float would move to the pane switched to.
+                            if tab.focused_pane != pane_id {
+                                tab.release_float_zoom();
+                            }
                             tab.focus_pane(pane_id);
                         }
                     }
@@ -4272,6 +4256,7 @@ async fn handle_command(
                 RemuxCommand::PaneToggleZoomFloat => ZoomMode::Float,
                 _ => config.zoom.mode,
             };
+            let popup_closed;
             {
                 let mut st = state.lock().await;
                 let sess = match st.sessions.get_mut(&session_name) {
@@ -4285,7 +4270,9 @@ async fn handle_command(
                 // `Tab::toggle_zoom` owns the rule that only *engaging* a zoom
                 // can be refused (Monocle is already fullscreen); releasing one
                 // always works, so the zoom can never become unreachable.
+                let popup_was_up = tab.popup_visible;
                 let changed = tab.toggle_zoom(mode);
+                popup_closed = popup_was_up && !tab.popup_visible;
                 log::debug!(
                     "server: PaneToggleZoom mode={mode:?} pane={} zoomed={} changed={changed}",
                     tab.focused_pane,
@@ -4298,6 +4285,10 @@ async fn handle_command(
                 }
             }
             resize_session_panes(&session_name, state, panes, clients, config).await?;
+            if popup_closed {
+                // A client that holds a popup layer must not diff against it.
+                invalidate_session_baselines(&session_name, clients, prev_frames).await;
+            }
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         // -- Explicit-target structural commands ----------------------------
@@ -9186,6 +9177,7 @@ async fn send_full_render_to_client(
     // Read before `prev_frames` is locked, to keep the lock order of the render
     // paths: never `state` under `prev_frames`.
     let live_popups = session_popups(session_name, state).await;
+    let float_zoom = session_float_zoom(session_name, state).await;
     // The baseline must equal what this client has on screen, because the next
     // broadcast diffs against it. A `FullRender` and a `RenderDiff` both leave
     // the client showing exactly what `frame_message` stores, so both save it.
@@ -9202,6 +9194,7 @@ async fn send_full_render_to_client(
         scroll_offset,
         status,
         live_popups,
+        float_zoom,
     };
     let (msg, stored) = frame_message(placed, &meta, baseline, &format!("client_id={client_id}"));
     let _ = tx.send(msg);
@@ -9397,6 +9390,7 @@ async fn broadcast_full_render(
 
     // As in `send_full_render_to_client`: read before `prev_frames` is locked.
     let live_popups = session_popups(session_name, state).await;
+    let float_zoom = session_float_zoom(session_name, state).await;
     let mut pf = prev_frames.lock().await;
     for (cid, tx, force_full, asking) in targets {
         // Force a full render when this client has no baseline yet, or when its
@@ -9427,6 +9421,7 @@ async fn broadcast_full_render(
             scroll_offset: 0,
             status: status.clone(),
             live_popups: live_popups.clone(),
+            float_zoom,
         };
         let (msg, stored) = frame_message(
             placed,
@@ -9658,10 +9653,14 @@ async fn build_composite(
             Screen::new(content.width.max(1), content.height.max(1), 0),
         ))
     });
-    let mut layout_screens = pane_screens.clone();
-    if let Some((id, blank)) = &placeholder {
-        layout_screens.insert(*id, blank);
-    }
+    let layout_screens = match &placeholder {
+        Some((id, blank)) => {
+            let mut screens = pane_screens.clone();
+            screens.insert(*id, blank);
+            std::borrow::Cow::Owned(screens)
+        }
+        None => std::borrow::Cow::Borrowed(&pane_screens),
+    };
 
     let status_info = StatusInfo {
         mode: mode.to_string(),
@@ -9711,7 +9710,7 @@ async fn build_composite(
     // layout's selection highlight must not land in the empty slot: the float
     // highlights its own selection.
     let (layout_focus, layout_selection) = match float {
-        Some((id, _)) => (PaneId::MAX, selection.filter(|sel| sel.pane_id != id)),
+        Some((id, _)) => (NO_FOCUSED_PANE, selection.filter(|sel| sel.pane_id != id)),
         None => (tab.focused_pane, selection),
     };
     let (mut cells, mut hit_regions) = composite(
@@ -9956,6 +9955,7 @@ struct FrameMeta {
     scroll_offset: usize,
     status: Option<StatusInfo>,
     live_popups: Vec<PaneId>,
+    float_zoom: bool,
 }
 
 /// Every popup pane `session_name` has, on any tab, visible or not.
@@ -9965,6 +9965,15 @@ async fn session_popups(session_name: &str, state: &Arc<Mutex<ServerState>>) -> 
         .get(session_name)
         .map(|s| s.tabs.iter().filter_map(|t| t.popup_pane).collect())
         .unwrap_or_default()
+}
+
+/// Whether `session_name`'s active tab shows a float zoom.
+async fn session_float_zoom(session_name: &str, state: &Arc<Mutex<ServerState>>) -> bool {
+    let st = state.lock().await;
+    st.sessions
+        .get(session_name)
+        .and_then(|s| s.tabs.get(s.active_tab))
+        .is_some_and(|t| t.float_zoomed().is_some())
 }
 
 /// Put the popup into the frame for one client.
@@ -10154,6 +10163,7 @@ fn frame_message(
             scroll_offset: meta.scroll_offset,
             status: meta.status.clone(),
             live_popups: meta.live_popups.clone(),
+            float_zoom: meta.float_zoom,
             popup: placed.layer.map(|layer| {
                 popup_cells(
                     layer,
@@ -10181,6 +10191,7 @@ fn frame_message(
                 status: meta.status.clone(),
                 popup: placed.layer.map(|layer| popup_cells(layer, None)),
                 live_popups: meta.live_popups.clone(),
+                float_zoom: meta.float_zoom,
             }
         }
     };
@@ -12139,6 +12150,7 @@ mod popup_tests {
             scroll_offset: 0,
             status: None,
             live_popups: Vec::new(),
+            float_zoom: false,
         }
     }
 
@@ -14238,7 +14250,7 @@ mod popup_tests {
     async fn a_float_zoom_works_in_monocle_where_a_fullscreen_zoom_is_refused() {
         let dir = tempfile::tempdir().expect("dir");
         let rig = Rig::new(100, 30, None, dir.path()).await;
-        let (_l, middle, _r) = three_panes(&rig, dir.path()).await;
+        let (_l, _middle, _r) = three_panes(&rig, dir.path()).await;
         for _ in 0..4 {
             let mode = rig.state.lock().await.sessions["main"].tabs[0]
                 .layout_mode
@@ -14273,7 +14285,38 @@ mod popup_tests {
             rig.screen_size(focused).await,
             (interior.width, interior.height)
         );
-        let _ = middle;
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_float_zoom_that_closes_the_popup_renders_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+        rig.drain();
+
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        assert_eq!(renders(&rig.drain()), 1);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn releasing_a_fullscreen_zoom_with_the_float_action_leaves_the_popup_up() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoom).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        let st = rig.state.lock().await;
+        let tab = &st.sessions["main"].tabs[0];
+        assert_eq!(tab.zoomed_pane, None, "the toggle released the zoom");
+        assert!(tab.popup_visible, "and took no float, so the popup stays");
+        drop(st);
         rig.finish().await;
     }
 
@@ -14305,6 +14348,196 @@ mod popup_tests {
         assert_eq!(
             rig.state.lock().await.sessions["main"].tabs[0].zoomed_pane,
             None
+        );
+        rig.finish().await;
+    }
+
+    fn full_render_float_flags(msgs: &[ServerMessage]) -> Vec<bool> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ServerMessage::FullRender { float_zoom, .. }
+                | ServerMessage::RenderDiff { float_zoom, .. } => Some(*float_zoom),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_frame_says_whether_the_tab_shows_a_float_zoom() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        three_panes(&rig, dir.path()).await;
+        rig.drain();
+
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        assert_eq!(full_render_float_flags(&rig.drain()), vec![true]);
+
+        rig.command(RemuxCommand::PaneToggleZoom).await;
+        assert_eq!(full_render_float_flags(&rig.drain()), vec![false]);
+
+        rig.command(RemuxCommand::PaneToggleZoom).await;
+        assert_eq!(
+            full_render_float_flags(&rig.drain()),
+            vec![false],
+            "a fullscreen zoom is not a float"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_float_survives_leaving_its_tab_and_coming_back_with_its_sizes() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+        let before = sizes_of(&rig, &[left, middle, right]).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        let floated = sizes_of(&rig, &[left, middle, right]).await;
+        rig.new_tab(dir.path()).await;
+        rig.command(RemuxCommand::SessionSwitchTab {
+            session: "main".to_string(),
+            tab_index: 1,
+        })
+        .await;
+
+        rig.command(RemuxCommand::SessionSwitchTab {
+            session: "main".to_string(),
+            tab_index: 0,
+        })
+        .await;
+
+        assert_eq!(float_of(&rig).await, Some(middle));
+        assert_eq!(sizes_of(&rig, &[left, middle, right]).await, floated);
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        assert_eq!(sizes_of(&rig, &[left, middle, right]).await, before);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_neighbour_under_a_float_keeps_the_float_and_resizes_the_rest() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        close_pane(
+            left,
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await;
+
+        assert_eq!(float_of(&rig).await, Some(middle));
+        let (_, interior) = float_box();
+        assert_eq!(
+            rig.screen_size(middle).await,
+            (interior.width, interior.height)
+        );
+        let (_, _, _, rects) = composite_of(&rig).await;
+        let slot = rects.iter().find(|(id, _)| *id == right).unwrap().1;
+        assert_eq!(
+            rig.screen_size(right).await,
+            (slot.width - 2, slot.height - 2),
+            "the survivor fills the slot the layout gave it"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_floated_pane_releases_the_float_and_sizes_the_survivors() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        close_pane(
+            middle,
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await;
+
+        assert_eq!(
+            rig.state.lock().await.sessions["main"].tabs[0].zoomed_pane,
+            None
+        );
+        let (_, regions, _, rects) = composite_of(&rig).await;
+        assert_eq!(regions.float, None);
+        for pane in [left, right] {
+            let slot = rects.iter().find(|(id, _)| *id == pane).unwrap().1;
+            assert_eq!(
+                rig.screen_size(pane).await,
+                (slot.width - 2, slot.height - 2),
+                "pane {pane}"
+            );
+        }
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn switching_to_another_pane_snaps_a_float_back_and_acts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+        let before = sizes_of(&rig, &[left, middle, right]).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        rig.command(RemuxCommand::SessionSwitchPane {
+            session: "main".to_string(),
+            tab_index: 0,
+            pane_id: left,
+        })
+        .await;
+
+        assert_eq!(float_of(&rig).await, None);
+        assert_eq!(
+            rig.state.lock().await.sessions["main"].tabs[0].focused_pane,
+            left
+        );
+        assert_eq!(sizes_of(&rig, &[left, middle, right]).await, before);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn switching_to_the_floated_pane_leaves_the_float_up() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        rig.command(RemuxCommand::SessionSwitchPane {
+            session: "main".to_string(),
+            tab_index: 0,
+            pane_id: middle,
+        })
+        .await;
+
+        assert_eq!(float_of(&rig).await, Some(middle));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn renaming_the_floated_pane_shows_the_name_on_the_box() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+
+        rig.command(RemuxCommand::PaneRename("floaty".to_string()))
+            .await;
+
+        let (cells, _, _, _) = composite_of(&rig).await;
+        let (rect, _) = float_box();
+        let top: String = cells[rect.y as usize].iter().map(|c| c.c).collect();
+        assert!(top.contains("floaty"), "{top:?}");
+        assert!(
+            float_of(&rig).await.is_some(),
+            "a rename does not end the float"
         );
         rig.finish().await;
     }

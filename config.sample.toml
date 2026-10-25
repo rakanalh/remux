@@ -186,8 +186,8 @@
 # "Alt-u" = "PaneToggleZoomFloat") or in the leader tree. Either action ends a
 # zoom of either kind.
 #
-# A float zoom ends when you click outside the box (the click then acts as it
-# would have), press Alt-h/j/k/l, split, cycle the layout or close the pane. It
+# A float zoom ends when you click anywhere outside the box, a sidebar included
+# (the click then acts as it would have), press Alt-h/j/k/l, split, cycle the layout or close the pane. It
 # and the popup terminal are never open together: opening one closes the other.
 # In Monocle a float zoom is allowed, a fullscreen one has nothing to do. A View
 # has one zoom, the focused cell filling the view, so a float request there is

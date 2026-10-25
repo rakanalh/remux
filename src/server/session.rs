@@ -451,6 +451,11 @@ impl Tab {
         } else {
             self.zoomed_pane = Some(self.focused_pane);
             self.zoom_mode = mode;
+            // Done here, in the same borrow that takes the float, so no other
+            // client can open the popup between the two steps.
+            if mode == ZoomMode::Float {
+                self.popup_visible = false;
+            }
             true
         }
     }
@@ -3930,6 +3935,25 @@ mod popup_invariant_tests {
         tab.focus_pane(panes[2]);
         assert_eq!(tab.float_zoomed(), Some(panes[2]));
         assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn taking_a_float_zoom_closes_the_popup_in_the_same_step() {
+        let (mut st, name, _popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.popup_visible = true;
+        assert!(tab.toggle_zoom(ZoomMode::Float));
+        assert!(!tab.popup_visible);
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn taking_a_fullscreen_zoom_leaves_the_popup_up() {
+        let (mut st, name, _popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.popup_visible = true;
+        assert!(tab.toggle_zoom(ZoomMode::Fullscreen));
+        assert!(tab.popup_visible);
     }
 
     #[test]

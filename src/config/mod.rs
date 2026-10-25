@@ -350,9 +350,23 @@ pub struct ZoomConfig {
     pub mode: ZoomMode,
     /// Width of a float zoom as a percentage of the area the tab's layout
     /// fills. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT`, like the popup's.
+    #[serde(deserialize_with = "clamped_percent")]
     pub width: u8,
     /// Height of a float zoom, as `width` is.
+    #[serde(deserialize_with = "clamped_percent")]
     pub height: u8,
+}
+
+/// An integer percentage of any size, clamped to the popup's range, so a
+/// `width = 500` or `height = 0` is a clamped value and not a config that
+/// fails to load.
+fn clamped_percent<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::server::layout::{POPUP_MAX_PCT, POPUP_MIN_PCT};
+    let pct = i64::deserialize(deserializer)?;
+    Ok(pct.clamp(POPUP_MIN_PCT as i64, POPUP_MAX_PCT as i64) as u8)
 }
 
 impl Default for ZoomConfig {
@@ -901,6 +915,25 @@ mod tests {
         let config: Config = toml::from_str("[zoom]\nwidth = 50\n").unwrap();
         assert_eq!(config.zoom.mode, ZoomMode::Fullscreen);
         assert_eq!(config.zoom.float_pct(), (50, 90));
+    }
+
+    #[test]
+    fn zoom_size_clamps_instead_of_failing_the_config() {
+        for (given, want) in [
+            (0, 20),
+            (19, 20),
+            (20, 20),
+            (100, 100),
+            (101, 100),
+            (500, 100),
+            (-5, 20),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[zoom]\nwidth = {given}\nheight = {given}\n"))
+                    .unwrap_or_else(|e| panic!("{given}: {e}"));
+            assert_eq!(config.zoom.float_pct(), (want, want), "{given}");
+        }
+        assert!(toml::from_str::<Config>("[zoom]\nwidth = \"wide\"\n").is_err());
     }
 
     #[test]

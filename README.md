@@ -250,7 +250,7 @@ height = 90
 
 `PaneToggleZoomFloat` always zooms as a float, and has no default key (bind one, for example `"Alt-u" = "PaneToggleZoomFloat"`). Either action releases a zoom of either kind, so a tab is always in one zoom state. The status bar shows the `Z` for both.
 
-A float ends when you click outside the box (the click then acts as if the float had not been there), press `Alt-h/j/k/l` (the float snaps back and focus steps from that pane), split, cycle the layout, promote a master or close the pane. The float and the popup terminal are mutually exclusive: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar, and a click on a sidebar does not end it. In Monocle a float zoom is allowed, where a fullscreen one has nothing to do. A View has one zoom, the focused cell filling the view, so a float request there is a fullscreen zoom. `[zoom]` is read by the server at startup: `remux restart` after a change.
+A float ends when you click outside the box (the click then acts as if the float had not been there), press `Alt-h/j/k/l` (the float snaps back and focus steps from that pane), split, cycle the layout, promote a master or close the pane. The float and the popup terminal are mutually exclusive: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar. A click anywhere outside the box ends the float, a sidebar included. In Monocle a float zoom is allowed, where a fullscreen one has nothing to do. A View has one zoom, the focused cell filling the view, so a float request there is a fullscreen zoom. `[zoom]` is read by the server at startup: `remux restart` after a change.
 
 ## Install / build / run
 

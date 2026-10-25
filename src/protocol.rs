@@ -690,6 +690,13 @@ pub enum ServerMessage {
         /// a client can forget what it keeps about a popup that is gone.
         #[serde(default)]
         live_popups: Vec<PaneId>,
+        /// Whether the active tab shows a float zoom. The server draws the box
+        /// into the frame, so the client cannot see it there; it needs the flag
+        /// to treat a press it answers itself (a sidebar, the bar's tail) as
+        /// outside the box, as it does for a popup. An older server sends none,
+        /// which reads as no float.
+        #[serde(default)]
+        float_zoom: bool,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -741,6 +748,13 @@ pub enum ServerMessage {
         /// a client can forget what it keeps about a popup that is gone.
         #[serde(default)]
         live_popups: Vec<PaneId>,
+        /// Whether the active tab shows a float zoom. The server draws the box
+        /// into the frame, so the client cannot see it there; it needs the flag
+        /// to treat a press it answers itself (a sidebar, the bar's tail) as
+        /// outside the box, as it does for a popup. An older server sends none,
+        /// which reads as no float.
+        #[serde(default)]
+        float_zoom: bool,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -2100,6 +2114,7 @@ mod tests {
             status: Some(info.clone()),
             popup: None,
             live_popups: Vec::new(),
+            float_zoom: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -3096,6 +3111,7 @@ mod tests {
             status: None,
             popup: Some(Box::new(layer.clone())),
             live_popups: vec![7],
+            float_zoom: false,
         };
         let json = serde_json::to_string(&full).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -3116,6 +3132,7 @@ mod tests {
             status: None,
             popup: Some(Box::new(layer.clone())),
             live_popups: vec![7],
+            float_zoom: false,
         };
         let json = serde_json::to_string(&diff).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {

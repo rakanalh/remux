@@ -186,6 +186,11 @@ fn cell_to_render_cell(cell: &Cell) -> RenderCell {
 // Compositing
 // ---------------------------------------------------------------------------
 
+/// Pass as `focused_pane` to [`composite`] when no pane of the layout is the
+/// focused one, so none wears the active frame. A float zoom is the case: the
+/// floated pane is focused, but it is drawn outside the layout.
+pub const NO_FOCUSED_PANE: PaneId = PaneId::MAX;
+
 /// Composite a full screen buffer from the layout, pane screens, frames,
 /// and status bar.
 ///
