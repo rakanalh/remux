@@ -245,7 +245,7 @@ A right click opens a context menu at the pointer. Its rows depend on what you c
 
 | Where you click | Rows |
 |---|---|
-| A pane, or the label of a stacked pane | The zoom for `[zoom] mode` (`Fullscreen zoom` or `Float zoom`), `Float zoom` as a second row when the mode is fullscreen, `Split right`, `Split down`, `Rename`, `Close`. A zoomed pane shows `Unzoom` instead of the zoom rows. |
+| A pane, or the label of a stacked pane | The zoom for `[zoom] mode` (`Fullscreen zoom` or `Float zoom`) first and the other mode second, `Split right`, `Split down`, `Rename`, `Close`. A zoomed pane shows `Unzoom` instead of the zoom rows. |
 | A tab label in the status bar | `Rename`, `Close` (asks first), `Move left`, `Move right` |
 | A row of the [sessions panel](/remux/sidebars/) | Session: `Switch`, `Rename`, `Kill session`. Tab: `Switch`, `Rename`, `Close tab`. |
 | A row of the agents panel | `Go to pane`, `Zoom` (zooms that pane and never releases a zoom), `Close pane` |

@@ -410,9 +410,8 @@ impl ContextMenu {
 /// the server refuses is a fullscreen zoom in Monocle, where every pane is
 /// already full-area, so that is the only row disabled for a pane. A float zoom
 /// of a lone pane is accepted and still useful, so zoom is offered whatever the
-/// pane count. Fullscreen zoom is offered as the second row only when the
-/// configured mode is fullscreen: there is no command that forces it when the
-/// configured mode is float.
+/// pane count. The row for the configured mode comes first and the other mode
+/// second, each by the command that forces that mode.
 pub fn items_for(target: &ContextTarget, hint: &dyn Fn(&str) -> Option<String>) -> Vec<MenuItem> {
     match *target {
         ContextTarget::Pane {
@@ -433,22 +432,34 @@ pub fn items_for(target: &ContextTarget, hint: &dyn Fn(&str) -> Option<String>) 
                     RemuxCommand::PaneToggleZoom,
                 ));
             } else {
-                let fullscreen_refused = monocle && zoom_mode == ZoomMode::Fullscreen;
-                let label = match zoom_mode {
-                    ZoomMode::Fullscreen => "Fullscreen zoom",
-                    ZoomMode::Float => "Float zoom",
+                // The server refuses to engage a fullscreen zoom in Monocle,
+                // where every pane is already full-area; a float zoom is fine.
+                let (first, second) = match zoom_mode {
+                    ZoomMode::Fullscreen => (
+                        row(
+                            "Fullscreen zoom",
+                            "PaneToggleZoom",
+                            RemuxCommand::PaneToggleZoom,
+                        )
+                        .enabled(!monocle),
+                        row(
+                            "Float zoom",
+                            "PaneToggleZoomFloat",
+                            RemuxCommand::PaneToggleZoomFloat,
+                        ),
+                    ),
+                    ZoomMode::Float => (
+                        row("Float zoom", "PaneToggleZoom", RemuxCommand::PaneToggleZoom),
+                        row(
+                            "Fullscreen zoom",
+                            "PaneToggleZoomFullscreen",
+                            RemuxCommand::PaneToggleZoomFullscreen,
+                        )
+                        .enabled(!monocle),
+                    ),
                 };
-                items.push(
-                    row(label, "PaneToggleZoom", RemuxCommand::PaneToggleZoom)
-                        .enabled(!fullscreen_refused),
-                );
-                if zoom_mode == ZoomMode::Fullscreen {
-                    items.push(row(
-                        "Float zoom",
-                        "PaneToggleZoomFloat",
-                        RemuxCommand::PaneToggleZoomFloat,
-                    ));
-                }
+                items.push(first);
+                items.push(second);
             }
             items.push(row(
                 "Split right",
@@ -583,18 +594,31 @@ mod tests {
     }
 
     #[test]
-    fn the_first_zoom_row_follows_the_configured_mode() {
-        let items = items_for(&pane(false, ZoomMode::Float, false), &no_hints);
-        assert_eq!(items[0].label, "Float zoom");
+    fn the_first_zoom_row_follows_the_configured_mode_and_the_other_mode_is_second() {
+        let float = items_for(&pane(false, ZoomMode::Float, false), &no_hints);
+        assert_eq!(float[0].label, "Float zoom");
         assert_eq!(
-            items[0].action,
+            float[0].action,
             MenuAction::Command(on_pane(7, RemuxCommand::PaneToggleZoom))
         );
+        assert_eq!(float[1].label, "Fullscreen zoom");
         assert_eq!(
-            labels(&items).iter().filter(|l| l.contains("zoom")).count(),
-            1,
-            "no command forces a fullscreen zoom in float mode"
+            float[1].action,
+            MenuAction::Command(on_pane(7, RemuxCommand::PaneToggleZoomFullscreen))
         );
+        let full = items_for(&pane(false, ZoomMode::Fullscreen, false), &no_hints);
+        assert_eq!(
+            (full[0].label.as_str(), full[1].label.as_str()),
+            ("Fullscreen zoom", "Float zoom")
+        );
+    }
+
+    #[test]
+    fn fullscreen_zoom_is_disabled_in_monocle_whichever_mode_is_configured() {
+        let float = items_for(&pane(false, ZoomMode::Float, true), &no_hints);
+        assert!(float[0].enabled, "a float zoom is accepted in Monocle");
+        assert_eq!(float[1].label, "Fullscreen zoom");
+        assert!(!float[1].enabled);
     }
 
     #[test]
