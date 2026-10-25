@@ -1617,6 +1617,174 @@ async fn handle_plugin_action(
     Ok(())
 }
 
+/// Open the rename prompt for the entity the foreground server has focused,
+/// as the rename keybindings do.
+async fn open_rename_prompt(
+    what: crate::client::context_menu::RenameWhat,
+    input: &mut InputHandler,
+    renderer: &mut Renderer,
+    mgr: &mut ConnectionManager,
+) -> Result<()> {
+    use crate::client::context_menu::RenameWhat;
+    let (target, label) = match what {
+        RenameWhat::Pane => (RenameTarget::Pane, "Pane"),
+        RenameWhat::Tab => (RenameTarget::Tab, "Tab"),
+        RenameWhat::Session => (RenameTarget::Session, "Session"),
+    };
+    input.rename_overlay = Some(crate::client::input::RenameOverlay {
+        buffer: String::new(),
+        cursor: 0,
+        target,
+    });
+    let (c, r) = crossterm::terminal::size()?;
+    renderer.render_rename_popup("", label, c, r)?;
+    renderer.flush()?;
+    mgr.send_foreground(ClientMessage::ModeChanged {
+        mode: "COMMAND".to_string(),
+    })
+    .await
+}
+
+/// Run the action of a chosen context-menu row.
+#[allow(clippy::too_many_arguments)]
+async fn run_menu_action(
+    action: crate::client::context_menu::MenuAction,
+    input: &mut InputHandler,
+    chrome: &mut crate::client::chrome::Chrome,
+    mgr: &mut ConnectionManager,
+    renderer: &mut Renderer,
+    theme: &crate::config::theme::CompositorTheme,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    views: &[crate::client::view::ClientView],
+    active_view: &mut Option<usize>,
+    active_view_id: &mut Option<ViewId>,
+    mouse_grab: &mut Option<MouseGrab>,
+    last_local_session: &mut Option<String>,
+    current_attached: &mut Option<(ConnId, String)>,
+    previous_attached: &mut Option<(ConnId, String)>,
+) -> Result<()> {
+    use crate::client::context_menu::MenuAction;
+    use crate::client::sidebar::PluginAction;
+    log::debug!("context menu: run {action:?}");
+    match action {
+        MenuAction::Command(cmd) => {
+            mgr.send_foreground(ClientMessage::Command(cmd)).await?;
+        }
+        MenuAction::Rename(what) => open_rename_prompt(what, input, renderer, mgr).await?,
+        MenuAction::Jump(target) => {
+            handle_plugin_action(
+                PluginAction::JumpTo(target),
+                chrome,
+                mgr,
+                renderer,
+                theme,
+                focused_pane_rect,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+            )
+            .await?;
+        }
+        MenuAction::JumpThen(target, then) => {
+            handle_plugin_action(
+                PluginAction::JumpTo(target),
+                chrome,
+                mgr,
+                renderer,
+                theme,
+                focused_pane_rect,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+            )
+            .await?;
+            match *then {
+                MenuAction::Command(cmd) => {
+                    mgr.send_foreground(ClientMessage::Command(cmd)).await?;
+                }
+                MenuAction::Rename(what) => open_rename_prompt(what, input, renderer, mgr).await?,
+                other => log::warn!("context menu: no action follows a jump for {other:?}"),
+            }
+        }
+        MenuAction::KillSession { conn, name } => {
+            mgr.send(&conn, ClientMessage::KillSession { name }).await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::CloseTab {
+            conn,
+            session,
+            tab_index,
+        } => {
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::TabCloseByIndex { session, tab_index }),
+            )
+            .await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::ClosePane {
+            conn,
+            session,
+            pane_id,
+        } => {
+            mgr.send(
+                &conn,
+                ClientMessage::Command(RemuxCommand::PaneCloseById { session, pane_id }),
+            )
+            .await?;
+            mgr.send(&conn, ClientMessage::ListSessionTree).await?;
+        }
+        MenuAction::Request(request) => dispatch_plugin_request(0, 0, request, mgr).await,
+        MenuAction::CopyText(text) => {
+            if let Err(e) = copy_to_clipboard(&text) {
+                log::error!("Failed to copy to clipboard: {e}");
+            }
+        }
+        MenuAction::Cancel => {}
+    }
+    Ok(())
+}
+
+/// Repaint the screen under the context menu and lay the overlays back on, the
+/// menu last. Used when the highlight moves or the menu closes, since both
+/// leave cells of the old frame on screen.
+#[allow(clippy::too_many_arguments)]
+fn repaint_overlays(
+    renderer: &mut Renderer,
+    input: &InputHandler,
+    whichkey: &WhichKeyPopup,
+    theme: &crate::config::theme::Theme,
+    which_key_position: &crate::config::WhichKeyPosition,
+    viewport_top: usize,
+    focused_pane_rect: Option<&crate::protocol::PaneRect>,
+    cursor: (u16, u16, bool),
+) -> Result<()> {
+    let (c, r) = crossterm::terminal::size()?;
+    renderer.clear_overlay(c, r)?;
+    relay_overlays(
+        renderer,
+        input,
+        whichkey,
+        theme,
+        which_key_position,
+        viewport_top,
+        focused_pane_rect,
+        c,
+        r,
+    )?;
+    renderer.restore_cursor(cursor.0, cursor.1, cursor.2)?;
+    renderer.flush()?;
+    Ok(())
+}
+
 /// Point the renderer at `content`.
 ///
 /// The origin and the content size are ONE piece of state and must always be
@@ -2183,6 +2351,10 @@ fn relay_overlays(
     else if whichkey.visible {
         let commands = whichkey.render(cols, rows, theme, which_key_position.clone());
         renderer.render_whichkey_overlay(&commands)?;
+    }
+    // The context menu goes last: it is over everything, the popup included.
+    if let Some(ref menu) = input.context_menu {
+        renderer.render_whichkey_overlay(&menu.render(theme))?;
     }
     Ok(())
 }
@@ -3660,6 +3832,71 @@ async fn run_client_loop(
     // `current_tree_focus` once it no longer describes the screen.
     let mut tree_focus: Option<(ConnId, crate::protocol::PaneId)> = None;
 
+    // Whether the right button went down on something that got the press, so
+    // its release is forwarded and a release with no such press is not.
+    let mut right_down = false;
+    // What a key or a click did to the open context menu: repaint, close, or
+    // close and run the chosen row. A macro because it reads a dozen of this
+    // loop's locals, which a function would take as a dozen parameters.
+    macro_rules! apply_menu_outcome {
+        ($outcome:expr) => {{
+            use crate::client::context_menu::MenuOutcome;
+            let outcome: MenuOutcome = $outcome;
+            let chosen = match outcome {
+                MenuOutcome::Ignored => None,
+                MenuOutcome::Redraw => {
+                    repaint_overlays(
+                        &mut renderer,
+                        &input,
+                        &whichkey,
+                        &theme,
+                        &which_key_position,
+                        viewport_top,
+                        focused_pane_rect.as_ref(),
+                        (last_cursor_x, last_cursor_y, last_cursor_visible),
+                    )?;
+                    None
+                }
+                MenuOutcome::Close | MenuOutcome::Run(_) => {
+                    input.context_menu = None;
+                    repaint_overlays(
+                        &mut renderer,
+                        &input,
+                        &whichkey,
+                        &theme,
+                        &which_key_position,
+                        viewport_top,
+                        focused_pane_rect.as_ref(),
+                        (last_cursor_x, last_cursor_y, last_cursor_visible),
+                    )?;
+                    match outcome {
+                        MenuOutcome::Run(action) => Some(action),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(action) = chosen {
+                run_menu_action(
+                    action,
+                    &mut input,
+                    &mut chrome,
+                    mgr,
+                    &mut renderer,
+                    &compositor_theme,
+                    focused_pane_rect.as_ref().filter(|_| active_view.is_none()),
+                    &views,
+                    &mut active_view,
+                    &mut active_view_id,
+                    &mut mouse_grab,
+                    &mut last_local_session,
+                    &mut current_attached,
+                    &mut previous_attached,
+                )
+                .await?;
+            }
+        }};
+    }
+
     loop {
         // Lay the panels out and act on what they ask for, before anything can
         // block in the `select!` below. This is the pass on which a `files`
@@ -3763,6 +4000,14 @@ async fn run_client_loop(
                     Some(Ok(crossterm::event::Event::Key(key)))
                         if key.kind == KeyEventKind::Press =>
                     {
+                        // An open context menu is modal and owns every key. It
+                        // sits ahead of the sidebar key gate below, which would
+                        // otherwise hand j/k/Enter/Esc to a focused panel.
+                        if let Some(menu) = input.context_menu.as_mut() {
+                            let outcome = menu.key(key);
+                            apply_menu_outcome!(outcome);
+                            continue;
+                        }
                         // A focused sidebar owns the keyboard, except for the
                         // prefix (which keeps command mode reachable), directional
                         // focus (handled by `intercept_focus` on the way out), the
@@ -6190,6 +6435,36 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Mouse(mouse))) => {
+                        // An open context menu is over everything, the popup
+                        // included, so it is asked first. A press outside it
+                        // closes it and then acts as if the menu had not been
+                        // there, like a press outside the popup does; every
+                        // other event over or after the menu is its own.
+                        if let Some(menu) = input.context_menu.as_mut() {
+                            use crate::client::context_menu::MenuOutcome;
+                            match mouse.kind {
+                                MouseEventKind::Moved => {
+                                    let outcome = menu.hover(mouse.column, mouse.row);
+                                    apply_menu_outcome!(outcome);
+                                    continue;
+                                }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let outcome = menu.click(mouse.column, mouse.row);
+                                    let falls_through = outcome == MenuOutcome::Close;
+                                    apply_menu_outcome!(outcome);
+                                    if !falls_through {
+                                        continue;
+                                    }
+                                }
+                                MouseEventKind::Down(_) => {
+                                    if menu.contains(mouse.column, mouse.row) {
+                                        continue;
+                                    }
+                                    apply_menu_outcome!(MenuOutcome::Close);
+                                }
+                                _ => continue,
+                            }
+                        }
                         // The popup box is over every sidebar and pane, so it is
                         // asked before anything else. It is the renderer's box
                         // that counts: until the next frame replaces it, that is
@@ -6911,6 +7186,36 @@ async fn run_client_loop(
                                     .await?;
                                 }
                             }
+                            MouseEventKind::Down(MouseButton::Right)
+                                if popup_local.is_some()
+                                    || !crate::client::chrome::past_the_server_bar(
+                                        content,
+                                        tc,
+                                        tr,
+                                        mouse.column,
+                                        mouse.row,
+                                    ) =>
+                            {
+                                log::debug!("mouse: right press at ({cx}, {cy})");
+                                right_down = true;
+                                mgr.send_foreground(ClientMessage::RightClick {
+                                    x: cx,
+                                    y: cy,
+                                    release: false,
+                                    popup: popup_flag,
+                                })
+                                .await?;
+                            }
+                            MouseEventKind::Up(MouseButton::Right) if right_down => {
+                                right_down = false;
+                                mgr.send_foreground(ClientMessage::RightClick {
+                                    x: cx,
+                                    y: cy,
+                                    release: true,
+                                    popup: popup_flag,
+                                })
+                                .await?;
+                            }
                             _ => {}
                         }
                     }
@@ -7314,6 +7619,31 @@ async fn run_client_loop(
                     }
                     Some(ServerMessage::Error { message }) => {
                         log::error!("Server error: {}", message);
+                    }
+                    Some(ServerMessage::ContextMenu { x, y, target }) => {
+                        // A modal prompt, a view or an open session manager owns
+                        // the screen; a menu opened over it could not be
+                        // answered.
+                        if active_view.is_none() && input.mode == Mode::Normal && !input.has_overlay() {
+                            let items = crate::client::context_menu::items_for(&target, &|action| {
+                                input.binding_hint(action)
+                            });
+                            let (tc, tr) = renderer.size();
+                            let content = chrome.content_rect(tc, tr);
+                            let anchor = (content.x.saturating_add(x), content.y.saturating_add(y));
+                            input.context_menu =
+                                crate::client::context_menu::ContextMenu::open(items, anchor, (tc, tr));
+                            repaint_overlays(
+                                &mut renderer,
+                                &input,
+                                &whichkey,
+                                &theme,
+                                &which_key_position,
+                                viewport_top,
+                                focused_pane_rect.as_ref(),
+                                (last_cursor_x, last_cursor_y, last_cursor_visible),
+                            )?;
+                        }
                     }
                     Some(ServerMessage::CopyToClipboard { data }) => {
                         if let Err(e) = copy_to_clipboard(&data) {

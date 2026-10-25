@@ -397,6 +397,23 @@ impl KeybindingTree {
         out
     }
 
+    /// The key path that runs `action`, as the first non-`EnterNormal` action
+    /// of a leaf's chain. When several leaves run it, the shortest path wins,
+    /// then the lowest keys, so the answer does not depend on map order.
+    pub fn path_for(&self, action: &str) -> Option<Vec<char>> {
+        self.leaves()
+            .into_iter()
+            .filter(|(_, chain)| {
+                chain
+                    .iter()
+                    .find(|a| a.as_str() != "EnterNormal")
+                    .map(String::as_str)
+                    == Some(action)
+            })
+            .map(|(path, _)| path)
+            .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+    }
+
     /// Merge another tree on top of this one. Keys in `overrides` replace keys
     /// in `self`. Groups are merged recursively; leaves are replaced outright.
     /// A leaf with an empty action string removes that key from the base.
@@ -542,6 +559,27 @@ impl ShortcutBindings {
     pub fn lookup(&self, key: &KeyEvent) -> Option<&InterceptAction> {
         let normalized = NormalizedKeyEvent::from(key);
         self.bindings.get(&normalized)
+    }
+
+    /// The notation of the shortcut that runs `action` alone, as the first
+    /// non-`EnterNormal` command of its chain. Ties break on the notation, so
+    /// the answer does not depend on map order.
+    pub fn notation_for(&self, action: &str) -> Option<String> {
+        self.bindings
+            .iter()
+            .filter_map(|(key, bound)| match bound {
+                InterceptAction::Command(cmds)
+                    if cmds
+                        .iter()
+                        .find(|c| c.as_str() != "EnterNormal")
+                        .map(String::as_str)
+                        == Some(action) =>
+                {
+                    Some(format_key_notation(key))
+                }
+                _ => None,
+            })
+            .min()
     }
 
     /// Merge another set of bindings on top of this one.
@@ -1578,6 +1616,25 @@ impl Default for SessionManagerBindings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_shortcut_that_runs_an_action_names_it() {
+        let shortcuts = ShortcutBindings::default();
+        assert_eq!(
+            shortcuts.notation_for("PaneToggleZoom").as_deref(),
+            Some("Alt-z")
+        );
+        assert_eq!(shortcuts.notation_for("PaneRename"), None);
+    }
+
+    #[test]
+    fn a_leaf_that_runs_an_action_gives_its_key_path() {
+        let tree = KeybindingTree::default();
+        assert_eq!(tree.path_for("PaneClose"), Some(vec!['p', 'x']));
+        assert_eq!(tree.path_for("TabClose"), Some(vec!['t', 'x']));
+        assert_eq!(tree.path_for("PaneRename"), Some(vec!['p', 'r']));
+        assert_eq!(tree.path_for("NoSuchAction"), None);
+    }
+
     use super::*;
     use crate::protocol::{action_specs, command_names, ClientAction};
 

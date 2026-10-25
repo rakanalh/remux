@@ -1,5 +1,6 @@
 pub mod chrome;
 pub mod command_palette;
+pub mod context_menu;
 pub mod editor;
 pub mod input;
 pub mod notify;

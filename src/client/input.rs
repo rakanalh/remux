@@ -616,6 +616,10 @@ pub struct InputHandler {
     pub tab_picker: Option<TabPickerOverlay>,
     /// Whether we are waiting for scrollback content to open in an editor.
     pub pending_editor_open: bool,
+    /// The right-click context menu, while it is open. The main loop routes
+    /// its keys and clicks before any other consumer, so no handler here reads
+    /// it; it lives on the handler so the overlay relay finds it.
+    pub context_menu: Option<crate::client::context_menu::ContextMenu>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -1723,7 +1727,23 @@ impl InputHandler {
             view_picker: None,
             tab_picker: None,
             pending_editor_open: false,
+            context_menu: None,
         }
+    }
+
+    /// The current keybinding for `action`, as shown in the context menu: a
+    /// modifier shortcut if one runs it, else the leader and the key path of
+    /// the first leaf that does.
+    pub fn binding_hint(&self, action: &str) -> Option<String> {
+        if let Some(shortcut) = self.shortcut_bindings.notation_for(action) {
+            return Some(shortcut);
+        }
+        let path = self.keybinding_tree.path_for(action)?;
+        let leader = crate::config::keybindings::format_key_notation(
+            &crate::config::keybindings::NormalizedKeyEvent::from(&self.leader_key),
+        );
+        let keys: Vec<String> = path.iter().map(char::to_string).collect();
+        Some(format!("{leader} {}", keys.join(" ")))
     }
 
     /// Create a new `InputHandler` with defaults (Ctrl-a as leader, default
@@ -3734,6 +3754,20 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         make_key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn a_binding_hint_prefers_a_shortcut_then_spells_out_the_leader_path() {
+        let handler = InputHandler::with_defaults();
+        assert_eq!(
+            handler.binding_hint("PaneToggleZoom").as_deref(),
+            Some("Alt-z")
+        );
+        assert_eq!(
+            handler.binding_hint("PaneClose").as_deref(),
+            Some("Ctrl-a p x")
+        );
+        assert_eq!(handler.binding_hint("PaneToggleZoomFloat"), None);
     }
 
     /// Build a handler with `Alt-p` registered as a group-prefix shortcut.
