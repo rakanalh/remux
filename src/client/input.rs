@@ -2240,6 +2240,7 @@ impl InputHandler {
                 // Prompt for a name via the rename overlay; the confirm maps to
                 // InputAction::NewView(name), handled in the main loop.
                 self.mode = Mode::Normal;
+                self.rename_explicit = None;
                 self.rename_overlay = Some(RenameOverlay {
                     buffer: String::new(),
                     cursor: 0,
@@ -2257,6 +2258,7 @@ impl InputHandler {
                 // InputAction::ViewRename(name), applied to the active view in the
                 // main loop.
                 self.mode = Mode::Normal;
+                self.rename_explicit = None;
                 self.rename_overlay = Some(RenameOverlay {
                     buffer: String::new(),
                     cursor: 0,
@@ -2384,6 +2386,7 @@ impl InputHandler {
                         }
                         RemuxCommand::PaneRename(_) => {
                             // Activate rename overlay instead of executing directly.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -2393,6 +2396,7 @@ impl InputHandler {
                         }
                         RemuxCommand::TabRename(_) => {
                             // Activate rename overlay instead of executing directly.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -2402,6 +2406,7 @@ impl InputHandler {
                         }
                         RemuxCommand::SessionRename(_) => {
                             // Activate rename overlay instead of executing directly.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -2411,6 +2416,7 @@ impl InputHandler {
                         }
                         RemuxCommand::SessionNew { .. } => {
                             // Activate rename overlay to prompt for session name.
+                            self.rename_explicit = None;
                             self.rename_overlay = Some(RenameOverlay {
                                 buffer: String::new(),
                                 cursor: 0,
@@ -3769,6 +3775,17 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         make_key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn a_keybinding_rename_forgets_a_menu_target_left_over() {
+        let mut handler = InputHandler::with_defaults();
+        handler.rename_explicit = Some(crate::client::context_menu::RenameFor::Pane(3));
+        handler.handle_key(ctrl_key('a'));
+        handler.handle_key(make_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        handler.handle_key(make_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(handler.rename_overlay.is_some(), "the prompt opened");
+        assert_eq!(handler.rename_explicit, None);
     }
 
     #[test]

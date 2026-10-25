@@ -2927,6 +2927,26 @@ async fn handle_resize(
     Ok(())
 }
 
+/// Bring the panes and every attached client in line after a command moved the
+/// focus or the active tab, as `TabGoto` does: the layout sizes of the newly
+/// shown tab, fresh baselines and a frame. Run before the command the focus move
+/// was for, so the move is painted even when that command turns out to do
+/// nothing.
+async fn settle_focus_change(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    mark_focus_changed();
+    resize_session_panes(session_name, state, panes, clients, config).await?;
+    invalidate_session_baselines(session_name, clients, prev_frames).await;
+    broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    Ok(())
+}
+
 /// The index of tab `tab_id` in `session`, `None` when either is gone.
 async fn tab_index_by_id(
     state: &Arc<Mutex<ServerState>>,
@@ -3002,26 +3022,54 @@ async fn handle_command(
     // on whatever happens to be focused instead.
     let cmd = match cmd {
         RemuxCommand::OnPane { pane_id, command } => {
-            let found = {
+            let landed = {
                 let mut st = state.lock().await;
-                st.sessions.get_mut(&session_name).is_some_and(|sess| {
-                    let Some(index) = sess
-                        .tabs
+                let index = st.sessions.get(&session_name).and_then(|sess| {
+                    sess.tabs
                         .iter()
                         .position(|t| t.pane_order.contains(&pane_id))
-                    else {
-                        return false;
-                    };
-                    sess.active_tab = index;
-                    sess.tabs[index].focus_pane(pane_id);
-                    true
-                })
+                });
+                match index {
+                    None => None,
+                    Some(index) => {
+                        let tab_changed = st.sessions[&session_name].active_tab != index;
+                        let _ = st.goto_tab(&session_name, index);
+                        let tab =
+                            &mut st.sessions.get_mut(&session_name).expect("session").tabs[index];
+                        // A visible popup owns input, and hiding it returns
+                        // input to `focused_pane`, so moving that here would send
+                        // the user elsewhere when the popup closes. As
+                        // `SessionSwitchPane` does, the tab is entered and the
+                        // focus stays; the layout commands are then refused by
+                        // the popup guard, and a command for another pane is
+                        // dropped.
+                        let popup_up = tab.popup_visible;
+                        let mut moved = tab_changed;
+                        if !popup_up && tab.focused_pane != pane_id {
+                            // A float zoom snaps back and the command then acts,
+                            // as a click outside the box does.
+                            tab.release_float_zoom();
+                            tab.focus_pane(pane_id);
+                            moved = true;
+                        }
+                        Some((moved, popup_up && tab.focused_pane != pane_id))
+                    }
+                }
             };
-            if !found {
+            let Some((moved, foreign_under_popup)) = landed else {
                 log::debug!("server: OnPane pane_id={pane_id} is gone, {command:?} dropped");
                 return Ok(());
+            };
+            if moved {
+                settle_focus_change(&session_name, state, panes, clients, config, prev_frames)
+                    .await?;
             }
-            mark_focus_changed();
+            if foreign_under_popup {
+                log::debug!(
+                    "server: OnPane pane_id={pane_id} is under the popup, {command:?} dropped"
+                );
+                return Ok(());
+            }
             return Box::pin(handle_command(
                 client_id,
                 *command,
@@ -3035,23 +3083,26 @@ async fn handle_command(
             .await;
         }
         RemuxCommand::OnTab { tab_id, command } => {
-            let found = {
+            let landed = {
                 let mut st = state.lock().await;
-                st.sessions.get_mut(&session_name).is_some_and(|sess| {
-                    match sess.tabs.iter().position(|t| t.id == tab_id) {
-                        Some(index) => {
-                            sess.active_tab = index;
-                            true
-                        }
-                        None => false,
-                    }
+                let index = st
+                    .sessions
+                    .get(&session_name)
+                    .and_then(|sess| sess.tabs.iter().position(|t| t.id == tab_id));
+                index.map(|index| {
+                    let tab_changed = st.sessions[&session_name].active_tab != index;
+                    let _ = st.goto_tab(&session_name, index);
+                    tab_changed
                 })
             };
-            if !found {
+            let Some(moved) = landed else {
                 log::debug!("server: OnTab tab_id={tab_id} is gone, {command:?} dropped");
                 return Ok(());
+            };
+            if moved {
+                settle_focus_change(&session_name, state, panes, clients, config, prev_frames)
+                    .await?;
             }
-            mark_focus_changed();
             return Box::pin(handle_command(
                 client_id,
                 *command,
@@ -4382,20 +4433,28 @@ async fn handle_command(
             .await?;
         }
         RemuxCommand::TabMoveBy(delta) => {
-            {
-                let mut st = state.lock().await;
-                if let Some(sess) = st.sessions.get_mut(&session_name) {
-                    let current = sess.active_tab;
-                    let last = sess.tabs.len().saturating_sub(1);
-                    let target = (current as i64 + i64::from(delta)).clamp(0, last as i64) as usize;
-                    if current != target && current < sess.tabs.len() {
-                        let tab = sess.tabs.remove(current);
-                        sess.tabs.insert(target, tab);
-                        sess.active_tab = target;
-                    }
-                }
+            // `TabMove` takes the destination as a 1-based position and clamps
+            // it, so the move is that of the active tab by `delta`.
+            let destination = {
+                let st = state.lock().await;
+                st.sessions.get(&session_name).map(|sess| {
+                    let last = sess.tabs.len().saturating_sub(1) as i64;
+                    ((sess.active_tab as i64 + i64::from(delta)).clamp(0, last) + 1) as usize
+                })
+            };
+            if let Some(destination) = destination {
+                return Box::pin(handle_command(
+                    client_id,
+                    RemuxCommand::TabMove(destination),
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                ))
+                .await;
             }
-            broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
         RemuxCommand::PaneEnsureZoom => {
             let already = {
@@ -15034,6 +15093,53 @@ mod popup_tests {
         assert_eq!(st.sessions["main"].tabs[0].focused_pane, left);
         assert_ne!(left, middle);
         drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_pane_snaps_a_float_back_and_renders_even_when_the_command_does_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        assert_eq!(float_of(&rig).await, Some(middle));
+        rig.drain();
+
+        rig.command(on_pane(left, RemuxCommand::EnterNormal)).await;
+
+        assert_eq!(float_of(&rig).await, None, "the float snapped back");
+        let focused = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        assert_eq!(focused, left);
+        assert!(renders(&rig.drain()) >= 1, "the focus change was painted");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_tab_renders_the_tab_switch_even_when_the_command_does_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        let first = tab_ids(&rig).await[0];
+        rig.drain();
+
+        rig.command(on_tab(first, RemuxCommand::EnterNormal)).await;
+
+        assert_eq!(rig.state.lock().await.sessions["main"].active_tab, 0);
+        assert!(renders(&rig.drain()) >= 1);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_pane_does_not_move_focus_under_a_visible_popup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let (left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
+
+        rig.command(on_pane(left, RemuxCommand::PaneSplitVertical))
+            .await;
+
+        assert_eq!(focus_and_popup(&rig).await, (middle, true));
+        assert_eq!(pane_ids(&rig).await.len(), 3, "the split was refused");
         rig.finish().await;
     }
 
