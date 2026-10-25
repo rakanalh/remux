@@ -19,7 +19,7 @@
 # which-key, sidebars, Views, search highlights). The server reads this file
 # once, at startup, so these need `remux restart`: everything under [general],
 # `border_style`, `default_layout`,
-# [layouts], [agents], and the theme colours of what the server draws (pane
+# [layouts], [zoom], [agents], and the theme colours of what the server draws (pane
 # borders, tab strips and the status bar in ordinary tabs).
 #
 # When you uncomment options, keep TOML ordering in mind: a table's own flat
@@ -167,6 +167,39 @@
 # grid = true
 # columns = true
 # rows = true
+
+# -----------------------------------------------------------------------------
+# ZOOM
+# -----------------------------------------------------------------------------
+# How `PaneToggleZoom` (Alt-z, Ctrl-a z, Ctrl-a p z) zooms the focused pane.
+#   mode: "fullscreen" (default) or "float".
+#     "fullscreen" fills the tab with the pane and hides the rest of the layout.
+#     "float" draws the pane in a framed box, centred over the tab, and leaves
+#     the layout under it as it was: the other panes keep their place and size,
+#     and the floated pane's slot shows an empty frame. The pane's terminal is
+#     resized to the box, and to its slot again when the zoom ends.
+#   width, height: the size of the float, in percent of the area the tab's
+#     layout fills (the window minus sidebars and the status bar). Clamped to
+#     20..=100, like the popup (default: 90 / 90). Ignored by "fullscreen".
+# `PaneToggleZoomFloat` always zooms as a float and `PaneToggleZoomFullscreen`
+# always fills the tab, whatever `mode` says. Neither has a default key; bind
+# one in [keybindings.command] (for example "Alt-u" = "PaneToggleZoomFloat") or
+# in the leader tree. Either action ends a zoom of either kind.
+#
+# A float zoom ends when you click anywhere outside the box, a sidebar included
+# (the click then acts as it would have), press Alt-h/j/k/l, split, cycle the
+# layout or close the pane. It and the popup terminal are never open together:
+# opening one closes the other.
+# In Monocle a float zoom is allowed, a fullscreen one has nothing to do. A View
+# has one zoom, the focused cell filling the view, so a float request there is
+# a fullscreen zoom.
+#
+# Read by the server at startup: `remux restart` after a change.
+#
+# [zoom]
+# mode = "fullscreen"
+# width = 90
+# height = 90
 
 # -----------------------------------------------------------------------------
 # APPEARANCE - THEME
@@ -543,7 +576,7 @@
 #   v     = "EnterVisualMode"                — enter Visual (scrollback) mode
 #   g     = "ToggleStyle; EnterNormal"       — toggle border style
 #   Space = "LayoutNext; EnterNormal"        — cycle layout (key is a literal space)
-#   f     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
+#   z     = "PaneToggleZoom; EnterNormal"    — zoom the focused pane
 #   ":"   = "CommandPaletteOpen"             — open the command palette
 #   a     = "SendKey Ctrl-a; EnterNormal"    — send the prefix key to the terminal
 #   "}"   = "TabNext; EnterNormal"           — quick next tab
@@ -648,7 +681,12 @@
 #   PaneUnstackRight                — Take focused pane out of its stack, to the right of it
 #   PaneUnstackUp                   — Take focused pane out of its stack, above it
 #   PaneUnstackDown                 — Take focused pane out of its stack, below it
-#   PaneToggleZoom                  — Toggle zoom (fullscreen) for the focused pane
+#   PaneToggleZoom                  — Toggle zoom for the focused pane, as [zoom] mode says
+#                                     (fullscreen, or a float over the layout)
+#   PaneToggleZoomFullscreen        — Toggle a fullscreen zoom for the focused pane, whatever
+#                                     [zoom] mode says (refused in Monocle)
+#   PaneToggleZoomFloat             — Toggle a float zoom for the focused pane, whatever
+#                                     [zoom] mode says
 #   PaneRename                      — Rename the focused pane (prompts)
 #   PaneMoveToTab                   — Move the focused pane to another tab (opens a picker)
 #   PopupToggle [position [size]]   — Toggle the popup terminal. A hidden popup opens

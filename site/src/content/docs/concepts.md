@@ -94,7 +94,7 @@ On macOS the config and saved sessions default to `~/Library/Application Support
 
 ## What reloads live
 
-The client watches its config file. Keybindings, remotes, sidebars and the colours of what the client draws apply as soon as you save. Settings the server reads when it starts, such as `[general]`, `[layouts]`, `[agents]` and the colours of pane borders, tab strips and the status bar, need `remux restart`. See [Configuration](/remux/configuration/#client-settings-and-server-settings) and, for appearance settings, [Theme](/remux/theme/#when-changes-apply).
+The client watches its config file. Keybindings, remotes, sidebars and the colours of what the client draws apply as soon as you save. Settings the server reads when it starts, such as `[general]`, `[layouts]`, `[zoom]`, `[agents]` and the colours of pane borders, tab strips and the status bar, need `remux restart`. See [Configuration](/remux/configuration/#client-settings-and-server-settings) and, for appearance settings, [Theme](/remux/theme/#when-changes-apply).
 
 ## Next steps
 

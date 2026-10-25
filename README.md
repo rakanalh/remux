@@ -32,7 +32,7 @@ Built on a client-server architecture with Unix socket IPC, async I/O via tokio,
 - **Move (swap) panes** — `PaneMove*` swaps the focused pane with its directional neighbour to rearrange a layout without re-splitting. Inside a stack of several panes, `PaneMoveLeft`/`PaneMoveRight` move the pane one place along the stack instead, and at the stack's end take it out into its own slot on that side; `PaneMoveUp`/`PaneMoveDown` take it out above or below at once.
 - **Pane stacking** — multiple panes can occupy the same screen position and cycle like tabs within a split (`stack add`, `stack next/prev`, `stack into` to fold an existing pane into a neighbour's stack, and `unstack` to give a stacked pane its own slot again).
 - **Move to tab** — `Ctrl-a p t` opens a picker of every session on the pane's server, each with its tabs and a `+ new tab`, the pane's own session first; pick one and the focused pane moves there with its running program and scrollback intact, and focus follows it, into another session too. A tab left empty closes, and so does a session.
-- **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact.
+- **Zoom** — toggle a focused pane to fullscreen and back, keeping the rest of the layout intact (`Alt-z` or `Ctrl-a z`). With `[zoom] mode = "float"` the pane instead becomes a framed, centred box drawn over a layout that does not move (`width` / `height` default to 90% of the area the tab fills), and `PaneToggleZoomFloat` float-zooms whatever the mode is. A click outside the float, or `Alt-h/j/k/l`, snaps it back and then acts as it would have without the float; splitting, cycling the layout or closing the pane ends it too. The float and the popup terminal are never open together. See [Zoom](#zoom).
 - **Resize** — grow/shrink the focused pane edge by a configurable amount.
 - **Seven layout algorithms** — **BSP** (recursive binary space partitioning, the default), **Master** (one large pane + evenly divided secondaries), **Monocle** (one pane fullscreen, cycle with stack next/prev), **Grid** (equal-size cells, `ceil(sqrt(n))` columns — the default for Views while enabled), **Columns** (every pane side by side, equal widths), **Rows** (every pane stacked, equal heights), and **Custom** (your exact manual splits, no auto-redistribution). Cycle the automatic ones with `Alt-Space` / `Ctrl-a Space` (BSP → Master → Monocle → Grid → Columns → Rows, then back to a remembered Custom arrangement); turn any of them off under `[layouts]`.
 - **Popup terminal** — a scratch terminal drawn over the layout instead of occupying a slot in it. Toggle with `Alt-p` (or `Ctrl-a p o`), or bind keys that open it at a given position (`"Alt--" = "PopupToggle bottom"`, see [Popup keys](#popup-keys)); it keeps running while hidden, so it's the same terminal with the same history every time you pull it up. One per tab — the first toggle in a tab starts a shell in that tab's focused pane's directory, and each tab keeps its own popup open or closed. `popup_position` puts it as a `float` centered over the whole window, sidebars included (the default), or as a drawer on the `left`, `right`, `top` or `bottom`; `popup_width_pct` / `popup_height_pct` (default 80×80) size it, and the pane-resize keys resize it while open, for that key's position and size only. Position and size apply on save. Two tabs whose popups are open at different positions share one popup terminal size, so switching between them resizes the popups (programs inside redraw, as on any terminal resize). It takes no space from the surrounding panes and is excluded from every layout operation, so `Alt-Space`, zoom, and pane move/swap can never pull it into the layout. A left click anywhere outside the box closes it and then lands as if the popup had not been there (it focuses the pane or drives the sidebar), except a click on a tab, which only switches tabs and leaves the popup of the tab you left up, as a tab key does. `Alt-h/j/k/l` closes it and moves focus one step among the panes from the pane you were on before it opened; with no pane that way it still closes and you stay put, and these keys never move the keyboard into a sidebar while the popup is up. The wheel does not close it: it scrolls whatever is under the pointer.
@@ -110,7 +110,7 @@ Full details: [https://rakanalh.github.io/remux/remotes/](https://rakanalh.githu
 - **Views** — a virtual tab whose cells are live, read/write **aliases** to existing panes that may live on different machines, sessions, and tabs. Watch and drive several long-running things (builds, logs, agents) from one screen without moving them.
 - **Compose from existing panes** — in the session manager, mark panes with `Space` across any servers/sessions/tabs, then `va` to alias them into a view. `Ctrl-a w a` adds the currently focused pane.
 - **Shared across terminals** — views live on the server, so every terminal on the machine sees the same views in the switcher. Add a pane in one terminal and any terminal displaying that view repaints live; focus, layout, and zoom are mirrored too. (Views are in-memory: they clear when the server restarts.)
-- **Real layouts** — views use the same layout engine as normal tabs (Grid by default, or the first enabled layout if `[layouts]` disables Grid; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a f` zoom, and a Monocle title strip.
+- **Real layouts** — views use the same layout engine as normal tabs (Grid by default, or the first enabled layout if `[layouts]` disables Grid; cycle with `Ctrl-a w Space`), plus per-cell resize/move, `Ctrl-a z` zoom, and a Monocle title strip.
 - **Re-entry via the switcher** — the quick switcher (`Alt-s`) lists views alongside sessions; selecting one enters it.
 
 Full details: [https://rakanalh.github.io/remux/views/](https://rakanalh.github.io/remux/views/)
@@ -234,6 +234,24 @@ Manual splits created by you. No automatic redistribution — your exact arrange
 
 ![Custom layout](docs/screenshots/layout-custom.png)
 
+### Zoom
+
+`PaneToggleZoom` (`Alt-z`, `Ctrl-a z`, `Ctrl-a p z`) zooms the focused pane in one of two ways, chosen by `[zoom] mode`:
+
+- **`fullscreen`** (the default): the pane fills the tab and the rest of the layout waits behind it.
+- **`float`**: the pane is drawn in a framed box centred over the tab. The layout underneath does not change: the other panes keep their place and size, and the floated pane's slot shows an empty, unfocused frame. The pane's terminal is resized to the box and goes back to its slot's size when the float ends. Keyboard focus stays on the floated pane.
+
+```toml
+[zoom]
+mode = "float"   # "fullscreen" (default) or "float"
+width = 90       # percent of the area the tab's layout fills, 20-100
+height = 90
+```
+
+`PaneToggleZoomFloat` always zooms as a float and `PaneToggleZoomFullscreen` always fills the tab (refused in Monocle), whatever the mode is. Neither has a default key (bind one, for example `"Alt-u" = "PaneToggleZoomFloat"`). Either action releases a zoom of either kind, so a tab is always in one zoom state. The status bar shows the `Z` for both.
+
+A float ends when you click outside the box (the click then acts as if the float had not been there), press `Alt-h/j/k/l` (the float snaps back and focus steps from that pane), split, cycle the layout, promote a master or close the pane. The float and the popup terminal are mutually exclusive: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar. A click anywhere outside the box ends the float, a sidebar included. In Monocle a float zoom is allowed, where a fullscreen one has nothing to do. A View has one zoom, the focused cell filling the view, so a float request there is a fullscreen zoom. `[zoom]` is read by the server at startup: `remux restart` after a change.
+
 ## Install / build / run
 
 Full details: [https://rakanalh.github.io/remux/install/](https://rakanalh.github.io/remux/install/) · Quick start: [https://rakanalh.github.io/remux/quick-start/](https://rakanalh.github.io/remux/quick-start/)
@@ -302,7 +320,7 @@ cp config.sample.toml ~/.config/remux/config.toml
 
 On macOS, copy it to `~/Library/Application Support/remux/` instead (or export `XDG_CONFIG_HOME=$HOME/.config` to keep using `~/.config`).
 
-Client-side edits — keybindings, remotes, sidebars, `[notifications]`, `pane_title`, `tab_style`, `which_key_position`, the popup's position and size, and client-drawn colours — are picked up automatically by the file watcher. Settings the **server** reads — `[general]`, `border_style`, `default_layout`, `[layouts]`, `[agents]`, and the colours of pane borders, tab strips and the status bar — need `remux restart`.
+Client-side edits — keybindings, remotes, sidebars, `[notifications]`, `pane_title`, `tab_style`, `which_key_position`, the popup's position and size, and client-drawn colours — are picked up automatically by the file watcher. Settings the **server** reads — `[general]`, `border_style`, `default_layout`, `[layouts]`, `[zoom]`, `[agents]`, and the colours of pane borders, tab strips and the status bar — need `remux restart`.
 
 Full details: [https://rakanalh.github.io/remux/configuration/](https://rakanalh.github.io/remux/configuration/)
 
@@ -335,7 +353,7 @@ Press the leader, then walk the tree. Bindings marked *(→ Normal)* return you 
 | `v` | Enter Visual mode |
 | `g` | Toggle border style (Zellij ⇄ Tmux) *(→ Normal)* |
 | `Space` | Cycle layout (BSP → Master → Monocle → Grid → Columns → Rows) *(→ Normal)* |
-| `f` | Zoom the focused pane *(→ Normal)* |
+| `z` | Zoom the focused pane *(→ Normal)* |
 | `}` | Next tab *(→ Normal)* |
 | `{` | Previous tab *(→ Normal)* |
 | `:` | Open the command palette |
@@ -451,7 +469,7 @@ There are deliberately no default keys for focusing a *specific* sidebar: `Alt-h
 | `Alt-s` | Quick session switcher (local + remote) |
 | `Alt-a` | Agent switcher (local + remote) |
 | `Alt-o` | Last session (toggle) |
-| `Alt-z` | Toggle pane zoom |
+| `Alt-z` | Toggle pane zoom (fullscreen, or a float with `[zoom] mode = "float"`) |
 | `Alt-p` | Toggle the popup terminal |
 | `Alt-Space` | Cycle layout |
 | `Alt-m` | Make the focused pane the master (Master layout) |
@@ -560,7 +578,9 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `PaneMoveDown` | — | Swap the focused pane with the pane below. In a stack of several panes, take it out of the stack into a new slot below. |
 | `PaneRename` | — | Rename the focused pane (prompts for the name). |
 | `PaneMoveToTab` | — | Pick a tab of any session on this server (or a session's `+ new tab`) and move the focused pane there. |
-| `PaneToggleZoom` | — | Toggle fullscreen zoom for the focused pane. |
+| `PaneToggleZoom` | — | Toggle zoom for the focused pane, as `[zoom] mode` says: fullscreen (the default) or a float over the layout. Releases a zoom of either kind. |
+| `PaneToggleZoomFullscreen` | — | Toggle a fullscreen zoom for the focused pane whatever `[zoom] mode` says. It has no default key. Refused in Monocle; releases a zoom of either kind. |
+| `PaneToggleZoomFloat` | — | Toggle a float zoom for the focused pane whatever `[zoom] mode` says. It has no default key. Releases a zoom of either kind. |
 | `ResizeLeft` | `<amount>` | Resize the focused pane's left edge (default 1). |
 | `ResizeRight` | `<amount>` | Resize the focused pane's right edge (default 1). |
 | `ResizeUp` | `<amount>` | Resize the focused pane's top edge (default 1). |
@@ -696,6 +716,7 @@ size = 30
   - **Edits here need `remux restart`.** This section is read by the *server*, at startup — unlike keybindings and remotes, it does not hot-reload. It bites exactly when it matters, because you edit a pattern *because* an agent is blocked and the panel is not saying so.
 - **`[notifications]`** — desktop notifications for agents, read by the *client*, so for a remote agent it is your local config that applies; edits apply on save. `enabled`, `needs_input`, `finished` and `exited` are each `true` by default. macOS uses `osascript` and Linux `notify-send`; `command = ["prog", "arg", …]` runs something else, with an argument that is exactly `{title}` or `{body}` replaced by that text and no shell involved. Two clients on the same machine attached to the same server show one notification between them, not two.
 - **`[layouts]`** — `bsp`, `master`, `monocle`, `grid`, `columns`, `rows`, each `true` by default. `false` drops that layout from the `LayoutNext` cycle, for tabs and Views alike; the order of the rest is unchanged. After the last enabled layout, the cycle returns to a remembered Custom arrangement if there is one. A new tab, session or View whose default layout is disabled starts in the first enabled one. Custom is manual and not listed. Disabling everything is treated as enabling everything, with a warning. Read by the server at startup, so `remux restart` after a change; a tab already in a layout you disable keeps it until the next cycle.
+- **`[zoom]`** — how `PaneToggleZoom` zooms a pane: `mode = "fullscreen"` (the default) or `"float"`; `width` and `height` size a float as a percentage of the area the tab's layout fills (default 90 / 90, clamped to 20–100 like the popup). Read by the server at startup, so `remux restart` after a change. See [Zoom](#zoom).
 - **`[remotes.<name>]`** — declare SSH-reachable remote servers:
 
 ```toml

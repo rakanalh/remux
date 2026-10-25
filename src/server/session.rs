@@ -13,7 +13,7 @@ use super::layout::{
     self, find_neighbor, relocate_pane_to_edge, swap_panes, Direction, EnabledLayouts,
     FocusDirection, GridLayout, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
-use crate::config::BorderStyle;
+use crate::config::{BorderStyle, ZoomMode};
 use crate::protocol::{
     CellId, ConnDescriptor, FolderTreeEntry, PaneTreeEntry, SessionTreeEntry, TabTreeEntry, ViewId,
 };
@@ -238,6 +238,11 @@ pub struct Tab {
     pub pane_order: Vec<PaneId>,
     #[serde(default)]
     pub zoomed_pane: Option<PaneId>,
+    /// How `zoomed_pane` is shown. Only meaningful while `zoomed_pane` is
+    /// set, and always rewritten when a zoom is taken, so a stale value left by
+    /// a release is never read.
+    #[serde(default)]
+    pub zoom_mode: ZoomMode,
     /// The user's last manually-arranged (`Custom`) layout tree, snapshotted
     /// when the automatic-layout cycle moves away from it so the cycle can
     /// return to it later. `None` until the user has a custom arrangement.
@@ -280,6 +285,7 @@ impl Tab {
             layout_mode,
             pane_order: vec![pane],
             zoomed_pane: None,
+            zoom_mode: ZoomMode::Fullscreen,
             saved_custom_layout: None,
             activity: TabActivity::None,
             last_output: None,
@@ -408,6 +414,11 @@ impl Tab {
     /// painted for it under the tmux border style).
     pub fn effective_layout(&self) -> std::borrow::Cow<'_, LayoutNode> {
         match self.zoomed_pane {
+            // A float zoom does not reshape the layout: the floated pane keeps
+            // its slot and every other pane keeps its rect.
+            Some(_) if self.zoom_mode == ZoomMode::Float => {
+                std::borrow::Cow::Borrowed(&self.layout)
+            }
             Some(zoomed) => {
                 let mut stack = LayoutNode::new_stack(zoomed);
                 layout::carry_pane_names(&self.layout, &mut stack);
@@ -421,7 +432,8 @@ impl Tab {
     ///
     /// **Disengaging always works; only engaging can be refused.** `Monocle`
     /// already paints one pane full-area, so *taking* a zoom there is
-    /// redundant -- but *releasing* one is not, and refusing it is a trap:
+    /// redundant (a float zoom is not, so it is taken there) -- but
+    /// *releasing* one is not, and refusing it is a trap:
     /// `zoomed_pane` outranks the mode in [`Tab::effective_layout`], so a tab
     /// zoomed in another mode and then cycled into `Monocle` would stay stuck
     /// on that one pane with no way back, for every attached client (the zoom
@@ -429,16 +441,40 @@ impl Tab {
     /// fields persist). That is exactly how a session became permanently
     /// "zoomed in and unable to zoom out" on one machine and looked the same
     /// way from another.
-    pub fn toggle_zoom(&mut self) -> bool {
+    pub fn toggle_zoom(&mut self, mode: ZoomMode) -> bool {
         if self.zoomed_pane.is_some() {
             self.zoomed_pane = None;
             true
-        } else if matches!(self.layout_mode, LayoutMode::Monocle(_)) {
+        } else if mode == ZoomMode::Fullscreen && matches!(self.layout_mode, LayoutMode::Monocle(_))
+        {
             false
         } else {
             self.zoomed_pane = Some(self.focused_pane);
+            self.zoom_mode = mode;
+            // Done here, in the same borrow that takes the float, so no other
+            // client can open the popup between the two steps.
+            if mode == ZoomMode::Float {
+                self.popup_visible = false;
+            }
             true
         }
+    }
+
+    /// The pane shown as a float zoom, `None` when the tab is not zoomed or is
+    /// zoomed fullscreen.
+    pub fn float_zoomed(&self) -> Option<PaneId> {
+        self.zoomed_pane
+            .filter(|_| self.zoom_mode == ZoomMode::Float)
+    }
+
+    /// Release a float zoom, leaving a fullscreen zoom alone. Returns whether
+    /// one was released.
+    pub fn release_float_zoom(&mut self) -> bool {
+        let floated = self.float_zoomed().is_some();
+        if floated {
+            self.zoomed_pane = None;
+        }
+        floated
     }
 
     /// Move focus to `pane_id`, carrying an active zoom along with it.
@@ -555,6 +591,9 @@ fn default_border_style() -> BorderStyle {
 ///    pane missing from the tree is not a violation here: `Tab::can_place_auto`
 ///    already treats that state as reachable.
 ///
+/// 7. a tab does not show a float zoom and its popup at once: both are boxes
+///    over the layout, and opening either closes the other.
+///
 /// Returns the first violation as a message rather than panicking, so
 /// production code can `debug_assert` on it (see [`debug_check_invariant`]) and
 /// tests can turn it into a hard assertion.
@@ -605,6 +644,9 @@ pub fn check_structural_invariant(sess: &Session) -> Result<(), String> {
                     tab.pane_order
                 ));
             }
+        }
+        if tab.float_zoomed().is_some() && tab.popup_visible {
+            return Err(format!("tab {i} shows a float zoom and its popup at once"));
         }
         let visible = layout::active_pane_ids(&tab.layout);
         if tree_set.contains(&tab.focused_pane) && !visible.contains(&tab.focused_pane) {
@@ -3750,9 +3792,15 @@ mod popup_invariant_tests {
         let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
         let focused = tab.focused_pane;
 
-        assert!(tab.toggle_zoom(), "taking a zoom changes the state");
+        assert!(
+            tab.toggle_zoom(ZoomMode::Fullscreen),
+            "taking a zoom changes the state"
+        );
         assert_eq!(tab.zoomed_pane, Some(focused));
-        assert!(tab.toggle_zoom(), "releasing it changes the state too");
+        assert!(
+            tab.toggle_zoom(ZoomMode::Fullscreen),
+            "releasing it changes the state too"
+        );
         assert_eq!(tab.zoomed_pane, None);
     }
 
@@ -3762,7 +3810,10 @@ mod popup_invariant_tests {
         let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
         tab.layout_mode = LayoutMode::Monocle(MonocleLayout);
 
-        assert!(!tab.toggle_zoom(), "Monocle is already fullscreen");
+        assert!(
+            !tab.toggle_zoom(ZoomMode::Fullscreen),
+            "Monocle is already fullscreen"
+        );
         assert_eq!(tab.zoomed_pane, None, "no redundant zoom is taken");
     }
 
@@ -3775,11 +3826,14 @@ mod popup_invariant_tests {
         let (mut st, name, _popup) = state_with_popup(3, false);
         let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
         let zoomed = tab.focused_pane;
-        tab.toggle_zoom();
+        tab.toggle_zoom(ZoomMode::Fullscreen);
         tab.layout_mode = LayoutMode::Monocle(MonocleLayout);
         assert_eq!(layout::all_pane_ids(&tab.effective_layout()), vec![zoomed]);
 
-        assert!(tab.toggle_zoom(), "the release is never refused");
+        assert!(
+            tab.toggle_zoom(ZoomMode::Fullscreen),
+            "the release is never refused"
+        );
         assert_eq!(tab.zoomed_pane, None);
         assert_eq!(
             layout::all_pane_ids(&tab.effective_layout()).len(),
@@ -3810,6 +3864,137 @@ mod popup_invariant_tests {
         );
         assert_eq!(layout::all_pane_ids(&tab.effective_layout()), vec![first]);
         assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn a_float_zoom_leaves_the_layout_tree_whole() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let focused = tab.focused_pane;
+
+        assert!(tab.toggle_zoom(ZoomMode::Float));
+        assert_eq!(tab.zoomed_pane, Some(focused));
+        assert_eq!(tab.float_zoomed(), Some(focused));
+        assert_eq!(
+            layout::all_pane_ids(&tab.effective_layout()),
+            layout::all_pane_ids(&tab.layout),
+            "the floated pane keeps its slot, and so does every other pane"
+        );
+    }
+
+    #[test]
+    fn a_fullscreen_zoom_is_not_a_float_zoom() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        assert!(tab.toggle_zoom(ZoomMode::Fullscreen));
+        assert_eq!(tab.float_zoomed(), None);
+        assert_eq!(layout::all_pane_ids(&tab.effective_layout()).len(), 1);
+    }
+
+    #[test]
+    fn either_toggle_releases_a_zoom_of_either_mode() {
+        for taken in [ZoomMode::Fullscreen, ZoomMode::Float] {
+            for released_by in [ZoomMode::Fullscreen, ZoomMode::Float] {
+                let (mut st, name, _popup) = state_with_popup(3, false);
+                let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+                assert!(tab.toggle_zoom(taken));
+                assert!(tab.toggle_zoom(released_by), "{taken:?} / {released_by:?}");
+                assert_eq!(tab.zoomed_pane, None, "{taken:?} / {released_by:?}");
+                assert_eq!(tab.float_zoomed(), None, "{taken:?} / {released_by:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_float_zoom_can_be_taken_in_monocle() {
+        // A fullscreen zoom there is redundant; a float is a different picture.
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.layout_mode = LayoutMode::Monocle(MonocleLayout);
+        assert!(tab.toggle_zoom(ZoomMode::Float));
+        assert_eq!(tab.float_zoomed(), Some(tab.focused_pane));
+    }
+
+    #[test]
+    fn retaking_a_zoom_in_the_other_mode_starts_clean() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.toggle_zoom(ZoomMode::Float);
+        tab.toggle_zoom(ZoomMode::Float);
+        assert!(tab.toggle_zoom(ZoomMode::Fullscreen));
+        assert_eq!(tab.float_zoomed(), None, "no float state leaks across");
+        assert_eq!(layout::all_pane_ids(&tab.effective_layout()).len(), 1);
+    }
+
+    #[test]
+    fn focus_pane_carries_a_float_zoom_and_keeps_it_a_float() {
+        let (mut st, name, _popup) = state_with_popup(3, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        let panes = layout::all_pane_ids(&tab.layout);
+        tab.toggle_zoom(ZoomMode::Float);
+        tab.focus_pane(panes[2]);
+        assert_eq!(tab.float_zoomed(), Some(panes[2]));
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn taking_a_float_zoom_closes_the_popup_in_the_same_step() {
+        let (mut st, name, _popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.popup_visible = true;
+        assert!(tab.toggle_zoom(ZoomMode::Float));
+        assert!(!tab.popup_visible);
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn taking_a_fullscreen_zoom_leaves_the_popup_up() {
+        let (mut st, name, _popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.popup_visible = true;
+        assert!(tab.toggle_zoom(ZoomMode::Fullscreen));
+        assert!(tab.popup_visible);
+    }
+
+    #[test]
+    fn invariant_catches_a_float_zoom_with_the_popup_up() {
+        let (mut st, name, _popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.toggle_zoom(ZoomMode::Float);
+        tab.popup_visible = true;
+        let err = check_structural_invariant(sess_of(&st, &name)).expect_err("violation");
+        assert!(err.contains("float zoom"), "{err}");
+    }
+
+    #[test]
+    fn a_fullscreen_zoom_may_share_the_tab_with_the_popup() {
+        let (mut st, name, _popup) = state_with_popup(2, true);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.toggle_zoom(ZoomMode::Fullscreen);
+        tab.popup_visible = true;
+        assert!(check_structural_invariant(sess_of(&st, &name)).is_ok());
+    }
+
+    #[test]
+    fn a_tab_saved_before_zoom_modes_restores_as_a_fullscreen_zoom() {
+        let (mut st, name, _popup) = state_with_popup(2, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.zoomed_pane = Some(tab.focused_pane);
+        let mut json: serde_json::Value = serde_json::to_value(&*tab).expect("serialize");
+        json.as_object_mut().expect("object").remove("zoom_mode");
+        let restored: Tab = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(restored.zoom_mode, ZoomMode::Fullscreen);
+        assert_eq!(restored.float_zoomed(), None);
+    }
+
+    #[test]
+    fn a_float_zoom_survives_a_save_and_restore() {
+        let (mut st, name, _popup) = state_with_popup(2, false);
+        let tab = &mut st.sessions.get_mut(&name).expect("session").tabs[0];
+        tab.toggle_zoom(ZoomMode::Float);
+        let json = serde_json::to_string(&*tab).expect("serialize");
+        let restored: Tab = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.float_zoomed(), Some(tab.focused_pane));
     }
 
     #[test]

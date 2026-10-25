@@ -3949,7 +3949,7 @@ mod tests {
 
         // An unbound key aborts the chord back to Normal (rather than staying
         // in Command mode and swallowing the next keypress).
-        let action = handler.handle_key(char_key('z'));
+        let action = handler.handle_key(char_key('q'));
         assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
         assert_eq!(handler.mode, Mode::Normal);
         assert!(handler.keybinding_state.is_at_root());
@@ -3967,8 +3967,8 @@ mod tests {
         assert_eq!(handler.mode, Mode::Command);
         assert!(matches!(action, InputAction::ShowWhichKey { .. }));
 
-        // Press 'z', which has no binding at root -- should abort back to Normal.
-        let action = handler.handle_key(char_key('z'));
+        // Press 'q', which has no binding at root -- should abort back to Normal.
+        let action = handler.handle_key(char_key('q'));
         assert_eq!(action, InputAction::ModeChanged(Mode::Normal));
         assert_eq!(handler.mode, Mode::Normal);
 
@@ -5099,9 +5099,9 @@ mod tests {
     fn reload_keybindings_swaps_tree_and_leader() {
         let mut handler = InputHandler::with_defaults();
 
-        // Default tree has no 'z' binding at root, and the default leader is
+        // Default tree has no 'q' binding at root, and the default leader is
         // Ctrl-a.
-        assert!(handler.keybinding_tree.lookup(&['z']).is_none());
+        assert!(handler.keybinding_tree.lookup(&['q']).is_none());
         let ctrl_a = ctrl_key('a');
         assert!(matches!(
             handler.handle_key(ctrl_a),
@@ -5111,10 +5111,10 @@ mod tests {
         handler.mode = Mode::Normal;
         handler.keybinding_state.reset();
 
-        // Build a distinct tree that binds 'z' at root and a new leader (Ctrl-b).
+        // Build a distinct tree that binds 'q' at root and a new leader (Ctrl-b).
         let mut root = std::collections::HashMap::new();
         root.insert(
-            'z',
+            'q',
             KeyNode::Leaf {
                 label: "new tab".to_string(),
                 action: vec!["TabNew".to_string(), "EnterNormal".to_string()],
@@ -5130,8 +5130,8 @@ mod tests {
             SessionManagerBindings::default(),
         );
 
-        // The tree actually changed: 'z' now resolves at root.
-        assert!(handler.keybinding_tree.lookup(&['z']).is_some());
+        // The tree actually changed: 'q' now resolves at root.
+        assert!(handler.keybinding_tree.lookup(&['q']).is_some());
 
         // The old leader (Ctrl-a) no longer enters Command mode; it is a normal
         // keystroke forwarded to the PTY.

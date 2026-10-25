@@ -2,7 +2,7 @@
 
 Exercises the view-management verbs through the shared-view intents on ONE
 client: `w n` create+enter an empty view, `w q` leave-to-session, re-enter via
-the switcher, SM `va` compose over real panes, `Prefix+f` zoom in AND out,
+the switcher, SM `va` compose over real panes, `Prefix+z` zoom in AND out,
 `Alt+Space` layout cycle, and `w x` eject a cell. Asserts on the actual screen
 and that the client stays alive with no panic.
 
@@ -90,15 +90,15 @@ def main():
     if not both:
         fail("va compose did not show both cells")
 
-    # --- Prefix+f zoom in AND out ---
-    t.prefix(b"f", 0.8)
+    # --- Prefix+z zoom in AND out ---
+    t.prefix(b"z", 0.8)
     t.pump(0.4)
     za, zb = t.has(A), t.has(B)
     zoom_ok = za != zb
     print(f"[zoom in] only one cell shown: A={za} B={zb}")
     if not zoom_ok:
         fail("zoom did not hide the unfocused cell")
-    t.prefix(b"f", 0.8)
+    t.prefix(b"z", 0.8)
     t.pump(0.4)
     unzoom_ok = t.has(A) and t.has(B)
     print("[zoom out] both cells shown again:", unzoom_ok)

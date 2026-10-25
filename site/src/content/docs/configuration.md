@@ -69,6 +69,7 @@ Remux is two processes. The **server** owns the sessions, panes and PTYs, and it
 - everything under `[general]`
 - `appearance.border_style`, `default_layout`
 - `[layouts]`
+- `[zoom]`
 - `[agents]`
 - `[appearance.theme]` colours for what the server draws: pane frames, tab chips and the status bar
 

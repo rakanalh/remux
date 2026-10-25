@@ -84,6 +84,18 @@ Defaults are the Catppuccin Mocha palette. Colours for pane frames, tab chips an
 
 `rounded` and `slanted` tab styles draw Powerline glyphs and need a Nerd Font. `square` works in any font.
 
+## `[zoom]`
+
+How `PaneToggleZoom` zooms the focused pane. Server-side, needs `remux restart`. See [Float zoom](/remux/layouts/#float-zoom).
+
+| Option | Type | Default |
+|---|---|---|
+| `mode` | `"fullscreen"` \| `"float"` | `"fullscreen"` |
+| `width` | integer, percent | `90` |
+| `height` | integer, percent | `90` |
+
+`fullscreen` fills the tab with the pane. `float` draws it in a framed, centred box over a layout that keeps its shape. `width` and `height` size the float as a percentage of the area the tab's layout fills (the window minus sidebars and the status bar), clamped to 20 to 100 like the popup's. They have no effect in `fullscreen` mode. `PaneToggleZoomFloat` always float-zooms and `PaneToggleZoomFullscreen` always fills the tab, whatever `mode` is.
+
 ## `[layouts]`
 
 Which automatic layouts `LayoutNext` (`Alt-Space`, `Ctrl-a Space`) cycles through, for tabs and Views. Server-side, needs `remux restart`. The cycle order is fixed: bsp, master, monocle, grid, columns, rows.

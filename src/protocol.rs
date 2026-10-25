@@ -152,6 +152,13 @@ pub enum ConnDescriptor {
 /// sends it with `None`, so the placement never crosses the wire. 18 also added
 /// [`SessionEvent::SessionRenamed`], so a client keys its popup state by the
 /// session's current name.
+///
+/// 18 also carries [`RemuxCommand::PaneToggleZoomFloat`] and
+/// [`RemuxCommand::PaneToggleZoomFullscreen`], added without a bump
+/// like the 13 commands above. An old server cannot decode it and drops the
+/// connection, but a client sends one only when the user runs that action. The
+/// zoom mode of a tab stays on the server (`Tab::zoom_mode`, `#[serde(default)]`)
+/// and never crosses the wire.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -684,6 +691,13 @@ pub enum ServerMessage {
         /// a client can forget what it keeps about a popup that is gone.
         #[serde(default)]
         live_popups: Vec<PaneId>,
+        /// Whether the active tab shows a float zoom. The server draws the box
+        /// into the frame, so the client cannot see it there; it needs the flag
+        /// to treat a press it answers itself (a sidebar, the bar's tail) as
+        /// outside the box, as it does for a popup. An older server sends none,
+        /// which reads as no float.
+        #[serde(default)]
+        float_zoom: bool,
     },
     /// Incremental render update (diff from previous frame).
     RenderDiff {
@@ -735,6 +749,13 @@ pub enum ServerMessage {
         /// a client can forget what it keeps about a popup that is gone.
         #[serde(default)]
         live_popups: Vec<PaneId>,
+        /// Whether the active tab shows a float zoom. The server draws the box
+        /// into the frame, so the client cannot see it there; it needs the flag
+        /// to treat a press it answers itself (a sidebar, the bar's tail) as
+        /// outside the box, as it does for a popup. An older server sends none,
+        /// which reads as no float.
+        #[serde(default)]
+        float_zoom: bool,
     },
     /// Optimized scroll render: shift content within a pane rect and render
     /// only the new rows that appeared.
@@ -1401,7 +1422,16 @@ pub enum RemuxCommand {
         session: Option<String>,
     },
     PaneRename(String),
+    /// Zoom the focused pane the way `[zoom] mode` says, or release a zoom of
+    /// either mode.
     PaneToggleZoom,
+    /// Zoom the focused pane to fill the tab whatever `[zoom] mode` says, or
+    /// release a zoom of either mode. Refused in Monocle, which already fills
+    /// the tab.
+    PaneToggleZoomFullscreen,
+    /// Zoom the focused pane as a centred float over the layout whatever
+    /// `[zoom] mode` says, or release a zoom of either mode.
+    PaneToggleZoomFloat,
     /// Show/hide the active tab's popup terminal, drawn over the layout. One
     /// popup per tab, shared by every attached client; the pane is spawned
     /// lazily on the tab's first toggle and its shell keeps running while
@@ -1592,6 +1622,8 @@ impl RemuxCommand {
             | RemuxCommand::PaneUnstackDown
             | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
+            | RemuxCommand::PaneToggleZoomFullscreen
+            | RemuxCommand::PaneToggleZoomFloat
             | RemuxCommand::PopupToggle(_)
             | RemuxCommand::ResizeLeft(_)
             | RemuxCommand::ResizeRight(_)
@@ -1887,6 +1919,8 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
+            ActionSpec::server("PaneToggleZoomFullscreen"),
+            ActionSpec::server("PaneToggleZoomFloat"),
             ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom] [size]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
             ActionSpec::server("ResizeRight").arg("<amount>", "5"),
@@ -2087,6 +2121,7 @@ mod tests {
             status: Some(info.clone()),
             popup: None,
             live_popups: Vec::new(),
+            float_zoom: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -2842,6 +2877,8 @@ mod tests {
             RemuxCommand::PaneUnstackDown => Some("PaneUnstackDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
+            RemuxCommand::PaneToggleZoomFullscreen => Some("PaneToggleZoomFullscreen"),
+            RemuxCommand::PaneToggleZoomFloat => Some("PaneToggleZoomFloat"),
             RemuxCommand::PopupToggle(_) => Some("PopupToggle"),
             RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
             RemuxCommand::ResizeRight(_) => Some("ResizeRight"),
@@ -2995,6 +3032,29 @@ mod tests {
     }
 
     #[test]
+    fn zoom_commands_round_trip_and_are_registered_actions() {
+        for (cmd, name) in [
+            (RemuxCommand::PaneToggleZoom, "PaneToggleZoom"),
+            (
+                RemuxCommand::PaneToggleZoomFullscreen,
+                "PaneToggleZoomFullscreen",
+            ),
+            (RemuxCommand::PaneToggleZoomFloat, "PaneToggleZoomFloat"),
+        ] {
+            let json = serde_json::to_string(&ClientMessage::Command(cmd.clone())).unwrap();
+            match serde_json::from_str::<ClientMessage>(&json).unwrap() {
+                ClientMessage::Command(back) => assert_eq!(back, cmd, "{json}"),
+                other => panic!("unexpected variant: {other:?}"),
+            }
+            assert_eq!(registry_name(&cmd), Some(name));
+            assert!(
+                action_specs().iter().any(|spec| spec.name == name),
+                "{name} is in the action list"
+            );
+        }
+    }
+
+    #[test]
     fn popup_mouse_flag_round_trips() {
         let click = ClientMessage::MouseClick {
             x: 3,
@@ -3063,6 +3123,7 @@ mod tests {
             status: None,
             popup: Some(Box::new(layer.clone())),
             live_popups: vec![7],
+            float_zoom: false,
         };
         let json = serde_json::to_string(&full).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
@@ -3083,6 +3144,7 @@ mod tests {
             status: None,
             popup: Some(Box::new(layer.clone())),
             live_popups: vec![7],
+            float_zoom: false,
         };
         let json = serde_json::to_string(&diff).unwrap();
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {

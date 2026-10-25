@@ -318,7 +318,7 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
         leaf_chain("layout next", &["LayoutNext", "EnterNormal"]),
     );
     root.insert(
-        'f',
+        'z',
         leaf_chain("zoom pane", &["PaneToggleZoom", "EnterNormal"]),
     );
 
@@ -1098,6 +1098,8 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
+        "PaneToggleZoomFullscreen" => Some(RemuxCommand::PaneToggleZoomFullscreen),
+        "PaneToggleZoomFloat" => Some(RemuxCommand::PaneToggleZoomFloat),
         "PopupToggle" => crate::config::PopupPlacement::from_args(args)
             .ok()
             .map(RemuxCommand::PopupToggle),
@@ -1988,7 +1990,8 @@ mod tests {
         assert!(tree.root.contains_key(&'p'));
         assert!(tree.root.contains_key(&'s')); // Search group
         assert!(tree.root.contains_key(&'x')); // Session group (moved from 's')
-        assert!(tree.root.contains_key(&'f')); // Zoom pane toggle
+        assert!(tree.root.contains_key(&'z')); // Zoom pane toggle
+        assert!(!tree.root.contains_key(&'f')); // moved to 'z'
         assert!(tree.root.contains_key(&'v'));
         assert!(tree.root.contains_key(&'g'));
         // 'b' was the Buffer group, removed in the search-mode refactor and
@@ -2073,8 +2076,8 @@ mod tests {
     #[test]
     fn lookup_missing() {
         let tree = KeybindingTree::default();
-        assert!(tree.lookup(&['z']).is_none());
-        assert!(tree.lookup(&['t', 'z']).is_none());
+        assert!(tree.lookup(&['q']).is_none());
+        assert!(tree.lookup(&['t', 'q']).is_none());
     }
 
     #[test]
@@ -2739,7 +2742,7 @@ mod tests {
         let mut bindings = ShortcutBindings::default();
         bindings
             .bindings
-            .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['z']));
+            .insert(alt_key('z'), InterceptAction::GroupPrefix(vec!['q']));
         let tree = KeybindingTree::default();
         assert!(!bindings.validate_group_refs(&tree));
     }
@@ -2785,6 +2788,11 @@ mod tests {
         assert_eq!(humanize_command("PaneFocusLeft"), "focus left");
         assert_eq!(humanize_command("PaneMoveLeft"), "move left");
         assert_eq!(humanize_command("PaneToggleZoom"), "toggle zoom");
+        assert_eq!(humanize_command("PaneToggleZoomFloat"), "toggle zoom float");
+        assert_eq!(
+            humanize_command("PaneToggleZoomFullscreen"),
+            "toggle zoom fullscreen"
+        );
         assert_eq!(humanize_command("TabNext"), "next tab");
         assert_eq!(humanize_command("TabNew"), "new tab");
         assert_eq!(humanize_command("TabGoto 0"), "tab 1");

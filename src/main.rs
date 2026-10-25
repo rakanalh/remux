@@ -2973,7 +2973,9 @@ async fn send_to_focused_cell(
 ///   re-subscribe the view's cells to the content rect that moved
 ///   (`handle_chrome_resize` cannot: it repaints with `chrome.paint`).
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
-/// - `PaneToggleZoom` -> `ViewToggleZoom`.
+/// - `PaneToggleZoom`, `PaneToggleZoomFullscreen` and `PaneToggleZoomFloat` ->
+///   `ViewToggleZoom`. A view has one zoom, the focused cell filling the view,
+///   so a float request falls back to it.
 /// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
@@ -3240,7 +3242,9 @@ async fn handle_view_command(
             repaint!();
             Ok(true)
         }
-        RemuxCommand::PaneToggleZoom => {
+        RemuxCommand::PaneToggleZoom
+        | RemuxCommand::PaneToggleZoomFullscreen
+        | RemuxCommand::PaneToggleZoomFloat => {
             hide_whichkey!();
             if !views[av].cells.is_empty() {
                 mgr.send(
@@ -3446,6 +3450,8 @@ async fn run_client_loop(
     // client places the popup itself; the server only sizes its PTY to what is
     // announced with `PopupSize`.
     let mut popup = PopupState::from_config(config);
+    // Whether the last frame the foreground session sent holds a float zoom.
+    let mut float_zoom = false;
     // Border style used to frame a VIEW's cells. This is client-local, and has
     // to be: `Session::border_style` is PER-SESSION server state, while a view's
     // cells alias panes across several sessions and machines at once, so there
@@ -6201,7 +6207,7 @@ async fn run_client_loop(
                         let popup_dismiss = active_view.is_none()
                             && dismisses_popup(
                                 &mut popup,
-                                renderer.popup_box().is_some(),
+                                renderer.popup_box().is_some() || float_zoom,
                                 popup_pointer,
                                 &mouse,
                             );
@@ -7114,7 +7120,8 @@ async fn run_client_loop(
                     continue;
                 }
                 match msg {
-                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups }) => {
+                    Some(ServerMessage::FullRender { cells, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups, float_zoom: frame_float_zoom }) => {
+                        float_zoom = frame_float_zoom;
                         log::debug!("srv: FullRender rows={} cols={} cursor=({},{}) visible={} viewport_top={} scroll_offset={}",
                             cells.len(), if cells.is_empty() { 0 } else { cells[0].len() }, cursor_x, cursor_y, cursor_visible, so, srv_so);
                         // The popup layer first, so the frame below skips the
@@ -7174,7 +7181,8 @@ async fn run_client_loop(
                             renderer.flush()?;
                         }
                     }
-                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups }) => {
+                    Some(ServerMessage::RenderDiff { changes, cursor_x, cursor_y, cursor_visible, cursor_style, focused_pane_rect: fpr, application_cursor_keys: ack, bracketed_paste: bp, viewport_top: so, scroll_offset: srv_so, status, popup: popup_layer, live_popups, float_zoom: frame_float_zoom }) => {
+                        float_zoom = frame_float_zoom;
                         log::debug!("srv: RenderDiff changes={} cursor=({},{}) viewport_top={} scroll_offset={}", changes.len(), cursor_x, cursor_y, so, srv_so);
                         // See the FullRender arm: the popup layer goes first.
                         let frame_session = frame_attached(&current_attached, status.as_ref());
