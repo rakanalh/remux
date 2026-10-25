@@ -55,6 +55,7 @@ use super::{
     blank_grid, draw_text, draw_text_with, shorten_path, tilde_path, PluginAction, PluginEvent,
     PluginRequest, SidebarPlugin,
 };
+use crate::client::context_menu::{MenuAction, MenuItem};
 use crate::client::registry::ConnId;
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, DirEntry, RenderCell};
@@ -573,6 +574,39 @@ impl SidebarPlugin for FilesPlugin {
             nav::HitOutcome::Moved => PluginAction::Redraw,
             nav::HitOutcome::Activate => self.activate(),
         }
+    }
+
+    fn context_menu(&mut self, _x: u16, y: u16) -> Vec<MenuItem> {
+        let Some(entry) = self
+            .nav
+            .pick(y, self.rows.len())
+            .and_then(|i| self.rows.get(i))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let Some(path) = self.child_path(&entry.name) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if !entry.is_dir {
+            if let Some(conn) = self.conn.clone() {
+                items.push(
+                    MenuItem::new(
+                        "Open in split",
+                        MenuAction::Request(PluginRequest::OpenInSplit {
+                            conn,
+                            path: path.clone(),
+                            command: self.editor.clone(),
+                            vertical: true,
+                        }),
+                    )
+                    .hint(Some("Enter".into())),
+                );
+            }
+        }
+        items.push(MenuItem::new("Copy path", MenuAction::CopyText(path)));
+        items
     }
 
     fn on_event(&mut self, ev: &PluginEvent) {
@@ -1374,6 +1408,37 @@ mod tests {
             PluginAction::None,
             "the notice is not a row, however many rows exist below the fold"
         );
+    }
+
+    #[test]
+    fn a_file_row_offers_open_in_split_and_copy_path() {
+        let mut p = at("/w", vec![entry("a", false), entry("b", false)]);
+        let _ = painted(&p, 24, 5);
+        let items = p.context_menu(0, 3);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Open in split", "Copy path"]);
+        assert_eq!(
+            items[0].action,
+            MenuAction::Request(PluginRequest::OpenInSplit {
+                conn: ConnId::Local,
+                path: "/w/b".to_string(),
+                command: None,
+                vertical: true,
+            })
+        );
+        assert_eq!(items[1].action, MenuAction::CopyText("/w/b".to_string()));
+        assert_eq!(p.nav.selected(), 1);
+        assert!(p.take_requests().is_empty(), "choosing is the menu's job");
+    }
+
+    #[test]
+    fn a_directory_row_offers_only_copy_path() {
+        let mut p = at("/w", vec![entry("sub", true)]);
+        let _ = painted(&p, 24, 5);
+        let items = p.context_menu(0, 2);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Copy path"]);
+        assert_eq!(items[0].action, MenuAction::CopyText("/w/sub".to_string()));
     }
 
     #[test]

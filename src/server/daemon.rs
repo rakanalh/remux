@@ -953,6 +953,11 @@ struct ClientConnection {
     /// frames itself, as a framed float, and sizes the popup PTY so that
     /// float's interior fits.
     popup_want: Option<(u16, u16)>,
+    /// The pane that got this client's last forwarded right press, until the
+    /// release is sent. The release goes to that pane alone, wherever the
+    /// pointer is by then: a release the application never saw a press for,
+    /// or a press with no release, would leave its button state wrong.
+    right_press: Option<PaneId>,
 }
 
 impl ClientConnection {
@@ -1331,6 +1336,7 @@ impl RemuxServer {
                     naming: None,
                     tab_style: None,
                     popup_want: None,
+                    right_press: None,
                 },
             );
             log::debug!("server: new client connection, assigned client_id={id}");
@@ -1934,6 +1940,26 @@ async fn handle_client_message(
                 .await
             }
         },
+        ClientMessage::RightClick {
+            x,
+            y,
+            release,
+            popup,
+        } => {
+            handle_right_click(
+                client_id,
+                x,
+                y,
+                release,
+                popup,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+            )
+            .await
+        }
         ClientMessage::MouseDrag {
             start_x,
             start_y,
@@ -2901,6 +2927,40 @@ async fn handle_resize(
     Ok(())
 }
 
+/// Bring the panes and every attached client in line after a command moved the
+/// focus or the active tab, as `TabGoto` does: the layout sizes of the newly
+/// shown tab, fresh baselines and a frame. Run before the command the focus move
+/// was for, so the move is painted even when that command turns out to do
+/// nothing.
+async fn settle_focus_change(
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    mark_focus_changed();
+    resize_session_panes(session_name, state, panes, clients, config).await?;
+    invalidate_session_baselines(session_name, clients, prev_frames).await;
+    broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+    Ok(())
+}
+
+/// The index of tab `tab_id` in `session`, `None` when either is gone.
+async fn tab_index_by_id(
+    state: &Arc<Mutex<ServerState>>,
+    session: &str,
+    tab_id: u64,
+) -> Option<usize> {
+    let st = state.lock().await;
+    st.sessions
+        .get(session)?
+        .tabs
+        .iter()
+        .position(|t| t.id == tab_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     client_id: u64,
@@ -2942,6 +3002,8 @@ async fn handle_command(
                     | RemuxCommand::PaneCloseById { .. }
                     | RemuxCommand::PaneRenameById { .. }
                     | RemuxCommand::TabMoveByIndex { .. }
+                    | RemuxCommand::TabCloseById { .. }
+                    | RemuxCommand::TabRenameById { .. }
             ) {
                 String::new()
             } else {
@@ -2951,6 +3013,130 @@ async fn handle_command(
     };
 
     log::debug!("server: client_id={client_id} command={cmd:?} session={session_name:?}");
+
+    // -- Commands aimed at a named pane or tab -------------------------------
+    //
+    // The context menu names what was clicked, and the menu can stay open while
+    // the layout changes under it. Each of these resolves its target now, and
+    // does nothing when the target is gone, so the inner command can never fall
+    // on whatever happens to be focused instead.
+    let cmd = match cmd {
+        RemuxCommand::OnPane { pane_id, command } => {
+            let landed = {
+                let mut st = state.lock().await;
+                let index = st.sessions.get(&session_name).and_then(|sess| {
+                    sess.tabs
+                        .iter()
+                        .position(|t| t.pane_order.contains(&pane_id))
+                });
+                match index {
+                    None => None,
+                    Some(index) => {
+                        let tab_changed = st.sessions[&session_name].active_tab != index;
+                        let _ = st.goto_tab(&session_name, index);
+                        let tab =
+                            &mut st.sessions.get_mut(&session_name).expect("session").tabs[index];
+                        // A visible popup owns input, and hiding it returns
+                        // input to `focused_pane`, so moving that here would send
+                        // the user elsewhere when the popup closes. As
+                        // `SessionSwitchPane` does, the tab is entered and the
+                        // focus stays; the layout commands are then refused by
+                        // the popup guard, and a command for another pane is
+                        // dropped.
+                        let popup_up = tab.popup_visible;
+                        let mut moved = tab_changed;
+                        if !popup_up && tab.focused_pane != pane_id {
+                            // A float zoom snaps back and the command then acts,
+                            // as a click outside the box does.
+                            tab.release_float_zoom();
+                            tab.focus_pane(pane_id);
+                            moved = true;
+                        }
+                        Some((moved, popup_up && tab.focused_pane != pane_id))
+                    }
+                }
+            };
+            let Some((moved, foreign_under_popup)) = landed else {
+                log::debug!("server: OnPane pane_id={pane_id} is gone, {command:?} dropped");
+                return Ok(());
+            };
+            if moved {
+                settle_focus_change(&session_name, state, panes, clients, config, prev_frames)
+                    .await?;
+            }
+            if foreign_under_popup {
+                log::debug!(
+                    "server: OnPane pane_id={pane_id} is under the popup, {command:?} dropped"
+                );
+                return Ok(());
+            }
+            return Box::pin(handle_command(
+                client_id,
+                *command,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            ))
+            .await;
+        }
+        RemuxCommand::OnTab { tab_id, command } => {
+            let landed = {
+                let mut st = state.lock().await;
+                let index = st
+                    .sessions
+                    .get(&session_name)
+                    .and_then(|sess| sess.tabs.iter().position(|t| t.id == tab_id));
+                index.map(|index| {
+                    let tab_changed = st.sessions[&session_name].active_tab != index;
+                    let _ = st.goto_tab(&session_name, index);
+                    tab_changed
+                })
+            };
+            let Some(moved) = landed else {
+                log::debug!("server: OnTab tab_id={tab_id} is gone, {command:?} dropped");
+                return Ok(());
+            };
+            if moved {
+                settle_focus_change(&session_name, state, panes, clients, config, prev_frames)
+                    .await?;
+            }
+            return Box::pin(handle_command(
+                client_id,
+                *command,
+                state,
+                panes,
+                clients,
+                config,
+                prev_frames,
+                dormant,
+            ))
+            .await;
+        }
+        RemuxCommand::TabCloseById { session, tab_id } => {
+            let Some(tab_index) = tab_index_by_id(state, &session, tab_id).await else {
+                return Ok(());
+            };
+            RemuxCommand::TabCloseByIndex { session, tab_index }
+        }
+        RemuxCommand::TabRenameById {
+            session,
+            tab_id,
+            name,
+        } => {
+            let Some(tab_index) = tab_index_by_id(state, &session, tab_id).await else {
+                return Ok(());
+            };
+            RemuxCommand::TabRenameByIndex {
+                session,
+                tab_index,
+                name,
+            }
+        }
+        other => other,
+    };
 
     // -- Popup command guard -----------------------------------------------
     //
@@ -4246,6 +4432,52 @@ async fn handle_command(
             )
             .await?;
         }
+        RemuxCommand::TabMoveBy(delta) => {
+            // `TabMove` takes the destination as a 1-based position and clamps
+            // it, so the move is that of the active tab by `delta`.
+            let destination = {
+                let st = state.lock().await;
+                st.sessions.get(&session_name).map(|sess| {
+                    let last = sess.tabs.len().saturating_sub(1) as i64;
+                    ((sess.active_tab as i64 + i64::from(delta)).clamp(0, last) + 1) as usize
+                })
+            };
+            if let Some(destination) = destination {
+                return Box::pin(handle_command(
+                    client_id,
+                    RemuxCommand::TabMove(destination),
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                ))
+                .await;
+            }
+        }
+        RemuxCommand::PaneEnsureZoom => {
+            let already = {
+                let st = state.lock().await;
+                st.sessions
+                    .get(&session_name)
+                    .and_then(|s| s.tabs.get(s.active_tab))
+                    .is_none_or(|t| t.zoomed_pane.is_some())
+            };
+            if !already {
+                return Box::pin(handle_command(
+                    client_id,
+                    RemuxCommand::PaneToggleZoom,
+                    state,
+                    panes,
+                    clients,
+                    config,
+                    prev_frames,
+                    dormant,
+                ))
+                .await;
+            }
+        }
         RemuxCommand::TabMove(idx) => {
             let mut st = state.lock().await;
             if let Some(sess) = st.sessions.get_mut(&session_name) {
@@ -5470,6 +5702,23 @@ enum ButtonPhase {
     Release,
 }
 
+/// A mouse button a tracking application can be sent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Button {
+    Left,
+    Right,
+}
+
+impl Button {
+    /// The button number of a press in the mouse protocol.
+    fn code(self) -> u16 {
+        match self {
+            Button::Left => 0,
+            Button::Right => 2,
+        }
+    }
+}
+
 /// Build a left-button mouse-report byte sequence, the [`wheel_report`] sibling
 /// for press/motion/release. `col`/`row` are pane-relative 1-based coordinates.
 ///
@@ -5478,11 +5727,16 @@ enum ButtonPhase {
 /// lowercase form and reports a release as button 3 ("no button"). Motion adds
 /// the +32 motion bit in both encodings.
 fn button_report(sgr: bool, phase: ButtonPhase, col: u16, row: u16) -> Vec<u8> {
-    // Left button = 0; motion sets bit 5; X10 spells a release as button 3.
+    report_for(Button::Left, sgr, phase, col, row)
+}
+
+/// [`button_report`] for any [`Button`].
+fn report_for(button: Button, sgr: bool, phase: ButtonPhase, col: u16, row: u16) -> Vec<u8> {
+    // Motion sets bit 5; X10 spells a release as button 3.
     let btn: u16 = match phase {
-        ButtonPhase::Press => 0,
-        ButtonPhase::Motion => 32,
-        ButtonPhase::Release if sgr => 0,
+        ButtonPhase::Press => button.code(),
+        ButtonPhase::Motion => button.code() + 32,
+        ButtonPhase::Release if sgr => button.code(),
         ButtonPhase::Release => 3,
     };
     if sgr {
@@ -5498,6 +5752,52 @@ fn button_report(sgr: bool, phase: ButtonPhase, col: u16, row: u16) -> Vec<u8> {
         let r = (32u32 + row as u32).min(255) as u8;
         vec![0x1b, b'[', b'M', b, c, r]
     }
+}
+
+/// What a right-button press does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RightPress {
+    /// The pane's application gets the button-2 report.
+    Forward,
+    /// The client opens a context menu.
+    Menu,
+    Nothing,
+}
+
+/// Whether `(x, y)` is on the border drawn inside `rect`: in the rect but
+/// outside the content, which sits `inset` cells in from each side.
+fn on_pane_border(rect: Rect, inset: u16, x: u16, y: u16) -> bool {
+    if inset == 0 {
+        return false;
+    }
+    let inside_content = x >= rect.x + inset
+        && x < rect.x + rect.width.saturating_sub(inset)
+        && y >= rect.y + inset
+        && y < rect.y + rect.height.saturating_sub(inset);
+    !inside_content
+}
+
+/// The decision for a right-button press on a pane.
+///
+/// The border always opens the menu, because an application that tracks the
+/// mouse cannot see the border and so cannot claim a press on it. The popup's
+/// interior belongs to the popup's application alone, so the menu never opens
+/// there.
+fn right_press_outcome(route: MouseRoute, on_border: bool, in_popup: bool) -> RightPress {
+    match (route, on_border, in_popup) {
+        (MouseRoute::App { .. }, _, true) => RightPress::Forward,
+        (_, _, true) => RightPress::Nothing,
+        (_, true, false) => RightPress::Menu,
+        (MouseRoute::App { .. }, false, false) => RightPress::Forward,
+        _ => RightPress::Menu,
+    }
+}
+
+/// Whether a right-button release goes to the pane's application. A press that
+/// opened the menu has no matching press at the application, so its release
+/// must not reach it.
+fn right_release_outcome(route: MouseRoute, on_border: bool) -> bool {
+    matches!(route, MouseRoute::App { .. }) && !on_border
 }
 
 /// Which kind of mouse event is being routed. The two differ only in their
@@ -5649,12 +5949,27 @@ async fn forward_button(
     col: u16,
     row: u16,
 ) -> Result<()> {
+    forward_button_as(panes, pane_id, Button::Left, sgr, motion, phase, col, row).await
+}
+
+/// [`forward_button`] for any [`Button`].
+#[allow(clippy::too_many_arguments)]
+async fn forward_button_as(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    pane_id: PaneId,
+    button: Button,
+    sgr: bool,
+    motion: bool,
+    phase: ButtonPhase,
+    col: u16,
+    row: u16,
+) -> Result<()> {
     if phase == ButtonPhase::Motion && !motion {
         return Ok(());
     }
-    let bytes = button_report(sgr, phase, col, row);
+    let bytes = report_for(button, sgr, phase, col, row);
     log::debug!(
-        "server: mouse->app pane_id={pane_id} phase={phase:?} sgr={sgr} col={col} row={row}"
+        "server: mouse->app pane_id={pane_id} button={button:?} phase={phase:?} sgr={sgr} col={col} row={row}"
     );
     write_to_pane(panes, pane_id, &bytes).await
 }
@@ -6371,6 +6686,67 @@ async fn handle_mouse_click(
     config: &Arc<Config>,
     prev_frames: &PrevFrameCache,
 ) -> Result<()> {
+    handle_mouse_button(
+        Button::Left,
+        client_id,
+        x,
+        y,
+        release,
+        popup_local,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+    )
+    .await
+}
+
+/// A right-button press or release: routed to the pane's application, or
+/// answered with a [`ServerMessage::ContextMenu`]. See [`right_press_outcome`].
+#[allow(clippy::too_many_arguments)]
+async fn handle_right_click(
+    client_id: u64,
+    x: u16,
+    y: u16,
+    release: bool,
+    popup_local: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    handle_mouse_button(
+        Button::Right,
+        client_id,
+        x,
+        y,
+        release,
+        popup_local,
+        state,
+        panes,
+        clients,
+        config,
+        prev_frames,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mouse_button(
+    button: Button,
+    client_id: u64,
+    x: u16,
+    y: u16,
+    release: bool,
+    popup_local: bool,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
     let (session_name, cols, rows, mode, naming, theme, asking) = {
         let mut cls = clients.lock().await;
         let client = match cls.get_mut(&client_id) {
@@ -6382,7 +6758,7 @@ async fn handle_mouse_click(
         // a new selection in the same or a different pane). A RELEASE never
         // clears: with `mouse_auto_yank = false` the drag that just ended left a
         // highlight up on purpose, and wiping it here would undo that.
-        if !release {
+        if !release && button == Button::Left {
             client.mouse_selection = None;
             client.drag = None;
         }
@@ -6447,6 +6823,31 @@ async fn handle_mouse_click(
     log::debug!(
         "server: MouseClick client_id={client_id} x={x} y={y} release={release} target={target:?}"
     );
+
+    if button == Button::Right {
+        // Copy mode, a pending key chord, a prompt and the session manager each
+        // own the mouse or the keyboard, and a menu opened over them could not
+        // be answered. The press is dropped, focus included.
+        if mode != "NORMAL" {
+            return Ok(());
+        }
+        return right_click_target(
+            client_id,
+            target,
+            &popup,
+            hit_regions.float.map(|(id, _)| id),
+            &pane_rects,
+            (x, y),
+            release,
+            &session_name,
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+        )
+        .await;
+    }
 
     // A press that is not the popup's own dismisses it, then lands as if the
     // popup had never been there. The client keeps the popup's interior and
@@ -6580,6 +6981,231 @@ async fn handle_mouse_click(
     }
 
     Ok(())
+}
+
+/// The right-button half of [`handle_mouse_button`]: `target` is what the
+/// press hit, and `at` is where, in the screen coordinates the client sent.
+///
+/// A press that opens the menu first moves focus to the pane or tab it hit, as a
+/// left press does, and the menu's commands name that pane or tab, so a layout
+/// change while the menu is open cannot redirect them. While the popup is up it
+/// owns input and the layout commands are refused, so a press on a pane outside
+/// it does nothing, as does a press outside a float zoom; a tab label still
+/// answers. A press that does nothing leaves the mouse selection alone.
+///
+/// A forwarded press is remembered, and its release goes to that pane alone.
+#[allow(clippy::too_many_arguments)]
+async fn right_click_target(
+    client_id: u64,
+    target: ClickTarget,
+    popup: &MousePopup,
+    float_pane: Option<PaneId>,
+    pane_rects: &[(PaneId, Rect)],
+    at: (u16, u16),
+    release: bool,
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) -> Result<()> {
+    let (x, y) = at;
+    if release {
+        let pressed = clients
+            .lock()
+            .await
+            .get_mut(&client_id)
+            .and_then(|c| c.right_press.take());
+        let Some(pane_id) = pressed else {
+            return Ok(());
+        };
+        let (Some(route), Some((rect, inset))) = (
+            route_of_pane(panes, pane_id, MouseGesture::Button, false).await,
+            rect_of_pane(pane_rects, popup, config, pane_id),
+        ) else {
+            return Ok(());
+        };
+        if let MouseRoute::App { sgr, motion } = route {
+            let (col, row) = report_coords(rect, inset, x, y);
+            forward_button_as(
+                panes,
+                pane_id,
+                Button::Right,
+                sgr,
+                motion,
+                ButtonPhase::Release,
+                col,
+                row,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    // A fresh press starts a new gesture.
+    if let Some(c) = clients.lock().await.get_mut(&client_id) {
+        c.right_press = None;
+    }
+    let menu_for = |pane_id: PaneId| {
+        open_pane_menu(
+            client_id,
+            pane_id,
+            at,
+            session_name,
+            state,
+            panes,
+            clients,
+            config,
+            prev_frames,
+        )
+    };
+    match target {
+        ClickTarget::Pane(pane_id) => {
+            // A float zoom fills `popup.pane` too, but it is a pane of the
+            // layout: its frame opens the menu and its interior routes like any
+            // pane's.
+            let in_popup = popup.pane == Some(pane_id) && float_pane != Some(pane_id);
+            if popup.pane.is_some() && popup.pane != Some(pane_id) {
+                return Ok(());
+            }
+            let (Some(route), Some((rect, inset))) = (
+                route_of_pane(panes, pane_id, MouseGesture::Button, false).await,
+                rect_of_pane(pane_rects, popup, config, pane_id),
+            ) else {
+                return Ok(());
+            };
+            let on_border = !in_popup && on_pane_border(rect, inset, x, y);
+            match right_press_outcome(route, on_border, in_popup) {
+                RightPress::Forward => {
+                    let MouseRoute::App { sgr, motion } = route else {
+                        return Ok(());
+                    };
+                    clear_mouse_gesture(clients, client_id).await;
+                    let (col, row) = report_coords(rect, inset, x, y);
+                    if let Some(c) = clients.lock().await.get_mut(&client_id) {
+                        c.right_press = Some(pane_id);
+                    }
+                    forward_button_as(
+                        panes,
+                        pane_id,
+                        Button::Right,
+                        sgr,
+                        motion,
+                        ButtonPhase::Press,
+                        col,
+                        row,
+                    )
+                    .await?;
+                }
+                RightPress::Menu => {
+                    clear_mouse_gesture(clients, client_id).await;
+                    menu_for(pane_id).await;
+                }
+                RightPress::Nothing => {}
+            }
+        }
+        ClickTarget::StackLabel(pane_id) if popup.pane.is_none() => {
+            clear_mouse_gesture(clients, client_id).await;
+            menu_for(pane_id).await;
+        }
+        ClickTarget::Tab(index) => {
+            let opened = {
+                let mut st = state.lock().await;
+                match st.goto_tab(session_name, index) {
+                    Ok(()) => st
+                        .sessions
+                        .get(session_name)
+                        .and_then(|s| s.tabs.get(index).map(|t| (t.id, s.tabs.len()))),
+                    Err(_) => None,
+                }
+            };
+            let Some((tab_id, count)) = opened else {
+                return Ok(());
+            };
+            clear_mouse_gesture(clients, client_id).await;
+            mark_focus_changed();
+            broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+            repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
+            send_context_menu(
+                clients,
+                client_id,
+                at,
+                ContextTarget::Tab {
+                    tab_id,
+                    index,
+                    count,
+                },
+            )
+            .await;
+        }
+        ClickTarget::StackLabel(_) | ClickTarget::None => {}
+    }
+    Ok(())
+}
+
+/// End the client's selection and drag, as a press that acts does.
+async fn clear_mouse_gesture(clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>, client_id: u64) {
+    if let Some(c) = clients.lock().await.get_mut(&client_id) {
+        c.mouse_selection = None;
+        c.drag = None;
+    }
+}
+
+/// Focus `pane_id` as a left press would, then ask the client to open the pane
+/// menu.
+#[allow(clippy::too_many_arguments)]
+async fn open_pane_menu(
+    client_id: u64,
+    pane_id: PaneId,
+    at: (u16, u16),
+    session_name: &str,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    prev_frames: &PrevFrameCache,
+) {
+    let (refocused, facts) = {
+        let mut st = state.lock().await;
+        let Some(tab) = st
+            .sessions
+            .get_mut(session_name)
+            .and_then(|s| s.tabs.get_mut(s.active_tab))
+        else {
+            return;
+        };
+        let refocused = tab.focused_pane != pane_id;
+        if refocused {
+            tab.focus_pane(pane_id);
+        }
+        (
+            refocused,
+            ContextTarget::Pane {
+                pane_id,
+                zoomed: tab.zoomed_pane.is_some(),
+                zoom_mode: config.zoom.mode,
+                monocle: matches!(tab.layout_mode, LayoutMode::Monocle(_)),
+            },
+        )
+    };
+    if refocused {
+        mark_focus_changed();
+        broadcast_full_render(session_name, state, panes, clients, config, prev_frames).await;
+        repaint_scrolled_requester(client_id, state, panes, clients, config, prev_frames).await;
+    }
+    send_context_menu(clients, client_id, at, facts).await;
+}
+
+async fn send_context_menu(
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    client_id: u64,
+    (x, y): (u16, u16),
+    target: ContextTarget,
+) {
+    let cls = clients.lock().await;
+    if let Some(client) = cls.get(&client_id) {
+        let _ = client.tx.send(ServerMessage::ContextMenu { x, y, target });
+    }
 }
 
 /// Whether a focus change just carried the zoom from `before` onto another pane.
@@ -11238,14 +11864,15 @@ async fn handle_resurrect_session(
 mod tests {
     use super::{
         arrow_report, button_report, compute_diff, group_member_name, merge_dormant_into,
-        mouse_route, next_layout_mode, saved_custom_is_restorable, take_dormant_session,
-        wheel_report, ButtonPhase, MouseGesture, MouseRoute, PaneNames, PanePlacement,
+        mouse_route, next_layout_mode, on_pane_border, report_for, right_press_outcome,
+        right_release_outcome, saved_custom_is_restorable, take_dormant_session, wheel_report,
+        Button, ButtonPhase, MouseGesture, MouseRoute, PaneNames, PanePlacement, RightPress,
     };
     use crate::protocol::RenderCell;
     use crate::screen::Screen;
     use crate::server::layout::{
         BspLayout, ColumnsLayout, CustomLayout, EnabledLayouts, GridLayout, LayoutMode, LayoutNode,
-        MasterLayout, MonocleLayout, RowsLayout,
+        MasterLayout, MonocleLayout, Rect, RowsLayout,
     };
     use crate::server::persistence::PersistedState;
     use crate::server::session::ServerState;
@@ -11755,6 +12382,80 @@ mod tests {
             button_report(false, ButtonPhase::Press, 300, 400),
             vec![0x1b, b'[', b'M', 32, 255, 255]
         );
+    }
+
+    #[test]
+    fn right_button_reports_use_button_two() {
+        assert_eq!(
+            report_for(Button::Right, true, ButtonPhase::Press, 10, 5),
+            b"\x1b[<2;10;5M".to_vec()
+        );
+        assert_eq!(
+            report_for(Button::Right, true, ButtonPhase::Release, 10, 5),
+            b"\x1b[<2;10;5m".to_vec()
+        );
+        assert_eq!(
+            report_for(Button::Right, false, ButtonPhase::Press, 5, 10),
+            vec![0x1b, b'[', b'M', 32 + 2, 32 + 5, 32 + 10]
+        );
+        // X10 still spells every release as button 3.
+        assert_eq!(
+            report_for(Button::Right, false, ButtonPhase::Release, 5, 10),
+            vec![0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 10]
+        );
+    }
+
+    #[test]
+    fn border_is_inside_the_rect_and_outside_the_inset_content() {
+        let r = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+        assert!(on_pane_border(r, 1, 10, 7), "left edge");
+        assert!(on_pane_border(r, 1, 29, 7), "right edge");
+        assert!(on_pane_border(r, 1, 15, 5), "top edge");
+        assert!(on_pane_border(r, 1, 15, 12), "bottom edge");
+        assert!(!on_pane_border(r, 1, 11, 6), "first content cell");
+        assert!(!on_pane_border(r, 1, 28, 11), "last content cell");
+        assert!(!on_pane_border(r, 0, 10, 5), "no inset means no border");
+    }
+
+    #[test]
+    fn right_press_goes_to_a_tracking_app_but_opens_the_menu_on_the_border() {
+        let app = MouseRoute::App {
+            sgr: true,
+            motion: false,
+        };
+        let shell = MouseRoute::Remux { scrollback: true };
+        assert_eq!(right_press_outcome(app, false, false), RightPress::Forward);
+        assert_eq!(right_press_outcome(app, true, false), RightPress::Menu);
+        assert_eq!(right_press_outcome(shell, false, false), RightPress::Menu);
+        assert_eq!(right_press_outcome(shell, true, false), RightPress::Menu);
+    }
+
+    #[test]
+    fn right_press_in_the_popup_never_opens_the_menu() {
+        let app = MouseRoute::App {
+            sgr: false,
+            motion: true,
+        };
+        let shell = MouseRoute::Remux { scrollback: true };
+        assert_eq!(right_press_outcome(app, false, true), RightPress::Forward);
+        assert_eq!(right_press_outcome(shell, false, true), RightPress::Nothing);
+    }
+
+    #[test]
+    fn right_release_is_forwarded_only_to_a_tracking_app_off_the_border() {
+        let app = MouseRoute::App {
+            sgr: true,
+            motion: false,
+        };
+        let shell = MouseRoute::Remux { scrollback: true };
+        assert!(right_release_outcome(app, false));
+        assert!(!right_release_outcome(app, true));
+        assert!(!right_release_outcome(shell, false));
     }
 
     /// The one routing decision every mouse path shares. A plain shell scrolls
@@ -12504,6 +13205,7 @@ mod popup_tests {
             naming: None,
             tab_style: None,
             popup_want: want,
+            right_press: None,
         }
     }
 
@@ -14071,6 +14773,601 @@ mod popup_tests {
             assert_eq!(sizes_of(&rig, &[left, middle, right]).await, before);
             rig.finish().await;
         }
+    }
+
+    async fn right(rig: &Rig, x: u16, y: u16, release: bool, popup: bool) {
+        handle_right_click(
+            CLIENT,
+            x,
+            y,
+            release,
+            popup,
+            &rig.state,
+            &rig.panes,
+            &rig.clients,
+            &rig.config,
+            &rig.prev_frames,
+        )
+        .await
+        .expect("right click");
+    }
+
+    fn menus(msgs: &[ServerMessage]) -> Vec<(u16, u16, crate::protocol::ContextTarget)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ServerMessage::ContextMenu { x, y, target } => Some((*x, *y, target.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Start `cat -v` in `pane`, which prints the escape bytes it is sent, and
+    /// mark the pane as an application that asked for SGR mouse reports.
+    async fn track_mouse(rig: &Rig, pane: PaneId) {
+        write_to_pane(&rig.panes, pane, b"cat -v\n")
+            .await
+            .expect("write");
+        assert!(
+            output_has(rig, pane, &["cat -v"], 5000).await,
+            "shell echoed the command"
+        );
+        let mut ps = rig.panes.lock().await;
+        let s = &mut ps.get_mut(&pane).expect("pane").screen;
+        s.mouse_tracking = true;
+        s.mouse_sgr = true;
+    }
+
+    /// Whether everything `pane`'s shell prints within `wait_ms` contains every
+    /// needle. The Rig runs no forwarding loop, so this reads the PTY's output
+    /// channel itself, which also drains it.
+    async fn output_has(rig: &Rig, pane: PaneId, needles: &[&str], wait_ms: u64) -> bool {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        while std::time::Instant::now() < deadline {
+            {
+                let mut ps = rig.panes.lock().await;
+                while let Ok(bytes) = ps.get_mut(&pane).expect("pane").pty_rx.try_recv() {
+                    seen.push_str(&String::from_utf8_lossy(&bytes.data));
+                }
+            }
+            if needles.iter().all(|n| seen.contains(n)) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_shell_pane_focuses_it_and_asks_for_its_menu() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.drain();
+
+        right(&rig, 5, 10, false, false).await;
+
+        let msgs = rig.drain();
+        assert_eq!(
+            menus(&msgs),
+            vec![(
+                5,
+                10,
+                crate::protocol::ContextTarget::Pane {
+                    pane_id: left,
+                    zoomed: false,
+                    zoom_mode: crate::config::ZoomMode::Fullscreen,
+                    monocle: false,
+                }
+            )]
+        );
+        let focused = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        assert_eq!((focused, focused == middle), (left, false));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_tracking_apps_content_goes_to_the_app_not_the_menu() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, _middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, left).await;
+        rig.drain();
+
+        right(&rig, 5, 10, false, false).await;
+        right(&rig, 5, 10, true, false).await;
+
+        assert!(menus(&rig.drain()).is_empty());
+        assert!(
+            output_has(&rig, left, &["<2;5;10M", "<2;5;10m"], 5000).await,
+            "the press and the release reached the app"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_tracking_panes_border_still_opens_the_menu() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, _middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, left).await;
+        let (_, _, _, rects) = composite_of(&rig).await;
+        let rect = rects.iter().find(|(id, _)| *id == left).unwrap().1;
+        rig.drain();
+
+        right(&rig, rect.x + 3, rect.y, false, false).await;
+        right(&rig, rect.x + 3, rect.y, true, false).await;
+
+        let found = menus(&rig.drain());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(matches!(
+            found[0].2,
+            crate::protocol::ContextTarget::Pane { pane_id, .. } if pane_id == left
+        ));
+        assert!(
+            !output_has(&rig, left, &["<2;"], 1000).await,
+            "nothing reached the app"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_tab_label_selects_the_tab_and_asks_for_its_menu() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.command(RemuxCommand::TabNew).await;
+        let (_, regions, _, _) = composite_of(&rig).await;
+        let first = regions
+            .tab_regions
+            .iter()
+            .find(|r| r.tab_index == 0)
+            .unwrap();
+        let (x, y) = (first.x_start, first.y);
+        rig.drain();
+
+        right(&rig, x, y, false, false).await;
+
+        let first_id = tab_ids(&rig).await[0];
+        assert_eq!(
+            menus(&rig.drain()),
+            vec![(
+                x,
+                y,
+                crate::protocol::ContextTarget::Tab {
+                    tab_id: first_id,
+                    index: 0,
+                    count: 2
+                }
+            )]
+        );
+        assert_eq!(rig.state.lock().await.sessions["main"].active_tab, 0);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_outside_normal_mode_does_nothing() {
+        for mode in ["VISUAL", "COMMAND", "SEARCH"] {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut rig = Rig::new(100, 30, None, dir.path()).await;
+            let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+            rig.clients.lock().await.get_mut(&CLIENT).unwrap().mode = mode.to_string();
+            rig.drain();
+
+            right(&rig, 5, 10, false, false).await;
+
+            assert!(menus(&rig.drain()).is_empty(), "{mode}");
+            let focused = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+            assert_eq!(focused, middle, "{mode}: focus did not move");
+            rig.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_right_click_inside_a_float_zoom_offers_unzoom_and_keeps_the_float() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        let (rect, _) = float_box();
+        rig.drain();
+
+        right(&rig, rect.x + 3, rect.y + 3, false, false).await;
+
+        let found = menus(&rig.drain());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(matches!(
+            found[0].2,
+            crate::protocol::ContextTarget::Pane { pane_id, zoomed: true, .. } if pane_id == middle
+        ));
+        assert_eq!(float_of(&rig).await, Some(middle));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_fullscreen_zoomed_pane_offers_unzoom() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoom).await;
+        rig.drain();
+
+        right(&rig, 40, 10, false, false).await;
+
+        let found = menus(&rig.drain());
+        assert!(
+            matches!(
+                found.as_slice(),
+                [(_, _, crate::protocol::ContextTarget::Pane { pane_id, zoomed: true, .. })]
+                    if *pane_id == middle
+            ),
+            "{found:?}"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_on_a_float_zooms_frame_opens_the_menu_even_for_a_tracking_app() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, middle).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        let (rect, _) = float_box();
+        rig.drain();
+
+        right(&rig, rect.x + 4, rect.y, false, false).await;
+
+        assert_eq!(menus(&rig.drain()).len(), 1);
+        rig.finish().await;
+    }
+
+    fn on_pane(pane_id: PaneId, command: RemuxCommand) -> RemuxCommand {
+        RemuxCommand::OnPane {
+            pane_id,
+            command: Box::new(command),
+        }
+    }
+
+    fn on_tab(tab_id: u64, command: RemuxCommand) -> RemuxCommand {
+        RemuxCommand::OnTab {
+            tab_id,
+            command: Box::new(command),
+        }
+    }
+
+    async fn pane_ids(rig: &Rig) -> Vec<PaneId> {
+        rig.state.lock().await.sessions["main"].tabs[0]
+            .pane_order
+            .clone()
+    }
+
+    async fn tab_ids(rig: &Rig) -> Vec<u64> {
+        rig.state.lock().await.sessions["main"]
+            .tabs
+            .iter()
+            .map(|t| t.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn on_pane_acts_on_the_named_pane_and_not_on_the_focused_one() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+
+        rig.command(on_pane(left, RemuxCommand::PaneClose)).await;
+
+        let left_alive = pane_ids(&rig).await.contains(&left);
+        assert!(!left_alive, "the named pane closed");
+        assert!(pane_ids(&rig).await.contains(&middle));
+        assert!(pane_ids(&rig).await.contains(&right));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_pane_does_nothing_when_the_pane_is_gone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+        rig.command(on_pane(left, RemuxCommand::PaneClose)).await;
+
+        rig.command(on_pane(left, RemuxCommand::PaneClose)).await;
+
+        let mut alive = pane_ids(&rig).await;
+        alive.sort_unstable();
+        assert_eq!(alive, vec![middle, right], "no other pane was closed");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_pane_splits_and_zooms_the_named_pane() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, _right) = three_panes(&rig, dir.path()).await;
+
+        rig.command(on_pane(left, RemuxCommand::PaneToggleZoom))
+            .await;
+
+        let st = rig.state.lock().await;
+        assert_eq!(st.sessions["main"].tabs[0].zoomed_pane, Some(left));
+        assert_eq!(st.sessions["main"].tabs[0].focused_pane, left);
+        assert_ne!(left, middle);
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_pane_snaps_a_float_back_and_renders_even_when_the_command_does_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        assert_eq!(float_of(&rig).await, Some(middle));
+        rig.drain();
+
+        rig.command(on_pane(left, RemuxCommand::EnterNormal)).await;
+
+        assert_eq!(float_of(&rig).await, None, "the float snapped back");
+        let focused = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        assert_eq!(focused, left);
+        assert!(renders(&rig.drain()) >= 1, "the focus change was painted");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_tab_renders_the_tab_switch_even_when_the_command_does_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        let first = tab_ids(&rig).await[0];
+        rig.drain();
+
+        rig.command(on_tab(first, RemuxCommand::EnterNormal)).await;
+
+        assert_eq!(rig.state.lock().await.sessions["main"].active_tab, 0);
+        assert!(renders(&rig.drain()) >= 1);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn on_pane_does_not_move_focus_under_a_visible_popup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let (left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
+
+        rig.command(on_pane(left, RemuxCommand::PaneSplitVertical))
+            .await;
+
+        assert_eq!(focus_and_popup(&rig).await, (middle, true));
+        assert_eq!(pane_ids(&rig).await.len(), 3, "the split was refused");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_zoom_zooms_once_and_never_releases() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, _middle, _right) = three_panes(&rig, dir.path()).await;
+
+        rig.command(on_pane(left, RemuxCommand::PaneEnsureZoom))
+            .await;
+        rig.command(on_pane(left, RemuxCommand::PaneEnsureZoom))
+            .await;
+
+        assert_eq!(
+            rig.state.lock().await.sessions["main"].tabs[0].zoomed_pane,
+            Some(left)
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_tab_is_found_by_id_after_another_client_moved_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        let ids = tab_ids(&rig).await;
+        let (a, b) = (ids[0], ids[1]);
+        // Another client moves tab `a` behind `b` while the menu is open.
+        rig.command(on_tab(a, RemuxCommand::TabMoveBy(1))).await;
+        assert_eq!(tab_ids(&rig).await, vec![b, a]);
+
+        rig.command(on_tab(a, RemuxCommand::TabClose)).await;
+
+        assert_eq!(tab_ids(&rig).await, vec![b], "`a` closed, `b` survived");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn closing_or_renaming_a_tab_by_id_ignores_a_gone_tab_and_a_moved_index() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        let ids = tab_ids(&rig).await;
+        let (a, b) = (ids[0], ids[1]);
+        rig.command(on_tab(a, RemuxCommand::TabMoveBy(1))).await;
+
+        rig.command(RemuxCommand::TabRenameById {
+            session: "main".into(),
+            tab_id: a,
+            name: "kept".into(),
+        })
+        .await;
+        rig.command(RemuxCommand::TabCloseById {
+            session: "main".into(),
+            tab_id: 9999,
+        })
+        .await;
+
+        let st = rig.state.lock().await;
+        let names: Vec<(u64, String)> = st.sessions["main"]
+            .tabs
+            .iter()
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        assert_eq!(names.len(), 2, "a gone tab closed nothing");
+        assert_eq!(names.iter().find(|(id, _)| *id == a).unwrap().1, "kept");
+        assert_ne!(names.iter().find(|(id, _)| *id == b).unwrap().1, "kept");
+        drop(st);
+        rig.command(RemuxCommand::TabCloseById {
+            session: "main".into(),
+            tab_id: a,
+        })
+        .await;
+        assert_eq!(tab_ids(&rig).await, vec![b]);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_release_in_the_content_after_a_border_press_is_not_forwarded() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, _middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, left).await;
+        let (_, _, _, rects) = composite_of(&rig).await;
+        let rect = rects.iter().find(|(id, _)| *id == left).unwrap().1;
+        rig.drain();
+
+        right(&rig, rect.x + 3, rect.y, false, false).await;
+        right(&rig, rect.x + 5, rect.y + 5, true, false).await;
+
+        assert_eq!(
+            menus(&rig.drain()).len(),
+            1,
+            "the border press opened the menu"
+        );
+        assert!(
+            !output_has(&rig, left, &["<2;"], 1000).await,
+            "the app saw no release"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_release_on_the_border_after_a_content_press_still_reaches_the_app() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, _middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, left).await;
+        let (_, _, _, rects) = composite_of(&rig).await;
+        let rect = rects.iter().find(|(id, _)| *id == left).unwrap().1;
+
+        right(&rig, rect.x + 5, rect.y + 5, false, false).await;
+        right(&rig, rect.x + 3, rect.y, true, false).await;
+
+        assert!(
+            output_has(&rig, left, &["<2;5;5M", "<2;3;1m"], 3000).await,
+            "the press and the release both arrived"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_release_goes_only_to_the_pane_that_got_the_press() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        let (left, middle, _right) = three_panes(&rig, dir.path()).await;
+        track_mouse(&rig, left).await;
+        track_mouse(&rig, middle).await;
+        let (_, _, _, rects) = composite_of(&rig).await;
+        let l = rects.iter().find(|(id, _)| *id == left).unwrap().1;
+        let m = rects.iter().find(|(id, _)| *id == middle).unwrap().1;
+
+        right(&rig, l.x + 5, l.y + 5, false, false).await;
+        right(&rig, m.x + 5, m.y + 5, true, false).await;
+
+        // The pointer is over the middle pane, so the column and row are counted
+        // from the left pane's own origin.
+        let release = format!("<2;{};{}m", m.x + 5 - l.x, m.y + 5 - l.y);
+        assert!(
+            output_has(&rig, left, &[&release], 3000).await,
+            "left got its release"
+        );
+        assert!(
+            !output_has(&rig, middle, &["<2;"], 1000).await,
+            "middle got nothing"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_press_that_does_nothing_keeps_the_selection() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        three_panes_popup_up(&rig, dir.path()).await;
+        {
+            let mut cls = rig.clients.lock().await;
+            let c = cls.get_mut(&CLIENT).unwrap();
+            c.mouse_selection = Some(MouseSelection {
+                pane_id: 1,
+                start: (0, 0),
+                end: (3, 0),
+            });
+        }
+
+        // Outside the popup: refused, so nothing is cleared.
+        right(&rig, RIGHT_X, 5, false, false).await;
+
+        assert!(rig.clients.lock().await[&CLIENT].mouse_selection.is_some());
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_press_on_a_stack_label_opens_that_panes_menu() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.command(RemuxCommand::PaneStackAdd).await;
+        let focused = rig.state.lock().await.sessions["main"].tabs[0].focused_pane;
+        let (_, regions, _, _) = composite_of(&rig).await;
+        let label = regions
+            .stack_regions
+            .iter()
+            .find(|r| r.pane_id != focused)
+            .expect("a label for the pane that is not focused");
+        let (x, y, pane) = (label.x_start, label.y, label.pane_id);
+        rig.drain();
+
+        right(&rig, x, y, false, false).await;
+
+        let found = menus(&rig.drain());
+        assert!(
+            matches!(
+                found.as_slice(),
+                [(_, _, crate::protocol::ContextTarget::Pane { pane_id, .. })] if *pane_id == pane
+            ),
+            "{found:?}"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_does_not_dismiss_a_float_zoom() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        let (_left, middle, _right) = three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PaneToggleZoomFloat).await;
+        rig.drain();
+
+        right(&rig, 98, 14, false, false).await;
+
+        assert_eq!(float_of(&rig).await, Some(middle));
+        assert!(menus(&rig.drain()).is_empty());
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_right_click_inside_the_popup_never_opens_the_menu_or_closes_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        let (_left, middle, _right) = three_panes_popup_up(&rig, dir.path()).await;
+        rig.drain();
+
+        right(&rig, 3, 3, false, true).await;
+        right(&rig, RIGHT_X, 5, false, false).await;
+
+        assert!(menus(&rig.drain()).is_empty());
+        assert_eq!(focus_and_popup(&rig).await, (middle, true));
+        rig.finish().await;
     }
 
     #[tokio::test]

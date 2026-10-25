@@ -29,8 +29,9 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 use super::nav::LIST_HEADER_ROWS;
 use super::nav::{self, ListLayout, NavKey};
 use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
+use crate::client::context_menu::{MenuAction, MenuItem, RenameFor};
 use crate::client::registry::{ConnId, RemoteState};
-use crate::client::tree_model::{ConnTrees, NodeType, TreeModel};
+use crate::client::tree_model::{ConnTrees, JumpTarget, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
 use crate::protocol::{CellColor, RenderCell};
 
@@ -94,6 +95,20 @@ impl SessionsPlugin {
                 Vec::new(),
             );
         }
+    }
+
+    /// The id of tab `tab_index` of `session` on `conn`, from the tree the panel
+    /// holds.
+    fn tab_id(&self, conn: &ConnId, session: &str, tab_index: usize) -> Option<u64> {
+        let (_, trees) = self.trees.iter().find(|(id, _)| id == conn)?;
+        trees
+            .unfiled
+            .iter()
+            .chain(trees.folders.iter().flat_map(|f| f.sessions.iter()))
+            .find(|s| s.name == session)?
+            .tabs
+            .get(tab_index)
+            .map(|t| t.id)
     }
 
     /// Whether the selected node has children to show or hide.
@@ -242,6 +257,84 @@ impl SidebarPlugin for SessionsPlugin {
             nav::HitOutcome::Ignore => PluginAction::None,
             nav::HitOutcome::Moved => PluginAction::Redraw,
             nav::HitOutcome::Activate => self.activate(),
+        }
+    }
+
+    fn context_menu(&mut self, _x: u16, y: u16) -> Vec<MenuItem> {
+        let hit = nav::hit_test_in(
+            self.layout(),
+            y,
+            self.last_top.get(),
+            self.model.selected,
+            self.model.rows.len(),
+        );
+        if nav::pick_row(hit, &mut self.model.selected).is_none() {
+            return Vec::new();
+        }
+        let Some(row) = self.model.selected_row() else {
+            return Vec::new();
+        };
+        match row.node_type.clone() {
+            NodeType::Session { server, name } => {
+                let target = JumpTarget::Session {
+                    conn: server.clone(),
+                    session: name.clone(),
+                };
+                vec![
+                    MenuItem::new("Switch", MenuAction::Jump(target)).hint(Some("Enter".into())),
+                    MenuItem::new(
+                        "Rename",
+                        MenuAction::Rename(RenameFor::Session {
+                            conn: server.clone(),
+                            name: name.clone(),
+                        }),
+                    ),
+                    MenuItem::new(
+                        "Kill session",
+                        MenuAction::KillSession { conn: server, name },
+                    )
+                    .confirm(),
+                ]
+            }
+            NodeType::Tab {
+                server,
+                session,
+                tab_index,
+            } => {
+                let target = JumpTarget::Tab {
+                    conn: server.clone(),
+                    session: session.clone(),
+                    tab_index,
+                };
+                let mut items =
+                    vec![MenuItem::new("Switch", MenuAction::Jump(target))
+                        .hint(Some("Enter".into()))];
+                // The id is read now, so a tab moved before a row is chosen is
+                // still the one renamed or closed.
+                if let Some(tab_id) = self.tab_id(&server, &session, tab_index) {
+                    items.push(MenuItem::new(
+                        "Rename",
+                        MenuAction::Rename(RenameFor::SessionTab {
+                            conn: server.clone(),
+                            session: session.clone(),
+                            tab_id,
+                        }),
+                    ));
+                    items.push(
+                        MenuItem::new(
+                            "Close tab",
+                            MenuAction::CloseTab {
+                                conn: server,
+                                session,
+                                tab_id,
+                            },
+                        )
+                        .confirm(),
+                    );
+                }
+                items
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -710,6 +803,79 @@ mod tests {
                 session: "alpha".to_string(),
             })
         );
+    }
+
+    fn menu_at(p: &mut SessionsPlugin, label: &str) -> Vec<MenuItem> {
+        let idx = p
+            .model
+            .rows
+            .iter()
+            .position(|r| r.display_name == label)
+            .unwrap();
+        p.context_menu(0, (idx + LIST_HEADER_ROWS) as u16)
+    }
+
+    #[test]
+    fn a_session_row_offers_switch_rename_and_a_confirmed_kill() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let _ = painted(&p, 24, 12);
+        let items = menu_at(&mut p, "alpha");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Switch", "Rename", "Kill session"]);
+        let target = JumpTarget::Session {
+            conn: ConnId::Local,
+            session: "alpha".to_string(),
+        };
+        assert_eq!(items[0].action, MenuAction::Jump(target));
+        assert_eq!(
+            items[1].action,
+            MenuAction::Rename(RenameFor::Session {
+                conn: ConnId::Local,
+                name: "alpha".to_string()
+            })
+        );
+        assert_eq!(
+            items[2].action,
+            MenuAction::KillSession {
+                conn: ConnId::Local,
+                name: "alpha".to_string()
+            }
+        );
+        assert!(items[2].confirm && !items[0].confirm);
+        assert_eq!(p.model.selected_row().unwrap().display_name, "alpha");
+    }
+
+    #[test]
+    fn a_tab_row_offers_switch_rename_and_a_confirmed_close() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let _ = painted(&p, 24, 12);
+        let items = menu_at(&mut p, "editor");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Switch", "Rename", "Close tab"]);
+        assert!(matches!(
+            items[2].action,
+            MenuAction::CloseTab { tab_id: 1, .. }
+        ));
+        assert_eq!(
+            items[1].action,
+            MenuAction::Rename(RenameFor::SessionTab {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_id: 1
+            })
+        );
+        assert!(items[2].confirm);
+    }
+
+    #[test]
+    fn the_header_and_the_rows_below_the_list_have_no_menu() {
+        let mut p = SessionsPlugin::new();
+        p.on_event(&local_tree());
+        let _ = painted(&p, 24, 12);
+        assert!(p.context_menu(0, 0).is_empty());
+        assert!(p.context_menu(0, 200).is_empty());
     }
 
     #[test]

@@ -161,6 +161,8 @@ Focusing a collapsed sidebar (`Alt-h`/`Alt-l`, or `Ctrl-a b b`) expands it.
 
 With the mouse, click a row to select it, click the collapse button to collapse a sidebar, and click a collapsed strip to expand it (see [Collapse to a strip](#collapse-to-a-strip)).
 
+A right click on a row of the `sessions`, `agents` or `files` panel selects it and opens a [context menu](/remux/keybindings/#context-menu) for that row: switch, rename or kill a session, switch, rename or close a tab, jump to, zoom or close an agent's pane, open a file in a split or copy a path. The `placeholder` panel and rows that have no action, such as a server or a pane row of the sessions panel, open no menu.
+
 :::tip
 There are no default keys that jump straight into a sidebar, but the actions exist. Bind them under `[keybindings.command.b]` if you want them:
 

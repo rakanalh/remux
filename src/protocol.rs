@@ -159,7 +159,14 @@ pub enum ConnDescriptor {
 /// connection, but a client sends one only when the user runs that action. The
 /// zoom mode of a tab stays on the server (`Tab::zoom_mode`, `#[serde(default)]`)
 /// and never crosses the wire.
-pub const PROTOCOL_VERSION: u32 = 18;
+///
+/// 18 -> 19: the right-click context menu. Adds [`ClientMessage::RightClick`]
+/// and [`ServerMessage::ContextMenu`]. Neither decodes on a 18 peer, and the
+/// decode error ends the connection, so the bump turns that into a refused
+/// handshake. The server alone decides whether a right press goes to the pane's
+/// application or opens the menu, so a client cannot fall back to sending the
+/// press as a left click on an old server.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -258,6 +265,30 @@ pub enum CliPlacement {
     NewTab,
 }
 
+/// What a right-click landed on, with the facts the client needs to decide
+/// which menu items apply. The server has already moved focus to the pane or
+/// tab, so the menu's commands act on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextTarget {
+    /// A pane, by content or by border.
+    Pane {
+        pane_id: PaneId,
+        /// Whether the tab has a zoomed pane.
+        zoomed: bool,
+        /// The server's `[zoom] mode`, which `PaneToggleZoom` follows.
+        zoom_mode: crate::config::ZoomMode,
+        /// Whether the tab's layout is Monocle, where a fullscreen zoom is
+        /// refused because every pane is already full-area.
+        monocle: bool,
+    },
+    /// A tab label in the status bar.
+    Tab {
+        tab_id: u64,
+        index: usize,
+        count: usize,
+    },
+}
+
 /// Messages sent from a Remux client to the server over the Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -305,6 +336,20 @@ pub enum ClientMessage {
         /// `x`/`y` are interior-local to the popup layer the client holds, so
         /// the server targets the active tab's popup with no hit test. Only a
         /// client that was sent a [`PopupCells`] layer sets it.
+        #[serde(default)]
+        popup: bool,
+    },
+    /// A right-button press (`release: false`) or release at screen
+    /// coordinates in the client's foreground session.
+    ///
+    /// The server routes it: a pane whose application asked for the mouse gets
+    /// the button-2 report, and anything else answers the press with
+    /// [`ServerMessage::ContextMenu`]. `popup` is as
+    /// [`ClientMessage::MouseClick::popup`].
+    RightClick {
+        x: u16,
+        y: u16,
+        release: bool,
         #[serde(default)]
         popup: bool,
     },
@@ -813,6 +858,13 @@ pub enum ServerMessage {
     Event(SessionEvent),
     /// Request the client to copy data to the system clipboard via OSC 52.
     CopyToClipboard { data: String },
+    /// Answer to a [`ClientMessage::RightClick`] that opens a context menu.
+    /// `x`/`y` are the screen coordinates of the press, as the client sent them.
+    ContextMenu {
+        x: u16,
+        y: u16,
+        target: ContextTarget,
+    },
     /// Response to a `RequestScrollback` request with the pane's text content.
     ScrollbackContent { lines: Vec<String> },
     /// Response to a `RequestScrollbackInfo` request with the total line count.
@@ -1572,6 +1624,38 @@ pub enum RemuxCommand {
         tab_index: usize,
         delta: i32,
     },
+    /// Run `command` on the pane `pane_id` of the requester's attached session:
+    /// focus it first, so a command that acts on the focused pane acts on this
+    /// one. A no-op when the pane is gone, so a menu opened on a pane that has
+    /// since closed cannot act on whatever is focused now.
+    OnPane {
+        pane_id: PaneId,
+        command: Box<RemuxCommand>,
+    },
+    /// [`RemuxCommand::OnPane`] for a tab, by its id. The tab becomes the active
+    /// one before `command` runs.
+    OnTab {
+        tab_id: u64,
+        command: Box<RemuxCommand>,
+    },
+    /// Close a tab of `session` by id, as [`RemuxCommand::TabCloseByIndex`] does
+    /// by index. A no-op when the tab is gone.
+    TabCloseById {
+        session: String,
+        tab_id: u64,
+    },
+    /// Rename a tab of `session` by id. A no-op when the tab is gone.
+    TabRenameById {
+        session: String,
+        tab_id: u64,
+        name: String,
+    },
+    /// Move the active tab `delta` places, stopping at either end.
+    TabMoveBy(i32),
+    /// Zoom the focused pane in the configured mode, and do nothing when the
+    /// tab is already zoomed. Unlike [`RemuxCommand::PaneToggleZoom`] it never
+    /// releases a zoom.
+    PaneEnsureZoom,
 }
 
 impl RemuxCommand {
@@ -1644,7 +1728,12 @@ impl RemuxCommand {
             // so snapping it would cost the user their place in the scrollback
             // for a change they cannot see. An unattached requester compares
             // against "", which matches no real session -- also correctly false.
+            RemuxCommand::OnPane { command, .. } | RemuxCommand::OnTab { command, .. } => {
+                command.returns_to_live_tail(attached_session)
+            }
+            RemuxCommand::TabMoveBy(_) | RemuxCommand::PaneEnsureZoom => true,
             RemuxCommand::TabCloseByIndex { session, .. }
+            | RemuxCommand::TabCloseById { session, .. }
             | RemuxCommand::TabMoveByIndex { session, .. }
             | RemuxCommand::PaneCloseById { session, .. }
             | RemuxCommand::PaneNewInTab { session, .. }
@@ -1690,6 +1779,7 @@ impl RemuxCommand {
             // deliberately. Do not extend the rule to them.
             RemuxCommand::TabRename(_)
             | RemuxCommand::TabRenameByIndex { .. }
+            | RemuxCommand::TabRenameById { .. }
             | RemuxCommand::PaneRename(_)
             | RemuxCommand::PaneRenameById { .. }
             | RemuxCommand::SessionNew { .. }
@@ -2914,6 +3004,12 @@ mod tests {
             RemuxCommand::SessionSwitchTab { .. }
             | RemuxCommand::SessionSwitchPane { .. }
             | RemuxCommand::TabCloseByIndex { .. }
+            | RemuxCommand::TabCloseById { .. }
+            | RemuxCommand::TabRenameById { .. }
+            | RemuxCommand::OnPane { .. }
+            | RemuxCommand::OnTab { .. }
+            | RemuxCommand::TabMoveBy(_)
+            | RemuxCommand::PaneEnsureZoom
             | RemuxCommand::SessionRenameByName { .. }
             | RemuxCommand::FolderRename { .. }
             | RemuxCommand::TabNewInSession { .. }
@@ -2954,11 +3050,60 @@ mod tests {
         serde_json::from_slice(&encoded[4..4 + len]).unwrap()
     }
 
-    /// 18 is the version that introduces `PopupSize`; a peer on 17 cannot
-    /// decode it, so the handshake has to refuse that pairing.
+    /// 19 is the version that introduces `RightClick` and `ContextMenu`; a peer
+    /// on 18 cannot decode either, so the handshake has to refuse that pairing.
     #[test]
-    fn protocol_version_is_18_for_popup_size() {
-        assert_eq!(PROTOCOL_VERSION, 18);
+    fn protocol_version_is_19_for_the_context_menu() {
+        assert_eq!(PROTOCOL_VERSION, 19);
+    }
+
+    #[test]
+    fn right_click_and_context_menu_round_trip() {
+        match decode_client(&ClientMessage::RightClick {
+            x: 4,
+            y: 9,
+            release: true,
+            popup: false,
+        }) {
+            ClientMessage::RightClick {
+                x,
+                y,
+                release,
+                popup,
+            } => assert_eq!((x, y, release, popup), (4, 9, true, false)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let legacy = br#"{"RightClick":{"x":1,"y":2,"release":false}}"#;
+        match serde_json::from_slice::<ClientMessage>(legacy).unwrap() {
+            ClientMessage::RightClick { popup, .. } => assert!(!popup),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let menu = ServerMessage::ContextMenu {
+            x: 3,
+            y: 4,
+            target: ContextTarget::Pane {
+                pane_id: 7,
+                zoomed: true,
+                zoom_mode: crate::config::ZoomMode::Float,
+                monocle: false,
+            },
+        };
+        let encoded = encode_message(&menu).unwrap();
+        let len = decode_message_length(encoded[..4].try_into().unwrap());
+        match serde_json::from_slice::<ServerMessage>(&encoded[4..4 + len]).unwrap() {
+            ServerMessage::ContextMenu { x, y, target } => {
+                assert_eq!((x, y), (3, 4));
+                assert!(matches!(
+                    target,
+                    ContextTarget::Pane {
+                        pane_id: 7,
+                        zoomed: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]
