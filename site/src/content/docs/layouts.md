@@ -110,13 +110,34 @@ A move swaps the focused pane with its neighbour in that direction; focus travel
 
 | Action | Keys |
 |---|---|
-| Toggle zoom on the focused pane | `Alt-z`, `Ctrl-a f` or `Ctrl-a p z` |
+| Toggle zoom on the focused pane | `Alt-z`, `Ctrl-a z` or `Ctrl-a p z` |
+| Toggle a float zoom, whatever the mode | `PaneToggleZoomFloat` (no default key) |
 
 A zoomed pane fills the tab while the rest of the layout waits behind it, untouched. The status bar shows a `Z` while a pane is zoomed.
 
 ![A zoomed pane with the Z flag on the status bar](../../assets/screenshots/pane-zoom.png)
 
 Opening a new pane, cycling the layout or promoting a master releases the zoom. In Monocle there is nothing to zoom: the focused pane already fills the tab.
+
+### Float zoom
+
+With `mode = "float"` in the `[zoom]` section, `PaneToggleZoom` draws the pane in a framed box centred over the tab instead of filling it. `PaneToggleZoomFloat` does the same whatever the mode is. The layout underneath does not change: the other panes keep their place and size, and the floated pane's slot shows an empty, unfocused frame. The pane's terminal is resized to the box, and goes back to its slot's size when the float ends. Keyboard focus stays on the floated pane.
+
+```toml
+[zoom]
+mode = "float"   # "fullscreen" (default) or "float"
+width = 90       # percent of the area the tab's layout fills, 20-100
+height = 90
+```
+
+A float ends when you:
+
+- click outside the box. The click then acts as if the float had not been there.
+- press `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l`. The float snaps back and focus steps from the pane that was floated.
+- split, cycle the layout, promote a master or close the pane, as for a fullscreen zoom.
+- toggle either zoom action again.
+
+The float and the [popup terminal](/remux/keybindings/) are never open together: opening one closes the other. The box covers the area the tab's layout fills, so it does not cover a sidebar, and a click on a sidebar does not end it. A float zoom works in Monocle, where a fullscreen zoom has nothing to do. A [view](/remux/views/) has one zoom, the focused cell filling the view, so a float request there is a fullscreen zoom. `[zoom]` is read by the **server** when it starts. Run `remux restart` after changing it.
 
 ## Pane stacks
 

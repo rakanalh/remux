@@ -137,7 +137,7 @@ remux restart   # stop it and start it again
 
 Both ask the server to shut down cleanly, which saves your sessions when `save_sessions` is on. `remux restart` then starts a fresh server, which restores them.
 
-Restart after changing a setting the server reads at startup, such as `[general]`, `[layouts]` or `[agents]`, and after rebuilding or upgrading Remux: a running server keeps serving the old binary until it is replaced.
+Restart after changing a setting the server reads at startup, such as `[general]`, `[layouts]`, `[zoom]` or `[agents]`, and after rebuilding or upgrading Remux: a running server keeps serving the old binary until it is replaced.
 
 :::caution
 [Views](/remux/views/) are kept in memory only and don't survive a stop or restart.

@@ -39,6 +39,10 @@ pub struct Config {
     /// Desktop notifications for agents. Read by the CLIENT, which sends them.
     #[serde(default)]
     pub notifications: notifications::NotificationsConfig,
+    /// How `PaneToggleZoom` zooms a pane. Read by the SERVER, which owns every
+    /// tab's zoom and sizes the zoomed pane's PTY.
+    #[serde(default)]
+    pub zoom: ZoomConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +326,53 @@ fn parse_percent(text: &str) -> Option<u8> {
     Some(pct.clamp(POPUP_MIN_PCT as u32, POPUP_MAX_PCT as u32) as u8)
 }
 
+// ---------------------------------------------------------------------------
+// Zoom
+// ---------------------------------------------------------------------------
+
+/// How a zoomed pane is shown.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoomMode {
+    /// The pane fills the tab's whole area and the rest of the layout is hidden.
+    #[default]
+    Fullscreen,
+    /// The pane is a framed, centred box drawn over a layout that keeps its
+    /// shape.
+    Float,
+}
+
+/// The `[zoom]` section.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ZoomConfig {
+    /// What `PaneToggleZoom` does. `PaneToggleZoomFloat` is always a float.
+    pub mode: ZoomMode,
+    /// Width of a float zoom as a percentage of the area the tab's layout
+    /// fills. Clamped to `POPUP_MIN_PCT..=POPUP_MAX_PCT`, like the popup's.
+    pub width: u8,
+    /// Height of a float zoom, as `width` is.
+    pub height: u8,
+}
+
+impl Default for ZoomConfig {
+    fn default() -> Self {
+        Self {
+            mode: ZoomMode::default(),
+            width: 90,
+            height: 90,
+        }
+    }
+}
+
+impl ZoomConfig {
+    /// `(width_pct, height_pct)` in the form [`crate::server::layout::popup_rect`]
+    /// takes.
+    pub fn float_pct(&self) -> (u8, u8) {
+        (self.width, self.height)
+    }
+}
+
 /// Placement style for the which-key hint popup.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -477,6 +528,7 @@ impl Default for Config {
             agents: agents::AgentsConfig::default(),
             layouts: crate::server::layout::EnabledLayouts::default(),
             notifications: notifications::NotificationsConfig::default(),
+            zoom: ZoomConfig::default(),
         }
     }
 }
@@ -825,6 +877,35 @@ mod tests {
             pane_title: _,
         } = &appearance;
         assert_eq!(*border_style, BorderStyle::ZellijStyle);
+    }
+
+    #[test]
+    fn zoom_defaults_to_a_fullscreen_zoom_with_a_90_by_90_float() {
+        let zoom = Config::default().zoom;
+        assert_eq!(zoom.mode, ZoomMode::Fullscreen);
+        assert_eq!(zoom.float_pct(), (90, 90));
+    }
+
+    #[test]
+    fn zoom_section_parses_mode_and_size() {
+        let config: Config =
+            toml::from_str("[zoom]\nmode = \"float\"\nwidth = 70\nheight = 60\n").unwrap();
+        assert_eq!(config.zoom.mode, ZoomMode::Float);
+        assert_eq!(config.zoom.float_pct(), (70, 60));
+    }
+
+    #[test]
+    fn zoom_section_keeps_the_defaults_it_does_not_name() {
+        let config: Config = toml::from_str("[zoom]\nmode = \"float\"\n").unwrap();
+        assert_eq!(config.zoom.float_pct(), (90, 90));
+        let config: Config = toml::from_str("[zoom]\nwidth = 50\n").unwrap();
+        assert_eq!(config.zoom.mode, ZoomMode::Fullscreen);
+        assert_eq!(config.zoom.float_pct(), (50, 90));
+    }
+
+    #[test]
+    fn zoom_mode_rejects_an_unknown_spelling() {
+        assert!(toml::from_str::<Config>("[zoom]\nmode = \"Float\"\n").is_err());
     }
 
     #[test]

@@ -39,7 +39,7 @@ A view takes over the keyboard while it's on screen. The familiar pane keys act 
 |---|---|
 | Move focus between cells | `Alt-h` / `Alt-j` / `Alt-k` / `Alt-l` |
 | Cycle the view's layout | `Alt-Space`, `Ctrl-a Space` or `Ctrl-a w Space` |
-| Zoom the focused cell | `Alt-z`, `Ctrl-a f` or `Ctrl-a p z` |
+| Zoom the focused cell | `Alt-z`, `Ctrl-a z` or `Ctrl-a p z` |
 | Move the focused cell | `Alt-H` / `Alt-J` / `Alt-K` / `Alt-L` |
 | Resize the focused cell | `Ctrl-a p R` then `h` / `j` / `k` / `l` |
 | Make the focused cell the master | `Alt-m` or `Ctrl-a p m` |

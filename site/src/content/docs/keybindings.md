@@ -153,7 +153,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | Keys | Action | Notes |
 |---|---|---|
 | `Prefix Space` | `LayoutNext` | Cycle the tab's layout |
-| `Prefix f` | `PaneToggleZoom` | Zoom the focused pane |
+| `Prefix z` | `PaneToggleZoom` | Zoom the focused pane (fullscreen or float, per `[zoom] mode`) |
 | `Prefix g` | `ToggleStyle` | Switch between zellij and tmux border styles |
 | `Prefix v` | `EnterVisualMode` | |
 | `Prefix :` | `CommandPaletteOpen` | |
@@ -166,7 +166,7 @@ Only characters are sent. `Ctrl-<letter>` sends the control character; `Alt` and
 | `s` | `PaneSplitHorizontal` | New pane below |
 | `h` `j` `k` `l` | `PaneFocusLeft/Down/Up/Right` | |
 | `H` `J` `K` `L` | `PaneMoveLeft/Down/Up/Right` | |
-| `z` | `PaneToggleZoom` | |
+| `z` | `PaneToggleZoom` | Same as `Prefix z` |
 | `o` | `PopupToggle` | Popup terminal |
 | `m` | `SetMaster` | |
 | `r` | `PaneRename` | Prompts for a name |
@@ -292,7 +292,8 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneStackNext` / `PaneStackPrev` | Focus the next or previous pane in the stack |
 | `PaneStackIntoLeft` / `Right` / `Up` / `Down` | Move the focused pane into that neighbour's stack |
 | `PaneUnstackLeft` / `Right` / `Up` / `Down` | Take the focused pane out of its stack, on that side |
-| `PaneToggleZoom` | Zoom or unzoom the focused pane |
+| `PaneToggleZoom` | Zoom or unzoom the focused pane, as `[zoom] mode` says (fullscreen by default, or a float over the layout). Releases a zoom of either kind |
+| `PaneToggleZoomFloat` | Zoom the focused pane as a float whatever `[zoom] mode` says, or release a zoom of either kind. No default key |
 | `PaneRename` | Rename the focused pane (prompts) |
 | `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |
 | `PopupToggle [float\|left\|right\|top\|bottom] [size]` | Show or hide the active tab's popup terminal. A hidden popup opens at the named position, or at `popup_position` with none, sized by `size` in percent (`80` or `80x60` for a float, one number for a drawer's axis) or by `popup_width_pct` / `popup_height_pct` with none; a visible one closes, whatever the key names |

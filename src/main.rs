@@ -2973,7 +2973,9 @@ async fn send_to_focused_cell(
 ///   re-subscribe the view's cells to the content rect that moved
 ///   (`handle_chrome_resize` cannot: it repaints with `chrome.paint`).
 /// - `PaneMove{Left,Right,Up,Down}` -> `ViewMoveCell { dir }`.
-/// - `PaneToggleZoom` -> `ViewToggleZoom`.
+/// - `PaneToggleZoom` and `PaneToggleZoomFloat` -> `ViewToggleZoom`. A view
+///   has one zoom, the focused cell filling the view, so a float request
+///   falls back to it.
 /// - `SetMaster` -> `ViewSetMaster` (Master layout + promote the focused cell).
 /// - `PaneClose` -> eject the focused cell: `ViewRemoveCell { cell_id }` (the
 ///   real pane is untouched; the resync unsubscribes it).
@@ -3240,7 +3242,7 @@ async fn handle_view_command(
             repaint!();
             Ok(true)
         }
-        RemuxCommand::PaneToggleZoom => {
+        RemuxCommand::PaneToggleZoom | RemuxCommand::PaneToggleZoomFloat => {
             hide_whichkey!();
             if !views[av].cells.is_empty() {
                 mgr.send(

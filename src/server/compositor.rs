@@ -69,6 +69,11 @@ pub struct StackRegion {
 pub struct HitRegions {
     pub tab_regions: Vec<TabRegion>,
     pub stack_regions: Vec<StackRegion>,
+    /// The pane drawn as a float zoom and its box, frame included. It covers
+    /// part of the layout, so a hit inside it belongs to it before any pane or
+    /// stack label under it. Set by the daemon after compositing, never by
+    /// [`composite`].
+    pub float: Option<(PaneId, Rect)>,
 }
 
 /// Perform a hit test at the given screen coordinates.
@@ -1588,6 +1593,19 @@ pub fn render_popup_layer(
         cursor_visible: screen.cursor_visible,
         cursor_style: screen.cursor_style,
     }
+}
+
+/// The box a float zoom is drawn in, and the terminal inside its frame, for a
+/// layout that fills `area`. `pct` is `(width_pct, height_pct)`.
+///
+/// The one definition of both rects: the PTY of the floated pane is sized from
+/// the interior and [`draw_popup`] frames the box, so they agree by
+/// construction. The box is a popup's float box, and the interior is what
+/// [`draw_popup`] leaves inside its frame.
+pub fn float_zoom_box(area: Rect, pct: (u8, u8)) -> (Rect, Rect) {
+    let rect = layout::popup_rect(area, pct);
+    let interior = pane_content_rect(&BorderStyle::ZellijStyle, rect, false);
+    (rect, interior)
 }
 
 /// Draw a popup layer, framed, on top of an already-composited buffer,
@@ -3799,6 +3817,41 @@ mod tests {
     }
 
     #[test]
+    fn float_zoom_box_is_a_popup_float_and_its_interior_is_inside_the_frame() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 29,
+        };
+        let (rect, interior) = float_zoom_box(area, (90, 90));
+        assert_eq!(rect, layout::popup_rect(area, (90, 90)));
+        assert_eq!((rect.width, rect.height), (90, 26));
+        assert_eq!((rect.x, rect.y), (5, 1), "centred");
+        assert_eq!(
+            interior,
+            Rect {
+                x: rect.x + 1,
+                y: rect.y + 1,
+                width: rect.width - 2,
+                height: rect.height - 2
+            }
+        );
+    }
+
+    #[test]
+    fn float_zoom_box_clamps_like_the_popup() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
+        let (rect, _) = float_zoom_box(area, (1, 250));
+        assert_eq!(rect, layout::popup_rect(area, (20, 100)));
+    }
+
+    #[test]
     fn test_hit_test_tab_label() {
         let pane_rects = vec![(
             1,
@@ -3825,6 +3878,7 @@ mod tests {
                 },
             ],
             stack_regions: vec![],
+            ..Default::default()
         };
 
         assert_eq!(hit_test(25, 23, &regions, &pane_rects), ClickTarget::Tab(0));
@@ -3858,6 +3912,7 @@ mod tests {
                     pane_id: 2,
                 },
             ],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -3935,6 +3990,7 @@ mod tests {
                 tab_index: 0,
             }],
             stack_regions: vec![],
+            ..Default::default()
         };
 
         assert_eq!(hit_test(15, 23, &regions, &pane_rects), ClickTarget::Tab(0));
@@ -3960,6 +4016,7 @@ mod tests {
                 y: 0,
                 pane_id: 3,
             }],
+            ..Default::default()
         };
 
         assert_eq!(

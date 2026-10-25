@@ -42,7 +42,7 @@ These work directly in Normal mode, with no prefix.
 | Quick session switcher | `Alt-s` |
 | Agent switcher | `Alt-a` |
 | Previous session | `Alt-o` |
-| Zoom the focused pane | `Alt-z` |
+| Zoom the focused pane (fullscreen, or a float with `[zoom] mode = "float"`) | `Alt-z` |
 | Toggle the popup terminal | `Alt-p` |
 | Cycle the layout | `Alt-Space` |
 | Make the focused pane the master (Master layout) | `Alt-m` |
@@ -63,7 +63,7 @@ Keys below follow `Ctrl-a`. For the action name behind each key, which is what y
 | Sidebar group | `b` |
 | Visual mode | `v` |
 | Cycle the layout | `Space` |
-| Zoom the focused pane | `f` |
+| Zoom the focused pane | `z` |
 | Next / previous tab | `}` / `{` |
 | Toggle border style (Zellij / tmux) | `g` |
 | Command palette | `:` |

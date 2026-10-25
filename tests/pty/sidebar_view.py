@@ -1014,7 +1014,7 @@ def test_alt_l_with_only_the_focused_cell_placed_does_not_panic():
     require_in_view(t, fails)
 
     focus_left_cell(t)
-    t.prefix(b"f", 1.2)         # PaneToggleZoom -> ViewToggleZoom
+    t.prefix(b"z", 1.2)         # PaneToggleZoom -> ViewToggleZoom
     if " Z" not in t.rows_text()[-1]:
         fails.append(f"the view did not zoom: {t.rows_text()[-1].rstrip()!r}")
 
