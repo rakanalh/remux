@@ -94,7 +94,7 @@ How `PaneToggleZoom` zooms the focused pane. Server-side, needs `remux restart`.
 | `width` | integer, percent | `90` |
 | `height` | integer, percent | `90` |
 
-`fullscreen` fills the tab with the pane. `float` draws it in a framed, centred box over a layout that keeps its shape. `width` and `height` size the float as a percentage of the area the tab's layout fills (the window minus sidebars and the status bar), clamped to 20 to 100 like the popup's. They have no effect in `fullscreen` mode. `PaneToggleZoomFloat` always float-zooms, whatever `mode` is.
+`fullscreen` fills the tab with the pane. `float` draws it in a framed, centred box over a layout that keeps its shape. `width` and `height` size the float as a percentage of the area the tab's layout fills (the window minus sidebars and the status bar), clamped to 20 to 100 like the popup's. They have no effect in `fullscreen` mode. `PaneToggleZoomFloat` always float-zooms and `PaneToggleZoomFullscreen` always fills the tab, whatever `mode` is.
 
 ## `[layouts]`
 

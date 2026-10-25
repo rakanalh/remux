@@ -3043,6 +3043,7 @@ async fn handle_command(
                 | RemuxCommand::PaneUnstackDown
                 | RemuxCommand::PaneMoveToTabTarget { .. }
                 | RemuxCommand::PaneToggleZoom
+                | RemuxCommand::PaneToggleZoomFullscreen
                 | RemuxCommand::LayoutNext
                 | RemuxCommand::SetMaster => {
                     log::debug!("server: command {cmd:?} is a no-op while the popup is open");
@@ -4251,9 +4252,12 @@ async fn handle_command(
             drop(st);
             broadcast_full_render(&session_name, state, panes, clients, config, prev_frames).await;
         }
-        RemuxCommand::PaneToggleZoom | RemuxCommand::PaneToggleZoomFloat => {
+        RemuxCommand::PaneToggleZoom
+        | RemuxCommand::PaneToggleZoomFullscreen
+        | RemuxCommand::PaneToggleZoomFloat => {
             let mode = match cmd {
                 RemuxCommand::PaneToggleZoomFloat => ZoomMode::Float,
+                RemuxCommand::PaneToggleZoomFullscreen => ZoomMode::Fullscreen,
                 _ => config.zoom.mode,
             };
             let popup_closed;
@@ -14316,6 +14320,109 @@ mod popup_tests {
         let tab = &st.sessions["main"].tabs[0];
         assert_eq!(tab.zoomed_pane, None, "the toggle released the zoom");
         assert!(tab.popup_visible, "and took no float, so the popup stays");
+        drop(st);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_fullscreen_action_zooms_fullscreen_even_when_the_mode_is_float() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.config = float_rig_config(crate::config::ZoomMode::Float);
+        let (left, middle, right) = three_panes(&rig, dir.path()).await;
+        let before = sizes_of(&rig, &[left, middle, right]).await;
+
+        rig.command(RemuxCommand::PaneToggleZoomFullscreen).await;
+        {
+            let st = rig.state.lock().await;
+            let tab = &st.sessions["main"].tabs[0];
+            assert_eq!(tab.zoomed_pane, Some(middle));
+            assert_eq!(tab.float_zoomed(), None);
+        }
+        assert_ne!(
+            rig.screen_size(middle).await,
+            before[1],
+            "it fills the area"
+        );
+
+        rig.command(RemuxCommand::PaneToggleZoomFullscreen).await;
+        assert_eq!(
+            rig.state.lock().await.sessions["main"].tabs[0].zoomed_pane,
+            None
+        );
+        assert_eq!(sizes_of(&rig, &[left, middle, right]).await, before);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_fullscreen_action_releases_a_float_and_the_float_action_releases_a_fullscreen_zoom(
+    ) {
+        for (take, release) in [
+            (
+                RemuxCommand::PaneToggleZoomFloat,
+                RemuxCommand::PaneToggleZoomFullscreen,
+            ),
+            (
+                RemuxCommand::PaneToggleZoomFullscreen,
+                RemuxCommand::PaneToggleZoomFloat,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let rig = Rig::new(100, 30, None, dir.path()).await;
+            let (left, middle, right) = three_panes(&rig, dir.path()).await;
+            let before = sizes_of(&rig, &[left, middle, right]).await;
+
+            rig.command(take.clone()).await;
+            rig.command(release.clone()).await;
+
+            assert_eq!(
+                rig.state.lock().await.sessions["main"].tabs[0].zoomed_pane,
+                None,
+                "{take:?} then {release:?}"
+            );
+            assert_eq!(sizes_of(&rig, &[left, middle, right]).await, before);
+            rig.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fullscreen_action_is_refused_in_monocle() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        three_panes(&rig, dir.path()).await;
+        for _ in 0..4 {
+            let name = rig.state.lock().await.sessions["main"].tabs[0]
+                .layout_mode
+                .name()
+                .to_string();
+            if name == "monocle" {
+                break;
+            }
+            rig.command(RemuxCommand::LayoutNext).await;
+        }
+
+        rig.command(RemuxCommand::PaneToggleZoomFullscreen).await;
+
+        assert_eq!(
+            rig.state.lock().await.sessions["main"].tabs[0].zoomed_pane,
+            None
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_fullscreen_action_is_refused_while_the_popup_is_up_whatever_the_mode() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut rig = Rig::new(100, 30, Some((50, 10)), dir.path()).await;
+        rig.config = float_rig_config(crate::config::ZoomMode::Float);
+        three_panes(&rig, dir.path()).await;
+        rig.command(RemuxCommand::PopupToggle(None)).await;
+
+        rig.command(RemuxCommand::PaneToggleZoomFullscreen).await;
+
+        let st = rig.state.lock().await;
+        assert_eq!(st.sessions["main"].tabs[0].zoomed_pane, None);
+        assert!(st.sessions["main"].tabs[0].popup_visible);
         drop(st);
         rig.finish().await;
     }

@@ -153,9 +153,10 @@ pub enum ConnDescriptor {
 /// [`SessionEvent::SessionRenamed`], so a client keys its popup state by the
 /// session's current name.
 ///
-/// 18 also carries [`RemuxCommand::PaneToggleZoomFloat`], added without a bump
+/// 18 also carries [`RemuxCommand::PaneToggleZoomFloat`] and
+/// [`RemuxCommand::PaneToggleZoomFullscreen`], added without a bump
 /// like the 13 commands above. An old server cannot decode it and drops the
-/// connection, but a client sends it only when the user runs that action. The
+/// connection, but a client sends one only when the user runs that action. The
 /// zoom mode of a tab stays on the server (`Tab::zoom_mode`, `#[serde(default)]`)
 /// and never crosses the wire.
 pub const PROTOCOL_VERSION: u32 = 18;
@@ -1424,6 +1425,10 @@ pub enum RemuxCommand {
     /// Zoom the focused pane the way `[zoom] mode` says, or release a zoom of
     /// either mode.
     PaneToggleZoom,
+    /// Zoom the focused pane to fill the tab whatever `[zoom] mode` says, or
+    /// release a zoom of either mode. Refused in Monocle, which already fills
+    /// the tab.
+    PaneToggleZoomFullscreen,
     /// Zoom the focused pane as a centred float over the layout whatever
     /// `[zoom] mode` says, or release a zoom of either mode.
     PaneToggleZoomFloat,
@@ -1617,6 +1622,7 @@ impl RemuxCommand {
             | RemuxCommand::PaneUnstackDown
             | RemuxCommand::PaneMoveToTabTarget { .. }
             | RemuxCommand::PaneToggleZoom
+            | RemuxCommand::PaneToggleZoomFullscreen
             | RemuxCommand::PaneToggleZoomFloat
             | RemuxCommand::PopupToggle(_)
             | RemuxCommand::ResizeLeft(_)
@@ -1913,6 +1919,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("PaneUnstackDown"),
             ActionSpec::server("PaneRename").arg("<name>", "shell"),
             ActionSpec::server("PaneToggleZoom"),
+            ActionSpec::server("PaneToggleZoomFullscreen"),
             ActionSpec::server("PaneToggleZoomFloat"),
             ActionSpec::server("PopupToggle").arg("[float|left|right|top|bottom] [size]", "right"),
             ActionSpec::server("ResizeLeft").arg("<amount>", "5"),
@@ -2870,6 +2877,7 @@ mod tests {
             RemuxCommand::PaneUnstackDown => Some("PaneUnstackDown"),
             RemuxCommand::PaneRename(_) => Some("PaneRename"),
             RemuxCommand::PaneToggleZoom => Some("PaneToggleZoom"),
+            RemuxCommand::PaneToggleZoomFullscreen => Some("PaneToggleZoomFullscreen"),
             RemuxCommand::PaneToggleZoomFloat => Some("PaneToggleZoomFloat"),
             RemuxCommand::PopupToggle(_) => Some("PopupToggle"),
             RemuxCommand::ResizeLeft(_) => Some("ResizeLeft"),
@@ -3027,6 +3035,10 @@ mod tests {
     fn zoom_commands_round_trip_and_are_registered_actions() {
         for (cmd, name) in [
             (RemuxCommand::PaneToggleZoom, "PaneToggleZoom"),
+            (
+                RemuxCommand::PaneToggleZoomFullscreen,
+                "PaneToggleZoomFullscreen",
+            ),
             (RemuxCommand::PaneToggleZoomFloat, "PaneToggleZoomFloat"),
         ] {
             let json = serde_json::to_string(&ClientMessage::Command(cmd.clone())).unwrap();

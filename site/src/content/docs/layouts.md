@@ -111,6 +111,7 @@ A move swaps the focused pane with its neighbour in that direction; focus travel
 | Action | Keys |
 |---|---|
 | Toggle zoom on the focused pane | `Alt-z`, `Ctrl-a z` or `Ctrl-a p z` |
+| Toggle a fullscreen zoom, whatever the mode | `PaneToggleZoomFullscreen` (no default key) |
 | Toggle a float zoom, whatever the mode | `PaneToggleZoomFloat` (no default key) |
 
 A zoomed pane fills the tab while the rest of the layout waits behind it, untouched. The status bar shows a `Z` while a pane is zoomed.

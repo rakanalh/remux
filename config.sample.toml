@@ -181,8 +181,8 @@
 #   width, height: the size of the float, in percent of the area the tab's
 #     layout fills (the window minus sidebars and the status bar). Clamped to
 #     20..=100, like the popup (default: 90 / 90). Ignored by "fullscreen".
-# `PaneToggleZoomFloat` always zooms as a float, whatever `mode` says. It has no
-# default key; bind one in [keybindings.command] (for example
+# `PaneToggleZoomFloat` always zooms as a float and `PaneToggleZoomFullscreen`
+# always fills the tab, whatever `mode` says. Neither has a default key; bind one in [keybindings.command] (for example
 # "Alt-u" = "PaneToggleZoomFloat") or in the leader tree. Either action ends a
 # zoom of either kind.
 #
@@ -682,6 +682,10 @@
 #   PaneUnstackDown                 — Take focused pane out of its stack, below it
 #   PaneToggleZoom                  — Toggle zoom for the focused pane, as [zoom] mode says
 #                                     (fullscreen, or a float over the layout)
+#   PaneToggleZoomFullscreen        — Toggle a fullscreen zoom for the focused pane, whatever
+#                                     [zoom] mode says (refused in Monocle)
+#   PaneToggleZoomFullscreen        — Toggle a fullscreen zoom for the focused pane, whatever
+#                                     [zoom] mode says (refused in Monocle)
 #   PaneToggleZoomFloat             — Toggle a float zoom for the focused pane, whatever
 #                                     [zoom] mode says
 #   PaneRename                      — Rename the focused pane (prompts)

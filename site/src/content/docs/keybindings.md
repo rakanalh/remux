@@ -293,6 +293,7 @@ Every action you can bind or run from the command palette. The names are PascalC
 | `PaneStackIntoLeft` / `Right` / `Up` / `Down` | Move the focused pane into that neighbour's stack |
 | `PaneUnstackLeft` / `Right` / `Up` / `Down` | Take the focused pane out of its stack, on that side |
 | `PaneToggleZoom` | Zoom or unzoom the focused pane, as `[zoom] mode` says (fullscreen by default, or a float over the layout). Releases a zoom of either kind |
+| `PaneToggleZoomFullscreen` | Zoom the focused pane to fill the tab whatever `[zoom] mode` says, or release a zoom of either kind. Refused in Monocle. No default key |
 | `PaneToggleZoomFloat` | Zoom the focused pane as a float whatever `[zoom] mode` says, or release a zoom of either kind. No default key |
 | `PaneRename` | Rename the focused pane (prompts) |
 | `PaneMoveToTab` | Move the focused pane to another tab or a new one, in any session on this server (opens a picker) |

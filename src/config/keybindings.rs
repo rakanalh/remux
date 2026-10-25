@@ -1098,6 +1098,7 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
         "LayoutNext" => Some(RemuxCommand::LayoutNext),
         "SetMaster" => Some(RemuxCommand::SetMaster),
         "PaneToggleZoom" => Some(RemuxCommand::PaneToggleZoom),
+        "PaneToggleZoomFullscreen" => Some(RemuxCommand::PaneToggleZoomFullscreen),
         "PaneToggleZoomFloat" => Some(RemuxCommand::PaneToggleZoomFloat),
         "PopupToggle" => crate::config::PopupPlacement::from_args(args)
             .ok()
@@ -2788,6 +2789,10 @@ mod tests {
         assert_eq!(humanize_command("PaneMoveLeft"), "move left");
         assert_eq!(humanize_command("PaneToggleZoom"), "toggle zoom");
         assert_eq!(humanize_command("PaneToggleZoomFloat"), "toggle zoom float");
+        assert_eq!(
+            humanize_command("PaneToggleZoomFullscreen"),
+            "toggle zoom fullscreen"
+        );
         assert_eq!(humanize_command("TabNext"), "next tab");
         assert_eq!(humanize_command("TabNew"), "new tab");
         assert_eq!(humanize_command("TabGoto 0"), "tab 1");
