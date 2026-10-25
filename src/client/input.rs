@@ -343,6 +343,9 @@ pub enum InputAction {
     Execute(RemuxCommand),
     /// Execute an action chain (multiple commands in sequence).
     ExecuteChain(Vec<RemuxCommand>),
+    /// Send a command to the named connection, which need not be the
+    /// foreground one. A context-menu rename of a sidebar row ends here.
+    ExecuteOn { conn: ConnId, command: RemuxCommand },
     /// The input mode changed.
     ModeChanged(Mode),
     /// Show the which-key popup for a group.
@@ -620,6 +623,10 @@ pub struct InputHandler {
     /// its keys and clicks before any other consumer, so no handler here reads
     /// it; it lives on the handler so the overlay relay finds it.
     pub context_menu: Option<crate::client::context_menu::ContextMenu>,
+    /// What the open rename prompt renames when it was opened from a context
+    /// menu, which names its target. `None` for a prompt opened by a key, which
+    /// renames the focused entity.
+    pub rename_explicit: Option<crate::client::context_menu::RenameFor>,
 }
 
 /// Inline text input overlay state used for rename operations.
@@ -1728,6 +1735,7 @@ impl InputHandler {
             tab_picker: None,
             pending_editor_open: false,
             context_menu: None,
+            rename_explicit: None,
         }
     }
 
@@ -3480,6 +3488,7 @@ impl InputHandler {
             KeyCode::Esc => {
                 // Cancel rename, close overlay.
                 self.rename_overlay = None;
+                self.rename_explicit = None;
                 // Return to Normal after cancelling.
                 self.mode = Mode::Normal;
                 InputAction::ModeChanged(Mode::Normal)
@@ -3490,6 +3499,12 @@ impl InputHandler {
                 let target = overlay.target.clone();
                 self.rename_overlay = None;
                 self.mode = Mode::Normal;
+                if let Some(explicit) = self.rename_explicit.take() {
+                    return match explicit.command(name) {
+                        (None, command) => InputAction::Execute(command),
+                        (Some(conn), command) => InputAction::ExecuteOn { conn, command },
+                    };
+                }
                 match target {
                     RenameTarget::NewSession => InputAction::NewSession(name),
                     RenameTarget::NewView => InputAction::NewView(name),

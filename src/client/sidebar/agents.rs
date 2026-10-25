@@ -579,7 +579,10 @@ impl SidebarPlugin for AgentsPlugin {
                 "Zoom",
                 MenuAction::JumpThen(
                     target,
-                    Box::new(MenuAction::Command(RemuxCommand::PaneToggleZoom)),
+                    Box::new(MenuAction::Command(RemuxCommand::OnPane {
+                        pane_id: row.entry.pane_id,
+                        command: Box::new(RemuxCommand::PaneEnsureZoom),
+                    })),
                 ),
             ),
             MenuItem::new(
@@ -1061,7 +1064,10 @@ mod tests {
             items[1].action,
             MenuAction::JumpThen(
                 target,
-                Box::new(MenuAction::Command(RemuxCommand::PaneToggleZoom))
+                Box::new(MenuAction::Command(RemuxCommand::OnPane {
+                    pane_id: 2,
+                    command: Box::new(RemuxCommand::PaneEnsureZoom),
+                }))
             )
         );
         assert!(matches!(

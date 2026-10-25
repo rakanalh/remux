@@ -14,18 +14,19 @@ use crate::client::tree_model::JumpTarget;
 use crate::client::whichkey::DrawCommand;
 use crate::config::theme::Theme;
 use crate::config::ZoomMode;
-use crate::protocol::{ContextTarget, RemuxCommand};
+use crate::protocol::{ContextTarget, PaneId, RemuxCommand};
 use crate::server::layout::Rect;
 
 /// What choosing a row does. Every variant maps to a path the keyboard already
 /// has, so the menu adds no new behaviour of its own.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuAction {
-    /// Send a command to the foreground server. It acts on the focused pane or
-    /// tab, which the server focused when the menu opened.
+    /// Send a command to the foreground server. A row that acts on the clicked
+    /// pane or tab wraps its command in `OnPane` or `OnTab`, so the server
+    /// resolves the target when the row is chosen and drops it if it is gone.
     Command(RemuxCommand),
-    /// Open the rename prompt for the focused pane or tab.
-    Rename(RenameWhat),
+    /// Open the rename prompt for the named entity.
+    Rename(RenameFor),
     /// Go to a session, tab or pane, on any connection.
     Jump(JumpTarget),
     /// Go to a target, then run an action that acts on the focused entity:
@@ -33,11 +34,12 @@ pub enum MenuAction {
     JumpThen(JumpTarget, Box<MenuAction>),
     /// Kill a session, as the session manager's delete does.
     KillSession { conn: ConnId, name: String },
-    /// Close a tab by index, as the session manager's close does.
+    /// Close a tab by its id, so a tab moved since the menu opened is still the
+    /// one closed.
     CloseTab {
         conn: ConnId,
         session: String,
-        tab_index: usize,
+        tab_id: u64,
     },
     /// Close a pane by id, as the session manager's close does.
     ClosePane {
@@ -53,12 +55,75 @@ pub enum MenuAction {
     Cancel,
 }
 
-/// The entity the rename prompt opens for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RenameWhat {
-    Pane,
-    Tab,
-    Session,
+/// The entity the rename prompt renames. It names its target, so the new name
+/// lands on what was clicked and not on what is focused when Enter is pressed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RenameFor {
+    /// A pane of the foreground session.
+    Pane(PaneId),
+    /// A tab of the foreground session, by id.
+    Tab(u64),
+    /// A session on any connection, by name.
+    Session { conn: ConnId, name: String },
+    /// A tab of a session on any connection, by id.
+    SessionTab {
+        conn: ConnId,
+        session: String,
+        tab_id: u64,
+    },
+}
+
+impl RenameFor {
+    /// The word the prompt is titled with.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RenameFor::Pane(_) => "Pane",
+            RenameFor::Tab(_) | RenameFor::SessionTab { .. } => "Tab",
+            RenameFor::Session { .. } => "Session",
+        }
+    }
+
+    /// The command that applies `name`, and the connection it goes to, `None`
+    /// for the foreground server.
+    pub fn command(&self, name: String) -> (Option<ConnId>, RemuxCommand) {
+        match self {
+            RenameFor::Pane(pane_id) => (None, on_pane(*pane_id, RemuxCommand::PaneRename(name))),
+            RenameFor::Tab(tab_id) => (None, on_tab(*tab_id, RemuxCommand::TabRename(name))),
+            RenameFor::Session { conn, name: old } => (
+                Some(conn.clone()),
+                RemuxCommand::SessionRenameByName {
+                    old: old.clone(),
+                    new: name,
+                },
+            ),
+            RenameFor::SessionTab {
+                conn,
+                session,
+                tab_id,
+            } => (
+                Some(conn.clone()),
+                RemuxCommand::TabRenameById {
+                    session: session.clone(),
+                    tab_id: *tab_id,
+                    name,
+                },
+            ),
+        }
+    }
+}
+
+fn on_pane(pane_id: PaneId, command: RemuxCommand) -> RemuxCommand {
+    RemuxCommand::OnPane {
+        pane_id,
+        command: Box::new(command),
+    }
+}
+
+fn on_tab(tab_id: u64, command: RemuxCommand) -> RemuxCommand {
+    RemuxCommand::OnTab {
+        tab_id,
+        command: Box::new(command),
+    }
 }
 
 /// One row of the menu.
@@ -223,9 +288,20 @@ impl ContextMenu {
         }
     }
 
+    /// The rows that fit on screen. A menu taller than the screen draws only
+    /// these, so the highlight must never rest on a row below them.
+    fn drawn_rows(&self) -> usize {
+        self.items
+            .len()
+            .min(usize::from(self.rect.height.saturating_sub(2)))
+    }
+
     /// The enabled row after `from` in the direction of `delta`, wrapping.
     fn step_from(&self, from: Option<usize>, delta: i32) -> Option<usize> {
-        let n = self.items.len();
+        let n = self.drawn_rows();
+        if n == 0 {
+            return None;
+        }
         let start = match (from, delta > 0) {
             (Some(i), _) => i,
             (None, true) => n - 1,
@@ -338,16 +414,17 @@ impl ContextMenu {
 /// configured mode is fullscreen: there is no command that forces it when the
 /// configured mode is float.
 pub fn items_for(target: &ContextTarget, hint: &dyn Fn(&str) -> Option<String>) -> Vec<MenuItem> {
-    let row = |label: &str, action: &str, command: RemuxCommand| {
-        MenuItem::new(label, MenuAction::Command(command)).hint(hint(action))
-    };
     match *target {
         ContextTarget::Pane {
+            pane_id,
             zoomed,
             zoom_mode,
             monocle,
-            ..
         } => {
+            let row = |label: &str, action: &str, command: RemuxCommand| {
+                MenuItem::new(label, MenuAction::Command(on_pane(pane_id, command)))
+                    .hint(hint(action))
+            };
             let mut items = Vec::new();
             if zoomed {
                 items.push(row(
@@ -384,27 +461,30 @@ pub fn items_for(target: &ContextTarget, hint: &dyn Fn(&str) -> Option<String>) 
                 RemuxCommand::PaneSplitHorizontal,
             ));
             items.push(
-                MenuItem::new("Rename", MenuAction::Rename(RenameWhat::Pane))
+                MenuItem::new("Rename", MenuAction::Rename(RenameFor::Pane(pane_id)))
                     .hint(hint("PaneRename")),
             );
             items.push(row("Close", "PaneClose", RemuxCommand::PaneClose));
             items
         }
-        ContextTarget::Tab { index, count } => vec![
-            MenuItem::new("Rename", MenuAction::Rename(RenameWhat::Tab)).hint(hint("TabRename")),
-            row("Close", "TabClose", RemuxCommand::TabClose),
-            // `TabMove` takes the destination as a 1-based position.
-            MenuItem::new(
-                "Move left",
-                MenuAction::Command(RemuxCommand::TabMove(index)),
-            )
-            .enabled(index > 0),
-            MenuItem::new(
-                "Move right",
-                MenuAction::Command(RemuxCommand::TabMove(index + 2)),
-            )
-            .enabled(index + 1 < count),
-        ],
+        ContextTarget::Tab {
+            tab_id,
+            index,
+            count,
+        } => {
+            let row = |label: &str, command: RemuxCommand| {
+                MenuItem::new(label, MenuAction::Command(on_tab(tab_id, command)))
+            };
+            vec![
+                MenuItem::new("Rename", MenuAction::Rename(RenameFor::Tab(tab_id)))
+                    .hint(hint("TabRename")),
+                row("Close", RemuxCommand::TabClose)
+                    .hint(hint("TabClose"))
+                    .confirm(),
+                row("Move left", RemuxCommand::TabMoveBy(-1)).enabled(index > 0),
+                row("Move right", RemuxCommand::TabMoveBy(1)).enabled(index + 1 < count),
+            ]
+        }
     }
 }
 
@@ -489,15 +569,15 @@ mod tests {
         );
         assert_eq!(
             items[1].action,
-            MenuAction::Command(RemuxCommand::PaneToggleZoomFloat)
+            MenuAction::Command(on_pane(7, RemuxCommand::PaneToggleZoomFloat))
         );
         assert_eq!(
             items[2].action,
-            MenuAction::Command(RemuxCommand::PaneSplitVertical)
+            MenuAction::Command(on_pane(7, RemuxCommand::PaneSplitVertical))
         );
         assert_eq!(
             items[3].action,
-            MenuAction::Command(RemuxCommand::PaneSplitHorizontal)
+            MenuAction::Command(on_pane(7, RemuxCommand::PaneSplitHorizontal))
         );
         assert!(items.iter().all(|i| i.enabled));
     }
@@ -508,7 +588,7 @@ mod tests {
         assert_eq!(items[0].label, "Float zoom");
         assert_eq!(
             items[0].action,
-            MenuAction::Command(RemuxCommand::PaneToggleZoom)
+            MenuAction::Command(on_pane(7, RemuxCommand::PaneToggleZoom))
         );
         assert_eq!(
             labels(&items).iter().filter(|l| l.contains("zoom")).count(),
@@ -523,7 +603,7 @@ mod tests {
         assert_eq!(items[0].label, "Unzoom");
         assert_eq!(
             items[0].action,
-            MenuAction::Command(RemuxCommand::PaneToggleZoom)
+            MenuAction::Command(on_pane(7, RemuxCommand::PaneToggleZoom))
         );
         assert_eq!(items.len(), 5, "Unzoom replaces the zoom rows");
     }
@@ -547,25 +627,93 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_menu_disables_a_move_past_either_end() {
-        let first = items_for(&ContextTarget::Tab { index: 0, count: 3 }, &no_hints);
+    fn a_tab_menu_names_its_tab_and_disables_a_move_past_either_end() {
+        let tab = |index, count| ContextTarget::Tab {
+            tab_id: 42,
+            index,
+            count,
+        };
+        let first = items_for(&tab(0, 3), &no_hints);
         assert_eq!(
             labels(&first),
             ["Rename", "Close", "Move left", "Move right"]
         );
+        assert_eq!(first[0].action, MenuAction::Rename(RenameFor::Tab(42)));
+        assert_eq!(
+            first[1].action,
+            MenuAction::Command(on_tab(42, RemuxCommand::TabClose))
+        );
+        assert!(first[1].confirm, "closing a tab asks first");
         assert!(!first[2].enabled && first[3].enabled);
         assert_eq!(
             first[3].action,
-            MenuAction::Command(RemuxCommand::TabMove(2))
+            MenuAction::Command(on_tab(42, RemuxCommand::TabMoveBy(1)))
         );
-        let last = items_for(&ContextTarget::Tab { index: 2, count: 3 }, &no_hints);
+        let last = items_for(&tab(2, 3), &no_hints);
         assert!(last[2].enabled && !last[3].enabled);
         assert_eq!(
             last[2].action,
-            MenuAction::Command(RemuxCommand::TabMove(2))
+            MenuAction::Command(on_tab(42, RemuxCommand::TabMoveBy(-1)))
         );
-        let only = items_for(&ContextTarget::Tab { index: 0, count: 1 }, &no_hints);
+        let only = items_for(&tab(0, 1), &no_hints);
         assert!(!only[2].enabled && !only[3].enabled);
+    }
+
+    #[test]
+    fn a_rename_applies_to_the_entity_it_was_opened_on() {
+        assert_eq!(
+            RenameFor::Pane(9).command("x".into()),
+            (None, on_pane(9, RemuxCommand::PaneRename("x".into())))
+        );
+        assert_eq!(
+            RenameFor::Tab(4).command("x".into()),
+            (None, on_tab(4, RemuxCommand::TabRename("x".into())))
+        );
+        assert_eq!(
+            RenameFor::SessionTab {
+                conn: ConnId::Local,
+                session: "s".into(),
+                tab_id: 4
+            }
+            .command("x".into()),
+            (
+                Some(ConnId::Local),
+                RemuxCommand::TabRenameById {
+                    session: "s".into(),
+                    tab_id: 4,
+                    name: "x".into()
+                }
+            )
+        );
+        assert_eq!(
+            RenameFor::Session {
+                conn: ConnId::Local,
+                name: "old".into()
+            }
+            .command("new".into()),
+            (
+                Some(ConnId::Local),
+                RemuxCommand::SessionRenameByName {
+                    old: "old".into(),
+                    new: "new".into()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_menu_taller_than_the_screen_never_highlights_a_row_it_does_not_draw() {
+        let items: Vec<MenuItem> = (0..10)
+            .map(|i| cmd(&format!("row {i}"), RemuxCommand::PaneClose))
+            .collect();
+        let mut m = ContextMenu::open(items, (0, 0), (40, 5)).unwrap();
+        assert_eq!(m.rect().height, 5);
+        for _ in 0..12 {
+            m.key(key(KeyCode::Char('j')));
+            assert!(m.selected().unwrap() < 3, "{:?}", m.selected());
+        }
+        m.key(key(KeyCode::Char('k')));
+        assert!(m.selected().unwrap() < 3);
     }
 
     #[test]

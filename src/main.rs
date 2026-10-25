@@ -1617,25 +1617,29 @@ async fn handle_plugin_action(
     Ok(())
 }
 
-/// Open the rename prompt for the entity the foreground server has focused,
-/// as the rename keybindings do.
+/// Open the rename prompt for `what`. Enter applies the name to that entity, not
+/// to whatever is focused by then.
 async fn open_rename_prompt(
-    what: crate::client::context_menu::RenameWhat,
+    what: crate::client::context_menu::RenameFor,
     input: &mut InputHandler,
     renderer: &mut Renderer,
     mgr: &mut ConnectionManager,
 ) -> Result<()> {
-    use crate::client::context_menu::RenameWhat;
-    let (target, label) = match what {
-        RenameWhat::Pane => (RenameTarget::Pane, "Pane"),
-        RenameWhat::Tab => (RenameTarget::Tab, "Tab"),
-        RenameWhat::Session => (RenameTarget::Session, "Session"),
+    let (target, label) = match &what {
+        crate::client::context_menu::RenameFor::Pane(_) => (RenameTarget::Pane, "Pane"),
+        crate::client::context_menu::RenameFor::Tab(_)
+        | crate::client::context_menu::RenameFor::SessionTab { .. } => (RenameTarget::Tab, "Tab"),
+        crate::client::context_menu::RenameFor::Session { .. } => {
+            (RenameTarget::Session, "Session")
+        }
     };
+    debug_assert_eq!(label, what.label());
     input.rename_overlay = Some(crate::client::input::RenameOverlay {
         buffer: String::new(),
         cursor: 0,
         target,
     });
+    input.rename_explicit = Some(what);
     let (c, r) = crossterm::terminal::size()?;
     renderer.render_rename_popup("", label, c, r)?;
     renderer.flush()?;
@@ -1710,7 +1714,6 @@ async fn run_menu_action(
                 MenuAction::Command(cmd) => {
                     mgr.send_foreground(ClientMessage::Command(cmd)).await?;
                 }
-                MenuAction::Rename(what) => open_rename_prompt(what, input, renderer, mgr).await?,
                 other => log::warn!("context menu: no action follows a jump for {other:?}"),
             }
         }
@@ -1721,11 +1724,11 @@ async fn run_menu_action(
         MenuAction::CloseTab {
             conn,
             session,
-            tab_index,
+            tab_id,
         } => {
             mgr.send(
                 &conn,
-                ClientMessage::Command(RemuxCommand::TabCloseByIndex { session, tab_index }),
+                ClientMessage::Command(RemuxCommand::TabCloseById { session, tab_id }),
             )
             .await?;
             mgr.send(&conn, ClientMessage::ListSessionTree).await?;
@@ -4343,6 +4346,11 @@ async fn run_client_loop(
                                         last_visual_scroll = vs.scroll_offset;
                                     }
                                 }
+                            }
+                            InputAction::ExecuteOn { conn, command } => {
+                                log::debug!("input: ExecuteOn conn={conn:?} cmd={command:?}");
+                                mgr.send(&conn, ClientMessage::Command(command)).await?;
+                                mgr.send(&conn, ClientMessage::ListSessionTree).await?;
                             }
                             InputAction::ExecuteChain(cmds) => {
                                 log::debug!("input: ExecuteChain count={} cmds={:?}", cmds.len(), cmds);
@@ -7000,6 +7008,12 @@ async fn run_client_loop(
                             // instead of reaching the plugin's `on_mouse`. It
                             // takes the focus, as any press on a panel does.
                             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                                // A prompt, the session manager or a pending key
+                                // chord owns the screen; a menu opened over it
+                                // could not be answered.
+                                if input.mode != Mode::Normal || input.has_overlay() {
+                                    continue;
+                                }
                                 chrome.focus =
                                     crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel };
                                 let items = chrome.sidebars[sidebar].panels[panel]

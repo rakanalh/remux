@@ -282,7 +282,11 @@ pub enum ContextTarget {
         monocle: bool,
     },
     /// A tab label in the status bar.
-    Tab { index: usize, count: usize },
+    Tab {
+        tab_id: u64,
+        index: usize,
+        count: usize,
+    },
 }
 
 /// Messages sent from a Remux client to the server over the Unix socket.
@@ -1620,6 +1624,38 @@ pub enum RemuxCommand {
         tab_index: usize,
         delta: i32,
     },
+    /// Run `command` on the pane `pane_id` of the requester's attached session:
+    /// focus it first, so a command that acts on the focused pane acts on this
+    /// one. A no-op when the pane is gone, so a menu opened on a pane that has
+    /// since closed cannot act on whatever is focused now.
+    OnPane {
+        pane_id: PaneId,
+        command: Box<RemuxCommand>,
+    },
+    /// [`RemuxCommand::OnPane`] for a tab, by its id. The tab becomes the active
+    /// one before `command` runs.
+    OnTab {
+        tab_id: u64,
+        command: Box<RemuxCommand>,
+    },
+    /// Close a tab of `session` by id, as [`RemuxCommand::TabCloseByIndex`] does
+    /// by index. A no-op when the tab is gone.
+    TabCloseById {
+        session: String,
+        tab_id: u64,
+    },
+    /// Rename a tab of `session` by id. A no-op when the tab is gone.
+    TabRenameById {
+        session: String,
+        tab_id: u64,
+        name: String,
+    },
+    /// Move the active tab `delta` places, stopping at either end.
+    TabMoveBy(i32),
+    /// Zoom the focused pane in the configured mode, and do nothing when the
+    /// tab is already zoomed. Unlike [`RemuxCommand::PaneToggleZoom`] it never
+    /// releases a zoom.
+    PaneEnsureZoom,
 }
 
 impl RemuxCommand {
@@ -1692,7 +1728,12 @@ impl RemuxCommand {
             // so snapping it would cost the user their place in the scrollback
             // for a change they cannot see. An unattached requester compares
             // against "", which matches no real session -- also correctly false.
+            RemuxCommand::OnPane { command, .. } | RemuxCommand::OnTab { command, .. } => {
+                command.returns_to_live_tail(attached_session)
+            }
+            RemuxCommand::TabMoveBy(_) | RemuxCommand::PaneEnsureZoom => true,
             RemuxCommand::TabCloseByIndex { session, .. }
+            | RemuxCommand::TabCloseById { session, .. }
             | RemuxCommand::TabMoveByIndex { session, .. }
             | RemuxCommand::PaneCloseById { session, .. }
             | RemuxCommand::PaneNewInTab { session, .. }
@@ -1738,6 +1779,7 @@ impl RemuxCommand {
             // deliberately. Do not extend the rule to them.
             RemuxCommand::TabRename(_)
             | RemuxCommand::TabRenameByIndex { .. }
+            | RemuxCommand::TabRenameById { .. }
             | RemuxCommand::PaneRename(_)
             | RemuxCommand::PaneRenameById { .. }
             | RemuxCommand::SessionNew { .. }
@@ -2962,6 +3004,12 @@ mod tests {
             RemuxCommand::SessionSwitchTab { .. }
             | RemuxCommand::SessionSwitchPane { .. }
             | RemuxCommand::TabCloseByIndex { .. }
+            | RemuxCommand::TabCloseById { .. }
+            | RemuxCommand::TabRenameById { .. }
+            | RemuxCommand::OnPane { .. }
+            | RemuxCommand::OnTab { .. }
+            | RemuxCommand::TabMoveBy(_)
+            | RemuxCommand::PaneEnsureZoom
             | RemuxCommand::SessionRenameByName { .. }
             | RemuxCommand::FolderRename { .. }
             | RemuxCommand::TabNewInSession { .. }

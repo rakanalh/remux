@@ -10,12 +10,15 @@ Sends the SGR sequences a terminal emits for the right button
   D. a tab label             -> the tab menu opens
   E. the menu's own UX       -> Esc closes, an outside click closes and acts
   F. a sidebar session row   -> Switch/Rename/Kill; Rename renames, Kill asks first
+  H. a menu that goes stale -> its rows still act on the pane / tab that was clicked
   G. a sidebar file row      -> Open in split / Copy path; Copy path reaches the clipboard
 
 Run from a SHORT path (a long worktree name changes the prompt):
   PYTHONPATH=tests/pty python3 tests/pty/context_menu.py
 """
+import os
 import re
+import subprocess
 import sys
 
 from pty_harness import Tui
@@ -23,6 +26,7 @@ from pty_harness import Tui
 RUNDIR = "/private/tmp/claude-501/cm/run1"
 RUNDIR2 = "/private/tmp/claude-501/cm/run2"
 RUNDIR3 = "/private/tmp/claude-501/cm/run3"
+RUNDIR4 = "/private/tmp/claude-501/cm/run4"
 SIDEBAR_CFG = """
 [[sidebar]]
 edge = "left"
@@ -107,6 +111,59 @@ def sidebar_session(fails):
         t.dump("F: after typing the new name")
         if not t.has("zebra"):
             fails.append("F5 the session was not renamed from the sidebar menu")
+    finally:
+        t.kill()
+
+
+def cli(t, *args):
+    """Run a `remux` subcommand against THIS test's isolated server, as a pane would."""
+    env = {**t.env, "REMUX_SESSION": "main"}
+    subprocess.run([os.path.abspath("target/debug/remux"), *args], env=env, timeout=15,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stale_menus(fails):
+    t = Tui(RUNDIR4, cols=COLS, rows=ROWS).start()
+    try:
+        # A tab menu left open while another tab appears and takes the focus.
+        t.send(b"\x1bt", 0.8)
+        t.send("clear\r", 0.4)
+        first = where(t, "Tab 1")
+        rclick(t, first[0] + 1, first[1])
+        if not t.has("Move right"):
+            fails.append("H0 the tab menu did not open")
+            return
+        cli(t, "new-tab")
+        t.pump(1.0)
+        close = where(t, "Close")
+        lclick(t, close[0] + 1, close[1])
+        confirm = where(t, "Confirm: Close")
+        if confirm is None:
+            fails.append("H1 closing a tab did not ask for confirmation")
+            return
+        lclick(t, confirm[0] + 1, confirm[1])
+        t.dump("H: after closing Tab 1 from a stale menu")
+        bar = t.rows_text()[ROWS - 1]
+        if "Tab 1" in bar or "Tab 2" not in bar:
+            fails.append(f"H2 the stale menu closed the wrong tab: {bar.strip()!r}")
+
+        # A pane menu left open while a new pane takes the focus.
+        t.send("clear\r", 0.4)
+        t.send("echo LEFTMARK\r", 0.5)
+        cli(t, "split", "--right")
+        t.pump(1.0)
+        rclick(t, 20, 10)
+        cli(t, "split", "--right")
+        t.pump(1.0)
+        close = where(t, "Close")
+        if close is None:
+            fails.append("H3 the pane menu did not open")
+            return
+        lclick(t, close[0] + 1, close[1])
+        t.pump(1.0)
+        t.dump("H: after closing the clicked pane from a stale menu")
+        if t.has("LEFTMARK"):
+            fails.append("H4 the stale menu closed another pane, not the one clicked")
     finally:
         t.kill()
 
@@ -214,6 +271,7 @@ def main():
     finally:
         t.kill()
     sidebar_session(fails)
+    stale_menus(fails)
     sidebar_files(fails)
     if fails:
         print("FAIL")

@@ -29,7 +29,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 use super::nav::LIST_HEADER_ROWS;
 use super::nav::{self, ListLayout, NavKey};
 use super::{blank_grid, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
-use crate::client::context_menu::{MenuAction, MenuItem, RenameWhat};
+use crate::client::context_menu::{MenuAction, MenuItem, RenameFor};
 use crate::client::registry::{ConnId, RemoteState};
 use crate::client::tree_model::{ConnTrees, JumpTarget, NodeType, TreeModel};
 use crate::config::theme::CompositorTheme;
@@ -95,6 +95,20 @@ impl SessionsPlugin {
                 Vec::new(),
             );
         }
+    }
+
+    /// The id of tab `tab_index` of `session` on `conn`, from the tree the panel
+    /// holds.
+    fn tab_id(&self, conn: &ConnId, session: &str, tab_index: usize) -> Option<u64> {
+        let (_, trees) = self.trees.iter().find(|(id, _)| id == conn)?;
+        trees
+            .unfiled
+            .iter()
+            .chain(trees.folders.iter().flat_map(|f| f.sessions.iter()))
+            .find(|s| s.name == session)?
+            .tabs
+            .get(tab_index)
+            .map(|t| t.id)
     }
 
     /// Whether the selected node has children to show or hide.
@@ -267,14 +281,13 @@ impl SidebarPlugin for SessionsPlugin {
                     session: name.clone(),
                 };
                 vec![
-                    MenuItem::new("Switch", MenuAction::Jump(target.clone()))
-                        .hint(Some("Enter".into())),
+                    MenuItem::new("Switch", MenuAction::Jump(target)).hint(Some("Enter".into())),
                     MenuItem::new(
                         "Rename",
-                        MenuAction::JumpThen(
-                            target,
-                            Box::new(MenuAction::Rename(RenameWhat::Session)),
-                        ),
+                        MenuAction::Rename(RenameFor::Session {
+                            conn: server.clone(),
+                            name: name.clone(),
+                        }),
                     ),
                     MenuItem::new(
                         "Kill session",
@@ -293,23 +306,33 @@ impl SidebarPlugin for SessionsPlugin {
                     session: session.clone(),
                     tab_index,
                 };
-                vec![
-                    MenuItem::new("Switch", MenuAction::Jump(target.clone()))
-                        .hint(Some("Enter".into())),
-                    MenuItem::new(
+                let mut items =
+                    vec![MenuItem::new("Switch", MenuAction::Jump(target))
+                        .hint(Some("Enter".into()))];
+                // The id is read now, so a tab moved before a row is chosen is
+                // still the one renamed or closed.
+                if let Some(tab_id) = self.tab_id(&server, &session, tab_index) {
+                    items.push(MenuItem::new(
                         "Rename",
-                        MenuAction::JumpThen(target, Box::new(MenuAction::Rename(RenameWhat::Tab))),
-                    ),
-                    MenuItem::new(
-                        "Close tab",
-                        MenuAction::CloseTab {
-                            conn: server,
-                            session,
-                            tab_index,
-                        },
-                    )
-                    .confirm(),
-                ]
+                        MenuAction::Rename(RenameFor::SessionTab {
+                            conn: server.clone(),
+                            session: session.clone(),
+                            tab_id,
+                        }),
+                    ));
+                    items.push(
+                        MenuItem::new(
+                            "Close tab",
+                            MenuAction::CloseTab {
+                                conn: server,
+                                session,
+                                tab_id,
+                            },
+                        )
+                        .confirm(),
+                    );
+                }
+                items
             }
             _ => Vec::new(),
         }
@@ -804,10 +827,13 @@ mod tests {
             conn: ConnId::Local,
             session: "alpha".to_string(),
         };
-        assert_eq!(items[0].action, MenuAction::Jump(target.clone()));
+        assert_eq!(items[0].action, MenuAction::Jump(target));
         assert_eq!(
             items[1].action,
-            MenuAction::JumpThen(target, Box::new(MenuAction::Rename(RenameWhat::Session)))
+            MenuAction::Rename(RenameFor::Session {
+                conn: ConnId::Local,
+                name: "alpha".to_string()
+            })
         );
         assert_eq!(
             items[2].action,
@@ -830,8 +856,16 @@ mod tests {
         assert_eq!(labels, ["Switch", "Rename", "Close tab"]);
         assert!(matches!(
             items[2].action,
-            MenuAction::CloseTab { tab_index: 0, .. }
+            MenuAction::CloseTab { tab_id: 1, .. }
         ));
+        assert_eq!(
+            items[1].action,
+            MenuAction::Rename(RenameFor::SessionTab {
+                conn: ConnId::Local,
+                session: "alpha".to_string(),
+                tab_id: 1
+            })
+        );
         assert!(items[2].confirm);
     }
 
