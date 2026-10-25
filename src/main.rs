@@ -1742,7 +1742,27 @@ async fn run_menu_action(
             .await?;
             mgr.send(&conn, ClientMessage::ListSessionTree).await?;
         }
-        MenuAction::Request(request) => dispatch_plugin_request(0, 0, request, mgr).await,
+        MenuAction::Request(request) => {
+            dispatch_plugin_request(0, 0, request, mgr).await;
+            // As the panel's own Enter does: the user asked for the file to be
+            // open, and the keys must reach the editor, not the panel.
+            handle_plugin_action(
+                PluginAction::Leave,
+                chrome,
+                mgr,
+                renderer,
+                theme,
+                focused_pane_rect,
+                views,
+                active_view,
+                active_view_id,
+                mouse_grab,
+                last_local_session,
+                current_attached,
+                previous_attached,
+            )
+            .await?;
+        }
         MenuAction::CopyText(text) => {
             if let Err(e) = copy_to_clipboard(&text) {
                 log::error!("Failed to copy to clipboard: {e}");
@@ -6976,6 +6996,33 @@ async fn run_client_loop(
                             if popup_dismiss {
                                 dismiss_popup(mgr).await?;
                             }
+                            // A right press opens the row's context menu
+                            // instead of reaching the plugin's `on_mouse`. It
+                            // takes the focus, as any press on a panel does.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                                chrome.focus =
+                                    crate::client::chrome::ChromeFocus::Sidebar { sidebar, panel };
+                                let items = chrome.sidebars[sidebar].panels[panel]
+                                    .plugin
+                                    .context_menu(px, py);
+                                chrome.paint(&mut renderer, tc, tr, &compositor_theme, focused_pane_rect.as_ref().filter(|_| active_view.is_none()))?;
+                                input.context_menu = crate::client::context_menu::ContextMenu::open(
+                                    items,
+                                    (mouse.column, mouse.row),
+                                    (tc, tr),
+                                );
+                                repaint_overlays(
+                                    &mut renderer,
+                                    &input,
+                                    &whichkey,
+                                    &theme,
+                                    &which_key_position,
+                                    viewport_top,
+                                    focused_pane_rect.as_ref(),
+                                    (last_cursor_x, last_cursor_y, last_cursor_visible),
+                                )?;
+                                continue;
+                            }
                             let focus_before = chrome.focus;
                             // Only a press moves focus: the wheel and a drag
                             // that merely crosses a panel must not steal it.
@@ -7221,6 +7268,9 @@ async fn run_client_loop(
                     }
                     Some(Ok(crossterm::event::Event::Resize(new_cols, new_rows))) => {
                         log::debug!("resize: {}x{}", new_cols, new_rows);
+                        // The menu was placed for the old size, and the repaint
+                        // below would leave it half drawn.
+                        input.context_menu = None;
                         renderer.resize(new_cols, new_rows);
                         // `resize` reallocated the front buffer and reset the
                         // content size to the whole terminal, but deliberately
@@ -7262,6 +7312,11 @@ async fn run_client_loop(
                         }
                     }
                     Some(Ok(crossterm::event::Event::Paste(text))) => {
+                        // An open menu is modal: a paste is not for the pane
+                        // behind it.
+                        if input.context_menu.is_some() {
+                            continue;
+                        }
                         // Bracketed paste is a SEPARATE crossterm event, so it never
                         // passes the key routing above: without this guard a focused
                         // sidebar would have Ctrl-Shift-V typed into the shell behind

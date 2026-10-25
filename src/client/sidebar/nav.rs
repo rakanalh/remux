@@ -421,6 +421,13 @@ impl NavList {
         )
     }
 
+    /// The row a context-menu press at panel-local row `y` lands on, with the
+    /// cursor moved onto it. [`NavList::hit`] paired with [`pick_row`].
+    pub fn pick(&mut self, y: u16, len: usize) -> Option<usize> {
+        let hit = self.hit(y, len);
+        pick_row(hit, &mut self.selected)
+    }
+
     /// Resolve a click at panel-local row `y`, move the cursor, and say what is
     /// left to do. [`NavList::hit`] paired with [`action_for_hit`].
     pub fn click(&mut self, y: u16, len: usize) -> HitOutcome {
@@ -491,6 +498,19 @@ pub fn action_for_hit(hit: Hit, selected: &mut usize) -> HitOutcome {
             HitOutcome::Moved
         }
         Hit::Activate(_) => HitOutcome::Activate,
+    }
+}
+
+/// The row a context-menu press at `hit` lands on, with the cursor moved onto
+/// it. Unlike [`action_for_hit`], a press on the selected row is not an
+/// activation here: the menu offers the activation as a row of its own.
+pub fn pick_row(hit: Hit, selected: &mut usize) -> Option<usize> {
+    match hit {
+        Hit::Nothing => None,
+        Hit::Select(idx) | Hit::Activate(idx) => {
+            *selected = idx;
+            Some(idx)
+        }
     }
 }
 

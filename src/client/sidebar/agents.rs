@@ -31,10 +31,11 @@ use crossterm::event::{KeyEvent, MouseEventKind};
 
 use super::nav::{self, ListLayout, NavKey, NavList};
 use super::{blank_grid, draw_text, draw_text_with, PluginAction, PluginEvent, SidebarPlugin};
+use crate::client::context_menu::{MenuAction, MenuItem};
 use crate::client::registry::ConnId;
 use crate::client::tree_model::JumpTarget;
 use crate::config::theme::CompositorTheme;
-use crate::protocol::{AgentEntry, AgentState, CellColor, PaneId, RenderCell};
+use crate::protocol::{AgentEntry, AgentState, CellColor, PaneId, RemuxCommand, RenderCell};
 
 /// Lines per agent row, in every sidebar style.
 const ROW_HEIGHT: usize = 2;
@@ -562,6 +563,36 @@ impl SidebarPlugin for AgentsPlugin {
         }
     }
 
+    fn context_menu(&mut self, _x: u16, y: u16) -> Vec<MenuItem> {
+        let Some(row) = self
+            .nav
+            .pick(y, self.rows.len())
+            .and_then(|i| self.rows.get(i))
+        else {
+            return Vec::new();
+        };
+        let target = row.jump_target();
+        vec![
+            MenuItem::new("Go to pane", MenuAction::Jump(target.clone()))
+                .hint(Some("Enter".into())),
+            MenuItem::new(
+                "Zoom",
+                MenuAction::JumpThen(
+                    target,
+                    Box::new(MenuAction::Command(RemuxCommand::PaneToggleZoom)),
+                ),
+            ),
+            MenuItem::new(
+                "Close pane",
+                MenuAction::ClosePane {
+                    conn: row.conn.clone(),
+                    session: row.entry.session.clone(),
+                    pane_id: row.entry.pane_id,
+                },
+            ),
+        ]
+    }
+
     fn on_event(&mut self, ev: &PluginEvent) {
         match ev {
             PluginEvent::Agents {
@@ -1007,6 +1038,38 @@ mod tests {
         assert!(matches!(p.on_mouse(0, 4, down), PluginAction::JumpTo(_)));
         // The header is not a row.
         assert_eq!(p.on_mouse(0, 0, down), PluginAction::None);
+    }
+
+    #[test]
+    fn an_agent_row_offers_go_to_zoom_and_close_for_that_pane() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![
+                agent(1, "claude", "a", AgentState::Idle),
+                agent(2, "claude", "b", AgentState::Idle),
+            ],
+        ));
+        let _ = painted(&p, 24, 6);
+        // The second agent's row: rows are two lines tall under a two-row header.
+        let items = p.context_menu(0, 5);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Go to pane", "Zoom", "Close pane"]);
+        let target = p.rows[1].jump_target();
+        assert_eq!(items[0].action, MenuAction::Jump(target.clone()));
+        assert_eq!(
+            items[1].action,
+            MenuAction::JumpThen(
+                target,
+                Box::new(MenuAction::Command(RemuxCommand::PaneToggleZoom))
+            )
+        );
+        assert!(matches!(
+            items[2].action,
+            MenuAction::ClosePane { pane_id: 2, .. }
+        ));
+        assert_eq!(p.nav.selected(), 1, "the press moved the cursor");
+        assert!(p.context_menu(0, 0).is_empty(), "the header has no menu");
     }
 
     #[test]

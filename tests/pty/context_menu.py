@@ -9,6 +9,8 @@ Sends the SGR sequences a terminal emits for the right button
   C. that pane's border      -> the menu opens even though the app tracks
   D. a tab label             -> the tab menu opens
   E. the menu's own UX       -> Esc closes, an outside click closes and acts
+  F. a sidebar session row   -> Switch/Rename/Kill; Rename renames, Kill asks first
+  G. a sidebar file row      -> Open in split / Copy path; Copy path reaches the clipboard
 
 Run from a SHORT path (a long worktree name changes the prompt):
   PYTHONPATH=tests/pty python3 tests/pty/context_menu.py
@@ -19,6 +21,18 @@ import sys
 from pty_harness import Tui
 
 RUNDIR = "/private/tmp/claude-501/cm/run1"
+RUNDIR2 = "/private/tmp/claude-501/cm/run2"
+RUNDIR3 = "/private/tmp/claude-501/cm/run3"
+SIDEBAR_CFG = """
+[[sidebar]]
+edge = "left"
+size = 26
+visible = true
+
+  [[sidebar.panel]]
+  plugin = "sessions"
+  weight = 1
+"""
 COLS, ROWS = 100, 30
 REPORT = re.compile(r"\^\[\[<(\d+);(\d+);(\d+)([Mm])")
 TRACKER = "printf '\\033[?1000h\\033[?1006h'; cat -v\r"
@@ -57,6 +71,69 @@ def menu_up(t):
 
 def prompts(t, row):
     return t.rows_text()[row].count("$ ")
+
+
+def sidebar_session(fails):
+    t = Tui(RUNDIR2, cols=COLS, rows=ROWS, config=SIDEBAR_CFG).start()
+    try:
+        t.pump(1.5)
+        t.dump("F: the sessions sidebar")
+        pos = where(t, "main")
+        if pos is None:
+            fails.append("F0 the sessions panel shows no session row")
+            return
+        rclick(t, pos[0], pos[1])
+        t.dump("F: right click on the session row")
+        if not (t.has("Switch") and t.has("Rename") and t.has("Kill session")):
+            fails.append("F1 the session menu did not open on a sidebar row")
+            return
+        # Kill asks first: the row turns into a confirm/cancel pair.
+        kill = where(t, "Kill session")
+        lclick(t, kill[0] + 1, kill[1])
+        t.dump("F: after choosing Kill session")
+        if not t.has("Confirm: Kill session"):
+            fails.append("F2 Kill session did not ask for confirmation")
+        t.send("\x1b", 0.6)
+        if t.has("Confirm: Kill session"):
+            fails.append("F3 Esc did not dismiss the confirmation")
+        # Rename opens the rename prompt for that session.
+        rclick(t, pos[0], pos[1])
+        ren = where(t, "Rename")
+        lclick(t, ren[0] + 1, ren[1])
+        t.dump("F: after choosing Rename")
+        if not t.has("Session"):
+            fails.append("F4 Rename did not open the rename prompt")
+        t.send("zebra\r", 1.2)
+        t.dump("F: after typing the new name")
+        if not t.has("zebra"):
+            fails.append("F5 the session was not renamed from the sidebar menu")
+    finally:
+        t.kill()
+
+
+def sidebar_files(fails):
+    cfg = SIDEBAR_CFG.replace('"sessions"', '"files"')
+    t = Tui(RUNDIR3, cols=COLS, rows=ROWS, config=cfg).start()
+    try:
+        t.send("cd /private/tmp/claude-501/cm/run3/home && touch needle.txt && clear\r", 1.0)
+        t.pump(2.5)
+        t.dump("G: the files sidebar")
+        pos = where(t, "needle.txt")
+        if pos is None:
+            fails.append("G0 the files panel does not list needle.txt")
+            return
+        rclick(t, pos[0], pos[1])
+        t.dump("G: right click on a file row")
+        if not (t.has("Open in split") and t.has("Copy path")):
+            fails.append("G1 the file menu did not open on a sidebar row")
+            return
+        cp = where(t, "Copy path")
+        lclick(t, cp[0] + 1, cp[1])
+        got = t.yanks()
+        if not got or not got[-1].endswith("/home/needle.txt"):
+            fails.append(f"G2 Copy path did not put the path on the clipboard: {got}")
+    finally:
+        t.kill()
 
 
 def main():
@@ -136,6 +213,8 @@ def main():
                 fails.append("E1 a click outside did not close the menu")
     finally:
         t.kill()
+    sidebar_session(fails)
+    sidebar_files(fails)
     if fails:
         print("FAIL")
         for f in fails:

@@ -239,6 +239,36 @@ The `SidebarFocus*` actions have no default key. `Alt-h/j/k/l` move into and out
 "Alt-]"  = "PopupToggle right 40"
 ```
 
+## Context menu
+
+A right click opens a context menu at the pointer. Its rows depend on what you clicked:
+
+| Where you click | Rows |
+|---|---|
+| A pane | The zoom for `[zoom] mode` (`Fullscreen zoom` or `Float zoom`), `Float zoom` as a second row when the mode is fullscreen, `Split right`, `Split down`, `Rename`, `Close`. A zoomed pane shows `Unzoom` instead of the zoom rows. |
+| A tab label in the status bar | `Rename`, `Close`, `Move left`, `Move right` |
+| A row of the [sessions panel](/remux/sidebars/) | Session: `Switch`, `Rename`, `Kill session`. Tab: `Switch`, `Rename`, `Close tab`. |
+| A row of the agents panel | `Go to pane`, `Zoom`, `Close pane` |
+| A row of the files panel | A file: `Open in split`, `Copy path`. A directory: `Copy path`. |
+
+Every row runs an action that already exists, so the menu adds no behaviour of its own. Each row shows its current binding from your config: a modifier shortcut such as `Alt-z` when one runs the action, otherwise the leader and the key path, such as `Ctrl-a p x`. A row with no binding shows none.
+
+The menu opens at the pointer and is moved to stay on screen. It draws over everything, sidebars and the popup terminal included. Move the highlight with the mouse, `j`/`k` or the arrow keys, run a row with a left click or `Enter`, and close the menu with `Esc`. A left or right click outside the menu closes it, and the click then acts as if the menu had not been there. Only one menu is open at a time, and it does not close the popup terminal.
+
+A row that cannot apply is dimmed and cannot be chosen: `Move left` on the first tab, `Move right` on the last, and `Fullscreen zoom` in a Monocle layout, where every pane is already full-area. `Kill session` and `Close tab` in a sidebar ask for confirmation in the same menu, as `d` does in the session manager.
+
+### Right click and applications
+
+The server decides what a right click on a pane does:
+
+- A pane whose application asked for mouse events (modes 1000, 1002 or 1003) gets the right button as button 2, in SGR or the legacy encoding, and no menu opens.
+- Any other pane opens the menu.
+- The border of a pane always opens the menu, even when the application tracks the mouse, because the application cannot see its border.
+- Inside the popup terminal, a right click goes to the popup's application when it tracks the mouse and does nothing otherwise. While the popup is up, a right click on a pane outside it does nothing.
+- In Visual mode, while a key chord is pending, and while a prompt or the session manager is open, a right click does nothing.
+
+Opening the menu on a pane or a tab first moves focus to it, so the menu's commands act on what you clicked. Escaping the menu leaves the focus where the click put it. A right click inside a live [view](/remux/views/) is not handled yet.
+
 ## Session manager chords
 
 Inside the session manager (`Prefix x m`), one- or two-key chords act on the selected row. Rebind them under `[keybindings.session_manager]`:
