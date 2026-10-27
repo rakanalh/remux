@@ -2749,6 +2749,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
             ActionSpec::server("TabNext"),
             ActionSpec::server("TabPrev"),
             ActionSpec::server("TabMove").arg("<index>", "1"),
+            ActionSpec::server("TabMoveBy").arg("<delta>", "-1"),
             ActionSpec::server("PaneNew"),
             ActionSpec::server("PaneClose"),
             ActionSpec::server("PaneSplitVertical"),
@@ -4392,6 +4393,7 @@ mod tests {
             RemuxCommand::TabNext => Some("TabNext"),
             RemuxCommand::TabPrev => Some("TabPrev"),
             RemuxCommand::TabMove(_) => Some("TabMove"),
+            RemuxCommand::TabMoveBy(_) => Some("TabMoveBy"),
             RemuxCommand::PaneNew => Some("PaneNew"),
             RemuxCommand::PaneClose => Some("PaneClose"),
             RemuxCommand::PaneSplitVertical => Some("PaneSplitVertical"),
@@ -4458,7 +4460,6 @@ mod tests {
             | RemuxCommand::TabRenameById { .. }
             | RemuxCommand::OnPane { .. }
             | RemuxCommand::OnTab { .. }
-            | RemuxCommand::TabMoveBy(_)
             | RemuxCommand::PaneEnsureZoom
             | RemuxCommand::SessionRenameByName { .. }
             | RemuxCommand::FolderRename { .. }

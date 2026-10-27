@@ -21113,6 +21113,40 @@ mod popup_tests {
     }
 
     #[tokio::test]
+    async fn tab_move_by_stops_at_either_end_and_keeps_the_tab_active() {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(100, 30, None, dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        rig.new_tab(dir.path()).await;
+        let ids = tab_ids(&rig).await;
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let active = |st: &ServerState| {
+            let sess = &st.sessions["main"];
+            sess.tabs[sess.active_tab].id
+        };
+        assert_eq!(active(&*rig.state.lock().await), c);
+
+        rig.command(RemuxCommand::TabMoveBy(1)).await;
+        assert_eq!(tab_ids(&rig).await, vec![a, b, c], "past the last position");
+
+        rig.command(RemuxCommand::TabMoveBy(-5)).await;
+        assert_eq!(tab_ids(&rig).await, vec![c, a, b], "clamped to the first");
+        assert_eq!(active(&*rig.state.lock().await), c);
+
+        rig.command(RemuxCommand::TabMoveBy(-1)).await;
+        assert_eq!(
+            tab_ids(&rig).await,
+            vec![c, a, b],
+            "past the first position"
+        );
+
+        rig.command(RemuxCommand::TabMoveBy(1)).await;
+        assert_eq!(tab_ids(&rig).await, vec![a, c, b]);
+        assert_eq!(active(&*rig.state.lock().await), c);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
     async fn closing_or_renaming_a_tab_by_id_ignores_a_gone_tab_and_a_moved_index() {
         let dir = tempfile::tempdir().expect("dir");
         let rig = Rig::new(100, 30, None, dir.path()).await;

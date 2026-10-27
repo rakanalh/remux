@@ -211,7 +211,16 @@ fn build_default_tree() -> HashMap<char, KeyNode> {
                 ('r', leaf("rename", "TabRename")),
                 (']', leaf_chain("next", &["TabNext", "EnterNormal"])),
                 ('[', leaf_chain("prev", &["TabPrev", "EnterNormal"])),
-                ('m', leaf("move", "TabMove")),
+                (
+                    'm',
+                    group(
+                        "Move",
+                        vec![
+                            ('h', leaf_chain("left", &["TabMoveBy -1", "EnterNormal"])),
+                            ('l', leaf_chain("right", &["TabMoveBy 1", "EnterNormal"])),
+                        ],
+                    ),
+                ),
                 ('1', leaf_chain("tab 1", &["TabGoto 0", "EnterNormal"])),
                 ('2', leaf_chain("tab 2", &["TabGoto 1", "EnterNormal"])),
                 ('3', leaf_chain("tab 3", &["TabGoto 2", "EnterNormal"])),
@@ -1213,6 +1222,12 @@ fn build_command(name: &str, args: &[String]) -> Option<RemuxCommand> {
             Some(RemuxCommand::TabMove(idx))
         }
 
+        // -- i32 arg commands -------------------------------------------------
+        "TabMoveBy" => {
+            let delta = args.first()?.parse().ok()?;
+            Some(RemuxCommand::TabMoveBy(delta))
+        }
+
         // -- u16 arg commands (default 1) -------------------------------------
         "ResizeLeft" => {
             let amount = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -1896,6 +1911,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_tab_move_by() {
+        assert_eq!(
+            parse_command("TabMoveBy -1"),
+            Some(RemuxCommand::TabMoveBy(-1))
+        );
+        assert_eq!(
+            parse_command("TabMoveBy 1"),
+            Some(RemuxCommand::TabMoveBy(1))
+        );
+        assert_eq!(parse_command("TabMoveBy"), None);
+    }
+
+    #[test]
     fn parse_command_remote_connect() {
         assert_eq!(
             parse_command("RemoteConnect user@host"),
@@ -2277,6 +2305,33 @@ mod tests {
                 assert_eq!(label, "prev tab");
             }
             other => panic!("expected leaf for '{{', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_tree_tab_move_is_a_left_right_group() {
+        let tree = KeybindingTree::default();
+        match tree.lookup(&['t', 'm']).unwrap() {
+            KeyNode::Group {
+                label,
+                children,
+                sticky,
+            } => {
+                assert_eq!(label, "Move");
+                assert!(!sticky);
+                let mut keys: Vec<char> = children.keys().copied().collect();
+                keys.sort_unstable();
+                assert_eq!(keys, vec!['h', 'l']);
+            }
+            other => panic!("expected group for 't' -> 'm', got {other:?}"),
+        }
+        for (key, cmd) in [('h', "TabMoveBy -1"), ('l', "TabMoveBy 1")] {
+            match tree.lookup(&['t', 'm', key]).unwrap() {
+                KeyNode::Leaf { action, .. } => {
+                    assert_eq!(action, &vec![cmd.to_string(), "EnterNormal".to_string()]);
+                }
+                other => panic!("expected leaf for 't m {key}', got {other:?}"),
+            }
         }
     }
 

@@ -471,8 +471,16 @@ The focused pane must share a stack with at least one other pane; alone in its s
 | `x` | Close tab *(→ Normal)* |
 | `r` | Rename tab |
 | `]` / `[` | Next / previous tab *(→ Normal)* |
-| `m` | Move tab |
+| `m` | Open the **Move** sub-group |
 | `1`–`9` | Jump to tab 1–9 *(→ Normal)* |
+
+#### Tab → Move (`t m`)
+
+The tab stays active. At the first or last position the key does nothing; it does not wrap.
+
+| Key | Action |
+|-----|--------|
+| `h` / `l` | Move the active tab one position left / right *(→ Normal)* |
 
 #### Session (`x`)
 
@@ -615,6 +623,7 @@ Every command below is a `RemuxCommand` recognised by the config parser and the 
 | `TabNext` | — | Focus the next tab. |
 | `TabPrev` | — | Focus the previous tab. |
 | `TabMove` | `[index]` | Move the active tab to the given 1-based position; `0`, `1` or no index moves it first. |
+| `TabMoveBy` | `<delta>` | Move the active tab `delta` positions (negative is left), stopping at the first or last position. |
 | `PaneNew` | — | Open a new pane in the current tab. |
 | `PaneClose` | — | Close the focused pane. |
 | `PaneSplitVertical` | — | Split the focused pane vertically. |

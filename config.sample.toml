@@ -505,7 +505,6 @@
 # r = "TabRename"
 # "]" = "TabNext; EnterNormal"
 # "[" = "TabPrev; EnterNormal"
-# m = "TabMove"
 # "1" = "TabGoto 0; EnterNormal"
 # "2" = "TabGoto 1; EnterNormal"
 # "3" = "TabGoto 2; EnterNormal"
@@ -515,6 +514,11 @@
 # "7" = "TabGoto 6; EnterNormal"
 # "8" = "TabGoto 7; EnterNormal"
 # "9" = "TabGoto 8; EnterNormal"
+#
+# [keybindings.command.t.m]
+# _label = "Move"
+# h = "TabMoveBy -1; EnterNormal"
+# l = "TabMoveBy 1; EnterNormal"
 
 # --- Session (x) ---
 # [keybindings.command.x]
@@ -655,6 +659,7 @@
 #   TabNext                         — Focus next tab
 #   TabPrev                         — Focus previous tab
 #   TabMove [index]                 — Move tab to 1-based position (0, 1 or none: first)
+#   TabMoveBy <delta>               — Move tab delta positions (negative: left), stopping at the ends
 #   TabRename                       — Rename the active tab (prompts)
 #
 # Pane commands:
