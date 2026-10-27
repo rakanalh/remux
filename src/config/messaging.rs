@@ -23,6 +23,9 @@ pub struct MessagingConfig {
     /// pane each names: a peer that rotates its sender's pane id is held by
     /// this rather than by the per-pane rate.
     pub link_rate_per_10s: u32,
+    /// Sends one server link may have waiting to be typed or answered at
+    /// once: a local connection parks one, a link carries many.
+    pub link_parked_max: usize,
     /// `false` keeps mailboxes and names in memory only, so they do not
     /// survive `remux restart`.
     pub persist: bool,
@@ -209,6 +212,7 @@ impl Default for MessagingConfig {
             max_body_bytes: 64 * 1024,
             rate_per_10s: 20,
             link_rate_per_10s: 60,
+            link_parked_max: 8,
             persist: true,
             typing_guard_ms: 3000,
             typing_guard_unattended_ms: 500,
@@ -248,6 +252,7 @@ impl MessagingConfig {
                 self.rate_per_10s
             },
             ttl_ms: self.ttl_ms(),
+            link_parked_max: or_default(self.link_parked_max, default.link_parked_max),
         }
     }
 
@@ -574,6 +579,7 @@ mod tests {
                 max_body: 64 * 1024,
                 rate_per_10s: 20,
                 ttl_ms: 24 * 3_600_000,
+                link_parked_max: 8,
             }
         );
     }
@@ -598,8 +604,8 @@ mod tests {
         assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
         assert_eq!(
             block.lines().count(),
-            15,
-            "the block is not all fourteen keys"
+            16,
+            "the block is not all fifteen keys"
         );
         assert_eq!(parse(&block), MessagingConfig::default());
     }

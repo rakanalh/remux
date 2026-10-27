@@ -583,21 +583,36 @@ pub struct Envelope {
     pub close: String,
 }
 
-/// The envelope for message `id`. `from_name` is a validated agent name,
-/// escaped all the same because the line reaches a terminal.
+/// The envelope for message `id`. A name is a validated agent name, escaped
+/// all the same because the line reaches a terminal. A remote sender is
+/// named by its host, and answered with ITS server's id for the message:
+/// this server's id means nothing there.
 pub fn envelope(
     id: crate::protocol::MsgId,
-    from_pane: PaneId,
-    from_name: Option<&str>,
+    from: &crate::server::messaging::SubmitFrom,
     mark: &str,
 ) -> Envelope {
-    let from = match from_name {
-        Some(name) => format!("{} (%{from_pane})", crate::client::cli_common::escape(name)),
-        None => format!("%{from_pane}"),
+    use crate::server::messaging::SubmitFrom;
+    let (address, name, reply_id) = match from {
+        SubmitFrom::Pane { pane, name } => (format!("%{pane}"), name.as_deref(), id),
+        SubmitFrom::Remote {
+            link,
+            pane,
+            name,
+            origin_id,
+        } => (format!("{link}:%{pane}"), name.as_deref(), *origin_id),
+    };
+    let named = match (from, name) {
+        (SubmitFrom::Remote { link, .. }, Some(name)) => format!(
+            "{link}:{} ({address})",
+            crate::client::cli_common::escape(name)
+        ),
+        (_, Some(name)) => format!("{} ({address})", crate::client::cli_common::escape(name)),
+        (_, None) => address.clone(),
     };
     Envelope {
         open: format!(
-            "# [remux message #{id} from {from}, mark {mark}; reply: remux msg send %{from_pane} --reply-to {id}]"
+            "# [remux message #{id} from {named}, mark {mark}; reply: remux msg send {address} --reply-to {reply_id}]"
         ),
         close: format!("# [end of remux message #{id}, mark {mark}]"),
     }
@@ -844,20 +859,40 @@ mod tests {
 
     #[test]
     fn the_envelope_names_the_message_its_sender_its_mark_and_the_reply() {
+        use crate::server::messaging::SubmitFrom;
+        let named = |pane, name: Option<&str>| SubmitFrom::Pane {
+            pane,
+            name: name.map(str::to_string),
+        };
         assert_eq!(
-            envelope(7, 1, Some("lead"), "5eed"),
+            envelope(7, &named(1, Some("lead")), "5eed"),
             Envelope {
                 open: "# [remux message #7 from lead (%1), mark 5eed; reply: remux msg send %1 --reply-to 7]".into(),
                 close: "# [end of remux message #7, mark 5eed]".into(),
             }
         );
         assert_eq!(
-            envelope(8, 3, None, "5eed").open,
+            envelope(8, &named(3, None), "5eed").open,
             "# [remux message #8 from %3, mark 5eed; reply: remux msg send %3 --reply-to 8]"
         );
         assert_eq!(
-            envelope(9, 3, Some("a\u{1b}b"), "5eed").open,
+            envelope(9, &named(3, Some("a\u{1b}b")), "5eed").open,
             "# [remux message #9 from a\\x1bb (%3), mark 5eed; reply: remux msg send %3 --reply-to 9]"
+        );
+    }
+
+    #[test]
+    fn a_remote_senders_envelope_names_its_host_and_answers_with_its_id() {
+        use crate::server::messaging::SubmitFrom;
+        let remote = SubmitFrom::Remote {
+            link: "laptop".into(),
+            pane: 1,
+            name: Some("lead".into()),
+            origin_id: 42,
+        };
+        assert_eq!(
+            envelope(7, &remote, "5eed").open,
+            "# [remux message #7 from laptop:lead (laptop:%1), mark 5eed; reply: remux msg send laptop:%1 --reply-to 42]"
         );
     }
 

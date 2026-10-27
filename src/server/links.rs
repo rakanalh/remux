@@ -363,6 +363,8 @@ fn fail_queued(rx: &mut mpsc::UnboundedReceiver<Forward>, reason: &str) {
 struct InFlight {
     last_req: u64,
     waiting: HashMap<u64, oneshot::Sender<Answer>>,
+    /// Whether an answer naming no forward has been reported on this link.
+    stray_seen: bool,
 }
 
 impl InFlight {
@@ -393,15 +395,21 @@ impl InFlight {
     }
 
     /// Hand an answer to the forward its `req` names. One naming no
-    /// forward in flight, or none at all, is dropped.
-    fn answer(&mut self, frame: ServerMessage) {
+    /// forward in flight, or none at all, is dropped: never handed to
+    /// another forward, which would answer it with the wrong outcome. Returns
+    /// whether it is the link's first such stray, to be logged once.
+    fn answer(&mut self, frame: ServerMessage) -> bool {
         let (ServerMessage::MsgSent { req: Some(req), .. }
         | ServerMessage::Error { req: Some(req), .. }) = frame
         else {
-            return;
+            return !std::mem::replace(&mut self.stray_seen, true);
         };
-        if let Some(reply) = self.waiting.remove(&req) {
-            let _ = reply.send(Ok(frame));
+        match self.waiting.remove(&req) {
+            Some(reply) => {
+                let _ = reply.send(Ok(frame));
+                false
+            }
+            None => !std::mem::replace(&mut self.stray_seen, true),
         }
     }
 
@@ -732,7 +740,9 @@ async fn serve(spec: &LinkSpec, mut up: Up, rx: &mut mpsc::UnboundedReceiver<For
             }
             frame = up.frames.recv() => match frame {
                 Some(answer @ (ServerMessage::MsgSent { .. } | ServerMessage::Error { .. })) => {
-                    in_flight.answer(answer);
+                    if in_flight.answer(answer) {
+                        log::info!("link {key}: dropping an answer with no req, or one naming no send in flight (logged once per link)");
+                    }
                 }
                 Some(ServerMessage::MsgInbound { to, body, deliver, reply_to, origin, req }) => {
                     let request = InboundRequest {
@@ -968,9 +978,12 @@ mod tests {
         let mut in_flight = InFlight::default();
         let (reply, mut rx) = oneshot::channel();
         in_flight.wait(5, reply);
-        in_flight.answer(sent(None, 1));
-        in_flight.answer(sent(Some(4), 2));
-        in_flight.answer(sent(Some(6), 3));
+        assert!(
+            in_flight.answer(sent(None, 1)),
+            "the first stray is reported"
+        );
+        assert!(!in_flight.answer(sent(Some(4), 2)), "...and only the first");
+        assert!(!in_flight.answer(sent(Some(6), 3)));
         assert!(
             rx.try_recv().is_err(),
             "no stray reached the forward in flight"

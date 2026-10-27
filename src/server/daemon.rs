@@ -677,7 +677,7 @@ async fn handle_msg_send(
         .peer_name(client_id)
         .map(str::to_string);
     if let Some(link) = link {
-        return handle_link_send(client_id, link, msg, state, panes, config, store).await;
+        return handle_link_send(client_id, link, msg, state, panes, config, clients, store).await;
     }
     if msg.origin.is_some() {
         log::warn!(
@@ -790,7 +790,7 @@ async fn handle_msg_send(
     let wait_until = msg.wait.then(|| enqueued_at + wait_timeout(msg.timeout_ms));
     let (sent, swept, answered, queued) = {
         let mut store = store.lock().await;
-        if submit && store.has_parked_send(client_id) {
+        if submit && (store.has_parked_send(client_id) || forward_parked(client_id)) {
             drop(store);
             log::info!(
                 "msg: refused from=%{} to=%{to}: bad_request (a send is already waiting)",
@@ -823,25 +823,30 @@ async fn handle_msg_send(
             Vec::new()
         };
         let queued = match (&sent, body) {
-            (Ok((id, _)), Some(body)) => Some(store.enqueue_submit(
-                crate::server::messaging::SubmitEntry {
-                    id: *id,
-                    pane: to,
-                    deliver: msg.deliver,
-                    body,
-                    from_pane: from.pane,
-                    from_name: from_name.clone(),
-                    enqueued_at,
-                    defer: msg.defer,
-                    deadline,
-                    had_reply: reply_tx.is_some(),
-                    reply: reply_tx.map(|tx| crate::server::messaging::Reply { client_id, tx }),
-                    put_back: 0,
-                    waiting_on: None,
-                    wait_until,
-                },
-                config.messaging.submit_queue_len(),
-            )),
+            (Ok((id, _)), Some(body)) => Some(
+                store.enqueue_submit(
+                    crate::server::messaging::SubmitEntry {
+                        id: *id,
+                        pane: to,
+                        deliver: msg.deliver,
+                        body,
+                        from: crate::server::messaging::SubmitFrom::Pane {
+                            pane: from.pane,
+                            name: from_name.clone(),
+                        },
+                        enqueued_at,
+                        defer: msg.defer,
+                        deadline,
+                        had_reply: reply_tx.is_some(),
+                        reply: reply_tx
+                            .map(|tx| crate::server::messaging::Reply::new(client_id, tx, None)),
+                        put_back: 0,
+                        waiting_on: None,
+                        wait_until,
+                    },
+                    config.messaging.submit_queue_len(),
+                ),
+            ),
             _ => None,
         };
         (sent, store.take_swept(), answered, queued)
@@ -905,6 +910,75 @@ pub const FORWARD_ANSWER_MS: u64 = 8_000;
 pub const FORWARD_BUDGET_MS: u64 =
     CALLER_ATTRIBUTION_TIMEOUT.as_millis() as u64 + LINK_DIAL_BUDGET_MS + FORWARD_ANSWER_MS;
 
+/// How long after a send is stored its answer may take beyond a mailbox
+/// send's: a submit's whole typing budget, plus the longer of a deferral and
+/// a `--wait` (both count from the store). Zero for the mailbox. The CLI's
+/// deadline and a forward's bound are both built on it, so they agree.
+pub fn submit_answer_budget(
+    deliver: Deliver,
+    defer: bool,
+    wait: bool,
+    timeout_ms: Option<u64>,
+) -> std::time::Duration {
+    use std::time::Duration;
+    let asked = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SUBMIT_TIMEOUT_MS));
+    let max = Duration::from_millis(MAX_WAIT_MS);
+    let deferred = if defer {
+        asked.clamp(Duration::from_millis(SUBMIT_HOLD_MS), max)
+    } else {
+        Duration::ZERO
+    };
+    let waited = if wait { asked.min(max) } else { Duration::ZERO };
+    match deliver {
+        Deliver::Mailbox => Duration::ZERO,
+        Deliver::Submit | Deliver::Auto => {
+            Duration::from_millis(SUBMIT_BUDGET_MS) + deferred.max(waited)
+        }
+    }
+}
+
+/// The local connections with a send to another server parked, waiting for
+/// the far server's answer: a connection parks one, as for a local submit,
+/// though nothing of it is queued here.
+static FORWARDS_PARKED: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// A connection's parked forward, given back when it is dropped.
+struct ParkedForward(u64);
+
+impl ParkedForward {
+    /// Park a forward for `client_id`, or `None` when it already has one.
+    fn take(client_id: u64) -> Option<Self> {
+        FORWARDS_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .insert(client_id)
+            .then(|| ParkedForward(client_id))
+    }
+}
+
+/// Whether connection `client_id` has a forward parked.
+fn forward_parked(client_id: u64) -> bool {
+    FORWARDS_PARKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|parked| parked.contains(&client_id))
+}
+
+impl Drop for ParkedForward {
+    fn drop(&mut self) {
+        if let Some(parked) = FORWARDS_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            parked.remove(&self.0);
+        }
+    }
+}
+
 /// How long a forward waits, once attributed, for a link dialled within
 /// `dial` to carry it and the far server to answer.
 pub fn forward_wait(dial: std::time::Duration) -> std::time::Duration {
@@ -946,7 +1020,12 @@ async fn send_to_host(
             )
             .await
         }
-        Route::Dial => forward_send(client_id, host, msg, peer, state, panes, config, store).await,
+        Route::Dial => {
+            forward_send(
+                client_id, host, msg, peer, state, panes, config, clients, store,
+            )
+            .await
+        }
         Route::Neither => Some(ServerMessage::refused(
             "route_unavailable",
             // `host` passed `valid_host` above, so it prints as itself.
@@ -1529,9 +1608,10 @@ async fn forward_send(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     store: &'static Mutex<Messaging>,
 ) -> Option<ServerMessage> {
-    use crate::server::links::{Forward, LinkSpec, Undelivered};
+    use crate::server::links::{Forward, LinkSpec};
     use crate::server::messaging::Refusal;
 
     let Some(remote) = config.remotes.get(&host).cloned() else {
@@ -1540,15 +1620,6 @@ async fn forward_send(
             format!("no remote named {} in [remotes]", loggable(&host)),
         ));
     };
-    if msg.deliver != Deliver::Mailbox {
-        return Some(ServerMessage::refused(
-            "route_unavailable",
-            format!(
-                "{}: typing a message over a link is not built yet; send it --deliver mailbox",
-                loggable(&host)
-            ),
-        ));
-    }
     if let Target::Name(name) = &msg.to.target {
         if !valid_name(name) {
             let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
@@ -1560,6 +1631,24 @@ async fn forward_send(
             Ok(found) => found,
             Err(refusal) => return Some(refusal),
         };
+    // A typed send parks this connection until the far server answers, as a
+    // local one does: one at a time, and never beside a local one.
+    let submit = msg.deliver != Deliver::Mailbox;
+    let _parked = if submit {
+        let local = store.lock().await.has_parked_send(client_id);
+        match ParkedForward::take(client_id).filter(|_| !local) {
+            Some(parked) => Some(parked),
+            None => {
+                log::info!("msg: refused from=%{from_pane} to {host}: bad_request (a send is already waiting)");
+                return Some(ServerMessage::refused(
+                    "bad_request",
+                    "this connection already has a message waiting to be typed",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let (minted, from_name) = {
         let mut store = store.lock().await;
         let from_name = store.name_of(from_pane).map(str::to_string);
@@ -1600,16 +1689,16 @@ async fn forward_send(
             target: msg.to.target.clone(),
         },
         body: msg.body,
-        deliver: Deliver::Mailbox,
+        deliver: msg.deliver,
         // The thread names the server whose id it is, as the far side sees it.
         reply_to: msg.reply_to.map(|r| MsgRef {
             host: r.host.or_else(|| Some(host.clone())),
             id: r.id,
         }),
         pane_hint: None,
-        defer: false,
-        timeout_ms: None,
-        wait: false,
+        defer: msg.defer,
+        timeout_ms: msg.timeout_ms,
+        wait: msg.wait,
         origin: Some(Origin {
             host: host_name.clone(),
             pane_id: from_pane,
@@ -1639,53 +1728,120 @@ async fn forward_send(
     if let Some(dial) = started {
         tokio::spawn(crate::server::links::run_link(dial));
     }
-    let budget = forward_wait(dial);
-    let answer = match tokio::time::timeout(budget, answer).await {
-        Ok(Ok(answer)) => answer,
-        Ok(Err(_)) => Err(Undelivered::Unknown(format!("{host}: link lost"))),
-        Err(_) => Err(Undelivered::Unknown(format!(
-            "{host}: no answer in {}s",
-            budget.as_secs()
-        ))),
+    let budget =
+        forward_wait(dial) + submit_answer_budget(msg.deliver, msg.defer, msg.wait, msg.timeout_ms);
+    let forward = AwaitedForward {
+        id,
+        host,
+        target,
+        submit,
+        budget,
     };
-    match answer {
-        Ok(ServerMessage::MsgSent { to, .. }) => {
-            log::info!("msg: id={id} -> {host}:%{} (forwarded)", to.pane_id);
-            Some(ServerMessage::MsgSent {
-                id,
-                to: Resolved {
-                    host: Some(host),
-                    pane_id: to.pane_id,
-                    // The far server's word for the pane's name, kept only
-                    // when it could be one.
-                    name: to.name.filter(|name| valid_name(name)),
-                },
-                delivery: Delivery::Forwarded,
-                reason: None,
-                timed_out: false,
-                final_state: None,
-                req: None,
-            })
-        }
-        Ok(ServerMessage::Error { message, code, .. }) => {
-            let (code, message) = crate::server::links::far_refusal(code.as_deref(), &message);
-            log::info!("msg: id={id} refused by {host}: {code}");
-            Some(ServerMessage::refused(
-                "remote_refused",
-                format!("{host} refused: {code}: {message}"),
-            ))
-        }
-        Ok(other) => Some(forward_unknown(
+    if !submit {
+        return Some(forward.answer(answer).await);
+    }
+    // A typed send parks: the connection goes on reading, so a second typed
+    // send on it is refused while this one waits, as for a local submit.
+    let tx = clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|conn| conn.tx.clone())?;
+    tokio::spawn(async move {
+        let message = forward.answer(answer).await;
+        let _ = tx.send(message);
+        drop(_parked);
+    });
+    None
+}
+
+/// A forward written to a link, and how to answer its caller.
+struct AwaitedForward {
+    id: MsgId,
+    host: String,
+    target: Target,
+    submit: bool,
+    budget: std::time::Duration,
+}
+
+impl AwaitedForward {
+    /// The caller's answer, from the far server's answer or its absence.
+    async fn answer(
+        self,
+        answer: tokio::sync::oneshot::Receiver<crate::server::links::Answer>,
+    ) -> ServerMessage {
+        use crate::server::links::Undelivered;
+        let AwaitedForward {
             id,
-            &host,
-            &target,
-            &format!("{host} answered {}", other.variant_name()),
-        )),
-        Err(Undelivered::NotSent(reason)) => {
-            log::info!("msg: id={id} not forwarded: {reason}");
-            Some(ServerMessage::refused("route_unavailable", reason))
+            host,
+            target,
+            submit,
+            budget,
+        } = self;
+        let answer = match tokio::time::timeout(budget, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(Undelivered::Unknown(format!("{host}: link lost"))),
+            Err(_) => Err(Undelivered::Unknown(format!(
+                "{host}: no answer in {}s",
+                budget.as_secs()
+            ))),
+        };
+        match answer {
+            Ok(ServerMessage::MsgSent {
+                to,
+                delivery,
+                reason,
+                timed_out,
+                final_state,
+                ..
+            }) => {
+                log::info!("msg: id={id} -> {host}:%{} (forwarded)", to.pane_id);
+                // A mailbox send is the far server's to store: forwarded. A
+                // typed one is answered with what the far server's typing
+                // came to, as a local one would be.
+                let (delivery, reason) = if submit {
+                    let reason =
+                        reason.map(|reason| crate::server::links::far_refusal(Some(&reason), "").0);
+                    (delivery, reason)
+                } else {
+                    (Delivery::Forwarded, None)
+                };
+                ServerMessage::MsgSent {
+                    id,
+                    to: Resolved {
+                        host: Some(host),
+                        pane_id: to.pane_id,
+                        // The far server's word for the pane's name, kept
+                        // only when it could be one.
+                        name: to.name.filter(|name| valid_name(name)),
+                    },
+                    delivery,
+                    reason,
+                    timed_out,
+                    final_state,
+                    req: None,
+                }
+            }
+            Ok(ServerMessage::Error { message, code, .. }) => {
+                let (code, message) = crate::server::links::far_refusal(code.as_deref(), &message);
+                log::info!("msg: id={id} refused by {host}: {code}");
+                ServerMessage::refused(
+                    "remote_refused",
+                    format!("{host} refused: {code}: {message}"),
+                )
+            }
+            Ok(other) => forward_unknown(
+                id,
+                &host,
+                &target,
+                &format!("{host} answered {}", other.variant_name()),
+            ),
+            Err(Undelivered::NotSent(reason)) => {
+                log::info!("msg: id={id} not forwarded: {reason}");
+                ServerMessage::refused("route_unavailable", reason)
+            }
+            Err(Undelivered::Unknown(reason)) => forward_unknown(id, &host, &target, &reason),
         }
-        Err(Undelivered::Unknown(reason)) => Some(forward_unknown(id, &host, &target, &reason)),
     }
 }
 
@@ -1819,6 +1975,7 @@ async fn handle_peer_link(
 /// sshd's child. The sender is the link's declared name and the origin's
 /// pane; `origin.host` is checked and never stored, so one connection names
 /// one host. Only mailbox delivery arrives over a link in this build.
+#[allow(clippy::too_many_arguments)]
 async fn handle_link_send(
     client_id: u64,
     link: String,
@@ -1826,6 +1983,7 @@ async fn handle_link_send(
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     store: &'static Mutex<Messaging>,
 ) -> Option<ServerMessage> {
     use crate::server::messaging::{Arrival, Refusal};
@@ -1860,12 +2018,6 @@ async fn handle_link_send(
             loggable(&origin.host)
         );
     }
-    if msg.deliver != Deliver::Mailbox {
-        return Some(ServerMessage::refused(
-            "bad_request",
-            "only mailbox delivery arrives over a link in this build",
-        ));
-    }
     if let Target::Name(name) = &msg.to.target {
         if !valid_name(name) {
             let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
@@ -1887,9 +2039,39 @@ async fn handle_link_send(
     }
     let bytes = msg.body.len();
     let from_pane = origin.pane_id;
-    let (sent, swept, answered) = {
+    let submit = msg.deliver != Deliver::Mailbox;
+    let reply_tx = if submit {
+        clients
+            .lock()
+            .await
+            .get(&client_id)
+            .map(|conn| conn.tx.clone())
+    } else {
+        None
+    };
+    let from = crate::server::messaging::SubmitFrom::Remote {
+        link: link.clone(),
+        pane: from_pane,
+        name: origin.name.clone(),
+        origin_id: origin.id,
+    };
+    let enqueued_at = std::time::Instant::now();
+    let deadline = submit_deadline(enqueued_at, msg.defer, msg.timeout_ms);
+    let wait_until = msg.wait.then(|| enqueued_at + wait_timeout(msg.timeout_ms));
+    // As for a local send: the room to park it is checked in the section
+    // that stores it, so a send refused for want of room is never stored.
+    let (sent, swept, answered, queued) = {
         let mut store = store.lock().await;
+        if let Some(refusal) = submit
+            .then(|| store.park_refusal(client_id, &from))
+            .flatten()
+        {
+            drop(store);
+            log::info!("msg: refused from {link}:%{from_pane} to=%{to}: queue_full (parked)");
+            return Some(link_full(&refusal));
+        }
         let to_name = store.name_of(to).map(str::to_string);
+        let body = submit.then(|| msg.body.clone());
         let sent = store
             .send_arrival(
                 Sender::Remote {
@@ -1918,7 +2100,31 @@ async fn handle_link_send(
         } else {
             Vec::new()
         };
-        (sent, store.take_swept(), answered)
+        let queued = match (&sent, body) {
+            (Ok((id, _)), Some(body)) => Some(
+                store.enqueue_submit(
+                    crate::server::messaging::SubmitEntry {
+                        id: *id,
+                        pane: to,
+                        deliver: msg.deliver,
+                        body,
+                        from,
+                        enqueued_at,
+                        defer: msg.defer,
+                        deadline,
+                        had_reply: reply_tx.is_some(),
+                        reply: reply_tx
+                            .map(|tx| crate::server::messaging::Reply::new(client_id, tx, msg.req)),
+                        put_back: 0,
+                        waiting_on: None,
+                        wait_until,
+                    },
+                    config.messaging.submit_queue_len(),
+                ),
+            ),
+            _ => None,
+        };
+        (sent, store.take_swept(), answered, queued)
     };
     mark_agents_dirty();
     for (waiter, messages) in answered {
@@ -1940,21 +2146,16 @@ async fn handle_link_send(
     match sent {
         Ok((id, to_name)) => {
             log::info!(
-                "msg: id={id} from {link}:%{from_pane} to=%{to} bytes={bytes} (client_id={client_id}) -> mailbox"
+                "msg: id={id} from {link}:%{from_pane} to=%{to} bytes={bytes} deliver={:?}{} (client_id={client_id}) -> mailbox",
+                msg.deliver,
+                if msg.defer && submit { " defer" } else { "" }
             );
-            Some(ServerMessage::MsgSent {
-                id,
-                to: Resolved {
-                    host: None,
-                    pane_id: to,
-                    name: to_name,
-                },
-                delivery: Delivery::Mailbox,
-                reason: None,
-                timed_out: false,
-                final_state: None,
-                req: None,
-            })
+            let resolved = Resolved {
+                host: None,
+                pane_id: to,
+                name: to_name,
+            };
+            answer_enqueued(id, to, resolved, msg.deliver, queued)
         }
         Err(refusal) => {
             log::info!(
@@ -1997,6 +2198,7 @@ fn answer_enqueued(
             "bad_request",
             "this connection already has a message waiting to be typed",
         )),
+        Some(Err(refusal @ EnqueueRefusal::LinkFull { .. })) => Some(link_full(&refusal)),
         Some(Err(EnqueueRefusal::QueueFull)) => {
             let refusal = SubmitRefusal {
                 code: "queue_full",
@@ -2006,6 +2208,18 @@ fn answer_enqueued(
             };
             Some(answer_submit(id, resolved, settle(deliver, refusal), None))
         }
+    }
+}
+
+/// The refusal for a send its peer link has no room to park.
+fn link_full(refusal: &crate::server::messaging::EnqueueRefusal) -> ServerMessage {
+    use crate::server::messaging::EnqueueRefusal;
+    match refusal {
+        EnqueueRefusal::LinkFull { link, max } => ServerMessage::refused(
+            "queue_full",
+            format!("link {link} already has {max} messages waiting here to be typed or answered"),
+        ),
+        _ => ServerMessage::refused("queue_full", "no room to park this send"),
     }
 }
 
@@ -2153,9 +2367,7 @@ fn answer_wait_ended(
         wait.id,
         wait.pane
     );
-    let _ = wait
-        .reply
-        .tx
+    wait.reply
         .send(submitted_because(wait.id, wait.pane, name, reason));
 }
 
@@ -2205,7 +2417,7 @@ fn answer_submit_wait(
         }
         WaitStep::Continue => return,
     };
-    let _ = wait.reply.tx.send(message);
+    wait.reply.send(message);
 }
 
 /// One pass over one queue head: answer it, hold it, or type it. Logs only on
@@ -2330,12 +2542,7 @@ async fn step_submit(
     // A mark per typing, never stored: the body was written before it.
     let envelope = match rule.envelope.then(crate::client::msg_cli::render_mark) {
         None => None,
-        Some(Some(mark)) => Some(crate::server::submit::envelope(
-            id,
-            entry.from_pane,
-            entry.from_name.as_deref(),
-            &mark,
-        )),
+        Some(Some(mark)) => Some(crate::server::submit::envelope(id, &entry.from, &mark)),
         Some(None) => {
             let answer = settle(entry.deliver, SubmitRefusal::no_mark(pane));
             return answer_untyped(entry, answer, None, store).await;
@@ -2419,7 +2626,7 @@ async fn step_submit(
                             st.park_submit_wait(crate::server::messaging::SubmitWait {
                                 id,
                                 pane,
-                                from_pane: entry.from_pane,
+                                from: entry.from.key(),
                                 deliver: entry.deliver,
                                 reply,
                                 machine: crate::server::submit::WaitMachine::new(
@@ -2562,9 +2769,9 @@ async fn requeue_untyped(
     unsubmit_and_dirty(&mut st, entry.pane, entry.id);
     entry.reply = st.end_typing(entry.pane);
     let id = entry.id;
-    if st.is_closed(entry.from_pane) {
+    if let Some(from) = entry.from.local_pane().filter(|&from| st.is_closed(from)) {
         drop(st);
-        let refusal = SubmitRefusal::sender_closed(entry.from_pane, id);
+        let refusal = SubmitRefusal::sender_closed(from, id);
         let answer = settle(entry.deliver, refusal);
         reply_submit(entry, answer, None, store).await;
         mark_submit_dirty();
@@ -2672,7 +2879,7 @@ async fn reply_submit(
 fn send_reply(id: MsgId, reply: Option<crate::server::messaging::Reply>, message: ServerMessage) {
     match reply {
         Some(reply) => {
-            let _ = reply.tx.send(message);
+            reply.send(message);
         }
         None => log::info!("msg: id={id} submit answered with its sender gone (reply detached)"),
     }
@@ -3649,7 +3856,7 @@ async fn handle_agent_wait(
             pane,
             want,
             deadline,
-            reply: crate::server::messaging::Reply { client_id, tx },
+            reply: crate::server::messaging::Reply::new(client_id, tx, None),
         };
         if st.park_state_wait(wait).is_err() {
             drop(st);
@@ -3711,7 +3918,7 @@ async fn step_state_waits(
                         if timed_out { "timed out" } else { "answered" }
                     );
                     let message = agent_waited(pane, name.clone(), agent_state, timed_out);
-                    let _ = wait.reply.tx.send(message);
+                    wait.reply.send(message);
                 }
             }
             (live, _) => {
@@ -3726,7 +3933,7 @@ async fn step_state_waits(
                         wait.reply.client_id
                     );
                     let message = ServerMessage::refused(code, format!("{why} while waited on"));
-                    let _ = wait.reply.tx.send(message);
+                    wait.reply.send(message);
                 }
             }
         }
@@ -13984,7 +14191,7 @@ async fn reap_panes(
                     "agent: client_id={} wait on %{pane_id} ended: the pane closed",
                     wait.reply.client_id
                 );
-                let _ = wait.reply.tx.send(ServerMessage::refused(
+                wait.reply.send(ServerMessage::refused(
                     "no_such_target",
                     format!("pane %{pane_id} closed while waited on"),
                 ));
@@ -14005,7 +14212,7 @@ async fn reap_panes(
                 );
             }
             for reply in replies {
-                let _ = reply.tx.send(ServerMessage::refused(
+                reply.send(ServerMessage::refused(
                     "no_such_target",
                     format!("pane %{pane_id} closed while its message was queued"),
                 ));
@@ -14873,8 +15080,7 @@ mod tests {
                 pane,
                 deliver: crate::protocol::Deliver::Submit,
                 body: String::new(),
-                from_pane: 1,
-                from_name: None,
+                from: crate::server::messaging::SubmitFrom::pane(1),
                 enqueued_at: std::time::Instant::now(),
                 defer: false,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),

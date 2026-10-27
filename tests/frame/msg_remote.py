@@ -44,7 +44,8 @@ itself: a rogue peer is `peer_child`, a subprocess of the harness.
       origin.host part, are bad_address; an origin.session with ESC is
       stored sanitised, and the raw byte is in no log; a reply_to whose
       host cannot be a host is bad_address and stored nowhere
-  1k  auto and submit over the link: route_unavailable, not built yet
+  1k  auto and submit to a pane on B running no agent: auto is stored with
+      the reason agent_not_ready, submit is remote_refused agent_not_ready
   1l  a host with no [remotes] entry: route_unavailable, and no dial
   1m  a body forwarded over the link is in no log (A's, B's, the relay's,
       A's client.log); A's forward line and B's store line are there, and
@@ -111,6 +112,25 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
       id: after eight such refusals a reply that fits is still delivered
   2t  B with its own [remotes.laptop]: a reply still goes back over the link
       A holds open, and B runs no ssh
+  3a  a submit to a fakeagent on B is typed in, and its envelope names the
+      sender as laptop's pane with A's id in the reply hint
+  3b  submit --wait over the link answers when the agent's turn ends
+  3c  a submit into a blocked agent is remote_refused agent_blocked; auto
+      is stored with the reason
+  3d  a mailbox send on the same link is answered while a --wait is parked
+  3e  two --waits on one link park side by side on B; A still refuses a
+      second typed send on ONE local connection before forwarding it
+  3j  link bounds against a rotating origin.pane_id: one deferred per link
+      and target; at link_parked_max = 3 the 4th parked send is queue_full
+      naming the link, and the 3 are typed in order once a person stops
+  3h  the relay killed while a --wait is parked: the CLI is told the outcome
+      is unknown, and on B the message is Submitted
+  3f  a --defer --timeout 20 into a blocked agent, cleared at +12 s, is
+      typed: A waits past its mailbox bound for a typed forward
+  3i  the bodies of 3a, 3b and 3f are in none of A's, B's or the relay's
+      logs, nor A1's client.log
+  3g  answers that name no send in flight are dropped and logged once; the
+      send they did not answer is forward_unknown
   2z  no panic
 
 Run from the repo root: python3 tests/frame/msg_remote.py  (RMX_RUNDIR overrides)
@@ -129,10 +149,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from harness import BIN, PROTOCOL_VERSION, Client, Server, name_of  # noqa: E402
 import ssh_shim  # noqa: E402
+import fakeagent  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgrem")
 SHIMDIR = RUNDIR + "-bin"
 PEER = f"{SHIMDIR}/peer.py"
+FAKEAGENT = f"{SHIMDIR}/fakeagent"
 
 A_CONFIG = """
 [messaging]
@@ -150,9 +172,23 @@ remux_path = "remux"
 
 # B calls itself "minib", which A's key for it ("mini") is not: A must store
 # B's messages under its own name for the link, never the one B declares.
+# [messaging] comes last: variants append keys to it.
 B_CONFIG = """
+[agents]
+commands = ["fakeagent"]
+working_ms = 500
+  [[agents.pattern]]
+  name = "fake-proceed"
+  command = "fakeagent"
+  regex = "Do you want to proceed"
+
+[messaging.submit.fakeagent]
+while_working = "queue"
+
 [messaging]
 host_name = "minib"
+stall_ms = 2000
+settle_ms = 500
 """
 
 failures = []
@@ -263,6 +299,7 @@ def write_shim():
     os.chmod(f"{SHIMDIR}/ssh", 0o755)
     with open(PEER, "w") as f:
         f.write(PEER_SOURCE)
+    fakeagent.install(FAKEAGENT)
 
 
 def shim_lines(name):
@@ -326,10 +363,10 @@ def setup_server(srv, panes):
     return c, out
 
 
-def cli_spawn(srv, argv=None):
+def cli_spawn(srv, argv=None, session="main"):
     c = Client(srv.sock)
     c.hello()
-    body = {"session": "main", "placement": "SplitBelow"}
+    body = {"session": session, "placement": "SplitBelow"}
     if argv is not None:
         body["argv"] = argv
     c.send({"CliSpawn": body})
@@ -463,6 +500,101 @@ def reply_from_b1(target, word, reply_to=None, deliver="mailbox"):
     """A reply typed into B1, its body assembled by printf and piped in."""
     flag = f" --reply-to {reply_to}" if reply_to is not None else ""
     return type_cli(cli_b, B1, f"printf 'RE:%s' {word} | '{BIN}' msg send {target}{flag} --stdin --deliver {deliver}")
+
+
+fakes = [0]
+
+
+def b_status(pane):
+    c = Client(srv_b.sock)
+    c.hello()
+    c.send({"AgentStatus": {"target": {"host": None, "target": {"Pane": pane}}}})
+    found = None
+    for m in c.drain(1.0):
+        if name_of(m) == "AgentStatusList":
+            found = m["AgentStatusList"]["panes"]
+            break
+    c.close()
+    return (found or [None])[0]
+
+
+def wait_b_idle(pane, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        row = b_status(pane)
+        if row and row.get("command") == "fakeagent" and row.get("state") == "Idle":
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def tell(ctl, log, command, timeout=5.0):
+    """Give a fakeagent one command and wait for its acknowledgement."""
+    def acks():
+        try:
+            return sum(1 for ln in open(log) if ln.strip() == f"CTL {command}")
+        except FileNotFoundError:
+            return 0
+    before = acks()
+    with open(ctl + ".tmp", "w") as f:
+        f.write(command + "\n")
+    os.replace(ctl + ".tmp", ctl)
+    end = time.time() + timeout
+    while time.time() < end and acks() == before:
+        time.sleep(0.05)
+    time.sleep(0.4)
+
+
+def spawn_fake_b():
+    """A fakeagent pane on B, bracketed paste on, in a session of its own:
+    B's `main` holds every pane earlier cases made, and survives restarts,
+    so a pane split into it is too short to show a three-line prompt."""
+    fakes[0] += 1
+    log, ctl = f"{RUNDIR}/fake-{fakes[0]}.log", f"{RUNDIR}/fake-{fakes[0]}.ctl"
+    session = f"fakes{fakes[0]}"
+    c = Client(srv_b.sock)
+    c.hello()
+    c.send({"CreateSession": {"name": session, "folder": None}})
+    c.drain(0.6)
+    c.close()
+    pane = cli_spawn(srv_b, [FAKEAGENT, log, ctl], session=session)
+    end = time.time() + 8
+    while time.time() < end and not os.path.exists(log):
+        time.sleep(0.05)
+    tell(ctl, log, "paste-on")
+    return pane, log, ctl
+
+
+def fake_text(log):
+    """Everything the fakeagent read, as text."""
+    try:
+        lines = open(log).read().splitlines()
+    except FileNotFoundError:
+        return ""
+    data = b"".join(bytes.fromhex(ln.split()[2]) for ln in lines if ln.startswith("RX ") and len(ln.split()) > 2)
+    return data.decode("utf-8", "replace")
+
+
+def type_start(conn, pane_id, cmdline):
+    """Start `cmdline` in `pane_id`'s shell: the base of its result files."""
+    runs[0] += 1
+    base = f"{RUNDIR}/cli-{runs[0]}"
+    line = f"{cmdline} > {base}.out 2> {base}.err; echo $? > {base}.tmp; mv {base}.tmp {base}.code\n"
+    conn.send({"InputToPane": {"pane_id": pane_id, "data": list(line.encode())}})
+    return base
+
+
+def type_wait(base, timeout=40.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if os.path.exists(f"{base}.code"):
+            return int(open(f"{base}.code").read().strip() or "-1"), open(f"{base}.out").read(), open(f"{base}.err").read()
+        time.sleep(0.05)
+    return None, "", ""
+
+
+def a_send_cmd(target, word, deliver, extra=""):
+    return f"""'{BIN}' msg send {target} --deliver {deliver} {extra} "$(printf 'R:%s' {word})" """
 
 
 def drop_link():
@@ -701,10 +833,12 @@ try:
           f"1j3 a reply_to host that cannot be a host is bad_address, and nothing is stored ({got})")
 
     # --- 1k -----------------------------------------------------------------
-    for deliver in ("auto", "submit"):
-        code, out, err = send_from_a1(f"mini:%{B1}", f"k{deliver}", deliver=deliver)
-        check(code == 1 and "route_unavailable" in err and "not built yet" in err,
-              f"1k --deliver {deliver} over the link is route_unavailable, not built yet (exit {code}, err {err!r})")
+    code, out, err = send_from_a1(f"mini:%{B1}", "kauto", deliver="auto")
+    check(code == 0 and f"to mini:%{B1}" in out and "stored in its mailbox" in out and "agent_not_ready" in out,
+          f"1k --deliver auto to a pane running no agent is stored, agent_not_ready (exit {code}, out {out!r}, err {err!r})")
+    code, out, err = send_from_a1(f"mini:%{B1}", "ksubmit", deliver="submit")
+    check(code == 1 and "remote_refused" in err and "agent_not_ready" in err,
+          f"1k --deliver submit to it is remote_refused, agent_not_ready (exit {code}, err {err!r})")
 
     # --- 1l -----------------------------------------------------------------
     calls = shim_calls()
@@ -1040,6 +1174,174 @@ try:
     check(code == 0 and "RE:prec" in bodies(srv_a, A1) and shim_calls() == calls,
           f"2t with [remotes.laptop] on B the reply still goes over A's open link, and B runs no ssh "
           f"(exit {code}, err {err!r}, ssh {shim_calls()} vs {calls})")
+
+
+    # === Task 3: typing over the link ======================================
+    restart_b(B_CONFIG + "link_parked_max = 3\n")
+    cli_b.close()
+    cli_b, (B6,) = setup_server(srv_b, 1)
+    BF, BF_LOG, BF_CTL = spawn_fake_b()
+    A5 = cli_spawn(srv_a)
+    time.sleep(0.4)
+    check(wait_b_idle(BF), f"3 the fakeagent pane %{BF} on B is an agent, Idle ({b_status(BF)})")
+
+    # --- 3a -----------------------------------------------------------------
+    code, out, err = send_from_a1(f"mini:%{BF}", "plain-three-a", deliver="submit")
+    seen = fake_text(BF_LOG)
+    a_id = sent_id(out)
+    check(code == 0 and f"to mini:%{BF}" in out and "typed into the pane" in out,
+          f"3a a submit to mini:%BF is typed into the pane (exit {code}, out {out!r}, err {err!r})")
+    check("R:plain-three-a" in seen and f"(laptop:%{A1})" in seen
+          and f"reply: remux msg send laptop:%{A1} --reply-to {a_id}]" in seen,
+          f"3a the envelope names laptop's pane and A's id {a_id} ({seen[-400:]!r})")
+
+    # --- 3b -----------------------------------------------------------------
+    check(wait_b_idle(BF), "3b BF is Idle before the next send")
+    t0 = time.time()
+    code, out, err = type_cli(cli_a, A1, a_send_cmd(f"mini:%{BF}", "GO:2500-threeb", "submit", "--wait --timeout 20"), timeout=45)
+    took = time.time() - t0
+    check(code == 0 and "typed into the pane; idle, answered after" in out and 2.0 <= took <= 8.0,
+          f"3b --wait over the link answers when the agent's turn ends (exit {code}, {took:.1f}s, out {out!r}, err {err!r})")
+
+    # --- 3c -----------------------------------------------------------------
+    check(wait_b_idle(BF), "3c BF is Idle before the next send")
+    tell(BF_CTL, BF_LOG, "block")
+    end = time.time() + 5
+    while time.time() < end and (b_status(BF) or {}).get("state") != "NeedsInput":
+        time.sleep(0.1)
+    code, out, err = send_from_a1(f"mini:%{BF}", "blocked-submit", deliver="submit")
+    check(code == 1 and "remote_refused" in err and "agent_blocked" in err,
+          f"3c a submit into a blocked agent is remote_refused, agent_blocked (exit {code}, err {err!r})")
+    code, out, err = send_from_a1(f"mini:%{BF}", "blocked-auto", deliver="auto")
+    check(code == 0 and "stored in its mailbox" in out and "agent_blocked" in out,
+          f"3c auto into it is stored, agent_blocked (exit {code}, out {out!r}, err {err!r})")
+    tell(BF_CTL, BF_LOG, "clear")
+
+    # --- 3f -----------------------------------------------------------------
+    # The deferral runs past A's dial + answer bound (3 s + 8 s here): only
+    # the submit budget A adds for a typed forward keeps it waiting.
+    check(wait_b_idle(BF), "3f BF is Idle before the deferred send")
+    tell(BF_CTL, BF_LOG, "block")
+    end = time.time() + 5
+    while time.time() < end and (b_status(BF) or {}).get("state") != "NeedsInput":
+        time.sleep(0.1)
+    deferred_send = type_start(cli_a, A1, a_send_cmd(f"mini:%{BF}", "deferred-threef", "submit", "--defer --timeout 20"))
+    time.sleep(12)
+    tell(BF_CTL, BF_LOG, "clear")
+    c, o, e = type_wait(deferred_send, 40)
+    check(c == 0 and "typed into the pane" in o,
+          f"3f a deferred submit cleared at +12 s is typed, past A's dial + answer bound (exit {c}, out {o!r}, err {e!r})")
+
+    # --- 3d / 3e ------------------------------------------------------------
+    check(wait_b_idle(BF), "3d BF is Idle before the concurrent sends")
+    first = type_start(cli_a, A1, a_send_cmd(f"mini:%{BF}", "GO:2500-threed", "submit", "--wait --timeout 30"))
+    time.sleep(0.3)
+    t0 = time.time()
+    code, out, err = type_cli(cli_a, A5, a_send_cmd(f"mini:%{B6}", "beside", "mailbox"))
+    beside = time.time() - t0
+    check(code == 0 and "forwarded to mini" in out and beside < 2.0 and not os.path.exists(f"{first}.code"),
+          f"3d a mailbox send on the same link is answered while a --wait is parked ({beside:.1f}s, exit {code}, err {err!r})")
+    second = type_start(cli_a, A5, a_send_cmd(f"mini:%{BF}", "GO:2500-threee", "submit", "--wait --timeout 30"))
+    c1, o1, e1 = type_wait(first)
+    c2, o2, e2 = type_wait(second)
+    check(c1 == 0 and "idle, answered after" in o1, f"3d ...and the parked --wait answers after it (exit {c1}, out {o1!r}, err {e1!r})")
+    check(c2 == 0 and "typed into the pane" in o2 and "bad_request" not in e2,
+          f"3e a second --wait into BF on the same link is parked beside the first, then answered (exit {c2}, out {o2!r}, err {e2!r})")
+
+    # --- 3e: A's own one-per-connection rule --------------------------------
+    check(wait_b_idle(BF), "3e BF is Idle before the two sends on one connection")
+    twice = [{"MsgSend": {"to": {"host": "mini", "target": {"Pane": BF}}, "body": f"R:TWICE{n}",
+                          "deliver": "Submit", "wait": True, "timeout_ms": 5000}} for n in (1, 2)]
+    with open(f"{RUNDIR}/twice.json", "w") as f:
+        json.dump(twice, f)
+    out_file = f"{RUNDIR}/twice-out.json"
+    cli_a.send({"InputToPane": {"pane_id": A1, "data": list(
+        f"python3 {HERE}/wire_send.py --fire {srv_a.sock} {RUNDIR}/twice.json {out_file}\n".encode())}})
+    end = time.time() + 30
+    while time.time() < end and not os.path.exists(out_file):
+        time.sleep(0.1)
+    replies = json.load(open(out_file)) if os.path.exists(out_file) else []
+    on_b = [b for b in bodies(srv_b, BF) if b.startswith("R:TWICE")]
+    check(len(replies) == 2 and err_of(replies[0])[0] == "bad_request" and len(on_b) == 1,
+          f"3e A refuses a second typed send on one connection before forwarding it (replies {codes(replies)}, on B {on_b})")
+
+    # --- 3j ---------------------------------------------------------------------
+    check(wait_b_idle(BF, 12), "3j BF is Idle before the link bounds")
+    tell(BF_CTL, BF_LOG, "block")
+    end = time.time() + 5
+    while time.time() < end and (b_status(BF) or {}).get("state") != "NeedsInput":
+        time.sleep(0.1)
+    deferred = [origin_send(BF, f"RD:{n}", origin(pane_id=n, msg_id=n)) for n in (1, 2)]
+    for n, frame in enumerate(deferred, 1):
+        frame["MsgSend"].update(deliver="Submit", defer=True, timeout_ms=10000, req=n)
+    got, rogue = peer_frames([{"PeerLink": {"name": "rogue"}}] + deferred, hold=3.0)
+    check(codes(got) == ["queue_full"] and "RD:2" in bodies(srv_b, BF),
+          f"3j(i) one deferred per link and target: the second, under another pane id, is queue_full ({got})")
+    rogue.wait(timeout=10)
+    tell(BF_CTL, BF_LOG, "clear")
+    check(wait_b_idle(BF, 12), "3j BF is Idle before the typing guard")
+    typing = [True]
+
+    def keep_typing():
+        c = Client(srv_b.sock)
+        c.hello()
+        while typing[0]:
+            c.send({"InputToPane": {"pane_id": BF, "data": list(b"x")}})
+            time.sleep(0.2)
+        c.close()
+
+    typist = threading.Thread(target=keep_typing)
+    typist.start()
+    time.sleep(0.6)
+    parked = [origin_send(BF, f"RP:{n}", origin(pane_id=n, msg_id=10 + n)) for n in range(1, 5)]
+    for n, frame in enumerate(parked, 1):
+        frame["MsgSend"].update(deliver="Submit", req=n)
+    got, rogue2 = peer_frames([{"PeerLink": {"name": "rogue2"}}] + parked, hold=20.0)
+    refused = [m for m in (got or []) if isinstance(m, dict) and "Error" in m]
+    check(len(refused) == 1 and err_of(refused[0])[0] == "queue_full" and "link rogue2" in err_of(refused[0])[1]
+          and refused[0]["Error"].get("req") == 4,
+          f"3j(ii) the 4th parked send on a link of link_parked_max = 3 is queue_full naming the link ({got})")
+    typing[0] = False
+    typist.join()
+    end = time.time() + 15
+    while time.time() < end and fake_text(BF_LOG).count("RP:") < 3:
+        time.sleep(0.2)
+    order = re.findall(r"RP:(\d)", fake_text(BF_LOG))
+    check(order == ["1", "2", "3"], f"3j(ii) ...and once the person stops, the three are typed, in order ({order})")
+    rogue2.kill()
+
+    # --- 3h -----------------------------------------------------------------
+    check(wait_b_idle(BF, 12), "3h BF is Idle before the lost link")
+    lost = type_start(cli_a, A1, a_send_cmd(f"mini:%{BF}", "GO:4000-threeh", "submit", "--wait --timeout 20"))
+    end = time.time() + 10
+    while time.time() < end and "threeh" not in fake_text(BF_LOG):
+        time.sleep(0.1)
+    time.sleep(0.5)
+    check(drop_link(), "3h the relay is killed while the --wait is parked")
+    c, o, e = type_wait(lost, 15)
+    check(c == 1 and "forward_unknown" in e and "link lost" in e,
+          f"3h the parked CLI is told the outcome is unknown, link lost (exit {c}, err {e!r})")
+    states = {m["body"]: m["state"] for m in box(srv_b, BF)}
+    check(states.get("R:GO:4000-threeh") == "Submitted",
+          f"3h ...while on B the message was typed and is Submitted ({states.get('R:GO:4000-threeh')})")
+
+    # --- 3i -----------------------------------------------------------------
+    typed_bodies = ("plain-three-a", "GO:2500-threeb", "deferred-threef")
+    leaked = [(b, k) for b in typed_bodies
+              for k, v in (("A", srv_a.log()), ("B", srv_b.log()), ("relay", relay_log() or ""),
+                           ("A client.log", client_log_a())) if b in v]
+    check(not leaked, f"3i a typed forward's body is in no log ({leaked})")
+
+    # --- 3g -----------------------------------------------------------------
+    set_mode("echo")
+    stray_line = "dropping an answer with no req, or one naming no send in flight"
+    strays_before = srv_a.log().count(stray_line)
+    code, out, err = type_cli(cli_a, A1, a_send_cmd(f"mini:%{B6}", "to-echo", "mailbox"), timeout=30)
+    strays = srv_a.log().count(stray_line) - strays_before
+    check(code == 1 and "forward_unknown" in err and "no answer" in err and strays == 1,
+          f"3g answers naming no send are dropped, logged once, never taken as this send's (exit {code}, err {err!r}, logged {strays})")
+    check(drop_link(), "3g ...and the echo link is torn down after")
+    set_mode("relay")
 
     # --- 1r -----------------------------------------------------------------
     # B restarts below, so the next send dials afresh; 16 panes are made on A

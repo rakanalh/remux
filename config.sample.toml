@@ -1084,6 +1084,8 @@
 #                      (`rate_limited`), so a looping agent cannot flood a peer.
 # link_rate_per_10s    messages one other server may deliver here in any 10
 #                      seconds, whatever pane it says each is from.
+# link_parked_max      sends one other server may have waiting here at once
+#                      to be typed or answered (`queue_full`).
 # persist              keep mailboxes and names across `remux restart`, in
 #                      $XDG_DATA_HOME/remux/mailbox.json (mode 0600). Message
 #                      bodies are then stored on disk; `false` keeps them in
@@ -1112,6 +1114,7 @@
 # max_body_bytes = 65536
 # rate_per_10s = 20
 # link_rate_per_10s = 60
+# link_parked_max = 8
 # persist = true
 # typing_guard_ms = 3000
 # typing_guard_unattended_ms = 500
@@ -1191,6 +1194,12 @@
 #                 to send to it: "replies" (default) only answers to messages
 #                 sent from here over that link, "any" anything addressed to a
 #                 pane here, "off" nothing.
+#
+# Any machine whose remux can reach this one over ssh as you (it has a
+# [remotes] entry pointing here) can store mail in, and type into, this
+# machine's agent panes, subject only to [messaging.submit] here. `inbound`
+# does not restrict it: `inbound` governs replies over links this machine
+# dials. It is the same trust a remote view already has.
 #
 # To send messages to a remote (`remux msg send mini:alpha`), its key must be a
 # valid host name: no leading - or ., and none of user, system, claude, remux,

@@ -473,23 +473,13 @@ fn send_timeout_of(
 /// latest. Both count from when the server stores the message, so the
 /// longer of the two is added, not both.
 fn send_deadline(deliver: Deliver, defer: bool, wait: bool, timeout: Option<Duration>) -> Duration {
-    use crate::server::daemon::{
-        DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS, SUBMIT_BUDGET_MS, SUBMIT_HOLD_MS,
-    };
-    let asked = timeout.unwrap_or(Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS));
-    let max = Duration::from_millis(MAX_WAIT_MS);
-    let deferred = if defer {
-        asked.clamp(Duration::from_millis(SUBMIT_HOLD_MS), max)
-    } else {
-        Duration::ZERO
-    };
-    let waited = if wait { asked.min(max) } else { Duration::ZERO };
-    match deliver {
-        Deliver::Mailbox => REPLY_DEADLINE,
-        Deliver::Submit | Deliver::Auto => {
-            REPLY_DEADLINE + Duration::from_millis(SUBMIT_BUDGET_MS) + deferred.max(waited)
-        }
-    }
+    REPLY_DEADLINE
+        + crate::server::daemon::submit_answer_budget(
+            deliver,
+            defer,
+            wait,
+            timeout.map(|t| t.as_millis() as u64),
+        )
 }
 
 /// What a send to another server waits on top of [`send_deadline`]: the
@@ -643,7 +633,11 @@ fn sent_line(
     } else {
         format!(" ({})", why.join("; "))
     };
-    format!("sent #{id} to %{pane}{named}: {how}{ended}{why}{advice}")
+    let to = match &host {
+        Some(host) => format!("{host}:%{pane}"),
+        None => format!("%{pane}"),
+    };
+    format!("sent #{id} to {to}{named}: {how}{ended}{why}{advice}")
 }
 
 /// The body under its header: every line indented and escaped, so no line of
@@ -844,6 +838,29 @@ mod tests {
                 > server_worst
         );
         assert_eq!(forward_deadline(&local), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_remote_submit_is_waited_for_past_the_servers_forward_of_it() {
+        use crate::server::daemon::{
+            forward_wait, submit_answer_budget, CALLER_ATTRIBUTION_TIMEOUT,
+        };
+        let remote: Address = "mini:%4".parse().unwrap();
+        let ms = Duration::from_millis;
+        for (deliver, defer, wait, timeout) in [
+            (Deliver::Submit, false, false, None),
+            (Deliver::Auto, false, true, Some(ms(20_000))),
+            (Deliver::Submit, true, false, Some(ms(120_000))),
+        ] {
+            let server_worst = CALLER_ATTRIBUTION_TIMEOUT
+                + forward_wait(Duration::MAX)
+                + submit_answer_budget(deliver, defer, wait, timeout.map(|t| t.as_millis() as u64));
+            assert!(
+                send_deadline(deliver, defer, wait, timeout) + forward_deadline(&remote)
+                    > server_worst,
+                "{deliver:?} defer={defer} wait={wait}"
+            );
+        }
     }
 
     #[test]

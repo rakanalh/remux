@@ -21,6 +21,8 @@ pub struct Limits {
     pub max_body: usize,
     pub rate_per_10s: u32,
     pub ttl_ms: u64,
+    /// Sends one peer link may have parked at once.
+    pub link_parked_max: usize,
 }
 
 /// Which mailbox cap a send ran into, with what the mailbox holds.
@@ -201,10 +203,74 @@ pub struct Waiter {
     pub cancel: tokio::sync::oneshot::Sender<()>,
 }
 
-/// Where a parked send is answered: the connection that made it.
+/// Where a parked send is answered: the connection that made it, and the
+/// `req` it named, which a peer link carrying many sends matches answers by.
 pub struct Reply {
     pub client_id: u64,
-    pub tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerMessage>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerMessage>,
+    req: Option<u64>,
+}
+
+impl Reply {
+    pub fn new(
+        client_id: u64,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerMessage>,
+        req: Option<u64>,
+    ) -> Self {
+        Reply { client_id, tx, req }
+    }
+
+    /// Answer the send, echoing its `req`. The only way to reach `tx`, so
+    /// no answer can leave without it.
+    pub fn send(&self, message: crate::protocol::ServerMessage) {
+        let _ = self.tx.send(message.with_req(self.req));
+    }
+}
+
+/// Who a queued message is from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitFrom {
+    /// A pane on this server.
+    Pane { pane: PaneId, name: Option<String> },
+    /// A pane on the server at the other end of the peer link `link`, which
+    /// knows the message as `origin_id`.
+    Remote {
+        link: String,
+        pane: PaneId,
+        name: Option<String>,
+        origin_id: MsgId,
+    },
+}
+
+/// What a sender's share of a pane's queue, and of waits, is counted by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SubmitKey {
+    Pane(PaneId),
+    /// Every remote sender of one link, whatever pane id its origin claims:
+    /// rotating that buys no extra share.
+    Link(String),
+}
+
+impl SubmitFrom {
+    pub fn pane(pane: PaneId) -> Self {
+        SubmitFrom::Pane { pane, name: None }
+    }
+
+    pub fn key(&self) -> SubmitKey {
+        match self {
+            SubmitFrom::Pane { pane, .. } => SubmitKey::Pane(*pane),
+            SubmitFrom::Remote { link, .. } => SubmitKey::Link(link.clone()),
+        }
+    }
+
+    /// The pane on this server, for the checks that ask whether a sender has
+    /// closed: a remote pane's id names nothing here.
+    pub fn local_pane(&self) -> Option<PaneId> {
+        match self {
+            SubmitFrom::Pane { pane, .. } => Some(*pane),
+            SubmitFrom::Remote { .. } => None,
+        }
+    }
 }
 
 /// The most `agent wait` callers parked at once, across every pane.
@@ -226,9 +292,8 @@ pub struct SubmitEntry {
     pub pane: PaneId,
     pub deliver: crate::protocol::Deliver,
     pub body: String,
-    /// The sender, for the envelope.
-    pub from_pane: PaneId,
-    pub from_name: Option<String>,
+    /// The sender, for the envelope and its share of the queue.
+    pub from: SubmitFrom,
     pub enqueued_at: Instant,
     /// Waits while the agent is waiting on its user, rather than being
     /// answered `agent_blocked`.
@@ -258,8 +323,8 @@ pub struct SubmitEntry {
 pub struct SubmitWait {
     pub id: MsgId,
     pub pane: PaneId,
-    /// The sender's pane, which a sender's share of waits is counted by.
-    pub from_pane: PaneId,
+    /// What the sender's share of waits is counted by.
+    pub from: SubmitKey,
     /// How the message was sent, which decides how a stall is answered.
     pub deliver: crate::protocol::Deliver,
     pub reply: Reply,
@@ -287,10 +352,12 @@ pub struct SubmitHead {
 }
 
 /// Why a submit could not be queued.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueRefusal {
     /// The sender's connection already has a send waiting for its answer.
     SendParked,
+    /// The sender's peer link already has `link_parked_max` sends waiting.
+    LinkFull { link: String, max: usize },
     /// The pane's queue, or the sender's share of it, is full.
     QueueFull,
 }
@@ -891,33 +958,58 @@ impl Messaging {
     /// connection parks at most one, and a second cannot supersede the first:
     /// a send's message is already stored.
     pub fn has_parked_send(&self, client_id: u64) -> bool {
+        self.parked_sends(client_id) > 0
+    }
+
+    /// How many requests connection `client_id` has parked. A peer link may
+    /// park up to `link_parked_max`, one per `req`.
+    pub fn parked_sends(&self, client_id: u64) -> usize {
         let is_it =
             |reply: &Option<Reply>| reply.as_ref().is_some_and(|r| r.client_id == client_id);
         self.submit_queues
             .values()
             .flatten()
-            .any(|queued| is_it(&queued.reply))
-            || self.in_flight.values().any(is_it)
-            || self
+            .filter(|queued| is_it(&queued.reply))
+            .count()
+            + self.in_flight.values().filter(|r| is_it(r)).count()
+            + self
                 .submit_waits
                 .values()
-                .any(|w| w.reply.client_id == client_id)
-            || self
+                .filter(|w| w.reply.client_id == client_id)
+                .count()
+            + self
                 .state_waits
                 .values()
                 .flatten()
-                .any(|w| w.reply.client_id == client_id)
+                .filter(|w| w.reply.client_id == client_id)
+                .count()
+    }
+
+    /// Whether a send from `from` on connection `client_id` must be refused
+    /// before it is stored because the connection is out of room to park
+    /// it: one for a local connection, `link_parked_max` for a peer link.
+    pub fn park_refusal(&self, client_id: u64, from: &SubmitFrom) -> Option<EnqueueRefusal> {
+        let parked = self.parked_sends(client_id);
+        match from {
+            SubmitFrom::Pane { .. } => (parked > 0).then_some(EnqueueRefusal::SendParked),
+            SubmitFrom::Remote { link, .. } => {
+                (parked >= self.limits.link_parked_max).then(|| EnqueueRefusal::LinkFull {
+                    link: link.clone(),
+                    max: self.limits.link_parked_max,
+                })
+            }
+        }
     }
 
     /// How many waits pane `from` has, parked or queued to be typed. An
     /// entry being typed is not counted: there is at most one per target.
-    fn waits_from(&self, from: PaneId) -> usize {
-        let parked = self.submit_waits.values().filter(|w| w.from_pane == from);
+    fn waits_from(&self, from: &SubmitKey) -> usize {
+        let parked = self.submit_waits.values().filter(|w| &w.from == from);
         let queued = self
             .submit_queues
             .values()
             .flatten()
-            .filter(|e| e.wait_until.is_some() && e.from_pane == from);
+            .filter(|e| e.wait_until.is_some() && &e.from.key() == from);
         parked.count() + queued.count()
     }
 
@@ -930,24 +1022,19 @@ impl Messaging {
     /// everyone else out for that long.
     pub fn enqueue_submit(&mut self, entry: SubmitEntry, cap: usize) -> Result<(), EnqueueRefusal> {
         if let Some(client_id) = entry.reply.as_ref().map(|r| r.client_id) {
-            if self.has_parked_send(client_id) {
-                return Err(EnqueueRefusal::SendParked);
+            if let Some(refusal) = self.park_refusal(client_id, &entry.from) {
+                return Err(refusal);
             }
         }
         // A wait lasts as long as its sender asked, so one sender pane, with a
         // connection per send, could otherwise hold any number of them.
-        if entry.wait_until.is_some() && self.waits_from(entry.from_pane) >= (cap / 2).max(1) {
+        let key = entry.from.key();
+        if entry.wait_until.is_some() && self.waits_from(&key) >= (cap / 2).max(1) {
             return Err(EnqueueRefusal::QueueFull);
         }
         let queue = self.submit_queues.entry(entry.pane).or_default();
-        let own = queue
-            .iter()
-            .filter(|e| e.from_pane == entry.from_pane)
-            .count();
-        let deferred = entry.defer
-            && queue
-                .iter()
-                .any(|e| e.defer && e.from_pane == entry.from_pane);
+        let own = queue.iter().filter(|e| e.from.key() == key).count();
+        let deferred = entry.defer && queue.iter().any(|e| e.defer && e.from.key() == key);
         if queue.len() >= cap || own >= (cap / 2).max(1) || deferred {
             if queue.is_empty() {
                 self.submit_queues.remove(&entry.pane);
@@ -1006,7 +1093,7 @@ impl Messaging {
     pub fn take_submits_from(&mut self, from: PaneId) -> Vec<SubmitEntry> {
         let mut taken = Vec::new();
         for queue in self.submit_queues.values_mut() {
-            taken.extend(take_where(queue, |e| e.from_pane == from));
+            taken.extend(take_where(queue, |e| e.from.local_pane() == Some(from)));
         }
         if !taken.is_empty() {
             self.submit_queues.retain(|_, queue| !queue.is_empty());
@@ -1801,6 +1888,7 @@ mod tests {
             max_body: 64 * 1024,
             rate_per_10s: 1000,
             ttl_ms: 24 * 3_600_000,
+            link_parked_max: 8,
         }
     }
 
@@ -2755,8 +2843,7 @@ mod tests {
             pane,
             deliver: crate::protocol::Deliver::Submit,
             body: format!("body {id}"),
-            from_pane: 100 + id,
-            from_name: None,
+            from: SubmitFrom::pane(100 + id),
             enqueued_at: Instant::now(),
             defer: false,
             deadline: Instant::now() + std::time::Duration::from_secs(60),
@@ -2783,7 +2870,7 @@ mod tests {
         SubmitWait {
             id,
             pane,
-            from_pane: 100 + id,
+            from: SubmitKey::Pane(100 + id),
             deliver: crate::protocol::Deliver::Submit,
             reply: reply(client_id),
             machine: crate::server::submit::WaitMachine::new(
@@ -2949,14 +3036,14 @@ mod tests {
     fn a_sender_pane_holds_at_most_its_share_of_waits() {
         let mut m = Messaging::new(limits());
         let waiting = |id: MsgId, pane: PaneId, client: u64| SubmitEntry {
-            from_pane: 40,
+            from: SubmitFrom::pane(40),
             wait_until: Some(Instant::now() + std::time::Duration::from_secs(60)),
             ..entry(id, pane, Some(client))
         };
         // A queue of 4 is a share of 2: one parked and one queued fill it,
         // whichever panes they are for.
         m.park_submit_wait(SubmitWait {
-            from_pane: 40,
+            from: SubmitKey::Pane(40),
             ..turn_wait(1, 5, 70)
         });
         assert_eq!(m.enqueue_submit(waiting(2, 6, 71), 4), Ok(()));
@@ -2974,10 +3061,108 @@ mod tests {
     }
 
     fn reply(client_id: u64) -> Reply {
-        Reply {
-            client_id,
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+        Reply::new(client_id, tokio::sync::mpsc::unbounded_channel().0, None)
+    }
+
+    fn from_remote(link: &str, pane: PaneId) -> SubmitFrom {
+        SubmitFrom::Remote {
+            link: link.into(),
+            pane,
+            name: None,
+            origin_id: 1,
         }
+    }
+
+    #[test]
+    fn a_peer_connection_may_park_one_send_per_req_up_to_its_cap() {
+        let mut m = Messaging::new(Limits {
+            link_parked_max: 3,
+            ..limits()
+        });
+        let from_link = |id: MsgId, pane| SubmitEntry {
+            from: from_remote("rogue", pane),
+            ..entry(id, 10 + id, Some(7))
+        };
+        for id in 1..=3 {
+            assert_eq!(m.enqueue_submit(from_link(id, id), 8), Ok(()), "send {id}");
+        }
+        assert_eq!(
+            m.enqueue_submit(from_link(4, 4), 8),
+            Err(EnqueueRefusal::LinkFull {
+                link: "rogue".into(),
+                max: 3
+            })
+        );
+        assert!(m.park_refusal(7, &from_remote("rogue", 9)).is_some());
+    }
+
+    #[test]
+    fn a_local_connection_still_parks_one() {
+        let mut m = Messaging::new(limits());
+        assert_eq!(m.enqueue_submit(entry(1, 5, Some(7)), 8), Ok(()));
+        assert_eq!(
+            m.enqueue_submit(entry(2, 6, Some(7)), 8),
+            Err(EnqueueRefusal::SendParked)
+        );
+        assert_eq!(
+            m.park_refusal(7, &SubmitFrom::pane(3)),
+            Some(EnqueueRefusal::SendParked)
+        );
+    }
+
+    #[test]
+    fn a_links_senders_share_one_slice_of_a_queue_whatever_pane_ids_they_claim() {
+        let mut m = Messaging::new(limits());
+        let from_link = |id: MsgId, pane| SubmitEntry {
+            from: from_remote("rogue", pane),
+            ..entry(id, 5, None)
+        };
+        for id in 1..=4 {
+            assert_eq!(m.enqueue_submit(from_link(id, id), 8), Ok(()), "entry {id}");
+        }
+        assert_eq!(
+            m.enqueue_submit(from_link(5, 5), 8),
+            Err(EnqueueRefusal::QueueFull),
+            "a fifth from the link, under a fifth pane id"
+        );
+        let deferred = |id: MsgId, pane| SubmitEntry {
+            defer: true,
+            from: from_remote("other", pane),
+            ..entry(id, 6, None)
+        };
+        assert_eq!(m.enqueue_submit(deferred(6, 1), 8), Ok(()));
+        assert_eq!(
+            m.enqueue_submit(deferred(7, 2), 8),
+            Err(EnqueueRefusal::QueueFull),
+            "one deferred per link and target, whatever pane id"
+        );
+    }
+
+    #[test]
+    fn a_closing_local_pane_takes_only_its_own_sends_not_a_remote_pane_of_the_same_id() {
+        let mut m = Messaging::new(limits());
+        m.enqueue_submit(
+            SubmitEntry {
+                from: SubmitFrom::pane(40),
+                ..entry(1, 5, None)
+            },
+            8,
+        )
+        .unwrap();
+        m.enqueue_submit(
+            SubmitEntry {
+                from: from_remote("laptop", 40),
+                ..entry(2, 5, None)
+            },
+            8,
+        )
+        .unwrap();
+        let taken: Vec<MsgId> = m.take_submits_from(40).iter().map(|e| e.id).collect();
+        assert_eq!(taken, [1]);
+        assert_eq!(
+            m.submit_heads().iter().map(|h| h.id).collect::<Vec<_>>(),
+            [2]
+        );
     }
 
     #[test]
@@ -3000,7 +3185,7 @@ mod tests {
     fn one_sender_holds_at_most_half_a_panes_queue() {
         let mut m = Messaging::new(limits());
         let from = |id, from_pane| SubmitEntry {
-            from_pane,
+            from: SubmitFrom::pane(from_pane),
             ..entry(id, 5, None)
         };
         for id in 1..=4 {
@@ -3247,7 +3432,7 @@ mod tests {
         let mut m = Messaging::new(limits());
         let deferred = |id, pane, from| SubmitEntry {
             defer: true,
-            from_pane: from,
+            from: SubmitFrom::pane(from),
             ..entry(id, pane, None)
         };
         m.enqueue_submit(deferred(1, 5, 40), 8).unwrap();
@@ -3266,7 +3451,7 @@ mod tests {
             "another sender"
         );
         let plain = SubmitEntry {
-            from_pane: 40,
+            from: SubmitFrom::pane(40),
             ..entry(5, 5, None)
         };
         assert_eq!(m.enqueue_submit(plain, 8), Ok(()), "not deferred");
@@ -3276,7 +3461,7 @@ mod tests {
     fn a_closed_pane_s_queued_sends_are_taken_from_every_queue() {
         let mut m = Messaging::new(limits());
         let from = |id, pane, from| SubmitEntry {
-            from_pane: from,
+            from: SubmitFrom::pane(from),
             ..entry(id, pane, None)
         };
         m.enqueue_submit(from(1, 5, 40), 8).unwrap();

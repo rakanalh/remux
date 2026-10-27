@@ -15,6 +15,9 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
   eatsend  a correct handshake and peer link, then exit on the first send,
            unanswered: the send was written and its outcome is unknown
   mute     the same, but stay open and never answer the send
+  echo     a far server that answers every forwarded send with two answers
+           naming no send in flight (req 999, then no req at all), never
+           with its own
   hostile  a far server that pushes messages back: one MsgInbound before
            its Pong (req 100), then, once the dialler forwards a send (which
            it answers), each frame in $RMX_SHIM_PUSH with "$PANE" and
@@ -24,7 +27,7 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
 Before the relay, the shim lists its own open descriptors to `$RMX_SHIM_FDS`:
 the relay inherits exactly these, and decision 71 says they are 0, 1 and 2.
 
-Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute|hostile`) it
+Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute|hostile|echo`) it
 is the far side of the link for the modes that need no real server.
 """
 import json
@@ -47,6 +50,7 @@ case "$mode" in
   eatsend) exec "$RMX_PY" "$RMX_SHIM_PY" eatsend ;;
   mute)    exec "$RMX_PY" "$RMX_SHIM_PY" mute ;;
   hostile) exec "$RMX_PY" "$RMX_SHIM_PY" hostile ;;
+  echo)    exec "$RMX_PY" "$RMX_SHIM_PY" echo ;;
 esac
 """
 
@@ -78,6 +82,19 @@ def main(mode):
         _read_frame(stdin)
     if mode == "hostile":
         return _hostile(stdin, stdout)
+    if mode == "echo":
+        while True:
+            frame = _read_frame(stdin)
+            if frame is None:
+                return 0
+            if "Ping" in frame:
+                _write_frame(stdout, {"Pong": {"nonce": frame["Ping"]["nonce"]}})
+            elif "MsgSend" in frame:
+                for req in (999, None):
+                    _write_frame(stdout, {"MsgSent": {
+                        "id": 1, "to": {"host": None, "pane_id": 1, "name": None},
+                        "delivery": "Mailbox", "reason": None, "timed_out": False,
+                        "final_state": None, "req": req}})
     if mode in ("eatsend", "mute"):
         # The far server answers a PeerLink only to refuse it, and the ping
         # after it with a Pong, which is what tells the dialler the link is up.
