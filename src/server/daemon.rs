@@ -30,6 +30,7 @@ use crate::server::identity;
 use crate::server::layout::{
     self, CustomLayout, EnabledLayouts, LayoutMode, LayoutNode, MasterLayout, PaneId, Rect,
 };
+use crate::server::messaging::Messaging;
 use crate::server::persistence::{self, PersistedState};
 use crate::server::pty::{self, PaneIdentity, Pty};
 use crate::server::session::{self, Folder, ServerState, Session};
@@ -482,8 +483,10 @@ pub(crate) fn process_pgid(_pid: i32) -> Option<i32> {
     None
 }
 
+/// A pane whose program has exited is left out, so that a leftover process
+/// still in its session is not attributed to it.
 fn proc_index(ps: &HashMap<PaneId, PaneData>) -> identity::ProcIndex {
-    identity::ProcIndex::new(ps.iter().map(|(&id, pd)| {
+    identity::ProcIndex::new(ps.iter().filter(|(_, pd)| !pd.exited).map(|(&id, pd)| {
         (
             pd.pty.child_pid.as_raw(),
             id,
@@ -496,6 +499,325 @@ fn proc_index(ps: &HashMap<PaneId, PaneData>) -> identity::ProcIndex {
 /// reader. Past it the peer is logged as unattributed; the line is diagnostic,
 /// so a wedged `panes` lock or a slow `/proc` must never cost a connection.
 const ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a message handler waits for its caller to be attributed.
+///
+/// The bound covers the whole check (the pin's first read, the process table,
+/// the pin's second read) and a timeout gives no verdict at all, so it is
+/// refused as `sender_unverified` with its own reason. Longer than
+/// [`ATTRIBUTION_TIMEOUT`] because here a timeout refuses the user's request
+/// rather than dropping a log line, and shorter than the CLI's 10s reply
+/// deadline so that the CLI reports the refusal instead of its own timeout.
+const CALLER_ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pane of the process that sent the frame being handled.
+///
+/// The reader loop awaits the handler that calls this, so the next frame is
+/// not read until the verdict is in or the timeout has fired. A task
+/// abandoned by the timeout is never awaited again, so its late answer is
+/// dropped rather than applied to a later frame.
+async fn attribute_frame_caller(
+    peer: &Arc<identity::Peer>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> Result<identity::Attribution, identity::Unverified> {
+    let peer = Arc::clone(peer);
+    let checked = tokio::time::timeout(CALLER_ATTRIBUTION_TIMEOUT, async {
+        let index = proc_index(&*panes.lock().await);
+        tokio::task::spawn_blocking(move || {
+            identity::attribute_caller(&*peer, &index, &identity::system_table())
+        })
+        .await
+    })
+    .await;
+    match checked {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(e)) => {
+            log::warn!("identity: attribution task failed: {e}");
+            Err(identity::Unverified::CheckFailed)
+        }
+        Err(_) => Err(identity::Unverified::TimedOut),
+    }
+}
+
+/// The attribution line a message handler writes. `how` is what the harnesses
+/// read to tell the session-id path from the walk.
+fn log_caller(client_id: u64, verb: &str, found: &identity::Attribution) {
+    log::debug!(
+        "identity: client_id={client_id} {verb} caller -> pane %{} by {:?}{}",
+        found.pane,
+        found.how,
+        if found.tty_differs {
+            "; its tty differs (nested pty?)"
+        } else {
+            ""
+        }
+    );
+}
+
+async fn reply(
+    client_id: u64,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    msg: ServerMessage,
+) {
+    if let Some(conn) = clients.lock().await.get(&client_id) {
+        let _ = conn.tx.send(msg);
+    }
+}
+
+/// The panes a message may name: in the table and not exited.
+async fn live_panes(
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+) -> std::collections::HashSet<PaneId> {
+    panes
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, pd)| !pd.exited)
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// A [`ClientMessage::MsgSend`], unpacked.
+struct OutgoingMessage {
+    to: Address,
+    body: String,
+    deliver: Deliver,
+    reply_to: Option<MsgRef>,
+    pane_hint: Option<PaneId>,
+}
+
+/// A [`ClientMessage::MsgRead`], unpacked.
+struct MailboxRead {
+    pane: Option<PaneId>,
+    all: bool,
+    peek: bool,
+    wait_ms: Option<u64>,
+    pane_hint: Option<PaneId>,
+}
+
+/// A caller-supplied string as it may be logged: Debug-quoted, so a newline
+/// cannot start a forged log line, and cut to a bounded length.
+fn loggable(s: &str) -> String {
+    const MAX: usize = 64;
+    let quoted = format!("{s:?}");
+    if quoted.chars().count() <= MAX {
+        quoted
+    } else {
+        format!("{}...", quoted.chars().take(MAX).collect::<String>())
+    }
+}
+
+/// Why a popup is refused, as the popup's own pane: it is in no tab and no
+/// session tree, so nothing could address it or name where it lives.
+const POPUP_REFUSED: &str = "a popup cannot send or receive messages";
+
+fn log_hint(pane_hint: Option<PaneId>, attributed: PaneId) {
+    if let Some(hint) = pane_hint.filter(|&hint| hint != attributed) {
+        log::info!(
+            "msg: pane_hint=%{hint} disagrees with attribution %{attributed}; using the attribution"
+        );
+    }
+}
+
+/// Store a message from the calling pane. The sender is the attribution,
+/// never `pane_hint` and never anything else the caller sent; a caller that
+/// cannot be attributed is refused rather than sent anonymously.
+async fn handle_msg_send(
+    client_id: u64,
+    msg: OutgoingMessage,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    use crate::server::messaging::Refusal;
+
+    let bad_host = msg
+        .to
+        .host
+        .iter()
+        .chain(msg.reply_to.as_ref().and_then(|r| r.host.as_ref()))
+        .find(|host| !valid_host(host));
+    if let Some(host) = bad_host {
+        let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
+        return ServerMessage::refused(refusal.code(), refusal.message());
+    }
+    if msg.to.host.is_some() {
+        return ServerMessage::refused(
+            "route_unavailable",
+            format!(
+                "{}: messages to another server are not routed yet",
+                loggable(&msg.to.to_string())
+            ),
+        );
+    }
+    // The CLI parses the address, but the wire accepts any string as a name.
+    if let Target::Name(name) = &msg.to.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return ServerMessage::refused(refusal.code(), refusal.message());
+        }
+    }
+
+    let from = match attribute_frame_caller(peer, panes).await {
+        Ok(found) => found,
+        Err(why) => {
+            log::info!(
+                "msg: sender unverified: client_id={client_id} {}{}",
+                why.reason(),
+                msg.pane_hint
+                    .map(|hint| format!(" (pane_hint=%{hint})"))
+                    .unwrap_or_default()
+            );
+            return ServerMessage::refused(
+                "sender_unverified",
+                format!("{}: {}", why.reason(), why.fix()),
+            );
+        }
+    };
+    log_caller(client_id, "MsgSend", &from);
+    log_hint(msg.pane_hint, from.pane);
+
+    let live = live_panes(panes).await;
+    let (resolved, from_name) = {
+        let store = store.lock().await;
+        (
+            store.resolve(&msg.to.target, |pane| live.contains(&pane)),
+            store.name_of(from.pane).map(str::to_string),
+        )
+    };
+    let to = match resolved {
+        Ok(to) => to,
+        Err(refusal) => return ServerMessage::refused(refusal.code(), refusal.message()),
+    };
+    let (session, to_in_a_tab, from_popup, to_popup) = {
+        let st = state.lock().await;
+        (
+            st.locate_pane(from.pane).map(|(session, _)| session),
+            st.locate_pane(to).is_some(),
+            st.is_popup(from.pane),
+            st.is_popup(to),
+        )
+    };
+    if from_popup {
+        return ServerMessage::refused("sender_unverified", POPUP_REFUSED);
+    }
+    if to_popup {
+        return ServerMessage::refused("no_such_target", POPUP_REFUSED);
+    }
+    let Some(session) = session else {
+        return ServerMessage::refused(
+            "sender_unverified",
+            format!("pane %{} is closing", from.pane),
+        );
+    };
+    if !to_in_a_tab {
+        let refusal = Refusal::NoSuchTarget(format!("%{to}"));
+        return ServerMessage::refused(refusal.code(), refusal.message());
+    }
+
+    let bytes = msg.body.len();
+    let sent = {
+        let mut store = store.lock().await;
+        let to_name = store.name_of(to).map(str::to_string);
+        store
+            .send(
+                Sender::Pane {
+                    pane_id: from.pane,
+                    name: from_name.clone(),
+                    session,
+                },
+                to,
+                msg.body,
+                msg.reply_to,
+                now_ms(),
+                std::time::Instant::now(),
+            )
+            .map(|id| (id, to_name))
+    };
+    match sent {
+        Ok((id, to_name)) => {
+            log::info!(
+                "msg: id={id} from=%{}({}) to=%{to} bytes={bytes} deliver={:?} -> mailbox",
+                from.pane,
+                from_name.as_deref().unwrap_or("-"),
+                msg.deliver
+            );
+            ServerMessage::MsgSent {
+                id,
+                to: Resolved {
+                    host: None,
+                    pane_id: to,
+                    name: to_name,
+                },
+                delivery: Delivery::Mailbox,
+                // Every message is stored. Typing it into the pane is a later
+                // release, so a request for that is answered, not refused.
+                reason: (msg.deliver != Deliver::Mailbox).then(|| "submit_unavailable".to_string()),
+            }
+        }
+        Err(refusal) => {
+            log::info!(
+                "msg: refused from=%{} to=%{to}: {}",
+                from.pane,
+                refusal.code()
+            );
+            ServerMessage::refused(refusal.code(), refusal.message())
+        }
+    }
+}
+
+/// List a mailbox. Only the caller's own mailbox is ever marked read: a read
+/// of anyone else's, or from outside any pane, is a peek whatever it asked.
+async fn handle_msg_read(
+    client_id: u64,
+    msg: MailboxRead,
+    peer: &Arc<identity::Peer>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    store: &Mutex<Messaging>,
+) -> ServerMessage {
+    let caller = attribute_frame_caller(peer, panes).await;
+    if let Ok(found) = &caller {
+        log_caller(client_id, "MsgRead", found);
+        log_hint(msg.pane_hint, found.pane);
+    }
+    let pane = match (msg.pane, &caller) {
+        (Some(pane), _) => pane,
+        (None, Ok(found)) => found.pane,
+        (None, Err(why)) => {
+            return ServerMessage::refused(
+                "not_in_pane",
+                format!("not in a pane ({}): pass --pane %N", why.reason()),
+            )
+        }
+    };
+    let live = live_panes(panes).await.contains(&pane);
+    let (in_a_tab, popup) = {
+        let st = state.lock().await;
+        (st.locate_pane(pane).is_some(), st.is_popup(pane))
+    };
+    if popup {
+        return ServerMessage::refused("no_such_target", POPUP_REFUSED);
+    }
+    if !live || !in_a_tab {
+        return ServerMessage::refused("no_such_target", format!("no such target: %{pane}"));
+    }
+    let own = caller.as_ref().is_ok_and(|found| found.pane == pane);
+    let mark = own && !msg.peek;
+    if let Some(wait_ms) = msg.wait_ms {
+        log::debug!("msg: read wait_ms={wait_ms} is not supported yet; answering at once");
+    }
+    let messages = store.lock().await.read(pane, msg.all, mark, now_ms());
+    if !messages.is_empty() {
+        log::info!("msg: read pane=%{pane} n={} marked={mark}", messages.len());
+    }
+    ServerMessage::MsgList {
+        pane,
+        messages,
+        timed_out: false,
+    }
+}
 
 /// Log which pane a new connection's peer runs in, once per connection.
 ///
@@ -752,6 +1074,10 @@ struct PaneData {
     /// Process names and working directory, read outside the `panes` lock by
     /// [`refresh_pane_names`] so that naming a pane never does a syscall.
     names: PaneNames,
+    /// The pane's program has exited. Such a pane can stay in the table when
+    /// `close_pane` declines to close it (a background tab), and it must not
+    /// be a message target or a sender's pane in the meantime.
+    exited: bool,
 }
 
 /// A pane's cached process names and working directory.
@@ -1118,6 +1444,7 @@ impl RemuxServer {
     /// Create a new server instance.
     fn new(config: Config) -> Self {
         PANE_TITLE.get_or_init(|| config.appearance.pane_title.clone());
+        MESSAGING.get_or_init(|| Mutex::new(Messaging::new(config.messaging.limits())));
         Self {
             state: Arc::new(Mutex::new(ServerState::new())),
             panes: Arc::new(Mutex::new(HashMap::new())),
@@ -1520,13 +1847,18 @@ impl RemuxServer {
             let mut reader = read_half;
             // Owned by the reader for the life of the connection, which keeps
             // the connector pinned for every frame this loop reads.
-            let _peer = peer;
+            // A message handler that attributes its caller does so before this
+            // loop reads the next frame, because `handle_client_message` is
+            // awaited here rather than spawned. The macOS pin depends on that
+            // order: its token names whoever last used the peer's end.
+            let peer = peer;
             loop {
                 match read_message::<ClientMessage>(&mut reader).await {
                     Ok(Some(msg)) => {
                         if let Err(e) = handle_client_message(
                             client_id,
                             msg,
+                            &peer,
                             &state,
                             &panes,
                             &clients,
@@ -1541,6 +1873,7 @@ impl RemuxServer {
                             if let Some(client) = cls.get(&client_id) {
                                 let _ = client.tx.send(ServerMessage::Error {
                                     message: format!("{e}"),
+                                    code: None,
                                 });
                             }
                         }
@@ -1697,6 +2030,7 @@ fn log_list_directory(client_id: u64, path: &str) {
 async fn handle_client_message(
     client_id: u64,
     msg: ClientMessage,
+    peer: &Arc<identity::Peer>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -1763,6 +2097,37 @@ async fn handle_client_message(
         ClientMessage::ListDirectory { path } => {
             log_list_directory(client_id, path);
         }
+        // Every field is named, so a field added later cannot reach the
+        // catch-all below: a message body is user content and never logged.
+        ClientMessage::MsgSend {
+            to,
+            body,
+            deliver,
+            reply_to,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=MsgSend(to={}, deliver={deliver:?}, {} bytes, \
+                 reply_to={}, pane_hint={pane_hint:?})",
+                loggable(&to.to_string()),
+                body.len(),
+                reply_to
+                    .as_ref()
+                    .map_or("None".to_string(), |r| loggable(&format!("{r:?}")))
+            );
+        }
+        ClientMessage::MsgRead {
+            pane,
+            all,
+            peek,
+            wait_ms,
+            pane_hint,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=MsgRead(pane={pane:?}, all={all}, peek={peek}, \
+                 wait_ms={wait_ms:?}, pane_hint={pane_hint:?})"
+            );
+        }
         ClientMessage::ScrollDelta { delta } => {
             log::debug!("server: client_id={client_id} msg=ScrollDelta(delta={delta})");
         }
@@ -1784,6 +2149,50 @@ async fn handle_client_message(
     }
 
     match msg {
+        ClientMessage::MsgSend {
+            to,
+            body,
+            deliver,
+            reply_to,
+            pane_hint,
+        } => {
+            let outgoing = OutgoingMessage {
+                to,
+                body,
+                deliver,
+                reply_to,
+                pane_hint,
+            };
+            let answer =
+                handle_msg_send(client_id, outgoing, peer, state, panes, messaging()).await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::MsgRead {
+            pane,
+            all,
+            peek,
+            wait_ms,
+            pane_hint,
+        } => {
+            let answer = handle_msg_read(
+                client_id,
+                MailboxRead {
+                    pane,
+                    all,
+                    peek,
+                    wait_ms,
+                    pane_hint,
+                },
+                peer,
+                state,
+                panes,
+                messaging(),
+            )
+            .await;
+            reply(client_id, clients, answer).await;
+            Ok(())
+        }
         ClientMessage::Attach { session_name } => {
             let result = handle_attach(
                 client_id,
@@ -2577,6 +2986,7 @@ async fn handle_attach(
             if let Some(client) = cls.get(&client_id) {
                 let _ = client.tx.send(ServerMessage::Error {
                     message: format!("session '{}' not found", session_name),
+                    code: None,
                 });
             }
             return Ok(());
@@ -4950,6 +5360,30 @@ async fn refresh_pane_names(
 /// The server's `[appearance] pane_title`, read once at startup like
 /// [`AGENT_RULES`].
 static PANE_TITLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Every mailbox and agent name on this server, set up once from `[messaging]`
+/// in [`RemuxServer::new`]. A static rather than a field because pane death
+/// reaches [`reap_panes`] through seven call chains that carry only `panes`
+/// and `clients`.
+///
+/// Taken ALONE: never while `state`, `panes` or `clients` is held, and
+/// nothing else is taken while it is held, so it adds no lock ordering.
+static MESSAGING: std::sync::OnceLock<Mutex<Messaging>> = std::sync::OnceLock::new();
+
+fn messaging() -> &'static Mutex<Messaging> {
+    MESSAGING.get_or_init(|| {
+        Mutex::new(Messaging::new(
+            crate::config::messaging::MessagingConfig::default().limits(),
+        ))
+    })
+}
+
+/// Unix milliseconds, the clock mail expiry is measured on.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
 
 fn pane_title_template() -> Option<&'static str> {
     PANE_TITLE.get().and_then(|t| t.as_deref())
@@ -7523,6 +7957,7 @@ resolved={session:?} placement={placement:?} program={:?} ({} more arg(s)) cwd={
                     ),
                     None => format!("no session named '{session}' on this server"),
                 },
+                code: None,
             },
         };
         let _ = conn.tx.send(msg);
@@ -7608,6 +8043,7 @@ async fn spawn_pane(
                     .unwrap_or_default(),
                 ..PaneNames::default()
             },
+            exited: false,
         },
     );
     Ok(())
@@ -9575,6 +10011,18 @@ async fn reap_panes(
     // Taken under `clients` alone (the panes lock above is released) to keep the
     // locks unnested.
     notify_panes_exited(&exits, clients).await;
+    {
+        let mut store = messaging().lock().await;
+        for &pane_id in pane_ids {
+            let (dropped, named) = store.drop_pane(pane_id);
+            if dropped > 0 || named {
+                log::info!(
+                    "msg: pane %{pane_id} closed; dropped {dropped} message(s){}",
+                    if named { " and its name" } else { "" }
+                );
+            }
+        }
+    }
     // Every path that destroys a pane funnels through here, so this is the one
     // place an agent that has GONE has to be noticed. Nothing else would: the
     // pusher is woken by output, and a dead pane produces none.
@@ -9978,6 +10426,9 @@ async fn start_forwarding_for_pane(
                         log::debug!(
                             "server: PTY channel disconnected for pane_id={pane_id} session={session_name}"
                         );
+                        if let Some(pd) = panes.lock().await.get_mut(&pane_id) {
+                            pd.exited = true;
+                        }
                         close_pane(pane_id, &state, &panes, &clients, &config, &prev_frames).await;
                         notify_if_close_declined(pane_id, &panes, &clients).await;
                         save_if_enabled(&state, &panes, &config, &dormant).await;

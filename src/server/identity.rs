@@ -137,6 +137,9 @@ pub enum Unverified {
     /// The pin could not be read or confirmed for a reason that says nothing
     /// about whether the sender is alive.
     CheckFailed,
+    /// The check did not finish in time. No verdict was reached, so nothing
+    /// is said about the sender.
+    TimedOut,
 }
 
 impl Unverified {
@@ -148,6 +151,23 @@ impl Unverified {
             Unverified::PeerExited => "the sending process exited before it was checked",
             Unverified::PeerChanged => "the process tree changed while the sender was checked",
             Unverified::CheckFailed => "the sending process could not be checked",
+            Unverified::TimedOut => "the sender could not be checked in time",
+        }
+    }
+
+    /// What the caller can do about it, the second half of a
+    /// `sender_unverified` refusal.
+    pub fn fix(&self) -> &'static str {
+        match self {
+            Unverified::NoPeerPid => "messaging needs Linux or macOS",
+            Unverified::NoPaneAncestor => {
+                "run it from inside the pane; do not setsid/daemonize the sender"
+            }
+            Unverified::Unreadable => "run the sender in the server's pid namespace",
+            Unverified::PeerExited => {
+                "keep the sender running until its reply; do not hand the socket to another process"
+            }
+            Unverified::PeerChanged | Unverified::CheckFailed | Unverified::TimedOut => "retry",
         }
     }
 }

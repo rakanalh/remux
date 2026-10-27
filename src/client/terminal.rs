@@ -361,6 +361,29 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             argv.len().saturating_sub(1),
             if cwd.is_some() { "set" } else { "none" }
         ),
+        // A message body is user content. Every field is named so that a
+        // field added later cannot fall through to the catch-all.
+        ClientMessage::MsgSend {
+            to,
+            body,
+            deliver,
+            reply_to,
+            pane_hint,
+        } => format!(
+            "MsgSend(to={:?}, deliver={deliver:?}, {} bytes, reply_to={:?}, pane_hint={pane_hint:?})",
+            to.to_string(),
+            body.len(),
+            reply_to.as_ref().map(|r| r.id)
+        ),
+        ClientMessage::MsgRead {
+            pane,
+            all,
+            peek,
+            wait_ms,
+            pane_hint,
+        } => format!(
+            "MsgRead(pane={pane:?}, all={all}, peek={peek}, wait_ms={wait_ms:?}, pane_hint={pane_hint:?})"
+        ),
         other => format!("{:?}", other),
     }
 }
@@ -425,6 +448,20 @@ mod tests {
         assert!(s.contains("psql"), "but the program must: {s}");
         assert!(s.contains("1 more arg"), "and how many were dropped: {s}");
         assert!(s.contains("pane=Some(7)"), "and the caller's pane id: {s}");
+    }
+
+    #[test]
+    fn msg_send_names_the_target_but_not_the_body() {
+        let s = client_message_summary(&ClientMessage::MsgSend {
+            to: "beta".parse().unwrap(),
+            body: "the token is hunter2-BODY".to_string(),
+            deliver: crate::protocol::Deliver::Auto,
+            reply_to: None,
+            pane_hint: Some(3),
+        });
+        assert!(!s.contains("hunter2"), "the body must not appear: {s}");
+        assert!(s.contains("beta"), "but the target must: {s}");
+        assert!(s.contains("25 bytes"), "and the body's size: {s}");
     }
 
     /// Drive [`handshake`] against a scripted peer that answers with `welcome`.

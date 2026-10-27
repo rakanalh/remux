@@ -242,7 +242,7 @@ async fn run_cli_spawn(
         Some(ServerMessage::CliSpawned { pane_id }) => {
             log::debug!("cmd: cli-spawn created pane_id={pane_id}");
         }
-        Some(ServerMessage::Error { message }) => {
+        Some(ServerMessage::Error { message, .. }) => {
             eprintln!("remux: {message}");
             std::process::exit(1);
         }
@@ -475,7 +475,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                ServerMessage::Error { message } => {
+                ServerMessage::Error { message, .. } => {
                     eprintln!("Error: {}", message);
                 }
                 _ => {
@@ -550,7 +550,7 @@ async fn main() -> Result<()> {
                 ))) => {
                     println!("Killed session '{}'.", deleted);
                 }
-                Some(ServerMessage::Error { message }) => {
+                Some(ServerMessage::Error { message, .. }) => {
                     eprintln!("Error: {}", message);
                 }
                 _ => {
@@ -6607,7 +6607,7 @@ async fn run_client_loop(
                             record_switch(&mut current_attached, &mut previous_attached, ConnId::Local, target);
                         }
                     }
-                    Some(ServerMessage::Error { message }) => {
+                    Some(ServerMessage::Error { message, .. }) => {
                         log::error!("Server error: {}", message);
                     }
                     Some(ServerMessage::CopyToClipboard { data }) => {
@@ -7295,6 +7295,12 @@ async fn run_client_loop(
                         // if it ever DOES arrive here, the log says so instead of
                         // the message vanishing into a catch-all.
                         log::debug!("srv: CliSpawned pane_id={pane_id} (unexpected here)");
+                    }
+                    // The interactive client sends neither `MsgSend` nor
+                    // `MsgRead`. The variant NAME only: a `MsgList` carries
+                    // message bodies, which never go to a log.
+                    Some(ServerMessage::MsgSent { .. }) | Some(ServerMessage::MsgList { .. }) => {
+                        log::warn!("client: a messaging reply on the TUI connection; ignored");
                     }
                     Some(ServerMessage::ScrollbackInfo { total_lines }) => {
                         log::debug!("srv: ScrollbackInfo total_lines={}", total_lines);

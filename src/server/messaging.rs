@@ -4,7 +4,7 @@
 //! its own mutex and passes the clock in, so every ruling about ordering,
 //! bounds, expiry and names is a unit test.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{valid_name, Message, MsgId, MsgRef, MsgState, PaneId, Sender, Target};
@@ -40,11 +40,27 @@ pub enum Full {
 pub enum Refusal {
     BadAddress(String),
     BadName(String),
-    NameTaken { name: String, holder: PaneId },
+    NameTaken {
+        name: String,
+        holder: PaneId,
+    },
     NoSuchTarget(String),
-    MessageTooLarge { bytes: usize, max: usize },
-    MailboxFull { pane: PaneId, full: Full },
-    RateLimited { per_10s: u32 },
+    MessageTooLarge {
+        bytes: usize,
+        max: usize,
+    },
+    MailboxFull {
+        pane: PaneId,
+        full: Full,
+    },
+    RateLimited {
+        per_10s: u32,
+    },
+    /// A body carrying a control character other than `\n` and `\t`.
+    BadBody {
+        character: char,
+        at_byte: usize,
+    },
 }
 
 impl Refusal {
@@ -57,6 +73,7 @@ impl Refusal {
             Refusal::MessageTooLarge { .. } => "message_too_large",
             Refusal::MailboxFull { .. } => "mailbox_full",
             Refusal::RateLimited { .. } => "rate_limited",
+            Refusal::BadBody { .. } => "bad_body",
         }
     }
 
@@ -88,6 +105,10 @@ impl Refusal {
             Refusal::RateLimited { per_10s } => {
                 format!("rate limited: at most {per_10s} sends per 10s")
             }
+            Refusal::BadBody { character, at_byte } => format!(
+                "the body has a control character (U+{:04X} at byte {at_byte}); only \\n and \\t are allowed",
+                *character as u32
+            ),
         }
     }
 }
@@ -177,6 +198,11 @@ pub struct Messaging {
     names: HashMap<String, PaneId>,
     next_id: MsgId,
     rate: HashMap<SenderKey, VecDeque<Instant>>,
+    /// Panes whose mailbox was dropped because they closed. A send racing a
+    /// close would otherwise make a fresh mailbox nobody can ever read. Pane
+    /// ids are never reused, so this only grows, and it is not persisted: a
+    /// restart starts from the restored panes.
+    closed: HashSet<PaneId>,
 }
 
 impl Messaging {
@@ -187,6 +213,7 @@ impl Messaging {
             names: HashMap::new(),
             next_id: 1,
             rate: HashMap::new(),
+            closed: HashSet::new(),
         }
     }
 
@@ -205,6 +232,18 @@ impl Messaging {
                 bytes: body.len(),
                 max: limits.max_body,
             });
+        }
+        // A body is typed into a pane in a later release, and an escape
+        // sequence in it (ESC[201~ ends a bracketed paste) would reach the
+        // pane's program as input rather than as text.
+        if let Some((at_byte, character)) = body
+            .char_indices()
+            .find(|&(_, c)| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(Refusal::BadBody { character, at_byte });
+        }
+        if self.closed.contains(&to) {
+            return Err(Refusal::NoSuchTarget(format!("%{to}")));
         }
 
         let key = SenderKey::of(&from);
@@ -343,6 +382,7 @@ impl Messaging {
         let named = self.name_of(pane).is_some();
         self.names.retain(|_, holder| *holder != pane);
         self.rate.remove(&SenderKey::Pane(pane));
+        self.closed.insert(pane);
         (messages, named)
     }
 
@@ -677,6 +717,29 @@ mod tests {
     }
 
     #[test]
+    fn a_full_mailbox_does_not_use_up_the_rate() {
+        let lim = Limits {
+            max_messages: 1,
+            rate_per_10s: 2,
+            ..limits()
+        };
+        let mut m = Messaging::new(lim);
+        let t0 = Instant::now();
+        send(&mut m, "a", t0).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                send(&mut m, "b", t0),
+                Err(Refusal::MailboxFull { .. })
+            ));
+        }
+        m.read(2, false, true, 0);
+        assert!(
+            send(&mut m, "c", t0).is_ok(),
+            "refused sends used up the sender's rate"
+        );
+    }
+
+    #[test]
     fn expired_mail_is_swept_and_never_read() {
         let lim = Limits {
             ttl_ms: 1_000,
@@ -825,6 +888,44 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_pane_is_never_a_target_again() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        m.drop_pane(7);
+        assert_eq!(
+            m.send(pane(1), 7, "late".into(), None, 0, t0),
+            Err(Refusal::NoSuchTarget("%7".into()))
+        );
+        assert!(
+            m.read(7, true, false, 0).is_empty(),
+            "a mailbox was made for it"
+        );
+        assert!(send(&mut m, "fine", t0).is_ok(), "another pane was refused");
+    }
+
+    #[test]
+    fn a_body_with_a_control_character_is_refused() {
+        let mut m = Messaging::new(limits());
+        let t0 = Instant::now();
+        assert!(send(&mut m, "line one\nline\ttwo", t0).is_ok());
+        for (body, character, at_byte) in [
+            ("paste\u{1b}[201~end", '\u{1b}', 5),
+            ("bell\u{7}", '\u{7}', 4),
+            ("cr\r", '\r', 2),
+            ("del\u{7f}", '\u{7f}', 3),
+            ("c1\u{9b}201~", '\u{9b}', 2),
+            ("nul\0", '\0', 3),
+        ] {
+            assert_eq!(
+                send(&mut m, body, t0),
+                Err(Refusal::BadBody { character, at_byte }),
+                "{body:?}"
+            );
+        }
+        assert_eq!(bodies(&m.read(2, true, false, 0)), ["line one\nline\ttwo"]);
+    }
+
+    #[test]
     fn every_refusal_has_its_wire_code() {
         let codes = [
             (Refusal::BadAddress("x".into()), "bad_address"),
@@ -849,6 +950,13 @@ mod tests {
                 "mailbox_full",
             ),
             (Refusal::RateLimited { per_10s: 1 }, "rate_limited"),
+            (
+                Refusal::BadBody {
+                    character: '\u{1b}',
+                    at_byte: 0,
+                },
+                "bad_body",
+            ),
         ];
         for (r, code) in codes {
             assert_eq!(r.code(), code);

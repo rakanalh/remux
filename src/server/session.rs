@@ -1693,6 +1693,24 @@ impl ServerState {
         }
     }
 
+    /// Whether `pane_id` is some session's popup, which is in no tab.
+    pub fn is_popup(&self, pane_id: PaneId) -> bool {
+        self.sessions
+            .values()
+            .any(|sess| sess.popup_pane == Some(pane_id))
+    }
+
+    /// The session and tab index that own `pane_id`, by [`Tab::panes`]. The
+    /// popup is in no tab, so it is `None` like an unknown id.
+    pub fn locate_pane(&self, pane_id: PaneId) -> Option<(SessionId, usize)> {
+        self.sessions.iter().find_map(|(name, sess)| {
+            sess.tabs
+                .iter()
+                .position(|tab| tab.panes().contains(&pane_id))
+                .map(|idx| (name.clone(), idx))
+        })
+    }
+
     /// Promote any background tab that has been quietly in `Activity` past the
     /// `threshold` to `Silent` ("finished"). Returns the names of sessions that
     /// had at least one tab change, so the caller can re-render only those.
@@ -2493,6 +2511,48 @@ mod tests {
         assert_eq!(sess.active_tab, 1);
         assert_eq!(sess.tabs[1].name, "new-tab");
         assert_eq!(sess.tabs[1].focused_pane, pane_id);
+    }
+
+    fn create_plain_session(st: &mut ServerState, name: &str) -> PaneId {
+        st.create_session(
+            name,
+            None,
+            BorderStyle::ZellijStyle,
+            LayoutMode::default(),
+            (80, 80),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn locate_pane_finds_a_pane_in_a_background_tab_of_another_session() {
+        let mut st = ServerState::new();
+        create_plain_session(&mut st, "a");
+        let b_pane = create_plain_session(&mut st, "b");
+        let b_tab1_pane = st.create_tab("b", "t1", LayoutMode::default()).unwrap();
+        assert_eq!(st.locate_pane(b_pane), Some(("b".to_string(), 0)));
+        assert_eq!(st.locate_pane(b_tab1_pane), Some(("b".to_string(), 1)));
+    }
+
+    #[test]
+    fn is_popup_is_true_only_for_a_sessions_popup() {
+        let mut st = ServerState::new();
+        let pane = create_plain_session(&mut st, "a");
+        let popup = st.next_pane_id();
+        assert!(!st.is_popup(popup));
+        st.sessions.get_mut("a").unwrap().popup_pane = Some(popup);
+        assert!(st.is_popup(popup));
+        assert!(!st.is_popup(pane));
+    }
+
+    #[test]
+    fn locate_pane_is_none_for_an_unknown_id_and_for_the_popup() {
+        let mut st = ServerState::new();
+        create_plain_session(&mut st, "a");
+        assert_eq!(st.locate_pane(9_999), None);
+        let popup = st.next_pane_id();
+        st.sessions.get_mut("a").unwrap().popup_pane = Some(popup);
+        assert_eq!(st.locate_pane(popup), None, "the popup is in no tab");
     }
 
     #[test]

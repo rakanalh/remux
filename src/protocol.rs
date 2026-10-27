@@ -129,7 +129,14 @@ pub enum ConnDescriptor {
 /// session from the caller's `REMUX_SESSION`, which is stale for a pane moved
 /// to another session. The failure is a new pane in the wrong session, not a
 /// dropped connection, so only the handshake can catch it.
-pub const PROTOCOL_VERSION: u32 = 17;
+///
+/// 17 -> 18: agent messaging. Adds [`ClientMessage::MsgSend`] and
+/// [`ClientMessage::MsgRead`] with their replies [`ServerMessage::MsgSent`] and
+/// [`ServerMessage::MsgList`], and the additive `code` on
+/// [`ServerMessage::Error`]. Later tasks add `MsgAck`, `AgentName` and
+/// `AgentStatus` under the same number. An old server cannot decode any of
+/// them and would drop the connection.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
 /// version skew between rebuilt binaries is detectable. Falls back to
@@ -569,6 +576,43 @@ pub enum ClientMessage {
         cell_id: CellId,
         dir: FocusDirection,
     },
+    /// Leave a message in a pane's mailbox. Nothing here names the sender:
+    /// the server attributes it to the pane the connecting process runs in,
+    /// and refuses the send (`sender_unverified`) when it cannot.
+    ///
+    /// Answered with [`ServerMessage::MsgSent`], or [`ServerMessage::Error`]
+    /// carrying a `code`.
+    MsgSend {
+        to: Address,
+        body: String,
+        deliver: Deliver,
+        #[serde(default)]
+        reply_to: Option<MsgRef>,
+        /// The caller's `$REMUX_PANE`. Logged when it disagrees with the
+        /// attribution and never used for anything else: a stale or
+        /// overridden variable is exactly how a message arrives from the
+        /// wrong pane.
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
+    /// Read a mailbox: `pane`'s, or the caller's own when `pane` is `None`.
+    /// A mailbox that is not the caller's own is only peeked, whatever `peek`
+    /// says, so that looking at a teammate's mail never marks it read.
+    ///
+    /// Answered with [`ServerMessage::MsgList`], or [`ServerMessage::Error`].
+    MsgRead {
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        peek: bool,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+        /// See [`ClientMessage::MsgSend::pane_hint`].
+        #[serde(default)]
+        pane_hint: Option<PaneId>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -721,8 +765,15 @@ pub enum ServerMessage {
     },
     /// Response to a `ListSessions` request.
     SessionList { sessions: Vec<SessionListEntry> },
-    /// An error response.
-    Error { message: String },
+    /// An error response. `code` is a stable, machine-readable name for the
+    /// failure (`no_such_target`, `sender_unverified`, ...); `message` is for
+    /// people. `None` from an older server and from the errors that predate
+    /// codes.
+    Error {
+        message: String,
+        #[serde(default)]
+        code: Option<String>,
+    },
     /// Asynchronous session event notification.
     Event(SessionEvent),
     /// Request the client to copy data to the system clipboard via OSC 52.
@@ -759,6 +810,23 @@ pub enum ServerMessage {
     /// "which pane did I just get?" a wire change rather than a client change,
     /// and a script that wants to send the new pane input needs the answer.
     CliSpawned { pane_id: PaneId },
+    /// The answer to a [`ClientMessage::MsgSend`] that was stored.
+    MsgSent {
+        id: MsgId,
+        to: Resolved,
+        delivery: Delivery,
+        /// Why `delivery` is not what was asked for, when it is not.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// The answer to a [`ClientMessage::MsgRead`]: the listed messages,
+    /// oldest first.
+    MsgList {
+        pane: PaneId,
+        messages: Vec<Message>,
+        #[serde(default)]
+        timed_out: bool,
+    },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -1044,12 +1112,7 @@ impl std::str::FromStr for Address {
             None => (None, s),
         };
         if let Some(host) = host {
-            let host_ok = !host.is_empty()
-                && !host.starts_with('.')
-                && host
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-            if !host_ok {
+            if !valid_host(host) {
                 return Err(format!("bad host in address {s:?}"));
             }
         }
@@ -1082,6 +1145,16 @@ impl std::fmt::Display for Address {
             Target::Pane(id) => write!(f, "%{id}"),
         }
     }
+}
+
+/// A remote's name as an address spells it: `[A-Za-z0-9._-]+`, not starting
+/// with `.`. Checked on the server too, because the wire carries any string
+/// and a host is written to the log.
+pub fn valid_host(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// An agent name: `[a-z][a-z0-9_-]{0,31}`. A grammar rather than free text,
@@ -1124,6 +1197,42 @@ pub enum Sender {
         pane_id: PaneId,
         name: Option<String>,
     },
+}
+
+impl ServerMessage {
+    /// An [`ServerMessage::Error`] with a machine-readable `code`.
+    pub fn refused(code: &str, message: impl Into<String>) -> Self {
+        ServerMessage::Error {
+            message: message.into(),
+            code: Some(code.to_string()),
+        }
+    }
+}
+
+/// How the sender wants a message delivered. Every message is stored in the
+/// mailbox whatever this says; `Submit` and `Auto` also ask for it to be typed
+/// into the pane, which a later release adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Deliver {
+    Mailbox,
+    Submit,
+    Auto,
+}
+
+/// How a message was actually delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Delivery {
+    Mailbox,
+    Submitted,
+    Forwarded,
+}
+
+/// The pane an [`Address`] named, as the server resolved it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolved {
+    pub host: Option<String>,
+    pub pane_id: PaneId,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2040,6 +2149,75 @@ mod tests {
     }
 
     #[test]
+    fn an_error_code_is_optional_on_the_wire_and_survives_a_round_trip() {
+        let old: ServerMessage = serde_json::from_str(r#"{"Error":{"message":"x"}}"#).unwrap();
+        assert!(matches!(old, ServerMessage::Error { code: None, .. }));
+        let refused = ServerMessage::refused("no_such_target", "no such target: %9");
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&refused).unwrap()).unwrap();
+        match back {
+            ServerMessage::Error { message, code } => {
+                assert_eq!(code.as_deref(), Some("no_such_target"));
+                assert_eq!(message, "no such target: %9");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_messaging_frames_round_trip_and_default_their_optional_fields() {
+        let send: ClientMessage = serde_json::from_str(
+            r#"{"MsgSend":{"to":{"host":null,"target":{"Pane":7}},"body":"hi","deliver":"Auto"}}"#,
+        )
+        .unwrap();
+        match send {
+            ClientMessage::MsgSend {
+                to,
+                deliver,
+                reply_to,
+                pane_hint,
+                ..
+            } => {
+                assert_eq!(to.to_string(), "%7");
+                assert_eq!(deliver, Deliver::Auto);
+                assert_eq!((reply_to, pane_hint), (None, None));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let read: ClientMessage = serde_json::from_str(r#"{"MsgRead":{}}"#).unwrap();
+        assert!(matches!(
+            read,
+            ClientMessage::MsgRead {
+                pane: None,
+                all: false,
+                peek: false,
+                wait_ms: None,
+                pane_hint: None
+            }
+        ));
+        let sent = ServerMessage::MsgSent {
+            id: 1,
+            to: Resolved {
+                host: None,
+                pane_id: 7,
+                name: Some("beta".into()),
+            },
+            delivery: Delivery::Mailbox,
+            reason: Some("submit_unavailable".into()),
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::MsgSent {
+                id: 1,
+                delivery: Delivery::Mailbox,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn address_parses_every_spelling() {
         let name = || Target::Name("alpha".into());
         assert_eq!("alpha".parse(), Ok(addr(None, name())));
@@ -2134,12 +2312,13 @@ mod tests {
     fn round_trip_server_message() {
         let msg = ServerMessage::Error {
             message: "not found".into(),
+            code: None,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = decode_message_length(encoded[..4].try_into().unwrap());
         let decoded: ServerMessage = serde_json::from_slice(&encoded[4..4 + len]).unwrap();
         match decoded {
-            ServerMessage::Error { message } => assert_eq!(message, "not found"),
+            ServerMessage::Error { message, .. } => assert_eq!(message, "not found"),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
