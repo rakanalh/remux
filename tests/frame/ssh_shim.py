@@ -18,6 +18,13 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
   echo     a far server that answers every forwarded send with two answers
            naming no send in flight (req 999, then no req at all), never
            with its own
+  proxy    B's real relay, behind a proxy the harness steers with files:
+           while $RMX_SHIM_SWALLOW exists, nothing from A reaches B and the
+           proxy answers A's pings itself (B hears nothing, A stays Up);
+           when $RMX_SHIM_HOLD exists, the next ping from A is held 1.5 s.
+           The proxy exits when B's relay does, as ssh would
+  stalepong  a far server that answers the dial's barrier ping and every
+           forwarded send, but every later ping with the wrong nonce
   hostile  a far server that pushes messages back: one MsgInbound before
            its Pong (req 100), then, once the dialler forwards a send (which
            it answers), each frame in $RMX_SHIM_PUSH with "$PANE" and
@@ -27,7 +34,7 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
 Before the relay, the shim lists its own open descriptors to `$RMX_SHIM_FDS`:
 the relay inherits exactly these, and decision 71 says they are 0, 1 and 2.
 
-Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute|hostile|echo`) it
+Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute|hostile|echo|stalepong|proxy`) it
 is the far side of the link for the modes that need no real server.
 """
 import json
@@ -51,6 +58,8 @@ case "$mode" in
   mute)    exec "$RMX_PY" "$RMX_SHIM_PY" mute ;;
   hostile) exec "$RMX_PY" "$RMX_SHIM_PY" hostile ;;
   echo)    exec "$RMX_PY" "$RMX_SHIM_PY" echo ;;
+  stalepong) exec "$RMX_PY" "$RMX_SHIM_PY" stalepong ;;
+  proxy)   exec "$RMX_PY" "$RMX_SHIM_PY" proxy ;;
 esac
 """
 
@@ -74,6 +83,8 @@ def main(mode):
     from harness import PROTOCOL_VERSION  # noqa: E402
 
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    if mode == "proxy":
+        return _proxy(stdin, stdout)
     if _read_frame(stdin) is None:
         return 0
     version = 16 if mode == "skew" else PROTOCOL_VERSION
@@ -82,6 +93,19 @@ def main(mode):
         _read_frame(stdin)
     if mode == "hostile":
         return _hostile(stdin, stdout)
+    if mode == "stalepong":
+        while True:
+            frame = _read_frame(stdin)
+            if frame is None:
+                return 0
+            if "Ping" in frame:
+                nonce = frame["Ping"]["nonce"]
+                _write_frame(stdout, {"Pong": {"nonce": nonce if nonce == 1 else 0}})
+            elif "MsgSend" in frame:
+                _write_frame(stdout, {"MsgSent": {
+                    "id": 1, "to": {"host": None, "pane_id": 1, "name": None},
+                    "delivery": "Mailbox", "reason": None, "timed_out": False,
+                    "final_state": None, "req": frame["MsgSend"].get("req")}})
     if mode == "echo":
         while True:
             frame = _read_frame(stdin)
@@ -142,6 +166,49 @@ def _hostile(stdin, stdout):
         elif "MsgInboundAck" in frame:
             with open(os.environ["RMX_SHIM_ACKS"], "a") as f:
                 f.write(json.dumps(frame["MsgInboundAck"]) + "\n")
+
+
+def _proxy(stdin, stdout):
+    import subprocess
+    import threading
+    import time
+
+    env = dict(os.environ, XDG_RUNTIME_DIR=os.environ["RMX_B_RUN"], XDG_STATE_HOME=os.environ["RMX_B_STATE"],
+               XDG_DATA_HOME=os.environ["RMX_B_DATA"], XDG_CONFIG_HOME=os.environ["RMX_B_CONFIG"])
+    relay = subprocess.Popen([os.environ["RMX_BIN"], "relay"], env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    lock = threading.Lock()
+
+    def to_a(frame):
+        with lock:
+            _write_frame(stdout, frame)
+
+    def from_b():
+        while True:
+            frame = _read_frame(relay.stdout)
+            if frame is None:
+                os._exit(0)
+            to_a(frame)
+
+    threading.Thread(target=from_b, daemon=True).start()
+    swallow, hold = os.environ["RMX_SHIM_SWALLOW"], os.environ["RMX_SHIM_HOLD"]
+    while True:
+        frame = _read_frame(stdin)
+        if frame is None:
+            relay.stdin.close()
+            relay.wait()
+            return 0
+        if os.path.exists(swallow):
+            if "Ping" in frame:
+                to_a({"Pong": {"nonce": frame["Ping"]["nonce"]}})
+            continue
+        if "Ping" in frame and os.path.exists(hold):
+            os.remove(hold)
+            time.sleep(1.5)
+        try:
+            _write_frame(relay.stdin, frame)
+        except BrokenPipeError:
+            os._exit(0)
 
 
 if __name__ == "__main__":

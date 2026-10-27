@@ -1130,9 +1130,10 @@
 #
 # How the server dials a `[remotes.<name>]` to send to it (`remux msg send
 # mini:alpha`): ssh plus the handshake must finish in dial_ms (at most 10000),
-# a live link is to be pinged every ping_ms, and one idle for idle_ms closed.
-# This build does neither yet: the two are read, and ping_ms is told to the
-# far server, but the dialling side does not ping and nothing is closed idle.
+# a live link is pinged every ping_ms and is down after two pings go
+# unanswered, and one with nothing but pings for idle_ms is closed; the next
+# send dials again. The far server forgets a link that has not pinged it for
+# twice ping_ms, which this server tells it when it dials.
 #
 # [messaging.links]
 # dial_ms = 10000

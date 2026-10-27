@@ -674,7 +674,7 @@ async fn handle_msg_send(
     let link = links()
         .lock()
         .await
-        .peer_name(client_id)
+        .peer_name(client_id, std::time::Instant::now())
         .map(str::to_string);
     if let Some(link) = link {
         return handle_link_send(client_id, link, msg, state, panes, config, clients, store).await;
@@ -1003,7 +1003,10 @@ async fn send_to_host(
 ) -> Option<ServerMessage> {
     use crate::server::links::{route_for, Route};
 
-    let inbound = links().lock().await.live_inbound(&host);
+    let inbound = links()
+        .lock()
+        .await
+        .live_inbound(&host, std::time::Instant::now());
     match route_for(inbound, config.remotes.contains_key(&host)) {
         Route::Inbound(link_client) => {
             reply_over_inbound(
@@ -1715,6 +1718,7 @@ async fn forward_send(
         host_name,
         dial,
         ping_ms: config.messaging.links.ping_ms,
+        idle: std::time::Duration::from_millis(config.messaging.links.idle_ms),
         on_inbound: INBOUND.get().cloned(),
     };
     let (reply, answer) = tokio::sync::oneshot::channel();
@@ -1869,6 +1873,59 @@ fn peer_pid(peer: &identity::Peer) -> String {
         .map_or_else(|_| "?".to_string(), |(pid, _)| pid.to_string())
 }
 
+/// How often expired inbound links are swept: well inside the shortest
+/// expiry, twice a one-second ping.
+const LINK_EXPIRY_SWEEP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Log each expired inbound link, and the connections to close for them.
+fn log_expired(expired: Vec<(String, std::time::Duration, u64)>) -> Vec<u64> {
+    expired
+        .into_iter()
+        .map(|(name, limit, client_id)| {
+            log::info!(
+                "peer link {name}: expired (no ping for {}s); closing client_id={client_id}",
+                limit.as_secs_f64()
+            );
+            client_id
+        })
+        .collect()
+}
+
+/// Close each connection in `ids` from this end, so that its far side sees
+/// EOF: a lapsed peer link, which the dialling side must re-dial rather than
+/// keep pinging while every message on it is refused.
+async fn close_connections(clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>, ids: &[u64]) {
+    if ids.is_empty() {
+        return;
+    }
+    static NO_CLOSER_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let cls = clients.lock().await;
+    for id in ids {
+        // A connection already gone needs no closing; one still here that
+        // has no closer stays open, which is the zombie link this exists
+        // to end.
+        let Some(conn) = cls.get(id) else { continue };
+        match &conn.closer {
+            Some(fd) => {
+                // SAFETY: `fd` is an open descriptor this connection owns
+                // for its whole life; shutdown affects the socket, not the
+                // fd.
+                unsafe {
+                    libc::shutdown(std::os::fd::AsRawFd::as_raw_fd(fd), libc::SHUT_RDWR);
+                }
+            }
+            None if !NO_CLOSER_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+                log::warn!(
+                    "peer link: cannot close client_id={id}, which has no second descriptor; \
+                     it stays open until its far side closes it (logged once)"
+                );
+            }
+            None => {}
+        }
+    }
+}
+
 /// A `PeerLink`: admit the connection as a link from the server `name`, or
 /// refuse it. `None` when it is admitted, since nothing waits on that: the
 /// declaring server learns it from the `Pong` to the ping it sends next.
@@ -1878,6 +1935,7 @@ async fn handle_peer_link(
     ping_ms: u64,
     peer: &Arc<identity::Peer>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
 ) -> Option<ServerMessage> {
     use crate::server::links::Declare;
     use identity::{PeerPin, PeerRefusal};
@@ -1888,7 +1946,11 @@ async fn handle_peer_link(
             format!("bad peer link name {}", loggable(name)),
         ));
     }
-    if let Some(held) = links().lock().await.peer_name(client_id) {
+    if let Some(held) = links()
+        .lock()
+        .await
+        .peer_name(client_id, std::time::Instant::now())
+    {
         return Some(ServerMessage::refused(
             "bad_request",
             format!("this connection is already the peer link {held}"),
@@ -1945,9 +2007,18 @@ async fn handle_peer_link(
         }
     };
     let ping = crate::server::links::declared_ping(ping_ms);
-    let declared = links().lock().await.declare(name, client_id, ping);
+    let (declared, mut closing) = {
+        let mut links = links().lock().await;
+        let closing = log_expired(links.expire(std::time::Instant::now()));
+        (links.declare(name, client_id, ping), closing)
+    };
+    if let Ok(Some(old)) = declared {
+        log::info!("peer link {name}: expired; closing client_id={old}");
+        closing.push(old);
+    }
+    close_connections(clients, &closing).await;
     match declared {
-        Ok(()) => {
+        Ok(_) => {
             log::info!(
                 "peer link {name}: declared by client_id={client_id} peer_pid={pid} under sshd={sshd}"
             );
@@ -4912,6 +4983,11 @@ struct ClientConnection {
     /// [`ClientMessage::TabStyle`]. `None` until it says, and for ever for an
     /// older client or the CLI.
     tab_style: Option<TabStyle>,
+    /// A second descriptor for the connection's socket, which
+    /// [`close_connections`] shuts down: the reader then sees EOF and the
+    /// connection ends the usual way. Only a peer link that has lapsed is
+    /// closed by this server.
+    closer: Option<std::os::fd::OwnedFd>,
 }
 
 impl ClientConnection {
@@ -5131,6 +5207,18 @@ impl RemuxServer {
             });
         }
 
+        // Links from other servers that stopped pinging are forgotten, so
+        // their names are free and no reply is routed to them.
+        let sweep_clients = Arc::clone(&server.clients);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LINK_EXPIRY_SWEEP).await;
+                let expired = links().lock().await.expire(std::time::Instant::now());
+                let closing = log_expired(expired);
+                close_connections(&sweep_clients, &closing).await;
+            }
+        });
+
         // Messages that come back over the links this server dials.
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
         let _ = INBOUND.set(inbound_tx);
@@ -5297,6 +5385,7 @@ impl RemuxServer {
             pidfd,
             std::os::fd::AsFd::as_fd(&stream),
         ));
+        let closer = std::os::fd::AsFd::as_fd(&stream).try_clone_to_owned().ok();
         let (mut read_half, mut write_half) = stream.into_split();
 
         // Version handshake: exchange Hello/Welcome as the first frames, directly
@@ -5348,6 +5437,7 @@ impl RemuxServer {
             clients.insert(
                 id,
                 ClientConnection {
+                    closer,
                     session_name: None,
                     tx,
                     cols: 80,
@@ -5773,6 +5863,9 @@ async fn handle_client_message(
                 "server: client_id={client_id} msg=MouseDrag(start=({start_x},{start_y}), end=({end_x},{end_y}), is_final={is_final}, pane_id={pane_id:?})"
             );
         }
+        // A link pings every second or so: one line each would be a line per
+        // ping, for as long as the link lives.
+        ClientMessage::Ping { .. } => {}
         // The peer writes the code and the message: only a code spelled like
         // one, and the message's length, reach the log.
         ClientMessage::MsgInboundAck {
@@ -5925,13 +6018,31 @@ async fn handle_client_message(
             Ok(())
         }
         ClientMessage::PeerLink { name, ping_ms } => {
-            if let Some(answer) = handle_peer_link(client_id, &name, ping_ms, peer, panes).await {
+            if let Some(answer) =
+                handle_peer_link(client_id, &name, ping_ms, peer, panes, clients).await
+            {
                 reply(client_id, clients, answer).await;
             }
             Ok(())
         }
         ClientMessage::Ping { nonce } => {
-            reply(client_id, clients, ServerMessage::Pong { nonce }).await;
+            // A link from another server pings to stay declared. One that has
+            // lapsed is closed, not answered: a pong would keep its far side
+            // Up while every message on it is refused.
+            let lapsed = {
+                let now = std::time::Instant::now();
+                let mut links = links().lock().await;
+                links.pinged(client_id, now);
+                links.lapsed(client_id, now)
+            };
+            if lapsed {
+                log::info!(
+                    "peer link: client_id={client_id} pinged after its link lapsed; closing"
+                );
+                close_connections(clients, &[client_id]).await;
+            } else {
+                reply(client_id, clients, ServerMessage::Pong { nonce }).await;
+            }
             Ok(())
         }
         ClientMessage::MsgInboundAck {
@@ -9157,7 +9268,7 @@ static MESSAGING: std::sync::OnceLock<Mutex<Messaging>> = std::sync::OnceLock::n
 /// The server's links to other servers. Taken alone, like the store.
 static LINKS: std::sync::OnceLock<Mutex<crate::server::links::Links>> = std::sync::OnceLock::new();
 
-fn links() -> &'static Mutex<crate::server::links::Links> {
+pub(crate) fn links() -> &'static Mutex<crate::server::links::Links> {
     LINKS.get_or_init(|| Mutex::new(crate::server::links::Links::new()))
 }
 

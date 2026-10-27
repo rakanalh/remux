@@ -17,7 +17,7 @@
 //! `clients` or the message store is held.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -56,6 +56,9 @@ pub struct LinkSpec {
     pub host_name: String,
     pub dial: Duration,
     pub ping_ms: u64,
+    /// A link with nothing in flight and no traffic but pings for this long
+    /// is closed; the next send dials again.
+    pub idle: Duration,
     /// Where a message the far server sends back over this link goes to be
     /// stored, answered with the ack to write back. `None` refuses every one.
     pub on_inbound: Option<InboundTx>,
@@ -157,9 +160,18 @@ pub struct InboundLink {
     /// How often the declaring server pings, which bounds how long a
     /// declaration outlives a connection that went quiet.
     pub ping: Duration,
+    /// When it last pinged, or declared itself.
+    pub last_ping: Instant,
     /// Whether this link has already been logged for an `origin.host` that
     /// differs from its declared name, so it is logged once, not per send.
     pub host_mismatch_logged: bool,
+}
+
+impl InboundLink {
+    /// Whether it has pinged within twice its declared interval of `now`.
+    fn alive_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_ping) <= self.ping * 2
+    }
 }
 
 /// Why a `PeerLink` was not taken.
@@ -177,6 +189,10 @@ pub enum Declare {
 #[derive(Debug, Default)]
 pub struct Links {
     inbound: HashMap<String, InboundLink>,
+    /// Every connection that declared a peer link, live or since expired:
+    /// one whose entry is gone and which still pings is closed, never kept
+    /// alive by a pong while every message on it is refused.
+    declared: std::collections::HashSet<u64>,
     /// The queue of each link this server dialled, by `[remotes]` key. A
     /// closed queue is a link whose task ended, which the next forward dials
     /// again.
@@ -192,9 +208,13 @@ impl Links {
         Self::default()
     }
 
-    /// The client id of the live inbound link named `name`.
-    pub fn live_inbound(&self, name: &str) -> Option<u64> {
-        self.inbound.get(name).map(|link| link.client_id)
+    /// The client id of the inbound link named `name`, if it is live at
+    /// `now`: one past its expiry and not yet swept is not.
+    pub fn live_inbound(&self, name: &str, now: Instant) -> Option<u64> {
+        self.inbound
+            .get(name)
+            .filter(|link| link.alive_at(now))
+            .map(|link| link.client_id)
     }
 
     /// A fresh `req` for a message pushed over `client_id`'s link, and where
@@ -220,8 +240,18 @@ impl Links {
         self.pending.remove(&req);
     }
 
-    /// The name `client_id` declared, if its connection is a peer link.
-    pub fn peer_name(&self, client_id: u64) -> Option<&str> {
+    /// The name `client_id` declared, if its connection is a peer link that
+    /// is live at `now`. One past its expiry and not yet swept is not: what
+    /// it sends is refused as from any other connection.
+    pub fn peer_name(&self, client_id: u64, now: Instant) -> Option<&str> {
+        self.inbound
+            .iter()
+            .find(|(_, link)| link.client_id == client_id && link.alive_at(now))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The name `client_id` holds, live or not.
+    fn held_name(&self, client_id: u64) -> Option<&str> {
         self.inbound
             .iter()
             .find(|(_, link)| link.client_id == client_id)
@@ -230,27 +260,93 @@ impl Links {
 
     /// Take `name` for `client_id`'s connection, which the caller has already
     /// admitted.
-    pub fn declare(&mut self, name: &str, client_id: u64, ping: Duration) -> Result<(), Declare> {
+    pub fn declare(
+        &mut self,
+        name: &str,
+        client_id: u64,
+        ping: Duration,
+    ) -> Result<Option<u64>, Declare> {
+        self.declare_at(name, client_id, ping, Instant::now())
+    }
+
+    /// [`Self::declare`] at `now`. A name held by an entry that has expired
+    /// (no ping for twice its declared interval) is free again, and the
+    /// connection that held it is returned for the caller to close; one held
+    /// by a live entry is not, and says when it will be.
+    pub fn declare_at(
+        &mut self,
+        name: &str,
+        client_id: u64,
+        ping: Duration,
+        now: Instant,
+    ) -> Result<Option<u64>, Declare> {
         if !valid_host(name) {
             return Err(Declare::BadName);
         }
-        if let Some(held) = self.peer_name(client_id) {
+        if let Some(held) = self.held_name(client_id) {
             return Err(Declare::AlreadyPeer(held.to_string()));
         }
+        let mut replaced = None;
         if let Some(live) = self.inbound.get(name) {
-            return Err(Declare::Held {
-                retry_after: live.ping * 2,
-            });
+            let expires = live.last_ping + live.ping * 2;
+            if now < expires {
+                return Err(Declare::Held {
+                    retry_after: expires - now,
+                });
+            }
+            replaced = Some(live.client_id);
         }
+        self.declared.insert(client_id);
         self.inbound.insert(
             name.to_string(),
             InboundLink {
                 client_id,
                 ping,
+                last_ping: now,
                 host_mismatch_logged: false,
             },
         );
-        Ok(())
+        Ok(replaced)
+    }
+
+    /// Whether `client_id` declared a peer link that is not live at `now`:
+    /// its entry expired, swept or not yet, or another connection took the
+    /// name after it did.
+    pub fn lapsed(&self, client_id: u64, now: Instant) -> bool {
+        self.declared.contains(&client_id)
+            && !self
+                .inbound
+                .values()
+                .any(|link| link.client_id == client_id && link.alive_at(now))
+    }
+
+    /// Note a ping on `client_id`'s link: it is alive. A ping that comes
+    /// after the entry expired does not revive it, so expiry does not depend
+    /// on the sweep running before the late ping arrives.
+    pub fn pinged(&mut self, client_id: u64, now: Instant) {
+        if let Some(link) = self
+            .inbound
+            .values_mut()
+            .find(|link| link.client_id == client_id && link.alive_at(now))
+        {
+            link.last_ping = now;
+        }
+    }
+
+    /// Forget every inbound link that has not pinged for twice the interval
+    /// it declared, returning each name, how long it waited and its
+    /// connection, which the caller closes: left open, it would answer the
+    /// dialler's pings and keep its link Up while refusing every message.
+    pub fn expire(&mut self, now: Instant) -> Vec<(String, Duration, u64)> {
+        let mut gone = Vec::new();
+        self.inbound.retain(|name, link| {
+            let alive = link.alive_at(now);
+            if !alive {
+                gone.push((name.clone(), link.ping * 2, link.client_id));
+            }
+            alive
+        });
+        gone
     }
 
     /// Queue `fwd` on the link to `spec.key`: on the live one, or on a new
@@ -291,7 +387,8 @@ impl Links {
     pub fn drop_client(&mut self, client_id: u64) -> Option<String> {
         // Its pushes will never be acked: their waiters learn so at once.
         self.pending.retain(|_, (on, _)| *on != client_id);
-        let name = self.peer_name(client_id)?.to_string();
+        self.declared.remove(&client_id);
+        let name = self.held_name(client_id)?.to_string();
         self.inbound.remove(&name);
         Some(name)
     }
@@ -421,7 +518,9 @@ impl InFlight {
 }
 
 /// The task behind one outbound link: dial, then carry forwards until the
-/// link is lost. Logs on state changes only, never per frame.
+/// link is lost or idle. A link that ends is never dialled again here: the
+/// next forward finds its queue gone and starts a task of its own. Logs on
+/// state changes only, never per frame.
 pub async fn run_link((spec, mut rx): Dial) {
     let key = spec.key.clone();
     log::info!("link {key}: dialing");
@@ -438,9 +537,13 @@ pub async fn run_link((spec, mut rx): Dial) {
         crate::client::cli_common::escape(&up.stamp),
         crate::protocol::PROTOCOL_VERSION
     );
-    let reason = serve(&spec, up, &mut rx).await;
-    log::info!("link {key}: down ({reason})");
-    fail_queued(&mut rx, &format!("{key}: {reason}"));
+    match serve(&spec, up, &mut rx, crate::server::daemon::links()).await {
+        Ended::Lost(reason) => {
+            log::info!("link {key}: down ({reason})");
+            fail_queued(&mut rx, &format!("{key}: {reason}"));
+        }
+        Ended::Idle => log::info!("link {key}: idle, closed"),
+    }
 }
 
 /// Why a dial did not bring a link up.
@@ -532,8 +635,10 @@ async fn pump_frames(
 
 struct Up {
     stamp: String,
-    _child: tokio::process::Child,
-    writer: tokio::process::ChildStdin,
+    /// ssh, killed when the link ends. `None` only in tests, which play the
+    /// far side on an in-memory stream.
+    _child: Option<tokio::process::Child>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     frames: mpsc::Receiver<ServerMessage>,
 }
 
@@ -648,10 +753,96 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
     tokio::spawn(pump_frames(key.clone(), reader, frames_tx));
     Ok(Up {
         stamp,
-        _child: child,
-        writer,
+        _child: Some(child),
+        writer: Box::new(writer),
         frames,
     })
+}
+
+/// What a link's ping timer says to do on a tick.
+#[derive(Debug, PartialEq, Eq)]
+enum Tick {
+    /// Send this ping.
+    Ping(u64),
+    /// The last two pings went unanswered: the link is lost.
+    Lost,
+    /// Nothing but pings for the idle time, and nothing in flight.
+    Idle,
+}
+
+/// A dialled link's liveness: the ping it waits for, how many in a row went
+/// unanswered, and when anything but a ping last crossed it. A link is only
+/// known to be dead by asking it: a far server that died with its relay
+/// alive, or a relay that stopped, never closes the connection.
+struct Liveness {
+    idle: Duration,
+    /// The dial's barrier ping was nonce 1.
+    next_nonce: u64,
+    /// The last two pings sent, newest first: a pong for either counts, so
+    /// a round trip longer than the interval is slow, not dead.
+    recent: [Option<u64>; 2],
+    /// Whether a valid pong arrived since the last tick.
+    answered: bool,
+    missed: u8,
+    last_traffic: Instant,
+}
+
+impl Liveness {
+    fn new(idle: Duration, now: Instant) -> Self {
+        Liveness {
+            idle,
+            next_nonce: 2,
+            recent: [None, None],
+            answered: false,
+            missed: 0,
+            last_traffic: now,
+        }
+    }
+
+    /// A frame other than a ping or a pong crossed the link.
+    fn traffic(&mut self, now: Instant) {
+        self.last_traffic = now;
+    }
+
+    /// A pong: it counts only when it answers one of the last two pings
+    /// sent, never one this link did not send.
+    fn pong(&mut self, nonce: u64) {
+        if self.recent.contains(&Some(nonce)) {
+            self.answered = true;
+        }
+    }
+
+    /// One ping interval has passed. `busy` is whether anything is in
+    /// flight, which holds a link open however quiet it is. `Idle` changes
+    /// nothing, so a caller that finds work at the last moment ticks again
+    /// as busy and gets this interval's ping.
+    fn tick(&mut self, now: Instant, busy: bool) -> Tick {
+        if !busy && now.saturating_duration_since(self.last_traffic) >= self.idle {
+            return Tick::Idle;
+        }
+        if self.recent[0].is_some() {
+            if self.answered {
+                self.missed = 0;
+            } else {
+                self.missed += 1;
+                if self.missed >= 2 {
+                    return Tick::Lost;
+                }
+            }
+        }
+        self.answered = false;
+        let nonce = self.next_nonce;
+        self.next_nonce += 1;
+        self.recent = [Some(nonce), self.recent[0]];
+        Tick::Ping(nonce)
+    }
+}
+
+/// How a served link ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Lost(String),
+    Idle,
 }
 
 /// The ack to write back for the `MsgInbound` `req`.
@@ -709,42 +900,104 @@ impl InboundSlots {
     }
 }
 
-/// Carry forwards until the link is lost, and hand each message the far
-/// server sends back to `spec.on_inbound`; the reason the link was lost.
-async fn serve(spec: &LinkSpec, mut up: Up, rx: &mut mpsc::UnboundedReceiver<Forward>) -> String {
-    use crate::server::daemon::write_message;
+/// Write `frame` to the link, or fail when the far side has not taken it
+/// within `limit`: a far side that stopped reading (a stopped relay, a full
+/// pipe) would otherwise hold the link task in its write for ever, where no
+/// ping timer can see it.
+async fn write_within(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &ClientMessage,
+    limit: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(limit, crate::server::daemon::write_message(writer, frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("write failed: {e:#}")),
+        Err(_) => Err(format!("write stalled for {}ms", limit.as_millis())),
+    }
+}
 
+/// Carry forwards until the link is lost or idle, hand each message the far
+/// server sends back to `spec.on_inbound`, and ping it every `ping_ms`.
+async fn serve(
+    spec: &LinkSpec,
+    mut up: Up,
+    rx: &mut mpsc::UnboundedReceiver<Forward>,
+    links: &tokio::sync::Mutex<Links>,
+) -> Ended {
     let key = spec.key.as_str();
+    // Tokio's clock, which is std's outside a test that pauses time.
+    let now = || tokio::time::Instant::now().into_std();
+    let interval = crate::server::links::declared_ping(spec.ping_ms);
+    // Long enough for a slow far side to drain a frame, short enough that a
+    // stopped one is noticed.
+    let stall = (interval * 2).max(Duration::from_secs(10));
+    let mut liveness = Liveness::new(spec.idle, now());
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut in_flight = InFlight::default();
     let mut slots = InboundSlots::default();
     // Every ack comes from a taken slot, so the slots bound this channel.
     let (acks_tx, mut acks) = mpsc::channel::<ClientMessage>(INBOUND_IN_FLIGHT);
-    let reason = loop {
+    let ended = loop {
         tokio::select! {
+            _ = ticks.tick() => {
+                let busy = !in_flight.waiting.is_empty() || slots.taken > 0 || !rx.is_empty();
+                let tick = match liveness.tick(now(), busy) {
+                    // Decided under the lock that `Links::forward` queues
+                    // under, so a forward is either queued before the check
+                    // and carried here, or finds no queue after it and dials
+                    // a link of its own. Never queued on a link that is
+                    // closing, which would answer it unknown once written.
+                    Tick::Idle => {
+                        let mut links = links.lock().await;
+                        if rx.is_empty() {
+                            rx.close();
+                            links.outbound.remove(key);
+                            break Ended::Idle;
+                        }
+                        liveness.tick(now(), true)
+                    }
+                    tick => tick,
+                };
+                match tick {
+                    Tick::Lost => break Ended::Lost("2 pongs missed".to_string()),
+                    Tick::Idle => break Ended::Idle,
+                    Tick::Ping(nonce) => {
+                        if let Err(e) = write_within(&mut up.writer, &ClientMessage::Ping { nonce }, stall).await {
+                            break Ended::Lost(e);
+                        }
+                    }
+                }
+            }
             Some(ack) = acks.recv() => {
                 slots.release();
-                if let Err(e) = write_message(&mut up.writer, &ack).await {
-                    break format!("write failed: {e:#}");
+                liveness.traffic(now());
+                if let Err(e) = write_within(&mut up.writer, &ack, stall).await {
+                    break Ended::Lost(e);
                 }
             }
             fwd = rx.recv() => {
-                let Some(fwd) = fwd else { break "closed".to_string() };
+                let Some(fwd) = fwd else { break Ended::Lost("closed".to_string()) };
                 let Some((req, fwd)) = in_flight.admit(fwd) else { continue };
+                liveness.traffic(now());
                 // A failed write may still have put part or all of the
                 // frame on the link.
-                if let Err(e) = write_message(&mut up.writer, &fwd.msg).await {
+                if let Err(e) = write_within(&mut up.writer, &fwd.msg, stall).await {
                     let _ = fwd.reply.send(Err(Undelivered::Unknown(format!("{key}: link lost"))));
-                    break format!("write failed: {e:#}");
+                    break Ended::Lost(e);
                 }
                 in_flight.wait(req, fwd.reply);
             }
             frame = up.frames.recv() => match frame {
+                Some(ServerMessage::Pong { nonce }) => liveness.pong(nonce),
                 Some(answer @ (ServerMessage::MsgSent { .. } | ServerMessage::Error { .. })) => {
+                    liveness.traffic(now());
                     if in_flight.answer(answer) {
                         log::info!("link {key}: dropping an answer with no req, or one naming no send in flight (logged once per link)");
                     }
                 }
                 Some(ServerMessage::MsgInbound { to, body, deliver, reply_to, origin, req }) => {
+                    liveness.traffic(now());
                     let request = InboundRequest {
                         link: key.to_string(),
                         policy: spec.remote.inbound,
@@ -765,21 +1018,25 @@ async fn serve(spec: &LinkSpec, mut up: Up, rx: &mut mpsc::UnboundedReceiver<For
                             });
                         }
                         Err(refused) => {
-                            if let Err(e) = write_message(&mut up.writer, &inbound_ack(req, refused)).await {
-                                break format!("write failed: {e:#}");
+                            if let Err(e) = write_within(&mut up.writer, &inbound_ack(req, refused), stall).await {
+                                break Ended::Lost(e);
                             }
                         }
                     }
                 }
-                // Pongs and the far server's broadcasts to every
-                // connection: dropped, with no line per frame.
+                // The far server's broadcasts to every connection: dropped,
+                // with no line per frame, and not traffic.
                 Some(_) => {}
-                None => break "link lost".to_string(),
+                None => break Ended::Lost("link lost".to_string()),
             },
         }
     };
+    let reason = match &ended {
+        Ended::Lost(reason) => reason.clone(),
+        Ended::Idle => "closed while idle".to_string(),
+    };
     in_flight.fail_all(&format!("{key}: {reason}"));
-    reason
+    ended
 }
 
 #[cfg(test)]
@@ -795,6 +1052,7 @@ mod tests {
             host_name: "laptop".into(),
             dial: Duration::from_secs(1),
             ping_ms: 1000,
+            idle: Duration::from_secs(300),
             on_inbound: None,
         }
     }
@@ -1169,6 +1427,282 @@ mod tests {
         }
     }
 
+    const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn two_missed_pongs_bring_the_link_down() {
+        let t0 = Instant::now();
+        let mut live = Liveness::new(SEC * 300, t0);
+        assert_eq!(live.tick(t0 + SEC, true), Tick::Ping(2));
+        assert_eq!(live.tick(t0 + SEC * 2, true), Tick::Ping(3), "one missed");
+        assert_eq!(live.tick(t0 + SEC * 3, true), Tick::Lost, "two missed");
+    }
+
+    #[test]
+    fn a_matching_pong_resets_missed() {
+        let t0 = Instant::now();
+        let mut live = Liveness::new(SEC * 300, t0);
+        assert_eq!(live.tick(t0 + SEC, true), Tick::Ping(2));
+        assert_eq!(live.tick(t0 + SEC * 2, true), Tick::Ping(3));
+        live.pong(3);
+        assert_eq!(live.tick(t0 + SEC * 3, true), Tick::Ping(4));
+        assert_eq!(
+            live.tick(t0 + SEC * 4, true),
+            Tick::Ping(5),
+            "one missed again, not two"
+        );
+    }
+
+    #[test]
+    fn a_stale_nonce_is_not_a_pong() {
+        let t0 = Instant::now();
+        let mut live = Liveness::new(SEC * 300, t0);
+        assert_eq!(live.tick(t0 + SEC, true), Tick::Ping(2));
+        assert_eq!(live.tick(t0 + SEC * 2, true), Tick::Ping(3));
+        live.pong(0);
+        live.pong(1);
+        live.pong(9);
+        assert_eq!(live.tick(t0 + SEC * 3, true), Tick::Lost);
+    }
+
+    /// The far server of [`serve`]'s tests: a pong for every ping, noting
+    /// when each came in `pings`, and an answer naming its `req` for every
+    /// forwarded send.
+    async fn far_server(
+        stream: tokio::io::DuplexStream,
+        frames: mpsc::Sender<ServerMessage>,
+        pings: std::sync::Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    ) {
+        let (mut reader, _writer) = tokio::io::split(stream);
+        while let Ok(Some(frame)) =
+            crate::server::daemon::read_message::<ClientMessage>(&mut reader).await
+        {
+            let answer = match frame {
+                ClientMessage::Ping { nonce } => {
+                    pings.lock().unwrap().push(tokio::time::Instant::now());
+                    ServerMessage::Pong { nonce }
+                }
+                ClientMessage::MsgSend { req, .. } => ServerMessage::Error {
+                    message: "stored".into(),
+                    code: Some("stored".into()),
+                    req,
+                },
+                _ => continue,
+            };
+            if frames.send(answer).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_queued_at_the_idle_tick_is_carried_on_the_same_link() {
+        let links = std::sync::Arc::new(tokio::sync::Mutex::new(Links::new()));
+        let spec = LinkSpec {
+            idle: Duration::from_secs(2),
+            ..spec("mini")
+        };
+        let (first, first_answer) = oneshot::channel();
+        let forward = |reply| Forward {
+            msg: send_msg(),
+            reply,
+        };
+        let Some((spec, mut rx)) = links.lock().await.forward(spec, forward(first)) else {
+            panic!("the first forward dials");
+        };
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let (frames_tx, frames) = mpsc::channel(16);
+        let pings = std::sync::Arc::default();
+        tokio::spawn(far_server(far, frames_tx, std::sync::Arc::clone(&pings)));
+        let up = Up {
+            stamp: String::new(),
+            _child: None,
+            writer: Box::new(near),
+            frames,
+        };
+        let serving = {
+            let (links, spec) = (std::sync::Arc::clone(&links), spec.clone());
+            tokio::spawn(async move { serve(&spec, up, &mut rx, &links).await })
+        };
+        assert!(first_answer.await.unwrap().is_ok(), "the first is answered");
+
+        // Held across the idle tick and one interval past it, so that the
+        // link decides it is idle while a forward is being queued on it.
+        let interval = declared_ping(spec.ping_ms);
+        let mut held = links.lock().await;
+        tokio::time::sleep(spec.idle + interval + Duration::from_millis(100)).await;
+        let silent_since = pings.lock().unwrap().last().copied();
+        assert!(
+            silent_since.is_some_and(|t| t.elapsed() > interval),
+            "no ping for over an interval: the link is parked on the lock at its idle tick"
+        );
+        let (second, second_answer) = oneshot::channel();
+        assert!(
+            held.forward(spec.clone(), forward(second)).is_none(),
+            "the second forward is queued on the live link, not given a new dial"
+        );
+        let released = tokio::time::Instant::now();
+        drop(held);
+        assert!(
+            matches!(second_answer.await, Ok(Ok(ServerMessage::Error { .. }))),
+            "the second forward is written and answered by the far server, never failed"
+        );
+        assert!(!serving.is_finished(), "the link stays up for it");
+
+        // The kept tick pings at once, and every interval after: a skipped
+        // one leaves the far server two intervals without a ping, which is
+        // when it expires the link.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let after: Vec<_> = pings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&t| t >= released)
+            .copied()
+            .collect();
+        let widest = after.windows(2).map(|w| w[1] - w[0]).max();
+        assert!(
+            after.first() == Some(&released) && after.len() >= 3 && widest < Some(interval * 2),
+            "the kept tick's ping, then one every interval: {after:?} from {released:?}"
+        );
+    }
+
+    #[test]
+    fn an_idle_tick_changes_nothing_so_a_kept_link_counts_no_phantom_miss() {
+        let t0 = Instant::now();
+        let mut live = Liveness::new(SEC * 2, t0);
+        let Tick::Ping(first) = live.tick(t0 + SEC, false) else {
+            panic!("the first tick pings");
+        };
+        live.pong(first);
+        assert_eq!(live.tick(t0 + SEC * 2, false), Tick::Idle);
+        assert!(
+            matches!(live.tick(t0 + SEC * 2, true), Tick::Ping(_)),
+            "kept: the same interval's ping"
+        );
+        assert!(
+            matches!(live.tick(t0 + SEC * 3, true), Tick::Ping(_)),
+            "one unanswered ping is one miss, not two"
+        );
+    }
+
+    #[test]
+    fn a_round_trip_longer_than_the_interval_is_slow_not_dead() {
+        let t0 = Instant::now();
+        let mut live = Liveness::new(SEC * 300, t0);
+        let mut sent = vec![];
+        for n in 1..=6 {
+            match live.tick(t0 + SEC * n, true) {
+                Tick::Ping(nonce) => sent.push(nonce),
+                other => panic!("tick {n}: {other:?}"),
+            }
+            // Each pong arrives a tick and a half late: for the ping before
+            // this one.
+            if sent.len() >= 2 {
+                live.pong(sent[sent.len() - 2]);
+            }
+        }
+    }
+
+    #[test]
+    fn idle_ignores_pings_and_waits_for_nothing_in_flight() {
+        let t0 = Instant::now();
+        let mut live = Liveness::new(SEC * 4, t0);
+        for n in 1..=3 {
+            let Tick::Ping(nonce) = live.tick(t0 + SEC * n, false) else {
+                panic!("tick {n}");
+            };
+            live.pong(nonce);
+        }
+        assert!(
+            matches!(live.tick(t0 + SEC * 4, true), Tick::Ping(_)),
+            "busy holds it open"
+        );
+        live.pong(5);
+        assert_eq!(
+            live.tick(t0 + SEC * 5, false),
+            Tick::Idle,
+            "answered pings are not traffic"
+        );
+        let mut used = Liveness::new(SEC * 4, t0);
+        used.traffic(t0 + SEC * 3);
+        assert!(matches!(used.tick(t0 + SEC * 5, false), Tick::Ping(_)));
+    }
+
+    #[test]
+    fn an_inbound_link_expires_without_pings() {
+        let mut links = Links::new();
+        let t0 = Instant::now();
+        links.declare_at("laptop", 7, SEC, t0).unwrap();
+        links.pinged(7, t0 + SEC);
+        assert!(
+            links.expire(t0 + SEC * 3).is_empty(),
+            "pinged at 1s, so alive until 3s"
+        );
+        assert_eq!(
+            links.expire(t0 + SEC * 3 + SEC / 10),
+            vec![("laptop".to_string(), SEC * 2, 7)]
+        );
+        assert_eq!(links.peer_name(7, Instant::now()), None);
+    }
+
+    #[test]
+    fn an_expired_link_not_yet_swept_is_no_peer_and_no_route() {
+        let mut links = Links::new();
+        let t0 = Instant::now();
+        links.declare_at("laptop", 7, SEC, t0).unwrap();
+        assert_eq!(links.peer_name(7, t0 + SEC), Some("laptop"));
+        assert_eq!(links.live_inbound("laptop", t0 + SEC), Some(7));
+        let late = t0 + SEC * 2 + SEC / 2;
+        assert_eq!(links.peer_name(7, late), None, "its sends are refused");
+        assert_eq!(
+            links.live_inbound("laptop", late),
+            None,
+            "no reply is routed to it"
+        );
+    }
+
+    #[test]
+    fn a_ping_after_expiry_does_not_revive_the_link() {
+        let mut links = Links::new();
+        let t0 = Instant::now();
+        links.declare_at("laptop", 7, SEC, t0).unwrap();
+        let late = t0 + SEC * 2 + SEC / 2;
+        links.pinged(7, late);
+        assert!(
+            links.lapsed(7, late),
+            "past expiry and not yet swept, it is lapsed"
+        );
+        assert_eq!(
+            links.expire(late + SEC / 100),
+            vec![("laptop".to_string(), SEC * 2, 7)],
+            "the sweep after the late ping still expires it"
+        );
+    }
+
+    #[test]
+    fn a_held_name_is_refused_until_it_expires_then_free() {
+        let mut links = Links::new();
+        let t0 = Instant::now();
+        links.declare_at("laptop", 7, SEC, t0).unwrap();
+        assert_eq!(
+            links.declare_at("laptop", 8, SEC, t0 + SEC),
+            Err(Declare::Held { retry_after: SEC })
+        );
+        assert_eq!(
+            links.declare_at("laptop", 8, SEC, t0 + SEC * 2),
+            Ok(Some(7)),
+            "the expired holder's connection is handed back to be closed"
+        );
+        assert_eq!(links.peer_name(8, Instant::now()), Some("laptop"));
+        assert!(
+            links.lapsed(7, t0 + SEC * 2),
+            "7 declared, and holds nothing now"
+        );
+        assert!(!links.lapsed(8, t0 + SEC * 2));
+        assert!(!links.lapsed(9, t0 + SEC * 2), "9 never declared");
+    }
+
     #[test]
     fn a_declared_ping_is_clamped_to_one_second_through_a_minute() {
         assert_eq!(declared_ping(0), Duration::from_secs(1));
@@ -1181,22 +1715,23 @@ mod tests {
     #[test]
     fn a_declared_link_is_found_by_its_connection() {
         let mut links = Links::new();
-        assert_eq!(links.declare("laptop", 7, PING), Ok(()));
-        assert_eq!(links.peer_name(7), Some("laptop"));
-        assert_eq!(links.peer_name(8), None);
+        assert_eq!(links.declare("laptop", 7, PING), Ok(None));
+        assert_eq!(links.peer_name(7, Instant::now()), Some("laptop"));
+        assert_eq!(links.peer_name(8, Instant::now()), None);
     }
 
     #[test]
     fn a_live_link_is_never_replaced() {
         let mut links = Links::new();
-        links.declare("laptop", 7, PING).unwrap();
+        let t0 = Instant::now();
+        links.declare_at("laptop", 7, PING, t0).unwrap();
         assert_eq!(
-            links.declare("laptop", 8, PING),
+            links.declare_at("laptop", 8, PING, t0),
             Err(Declare::Held {
                 retry_after: PING * 2
             })
         );
-        assert_eq!(links.peer_name(7), Some("laptop"));
+        assert_eq!(links.peer_name(7, Instant::now()), Some("laptop"));
     }
 
     #[test]
@@ -1208,7 +1743,7 @@ mod tests {
             Err(Declare::AlreadyPeer("laptop".into()))
         );
         assert_eq!(links.drop_client(7), Some("laptop".into()));
-        assert_eq!(links.declare("laptop", 8, PING), Ok(()));
+        assert_eq!(links.declare("laptop", 8, PING), Ok(None));
     }
 
     #[test]
@@ -1238,6 +1773,6 @@ mod tests {
         ] {
             assert_eq!(links.declare(bad, 7, PING), Err(Declare::BadName), "{bad}");
         }
-        assert_eq!(links.declare("users", 7, PING), Ok(()));
+        assert_eq!(links.declare("users", 7, PING), Ok(None));
     }
 }

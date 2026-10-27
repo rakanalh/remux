@@ -131,6 +131,24 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
       logs, nor A1's client.log
   3g  answers that name no send in flight are dropped and logged once; the
       send they did not answer is forward_unknown
+  4h  ten pings add no line to either server's log
+  4f  a second link declaring laptop while A's is up is name_taken, and B's
+      replies still go over the real link
+  4a  a stopped relay: A's link is down within two missed pongs, and a
+      --wait parked on it is told the outcome is unknown
+  4e  B forgets a link that stopped pinging; a reply meanwhile has no route;
+      after A dials again the name is declared afresh
+  4b  B's server killed: A's link goes down, and a later send dials anew
+  4j  a second dial declaring laptop is refused while the stopped first one
+      holds the name, and declared once it expires
+  4k  one ping held 1.5 intervals: B expires the link and closes it, so the
+      next send is delivered over a new link, not refused
+  4l  a relay stopped until B expires its link (at most 2.5 intervals), then
+      resumed: A's link goes down and the next send works
+  4c  a link with only pings for idle_ms is closed; the next send re-dials
+  4d  a --wait in flight holds the link open past idle_ms
+  4g  pongs with the wrong nonce do not keep a link up
+  4i  B expires a link at twice the interval ITS pinger declared
   2z  no panic
 
 Run from the repo root: python3 tests/frame/msg_remote.py  (RMX_RUNDIR overrides)
@@ -654,6 +672,8 @@ os.environ.update(
     RMX_SHIM_MODE=f"{RUNDIR}/shim.mode",
     RMX_SHIM_FDS=f"{RUNDIR}/relay-fds.txt",
     RMX_SHIM_PUSH=f"{RUNDIR}/shim-push.json",
+    RMX_SHIM_SWALLOW=f"{RUNDIR}/shim-swallow",
+    RMX_SHIM_HOLD=f"{RUNDIR}/shim-hold",
     RMX_SHIM_ACKS=f"{RUNDIR}/shim-acks.jsonl",
     RMX_B_RUN=f"{RUNDIR}/b/run",
     RMX_B_STATE=f"{RUNDIR}/b/state",
@@ -1342,6 +1362,211 @@ try:
           f"3g answers naming no send are dropped, logged once, never taken as this send's (exit {code}, err {err!r}, logged {strays})")
     check(drop_link(), "3g ...and the echo link is torn down after")
     set_mode("relay")
+
+    # === Task 4: liveness ====================================================
+    import signal
+
+    def wait_downs(before, timeout):
+        end = time.time() + timeout
+        while time.time() < end and downs() == before:
+            time.sleep(0.05)
+        return downs() > before
+
+    def last_down():
+        lines = [ln for ln in srv_a.log().splitlines() if "link mini: down" in ln]
+        return lines[-1] if lines else ""
+
+    # --- 4h -----------------------------------------------------------------
+    code, out, err = send_from_a1(f"mini:%{B6}", "four-h")
+    a_lines, b_lines = srv_a.log().count("link mini"), srv_b.log().count("peer link")
+    b_pings = srv_b.log().count("msg=Ping")
+    time.sleep(10)
+    check(code == 0 and srv_a.log().count("link mini") == a_lines and srv_b.log().count("peer link") == b_lines
+          and srv_b.log().count("msg=Ping") == b_pings,
+          f"4h ten pings add no line to A's or B's log (exit {code}, A +{srv_a.log().count('link mini') - a_lines}, "
+          f"B +{srv_b.log().count('peer link') - b_lines}, B pings +{srv_b.log().count('msg=Ping') - b_pings})")
+
+    # --- 4f -----------------------------------------------------------------
+    code, out, err = send_from_a1(f"mini:%{B6}", "four-f")
+    four_f = sent_id(out)
+    got, _ = peer_frames([{"PeerLink": {"name": "laptop"}}, origin_send(B6, "R:IMPOSTOR", origin())])
+    check(codes(got)[:2] == ["name_taken", "origin_not_allowed"] and "held by a live link" in err_of(got[0])[1],
+          f"4f a second link declaring laptop while A's is up is name_taken, and is no peer after ({got})")
+    code, out, err = type_cli(cli_b, B6, f"printf 'RE:%s' fourf | '{BIN}' msg send laptop:%{A1} --reply-to {four_f} --stdin --deliver mailbox")
+    check(code == 0 and "RE:fourf" in bodies(srv_a, A1) and not [m for m in (got or []) if isinstance(m, dict) and "MsgInbound" in m],
+          f"4f ...and a reply from B still reaches A over the real link (exit {code}, err {err!r})")
+
+    # --- 4a / 4e ------------------------------------------------------------
+    check(wait_b_idle(BF), "4a BF is Idle before the parked --wait")
+    parked = type_start(cli_a, A1, a_send_cmd(f"mini:%{BF}", "GO:6000-foura", "submit", "--wait --timeout 20"))
+    end = time.time() + 10
+    while time.time() < end and "foura" not in fake_text(BF_LOG):
+        time.sleep(0.1)
+    stopped, before = relay_pid(), downs()
+    os.kill(stopped, signal.SIGSTOP)
+    t0 = time.time()
+    went = wait_downs(before, 5)
+    took = time.time() - t0
+    check(went and took <= 3.5 and "2 pongs missed" in last_down(),
+          f"4a a stopped relay brings A's link down within two missed pongs ({took:.1f}s, {last_down()[-60:]!r})")
+    c, o, e = type_wait(parked, 10)
+    check(c == 1 and "forward_unknown" in e and "2 pongs missed" in e,
+          f"4a ...and the --wait parked on it is told the outcome is unknown (exit {c}, err {e!r})")
+    # A kills the child of a link it gave up on, so the relay may be gone.
+    for sig in (signal.SIGCONT, signal.SIGKILL):
+        try:
+            os.kill(stopped, sig)
+        except OSError:
+            pass
+
+    def wait_b_log(text, mark, timeout=6.0):
+        end = time.time() + timeout
+        while time.time() < end and text not in srv_b.log()[mark:]:
+            time.sleep(0.05)
+        return text in srv_b.log()[mark:]
+
+    # --- 4e -----------------------------------------------------------------
+    # Through the proxy, which keeps A's link Up (it answers A's pings) while
+    # B hears nothing, so it is B's expiry, and nothing on A's side, that
+    # ends the link.
+    for f in (os.environ["RMX_SHIM_SWALLOW"], os.environ["RMX_SHIM_HOLD"]):
+        if os.path.exists(f):
+            os.remove(f)
+    set_mode("proxy")
+    code, out, err = send_from_a1(f"mini:%{B6}", "four-e0")
+    four_e0 = sent_id(out)
+    set_mode("relay")
+    before, b_mark = downs(), len(srv_b.log())
+    open(os.environ["RMX_SHIM_SWALLOW"], "w").close()
+    check(code == 0 and wait_b_log("peer link laptop: expired (no ping for 2s)", b_mark),
+          f"4e B expires the link that stopped pinging (exit {code})")
+    code, out, err = type_cli(cli_b, B6, f"printf 'RE:%s' foure | '{BIN}' msg send laptop:%{A1} --reply-to {four_e0} --stdin --deliver mailbox")
+    check(code == 1 and "route_unavailable" in err, f"4e ...so a reply meanwhile has no route (exit {code}, err {err!r})")
+    check(wait_downs(before, 5), "4e ...and B closes it, so A's link goes down rather than staying Up refused")
+    os.remove(os.environ["RMX_SHIM_SWALLOW"])
+    b_mark = len(srv_b.log())
+    code, out, err = send_from_a1(f"mini:%{B6}", "four-e")
+    four_e = sent_id(out)
+    code2, out2, err2 = type_cli(cli_b, B6, f"printf 'RE:%s' foure2 | '{BIN}' msg send laptop:%{A1} --reply-to {four_e} --stdin --deliver mailbox")
+    check(code == 0 and code2 == 0 and "peer link laptop: declared" in srv_b.log()[b_mark:],
+          f"4e after A dials again the name is declared afresh and the reply works (exit {code}/{code2}, err {err2!r})")
+
+    # --- 4b -----------------------------------------------------------------
+    before, old = downs(), relay_pid()
+    srv_b.crash()
+    t0 = time.time()
+    went = wait_downs(before, 5)
+    took = time.time() - t0
+    check(went and took <= 3.5, f"4b B's server killed under a live link: A's link is down in {took:.1f}s")
+    time.sleep(0.5)
+    srv_b.start_again()
+    time.sleep(1.0)
+    cli_b.close()
+    cli_b, (B7,) = setup_server(srv_b, 1)
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-b")
+    check(code == 0 and relay_pid() != old and not alive(old),
+          f"4b ...and after B is back the next send dials a NEW relay and is delivered (exit {code}, err {err!r})")
+
+    # --- 4j -----------------------------------------------------------------
+    a_restart(A_CONFIG + '\n[remotes.mini-again]\nssh = "whatever"\nremux_path = "remux"\n')
+    set_mode("proxy")
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-j0")
+    set_mode("relay")
+    b_mark = len(srv_b.log())
+    open(os.environ["RMX_SHIM_SWALLOW"], "w").close()
+    code, out, err = send_from_a1("mini-again:%" + str(B7), "four-j1")
+    check(code == 1 and "route_unavailable" in err and "held by a live link" in err,
+          f"4j a second dial declaring laptop while the first is held is refused (exit {code}, err {err!r})")
+    check(wait_b_log("peer link laptop: expired", b_mark), "4j ...the first is expired by B, not closed by A")
+    code, out, err = send_from_a1("mini-again:%" + str(B7), "four-j2")
+    check(code == 0 and "peer link laptop: declared" in srv_b.log()[b_mark:],
+          f"4j ...and once the held name expires, the same dial is declared (exit {code}, err {err!r})")
+    os.remove(os.environ["RMX_SHIM_SWALLOW"])
+    # mini-again's link now holds the name: A's restart closes it.
+    a_restart(A_CONFIG)
+
+    # --- 4k -----------------------------------------------------------------
+    # One ping held 1.5 intervals: B expires the link, though A's side, whose
+    # pong arrives late but within two intervals, would keep it.
+    set_mode("proxy")
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-k0")
+    set_mode("relay")
+    b_mark = len(srv_b.log())
+    open(os.environ["RMX_SHIM_HOLD"], "w").close()
+    expired = wait_b_log("peer link laptop: expired", b_mark)
+    time.sleep(0.5)
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-k")
+    check(code == 0 and expired and "forwarded to mini" in out and "R:four-k" in bodies(srv_b, B7),
+          f"4k after B expires a link over one held ping, the next send is delivered over a new one, "
+          f"not refused origin_not_allowed (expired {expired}, exit {code}, err {err!r})")
+
+    # --- 4l -----------------------------------------------------------------
+    # A smoke test of a stop and resume end to end. 4k and 4e are what prove
+    # the close: 4e the sweep's, 4k the Ping arm's. B expires the link about
+    # one interval before A has missed two pongs, so the relay is resumed the
+    # moment B logs the expiry: after a fixed stop, A's own detection may end
+    # the link first, and then nothing of B's is exercised. On a fresh link,
+    # so no earlier case's link is what is stopped.
+    a_restart(A_CONFIG)
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-l0")
+    stopped, before, b_mark = relay_pid(), downs(), len(srv_b.log())
+    os.kill(stopped, signal.SIGSTOP)
+    expired = wait_b_log("peer link laptop: expired", b_mark, timeout=2.5)
+    try:
+        os.kill(stopped, signal.SIGCONT)
+    except OSError:
+        pass
+    went = wait_downs(before, 3)
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-l")
+    check(code == 0 and expired and went and "R:four-l" in bodies(srv_b, B7),
+          f"4l a relay stopped until B expires its link, then resumed: B closes it, A's link goes down, and "
+          f"the next send is delivered over a new one (expired {expired}, A down {went}, exit {code}, err {err!r})")
+
+    # --- 4c / 4d ------------------------------------------------------------
+    a_restart(A_CONFIG.replace("idle_ms = 60000", "idle_ms = 4000"))
+    BF2, BF2_LOG, BF2_CTL = spawn_fake_b()
+    check(wait_b_idle(BF2), f"4c a fakeagent pane %{BF2} on B again")
+    a_mark = len(srv_a.log())
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-c")
+    n = shim_calls()
+    time.sleep(5.5)
+    check(code == 0 and "link mini: idle, closed" in srv_a.log()[a_mark:] and shim_calls() == n,
+          f"4c a link with only pings for idle_ms is closed (exit {code})")
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-c2")
+    check(code == 0 and shim_calls() == n + 1, f"4c ...and the next send dials again (exit {code}, ssh {shim_calls()} vs {n})")
+    check(wait_b_idle(BF2), "4d BF2 is Idle")
+    idles = srv_a.log().count("link mini: idle, closed")
+    c, o, e = type_cli(cli_a, A1, a_send_cmd(f"mini:%{BF2}", "GO:6000-fourd", "submit", "--wait --timeout 20"), timeout=40)
+    check(c == 0 and "idle, answered after" in o and srv_a.log().count("link mini: idle, closed") == idles,
+          f"4d a --wait in flight holds the link open past idle_ms (exit {c}, out {o!r}, err {e!r})")
+
+    # --- 4g -----------------------------------------------------------------
+    a_restart(A_CONFIG)
+    set_mode("stalepong")
+    before = downs()
+    code, out, err = send_from_a1(f"mini:%{B7}", "four-g")
+    went = wait_downs(before, 5)
+    check(code == 0 and went and "2 pongs missed" in last_down(),
+          f"4g pongs with the wrong nonce are not pongs: the link goes down (exit {code}, {last_down()[-60:]!r})")
+    try:
+        os.kill(relay_pid(), signal.SIGKILL)
+    except OSError:
+        pass
+    set_mode("relay")
+
+    # --- 4i -----------------------------------------------------------------
+    a_restart(A_CONFIG.replace("ping_ms = 1000", "ping_ms = 3000"))
+    restart_b(B_CONFIG + "\n[messaging.links]\nping_ms = 1000\n")
+    cli_b.close()
+    cli_b, (B8,) = setup_server(srv_b, 1)
+    b_mark = len(srv_b.log())
+    code, out, err = send_from_a1(f"mini:%{B8}", "four-i")
+    four_i = sent_id(out)
+    time.sleep(8)
+    code2, out2, err2 = type_cli(cli_b, B8, f"printf 'RE:%s' fouri | '{BIN}' msg send laptop:%{A1} --reply-to {four_i} --stdin --deliver mailbox")
+    check(code == 0 and code2 == 0 and "expired" not in srv_b.log()[b_mark:],
+          f"4i B expires a link at twice ITS pinger's interval: a 3 s pinger is alive at +8 s (exit {code}/{code2}, err {err2!r})")
+    a_restart(A_CONFIG)
 
     # --- 1r -----------------------------------------------------------------
     # B restarts below, so the next send dials afresh; 16 panes are made on A

@@ -29,7 +29,10 @@ impl PumpEnd {
 }
 
 /// Copy `ssh_in` to `server_out` and `server_in` to `ssh_out` until either
-/// direction ends.
+/// direction ends. The two directions are independent halves: one blocked
+/// writing (its reader is busy writing back) never stops the other from
+/// reading, which a single loop alternating between them would, and which
+/// deadlocks once both directions are full at once.
 pub async fn pump<A, B, C, D>(
     mut ssh_in: A,
     mut ssh_out: B,
@@ -42,37 +45,46 @@ where
     C: AsyncRead + Unpin,
     D: AsyncWrite + Unpin,
 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::AsyncReadExt;
-    let (mut up, mut down) = (0u64, 0u64);
-    let mut from_ssh = [0u8; 16 * 1024];
-    let mut from_server = [0u8; 16 * 1024];
-    let ssh_closed = loop {
-        tokio::select! {
-            got = ssh_in.read(&mut from_ssh) => match got {
-                Ok(0) | Err(_) => break true,
+    let (up, down) = (AtomicU64::new(0), AtomicU64::new(0));
+    // Each half ends with whether it was ssh's side that closed.
+    let upward = async {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match ssh_in.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
                 Ok(n) => {
-                    if server_out.write_all(&from_ssh[..n]).await.is_err() {
-                        break false;
+                    if server_out.write_all(&buf[..n]).await.is_err() {
+                        return false;
                     }
-                    up += n as u64;
+                    up.fetch_add(n as u64, Ordering::Relaxed);
                 }
-            },
-            got = server_in.read(&mut from_server) => match got {
-                Ok(0) | Err(_) => break false,
-                Ok(n) => {
-                    if ssh_out.write_all(&from_server[..n]).await.is_err()
-                        || ssh_out.flush().await.is_err()
-                    {
-                        break true;
-                    }
-                    down += n as u64;
-                }
-            },
+            }
         }
     };
+    let downward = async {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match server_in.read(&mut buf).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => {
+                    if ssh_out.write_all(&buf[..n]).await.is_err() || ssh_out.flush().await.is_err()
+                    {
+                        return true;
+                    }
+                    down.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let ssh_closed = tokio::select! {
+        closed = upward => closed,
+        closed = downward => closed,
+    };
     PumpEnd {
-        up,
-        down,
+        up: up.load(Ordering::Relaxed),
+        down: down.load(Ordering::Relaxed),
         ssh_closed,
     }
 }
@@ -80,6 +92,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both directions full at once: the server writes everything before it
+    /// reads anything, while ssh's side reads and writes together. A pump
+    /// that waits on its write to the server before reading the server
+    /// again never finishes.
+    #[tokio::test]
+    async fn both_directions_full_at_once_do_not_deadlock() {
+        use tokio::io::AsyncReadExt;
+        const N: usize = 1024 * 1024;
+        let (far, ssh_side) = tokio::io::duplex(256);
+        let (server_side, server) = tokio::io::duplex(256);
+        let (ssh_in, ssh_out) = tokio::io::split(ssh_side);
+        let (server_in, server_out) = tokio::io::split(server_side);
+        let pumping = tokio::spawn(pump(ssh_in, ssh_out, server_in, server_out));
+        let (mut far_in, mut far_out) = tokio::io::split(far);
+        let far_writes = tokio::spawn(async move {
+            far_out.write_all(&vec![b'u'; N]).await.unwrap();
+            far_out
+        });
+        let far_reads = tokio::spawn(async move {
+            let mut got = vec![0u8; N];
+            far_in.read_exact(&mut got).await.unwrap();
+        });
+        let server_turns = tokio::spawn(async move {
+            let (mut server_in, mut server_out) = tokio::io::split(server);
+            server_out.write_all(&vec![b'd'; N]).await.unwrap();
+            let mut got = vec![0u8; N];
+            server_in.read_exact(&mut got).await.unwrap();
+            (server_in, server_out)
+        });
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            far_reads.await.unwrap();
+            let _ = server_turns.await.unwrap();
+            let _ = far_writes.await.unwrap();
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the relay deadlocked with both directions full"
+        );
+        pumping.abort();
+    }
 
     #[tokio::test]
     async fn the_relay_logs_counts_never_bytes() {
