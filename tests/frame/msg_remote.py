@@ -149,6 +149,15 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
   4d  a --wait in flight holds the link open past idle_ms
   4g  pongs with the wrong nonce do not keep a link up
   4i  B expires a link at twice the interval ITS pinger declared
+  5a  a passphrase prompt fails at once with ssh's line and the fix, and one
+      warn line
+  5b  a dial that never answers fails at the dial deadline, and ssh is killed
+  5c  a far server at another protocol is named with both versions; a build
+      stamp holding a newline and ESC is one escaped, bounded log line
+  5d  a far server that closes on PeerLink is named an older remux or a
+      server gone, at once
+  5e  ssh's garbage stderr is cut and escaped; a megabyte of it is drained
+  5z  after every failure the next send dials and is delivered
   2z  no panic
 
 Run from the repo root: python3 tests/frame/msg_remote.py  (RMX_RUNDIR overrides)
@@ -339,8 +348,20 @@ def relay_pid():
     return int(pids[-1]) if pids else None
 
 
+# Without /proc (macOS) `alive` cannot see a process, and every check on it
+# is skipped rather than passed or failed on what it cannot see.
+HAVE_PROC = os.path.isdir("/proc/self")
+
+
 def alive(pid):
     return pid is not None and os.path.exists(f"/proc/{pid}")
+
+
+def check_proc(cond, label):
+    if HAVE_PROC:
+        check(cond, label)
+    else:
+        skip(label + " (no /proc)")
 
 
 def kill_relays():
@@ -1464,8 +1485,9 @@ try:
     cli_b.close()
     cli_b, (B7,) = setup_server(srv_b, 1)
     code, out, err = send_from_a1(f"mini:%{B7}", "four-b")
-    check(code == 0 and relay_pid() != old and not alive(old),
+    check(code == 0 and relay_pid() != old,
           f"4b ...and after B is back the next send dials a NEW relay and is delivered (exit {code}, err {err!r})")
+    check_proc(not alive(old), f"4b ...and the old relay is gone (pid {old})")
 
     # --- 4j -----------------------------------------------------------------
     a_restart(A_CONFIG + '\n[remotes.mini-again]\nssh = "whatever"\nremux_path = "remux"\n')
@@ -1568,6 +1590,80 @@ try:
           f"4i B expires a link at twice ITS pinger's interval: a 3 s pinger is alive at +8 s (exit {code}/{code2}, err {err2!r})")
     a_restart(A_CONFIG)
 
+    # === Task 5: every way a dial can fail ===================================
+    def dial_fails(mode, word):
+        """Send from A1 with the shim in `mode`: (exit, err, seconds, the
+        shim's pid), the shim having run once."""
+        set_mode(mode)
+        calls = shim_calls()
+        t0 = time.time()
+        code, out, err = send_from_a1(f"mini:%{B8}", word)
+        took = time.time() - t0
+        ran = shim_calls() == calls + 1
+        return code, err, took, (relay_pid() if ran else None)
+
+    def gone(pid, timeout=1.5):
+        end = time.time() + timeout
+        while time.time() < end and alive(pid):
+            time.sleep(0.05)
+        return not alive(pid)
+
+    # --- 5a -----------------------------------------------------------------
+    a_mark = len(srv_a.log())
+    code, err, took, pid = dial_fails("prompt", "five-a")
+    warned = [ln for ln in srv_a.log()[a_mark:].splitlines() if "WARN" in ln and "link mini: down" in ln]
+    check(code == 1 and "route_unavailable" in err and "Enter passphrase for key" in err
+          and "fix: connect the remote from the client once with ControlMaster" in err and took < 2.0
+          and pid is not None and len(warned) == 1,
+          f"5a a passphrase prompt fails at once with ssh's line and the fix, one warn line ({took:.1f}s, err {err!r}, warned {len(warned)})")
+    # --- 5b / 5f ------------------------------------------------------------
+    code, err, took, pid = dial_fails("hang", "five-b")
+    check(code == 1 and "dial timed out after 3s" in err and 2.5 <= took <= 5.0,
+          f"5b/5f a dial that never answers fails at the dial deadline, not the CLI's ({took:.1f}s, err {err!r})")
+    check_proc(pid is not None and gone(pid), f"5b ...and the hung ssh is killed (pid {pid})")
+    # --- 5c -----------------------------------------------------------------
+    code, err, took, pid = dial_fails("skew", "five-c")
+    check(code == 1 and f"remote protocol v16, local v{PROTOCOL_VERSION}" in err and "shim-skew" in err,
+          f"5c a far server at another protocol names both, and its build (err {err!r})")
+    # Read raw: Python's default newline handling turns a CR into a line
+    # break, which would hide one that reached the log. env_logger strips ESC
+    # sequences from a log file itself, so CR and the line break are what
+    # show whether the stamp reached the log unescaped.
+    a_log = f"{RUNDIR}/a/state/remux/server.log"
+    a_mark = len(open(a_log, newline="").read())
+    code, err, took, pid = dial_fails("skewnasty", "five-c2")
+    a_new = open(a_log, newline="").read()[a_mark:]
+    hs = [ln for ln in a_new.split("\n") if "handshake peer remux" in ln]
+    forged = [ln for ln in a_new.split("\n") if "forgedline" in ln]
+    check(code == 1 and "remote protocol v16" in err and "\x1b" not in err and "\x07" not in err
+          and "\r" not in err and "z" * 100 not in err,
+          f"5c a stamp with a newline, CR and ESC is escaped and bounded in the reply (err {err[:160]!r})")
+    check(len(hs) == 1 and "shim-nasty\\x0aINFO forgedline here\\x0dCR" in hs[0]
+          and all("shim-nasty" in ln for ln in forged)
+          and "\r" not in a_new and "\x1b" not in a_new and "\x07" not in a_new and "z" * 100 not in a_new,
+          f"5c ...and one escaped, bounded line in A's log (handshake lines {len(hs)}, forged lines {len(forged)}, "
+          f"CR in log {chr(13) in a_new}, ESC in log {chr(27) in a_new})")
+    # --- 5d -----------------------------------------------------------------
+    code, err, took, pid = dial_fails("oldpeer", "five-d")
+    check(code == 1 and took < 2.0 and "the far side closed the link during setup: an older remux that does not "
+          "know peer links, or a server that went away" in err,
+          f"5d a far server that closes on PeerLink is named an older remux or a server gone, at once ({took:.1f}s, err {err!r})")
+    # --- 5e -----------------------------------------------------------------
+    a_mark = len(srv_a.log())
+    code, err, took, pid = dial_fails("garbage", "five-e")
+    ssh_part = err.split("(ssh: ", 1)[1].split("); fix", 1)[0] if "(ssh: " in err else ""
+    check(code == 1 and ssh_part.startswith("Permission ") and len(ssh_part) <= 200
+          and "\x1b" not in err and "\x1b" not in srv_a.log()[a_mark:],
+          f"5e ssh's garbage is cut to its first line, at most 200 chars, escaped in the reply and the log ({len(ssh_part)} chars)")
+    code, err, took, pid = dial_fails("garbage-forever", "five-e2")
+    check(code == 1 and "(ssh: Permission " in err and took < 2.0 and pid is not None,
+          f"5e a megabyte of stderr is drained: the dial fails at once ({took:.1f}s, pid {pid})")
+    check_proc(gone(pid), f"5e ...and ssh exits (pid {pid})")
+    # --- 5z -----------------------------------------------------------------
+    set_mode("relay")
+    code, out, err = send_from_a1(f"mini:%{B8}", "five-z")
+    check(code == 0 and "forwarded to mini" in out, f"5z after every failure the next send dials and is delivered (exit {code}, err {err!r})")
+
     # --- 1r -----------------------------------------------------------------
     # B restarts below, so the next send dials afresh; 16 panes are made on A
     # while that dial is in flight.
@@ -1632,7 +1728,7 @@ try:
     # --- 1z -----------------------------------------------------------------
     for label, text in (("A", srv_a.log()), ("B", srv_b.log()), ("relay", relay_log() or "")):
         check("panicked at" not in text, f"1z no panic in {label}'s log")
-    check(alive(relay_pid()), f"1z the relay is alive at the end (pid {relay_pid()})")
+    check_proc(alive(relay_pid()), f"1z the relay is alive at the end (pid {relay_pid()})")
 finally:
     for c in (cli_a, cli_b):
         if c is not None:

@@ -11,6 +11,8 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
   hang     a dial that never answers (exec, so the recorded pid IS the sleep)
   skew     a Welcome with protocol_version 16, then exit (this file, run as a
            program on stdin/stdout)
+  skewnasty  the same, with a newline, a forged log line and ESC sequences
+           in its build stamp
   oldpeer  a correct handshake, then exit on the first frame after it
   eatsend  a correct handshake and peer link, then exit on the first send,
            unanswered: the send was written and its outcome is unknown
@@ -23,6 +25,9 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
            proxy answers A's pings itself (B hears nothing, A stays Up);
            when $RMX_SHIM_HOLD exists, the next ping from A is held 1.5 s.
            The proxy exits when B's relay does, as ssh would
+  garbage  ssh failing with 10 KiB of ESC-laden stderr, then 255
+  garbage-forever  the same with 1 MiB, more than any pipe holds: an ssh
+           whose stderr nobody drains blocks for ever
   stalepong  a far server that answers the dial's barrier ping and every
            forwarded send, but every later ping with the wrong nonce
   hostile  a far server that pushes messages back: one MsgInbound before
@@ -34,13 +39,17 @@ plays the mode the harness chose in `$RMX_SHIM_MODE`:
 Before the relay, the shim lists its own open descriptors to `$RMX_SHIM_FDS`:
 the relay inherits exactly these, and decision 71 says they are 0, 1 and 2.
 
-Run as a program (`python3 ssh_shim.py skew|oldpeer|eatsend|mute|hostile|echo|stalepong|proxy`) it
+Run as a program (`python3 ssh_shim.py skew|skewnasty|oldpeer|eatsend|mute|hostile|echo|stalepong|garbage|garbage-forever|proxy`) it
 is the far side of the link for the modes that need no real server.
 """
 import json
 import os
 import struct
 import sys
+
+# A build stamp that forges a log line, overwrites one with CR and colours
+# the terminal that shows the log, if any of it reaches a log raw.
+NASTY_STAMP = "shim-nasty\nINFO forgedline here\rCR\x1b[31mRED\x1b]0;title\x07" + "z" * 300
 
 SHIM = r"""#!/bin/sh
 # The fake ssh: records how it was called, then plays the mode the harness chose.
@@ -53,6 +62,7 @@ case "$mode" in
   prompt)  echo "Enter passphrase for key '/home/x/.ssh/id_ed25519':" >&2; exit 255 ;;
   hang)    exec sleep 60 ;;
   skew)    exec "$RMX_PY" "$RMX_SHIM_PY" skew ;;
+  skewnasty) exec "$RMX_PY" "$RMX_SHIM_PY" skewnasty ;;
   oldpeer) exec "$RMX_PY" "$RMX_SHIM_PY" oldpeer ;;
   eatsend) exec "$RMX_PY" "$RMX_SHIM_PY" eatsend ;;
   mute)    exec "$RMX_PY" "$RMX_SHIM_PY" mute ;;
@@ -60,6 +70,8 @@ case "$mode" in
   echo)    exec "$RMX_PY" "$RMX_SHIM_PY" echo ;;
   stalepong) exec "$RMX_PY" "$RMX_SHIM_PY" stalepong ;;
   proxy)   exec "$RMX_PY" "$RMX_SHIM_PY" proxy ;;
+  garbage) exec "$RMX_PY" "$RMX_SHIM_PY" garbage ;;
+  garbage-forever) exec "$RMX_PY" "$RMX_SHIM_PY" garbage-forever ;;
 esac
 """
 
@@ -85,10 +97,18 @@ def main(mode):
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
     if mode == "proxy":
         return _proxy(stdin, stdout)
+    if mode in ("garbage", "garbage-forever"):
+        size = 10 * 1024 if mode == "garbage" else 1024 * 1024
+        line = b"Permission \x1b[31mdenied\x1b[0m (publickey)" + b"\x1b" * 400 + b"\n"
+        rest = (b"\x1b[2J\x07garbage " * (size // 16 + 1))[:size]
+        sys.stderr.buffer.write(line + rest)
+        sys.stderr.buffer.flush()
+        return 255
     if _read_frame(stdin) is None:
         return 0
-    version = 16 if mode == "skew" else PROTOCOL_VERSION
-    _write_frame(stdout, {"protocol_version": version, "remux_version": f"shim-{mode}"})
+    version = 16 if mode in ("skew", "skewnasty") else PROTOCOL_VERSION
+    stamp = NASTY_STAMP if mode == "skewnasty" else f"shim-{mode}"
+    _write_frame(stdout, {"protocol_version": version, "remux_version": stamp})
     if mode == "oldpeer":
         _read_frame(stdin)
     if mode == "hostile":

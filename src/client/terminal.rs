@@ -315,22 +315,28 @@ where
         .await
         .context("reading Welcome")?
         .context("server closed connection during handshake")?;
+    // The far side writes the stamp, and this function also runs inside the
+    // server for a peer link: raw, a newline in it forges a line in
+    // server.log and an ESC reaches whatever terminal shows that log.
+    let shown = crate::client::cli_common::escape_bounded(&welcome.remux_version, STAMP_MAX);
     log::info!(
-        "terminal: handshake peer remux {} protocol v{}",
-        welcome.remux_version,
+        "terminal: handshake peer remux {shown} protocol v{}",
         welcome.protocol_version
     );
 
     if welcome.protocol_version != PROTOCOL_VERSION {
         anyhow::bail!(
-            "incompatible remux: remote protocol v{}, local v{} (remote remux {})",
+            "incompatible remux: remote protocol v{}, local v{} (remote remux {shown})",
             welcome.protocol_version,
             PROTOCOL_VERSION,
-            welcome.remux_version
         );
     }
-    Ok(welcome.remux_version)
+    Ok(welcome.remux_version.chars().take(STAMP_MAX).collect())
 }
+
+/// The most of a peer's build stamp that is kept or shown. A real stamp is a
+/// version and a short git hash, far shorter than this.
+const STAMP_MAX: usize = 64;
 
 /// Produce a concise summary of a `ClientMessage` for debug logging.
 fn client_message_summary(msg: &ClientMessage) -> String {
@@ -554,5 +560,31 @@ mod tests {
             err.contains("incompatible remux") && err.contains("0.1.0+old"),
             "the rejection must name the peer it refused: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_stamp_is_escaped_and_bounded_in_the_rejection() {
+        let stamp = format!("forged\nINFO line\u{1b}[31m{}", "x".repeat(500));
+        let (_, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION - 1,
+            remux_version: stamp,
+        })
+        .await;
+        let err = result.expect_err("a skewed peer is rejected").to_string();
+        assert!(
+            !err.contains('\n') && !err.contains('\u{1b}') && err.contains("forged\\x0aINFO"),
+            "{err:?}"
+        );
+        assert!(err.len() < 200, "the far stamp is cut: {} bytes", err.len());
+    }
+
+    #[tokio::test]
+    async fn a_peer_stamp_is_returned_cut() {
+        let (_, result) = handshake_against(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            remux_version: "é".repeat(500),
+        })
+        .await;
+        assert_eq!(result.unwrap(), "é".repeat(STAMP_MAX));
     }
 }

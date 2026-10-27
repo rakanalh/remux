@@ -409,10 +409,7 @@ pub fn code_like(code: &str) -> bool {
 /// far server's to write, and land in a reply and a log.
 pub fn far_refusal(code: Option<&str>, message: &str) -> (String, String) {
     let code = code.filter(|c| code_like(c)).unwrap_or("error").to_string();
-    let message = crate::client::cli_common::escape(message)
-        .chars()
-        .take(FAR_MESSAGE_MAX)
-        .collect();
+    let message = crate::client::cli_common::escape_bounded(message, FAR_MESSAGE_MAX);
     (code, message)
 }
 
@@ -426,10 +423,7 @@ pub fn ssh_failure_line(stderr: &[u8]) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
-    crate::client::cli_common::escape(line)
-        .chars()
-        .take(STDERR_LINE_MAX)
-        .collect()
+    crate::client::cli_common::escape_bounded(line, STDERR_LINE_MAX)
 }
 
 /// Spawn ssh. Off Linux, under [`crate::server::pty::OPEN_TO_FORK`]: a fork
@@ -527,7 +521,7 @@ pub async fn run_link((spec, mut rx): Dial) {
     let up = match dial(&spec).await {
         Ok(up) => up,
         Err(reason) => {
-            log::info!("link {key}: down ({reason})");
+            log::warn!("link {key}: down ({reason})");
             fail_queued(&mut rx, &reason);
             return;
         }
@@ -646,7 +640,6 @@ struct Up {
 /// answers only when it refuses: a `Pong` to the ping sent after it says it
 /// was taken. All within `spec.dial`.
 async fn dial(spec: &LinkSpec) -> Result<Up, String> {
-    use crate::server::daemon::write_message;
     use tokio::io::AsyncReadExt;
 
     let key = &spec.key;
@@ -686,47 +679,10 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
             let _ = tx.send(kept);
         }
     });
-    let declared = tokio::time::timeout(spec.dial, async {
-        let stamp = crate::client::terminal::handshake(&mut reader, &mut writer)
-            .await
-            .map_err(|e| DialError::from(format!("{e:#}")))?;
-        let declare = ClientMessage::PeerLink {
-            name: spec.host_name.clone(),
-            ping_ms: spec.ping_ms,
-        };
-        write_message(&mut writer, &declare)
-            .await
-            .map_err(|e| DialError::from(format!("{e:#}")))?;
-        write_message(&mut writer, &ClientMessage::Ping { nonce: 1 })
-            .await
-            .map_err(|e| DialError::from(format!("{e:#}")))?;
-        let mut skipped = false;
-        loop {
-            match next_frame(key, &mut reader, &mut skipped).await {
-                Ok(Some(ServerMessage::Pong { nonce: 1 })) => return Ok(stamp),
-                Ok(Some(ServerMessage::Error { message, .. })) => {
-                    let (_, message) = far_refusal(None, &message);
-                    return Err(DialError::Refused(format!(
-                        "{key} refused the peer link: {message}"
-                    )));
-                }
-                // The link is not up until the Pong: a message pushed
-                // before it is refused, never stored or left unanswered.
-                Ok(Some(ServerMessage::MsgInbound { req, .. })) => {
-                    let ack = inbound_ack(
-                        req,
-                        InboundAck::refused("route_unavailable", "link not up yet"),
-                    );
-                    write_message(&mut writer, &ack)
-                        .await
-                        .map_err(|e| DialError::from(format!("{e:#}")))?;
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => return Err("the connection closed".into()),
-                Err(e) => return Err(format!("{e:#}").into()),
-            }
-        }
-    })
+    let declared = tokio::time::timeout(
+        spec.dial,
+        set_up(key, &spec.host_name, spec.ping_ms, &mut reader, &mut writer),
+    )
     .await;
     let stamp = match declared {
         Ok(Ok(stamp)) => stamp,
@@ -734,19 +690,22 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
         failed => {
             let why = match failed {
                 Ok(Err(DialError::Failed(why))) => why,
-                _ => format!("no answer in {}ms", spec.dial.as_millis()),
+                _ => format!(
+                    "dial timed out after {}s",
+                    spec.dial.as_millis() as f64 / 1000.0
+                ),
             };
             let stderr = tokio::time::timeout(Duration::from_millis(500), kept_rx)
                 .await
                 .ok()
                 .and_then(Result::ok)
                 .unwrap_or_default();
-            let line = ssh_failure_line(&stderr);
-            return Err(if line.is_empty() {
-                format!("{key}: {why}")
-            } else {
-                format!("{key}: {why} (ssh: {line})")
-            });
+            return Err(dial_failure(
+                key,
+                &spec.remote,
+                &why,
+                &ssh_failure_line(&stderr),
+            ));
         }
     };
     let (frames_tx, frames) = mpsc::channel(FRAMES_QUEUE);
@@ -757,6 +716,113 @@ async fn dial(spec: &LinkSpec) -> Result<Up, String> {
         writer: Box::new(writer),
         frames,
     })
+}
+
+/// Why a dial failed when the far side took the handshake and then closed.
+/// A far server too old to know `PeerLink` drops the connection on it, but
+/// a server that stopped at that moment looks the same from here.
+const SETUP_EOF: &str = "the far side closed the link during setup: an older remux that does not know peer links, or a server that went away";
+
+/// The handshake, the `PeerLink` declaration and the barrier ping, on a
+/// connection that is ssh's in production and a test's own stream in
+/// tests: the remote's build stamp once the far server has taken the link.
+async fn set_up<R, W>(
+    key: &str,
+    host_name: &str,
+    ping_ms: u64,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<String, DialError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use crate::server::daemon::write_message;
+    let stamp = crate::client::terminal::handshake(reader, writer)
+        .await
+        .map_err(|e| DialError::from(format!("{e:#}")))?;
+    let declare = ClientMessage::PeerLink {
+        name: host_name.to_string(),
+        ping_ms,
+    };
+    write_message(writer, &declare)
+        .await
+        .map_err(|e| DialError::from(format!("{e:#}")))?;
+    write_message(writer, &ClientMessage::Ping { nonce: 1 })
+        .await
+        .map_err(|e| DialError::from(format!("{e:#}")))?;
+    let mut skipped = false;
+    loop {
+        match next_frame(key, reader, &mut skipped).await {
+            Ok(Some(ServerMessage::Pong { nonce: 1 })) => return Ok(stamp),
+            Ok(Some(ServerMessage::Error { message, .. })) => {
+                let (_, message) = far_refusal(None, &message);
+                return Err(DialError::Refused(format!(
+                    "{key} refused the peer link: {message}"
+                )));
+            }
+            // The link is not up until the Pong: a message pushed before it
+            // is refused, never stored or left unanswered.
+            Ok(Some(ServerMessage::MsgInbound { req, .. })) => {
+                let ack = inbound_ack(
+                    req,
+                    InboundAck::refused("route_unavailable", "link not up yet"),
+                );
+                write_message(writer, &ack)
+                    .await
+                    .map_err(|e| DialError::from(format!("{e:#}")))?;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(SETUP_EOF.into()),
+            Err(e) => return Err(format!("{e:#}").into()),
+        }
+    }
+}
+
+/// What a failed dial is answered with: the reason, escaped (part of it is
+/// the far side's to write), ssh's first stderr line when it wrote one, and
+/// then what to do, since what ssh says on stderr is a prompt or a refusal
+/// the server, which has no terminal, cannot answer.
+fn dial_failure(key: &str, remote: &RemoteConfig, why: &str, ssh_line: &str) -> String {
+    let why = crate::client::cli_common::escape_bounded(why, WHY_MAX);
+    if ssh_line.is_empty() {
+        return format!("{key}: {why}");
+    }
+    match ssh_fix(remote, ssh_line) {
+        Some(fix) => format!("{key}: {why} (ssh: {ssh_line}); fix: {fix}"),
+        None => format!("{key}: {why} (ssh: {ssh_line})"),
+    }
+}
+
+/// The longest dial failure reason kept. A decode error quotes the far
+/// side's bytes, so without a bound the far side sets the reason's length.
+const WHY_MAX: usize = 300;
+
+/// What to do about the ssh failure in `ssh_line`, when there is something
+/// to do. The ControlMaster and agent advice is for authentication only:
+/// for a refused connection or a name that does not resolve it sends the
+/// user to fix a key that is not the problem.
+fn ssh_fix(remote: &RemoteConfig, ssh_line: &str) -> Option<String> {
+    const AUTH: [&str; 4] = [
+        "Permission denied",
+        "passphrase",
+        "publickey",
+        "Too many authentication failures",
+    ];
+    if AUTH.iter().any(|token| ssh_line.contains(token)) {
+        Some(
+            "connect the remote from the client once with ControlMaster, or start the server where ssh-agent is available (note: panes inherit it)"
+                .to_string(),
+        )
+    } else if ssh_line.contains("Host key verification failed") {
+        let port = remote.port.map(|p| format!("-p {p} ")).unwrap_or_default();
+        Some(format!(
+            "accept the host key once with `ssh {port}{}`",
+            crate::client::cli_common::escape(&remote.ssh)
+        ))
+    } else {
+        None
+    }
 }
 
 /// What a link's ping timer says to do on a tick.
@@ -1136,6 +1202,12 @@ mod tests {
         );
         stderr = vec![b'a'; 10 * 1024];
         assert_eq!(ssh_failure_line(&stderr).chars().count(), STDERR_LINE_MAX);
+        stderr = vec![0x1b; 1024];
+        let line = ssh_failure_line(&stderr);
+        assert!(
+            line.chars().count() <= STDERR_LINE_MAX && line.ends_with("\\x1b..."),
+            "whole escapes only, with no partial one before the cut: {line}"
+        );
         assert_eq!(ssh_failure_line(b""), "");
     }
 
@@ -1366,6 +1438,15 @@ mod tests {
         assert_eq!(long.chars().count(), FAR_MESSAGE_MAX);
         let (_, esc) = far_refusal(Some("x"), "a\u{1b}[31mb\nc");
         assert!(!esc.contains('\u{1b}') && !esc.contains('\n'), "{esc:?}");
+        let (_, cut) = far_refusal(
+            Some("x"),
+            &format!("{}{}", "y".repeat(295), "\u{1b}".repeat(5)),
+        );
+        assert_eq!(
+            cut,
+            format!("{}...", "y".repeat(295)),
+            "an escape that does not fit whole is dropped, never cut to `\\x1`"
+        );
     }
 
     fn inbound_request() -> InboundRequest {
@@ -1701,6 +1782,124 @@ mod tests {
         );
         assert!(!links.lapsed(8, t0 + SEC * 2));
         assert!(!links.lapsed(9, t0 + SEC * 2), "9 never declared");
+    }
+
+    /// The far side of a handshake: read the Hello, answer a Welcome at
+    /// `version`, then read one frame and close.
+    async fn far_side(stream: tokio::io::DuplexStream, version: u32) {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let _: Option<crate::protocol::Hello> = crate::server::daemon::read_message(&mut reader)
+            .await
+            .unwrap();
+        let welcome = crate::protocol::Welcome {
+            protocol_version: version,
+            remux_version: "0.1.0+old\x1bt".into(),
+        };
+        crate::server::daemon::write_message(&mut writer, &welcome)
+            .await
+            .unwrap();
+        let _ = crate::server::daemon::read_frame(&mut reader).await;
+    }
+
+    async fn set_up_against(version: u32) -> Result<String, DialError> {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(far_side(far, version));
+        let (mut reader, mut writer) = tokio::io::split(near);
+        set_up("mini", "laptop", 1000, &mut reader, &mut writer).await
+    }
+
+    #[tokio::test]
+    async fn a_skewed_welcome_names_both_versions() {
+        let Err(DialError::Failed(why)) = set_up_against(16).await else {
+            panic!("a skewed handshake must fail");
+        };
+        let message = dial_failure("mini", &remote("box", None), &why, "");
+        assert!(
+            message.contains(&format!(
+                "remote protocol v16, local v{}",
+                crate::protocol::PROTOCOL_VERSION
+            )) && message.contains("0.1.0+old"),
+            "{message}"
+        );
+        assert!(
+            !message.contains('\u{1b}') && message.contains("(remote remux 0.1.0+old\\x1bt)"),
+            "the far side's stamp is escaped once, not twice: {message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_during_setup_is_named_as_an_old_peer() {
+        let Err(DialError::Failed(why)) = set_up_against(crate::protocol::PROTOCOL_VERSION).await
+        else {
+            panic!("a peer that closes on PeerLink must fail");
+        };
+        assert_eq!(why, SETUP_EOF);
+    }
+
+    fn remote(ssh: &str, port: Option<u16>) -> RemoteConfig {
+        RemoteConfig {
+            ssh: ssh.into(),
+            port,
+            ..RemoteConfig::default()
+        }
+    }
+
+    const AUTH_FIX: &str = "; fix: connect the remote from the client once with ControlMaster, or start the server where ssh-agent is available (note: panes inherit it)";
+
+    #[test]
+    fn an_auth_failure_says_to_reach_an_agent() {
+        for line in [
+            "user@host: Permission denied (publickey,password).",
+            "Enter passphrase for key '/home/u/.ssh/id_ed25519':",
+            "Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures",
+            &ssh_failure_line(b"Permission \x1b[31mdenied\x1b[0m (publickey)\n"),
+        ] {
+            let message = dial_failure("mini", &remote("box", None), "reading Welcome", line);
+            assert!(
+                message.ends_with(AUTH_FIX) && message.contains(&format!("(ssh: {line})")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_key_failure_says_to_accept_the_key() {
+        let line = "Host key verification failed.";
+        assert_eq!(
+            dial_failure("mini", &remote("me@box\u{1b}", None), "reading Welcome", line),
+            "mini: reading Welcome (ssh: Host key verification failed.); fix: accept the host key once with `ssh me@box\\x1b`"
+        );
+        assert_eq!(
+            dial_failure("mini", &remote("me@box", Some(2222)), "reading Welcome", line),
+            "mini: reading Welcome (ssh: Host key verification failed.); fix: accept the host key once with `ssh -p 2222 me@box`",
+            "the remote's port is part of the command, or it checks the key of another sshd"
+        );
+    }
+
+    #[test]
+    fn any_other_ssh_failure_has_no_fix() {
+        for line in [
+            "ssh: connect to host box port 22: Connection refused",
+            "ssh: Could not resolve hostname box: Name or service not known",
+        ] {
+            assert_eq!(
+                dial_failure("mini", &remote("box", None), "reading Welcome", line),
+                format!("mini: reading Welcome (ssh: {line})")
+            );
+        }
+    }
+
+    #[test]
+    fn a_dial_failure_reason_is_escaped_and_bounded() {
+        let box_ = remote("box", None);
+        assert_eq!(dial_failure("mini", &box_, "x\u{1b}", ""), "mini: x\\x1b");
+        let long = "é".repeat(WHY_MAX * 2);
+        let message = dial_failure("mini", &box_, &long, "");
+        assert_eq!(
+            message,
+            format!("mini: {}...", "é".repeat(WHY_MAX - 3)),
+            "cut to WHY_MAX characters, on a character boundary"
+        );
     }
 
     #[test]
