@@ -227,17 +227,32 @@ Task 5, --wait (stall_ms 2000, settle_ms 500, working_ms 500):
     never reaped (close_pane declines it): the wait is answered at once,
     Submitted/pane_closed_after_submit, not left until the sender gives up.
 5z. No panic.
+Task 7, `agent wait` (AgentWait / AgentWaited):
+7a. A wait for NeedsInput on an idle agent is answered when the agent draws
+    a prompt, not before.
+7b. A wait for Idle on an idle agent is answered at once.
+7c. A wait for Working with timeout_ms 1500 on an idle agent times out at
+    about 1.5 s, naming the state it is in (Idle).
+7d. A wait on a shell is agent_not_ready.
+7e. The pane closes mid-wait: no_such_target.
+7f. The agent exits mid-wait, leaving its shell: agent_not_ready.
+7g. A second request on a connection whose wait is parked is bad_request.
+7h. `remux agent wait %F --state blocked` exits 0 and says the agent is
+    blocked; with --timeout 1 on an idle agent it exits 0 and says it
+    timed out and is idle.
+7z. No panic.
 
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
 """
 import json
 import re
 import os
+import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Server, Client, name_of  # noqa: E402
+from harness import BIN, Server, Client, name_of  # noqa: E402
 import fakeagent  # noqa: E402
 
 RUNDIR = os.environ.get("RMX_RUNDIR", "/tmp/rmx-msgsub")
@@ -2387,6 +2402,150 @@ try:
           f"5l a wait on a pane whose program exited unseen is answered at once "
           f"({took and round(took, 2)}s after the quit; reply {r})")
     check("panicked at" not in srv.log(), "5z no panic")
+finally:
+    srv.kill()
+
+
+# === Task 7: agent wait ========================================================
+def start_wait(pane, state, timeout_ms=None):
+    """An AgentWait on a connection of its own, left open: (client, sent at)."""
+    c = Client(srv.sock)
+    c.hello()
+    body = {"target": {"host": None, "target": {"Pane": pane}}, "state": state}
+    if timeout_ms is not None:
+        body["timeout_ms"] = timeout_ms
+    c.send({"AgentWait": body})
+    return c, time.time()
+
+
+def answer_within(c, timeout):
+    """The wait's answer if one comes within `timeout`, leaving `c` open."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for m in c.drain(0.1):
+            if name_of(m) in ("AgentWaited", "Error"):
+                return m
+    return None
+
+
+def collect(c, timeout):
+    """The wait's answer and when it came, skipping pushes; (None, None) if
+    nothing came in time."""
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            for m in c.drain(0.1):
+                if name_of(m) in ("AgentWaited", "Error"):
+                    return m, time.time()
+    finally:
+        c.close()
+    return None, None
+
+
+def waited7(reply):
+    if name_of(reply) == "Error":
+        return ("Error", reply["Error"].get("code"))
+    w = (reply or {}).get("AgentWaited") or {}
+    return (w.get("state"), w.get("timed_out"))
+
+
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    X, X_LOG, X_CTL = spawn_agent(paste=True)
+    SH = cli_spawn("SplitBelow")
+    J = cli_spawn("SplitBelow")
+    time.sleep(1.0)
+    check(None not in (SH, J), "setup 7: the panes exist")
+
+    # 7a: answered when the prompt is drawn, not before.
+    c, _ = start_wait(F, "NeedsInput", 10_000)
+    early = answer_within(c, 1.5)
+    block_at = time.time()
+    tell(F_CTL, F_LOG, "block")
+    r, at = collect(c, 5)
+    check(early is None, f"7a ...the wait is not answered before the prompt (got {early})")
+    check(waited7(r) == ("NeedsInput", False) and at is not None and at - block_at < 2.0,
+          f"7a a wait for NeedsInput is answered when the prompt is drawn "
+          f"({at and round(at - block_at, 2)}s after the block; reply {r})")
+    tell(F_CTL, F_LOG, "clear")
+
+    # 7b: already there.
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle")
+    c, t0 = start_wait(F, "Idle", 10_000)
+    r, at = collect(c, 5)
+    check(waited7(r) == ("Idle", False) and at is not None and at - t0 < 0.5,
+          f"7b a wait for the state the agent is in is answered at once "
+          f"({at and round(at - t0, 2)}s; reply {r})")
+
+    # 7c: the deadline.
+    c, t0 = start_wait(F, "Working", 1500)
+    r, at = collect(c, 6)
+    took = (at - t0) if at else None
+    check(waited7(r) == ("Idle", True) and took is not None and 1.4 <= took < 2.5,
+          f"7c a wait that runs out names the state the agent is in ({took and round(took, 2)}s; reply {r})")
+
+    # 7d: a shell.
+    c, _ = start_wait(SH, "Idle", 5000)
+    r, _ = collect(c, 3)
+    check(waited7(r) == ("Error", "agent_not_ready"), f"7d a wait on a shell is agent_not_ready (reply {r})")
+
+    # 7g: one parked request per connection.
+    c, _ = start_wait(F, "Working", 10_000)
+    time.sleep(0.5)
+    c.send({"AgentWait": {"target": {"host": None, "target": {"Pane": F}}, "state": "NeedsInput"}})
+    r, _ = collect(c, 3)
+    check(waited7(r) == ("Error", "bad_request"),
+          f"7g a second request on a connection with a parked wait is bad_request (reply {r})")
+
+    # 7e: the pane closes.
+    c, _ = start_wait(X, "NeedsInput", 10_000)
+    time.sleep(1.0)
+    cli.send({"Command": {"PaneCloseById": {"session": "main", "pane_id": X}}})
+    r, _ = collect(c, 5)
+    check(waited7(r) == ("Error", "no_such_target"), f"7e the pane closes mid-wait: no_such_target (reply {r})")
+
+    # 7f: the agent exits to its shell.
+    agents[0] += 1
+    J_LOG, J_CTL = f"{RUNDIR}/agent-{agents[0]}.log", f"{RUNDIR}/agent-{agents[0]}.ctl"
+    cli.send({"InputToPane": {"pane_id": J, "data": list(f"{FAKEAGENT} {J_LOG} {J_CTL}\r".encode())}})
+    end = time.time() + 8
+    while time.time() < end and not os.path.exists(J_LOG):
+        time.sleep(0.05)
+    check(wait_idle(J, 8), f"setup 7f: the shell in %{J} runs the agent")
+    c, _ = start_wait(J, "NeedsInput", 10_000)
+    time.sleep(0.8)
+    tell(J_CTL, J_LOG, "quit")
+    r, _ = collect(c, 5)
+    check(waited7(r) == ("Error", "agent_not_ready"),
+          f"7f the agent exits mid-wait: agent_not_ready (reply {r})")
+
+    # 7h: the CLI.
+    env = {k: v for k, v in srv.env.items() if k not in ("REMUX_SESSION", "REMUX_PANE")}
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle")
+    proc = subprocess.Popen([BIN, "agent", "wait", f"%{F}", "--state", "blocked", "--timeout", "10"],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(1.0)
+    tell(F_CTL, F_LOG, "block")
+    out, err = proc.communicate(timeout=15)
+    check(proc.returncode == 0 and out.decode().strip() == f"%{F} is blocked",
+          f"7h `agent wait --state blocked` exits 0 once the agent asks (exit {proc.returncode}, "
+          f"out {out!r}, err {err!r})")
+    tell(F_CTL, F_LOG, "clear")
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle")
+    done = subprocess.run([BIN, "agent", "wait", f"%{F}", "--state", "working", "--timeout", "1"],
+                          env=env, capture_output=True, timeout=15)
+    check(done.returncode == 0 and done.stdout.decode().strip() == f"%{F} is not working (timed out; now idle)",
+          f"7h ...and a wait that runs out exits 0 and says so (exit {done.returncode}, "
+          f"out {done.stdout!r}, err {done.stderr!r})")
+    check("panicked at" not in srv.log(), "7z no panic")
 finally:
     srv.kill()
 

@@ -159,6 +159,19 @@ pub struct Reply {
     pub tx: tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerMessage>,
 }
 
+/// The most `agent wait` callers parked at once, across every pane.
+pub const MAX_STATE_WAITS: usize = 256;
+
+/// A caller waiting for a pane's agent to reach a state (`agent wait`). The
+/// submitter samples the pane each pass until it is there or the deadline
+/// passes.
+pub struct StateWait {
+    pub pane: PaneId,
+    pub want: crate::protocol::AgentState,
+    pub deadline: Instant,
+    pub reply: Reply,
+}
+
 /// A message waiting to be typed into a pane, oldest first per pane.
 pub struct SubmitEntry {
     pub id: MsgId,
@@ -327,6 +340,10 @@ pub struct Messaging {
     /// Submitted messages whose senders wait to hear how the turn ended,
     /// by message id.
     submit_waits: BTreeMap<MsgId, SubmitWait>,
+    /// Callers waiting for an agent to reach a state, by pane, each pane's in
+    /// the order they parked, so a pane's sample is checked against its own
+    /// waits only.
+    state_waits: BTreeMap<PaneId, Vec<StateWait>>,
 }
 
 /// What `mailbox.json` holds. Waiters, rate windows and the closed-pane set are
@@ -499,6 +516,7 @@ impl Messaging {
             changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             submit_queues: HashMap::new(),
             submit_waits: BTreeMap::new(),
+            state_waits: BTreeMap::new(),
             in_flight: HashMap::new(),
         }
     }
@@ -717,9 +735,10 @@ impl Messaging {
         before - self.waiters.len()
     }
 
-    /// Whether connection `client_id` has a send waiting for its answer,
-    /// queued or being typed. One per connection: a second cannot supersede
-    /// the first, whose message is already stored.
+    /// Whether connection `client_id` has a request parked: a send queued,
+    /// being typed or waiting for its turn to end, or an `agent wait`. A
+    /// connection parks at most one, and a second cannot supersede the first:
+    /// a send's message is already stored.
     pub fn has_parked_send(&self, client_id: u64) -> bool {
         let is_it =
             |reply: &Option<Reply>| reply.as_ref().is_some_and(|r| r.client_id == client_id);
@@ -731,6 +750,11 @@ impl Messaging {
             || self
                 .submit_waits
                 .values()
+                .any(|w| w.reply.client_id == client_id)
+            || self
+                .state_waits
+                .values()
+                .flatten()
                 .any(|w| w.reply.client_id == client_id)
     }
 
@@ -913,6 +937,68 @@ impl Messaging {
         !self.submit_queues.is_empty()
             || !self.in_flight.is_empty()
             || !self.submit_waits.is_empty()
+            || !self.state_waits.is_empty()
+    }
+
+    /// Park a caller waiting for an agent's state. Refused past
+    /// [`MAX_STATE_WAITS`] in all: `agent wait` takes callers outside every
+    /// pane, so there is no sender to hold to a share, and each wait is a
+    /// sample of its pane on every submitter pass.
+    pub fn park_state_wait(&mut self, wait: StateWait) -> Result<(), StateWait> {
+        let parked: usize = self.state_waits.values().map(Vec::len).sum();
+        if parked >= MAX_STATE_WAITS {
+            return Err(wait);
+        }
+        self.state_waits.entry(wait.pane).or_default().push(wait);
+        Ok(())
+    }
+
+    /// The panes some caller waits on the state of, each once.
+    pub fn state_wait_panes(&self) -> Vec<PaneId> {
+        self.state_waits.keys().copied().collect()
+    }
+
+    /// The waits on `pane` that are over now that its agent is in `state`:
+    /// those waiting for `state` (`false`), and those past their deadline
+    /// (`true`, timed out). Each is removed.
+    pub fn answer_state_waits(
+        &mut self,
+        pane: PaneId,
+        state: crate::protocol::AgentState,
+        now: Instant,
+    ) -> Vec<(StateWait, bool)> {
+        let Some(waits) = self.state_waits.remove(&pane) else {
+            return Vec::new();
+        };
+        let (over, kept): (Vec<StateWait>, Vec<StateWait>) = waits
+            .into_iter()
+            .partition(|w| w.want == state || now >= w.deadline);
+        if !kept.is_empty() {
+            self.state_waits.insert(pane, kept);
+        }
+        over.into_iter()
+            .map(|w| {
+                let timed_out = w.want != state;
+                (w, timed_out)
+            })
+            .collect()
+    }
+
+    /// Every wait on `pane`, removed: it closed, or is no longer an agent.
+    pub fn take_state_waits(&mut self, pane: PaneId) -> Vec<StateWait> {
+        self.state_waits.remove(&pane).unwrap_or_default()
+    }
+
+    /// Drop the state waits of a connection that closed. Returns how many.
+    pub fn drop_state_waits_of(&mut self, client_id: u64) -> usize {
+        let mut dropped = 0;
+        for waits in self.state_waits.values_mut() {
+            let before = waits.len();
+            waits.retain(|w| w.reply.client_id != client_id);
+            dropped += before - waits.len();
+        }
+        self.state_waits.retain(|_, waits| !waits.is_empty());
+        dropped
     }
 
     /// Watch `wait`'s pane until its agent's turn ends.
@@ -2034,6 +2120,89 @@ mod tests {
         let closing: Vec<MsgId> = m.take_submit_waits(6).iter().map(|w| w.id).collect();
         assert_eq!(closing, vec![3]);
         assert!(m.submit_waits_by_pane().is_empty());
+    }
+
+    fn state_wait(pane: PaneId, want: crate::protocol::AgentState, client: u64) -> StateWait {
+        StateWait {
+            pane,
+            want,
+            deadline: Instant::now() + std::time::Duration::from_secs(60),
+            reply: reply(client),
+        }
+    }
+
+    #[test]
+    fn a_state_wait_ends_on_its_state_or_its_deadline_and_not_another_state() {
+        use crate::protocol::AgentState::{Idle, NeedsInput, Working};
+        let mut m = Messaging::new(limits());
+        for w in [
+            state_wait(5, NeedsInput, 70),
+            state_wait(5, Idle, 71),
+            state_wait(6, Idle, 72),
+        ] {
+            assert!(m.park_state_wait(w).is_ok());
+        }
+        assert!(m.has_submit_work() && m.has_parked_send(70));
+        assert_eq!(m.state_wait_panes(), vec![5, 6]);
+        let now = Instant::now();
+        assert!(m.answer_state_waits(5, Working, now).is_empty());
+        let over = m.answer_state_waits(5, NeedsInput, now);
+        assert_eq!(
+            over.iter()
+                .map(|(w, t)| (w.reply.client_id, *t))
+                .collect::<Vec<_>>(),
+            vec![(70, false)],
+            "only the wait for that state, on that pane"
+        );
+        let late = now + std::time::Duration::from_secs(61);
+        let over = m.answer_state_waits(5, Working, late);
+        assert_eq!(
+            over.iter()
+                .map(|(w, t)| (w.reply.client_id, *t))
+                .collect::<Vec<_>>(),
+            vec![(71, true)],
+            "past its deadline, timed out"
+        );
+        assert_eq!(m.state_wait_panes(), vec![6]);
+    }
+
+    #[test]
+    fn state_waits_are_capped_in_all_and_free_a_place_when_one_ends() {
+        use crate::protocol::AgentState::Idle;
+        let mut m = Messaging::new(limits());
+        for n in 0..MAX_STATE_WAITS {
+            let pane = (n % 7) as PaneId;
+            assert!(
+                m.park_state_wait(state_wait(pane, Idle, n as u64)).is_ok(),
+                "{n}"
+            );
+        }
+        assert!(
+            m.park_state_wait(state_wait(99, Idle, 9_999)).is_err(),
+            "one past the cap, on a pane with none yet"
+        );
+        assert_eq!(m.drop_state_waits_of(0), 1);
+        assert!(
+            m.park_state_wait(state_wait(99, Idle, 9_999)).is_ok(),
+            "room again"
+        );
+    }
+
+    #[test]
+    fn state_waits_go_with_their_connection_or_their_pane() {
+        use crate::protocol::AgentState::Idle;
+        let mut m = Messaging::new(limits());
+        for w in [
+            state_wait(5, Idle, 70),
+            state_wait(6, Idle, 70),
+            state_wait(6, Idle, 71),
+        ] {
+            assert!(m.park_state_wait(w).is_ok());
+        }
+        assert_eq!(m.drop_state_waits_of(70), 2);
+        assert!(!m.has_parked_send(70));
+        assert_eq!(m.take_state_waits(6).len(), 1);
+        assert!(m.state_wait_panes().is_empty() && !m.has_submit_work());
     }
 
     #[test]

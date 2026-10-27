@@ -965,6 +965,7 @@ async fn run_submitter(
             step_submit(head, &state, &panes, &clients, &config, store).await;
         }
         step_submit_waits(&state, &panes, &config, store).await;
+        step_state_waits(&state, &panes, &config, store).await;
     }
 }
 
@@ -2433,6 +2434,177 @@ async fn handle_agent_name(
 
 /// Every agent, named pane and pane with mail, or only `target`. Answered per
 /// request and never on a timer, so it logs nothing per pane.
+/// The pane `address` names on this server, among the `live` ones, or the
+/// refusal to answer with: a bad host or name, a remote server, or no such
+/// pane.
+async fn resolve_target(
+    address: &Address,
+    live: &std::collections::HashSet<PaneId>,
+    store: &Mutex<Messaging>,
+) -> Result<PaneId, ServerMessage> {
+    use crate::server::messaging::Refusal;
+    if let Some(host) = &address.host {
+        if !valid_host(host) {
+            let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
+            return Err(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+        return Err(ServerMessage::refused(
+            "route_unavailable",
+            format!(
+                "{}: another server's panes are not listed yet",
+                loggable(&address.to_string())
+            ),
+        ));
+    }
+    if let Target::Name(name) = &address.target {
+        if !valid_name(name) {
+            let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
+            return Err(ServerMessage::refused(refusal.code(), refusal.message()));
+        }
+    }
+    store
+        .lock()
+        .await
+        .resolve(&address.target, |pane| live.contains(&pane))
+        .map_err(|refusal| ServerMessage::refused(refusal.code(), refusal.message()))
+}
+
+/// `agent wait`: answer at once when `target`'s agent is already in `want`,
+/// else park the caller for the submitter to answer. The state is the one a
+/// submit takes ([`submit_state`]), sampled from the one pane, so a selector
+/// no pattern names counts as `NeedsInput` here as it does for a submit.
+#[allow(clippy::too_many_arguments)]
+async fn handle_agent_wait(
+    client_id: u64,
+    target: Address,
+    want: AgentState,
+    timeout_ms: Option<u64>,
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let live = live_panes(panes).await;
+    let pane = match resolve_target(&target, &live, store).await {
+        Ok(pane) => pane,
+        Err(refusal) => return Some(refusal),
+    };
+    let sample = sample_pane(pane, state, panes, config).await;
+    if !sample.live {
+        return Some(ServerMessage::refused(
+            "no_such_target",
+            format!("no such target: %{pane}"),
+        ));
+    }
+    let Some(now_state) = sample.state else {
+        return Some(ServerMessage::refused(
+            "agent_not_ready",
+            format!("%{pane} is not running an agent this server knows"),
+        ));
+    };
+    let name = store.lock().await.name_of(pane).map(str::to_string);
+    if now_state == want {
+        return Some(agent_waited(pane, name, now_state, false));
+    }
+    let tx = clients.lock().await.get(&client_id).map(|c| c.tx.clone())?;
+    let deadline = std::time::Instant::now() + wait_timeout(timeout_ms);
+    {
+        let mut st = store.lock().await;
+        if st.has_parked_send(client_id) {
+            return Some(ServerMessage::refused(
+                "bad_request",
+                "this connection already has a request waiting",
+            ));
+        }
+        let wait = crate::server::messaging::StateWait {
+            pane,
+            want,
+            deadline,
+            reply: crate::server::messaging::Reply { client_id, tx },
+        };
+        if st.park_state_wait(wait).is_err() {
+            drop(st);
+            log::info!("agent: client_id={client_id} wait on %{pane} refused: busy");
+            return Some(ServerMessage::refused(
+                "busy",
+                format!(
+                    "{} callers already wait on agents' states; try again later",
+                    crate::server::messaging::MAX_STATE_WAITS
+                ),
+            ));
+        }
+    }
+    log::info!("agent: client_id={client_id} waits for %{pane} to be {want:?} (now {now_state:?})");
+    mark_submit_dirty();
+    None
+}
+
+fn agent_waited(
+    pane: PaneId,
+    name: Option<String>,
+    state: AgentState,
+    timed_out: bool,
+) -> ServerMessage {
+    ServerMessage::AgentWaited {
+        target: Resolved {
+            host: None,
+            pane_id: pane,
+            name,
+        },
+        state: Some(state),
+        timed_out,
+    }
+}
+
+/// One pass over the `agent wait` callers: sample each pane once, and answer
+/// the waits it ends. A pane that is no longer live is `no_such_target`, and
+/// one no longer running an agent is `agent_not_ready`: the state waited for
+/// can no longer come.
+async fn step_state_waits(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) {
+    let watched = store.lock().await.state_wait_panes();
+    for pane in watched {
+        let sample = sample_pane(pane, state, panes, config).await;
+        let now = std::time::Instant::now();
+        let mut st = store.lock().await;
+        match (sample.live, sample.state) {
+            (true, Some(agent_state)) => {
+                let name = st.name_of(pane).map(str::to_string);
+                for (wait, timed_out) in st.answer_state_waits(pane, agent_state, now) {
+                    log::info!(
+                        "agent: client_id={} wait on %{pane} for {:?} {}",
+                        wait.reply.client_id,
+                        wait.want,
+                        if timed_out { "timed out" } else { "answered" }
+                    );
+                    let message = agent_waited(pane, name.clone(), agent_state, timed_out);
+                    let _ = wait.reply.tx.send(message);
+                }
+            }
+            (live, _) => {
+                let (code, why) = if live {
+                    ("agent_not_ready", format!("the agent in %{pane} exited"))
+                } else {
+                    ("no_such_target", format!("pane %{pane} closed"))
+                };
+                for wait in st.take_state_waits(pane) {
+                    log::info!(
+                        "agent: client_id={} wait on %{pane} ended: {code}",
+                        wait.reply.client_id
+                    );
+                    let message = ServerMessage::refused(code, format!("{why} while waited on"));
+                    let _ = wait.reply.tx.send(message);
+                }
+            }
+        }
+    }
+}
+
 async fn handle_agent_status(
     target: Option<Address>,
     state: &Arc<Mutex<ServerState>>,
@@ -2440,40 +2612,13 @@ async fn handle_agent_status(
     config: &Arc<Config>,
     store: &Mutex<Messaging>,
 ) -> ServerMessage {
-    use crate::server::messaging::Refusal;
-
     let live = live_panes(panes).await;
     let wanted = match &target {
         None => None,
-        Some(address) => {
-            if let Some(host) = &address.host {
-                if !valid_host(host) {
-                    let refusal = Refusal::BadAddress(format!("bad host {}", loggable(host)));
-                    return ServerMessage::refused(refusal.code(), refusal.message());
-                }
-                return ServerMessage::refused(
-                    "route_unavailable",
-                    format!(
-                        "{}: another server's panes are not listed yet",
-                        loggable(&address.to_string())
-                    ),
-                );
-            }
-            if let Target::Name(name) = &address.target {
-                if !valid_name(name) {
-                    let refusal = Refusal::BadAddress(format!("bad name {}", loggable(name)));
-                    return ServerMessage::refused(refusal.code(), refusal.message());
-                }
-            }
-            let resolved = store
-                .lock()
-                .await
-                .resolve(&address.target, |pane| live.contains(&pane));
-            match resolved {
-                Ok(pane) => Some(pane),
-                Err(refusal) => return ServerMessage::refused(refusal.code(), refusal.message()),
-            }
-        }
+        Some(address) => match resolve_target(address, &live, store).await {
+            Ok(pane) => Some(pane),
+            Err(refusal) => return refusal,
+        },
     };
 
     // It dups the masters itself and holds no lock while it reads them.
@@ -4199,6 +4344,17 @@ async fn handle_client_message(
                     .map_or("None".to_string(), |t| loggable(&t.to_string()))
             );
         }
+        ClientMessage::AgentWait {
+            target,
+            state,
+            timeout_ms,
+        } => {
+            log::debug!(
+                "server: client_id={client_id} msg=AgentWait(target={}, state={state:?}, \
+                 timeout={timeout_ms:?})",
+                loggable(&target.to_string())
+            );
+        }
         ClientMessage::MsgRead {
             pane,
             all,
@@ -4347,6 +4503,29 @@ async fn handle_client_message(
         ClientMessage::AgentStatus { target } => {
             let answer = handle_agent_status(target, state, panes, config, messaging()).await;
             reply(client_id, clients, answer).await;
+            Ok(())
+        }
+        ClientMessage::AgentWait {
+            target,
+            state: want,
+            timeout_ms,
+        } => {
+            let answer = handle_agent_wait(
+                client_id,
+                target,
+                want,
+                timeout_ms,
+                state,
+                panes,
+                clients,
+                config,
+                messaging(),
+            )
+            .await;
+            // `None` is a wait that was parked: the submitter answers it.
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer).await;
+            }
             Ok(())
         }
         ClientMessage::Attach { session_name } => {
@@ -8121,6 +8300,10 @@ async fn handle_client_disconnect(
             store.drop_submit_waits_of(client_id),
         )
     };
+    let state_waits = messaging().lock().await.drop_state_waits_of(client_id);
+    if state_waits > 0 {
+        log::info!("agent: dropped {state_waits} wait(s) of client_id={client_id} (disconnected)");
+    }
     for id in waits {
         log::info!(
             "msg: id={id} wait dropped: client_id={client_id} disconnected before the turn ended"
@@ -12518,6 +12701,16 @@ async fn reap_panes(
                 let answer = crate::server::submit::settle(entry.deliver, refusal);
                 let message = answer_submit(entry.id, resolved, answer, None);
                 send_reply(entry.id, entry.reply, message);
+            }
+            for wait in store.take_state_waits(pane_id) {
+                log::info!(
+                    "agent: client_id={} wait on %{pane_id} ended: the pane closed",
+                    wait.reply.client_id
+                );
+                let _ = wait.reply.tx.send(ServerMessage::refused(
+                    "no_such_target",
+                    format!("pane %{pane_id} closed while waited on"),
+                ));
             }
             let name = store.name_of(pane_id).map(str::to_string);
             for wait in store.take_submit_waits(pane_id) {

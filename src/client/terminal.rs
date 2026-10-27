@@ -397,6 +397,14 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             "AgentStatus(target={:?})",
             target.as_ref().map(|t| t.to_string())
         ),
+        ClientMessage::AgentWait {
+            target,
+            state,
+            timeout_ms,
+        } => format!(
+            "AgentWait(target={:?}, state={state:?}, timeout={timeout_ms:?})",
+            target.to_string()
+        ),
         ClientMessage::MsgRead {
             pane,
             all,

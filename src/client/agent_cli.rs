@@ -1,12 +1,16 @@
-//! `remux agent name | ls | status`: name panes and list the ones worth
-//! addressing. Exit codes and deadlines as `remux msg` (see `cli_common`).
+//! `remux agent name | ls | status | wait`: name panes, list the ones worth
+//! addressing, and wait for an agent's state. Exit codes and deadlines as
+//! `remux msg` (see `cli_common`).
 //!
 //! Every field printed in the table is escaped: a name and a session are
 //! labels someone else chose, and a command is a process name, which any
 //! program can set to an escape sequence.
 
+use std::time::Duration;
+
 use crate::client::cli_common::{
-    ask, escape, json_line, pane_hint, parse_pane, run_verb, unexpected, CliError, REPLY_DEADLINE,
+    ask, escape, json_line, pane_hint, parse_pane, parse_wait, run_verb, unexpected, CliError,
+    REPLY_DEADLINE,
 };
 use crate::protocol::{
     valid_name, Address, AgentState, ClientMessage, PaneId, PaneStatusEntry, ServerMessage,
@@ -48,13 +52,52 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Wait until a pane's agent is in a state. Exits 0 when it is, and 0 when
+    /// the time runs out, saying so and naming the state it is in. The state
+    /// is the one a typed message is checked against, so a numbered selector
+    /// that no prompt pattern names counts as blocked here, while `agent
+    /// status` can still show that pane idle.
+    Wait {
+        /// `%N` or a name
+        target: String,
+        /// The state to wait for
+        #[arg(long, value_enum)]
+        state: StateArg,
+        /// How long to wait: `30`, `30s`, `2m`, at most 1h; 10m by default
+        #[arg(long, value_parser = parse_wait, value_name = "DUR")]
+        timeout: Option<Duration>,
+        /// Print the answer as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum StateArg {
+    Idle,
+    Working,
+    /// Waiting on its user: a question or a permission prompt
+    #[value(alias = "needs-input")]
+    Blocked,
+}
+
+impl From<StateArg> for AgentState {
+    fn from(arg: StateArg) -> Self {
+        match arg {
+            StateArg::Idle => AgentState::Idle,
+            StateArg::Working => AgentState::Working,
+            StateArg::Blocked => AgentState::NeedsInput,
+        }
+    }
 }
 
 /// Run one `remux agent` verb, and the exit code for it.
 pub async fn run_agent(cmd: AgentCmd) -> u8 {
     let json = matches!(
         cmd,
-        AgentCmd::Ls { json: true } | AgentCmd::Status { json: true, .. }
+        AgentCmd::Ls { json: true }
+            | AgentCmd::Status { json: true, .. }
+            | AgentCmd::Wait { json: true, .. }
     );
     run_verb(run(cmd), json).await
 }
@@ -102,6 +145,101 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                 .map_err(|why| CliError::usage("bad_address", why))?;
             status(target, json).await
         }
+        AgentCmd::Wait {
+            target,
+            state,
+            timeout,
+            json,
+        } => {
+            let target: Address = target
+                .parse()
+                .map_err(|why: String| CliError::usage("bad_address", why))?;
+            let want: AgentState = state.into();
+            let timeout = wait_for(timeout);
+            log::debug!(
+                "cmd: agent wait target={:?} state={want:?} timeout={}",
+                target.to_string(),
+                timeout.as_millis()
+            );
+            let answer = ask(
+                ClientMessage::AgentWait {
+                    target,
+                    state: want,
+                    timeout_ms: Some(timeout.as_millis() as u64),
+                },
+                timeout + REPLY_DEADLINE,
+            )
+            .await?;
+            match answer {
+                ServerMessage::AgentWaited {
+                    target,
+                    state,
+                    timed_out,
+                } => {
+                    log::debug!("cmd: agent wait answered AgentWaited(timed_out={timed_out})");
+                    if json {
+                        println!(
+                            "{}",
+                            json_line(&serde_json::json!({
+                                "target": target, "state": state, "timed_out": timed_out
+                            }))
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            waited_line(
+                                target.pane_id,
+                                target.name.as_deref(),
+                                want,
+                                state,
+                                timed_out
+                            )
+                        );
+                    }
+                    Ok(())
+                }
+                other => Err(unexpected(&other)),
+            }
+        }
+    }
+}
+
+/// The time `agent wait` asks for: `timeout`, or the server's default, at
+/// most an hour, as the server caps it.
+fn wait_for(timeout: Option<Duration>) -> Duration {
+    use crate::server::daemon::{DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS};
+    timeout
+        .unwrap_or(Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS))
+        .min(Duration::from_millis(MAX_WAIT_MS))
+}
+
+/// A state as `agent wait --state` names it, so the answer uses the flag's
+/// words.
+fn wait_word(state: Option<AgentState>) -> &'static str {
+    match state {
+        Some(AgentState::NeedsInput) => "blocked",
+        other => state_word(other),
+    }
+}
+
+fn waited_line(
+    pane: PaneId,
+    name: Option<&str>,
+    want: AgentState,
+    state: Option<AgentState>,
+    timed_out: bool,
+) -> String {
+    let named = name
+        .map(|n| format!(" ({})", escape(n)))
+        .unwrap_or_default();
+    if timed_out {
+        format!(
+            "%{pane}{named} is not {} (timed out; now {})",
+            wait_word(Some(want)),
+            wait_word(state)
+        )
+    } else {
+        format!("%{pane}{named} is {}", wait_word(state))
     }
 }
 
@@ -231,6 +369,69 @@ mod tests {
         assert!(table.contains("s\\x1b[2J\\x0ax"), "{table}");
         assert!(table.contains("c\\u{9b}31m\\u{202e}"), "{table}");
         assert!(table.contains("n\\x1b]52;c;aGk=\\x07\\u{e0041}"), "{table}");
+    }
+
+    #[test]
+    fn the_waited_line_says_whether_the_state_came() {
+        assert_eq!(
+            waited_line(
+                3,
+                Some("lead"),
+                AgentState::Idle,
+                Some(AgentState::Idle),
+                false
+            ),
+            "%3 (lead) is idle"
+        );
+        assert_eq!(
+            waited_line(3, None, AgentState::Idle, Some(AgentState::Working), true),
+            "%3 is not idle (timed out; now working)"
+        );
+        assert_eq!(
+            waited_line(
+                3,
+                Some("a\u{1b}"),
+                AgentState::NeedsInput,
+                Some(AgentState::NeedsInput),
+                false
+            ),
+            "%3 (a\\x1b) is blocked"
+        );
+    }
+
+    #[test]
+    fn the_wait_asks_for_the_default_and_never_past_the_cap() {
+        use crate::server::daemon::{DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS};
+        assert_eq!(
+            wait_for(None),
+            Duration::from_millis(DEFAULT_SUBMIT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            wait_for(Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            wait_for(Some(Duration::from_secs(u32::MAX as u64))),
+            Duration::from_millis(MAX_WAIT_MS)
+        );
+    }
+
+    #[derive(clap::Parser, Debug)]
+    struct Parsed {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    }
+
+    #[test]
+    fn a_wait_needs_a_state_and_takes_blocked_or_needs_input() {
+        use clap::Parser;
+        let parse = |args: &[&str]| Parsed::try_parse_from(["agent"].iter().chain(args));
+        assert!(parse(&["wait", "%1"]).is_err(), "no state");
+        assert!(parse(&["wait", "%1", "--state", "done"]).is_err());
+        for word in ["idle", "working", "blocked", "needs-input"] {
+            assert!(parse(&["wait", "%1", "--state", word]).is_ok(), "{word}");
+        }
+        assert!(parse(&["wait", "%1", "--state", "idle", "--timeout", "abc"]).is_err());
     }
 
     #[test]

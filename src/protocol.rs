@@ -140,7 +140,11 @@ pub enum ConnDescriptor {
 /// them and would drop the connection. Later on the same branch, before any
 /// release, `MsgSend` gained `defer`, `timeout_ms` and `wait`, and `MsgSent`
 /// gained `timed_out` and `final_state`, all `#[serde(default)]`, so an older
-/// 18 build and a newer one still decode each other.
+/// 18 build and a newer one still decode each other. [`ClientMessage::AgentWait`]
+/// and [`ServerMessage::AgentWaited`] were added at 18 the same way, with no
+/// bump: an 18 server built before them cannot decode an `AgentWait` and drops
+/// that connection, which is the skew 13 describes, and only the finished
+/// branch is released.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -677,6 +681,20 @@ pub enum ClientMessage {
         #[serde(default)]
         target: Option<Address>,
     },
+    /// Wait until `target`'s agent is in `state`, for at most `timeout_ms`
+    /// (`None` is the server's default; the server caps it).
+    ///
+    /// Answered with [`ServerMessage::AgentWaited`] at once when the agent is
+    /// already in `state`, else when it gets there or the time runs out; or
+    /// with [`ServerMessage::Error`]: `agent_not_ready` when the target is
+    /// not running an agent, or stops running one, and `no_such_target` when
+    /// it is not a live pane, or closes.
+    AgentWait {
+        target: Address,
+        state: AgentState,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +931,14 @@ pub enum ServerMessage {
     AgentNamed { pane: PaneId, name: Option<String> },
     /// The answer to a [`ClientMessage::AgentStatus`], sorted by pane id.
     AgentStatusList { panes: Vec<PaneStatusEntry> },
+    /// The answer to a [`ClientMessage::AgentWait`]: the agent's state, which
+    /// is the one waited for unless `timed_out`.
+    AgentWaited {
+        target: Resolved,
+        state: Option<AgentState>,
+        #[serde(default)]
+        timed_out: bool,
+    },
     /// The answer to a [`ClientMessage::ListDirectory`].
     ///
     /// `path` is the requested path echoed back unchanged -- the panel matches
@@ -1436,6 +1462,7 @@ impl ServerMessage {
             ServerMessage::MsgAcked { .. } => "MsgAcked",
             ServerMessage::AgentNamed { .. } => "AgentNamed",
             ServerMessage::AgentStatusList { .. } => "AgentStatusList",
+            ServerMessage::AgentWaited { .. } => "AgentWaited",
             ServerMessage::DirectoryListing { .. } => "DirectoryListing",
             ServerMessage::AgentList { .. } => "AgentList",
             ServerMessage::SessionTree { .. } => "SessionTree",
@@ -1476,6 +1503,7 @@ impl ServerMessage {
             | ServerMessage::MsgAcked { .. }
             | ServerMessage::AgentNamed { .. }
             | ServerMessage::AgentStatusList { .. }
+            | ServerMessage::AgentWaited { .. }
             | ServerMessage::DirectoryListing { .. }
             | ServerMessage::SessionTree { .. }
             | ServerMessage::ViewCreated { .. } => false,
@@ -2806,6 +2834,41 @@ mod tests {
                 pane_hint: None
             } if name.as_deref() == Some("alpha")
         ));
+        let wait: ClientMessage = serde_json::from_str(
+            r#"{"AgentWait":{"target":{"host":null,"target":{"Pane":7}},"state":"NeedsInput"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            wait,
+            ClientMessage::AgentWait {
+                state: AgentState::NeedsInput,
+                timeout_ms: None,
+                ..
+            }
+        ));
+        let waited = ServerMessage::AgentWaited {
+            target: Resolved {
+                host: None,
+                pane_id: 7,
+                name: None,
+            },
+            state: Some(AgentState::Working),
+            timed_out: true,
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&waited).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::AgentWaited {
+                state: Some(AgentState::Working),
+                timed_out: true,
+                ..
+            }
+        ));
+        assert!(
+            !back.is_push(),
+            "an answer, so a one-shot request waits for it"
+        );
         let status: ClientMessage = serde_json::from_str(r#"{"AgentStatus":{}}"#).unwrap();
         assert!(matches!(
             status,
