@@ -828,6 +828,8 @@ async fn handle_msg_send(
         };
         (sent, store.take_swept(), answered, queued)
     };
+    // The panel's unread count changed, though the pane printed nothing.
+    mark_agents_dirty();
     for (waiter, messages) in answered {
         log::info!(
             "msg: wait on %{to} answered n={} for client_id={}",
@@ -1207,6 +1209,7 @@ async fn step_submit(
             Claim::OutOfTime(entry)
         } else if st.mark_submitted(pane, id) {
             st.begin_typing(pane, entry.reply.take());
+            mark_agents_dirty();
             Claim::Typing(entry)
         } else {
             Claim::AlreadyRead(entry)
@@ -1400,6 +1403,16 @@ async fn hold_while_blocked(pane: PaneId, id: MsgId, store: &'static Mutex<Messa
     }
 }
 
+/// Move a claimed message back to Queued, the one way a message that was
+/// typed for becomes unread again. The agents panel counts it again, so the
+/// list is pushed: nothing else would push it, since an agent that did not
+/// read the message printed nothing.
+fn unsubmit_and_dirty(st: &mut Messaging, pane: PaneId, id: MsgId) {
+    if st.unsubmit(pane, id) {
+        mark_agents_dirty();
+    }
+}
+
 /// Answer an entry that was claimed but not written with `answer`.
 async fn answer_untyped(
     entry: crate::server::messaging::SubmitEntry,
@@ -1409,7 +1422,7 @@ async fn answer_untyped(
 ) {
     let reply = {
         let mut st = store.lock().await;
-        st.unsubmit(entry.pane, entry.id);
+        unsubmit_and_dirty(&mut st, entry.pane, entry.id);
         st.end_typing(entry.pane)
     };
     reply_submit(
@@ -1438,7 +1451,7 @@ async fn requeue_untyped(
 ) {
     use crate::server::submit::{settle, SubmitRefusal};
     let mut st = store.lock().await;
-    st.unsubmit(entry.pane, entry.id);
+    unsubmit_and_dirty(&mut st, entry.pane, entry.id);
     entry.reply = st.end_typing(entry.pane);
     let id = entry.id;
     if st.is_closed(entry.from_pane) {
@@ -2419,6 +2432,7 @@ async fn handle_agent_name(
     let named = store.lock().await.set_name(pane, request.name.as_deref());
     match named {
         Ok(()) => {
+            mark_agents_dirty();
             match &request.name {
                 Some(name) => log::info!("msg: pane %{pane} named {}", loggable(name)),
                 None => log::info!("msg: pane %{pane} unnamed"),
@@ -2783,7 +2797,11 @@ async fn handle_msg_read(
         };
         (messages, swept, parked)
     };
+    if mark && !messages.is_empty() {
+        mark_agents_dirty();
+    }
     if swept > 0 {
+        mark_agents_dirty();
         log::info!("msg: swept {swept} expired message(s)");
     }
     match parked {
@@ -2870,6 +2888,7 @@ async fn handle_msg_ack(
         }
     };
     if count > 0 {
+        mark_agents_dirty();
         log::info!(
             "msg: acked pane=%{pane} n={count} by={}",
             caller.map_or("outside".to_string(), |by| format!("%{by}"))
@@ -7851,6 +7870,9 @@ async fn save_mailbox_with(
         let mut store = store.lock().await;
         store.sweep(now_ms());
         let swept = store.take_swept();
+        if swept > 0 {
+            mark_agents_dirty();
+        }
         let changed = store.take_dirty();
         if !changed && issued <= SAVED_HIGH_WATER.load(Ordering::Relaxed) {
             return;
@@ -8192,7 +8214,18 @@ async fn collect_agents(
                 title: pd.name_parts(now).0.map(str::to_string),
                 custom_name,
                 cwd: pd.names.cwd.clone(),
+                name: None,
+                unread: 0,
             });
+        }
+    }
+    // The store alone, after `panes` is released, as everywhere.
+    let ids: Vec<PaneId> = entries.iter().map(|e| e.pane_id).collect();
+    let mail = messaging().lock().await.names_and_unread(&ids, now_ms());
+    for entry in &mut entries {
+        if let Some((name, unread)) = mail.get(&entry.pane_id) {
+            entry.name = name.clone();
+            entry.unread = *unread;
         }
     }
     // A stable order, so a refresh never reshuffles the panel under the user's

@@ -8,7 +8,7 @@ this script inside a pane, where the server attributes it to that pane.
 The request is read from a FILE, never from an argument or typed bytes: a
 message body then appears on no command line and in no pane's input.
 
-usage: wire_send.py [--fire] <socket> <in-file> <out-file>
+usage: wire_send.py [--fire] [--held <go-file>] <socket> <in-file> <out-file>
 
 Writes the first reply that is not a `ViewList` to <out-file> as one JSON
 line, by rename so a poller never reads half of it, and exits 0.
@@ -21,10 +21,16 @@ depending on how fast a shell starts python.
 With `--fire`, every request in the list is sent BEFORE any reply is read,
 and the replies are written in the order they ARRIVE. That is how a case
 makes a second send while the first is still parked on the server.
+
+With `--held`, it waits for <go-file> to exist before sending, and stays alive
+afterwards. Its pane then shows no output and no change of foreground process
+around the send, each of which would mark the agents list dirty on its own.
+That is how a case proves that the send itself pushed the list.
 """
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Client, name_of  # noqa: E402
@@ -42,6 +48,11 @@ def main():
     fire = args[0] == "--fire"
     if fire:
         args = args[1:]
+    go_file = None
+    if args[0] == "--held":
+        go_file, args = args[1], args[2:]
+        while not os.path.exists(go_file):
+            time.sleep(0.1)
     sock, in_file, out_file = args[:3]
     with open(in_file) as f:
         request = json.load(f)
@@ -64,6 +75,8 @@ def main():
     with open(tmp, "w") as f:
         f.write(json.dumps(out) + "\n")
     os.rename(tmp, out_file)
+    if go_file is not None:
+        time.sleep(600)
     return 0
 
 

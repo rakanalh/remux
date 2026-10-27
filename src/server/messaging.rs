@@ -1345,6 +1345,22 @@ impl Messaging {
         self.names.get(name).copied()
     }
 
+    /// Each of `panes`' name and unread count, for the agents panel: one
+    /// lookup per push, not one per pane.
+    pub fn names_and_unread(
+        &self,
+        panes: &[PaneId],
+        now_ms: u64,
+    ) -> HashMap<PaneId, (Option<String>, usize)> {
+        panes
+            .iter()
+            .map(|&pane| {
+                let name = self.name_of(pane).map(str::to_string);
+                (pane, (name, self.unread(pane, now_ms)))
+            })
+            .collect()
+    }
+
     pub fn unread(&self, pane: PaneId, now_ms: u64) -> usize {
         self.mailboxes.get(&pane).map_or(0, |mb| {
             mb.live(now_ms)

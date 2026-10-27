@@ -50,13 +50,23 @@ impl AgentRow {
         (self.conn.clone(), self.entry.pane_id)
     }
 
-    /// The label beside the marker, e.g. `claude main/1` -- host-prefixed for a
+    /// The label beside the marker, e.g. `claude main/1 @alpha`: the pane's
+    /// display name, then its messaging name, the address other panes send
+    /// to, when it has one.
+    pub fn label(&self) -> String {
+        match &self.entry.name {
+            Some(name) => format!("{} @{name}", self.display_name()),
+            None => self.display_name(),
+        }
+    }
+
+    /// The pane's display name, e.g. `claude main/1` -- host-prefixed for a
     /// remote, since two machines routinely have a session of the same name.
     ///
     /// A name the user gave the pane wins outright. Otherwise a `pane_title`
     /// template decides; with none, a titled agent is shown by its title alone
     /// and an untitled one by this command-and-location form.
-    pub fn label(&self) -> String {
+    fn display_name(&self) -> String {
         if let Some(custom) = &self.entry.custom_name {
             return custom.clone();
         }
@@ -100,6 +110,24 @@ impl AgentRow {
             pane_id: self.entry.pane_id,
         }
     }
+}
+
+/// The unread badge, `*N`, or nothing when there is no unread mail. Width 1
+/// per character on every terminal, which a panel 20 columns wide needs.
+fn badge(unread: usize) -> Option<String> {
+    (unread > 0).then(|| format!("*{unread}"))
+}
+
+/// `text` cut to at most `width` display columns.
+fn fit(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    text.chars()
+        .take_while(|&c| {
+            used += UnicodeWidthChar::width(c).unwrap_or(0);
+            used <= width
+        })
+        .collect()
 }
 
 /// The colour a state's marker is drawn in.
@@ -391,7 +419,27 @@ impl SidebarPlugin for AgentsPlugin {
                 state_fg(row.entry.state, theme),
                 row_bg.clone(),
             );
-            draw_text(&mut grid, 2, y, &row.label(), fg, row_bg);
+            // The badge holds the right edge, and the label is cut to leave
+            // it a column of space: the count is what a glance looks for.
+            // A row too narrow for the marker, a column and the badge shows
+            // no badge rather than a badge over the marker.
+            let badge = badge(row.entry.unread).filter(|b| cols as usize > 2 + b.len());
+            let room = match &badge {
+                Some(b) => cols as usize - (2 + b.len() + 1),
+                None => (cols as usize).saturating_sub(2),
+            };
+            draw_text(
+                &mut grid,
+                2,
+                y,
+                &fit(&row.label(), room),
+                fg,
+                row_bg.clone(),
+            );
+            if let Some(b) = badge {
+                let x = (cols as usize).saturating_sub(b.len()) as u16;
+                draw_text(&mut grid, x, y, &b, theme.tab_bell_fg.clone(), row_bg);
+            }
         }
 
         // Directly under the last row when the list is short, and at the bottom
@@ -498,6 +546,8 @@ mod tests {
             title: None,
             custom_name: None,
             cwd: None,
+            name: None,
+            unread: 0,
         }
     }
 
@@ -661,6 +711,80 @@ mod tests {
         );
         assert_eq!(state_fg(AgentState::Working, &theme), theme.tab_activity_fg);
         assert_eq!(state_fg(AgentState::Idle, &theme), theme.status_bar_fg);
+    }
+
+    #[test]
+    fn a_named_row_carries_its_name_after_the_label() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        assert_eq!(row(ConnId::Local, e.clone(), None).label(), "claude main/0");
+        e.name = Some("alpha".into());
+        assert_eq!(
+            row(ConnId::Local, e.clone(), None).label(),
+            "claude main/0 @alpha"
+        );
+        e.custom_name = Some("Fixer".into());
+        assert_eq!(row(remote("mini"), e, None).label(), "Fixer @alpha");
+    }
+
+    #[test]
+    fn a_badge_is_right_aligned_and_the_label_truncates_first() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        e.custom_name = Some("a-label-thirty-characters-long".into());
+        e.unread = 3;
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(ConnId::Local, vec![e]));
+        let theme = CompositorTheme::default();
+        let grid = p.render(20, 3, false, &theme);
+        let line: String = grid[1].iter().map(|c| c.c).collect();
+        assert!(line.ends_with("*3"), "{line:?}");
+        assert_eq!(grid[1][18].fg, theme.tab_bell_fg);
+        let cells: Vec<char> = line.chars().collect();
+        assert_eq!(
+            cells[2..17].iter().collect::<String>(),
+            "a-label-thirty-",
+            "the label is cut to leave the badge room"
+        );
+        assert_eq!(
+            line.chars().nth(17),
+            Some(' '),
+            "a column between them: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_the_badge_shows_none() {
+        let mut e = agent(3, "claude", "main", AgentState::Idle);
+        e.unread = 12;
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(ConnId::Local, vec![e]));
+        let theme = CompositorTheme::default();
+        let narrow: String = p.render(5, 3, false, &theme)[1]
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(!narrow.contains('*'), "{narrow:?}");
+        assert!(
+            narrow.starts_with('\u{25CF}'),
+            "the marker survives: {narrow:?}"
+        );
+        let fits: String = p.render(6, 3, false, &theme)[1]
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(fits.ends_with("*12"), "{fits:?}");
+    }
+
+    #[test]
+    fn no_badge_at_zero() {
+        let mut p = AgentsPlugin::new();
+        p.on_event(&push(
+            ConnId::Local,
+            vec![agent(3, "claude", "main", AgentState::Idle)],
+        ));
+        let grid = p.render(20, 3, false, &CompositorTheme::default());
+        let line: String = grid[1].iter().map(|c| c.c).collect();
+        assert!(!line.contains('*'), "{line:?}");
+        assert_eq!(line.trim_end(), "\u{25CF} claude main/0");
     }
 
     #[test]

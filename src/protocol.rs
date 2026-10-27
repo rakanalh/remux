@@ -140,7 +140,8 @@ pub enum ConnDescriptor {
 /// them and would drop the connection. Later on the same branch, before any
 /// release, `MsgSend` gained `defer`, `timeout_ms` and `wait`, and `MsgSent`
 /// gained `timed_out` and `final_state`, all `#[serde(default)]`, so an older
-/// 18 build and a newer one still decode each other. [`ClientMessage::AgentWait`]
+/// 18 build and a newer one still decode each other, as do [`AgentEntry`]'s
+/// `name` and `unread`. [`ClientMessage::AgentWait`]
 /// and [`ServerMessage::AgentWaited`] were added at 18 the same way, with no
 /// bump: an 18 server built before them cannot decode an `AgentWait` and drops
 /// that connection, which is the skew 13 describes, and only the finished
@@ -1195,6 +1196,12 @@ pub struct AgentEntry {
     /// client's `pane_title` template.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The pane's messaging name: the address other panes send to.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// How many messages in the pane's mailbox are unread.
+    #[serde(default)]
+    pub unread: usize,
 }
 
 /// A message's id: minted by one server, monotonic, never reused.
@@ -2507,6 +2514,15 @@ pub fn decode_message_length(header: &[u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_entry_decodes_without_the_messaging_fields() {
+        let entry: AgentEntry = serde_json::from_str(
+            r#"{"pane_id":4,"session":"main","tab_index":0,"command":"claude","state":"Idle"}"#,
+        )
+        .unwrap();
+        assert_eq!((entry.name, entry.unread), (None, 0));
+    }
 
     #[test]
     fn reserved_names_are_not_valid_names() {

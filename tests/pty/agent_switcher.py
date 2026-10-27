@@ -6,8 +6,8 @@ the agent list it pushes to a subscriber.
 
 What it covers:
 
-  1  with NO sidebar configured, Alt+a lists every agent pane, each with its
-     state marker in the agents panel's state colour, and the pane the user is
+  1  with NO sidebar configured, Alt+a lists every agent pane, a named one
+     with its " @name" after the label, each with its state marker in the agents panel's state colour, and the pane the user is
      in on the current-pane background (the selection sits elsewhere)
   2  a printable key neither narrows the list nor reaches the pane: there is no
      type-to-filter, and the key is swallowed
@@ -17,8 +17,8 @@ What it covers:
      contains, so an echo cannot fake it
   5  with an agents SIDEBAR configured, closing the switcher does not tear down
      the panel's subscription: a later state change still reaches the panel
-  6  a REMOTE agent (fake ssh -> a second server) is listed host-prefixed and
-     jumped to
+  6  a REMOTE agent (fake ssh -> a second server) is listed host-prefixed,
+     with the name it was given on ITS server, and jumped to
 
 Uses a stand-in `claude` script on `PATH`, so no real agent need be installed.
 
@@ -91,7 +91,12 @@ auto_connect = true
 #   claude TAG        prints a tag, then answers each stdin line with GOT:<line>
 #   claude spin       prints for ever, so it is permanently `Working`
 #   "block" on stdin  prints an approval prompt, so it is `NeedsInput`
+#   claude BETATAG / claude FARTAG name THEMSELVES, as a real agent would
 AGENT = """#!/bin/sh
+case "$1" in
+  BETATAG) '@BIN@' agent name bee > /dev/null 2>&1 ;;
+  FARTAG) '@BIN@' agent name yonder > /dev/null 2>&1 ;;
+esac
 printf 'agent ready %s\\n' "$*"
 if [ "$1" = "spin" ]; then
   while :; do printf '.'; sleep 0.2; done
@@ -163,7 +168,7 @@ def setup_dirs():
     write_config("cfg-remote", REMOTE)
     p = f"{RUN}/bin/claude"
     with open(p, "w") as f:
-        f.write(AGENT)
+        f.write(AGENT.replace("@BIN@", BIN))
     os.chmod(p, 0o755)
     shim = f"{RUN}/bin/ssh"
     with open(shim, "w") as f:
@@ -424,13 +429,13 @@ def scenario_no_sidebar():
 
     # -- 1 ----------------------------------------------------------------------
     child.send(ALT_A)
-    ok = wait_until(pump, lambda: len(switcher_rows(screen)) == 3)
+    want = ["claude alpha/0", "claude alpha/0", "claude beta/0 @bee"]
+    ok = wait_until(pump, lambda: [r[2] for r in switcher_rows(screen)] == want)
     rows = switcher_rows(screen)
     log("switcher:", rows)
     check("1 Alt+a opens the switcher", switcher_open(screen), screen.display)
-    check("1 every agent pane is listed, with the panel's labels",
-          ok and [r[2] for r in rows] == ["claude alpha/0", "claude alpha/0", "claude beta/0"],
-          rows)
+    check("1 every agent pane is listed, with the panel's labels and beta's @name",
+          ok and [r[2] for r in rows] == want, rows)
     if len(rows) == 3:
         markers = [str(cell(screen, y, x).fg) for y, x, _ in rows]
         check("1 each marker is in its state colour (Working, NeedsInput, Idle)",
@@ -542,11 +547,12 @@ def scenario_remote():
     child, screen, pump = spawn(env_local("cfg-remote"))
     pump(3.5)
     child.send(ALT_A)
-    ok = wait_until(pump, lambda: len(switcher_rows(screen)) == 4)
+    far = "claude mini:far/0 @yonder"
+    ok = wait_until(pump, lambda: [r[2] for r in switcher_rows(screen)][3:] == [far])
     rows = switcher_rows(screen)
     log("switcher:", rows)
-    check("6 the remote agent is listed after the local ones, host-prefixed",
-          ok and rows[-1][2] == "claude mini:far/0", rows)
+    check("6 the remote agent is listed after the local ones, host-prefixed, with its @name",
+          ok and len(rows) == 4 and rows[-1][2] == far, rows)
     child.send(b"G")
     pump(0.3)
     child.send(b"\r")
