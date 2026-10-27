@@ -86,7 +86,7 @@ pub const PASTE_CLOSE: &[u8] = b"\x1b[201~";
 pub const FOCUS_IN: &[u8] = b"\x1b[I";
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::messaging::{
     shipped_rows, valid_enter, Bracketed, MessagingConfig, SubmitRow, WhileWorking,
@@ -455,6 +455,20 @@ impl SubmitRefusal {
         }
     }
 
+    /// `--wait` saw nothing reach the pane after the prompt's echo. The
+    /// message was submitted, so it is not in the mailbox to be read again:
+    /// it is marked submitted there.
+    pub fn stalled(pane: PaneId, id: crate::protocol::MsgId, stall: Duration) -> Self {
+        SubmitRefusal {
+            code: "agent_prompt_stalled",
+            message: format!(
+                "%{pane}'s agent showed no sign of taking up message #{id} for {}s after it was \
+                 submitted. It was typed and submitted, so do not send it again; look at the pane",
+                stall.as_secs_f64()
+            ),
+        }
+    }
+
     pub fn sender_closed(from: PaneId, id: crate::protocol::MsgId) -> Self {
         SubmitRefusal {
             code: "sender_closed",
@@ -595,6 +609,126 @@ pub fn multi_line_refusal(body: &str) -> Option<SubmitRefusal> {
         code: "bad_body",
         message: "the pane's program cannot take a pasted block, so a message of more than one line cannot be typed into it; it is in the mailbox".to_string(),
     })
+}
+
+/// How `--wait` reads a pane after the Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitCfg {
+    /// The classifier's `working_ms`: output this recent reads as `Working`.
+    pub working: Duration,
+    /// How long after the quiet point the agent has to print something
+    /// before the wait ends `agent_prompt_stalled`.
+    pub stall: Duration,
+    /// How long the agent must hold a state other than `Working` for its
+    /// turn to count as ended.
+    pub settle: Duration,
+}
+
+/// What a step of a [`WaitMachine`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitStep {
+    Continue,
+    /// Nothing reached the pane after the prompt's own echo: the agent did
+    /// not take up the message.
+    Stalled,
+    /// The agent's turn ended in this state.
+    Settled(AgentState),
+    /// The wait's deadline passed, with the agent last in this state.
+    TimedOut(AgentState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitPhase {
+    /// Output here can be the agent echoing and redrawing the prompt it was
+    /// typed, so it says nothing about the agent taking the message up.
+    Echo,
+    /// Watching for the first output after the quiet point.
+    Stall { quiet_at: Instant },
+    /// The agent worked; watching for its turn to end.
+    Settle { left_working_at: Option<Instant> },
+}
+
+/// How an agent's turn went after a submitted message, told from samples of
+/// its pane: when output last reached it, and its state.
+///
+/// First the echo window. It ends at the quiet point: the first moment, at
+/// least `working` after the Enter, at which the pane has been quiet for
+/// `working`, or three times `working` after the Enter, whichever is first.
+/// The cap is there because an agent that starts printing at once and
+/// prints until its turn ends is never quiet in between. Output after the
+/// quiet point is the agent working; none for `stall` is a stall. Once the
+/// agent has worked, its turn ends when it has held a state other than
+/// `Working` for `settle`, and that state is the answer: `NeedsInput` is a
+/// turn that ended in a question. The deadline ends the wait in any phase.
+///
+/// A turn that ends inside the echo window leaves no output after the quiet
+/// point, so it reads as a stall: it cannot be told from the echo.
+#[derive(Debug, Clone)]
+pub struct WaitMachine {
+    enter_at: Instant,
+    deadline: Instant,
+    cfg: WaitCfg,
+    phase: WaitPhase,
+}
+
+impl WaitMachine {
+    /// A wait on a message whose Enter was written at `enter_at`.
+    pub fn new(enter_at: Instant, deadline: Instant, cfg: WaitCfg) -> Self {
+        WaitMachine {
+            enter_at,
+            deadline,
+            cfg,
+            phase: WaitPhase::Echo,
+        }
+    }
+
+    /// When the message's Enter was written.
+    pub fn enter_at(&self) -> Instant {
+        self.enter_at
+    }
+
+    pub fn cfg(&self) -> WaitCfg {
+        self.cfg
+    }
+
+    /// Take one sample of the pane: the time, when output last reached it,
+    /// and its state.
+    pub fn step(&mut self, now: Instant, last_output: Instant, state: AgentState) -> WaitStep {
+        if now >= self.deadline {
+            return WaitStep::TimedOut(state);
+        }
+        if self.phase == WaitPhase::Echo {
+            let quiet = now >= self.enter_at + self.cfg.working
+                && now.saturating_duration_since(last_output) >= self.cfg.working;
+            if !quiet && now < self.enter_at + self.cfg.working * 3 {
+                return WaitStep::Continue;
+            }
+            self.phase = WaitPhase::Stall { quiet_at: now };
+        }
+        if let WaitPhase::Stall { quiet_at } = self.phase {
+            if last_output <= quiet_at {
+                return if now.saturating_duration_since(quiet_at) >= self.cfg.stall {
+                    WaitStep::Stalled
+                } else {
+                    WaitStep::Continue
+                };
+            }
+            self.phase = WaitPhase::Settle {
+                left_working_at: None,
+            };
+        }
+        if let WaitPhase::Settle { left_working_at } = &mut self.phase {
+            if state == AgentState::Working {
+                *left_working_at = None;
+                return WaitStep::Continue;
+            }
+            let left = *left_working_at.get_or_insert(now);
+            if now.saturating_duration_since(left) >= self.cfg.settle {
+                return WaitStep::Settled(state);
+            }
+        }
+        WaitStep::Continue
+    }
 }
 
 #[cfg(test)]
@@ -1076,5 +1210,143 @@ mod tests {
         assert!(newlines_safe(Framing::Bracketed, true));
         assert!(!newlines_safe(Framing::Bracketed, false));
         assert!(!newlines_safe(Framing::Plain, true));
+    }
+
+    const WORKING_MS: u64 = 500;
+
+    fn wait_cfg() -> WaitCfg {
+        WaitCfg {
+            working: Duration::from_millis(WORKING_MS),
+            stall: Duration::from_millis(2000),
+            settle: Duration::from_millis(500),
+        }
+    }
+
+    /// Step a machine every 50 ms from the Enter, the way the submitter
+    /// samples a pane. The pane printed at `outputs` (ms after the Enter), and
+    /// reads `Working` within `WORKING_MS` of its last output and `rest`
+    /// after. Its last output before the Enter was 100 ms before it. Returns
+    /// the machine's answer and when it gave it, in ms after the Enter.
+    fn run_wait(
+        outputs: &[u64],
+        rest: AgentState,
+        deadline_ms: u64,
+        machine: impl FnOnce(std::time::Instant, std::time::Instant) -> WaitMachine,
+    ) -> (WaitStep, u64) {
+        let base = std::time::Instant::now();
+        let enter = base + Duration::from_millis(100);
+        let at = |ms: u64| enter + Duration::from_millis(ms);
+        let mut m = machine(enter, at(deadline_ms));
+        for ms in (0..=20_000).step_by(50) {
+            let last = outputs
+                .iter()
+                .filter(|&&o| o <= ms)
+                .max()
+                .map_or(base, |&o| at(o));
+            let state = if at(ms).duration_since(last) < Duration::from_millis(WORKING_MS) {
+                AgentState::Working
+            } else {
+                rest
+            };
+            match m.step(at(ms), last, state) {
+                WaitStep::Continue => {}
+                done => return (done, ms),
+            }
+        }
+        panic!("the machine never answered");
+    }
+
+    fn wait(outputs: &[u64], rest: AgentState, deadline_ms: u64) -> (WaitStep, u64) {
+        run_wait(outputs, rest, deadline_ms, |enter, deadline| {
+            WaitMachine::new(enter, deadline, wait_cfg())
+        })
+    }
+
+    /// An agent that starts printing as soon as it has the prompt and prints
+    /// until its turn ends never goes quiet in between. With no cap on the
+    /// quiet point it would only go quiet once its work was done, and the
+    /// stall that follows would call a finished turn stalled.
+    #[test]
+    fn a_fast_continuous_agent_settles_idle() {
+        let outputs: Vec<u64> = (50..=2050).step_by(100).collect();
+        let (step, at) = wait(&outputs, AgentState::Idle, 60_000);
+        assert_eq!(step, WaitStep::Settled(AgentState::Idle));
+        assert!((3000..=3200).contains(&at), "settled at {at} ms");
+    }
+
+    #[test]
+    fn a_silent_agent_stalls_after_the_quiet_point() {
+        let (step, at) = wait(&[], AgentState::Idle, 60_000);
+        assert_eq!(step, WaitStep::Stalled);
+        assert_eq!(at, 500 + 2000, "quiet at once, then the whole stall");
+    }
+
+    #[test]
+    fn the_echo_is_not_the_agents_output() {
+        let (step, at) = wait(&[10], AgentState::Idle, 60_000);
+        assert_eq!(step, WaitStep::Stalled);
+        assert_eq!(
+            at,
+            550 + 2000,
+            "quiet once the echo is a working period old"
+        );
+    }
+
+    #[test]
+    fn needs_input_at_settle_is_an_answer() {
+        let (step, at) = wait(&[1000], AgentState::NeedsInput, 60_000);
+        assert_eq!(step, WaitStep::Settled(AgentState::NeedsInput));
+        assert_eq!(
+            at,
+            1500 + 500,
+            "out of Working at 1500, held for the settle"
+        );
+    }
+
+    #[test]
+    fn working_again_resets_the_settle_hold() {
+        // Two bursts, the gap between them reading Idle from 2450 to 2700,
+        // shorter than the settle: the turn is not over in the gap, and the
+        // hold starts again after the second burst.
+        let mut outputs: Vec<u64> = (50..=1950).step_by(100).collect();
+        outputs.extend((2700..=3500).step_by(100));
+        let (step, at) = wait(&outputs, AgentState::Idle, 60_000);
+        assert_eq!(step, WaitStep::Settled(AgentState::Idle));
+        assert_eq!(at, 4000 + 500, "held from the end of the second burst");
+    }
+
+    #[test]
+    fn the_deadline_wins_in_every_phase() {
+        let busy: Vec<u64> = (50..=5050).step_by(100).collect();
+        assert_eq!(
+            wait(&busy, AgentState::Idle, 300),
+            (WaitStep::TimedOut(AgentState::Working), 300),
+            "while the echo is watched"
+        );
+        assert_eq!(
+            wait(&[], AgentState::Idle, 1000),
+            (WaitStep::TimedOut(AgentState::Idle), 1000),
+            "while a stall is watched"
+        );
+        assert_eq!(
+            wait(&busy, AgentState::Idle, 2000),
+            (WaitStep::TimedOut(AgentState::Working), 2000),
+            "while the settle is watched"
+        );
+        assert_eq!(
+            wait(&[1000], AgentState::NeedsInput, 1700),
+            (WaitStep::TimedOut(AgentState::NeedsInput), 1700),
+            "while a settle is held"
+        );
+    }
+
+    /// A turn that ends before the quiet point leaves no output after it, so
+    /// it reads as a stall: the machine cannot tell such a turn from the
+    /// prompt's own echo and redraw.
+    #[test]
+    fn a_turn_inside_the_echo_window_is_a_known_gap() {
+        let outputs: Vec<u64> = (50..=1050).step_by(100).collect();
+        let (step, _) = wait(&outputs, AgentState::NeedsInput, 60_000);
+        assert_eq!(step, WaitStep::Stalled);
     }
 }

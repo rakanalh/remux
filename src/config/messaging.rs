@@ -32,6 +32,12 @@ pub struct MessagingConfig {
     pub submit_when_attended: bool,
     /// The most messages a pane's submit queue holds.
     pub submit_queue_len: usize,
+    /// For `--wait`: how long after the prompt's echo the agent has to print
+    /// something before the wait ends `agent_prompt_stalled`.
+    pub stall_ms: u64,
+    /// For `--wait`: how long the agent must stay out of `Working` for its
+    /// turn to count as ended.
+    pub settle_ms: u64,
     /// How to type into each agent, by its `[agents] commands` spelling.
     /// Merged field by field over [`shipped_rows`].
     pub submit: BTreeMap<String, SubmitRow>,
@@ -161,6 +167,8 @@ impl Default for MessagingConfig {
             typing_guard_max_ms: 15000,
             submit_when_attended: true,
             submit_queue_len: 8,
+            stall_ms: 5000,
+            settle_ms: 1000,
             submit: BTreeMap::new(),
         }
     }
@@ -201,6 +209,17 @@ impl MessagingConfig {
             attended: Duration::from_millis(self.typing_guard_ms),
             unattended: Duration::from_millis(self.typing_guard_unattended_ms),
             max: Duration::from_millis(self.typing_guard_max_ms.min(MAX_TYPING_GUARD_MS)),
+        }
+    }
+
+    /// How `--wait` reads a pane, with `working_ms` from `[agents]`: the
+    /// output that reads as working is the same output the wait watches for.
+    pub fn wait_cfg(&self, working_ms: u64) -> crate::server::submit::WaitCfg {
+        use std::time::Duration;
+        crate::server::submit::WaitCfg {
+            working: Duration::from_millis(working_ms),
+            stall: Duration::from_millis(self.stall_ms),
+            settle: Duration::from_millis(self.settle_ms),
         }
     }
 
@@ -333,8 +352,8 @@ mod tests {
         assert!(block.starts_with("[messaging]\n"), "no [messaging] block");
         assert_eq!(
             block.lines().count(),
-            12,
-            "the block is not all eleven keys"
+            14,
+            "the block is not all thirteen keys"
         );
         assert_eq!(parse(&block), MessagingConfig::default());
     }

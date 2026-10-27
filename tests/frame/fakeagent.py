@@ -60,8 +60,20 @@ so a command written while another is being read is never lost:
 
 Each command is acknowledged with a `CTL <command>` line in `<log>` once its
 output is written, so a harness can wait for it rather than sleep.
+
+Two hooks are set by what a typed message SAYS, and fire on the read that is
+its Enter, the moment a real agent takes a prompt up:
+
+  GO:<ms>    print "working..." every 100 ms for <ms> (2000 when no number
+             follows): an agent that starts its turn at once and prints
+             until it ends
+  GO:<ms>+<gap>+<ms>
+             the same in two bursts with a silent gap between them
+  ASK:       show the permission prompt 1 s after the Enter: a turn that
+             ends in a question
 """
 import os
+import re
 import select
 import sys
 import time
@@ -131,6 +143,9 @@ def main():
     block_on_rx = None
     block_on_probe = False
     read_size, read_gap = 4096, 0.0
+    on_enter = None
+    ask_at = 0.0
+    second_burst = None
     while True:
         if deaf:
             time.sleep(0.02)
@@ -176,8 +191,32 @@ def main():
             if block_on_rx and b"\x1b[201~" in data:
                 out(block_on_rx)
                 block_on_rx = None
+            go = re.search(rb"GO:(\d*)(?:\+(\d+)\+(\d+))?", data)
+            if go:
+                then = go.group(2) and (int(go.group(2)) / 1000, int(go.group(3)) / 1000)
+                on_enter = ("work", (int(go.group(1) or 2000) / 1000, then))
+            elif b"ASK:" in data:
+                on_enter = ("ask", 1.0)
+            elif on_enter and data == b"\r":
+                kind, secs = on_enter
+                on_enter = None
+                if kind == "work":
+                    first, then = secs
+                    work_until = time.monotonic() + first
+                    next_work = 0.0
+                    if then:
+                        second_burst = (work_until + then[0], then[1])
+                else:
+                    ask_at = time.monotonic() + secs
             time.sleep(read_gap)
         now = time.monotonic()
+        if second_burst and now >= second_burst[0]:
+            work_until = now + second_burst[1]
+            next_work = 0.0
+            second_burst = None
+        if ask_at and now >= ask_at:
+            ask_at = 0.0
+            out(PROCEED)
         if now < work_until and now >= next_work:
             out("working...\n")
             next_work = now + 0.1

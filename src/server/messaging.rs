@@ -186,6 +186,23 @@ pub struct SubmitEntry {
     /// The last reason it was logged as waiting on, so a wait is logged once
     /// per distinct reason rather than on every pass.
     pub waiting_on: Option<&'static str>,
+    /// Sent with `--wait`: once submitted, it is answered when the agent's
+    /// turn ends, or at this time at the latest.
+    pub wait_until: Option<Instant>,
+}
+
+/// A submitted message whose sender asked to hear how the agent's turn
+/// ended (`--wait`). The submitter samples its pane each pass until the
+/// machine answers.
+pub struct SubmitWait {
+    pub id: MsgId,
+    pub pane: PaneId,
+    /// The sender's pane, which a sender's share of waits is counted by.
+    pub from_pane: PaneId,
+    /// How the message was sent, which decides how a stall is answered.
+    pub deliver: crate::protocol::Deliver,
+    pub reply: Reply,
+    pub machine: crate::server::submit::WaitMachine,
 }
 
 impl SubmitEntry {
@@ -307,6 +324,9 @@ pub struct Messaging {
     /// messages in order. The reply is held here, not by the typing task, so
     /// that a disconnect can drop it.
     in_flight: HashMap<PaneId, Option<Reply>>,
+    /// Submitted messages whose senders wait to hear how the turn ended,
+    /// by message id.
+    submit_waits: BTreeMap<MsgId, SubmitWait>,
 }
 
 /// What `mailbox.json` holds. Waiters, rate windows and the closed-pane set are
@@ -478,6 +498,7 @@ impl Messaging {
             dirty: false,
             changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             submit_queues: HashMap::new(),
+            submit_waits: BTreeMap::new(),
             in_flight: HashMap::new(),
         }
     }
@@ -707,6 +728,22 @@ impl Messaging {
             .flatten()
             .any(|queued| is_it(&queued.reply))
             || self.in_flight.values().any(is_it)
+            || self
+                .submit_waits
+                .values()
+                .any(|w| w.reply.client_id == client_id)
+    }
+
+    /// How many waits pane `from` has, parked or queued to be typed. An
+    /// entry being typed is not counted: there is at most one per target.
+    fn waits_from(&self, from: PaneId) -> usize {
+        let parked = self.submit_waits.values().filter(|w| w.from_pane == from);
+        let queued = self
+            .submit_queues
+            .values()
+            .flatten()
+            .filter(|e| e.wait_until.is_some() && e.from_pane == from);
+        parked.count() + queued.count()
     }
 
     /// Queue `entry` to be typed into its pane. Refused when its sender
@@ -721,6 +758,11 @@ impl Messaging {
             if self.has_parked_send(client_id) {
                 return Err(EnqueueRefusal::SendParked);
             }
+        }
+        // A wait lasts as long as its sender asked, so one sender pane, with a
+        // connection per send, could otherwise hold any number of them.
+        if entry.wait_until.is_some() && self.waits_from(entry.from_pane) >= (cap / 2).max(1) {
+            return Err(EnqueueRefusal::QueueFull);
         }
         let queue = self.submit_queues.entry(entry.pane).or_default();
         let own = queue
@@ -865,10 +907,77 @@ impl Messaging {
         self.in_flight.remove(&pane).flatten()
     }
 
-    /// Whether the submitter has anything to do: a queued entry or a pane
-    /// mid-typing.
+    /// Whether the submitter has anything to do: a queued entry, a pane
+    /// mid-typing, or a turn being waited on.
     pub fn has_submit_work(&self) -> bool {
-        !self.submit_queues.is_empty() || !self.in_flight.is_empty()
+        !self.submit_queues.is_empty()
+            || !self.in_flight.is_empty()
+            || !self.submit_waits.is_empty()
+    }
+
+    /// Watch `wait`'s pane until its agent's turn ends.
+    pub fn park_submit_wait(&mut self, wait: SubmitWait) {
+        self.submit_waits.insert(wait.id, wait);
+    }
+
+    /// The turns being waited on, grouped by pane, so that each pane is
+    /// sampled once however many waits it has.
+    pub fn submit_waits_by_pane(&self) -> Vec<(PaneId, Vec<MsgId>)> {
+        let mut by_pane: BTreeMap<PaneId, Vec<MsgId>> = BTreeMap::new();
+        for wait in self.submit_waits.values() {
+            by_pane.entry(wait.pane).or_default().push(wait.id);
+        }
+        by_pane.into_iter().collect()
+    }
+
+    /// Step the wait on message `id` with a sample of its pane. A wait that
+    /// is over is removed and handed back with how it ended.
+    pub fn step_submit_wait(
+        &mut self,
+        id: MsgId,
+        now: Instant,
+        last_output: Instant,
+        state: crate::protocol::AgentState,
+    ) -> Option<(SubmitWait, crate::server::submit::WaitStep)> {
+        let wait = self.submit_waits.get_mut(&id)?;
+        match wait.machine.step(now, last_output, state) {
+            crate::server::submit::WaitStep::Continue => None,
+            done => self.submit_waits.remove(&id).map(|wait| (wait, done)),
+        }
+    }
+
+    /// Take the wait on message `id` away, to be answered now.
+    pub fn take_submit_wait(&mut self, id: MsgId) -> Option<SubmitWait> {
+        self.submit_waits.remove(&id)
+    }
+
+    /// Drop the waits of a connection that closed: nobody is left to tell
+    /// how the turn ended. Returns their message ids.
+    pub fn drop_submit_waits_of(&mut self, client_id: u64) -> Vec<MsgId> {
+        let gone: Vec<MsgId> = self
+            .submit_waits
+            .values()
+            .filter(|w| w.reply.client_id == client_id)
+            .map(|w| w.id)
+            .collect();
+        for id in &gone {
+            self.submit_waits.remove(id);
+        }
+        gone
+    }
+
+    /// The waits on a pane that is closing, to be answered.
+    pub fn take_submit_waits(&mut self, pane: PaneId) -> Vec<SubmitWait> {
+        let closing: Vec<MsgId> = self
+            .submit_waits
+            .values()
+            .filter(|w| w.pane == pane)
+            .map(|w| w.id)
+            .collect();
+        closing
+            .iter()
+            .filter_map(|id| self.submit_waits.remove(id))
+            .collect()
     }
 
     /// Drop the replies of a connection that closed: `(queued, typing,
@@ -1841,6 +1950,7 @@ mod tests {
             reply: client.map(reply),
             put_back: 0,
             waiting_on: None,
+            wait_until: None,
         }
     }
 
@@ -1851,6 +1961,119 @@ mod tests {
             [e.note_put_back(), e.note_put_back(), e.note_put_back()],
             [false, true, false]
         );
+    }
+
+    fn turn_wait(id: MsgId, pane: PaneId, client_id: u64) -> SubmitWait {
+        let now = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        SubmitWait {
+            id,
+            pane,
+            from_pane: 100 + id,
+            deliver: crate::protocol::Deliver::Submit,
+            reply: reply(client_id),
+            machine: crate::server::submit::WaitMachine::new(
+                now,
+                now + ms(60_000),
+                crate::server::submit::WaitCfg {
+                    working: ms(500),
+                    stall: ms(2000),
+                    settle: ms(500),
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn a_turn_being_waited_on_is_work_and_holds_its_connections_send() {
+        let mut m = Messaging::new(limits());
+        assert!(!m.has_submit_work());
+        m.park_submit_wait(turn_wait(1, 5, 70));
+        assert!(m.has_submit_work(), "the submitter must keep ticking");
+        assert!(
+            m.has_parked_send(70),
+            "a second send on that connection is refused"
+        );
+        assert!(!m.has_parked_send(71));
+        assert_eq!(m.submit_waits_by_pane(), vec![(5, vec![1])]);
+        assert_eq!(m.take_submit_wait(1).map(|w| w.id), Some(1));
+        assert!(m.take_submit_wait(1).is_none() && !m.has_parked_send(70));
+    }
+
+    #[test]
+    fn a_wait_is_removed_once_it_has_an_answer_and_not_before() {
+        use crate::protocol::AgentState;
+        use crate::server::submit::WaitStep;
+        let mut m = Messaging::new(limits());
+        let w = turn_wait(1, 5, 70);
+        let enter = w.machine.enter_at();
+        m.park_submit_wait(w);
+        let ms = std::time::Duration::from_millis;
+        assert!(m
+            .step_submit_wait(1, enter + ms(100), enter, AgentState::Working)
+            .is_none());
+        assert_eq!(m.submit_waits_by_pane(), vec![(5, vec![1])]);
+        let (done, step) = m
+            .step_submit_wait(1, enter + ms(60_000), enter, AgentState::Idle)
+            .expect("the deadline answers it");
+        assert_eq!((done.id, step), (1, WaitStep::TimedOut(AgentState::Idle)));
+        assert!(m.submit_waits_by_pane().is_empty() && !m.has_submit_work());
+        assert!(m
+            .step_submit_wait(1, enter + ms(60_100), enter, AgentState::Idle)
+            .is_none());
+    }
+
+    #[test]
+    fn waits_go_with_their_connection_or_their_pane() {
+        let mut m = Messaging::new(limits());
+        m.park_submit_wait(turn_wait(1, 5, 70));
+        m.park_submit_wait(turn_wait(2, 6, 70));
+        m.park_submit_wait(turn_wait(3, 6, 71));
+        assert_eq!(m.drop_submit_waits_of(70), vec![1, 2]);
+        assert!(!m.has_parked_send(70));
+        let closing: Vec<MsgId> = m.take_submit_waits(6).iter().map(|w| w.id).collect();
+        assert_eq!(closing, vec![3]);
+        assert!(m.submit_waits_by_pane().is_empty());
+    }
+
+    #[test]
+    fn waits_on_one_pane_are_grouped_to_be_sampled_once() {
+        let mut m = Messaging::new(limits());
+        m.park_submit_wait(turn_wait(3, 6, 70));
+        m.park_submit_wait(turn_wait(1, 5, 71));
+        m.park_submit_wait(turn_wait(2, 6, 72));
+        assert_eq!(
+            m.submit_waits_by_pane(),
+            vec![(5, vec![1]), (6, vec![2, 3])]
+        );
+    }
+
+    #[test]
+    fn a_sender_pane_holds_at_most_its_share_of_waits() {
+        let mut m = Messaging::new(limits());
+        let waiting = |id: MsgId, pane: PaneId, client: u64| SubmitEntry {
+            from_pane: 40,
+            wait_until: Some(Instant::now() + std::time::Duration::from_secs(60)),
+            ..entry(id, pane, Some(client))
+        };
+        // A queue of 4 is a share of 2: one parked and one queued fill it,
+        // whichever panes they are for.
+        m.park_submit_wait(SubmitWait {
+            from_pane: 40,
+            ..turn_wait(1, 5, 70)
+        });
+        assert_eq!(m.enqueue_submit(waiting(2, 6, 71), 4), Ok(()));
+        assert_eq!(
+            m.enqueue_submit(waiting(3, 7, 72), 4),
+            Err(EnqueueRefusal::QueueFull)
+        );
+        assert_eq!(
+            m.enqueue_submit(entry(4, 7, Some(73)), 4),
+            Ok(()),
+            "a send without --wait is not counted"
+        );
+        m.take_submit_wait(1);
+        assert_eq!(m.enqueue_submit(waiting(5, 7, 74), 4), Ok(()), "room again");
     }
 
     fn reply(client_id: u64) -> Reply {

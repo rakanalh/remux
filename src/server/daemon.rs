@@ -602,6 +602,7 @@ struct OutgoingMessage {
     pane_hint: Option<PaneId>,
     defer: bool,
     timeout_ms: Option<u64>,
+    wait: bool,
 }
 
 /// A [`ClientMessage::AgentName`], unpacked.
@@ -768,6 +769,7 @@ async fn handle_msg_send(
     // refused, and a message it cannot know about must not reach the pane.
     let enqueued_at = std::time::Instant::now();
     let deadline = submit_deadline(enqueued_at, msg.defer, msg.timeout_ms);
+    let wait_until = msg.wait.then(|| enqueued_at + wait_timeout(msg.timeout_ms));
     let (sent, swept, answered, queued) = {
         let mut store = store.lock().await;
         if submit && store.has_parked_send(client_id) {
@@ -818,6 +820,7 @@ async fn handle_msg_send(
                     reply: reply_tx.map(|tx| crate::server::messaging::Reply { client_id, tx }),
                     put_back: 0,
                     waiting_on: None,
+                    wait_until,
                 },
                 config.messaging.submit_queue_len(),
             )),
@@ -887,6 +890,7 @@ fn answer_enqueued(
             delivery: Delivery::Mailbox,
             reason: None,
             timed_out: false,
+            final_state: None,
         }),
         Some(Ok(())) => {
             mark_submit_dirty();
@@ -960,7 +964,149 @@ async fn run_submitter(
         for head in heads {
             step_submit(head, &state, &panes, &clients, &config, store).await;
         }
+        step_submit_waits(&state, &panes, &config, store).await;
     }
+}
+
+/// One pass over the turns being waited on: sample each pane once and step
+/// its waits, answering those that are over. Two ends are answered at once,
+/// `Submitted` with no final state, because the agent's turn can no longer be
+/// watched: a pane whose agent is no longer in the foreground
+/// (`agent_exited`; the output after it is the shell's), and a pane that is
+/// no longer live (`pane_closed_after_submit`), which includes one whose
+/// program exited in a tab that is not shown, and so is never reaped. The
+/// reaper answers a closing pane's waits the same way, so the answer does not
+/// depend on which of the two sees the close first.
+///
+/// The state is [`submit_state`], as a submit takes it, not the agents
+/// panel's: a selector no pattern names, drawn at the end of a turn, is a
+/// question to the agent's user, and the wait answers `NeedsInput` for it.
+///
+/// A wait does not hold its pane's queue. A later message typed into the
+/// same agent during the wait makes output of its own, so the state answered
+/// can be that of the later message's turn.
+async fn step_submit_waits(
+    state: &Arc<Mutex<ServerState>>,
+    panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
+    config: &Arc<Config>,
+    store: &'static Mutex<Messaging>,
+) {
+    let by_pane = store.lock().await.submit_waits_by_pane();
+    for (pane, ids) in by_pane {
+        let sample = sample_pane(pane, state, panes, config).await;
+        let now = std::time::Instant::now();
+        let ended = match (sample.last_output, sample.state) {
+            (None, _) => Some("pane_closed_after_submit"),
+            (Some(_), None) => Some("agent_exited"),
+            (Some(_), Some(_)) => None,
+        };
+        let mut st = store.lock().await;
+        let name = st.name_of(pane).map(str::to_string);
+        for id in ids {
+            match (ended, sample.last_output, sample.state) {
+                (Some(reason), _, _) => {
+                    if let Some(wait) = st.take_submit_wait(id) {
+                        answer_wait_ended(wait, name.clone(), now, reason);
+                    }
+                }
+                (None, Some(last_output), Some(agent_state)) => {
+                    if let Some((wait, step)) =
+                        st.step_submit_wait(id, now, last_output, agent_state)
+                    {
+                        answer_submit_wait(wait, step, name.clone(), now);
+                    }
+                }
+                (None, _, _) => {}
+            }
+        }
+    }
+}
+
+/// A submitted message, answered with no final state and why.
+fn submitted_because(id: MsgId, pane: PaneId, name: Option<String>, reason: &str) -> ServerMessage {
+    ServerMessage::MsgSent {
+        id,
+        to: Resolved {
+            host: None,
+            pane_id: pane,
+            name,
+        },
+        delivery: Delivery::Submitted,
+        reason: Some(reason.to_string()),
+        timed_out: false,
+        final_state: None,
+    }
+}
+
+/// Answer a wait whose turn can no longer be watched, with `reason`. The
+/// message was typed and submitted, under `Submit` and `Auto` alike, so it is
+/// never an error: an error would have the sender send it again.
+fn answer_wait_ended(
+    wait: crate::server::messaging::SubmitWait,
+    name: Option<String>,
+    now: std::time::Instant,
+    reason: &str,
+) {
+    let after = now
+        .saturating_duration_since(wait.machine.enter_at())
+        .as_millis();
+    log::info!(
+        "msg: id={} wait ended after {after}ms on %{}: {reason}",
+        wait.id,
+        wait.pane
+    );
+    let _ = wait
+        .reply
+        .tx
+        .send(submitted_because(wait.id, wait.pane, name, reason));
+}
+
+/// Answer a wait that is over, and log how it ended. A stall is an error
+/// under `Submit`. `Auto` never errors, and the message was typed, so a
+/// stall there is `Submitted` with the stall as its reason.
+fn answer_submit_wait(
+    wait: crate::server::messaging::SubmitWait,
+    step: crate::server::submit::WaitStep,
+    name: Option<String>,
+    now: std::time::Instant,
+) {
+    use crate::server::submit::{SubmitRefusal, WaitStep};
+    let (id, pane) = (wait.id, wait.pane);
+    let after = now
+        .saturating_duration_since(wait.machine.enter_at())
+        .as_millis();
+    let sent = |final_state: AgentState, timed_out: bool| ServerMessage::MsgSent {
+        id,
+        to: Resolved {
+            host: None,
+            pane_id: pane,
+            name: name.clone(),
+        },
+        delivery: Delivery::Submitted,
+        reason: None,
+        timed_out,
+        final_state: Some(final_state),
+    };
+    let message = match step {
+        WaitStep::Settled(state) => {
+            log::info!("msg: id={id} wait -> {state:?} after {after}ms");
+            sent(state, false)
+        }
+        WaitStep::TimedOut(state) => {
+            log::info!("msg: id={id} wait timed out after {after}ms (last={state:?})");
+            sent(state, true)
+        }
+        WaitStep::Stalled => {
+            log::info!("msg: id={id} wait stalled after {after}ms");
+            let refusal = SubmitRefusal::stalled(pane, id, wait.machine.cfg().stall);
+            match wait.deliver {
+                Deliver::Auto => submitted_because(id, pane, name.clone(), refusal.code),
+                _ => ServerMessage::refused(refusal.code, refusal.message),
+            }
+        }
+        WaitStep::Continue => return,
+    };
+    let _ = wait.reply.tx.send(message);
 }
 
 /// One pass over one queue head: answer it, hold it, or type it. Logs only on
@@ -1122,6 +1268,13 @@ async fn step_submit(
     let (pgid, agent) = (sample.pgid, sample.agent);
     let panes = Arc::clone(panes);
     let rules = agent_rules(config);
+    // A message typed into an agent that is already working, as the `queue`
+    // policy allows, is taken up after the current turn. The output after it
+    // is that turn's, so there is nothing a wait could tell from it.
+    let wait = entry
+        .wait_until
+        .filter(|_| agent_state != Some(AgentState::Working))
+        .map(|until| (until, config.messaging.wait_cfg(config.agents.working_ms)));
     tokio::spawn(async move {
         let typing = EndTypingOnDrop { pane, armed: true };
         let _ends = TypingEnds(Arc::clone(&text.typing));
@@ -1144,22 +1297,47 @@ async fn step_submit(
                     "msg: id={id} submitted to %{pane} (bracketed={}, {bytes} bytes)",
                     if bracketed { "on" } else { "off" }
                 );
-                let (reply, name) = {
+                let enter_at = std::time::Instant::now();
+                // Ending the typing and parking the wait are one section, so
+                // the sender's connection always has its send parked.
+                let answer = {
                     let mut st = store.lock().await;
-                    (st.end_typing(pane), st.name_of(pane).map(str::to_string))
+                    let reply = st.end_typing(pane);
+                    match (wait, reply) {
+                        (Some((until, cfg)), Some(reply)) => {
+                            st.park_submit_wait(crate::server::messaging::SubmitWait {
+                                id,
+                                pane,
+                                from_pane: entry.from_pane,
+                                deliver: entry.deliver,
+                                reply,
+                                machine: crate::server::submit::WaitMachine::new(
+                                    enter_at, until, cfg,
+                                ),
+                            });
+                            None
+                        }
+                        (_, reply) => Some((reply, st.name_of(pane).map(str::to_string))),
+                    }
                 };
-                let message = ServerMessage::MsgSent {
-                    id,
-                    to: Resolved {
-                        host: None,
-                        pane_id: pane,
-                        name,
-                    },
-                    delivery: Delivery::Submitted,
-                    reason: None,
-                    timed_out: false,
-                };
-                send_reply(id, reply, message);
+                match answer {
+                    None => log::info!("msg: id={id} waiting for %{pane}'s turn to end"),
+                    Some((reply, name)) => {
+                        let message = ServerMessage::MsgSent {
+                            id,
+                            to: Resolved {
+                                host: None,
+                                pane_id: pane,
+                                name,
+                            },
+                            delivery: Delivery::Submitted,
+                            reason: None,
+                            timed_out: false,
+                            final_state: None,
+                        };
+                        send_reply(id, reply, message);
+                    }
+                }
             }
             // The agent has the message, so it stays Submitted, and an error
             // would make the sender retry and deliver it twice.
@@ -1439,6 +1617,7 @@ fn answer_submit(
                 delivery: Delivery::Mailbox,
                 reason: Some(reason.to_string()),
                 timed_out: false,
+                final_state: None,
             }
         }
         Answer::TimedOut(reason) => {
@@ -1452,6 +1631,7 @@ fn answer_submit(
                 delivery: Delivery::Mailbox,
                 reason: Some(reason.to_string()),
                 timed_out: true,
+                final_state: None,
             }
         }
     }
@@ -1669,6 +1849,17 @@ fn submit_deadline(
         SUBMIT_HOLD_MS
     };
     enqueued_at + std::time::Duration::from_millis(ms)
+}
+
+/// How long after a message is sent `--wait` watches for the agent's turn
+/// to end: `timeout_ms`, or [`DEFAULT_SUBMIT_TIMEOUT_MS`], at most
+/// [`MAX_WAIT_MS`]. Measured from the send, as the CLI's `--timeout` is.
+fn wait_timeout(timeout_ms: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        timeout_ms
+            .unwrap_or(DEFAULT_SUBMIT_TIMEOUT_MS)
+            .min(MAX_WAIT_MS),
+    )
 }
 
 /// The longest a submit is held in its queue before it is typed: the typing
@@ -3965,10 +4156,12 @@ async fn handle_client_message(
             pane_hint,
             defer,
             timeout_ms,
+            wait,
         } => {
             log::debug!(
                 "server: client_id={client_id} msg=MsgSend(to={}, deliver={deliver:?}, {} bytes, \
-                 reply_to={}, pane_hint={pane_hint:?}, defer={defer}, timeout={timeout_ms:?})",
+                 reply_to={}, pane_hint={pane_hint:?}, defer={defer}, timeout={timeout_ms:?}, \
+                 wait={wait})",
                 loggable(&to.to_string()),
                 body.len(),
                 reply_to
@@ -4047,6 +4240,7 @@ async fn handle_client_message(
             pane_hint,
             defer,
             timeout_ms,
+            wait,
         } => {
             let outgoing = OutgoingMessage {
                 to,
@@ -4056,6 +4250,7 @@ async fn handle_client_message(
                 pane_hint,
                 defer,
                 timeout_ms,
+                wait,
             };
             let answer = handle_msg_send(
                 client_id,
@@ -7627,6 +7822,9 @@ struct PaneSample {
     agent: Option<nix::unistd::Pid>,
     /// When a human last typed into the pane, for the typing guard.
     last_human_input: Option<std::time::Instant>,
+    /// When output last reached the pane, for `--wait`. `None` when the
+    /// pane is not live.
+    last_output: Option<std::time::Instant>,
 }
 
 /// One pane, sampled the way [`collect_agents`] samples every pane: the
@@ -7647,6 +7845,7 @@ async fn sample_pane(
         pgid: None,
         agent: None,
         last_human_input: None,
+        last_output: None,
     };
     let rules = agent_rules(config);
     let master = {
@@ -7691,6 +7890,7 @@ async fn sample_pane(
         pgid,
         agent,
         last_human_input: pd.last_human_input,
+        last_output: Some(pd.last_output),
     }
 }
 
@@ -7913,13 +8113,19 @@ async fn handle_client_disconnect(
         let mut cls = clients.lock().await;
         cls.remove(&client_id);
     }
-    let (dropped, (queued, typing, deferred)) = {
+    let (dropped, (queued, typing, deferred), waits) = {
         let mut store = messaging().lock().await;
         (
             store.drop_waiters_of(client_id),
             store.detach_replies_of(client_id),
+            store.drop_submit_waits_of(client_id),
         )
     };
+    for id in waits {
+        log::info!(
+            "msg: id={id} wait dropped: client_id={client_id} disconnected before the turn ended"
+        );
+    }
     if dropped > 0 {
         log::info!("msg: dropped {dropped} waiter(s) of client_id={client_id} (disconnected)");
     }
@@ -12313,6 +12519,15 @@ async fn reap_panes(
                 let message = answer_submit(entry.id, resolved, answer, None);
                 send_reply(entry.id, entry.reply, message);
             }
+            let name = store.name_of(pane_id).map(str::to_string);
+            for wait in store.take_submit_waits(pane_id) {
+                answer_wait_ended(
+                    wait,
+                    name.clone(),
+                    std::time::Instant::now(),
+                    "pane_closed_after_submit",
+                );
+            }
             let (queued, replies) = store.take_submits(pane_id);
             if queued > 0 {
                 log::info!(
@@ -13197,6 +13412,7 @@ mod tests {
                 had_reply: false,
                 put_back: 0,
                 waiting_on: None,
+                wait_until: None,
             };
             st.enqueue_submit(queued, 8).unwrap();
             assert!(st.submit_heads().iter().all(|h| h.pane != pane));
@@ -13265,6 +13481,15 @@ mod tests {
             at(DEFAULT_SUBMIT_TIMEOUT_MS)
         );
         assert_eq!(submit_deadline(t0, true, Some(u64::MAX)), at(MAX_WAIT_MS));
+    }
+
+    #[test]
+    fn a_wait_runs_for_its_own_timeout_with_no_floor() {
+        use super::{wait_timeout, DEFAULT_SUBMIT_TIMEOUT_MS, MAX_WAIT_MS};
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(wait_timeout(Some(1500)), ms(1500), "not raised to the hold");
+        assert_eq!(wait_timeout(None), ms(DEFAULT_SUBMIT_TIMEOUT_MS));
+        assert_eq!(wait_timeout(Some(u64::MAX)), ms(MAX_WAIT_MS));
     }
 
     #[test]

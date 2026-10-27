@@ -201,6 +201,32 @@ Task 4, --defer and the queue:
 4t. A deferred send whose sender's connection closes while its probe sits
     unread, then a person's key: it is not put back, and never typed.
 4z. No panic.
+Task 5, --wait (stall_ms 2000, settle_ms 500, working_ms 500):
+5a. An agent that starts printing at the Enter and prints for 2 s: Submitted,
+    final_state Idle, not timed out, answered 2 to 4.5 s after the send.
+5b. An agent that prints nothing after the echo: agent_prompt_stalled, under
+    4 s after the Enter, and the message is Submitted in the mailbox.
+5c. An agent that draws a permission prompt 1 s after the Enter:
+    final_state NeedsInput.
+5d. timeout_ms 1500 into an agent that works for 5 s: Submitted, timed out,
+    final_state Working, under 3 s after the send.
+5e. With while_working = "queue", a wait into a working agent: Submitted at
+    once, final_state None (there is no turn of its own to watch).
+5f. The waiting connection closes mid-wait: the wait is dropped, logged.
+5g. A wait sent Auto into a shell: Mailbox, agent_not_ready, final_state
+    None.
+5h. Two bursts of work with a gap that reads Idle for less than the settle:
+    the turn is not over in the gap, and Idle is answered after the second.
+5i. The target pane closes mid-wait: Submitted, reason
+    pane_closed_after_submit, never an Error (it was typed).
+5j. The agent exits mid-wait, leaving its shell in the foreground:
+    answered at once, Submitted, reason agent_exited, no final_state.
+5k. A wait sent Auto into an agent that prints nothing after the echo:
+    Submitted, reason agent_prompt_stalled, never an Error.
+5l. The agent's program exits in a tab that is not shown, so its pane is
+    never reaped (close_pane declines it): the wait is answered at once,
+    Submitted/pane_closed_after_submit, not left until the sender gives up.
+5z. No panic.
 
 Run: python3 tests/frame/msg_submit.py   (RMX_RUNDIR overrides the run dir)
 """
@@ -2140,6 +2166,227 @@ try:
           f"3al an agent whose child reads on in its job after it exits gets none of the message "
           f"(reply {r}, reads {[c[:12] for c in got]})")
     check("panicked at" not in srv.log(), "3z no panic (bash)")
+finally:
+    srv.kill()
+
+
+# === Task 5: --wait ============================================================
+T5 = """
+[messaging]
+stall_ms = 2000
+settle_ms = 500
+
+[messaging.submit.fakeagent]
+while_working = "queue"
+"""
+
+
+def wsend(to, body, deliver, timeout_ms=None):
+    msg = send(to, body, deliver)
+    msg["MsgSend"]["wait"] = True
+    if timeout_ms is not None:
+        msg["MsgSend"]["timeout_ms"] = timeout_ms
+    return msg
+
+
+def waited(reply):
+    """(delivery or error code, reason, final_state, timed_out) of a reply."""
+    if name_of(reply) == "Error":
+        return ("Error", reply["Error"].get("code"), None, None)
+    sent = (reply or {}).get("MsgSent") or {}
+    return (sent.get("delivery"), sent.get("reason"), sent.get("final_state"), sent.get("timed_out"))
+
+
+def wait_reply(out, timeout):
+    """The reply in `out` and when it arrived (time.time()), once it has."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if os.path.exists(out):
+            at = time.time()
+            return wait_file(out), at
+        time.sleep(0.02)
+    return None, None
+
+
+def enter_ns(log, body, timeout=6.0):
+    """When the fakeagent read the Enter that followed the message holding
+    `body`, in time.time_ns()."""
+    end = time.time() + timeout
+    while time.time() < end:
+        chunks = rx_chunks(log)
+        for i, (_, data) in enumerate(chunks):
+            if body.encode() in data and i + 1 < len(chunks) and chunks[i + 1][1] == b"\r":
+                return chunks[i + 1][0]
+        time.sleep(0.02)
+    return None
+
+
+def wait_log(text, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if text in srv.log():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+try:
+    srv = Server(RUNDIR)
+    srv.start(config=CONFIG + T5)
+    cli = Client(srv.sock)
+    cli.hello()
+    cli.send({"CreateSession": {"name": "main", "folder": None}})
+    cli.send({"Attach": {"session_name": "main"}})
+    cli.send({"Resize": {"cols": 200, "rows": 60}})
+    cli.drain(0.8)
+    F, F_LOG, F_CTL = spawn_agent(paste=True)
+    X, X_LOG, X_CTL = spawn_agent(paste=True)
+    SH = cli_spawn("SplitBelow")
+    J = cli_spawn("SplitBelow")
+    A = cli_spawn("SplitRight")
+    time.sleep(1.0)
+    check(None not in (SH, J, A) and focused_pane() == A,
+          f"setup 5: a sender pane, focused, so the agents are unattended (focused {focused_pane()})")
+
+    # 5a: work printed from the Enter on, for 2 s.
+    t0 = time.time()
+    out = type_start(A, wsend(F, "GO:2000 work for two seconds", "Submit"))
+    r, at = wait_reply(out, 12)
+    took = (at - t0) if at else None
+    check(waited(r) == ("Submitted", None, "Idle", False) and took is not None and 2.0 <= took <= 4.5,
+          f"5a an agent that prints from the Enter for 2 s settles Idle, answered in 2-4.5 s "
+          f"(took {took and round(took, 2)}s; reply {r})")
+    check(re.search(rf"msg: id={sent_id(r)} wait -> Idle after \d+ms", srv.log()) is not None,
+          "5a ...and the log says how the wait ended")
+
+    # 5b: nothing after the echo.
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle before the next send")
+    out = type_start(A, wsend(F, "SILENT:nothing to do", "Submit"))
+    r, at = wait_reply(out, 12)
+    enter = enter_ns(F_LOG, "SILENT:nothing to do")
+    after = (at - enter / 1e9) if at and enter else None
+    box = {m["body"]: m["state"] for m in (read_box(F, all=True) or [])}
+    check(waited(r)[:2] == ("Error", "agent_prompt_stalled") and after is not None and after < 4.0
+          and box.get("SILENT:nothing to do") == "Submitted",
+          f"5b an agent that prints nothing after the echo is agent_prompt_stalled, under 4 s after "
+          f"the Enter, and the message is Submitted ({after and round(after, 2)}s; reply {r}; "
+          f"box {box.get('SILENT:nothing to do')})")
+
+    # 5c: a question 1 s after the Enter.
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle before the next send")
+    out = type_start(A, wsend(F, "ASK:may I", "Submit"))
+    r, _ = wait_reply(out, 12)
+    check(waited(r) == ("Submitted", None, "NeedsInput", False),
+          f"5c a turn that ends in a question settles NeedsInput (reply {r})")
+    tell(F_CTL, F_LOG, "clear")
+
+    # 5d: the deadline, while the agent works.
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle before the next send")
+    t0 = time.time()
+    out = type_start(A, wsend(F, "GO:5000 a long one", "Submit", timeout_ms=1500))
+    r, at = wait_reply(out, 12)
+    took = (at - t0) if at else None
+    check(waited(r) == ("Submitted", None, "Working", True) and took is not None and took < 3.0,
+          f"5d a wait that runs out while the agent works is Submitted, timed out, Working, "
+          f"under 3 s (took {took and round(took, 2)}s; reply {r})")
+
+    # 5e: the queue policy into a working agent.
+    check(wait_idle(F, 10), f"...the agent in %{F} settled Idle before the next send")
+    tell(F_CTL, F_LOG, "work:4000")
+    check(wait_state(F, "Working"), f"...the agent in %{F} is working")
+    t0 = time.time()
+    out = type_start(A, wsend(F, "QUEUED:while working", "Submit"))
+    r, at = wait_reply(out, 12)
+    took = (at - t0) if at else None
+    check(waited(r) == ("Submitted", None, None, False) and took is not None and took < 3.0,
+          f"5e a wait typed into a working agent by the queue policy is answered at once, with no "
+          f"final_state (took {took and round(took, 2)}s; reply {r})")
+
+    # 5f: the waiting connection goes.
+    check(wait_idle(F, 10), f"...the agent in %{F} settled Idle before the next send")
+    out = type_start(A, wsend(F, "GO:3000 left alone", "Submit"), background=True)
+    check(enter_ns(F_LOG, "GO:3000 left alone") is not None and wait_log("waiting for %{}'s turn".format(F)),
+          "5f ...the wait began")
+    cli.send({"InputToPane": {"pane_id": A, "data": list(b"kill $!\n")}})
+    check(wait_log("wait dropped: client_id="),
+          "5f a wait whose connection closes is dropped, and the log says so")
+    time.sleep(4.0)
+    check(not os.path.exists(out) and "panicked at" not in srv.log(),
+          "5f ...and the agent's later output answers nobody")
+
+    # 5g: Auto into a shell.
+    r = type_send(A, wsend(SH, "WAIT:shell", "Auto"))
+    check(waited(r) == ("Mailbox", "agent_not_ready", None, False),
+          f"5g a wait sent Auto into a shell is Mailbox/agent_not_ready, with no final_state (reply {r})")
+
+    # 5h: the first burst outlasts the echo window (1.5 s), so the gap falls
+    # where the turn's end is watched for. Idle in the gap from 2.5 s to 2.9 s
+    # after the Enter, longer than a submitter tick so it is sampled, and
+    # shorter than the settle; the second burst ends at 3.9 s, so the turn
+    # ends at 4.9 s.
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle before the next send")
+    t0 = time.time()
+    out = type_start(A, wsend(F, "GO:2000+900+1000 two bursts", "Submit"))
+    r, at = wait_reply(out, 12)
+    enter = enter_ns(F_LOG, "GO:2000+900+1000 two bursts")
+    after = (at - enter / 1e9) if at and enter else None
+    check(waited(r) == ("Submitted", None, "Idle", False) and after is not None and after >= 4.4,
+          f"5h a gap in the work shorter than the settle does not end the turn: Idle after the "
+          f"second burst ({after and round(after, 2)}s after the Enter; reply {r})")
+
+    # 5i: the target pane closes mid-wait.
+    out = type_start(A, wsend(X, "GO:8000 then gone", "Submit"))
+    check(enter_ns(X_LOG, "GO:8000 then gone") is not None, "5i ...the message was submitted")
+    time.sleep(0.5)
+    cli.send({"Command": {"PaneCloseById": {"session": "main", "pane_id": X}}})
+    r, _ = wait_reply(out, 8)
+    check(waited(r) == ("Submitted", "pane_closed_after_submit", None, False),
+          f"5i a wait whose target pane closes is Submitted/pane_closed_after_submit (reply {r})")
+    # 5j: an agent run from a shell exits mid-wait.
+    agents[0] += 1
+    J_LOG, J_CTL = f"{RUNDIR}/agent-{agents[0]}.log", f"{RUNDIR}/agent-{agents[0]}.ctl"
+    cli.send({"InputToPane": {"pane_id": J, "data": list(f"{FAKEAGENT} {J_LOG} {J_CTL}\r".encode())}})
+    end = time.time() + 8
+    while time.time() < end and not os.path.exists(J_LOG):
+        time.sleep(0.05)
+    tell(J_CTL, J_LOG, "paste-on")
+    check(wait_idle(J, 8), f"setup 5j: the shell in %{J} runs the agent")
+    out = type_start(A, wsend(J, "GO:8000 then quit", "Submit"))
+    check(enter_ns(J_LOG, "GO:8000 then quit") is not None and wait_log(f"waiting for %{J}'s turn"),
+          "5j ...the wait began")
+    quit_at = time.time()
+    tell(J_CTL, J_LOG, "quit")
+    r, at = wait_reply(out, 8)
+    took = (at - quit_at) if at else None
+    check(waited(r) == ("Submitted", "agent_exited", None, False) and took is not None and took < 2.0
+          and wait_log(f"on %{J}: agent_exited"),
+          f"5j a wait whose agent exits is answered at once, Submitted/agent_exited "
+          f"({took and round(took, 2)}s after the quit; reply {r})")
+
+    # 5k: a stall under Auto.
+    check(wait_idle(F, 8), f"...the agent in %{F} settled Idle before the next send")
+    out = type_start(A, wsend(F, "SILENT:auto", "Auto"))
+    r, _ = wait_reply(out, 12)
+    check(waited(r) == ("Submitted", "agent_prompt_stalled", None, False),
+          f"5k a stall under Auto is Submitted with the stall as its reason, not an Error (reply {r})")
+
+    # 5l: an agent in a tab of its own, then another tab shown over it.
+    Y, Y_LOG, Y_CTL = spawn_agent(paste=True, placement="NewTab")
+    check(cli_spawn("NewTab") is not None, "setup 5l: a tab shown over the agent's")
+    out = type_start(A, wsend(Y, "GO:8000 in the background", "Submit"))
+    check(enter_ns(Y_LOG, "GO:8000 in the background") is not None
+          and wait_log(f"waiting for %{Y}'s turn"), "5l ...the wait began")
+    quit_at = time.time()
+    tell(Y_CTL, Y_LOG, "quit")
+    r, at = wait_reply(out, 8)
+    took = (at - quit_at) if at else None
+    check(wait_log(f"pane_id={Y} PTY exited but close_pane declined it"),
+          f"5l ...the pane %{Y} was not reaped")
+    check(waited(r) == ("Submitted", "pane_closed_after_submit", None, False)
+          and took is not None and took < 2.0,
+          f"5l a wait on a pane whose program exited unseen is answered at once "
+          f"({took and round(took, 2)}s after the quit; reply {r})")
+    check("panicked at" not in srv.log(), "5z no panic")
 finally:
     srv.kill()
 

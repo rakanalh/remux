@@ -137,7 +137,10 @@ pub enum ConnDescriptor {
 /// [`ServerMessage::AgentNamed`], [`ClientMessage::AgentStatus`] with
 /// [`ServerMessage::AgentStatusList`], and the additive `code` on
 /// [`ServerMessage::Error`]. An old server cannot decode any of
-/// them and would drop the connection.
+/// them and would drop the connection. Later on the same branch, before any
+/// release, `MsgSend` gained `defer`, `timeout_ms` and `wait`, and `MsgSent`
+/// gained `timed_out` and `final_state`, all `#[serde(default)]`, so an older
+/// 18 build and a newer one still decode each other.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -601,10 +604,17 @@ pub enum ClientMessage {
         /// `agent_blocked` at once. Bounded by `timeout_ms`.
         #[serde(default)]
         defer: bool,
-        /// How long a deferred submit may wait, in milliseconds. `None` is
-        /// the server's default; the server caps it.
+        /// How long a deferred submit may wait, and how long `wait` watches,
+        /// in milliseconds from when the message is sent. `None` is the
+        /// server's default; the server caps it.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// For `Submit` and `Auto`: once the message is submitted, answer
+        /// only when the agent's turn has ended, with the state it ended in
+        /// (`MsgSent::final_state`), or `agent_prompt_stalled` when the agent
+        /// shows no sign of taking it up.
+        #[serde(default)]
+        wait: bool,
     },
     /// Read a mailbox: `pane`'s, or the caller's own when `pane` is `None`.
     /// A mailbox that is not the caller's own is only peeked, whatever `peek`
@@ -873,9 +883,16 @@ pub enum ServerMessage {
         #[serde(default)]
         reason: Option<String>,
         /// The submit ran out of time before it could be typed, and `reason`
-        /// is what it was waiting on.
+        /// is what it was waiting on. For a submitted message sent with
+        /// `wait`: the wait ran out of time, and `final_state` is the agent's
+        /// state then.
         #[serde(default)]
         timed_out: bool,
+        /// For a submitted message sent with `wait`: the state the agent's
+        /// turn ended in, or its state when the wait timed out. `None` when
+        /// nothing was waited on.
+        #[serde(default)]
+        final_state: Option<AgentState>,
     },
     /// The answer to a [`ClientMessage::MsgRead`]: the listed messages,
     /// oldest first.
@@ -2650,12 +2667,13 @@ mod tests {
                 pane_hint,
                 defer,
                 timeout_ms,
+                wait,
                 ..
             } => {
                 assert_eq!(to.to_string(), "%7");
                 assert_eq!(deliver, Deliver::Auto);
                 assert_eq!((reply_to, pane_hint), (None, None));
-                assert_eq!((defer, timeout_ms), (false, None));
+                assert_eq!((defer, timeout_ms, wait), (false, None, false));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -2680,6 +2698,7 @@ mod tests {
             delivery: Delivery::Mailbox,
             reason: Some("agent_blocked".into()),
             timed_out: true,
+            final_state: None,
         };
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
@@ -2701,6 +2720,29 @@ mod tests {
             ServerMessage::MsgSent {
                 id: 2,
                 timed_out: false,
+                final_state: None,
+                ..
+            }
+        ));
+        let waited = ServerMessage::MsgSent {
+            id: 3,
+            to: Resolved {
+                host: None,
+                pane_id: 7,
+                name: None,
+            },
+            delivery: Delivery::Submitted,
+            reason: None,
+            timed_out: false,
+            final_state: Some(AgentState::NeedsInput),
+        };
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&waited).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::MsgSent {
+                id: 3,
+                final_state: Some(AgentState::NeedsInput),
                 ..
             }
         ));
@@ -2713,6 +2755,19 @@ mod tests {
             ClientMessage::MsgSend {
                 defer: true,
                 timeout_ms: Some(1500),
+                wait: false,
+                ..
+            }
+        ));
+        let waiting: ClientMessage = serde_json::from_str(
+            r#"{"MsgSend":{"to":{"host":null,"target":{"Pane":7}},"body":"hi","deliver":"Submit","wait":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            waiting,
+            ClientMessage::MsgSend {
+                wait: true,
+                defer: false,
                 ..
             }
         ));

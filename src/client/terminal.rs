@@ -371,9 +371,10 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             pane_hint,
             defer,
             timeout_ms,
+            wait,
         } => format!(
             "MsgSend(to={:?}, deliver={deliver:?}, {} bytes, reply_to={:?}, pane_hint={pane_hint:?}, \
-             defer={defer}, timeout={timeout_ms:?})",
+             defer={defer}, timeout={timeout_ms:?}, wait={wait})",
             to.to_string(),
             body.len(),
             reply_to.as_ref().map(|r| r.id)
@@ -481,12 +482,13 @@ mod tests {
             pane_hint: Some(3),
             defer: true,
             timeout_ms: Some(1500),
+            wait: true,
         });
         assert!(!s.contains("hunter2"), "the body must not appear: {s}");
         assert!(s.contains("beta"), "but the target must: {s}");
         assert!(s.contains("25 bytes"), "and the body's size: {s}");
         assert!(
-            s.contains("defer=true, timeout=Some(1500)"),
+            s.contains("defer=true, timeout=Some(1500), wait=true"),
             "and the flags: {s}"
         );
     }

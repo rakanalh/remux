@@ -1095,6 +1095,11 @@
 #                      (`pane_attended`).
 # submit_queue_len     the most messages waiting to be typed into one pane
 #                      (`queue_full`).
+# stall_ms             `remux msg send --wait`: once the prompt's echo is over,
+#                      the agent has this long to print something, or the wait
+#                      ends `agent_prompt_stalled`.
+# settle_ms            ...and its turn has ended once it has stopped working
+#                      for this long (see `[agents] working_ms`).
 #
 # Read by the SERVER at startup, so an edit needs `remux restart`.
 #
@@ -1110,6 +1115,8 @@
 # typing_guard_max_ms = 15000
 # submit_when_attended = true
 # submit_queue_len = 8
+# stall_ms = 5000
+# settle_ms = 1000
 #
 # How a message is TYPED into an agent's pane (`remux msg send --deliver
 # submit`, or `auto`, the default), one row per `[agents] commands` spelling.

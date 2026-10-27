@@ -169,6 +169,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     pane_hint: pane_hint(),
                     defer: false,
                     timeout_ms: None,
+                    wait: false,
                 },
                 send_deadline(deliver.into(), false, None),
             )
@@ -184,6 +185,7 @@ async fn run(cmd: MsgCmd) -> Result<(), CliError> {
                     delivery,
                     reason,
                     timed_out: _,
+                    final_state: _,
                 } => {
                     log::debug!("cmd: msg send answered MsgSent(id={id})");
                     if json {
