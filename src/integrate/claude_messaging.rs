@@ -48,6 +48,15 @@ enum Skill {
     Absent,
 }
 
+/// The skill path as `--status` reads it. A symlink to nothing reads as
+/// absent, but writing the skill would replace the link with a file, so it is
+/// not a [`Skill`]: the commands that write or remove the skill refuse it.
+#[derive(Debug, PartialEq, Eq)]
+enum OnDisk {
+    Skill(Skill),
+    Dangling { to: PathBuf },
+}
+
 /// `remux integrate claude-messaging`.
 pub struct ClaudeMessaging {
     hooks: HooksFile,
@@ -82,26 +91,35 @@ impl ClaudeMessaging {
         }
     }
 
-    fn skill(&self) -> Result<Skill> {
+    fn on_disk(&self) -> Result<OnDisk> {
         match std::fs::read(&self.skill) {
-            Ok(bytes) if bytes == SKILL.as_bytes() => Ok(Skill::Installed),
-            Ok(_) => Ok(Skill::Differs),
+            Ok(bytes) if bytes == SKILL.as_bytes() => Ok(OnDisk::Skill(Skill::Installed)),
+            Ok(_) => Ok(OnDisk::Skill(Skill::Differs)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // A link to nothing reads as NotFound, and writing the skill
-                // would replace the link with a file.
-                if let Ok(to) = std::fs::read_link(&self.skill) {
-                    anyhow::bail!(
-                        "{} is a symlink to {}, which does not exist; replacing it would \
-                         destroy the link: create the file it names, or remove the link, \
-                         and re-run",
-                        shown(&self.skill),
-                        shown(&to)
-                    );
-                }
-                Ok(Skill::Absent)
+                Ok(match std::fs::read_link(&self.skill) {
+                    Ok(to) => OnDisk::Dangling { to },
+                    Err(_) => OnDisk::Skill(Skill::Absent),
+                })
             }
             Err(e) => Err(e).with_context(|| format!("reading {}", self.skill.display())),
         }
+    }
+
+    /// The skill's state for a command that writes or removes it.
+    fn skill(&self) -> Result<Skill> {
+        match self.on_disk()? {
+            OnDisk::Skill(skill) => Ok(skill),
+            OnDisk::Dangling { to } => anyhow::bail!("{}", self.dangling_why(&to)),
+        }
+    }
+
+    fn dangling_why(&self, to: &Path) -> String {
+        format!(
+            "{} is a symlink to {}, which does not exist; replacing it would destroy the \
+             link: create the file it names, or remove the link, and re-run",
+            shown(&self.skill),
+            shown(to)
+        )
     }
 
     /// Before the skill is written or removed: the same ownership rules as
@@ -129,12 +147,13 @@ impl Integration for ClaudeMessaging {
     /// One line for both halves: the hooks' state, and the skill's beside it.
     fn status(&self) -> Result<IntegrationStatus> {
         let hooks = self.hooks.status()?;
-        let skill = self.skill()?;
+        let skill = self.on_disk()?;
         let path = shown(&self.skill);
-        let skill_why = match skill {
-            Skill::Installed => None,
-            Skill::Absent => Some(format!("the skill is absent from {path}")),
-            Skill::Differs => Some(format!(
+        let skill_why = match &skill {
+            OnDisk::Skill(Skill::Installed) => None,
+            OnDisk::Dangling { to } => Some(self.dangling_why(to)),
+            OnDisk::Skill(Skill::Absent) => Some(format!("the skill is absent from {path}")),
+            OnDisk::Skill(Skill::Differs) => Some(format!(
                 "the skill at {path} differs from this build; remove it and re-run install \
                  to replace it, or keep your edit"
             )),
@@ -151,7 +170,9 @@ impl Integration for ClaudeMessaging {
                 Some(why) => IntegrationStatus::Stale { why },
             },
             IntegrationStatus::Stale { why } => IntegrationStatus::Stale { why: joined(why) },
-            IntegrationStatus::Absent if skill == Skill::Absent => IntegrationStatus::Absent,
+            IntegrationStatus::Absent if skill == OnDisk::Skill(Skill::Absent) => {
+                IntegrationStatus::Absent
+            }
             IntegrationStatus::Absent => IntegrationStatus::Stale {
                 why: joined(
                     MESSAGING
@@ -437,5 +458,28 @@ mod tests {
         assert_eq!(std::fs::read_link(&skill).unwrap(), gone);
         assert!(!gone.exists());
         assert!(!home.path().join(".claude/settings.json").exists());
+    }
+
+    /// Status reports the dangling link rather than failing: it is the
+    /// command a user runs to find out what is wrong.
+    #[test]
+    fn status_reports_a_dangling_skill_symlink_as_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let it = in_home(home.path());
+        it.install().unwrap();
+        let skill = skill_path(home.path());
+        std::fs::remove_file(&skill).unwrap();
+        let gone = home.path().join("dotfiles/SKILL.md");
+        std::os::unix::fs::symlink(&gone, &skill).unwrap();
+        match it.status().unwrap() {
+            IntegrationStatus::Stale { why } => assert!(
+                why.contains(&format!("is a symlink to {}", gone.display()))
+                    && why.contains("which does not exist"),
+                "{why}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(it.uninstall().is_err(), "uninstall still refuses");
+        assert_eq!(std::fs::read_link(&skill).unwrap(), gone);
     }
 }

@@ -37,9 +37,17 @@
   i21 a binary another user could replace is refused, naming the path, and
       nothing is written: in a 0777 directory, under a directory with o+w, or
       anywhere under /tmp; a copy in a 0755 directory is accepted
+  i22 installed from a safe directory that is opened up later: --status says
+      Stale, naming the directory, instead of Installed
+  i23 a umask-002 layout, a 0775 ~/.claude and binary directory whose group
+      is the user's private group, is accepted; the same directory in a group
+      with other members is refused (SKIPs when the user's primary group is
+      not a private one: named after another user, or listing other members;
+      the shared half SKIPs when the user is in no other group)
 
 Copies of the binary go under ~/.cache/rmx-integmsg, never under /tmp: /tmp
-is world-writable, so a binary there is refused (i21).
+is world-writable, so a binary there is refused (i21). That tree is removed
+on any exit, a SIGTERM included.
 
 The skill, at ~/.claude/skills/remux-messaging/SKILL.md:
   s1  install writes it 0644, byte for byte the repo's SKILL.md
@@ -53,15 +61,20 @@ The skill, at ~/.claude/skills/remux-messaging/SKILL.md:
   s7  a skills/ directory linked to another user's (/etc) is refused by
       install and --dry-run, and nothing is written; uninstall still removes
       the hooks, and fails naming the skill's refusal
-  s8  a SKILL.md linked to nothing is refused, and stays that link
+  s8  a SKILL.md linked to nothing is refused, and stays that link; --status
+      reports it as Stale and exits 0
   s9  a skills/ others can write, with remux-messaging/ not there yet, is
       refused, and nothing is written
 
 Run: python3 tests/pty/integrate_claude_messaging.py
 """
+import atexit
+import grp
 import json
 import os
+import pwd
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -138,7 +151,15 @@ def snapshot(path):
 shutil.rmtree(RUNDIR, ignore_errors=True)
 os.makedirs(RUNDIR)
 shutil.rmtree(SAFE, ignore_errors=True)
-os.makedirs(SAFE, mode=0o755)
+# i21-i23 open directories under SAFE for a moment and run binaries from
+# them; 0700 keeps every other user out of SAFE whatever $HOME's mode is.
+os.makedirs(SAFE)
+atexit.register(shutil.rmtree, SAFE, ignore_errors=True)
+os.chmod(SAFE, 0o700)
+assert os.stat(SAFE).st_mode & 0o777 == 0o700, oct(os.stat(SAFE).st_mode)
+# atexit does not run on a signal's default action; exiting from the handler
+# lets it run.
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
 def copy_into(directory, mode=0o755):
@@ -411,6 +432,48 @@ check(rc == 0 and commands(json.load(open(settings(safe))), "Stop") == [hook_com
 os.chmod(f"{SAFE}/open", 0o755)
 os.chmod(f"{SAFE}/ow", 0o755)
 
+# -- i22 ---------------------------------------------------------------------
+openedhome = fresh_home("opened")
+opened = copy_into(f"{SAFE}/i22")
+assert integrate(openedhome, HARNESS, binary=opened, dev=False)[0] == 0
+rc, out, _ = integrate(openedhome, HARNESS, "--status", binary=opened)
+check("Installed" in out, f"i22 installed from a safe directory: Installed ({out.strip()!r})")
+os.chmod(f"{SAFE}/i22", 0o777)
+rc, out, _ = integrate(openedhome, HARNESS, "--status", binary=opened)
+os.chmod(f"{SAFE}/i22", 0o755)
+check("Stale" in out and f"{SAFE}/i22 is writable by others" in out,
+      f"i22 ...and Stale, naming it, once others can write there ({out.strip()!r})")
+
+# -- i23 ---------------------------------------------------------------------
+primary = os.getgid()
+me = pwd.getpwuid(os.getuid()).pw_name
+primary_group = grp.getgrgid(primary)
+if primary_group.gr_name == me and all(m == me for m in primary_group.gr_mem):
+    upg = fresh_home("upg")
+    os.makedirs(f"{upg}/.claude")
+    os.chmod(f"{upg}/.claude", 0o775)
+    upg_binary = copy_into(f"{SAFE}/upg", 0o775)
+    os.chown(f"{SAFE}/upg", -1, primary)
+    rc, _, err = integrate(upg, HARNESS, binary=upg_binary, dev=False)
+    check(rc == 0 and commands(json.load(open(settings(upg))), "Stop") == [hook_command(upg_binary, "claude-stop")],
+          f"i23 a 0775 ~/.claude and binary directory in the user's private group are accepted (rc={rc}, err={err.strip()!r})")
+    shared = next((g for g in os.getgroups() if g != primary), None)
+    if shared is None:
+        print("SKIP  i23 the shared-group half needs the user in a second group")
+    else:
+        os.chown(f"{SAFE}/upg", -1, shared)
+        sharedhome = fresh_home("upgshared")
+        rc, _, err = integrate(sharedhome, HARNESS, binary=upg_binary, dev=False)
+        check(rc != 0 and f"{SAFE}/upg is writable by others" in err and not os.path.exists(f"{sharedhome}/.claude"),
+              f"i23 ...the same directory in group {shared} is refused (rc={rc}, err={err.strip()[:160]!r})")
+        os.chown(f"{SAFE}/upg", -1, primary)
+        os.chown(f"{upg}/.claude", -1, shared)
+        rc, _, err = integrate(upg, HARNESS, "--uninstall")
+        check(rc != 0 and f"{upg}/.claude is writable by others" in err,
+              f"i23 ...and so is a 0775 ~/.claude in group {shared} (rc={rc}, err={err.strip()[:160]!r})")
+else:
+    print(f"SKIP  i23 the primary group {primary} ({primary_group.gr_name}) is not private to {me}")
+
 # -- s1 .. s7: the skill ---------------------------------------------------
 REPO_SKILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "skills",
                           "remux-messaging", "SKILL.md")
@@ -510,6 +573,10 @@ check(rc != 0 and "which does not exist" in err and os.path.islink(skill(danglin
       and os.readlink(skill(dangling_skill)) == f"{dangling_skill}/dotfiles/SKILL.md"
       and not os.path.exists(f"{dangling_skill}/dotfiles") and not os.path.exists(settings(dangling_skill)),
       f"s8 a dangling SKILL.md link is refused and kept (rc={rc}, err={err.strip()!r})")
+rc, out, err = integrate(dangling_skill, HARNESS, "--status")
+check(rc == 0 and "Stale" in out and f"is a symlink to {dangling_skill}/dotfiles/SKILL.md" in out
+      and "which does not exist" in out,
+      f"s8 ...and --status calls it Stale, exiting 0 (rc={rc}, out={out.strip()!r}, err={err.strip()!r})")
 
 # -- s9 ----------------------------------------------------------------------
 openskills = fresh_home("skillopen")

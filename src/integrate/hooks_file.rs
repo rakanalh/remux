@@ -214,17 +214,126 @@ pub fn check_owner(path: &Path, euid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether a group-writable file or directory with group `gid` can be written
+/// only by `euid`. This is the user-private-group layout that a umask of 002
+/// is designed for; [`only_yours`] has the rule.
+#[cfg(target_os = "linux")]
+fn group_is_private(gid: u32, euid: u32) -> bool {
+    use nix::unistd::{Gid, Group, Uid, User};
+    let Ok(Some(user)) = User::from_uid(Uid::from_raw(euid)) else {
+        return false;
+    };
+    let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid)) else {
+        return false;
+    };
+    only_yours(gid, user.gid.as_raw(), &user.name, &group.name, &group.mem)
+}
+
+/// The group is the user's primary group, it has the user's name, and it
+/// lists no member but the user. `members` holds only supplementary members,
+/// so a group that is the primary group of many accounts, such as a
+/// `users:x:100:` that every account is created in, lists nobody and passes
+/// the other two tests. The name test is what rejects it: useradd names a
+/// user-private group after its user. Another account whose primary gid is the
+/// same is not looked for, because that needs a walk of the whole passwd
+/// database. A group that root makes shared some other way (a gshadow member
+/// list, `newgrp` with a group password, pam_group) is out of scope.
+#[cfg(target_os = "linux")]
+fn only_yours(gid: u32, primary_gid: u32, user: &str, group: &str, members: &[String]) -> bool {
+    gid == primary_gid && group == user && members.iter().all(|m| m == user)
+}
+
+/// o+w always lets another user write; g+w does unless only the user can
+/// write through the group. `meta` is `path`'s, symlinks followed.
+fn others_can_write(path: &Path, meta: &std::fs::Metadata, euid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode();
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && !group_write_is_yours(path, meta.gid(), euid))
+}
+
+/// On a file with an extended access ACL, the mode's group bits are the ACL
+/// mask: the most that any named user or group entry is granted. So g+w there
+/// can be another user's write, and the private group is trusted only where
+/// there is no such ACL.
+#[cfg(target_os = "linux")]
+fn group_write_is_yours(path: &Path, gid: u32, euid: u32) -> bool {
+    group_is_private(gid, euid) && !has_access_acl(path)
+}
+
+/// Off everywhere but Linux. macOS ACLs do not show in the mode bits at all,
+/// so the mode cannot tell a private group's write from an ACL's, and a stock
+/// Mac's primary group is `staff`, which is not private anyway.
+#[cfg(not(target_os = "linux"))]
+fn group_write_is_yours(_path: &Path, _gid: u32, _euid: u32) -> bool {
+    false
+}
+
+/// Whether `path` has an extended access ACL. Only ENODATA answers no; any
+/// other result counts as an ACL, so a failed read never relaxes the check.
+/// That includes ENOTSUP, because an NFSv4 or CIFS client returns it while the
+/// server's ACL shows only as g+w. `getxattr` follows symlinks, as the
+/// `metadata` whose mode it qualifies does.
+#[cfg(target_os = "linux")]
+fn has_access_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: both pointers are NUL-terminated strings that live past the
+    // call, and a null buffer of size 0 asks only for the value's length.
+    let len = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    reports_an_acl(len, std::io::Error::last_os_error().raw_os_error())
+}
+
+/// What a `getxattr` of the access ACL answered: its length, or -1 and `errno`.
+#[cfg(target_os = "linux")]
+fn reports_an_acl(len: isize, errno: Option<i32>) -> bool {
+    len >= 0 || errno != Some(libc::ENODATA)
+}
+
+/// `path` with every symlink resolved, through its nearest existing ancestor
+/// when the rest does not exist yet.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    for dir in path.ancestors() {
+        match std::fs::canonicalize(dir) {
+            Ok(real) => {
+                let rest = path.strip_prefix(dir).unwrap_or(Path::new(""));
+                return Ok(if rest.as_os_str().is_empty() {
+                    real
+                } else {
+                    real.join(rest)
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("resolving {}", shown(dir))),
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
 /// The hooks run whatever file is at `binary`, as this user, each time Claude
 /// stops or takes a prompt. Another user who can replace that file, or any
 /// directory above it, chooses what runs. So the binary and every ancestor
 /// that exists must belong to this user or root and be writable by nobody
 /// else; a sticky world-writable directory such as `/tmp` counts as writable,
-/// since its owner's files can still be created there under a new name.
+/// since its owner's files can still be created there under a new name. Both
+/// the directories above the path as given and those above the file it
+/// resolves to are checked: a user who can write a link's directory can
+/// point the link at another binary, and the directories above the target
+/// hold the file that actually runs.
 pub fn check_binary_safe(binary: &Path, euid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     const FIX: &str = "install remux somewhere only you or root can write, and run that \
                        binary's `integrate`";
-    for path in binary.ancestors() {
+    let resolved = resolve(binary)?;
+    for path in binary.ancestors().chain(resolved.ancestors()) {
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -237,7 +346,7 @@ pub fn check_binary_safe(binary: &Path, euid: u32) -> Result<()> {
             meta.uid()
         );
         anyhow::ensure!(
-            meta.mode() & 0o022 == 0,
+            !others_can_write(path, &meta, euid),
             "{} is writable by others (mode {:o}): another user could replace the remux these \
              hooks run; {FIX}",
             shown(path),
@@ -274,7 +383,7 @@ pub fn check_directory(path: &Path, euid: u32) -> Result<()> {
         meta.uid()
     );
     anyhow::ensure!(
-        meta.mode() & 0o022 == 0,
+        !others_can_write(dir, &meta, euid),
         "{} is writable by others (mode {:o}); refusing to write into it: \
          chmod go-w it first",
         dir.display(),
@@ -410,7 +519,19 @@ impl HooksFile {
     /// The hooks' status in the file as it is now.
     pub fn status(&self) -> Result<IntegrationStatus> {
         let read = self.read(self.target()?)?;
-        Ok(status_of(&read.value, &self.hooks))
+        let status = status_of(&read.value, &self.hooks);
+        // The binary was safe when it was installed; a directory above it can
+        // have been opened up since, and every prompt then runs what is there.
+        // A status that is already Stale is not checked: its fix is a
+        // re-install, and the install refuses an unsafe binary itself.
+        if matches!(status, IntegrationStatus::Installed { .. }) {
+            if let Err(e) = check_binary_safe(self.hooks.binary(), self.euid) {
+                return Ok(IntegrationStatus::Stale {
+                    why: format!("{e:#}"),
+                });
+            }
+        }
+        Ok(status)
     }
 
     /// What [`Self::install`] would change, shown as the `hooks` subtree: the
@@ -1280,5 +1401,243 @@ mod tests {
             back["Stop"][0]["hooks"][0]["command"], "echo \u{9b}31mred\u{7f}",
             "the escape decodes to the same text"
         );
+    }
+
+    /// A directory under this crate's `target/`, which `/tmp` cannot stand in
+    /// for: `/tmp` is sticky world-writable, so a binary under it is unsafe.
+    /// None, with the reason printed, when there is no `target/` there (a
+    /// `CARGO_TARGET_DIR` elsewhere) or when the checkout itself is somewhere
+    /// others can write. The caller then skips, because the test needs a
+    /// directory the checks accept and the machine does not provide one.
+    fn safe_tempdir() -> Option<tempfile::TempDir> {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let dir = match tempfile::tempdir_in(&target) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("skipped: no directory under {}: {e}", target.display());
+                return None;
+            }
+        };
+        if let Err(e) = check_binary_safe(&dir.path().join("remux"), me()) {
+            eprintln!(
+                "skipped: {} is not safe for a binary: {e:#}",
+                target.display()
+            );
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// A supplementary group of this process other than `primary`.
+    #[cfg(target_os = "linux")]
+    fn another_group(primary: u32) -> Option<u32> {
+        nix::unistd::getgroups()
+            .ok()?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .find(|&g| g != primary)
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Whether this user's primary group is a user-private one, read from the
+    /// group database rather than from [`group_is_private`], which is under
+    /// test. Prints why when it is not, for the caller to skip.
+    #[cfg(target_os = "linux")]
+    fn primary_group_is_private() -> bool {
+        use nix::unistd::{getgid, Group, Uid, User};
+        let user = User::from_uid(Uid::from_raw(me())).unwrap().unwrap();
+        let group = Group::from_gid(getgid()).unwrap().unwrap();
+        let private = group.name == user.name && group.mem.iter().all(|m| *m == user.name);
+        if !private {
+            eprintln!(
+                "skipped: this user's primary group {} is not private to {}",
+                group.name, user.name
+            );
+        }
+        private
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_primary_group_with_no_other_member_is_private() {
+        let me = "rakan".to_string();
+        let private = |gid, members: &[String]| only_yours(gid, 1000, "rakan", "rakan", members);
+        assert!(private(1000, &[]));
+        assert!(private(1000, std::slice::from_ref(&me)));
+        assert!(!private(1000, &["eve".to_string()]));
+        assert!(!private(1000, &[me, "eve".to_string()]));
+        assert!(!private(10, &[]), "not the primary group");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_primary_group_with_no_listed_member_is_not_private() {
+        assert!(!only_yours(100, 100, "rakan", "users", &[]));
+    }
+
+    /// A umask-002 layout: the directory is g+w, and its group is the user's
+    /// private one. Accepted for the settings directory and the binary's.
+    /// Moved to a group with another member, the same mode is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_writable_directory_is_trusted_only_for_a_private_group() {
+        use nix::unistd::getgid;
+        let primary = getgid().as_raw();
+        if !primary_group_is_private() {
+            return;
+        }
+        let Some(base) = safe_tempdir() else {
+            return;
+        };
+        let dir = base.path().join("g");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::chown(&dir, None, Some(primary)).unwrap();
+        chmod(&dir, 0o775);
+        let binary = dir.join("remux");
+        std::fs::write(&binary, "").unwrap();
+        chmod(&binary, 0o775);
+        check_directory(&dir.join("settings.json"), me()).unwrap();
+        check_binary_safe(&binary, me()).unwrap();
+
+        chmod(&dir, 0o777);
+        let err = check_directory(&dir.join("settings.json"), me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+        chmod(&dir, 0o775);
+
+        let Some(shared) = another_group(primary) else {
+            eprintln!("skipped the shared half: this user is in no other group");
+            return;
+        };
+        std::os::unix::fs::chown(&dir, None, Some(shared)).unwrap();
+        let err = check_directory(&dir.join("settings.json"), me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+        let err = check_binary_safe(&binary, me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_enodata_means_there_is_no_acl() {
+        assert!(!reports_an_acl(-1, Some(libc::ENODATA)));
+        assert!(
+            reports_an_acl(-1, Some(libc::ENOTSUP)),
+            "an NFSv4 or CIFS client"
+        );
+        assert!(reports_an_acl(-1, Some(libc::EACCES)));
+        assert!(reports_an_acl(-1, None));
+        assert!(reports_an_acl(28, None));
+    }
+
+    /// On a file with an extended ACL the mode's group bits are the ACL mask,
+    /// so a 0775 directory in the private group can still grant a named user
+    /// write access.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_private_group_directory_with_an_acl_is_refused() {
+        use nix::unistd::getgid;
+        if !primary_group_is_private() {
+            return;
+        }
+        let Some(base) = safe_tempdir() else {
+            return;
+        };
+        let dir = base.path().join("acl");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::chown(&dir, None, Some(getgid().as_raw())).unwrap();
+        chmod(&dir, 0o755);
+        let binary = dir.join("remux");
+        std::fs::write(&binary, "").unwrap();
+        let granted = std::process::Command::new("setfacl")
+            .args(["-m", "u:nobody:rwx"])
+            .arg(&dir)
+            .output();
+        match granted {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let why = String::from_utf8_lossy(&out.stderr);
+                eprintln!("skipped: setfacl refused here: {}", why.trim());
+                return;
+            }
+            Err(e) => {
+                eprintln!("skipped: no setfacl: {e}");
+                return;
+            }
+        }
+        assert_eq!(mode(&dir), 0o775, "the mask shows as the group bits");
+        let err = check_directory(&dir.join("settings.json"), me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+        let err = check_binary_safe(&binary, me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+    }
+
+    /// A link in a safe directory to a binary in an open directory runs the
+    /// binary there, so it is refused whatever path the caller passed.
+    #[test]
+    fn a_link_to_a_binary_in_an_unsafe_directory_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let open = base.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        chmod(&open, 0o777);
+        let real = open.join("remux");
+        std::fs::write(&real, "").unwrap();
+        let Some(safe) = safe_tempdir() else {
+            return;
+        };
+        let link = safe.path().join("remux");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = check_binary_safe(&link, me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+        assert!(check_binary_safe(&safe.path().join("not-yet/remux"), me()).is_ok());
+    }
+
+    /// Anyone who can write the link's directory can point the link at
+    /// another binary, however safe the binary it names now.
+    #[test]
+    fn a_link_in_an_unsafe_directory_to_a_safe_binary_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let open = base.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        chmod(&open, 0o777);
+        let link = open.join("remux");
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        assert!(check_binary_safe(Path::new("/bin/sh"), me()).is_ok());
+        let err = check_binary_safe(&link, me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+    }
+
+    /// Installed from a safe directory that others can write into later: the
+    /// status says so, rather than Installed.
+    #[test]
+    fn status_is_stale_once_the_binarys_directory_is_opened_up() {
+        let home = tempfile::tempdir().unwrap();
+        let Some(safe) = safe_tempdir() else {
+            return;
+        };
+        let binary = safe.path().join("remux");
+        std::fs::write(&binary, "").unwrap();
+        let file = HooksFile::new(
+            home.path().join(".claude").join("settings.json"),
+            Hooks::new(&SET, std::fs::canonicalize(&binary).unwrap()),
+            true,
+            me(),
+        );
+        file.install().unwrap();
+        assert!(matches!(
+            file.status().unwrap(),
+            IntegrationStatus::Installed { .. }
+        ));
+        chmod(safe.path(), 0o777);
+        let status = file.status();
+        chmod(safe.path(), 0o755);
+        match status.unwrap() {
+            IntegrationStatus::Stale { why } => {
+                assert!(why.contains("writable by others"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
