@@ -614,7 +614,16 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Restart) => {
             log::debug!("cmd: restart server");
-            let _ = stop_server().await?;
+            // A server that has not exited still owns the socket, and its
+            // shutdown is still to come: starting another now would hand the
+            // "restart" to the old server, or lose the new one when the old
+            // one finally exits.
+            if let Stop::TimedOut { pid } = stop_server().await? {
+                anyhow::bail!(
+                    "the server (pid {pid}) did not exit, so no new server was started; \
+                     run `remux restart` again once it has"
+                );
+            }
             ensure_server_running().await?;
             println!("Server restarted.");
         }
@@ -747,13 +756,21 @@ async fn ensure_server_running() -> Result<()> {
     anyhow::bail!("timed out waiting for server to start")
 }
 
-/// Gracefully stop the running server via SIGTERM.
-///
-/// Returns `Ok(true)` if a running server was stopped, `Ok(false)` if none was
-/// running (or only stale files existed). The SIGTERM triggers the server's
-/// existing graceful path, which saves session state before removing the socket
+/// What `stop_server` came to.
+enum Stop {
+    Stopped,
+    /// No server was running, or none this command could signal.
+    NotRunning,
+    /// The server was signalled and is still there.
+    TimedOut {
+        pid: i32,
+    },
+}
+
+/// Gracefully stop the running server via SIGTERM, which triggers the
+/// server's graceful path: it saves session state before removing the socket
 /// and pid files.
-async fn stop_server() -> Result<bool> {
+async fn stop_server() -> Result<Stop> {
     // The pid file names the process to signal; one in a directory another
     // user controls could name any process of ours.
     daemon::prepare_runtime_dir()?;
@@ -762,7 +779,7 @@ async fn stop_server() -> Result<bool> {
 
     if !sock.exists() && !pid_file.exists() {
         println!("No server running.");
-        return Ok(false);
+        return Ok(Stop::NotRunning);
     }
 
     // Read and parse the PID. Without a valid pid file we can't signal a live
@@ -774,12 +791,12 @@ async fn stop_server() -> Result<bool> {
                 println!(
                     "Server socket exists but pid file is unreadable; cannot signal the server."
                 );
-                return Ok(false);
+                return Ok(Stop::NotRunning);
             }
         },
         Err(_) => {
             println!("Server socket exists but pid file is missing; cannot signal the server.");
-            return Ok(false);
+            return Ok(Stop::NotRunning);
         }
     };
 
@@ -790,11 +807,31 @@ async fn stop_server() -> Result<bool> {
     ) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {
-            // No such process: the pid file is stale. Clean up leftover files.
-            let _ = std::fs::remove_file(&sock);
+            // No such process: the pid file is stale, but the socket may not
+            // be. Unlinking a socket a server still listens on orphans that
+            // server and every session in it, so only "nothing is listening"
+            // makes the socket stale too.
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(_) => anyhow::bail!(
+                    "a server is listening on {} but its pid file is stale (no process {pid}); \
+                     it cannot be signalled from here: stop it by its own pid",
+                    sock.display()
+                ),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    let _ = std::fs::remove_file(&sock);
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("connecting to {}", sock.display()));
+                }
+            }
             let _ = std::fs::remove_file(&pid_file);
             println!("No server running (removed stale files).");
-            return Ok(false);
+            return Ok(Stop::NotRunning);
         }
         Err(e) => {
             return Err(e).context("sending SIGTERM to server");
@@ -805,13 +842,13 @@ async fn stop_server() -> Result<bool> {
     for _ in 0..50 {
         if !sock.exists() {
             println!("Server stopped.");
-            return Ok(true);
+            return Ok(Stop::Stopped);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     println!("Warning: server did not exit within 5s.");
-    Ok(false)
+    Ok(Stop::TimedOut { pid })
 }
 
 // ---------------------------------------------------------------------------

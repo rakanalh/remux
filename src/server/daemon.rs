@@ -4707,6 +4707,43 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("remux.sock")
 }
 
+/// The file at `path` as (device, inode), to tell it from another file later
+/// put at the same path.
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Remove this server's socket and pid file at shutdown, but only while they
+/// are still this server's. A shutdown that runs long (a large save) can end
+/// after the next server has bound its own socket at the same path and
+/// written its own pid: removing those would leave that server unreachable
+/// and `remux stop` unable to find it.
+fn remove_own_files(socket_path: &std::path::Path, bound: Option<(u64, u64)>) {
+    if bound.is_some() && file_identity(socket_path) == bound {
+        let _ = std::fs::remove_file(socket_path);
+    } else {
+        log::info!(
+            "shutdown: {} is no longer the socket this server bound; left in place",
+            socket_path.display()
+        );
+    }
+    let pid_file = pid_path();
+    let ours = std::process::id().to_string();
+    match std::fs::read_to_string(&pid_file) {
+        Ok(text) if text.trim() == ours => {
+            let _ = std::fs::remove_file(&pid_file);
+        }
+        Ok(_) => log::info!(
+            "shutdown: {} names another process; left in place",
+            pid_file.display()
+        ),
+        Err(_) => {}
+    }
+}
+
 /// Return the path to the pid file recording the running server's PID.
 ///
 /// Written on startup and removed on graceful shutdown; used by `remux stop`
@@ -5346,6 +5383,60 @@ impl RemuxServer {
         }
         let _ = PEER_SEAM.set(seam);
 
+        // Before anything is restored: a server that is about to refuse a
+        // live socket must not first spawn every restored pane's shell.
+        prepare_runtime_dir()?;
+        let path = socket_path();
+        // Only a socket nobody listens on is stale. Unlinking a live server's
+        // socket would leave that server running, and every session in it,
+        // where no client can reach it.
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(_) => anyhow::bail!(
+                "a remux server is already listening on {}; `remux stop` it first",
+                path.display()
+            ),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("probing {}", path.display()));
+            }
+        }
+
+        let listener = UnixListener::bind(&path).context("binding Unix listener")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {} to this user", path.display()))?;
+        }
+        log::info!("server listening on {}", path.display());
+        // What shutdown may remove: this file, and no other that a later
+        // server binds at the same path.
+        let bound = file_identity(&path);
+
+        // Before the restore, which can take a while: a `remux stop` that
+        // finds the socket must also find the pid, and the SIGTERM it sends
+        // must be held for the main loop rather than kill a server that has
+        // no handler yet. tokio keeps a signal until the handler is polled, so
+        // a stop during the restore becomes a graceful save once it is done.
+        // The handlers come first: a pid file names a server that can take
+        // the signal.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("registering SIGTERM handler")?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("registering SIGINT handler")?;
+        // Best-effort: a write failure here must not abort startup.
+        let pid_file = pid_path();
+        match std::fs::write(&pid_file, std::process::id().to_string()) {
+            Ok(()) => log::info!("wrote pid file {}", pid_file.display()),
+            Err(e) => log::warn!("failed to write pid file {}: {e}", pid_file.display()),
+        }
+
         // Load persisted state before accepting connections. Behavior depends
         // on two config flags:
         //   save_sessions=false            -> no persistence at all (skip load).
@@ -5395,51 +5486,7 @@ impl RemuxServer {
             spawn_mailbox_saver(Arc::clone(&server.state));
         }
 
-        prepare_runtime_dir()?;
-        let path = socket_path();
-        // Only a socket nobody listens on is stale. Unlinking a live server's
-        // socket would leave that server running, and every session in it,
-        // where no client can reach it.
-        match tokio::net::UnixStream::connect(&path).await {
-            Ok(_) => anyhow::bail!(
-                "a remux server is already listening on {}; `remux stop` it first",
-                path.display()
-            ),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                let _ = std::fs::remove_file(&path);
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("probing {}", path.display()));
-            }
-        }
-
-        let listener = UnixListener::bind(&path).context("binding Unix listener")?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting {} to this user", path.display()))?;
-        }
-        log::info!("server listening on {}", path.display());
         let own_uid = own_uid();
-
-        // Record our PID so `remux stop` can signal us for a graceful save-and-
-        // exit. Best-effort: a write failure here must not abort startup.
-        let pid_file = pid_path();
-        match std::fs::write(&pid_file, std::process::id().to_string()) {
-            Ok(()) => log::info!("wrote pid file {}", pid_file.display()),
-            Err(e) => log::warn!("failed to write pid file {}: {e}", pid_file.display()),
-        }
-
-        // Set up signal handlers for graceful shutdown.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("registering SIGTERM handler")?;
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .context("registering SIGINT handler")?;
 
         // Session-tree push task. Sleeping a full interval after each broadcast
         // is the coalescing: every change arriving during that sleep collapses
@@ -5592,12 +5639,12 @@ impl RemuxServer {
         }
 
         // Graceful shutdown: clean up resources.
-        server.shutdown(&path).await;
+        server.shutdown(&path, bound).await;
         Ok(())
     }
 
     /// Perform graceful shutdown: save state, drop panes, remove socket.
-    async fn shutdown(&self, socket_path: &std::path::Path) {
+    async fn shutdown(&self, socket_path: &std::path::Path, bound: Option<(u64, u64)>) {
         // Before the save_sessions return below: `persist` is the one switch
         // for this file. With save_sessions off no pane is restored, so the
         // next start prunes every mailbox, which is the right answer without
@@ -5609,8 +5656,7 @@ impl RemuxServer {
         // Persistence is fully off when save_sessions is disabled.
         if !self.config.general.save_sessions {
             log::info!("save_sessions disabled: skipping state save on shutdown");
-            let _ = std::fs::remove_file(socket_path);
-            let _ = std::fs::remove_file(pid_path());
+            remove_own_files(socket_path, bound);
             log::info!("shutdown complete");
             return;
         }
@@ -5649,9 +5695,7 @@ impl RemuxServer {
         drop(state);
         drop(panes);
 
-        // Remove socket and pid files.
-        let _ = std::fs::remove_file(socket_path);
-        let _ = std::fs::remove_file(pid_path());
+        remove_own_files(socket_path, bound);
         log::info!("shutdown complete");
     }
 
