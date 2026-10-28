@@ -4,7 +4,10 @@ Drives the actual client binary through a pseudo-terminal (pexpect) and reads
 the rendered screen with pyte. Spins up an isolated throwaway server (the client
 auto-spawns it) with its own XDG dirs and a short socket path.
 """
-import atexit, os, shutil, signal, subprocess, time, pexpect, pyte
+import atexit, os, shutil, signal, subprocess, sys, time, pexpect, pyte
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frame"))
+from harness import guard_rundir, kill_relays, reap_rundir  # noqa: E402,F401
 
 BIN = os.path.abspath(os.environ.get("REMUX_BIN", "target/debug/remux"))
 PREFIX = b"\x01"  # Ctrl-a
@@ -50,15 +53,20 @@ class Tui:
         self.config = config
 
     def start(self):
+        # `kill()` runs `remux stop` against this rundir, and the reaper kills
+        # under it; a relative one would resolve against whatever directory
+        # the harness runs from.
+        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
+        # Before `atexit.register(self.kill)`: atexit runs last-registered
+        # first, so `kill()`'s graceful `remux stop` runs before the reaper
+        # SIGKILLs whatever survived it.
+        guard_rundir(self.rundir)
         # The client auto-spawns a server that outlives it, so a harness that
         # exits without reaching `kill()` (an uncaught exception, an early
         # `sys.exit`) would leave that server running. `atexit` covers both.
         if not self._cleanup_registered:
             atexit.register(self.kill)
             self._cleanup_registered = True
-        # `kill()` runs `remux stop` against this rundir; a relative one would
-        # resolve against whatever directory the harness runs from.
-        assert os.path.isabs(self.rundir), f"rundir must be absolute: {self.rundir}"
         shutil.rmtree(self.rundir, ignore_errors=True)
         for s in ("run", "state", "data", "config"):
             os.makedirs(f"{self.rundir}/{s}", exist_ok=True)
