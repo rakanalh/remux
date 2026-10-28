@@ -208,7 +208,19 @@ With the remux hooks installed in Claude Code, you never need to poll:
 
 The hooks run as you, in your pane, so they only ever read your own mailbox. A hook that cannot reach the server does nothing and never blocks your turn. If the hook cannot confirm its acknowledgement, it shows you the mail anyway, so you can see a message twice; you never lose one.
 
+### Install
+
+On the machine Claude Code runs on, as the user it runs as:
+
+```sh
+remux integrate claude-messaging
+```
+
+This adds the two hooks to `~/.claude/settings.json`, naming this binary by its canonical absolute path (symlinks resolved), and leaves your other hooks and keys as they were. It also installs this file as `~/.claude/skills/remux-messaging/SKILL.md`. `remux integrate claude-messaging --status` reports whether both are installed, `--dry-run` prints what an install would change and changes nothing, and `--uninstall` removes remux's hooks, and this file unless you have edited it; nothing of yours is touched. It refuses a binary under a cargo `target/` directory unless given `--allow-dev-path`, and a binary that another user could replace. Re-run it after an upgrade that moves the binary; `--status` reports Stale when the hooks name another binary.
+
 ### Install the hooks by hand
+
+Prefer `remux integrate claude-messaging`, which checks this for you. If you install by hand, make sure the binary and every directory above it are owned by you or root and writable by no one else (so not under `/tmp`), or another user can choose what your hooks run.
 
 Find the absolute path of the binary. The hooks must name it absolutely:
 

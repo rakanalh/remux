@@ -290,7 +290,7 @@ This is what makes an external file manager's opener hook work: point `NNN_OPENE
 
 ### Agent messaging
 
-Agents in different panes can message each other through per-pane mailboxes on the server: `remux msg send`, `remux msg read`, `remux msg ack`, and `remux agent ls|status|name|wait` to find and address them. The server attributes every message to the pane its sending process runs in, never to anything the sender claims. [`skills/remux-messaging/SKILL.md`](skills/remux-messaging/SKILL.md) is the skill that teaches an agent all of it, including the rules it must follow and the reply codes, and shows how to install the Claude Code hooks (`remux msg hook claude-stop` and `claude-prompt`) that hand an agent its mail at the end of a turn and beside its user's next prompt. Copy it to `~/.claude/skills/remux-messaging/SKILL.md`.
+Agents in different panes can message each other through per-pane mailboxes on the server: `remux msg send`, `remux msg read`, `remux msg ack`, and `remux agent ls|status|name|wait` to find and address them. The server attributes every message to the pane its sending process runs in, never to anything the sender claims. [`skills/remux-messaging/SKILL.md`](skills/remux-messaging/SKILL.md) is the skill that teaches an agent all of it, including the rules it must follow and the reply codes, and covers the Claude Code hooks (`remux msg hook claude-stop` and `claude-prompt`) that hand an agent its mail at the end of a turn and beside its user's next prompt. `remux integrate claude-messaging` installs both the hooks and the skill (`--status`, `--dry-run`, `--uninstall`).
 
 ### Configuration file
 
