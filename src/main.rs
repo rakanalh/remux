@@ -4,6 +4,7 @@
 
 mod client;
 mod config;
+mod integrate;
 mod paths;
 mod protocol;
 mod relay;
