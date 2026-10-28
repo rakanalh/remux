@@ -53,6 +53,13 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum IntegrateHarness {
+    /// Claude Code: the Stop and UserPromptSubmit hooks in
+    /// ~/.claude/settings.json
+    ClaudeMessaging,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Create a new session
@@ -165,6 +172,32 @@ enum Commands {
     /// Name panes and list the ones that can be sent to
     #[command(subcommand)]
     Agent(crate::client::agent_cli::AgentCmd),
+
+    /// Install, check or remove what a coding agent needs in its own files to
+    /// use remux. Run it on the machine the agent runs on.
+    #[command(group(clap::ArgGroup::new("action").args(["status", "dry_run", "uninstall"])))]
+    Integrate {
+        /// The coding agent
+        #[arg(value_enum)]
+        harness: IntegrateHarness,
+
+        /// Report whether the integration is installed, stale or absent
+        #[arg(long)]
+        status: bool,
+
+        /// Print what an install would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove remux's hooks, and nothing of the user's
+        #[arg(long)]
+        uninstall: bool,
+
+        /// Write hooks that run this binary even though it is a cargo build
+        /// output (under a `target/` directory)
+        #[arg(long)]
+        allow_dev_path: bool,
+    },
 
     /// Internal: run the server (not for direct use)
     #[command(hide = true)]
@@ -606,6 +639,15 @@ async fn main() -> Result<()> {
         Some(Commands::Agent(cmd)) => {
             std::process::exit(crate::client::agent_cli::run_agent(cmd).await.into());
         }
+        Some(Commands::Integrate {
+            harness,
+            status,
+            dry_run,
+            uninstall,
+            allow_dev_path,
+        }) => {
+            run_integrate(harness, status, dry_run, uninstall, allow_dev_path)?;
+        }
         Some(Commands::NewTab { cwd, argv }) => {
             run_cli_spawn(CliPlacement::NewTab, cwd, argv).await?;
         }
@@ -755,6 +797,74 @@ async fn ensure_server_running() -> Result<()> {
 
     log::debug!("ensure_server_running: timed out waiting for socket");
     anyhow::bail!("timed out waiting for server to start")
+}
+
+/// `remux integrate`. Run by a human, so a failure exits non-zero.
+fn run_integrate(
+    harness: IntegrateHarness,
+    status: bool,
+    dry_run: bool,
+    uninstall: bool,
+    allow_dev_path: bool,
+) -> Result<()> {
+    use integrate::Integration;
+    let integration: Box<dyn Integration> = match harness {
+        IntegrateHarness::ClaudeMessaging => Box::new(
+            integrate::claude_messaging::ClaudeMessaging::from_env(allow_dev_path)?,
+        ),
+    };
+    let name = integration.name();
+    if status {
+        match integration.status()? {
+            integrate::IntegrationStatus::Installed { runs } => {
+                println!("{name}: Installed ({runs})")
+            }
+            integrate::IntegrationStatus::Stale { why } => println!("{name}: Stale ({why})"),
+            integrate::IntegrationStatus::Absent => println!("{name}: Absent"),
+        }
+        if let Some(text) = integration.instructions() {
+            println!("\n{text}");
+        }
+    } else if dry_run {
+        let (changes, notes) = integration.plan()?;
+        for note in &notes {
+            eprintln!("remux: {note}");
+        }
+        if changes.is_empty() {
+            println!("{name}: nothing to change");
+        }
+        for change in changes {
+            println!("{}", change.path.display());
+            println!("--- before");
+            println!("{}", change.before.as_deref().unwrap_or("(none)"));
+            println!("+++ after");
+            println!("{}", change.after.as_deref().unwrap_or("(none)"));
+        }
+    } else if uninstall {
+        let notes = integration.uninstall()?;
+        for note in &notes {
+            eprintln!("remux: {note}");
+        }
+        println!("{name}: removed{}", except_noted(&notes));
+    } else {
+        let notes = integration.install()?;
+        for note in &notes {
+            eprintln!("remux: {note}");
+        }
+        println!("{name}: installed{}", except_noted(&notes));
+        if let Some(text) = integration.instructions() {
+            println!("\n{text}");
+        }
+    }
+    Ok(())
+}
+
+fn except_noted(notes: &[String]) -> &'static str {
+    if notes.is_empty() {
+        ""
+    } else {
+        ", except where noted"
+    }
 }
 
 /// What `stop_server` came to.

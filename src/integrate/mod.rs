@@ -4,6 +4,7 @@
 //! Run by a human on the machine the harness runs on, so failures exit
 //! non-zero rather than following the hooks' exit-0 contract.
 
+pub mod claude_messaging;
 pub mod hooks_file;
 
 use std::path::PathBuf;

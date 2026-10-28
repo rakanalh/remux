@@ -16,8 +16,8 @@
 //! cannot place is refused `not_in_pane`, prints nothing, and can never hand
 //! an agent mail that is not its own, or the same mail on every Stop.
 //!
-//! The payload reader is P2's own copy until `feat/subagent-panes` merges, at
-//! which point it is unified with `integrate::claude::read_payload`.
+//! The payload reader here is remux's only one: `remux integrate` installs
+//! the hooks that run this command, and reads no payload of its own.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

@@ -319,7 +319,13 @@ pub(crate) fn escape_lines(s: &str) -> String {
 /// the text around it. Every one is escaped, allowed or not, because JSON is
 /// read by programs and the escape decodes to the same text.
 pub(crate) fn json_line(value: &serde_json::Value) -> String {
-    let raw = value.to_string();
+    escaped_json(&value.to_string())
+}
+
+/// [`json_line`]'s escaping, for JSON text already rendered, pretty or not:
+/// DEL, C1 and invisible characters can only stand inside its strings, where
+/// a `\u` escape means the same.
+pub(crate) fn escaped_json(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         let code = c as u32;

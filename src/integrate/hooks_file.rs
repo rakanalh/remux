@@ -214,6 +214,39 @@ pub fn check_owner(path: &Path, euid: u32) -> Result<()> {
     Ok(())
 }
 
+/// The hooks run whatever file is at `binary`, as this user, each time Claude
+/// stops or takes a prompt. Another user who can replace that file, or any
+/// directory above it, chooses what runs. So the binary and every ancestor
+/// that exists must belong to this user or root and be writable by nobody
+/// else; a sticky world-writable directory such as `/tmp` counts as writable,
+/// since its owner's files can still be created there under a new name.
+pub fn check_binary_safe(binary: &Path, euid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    const FIX: &str = "install remux somewhere only you or root can write, and run that \
+                       binary's `integrate`";
+    for path in binary.ancestors() {
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        anyhow::ensure!(
+            meta.uid() == euid || meta.uid() == 0,
+            "{} belongs to uid {}: another user could replace the remux these hooks run; {FIX}",
+            shown(path),
+            meta.uid()
+        );
+        anyhow::ensure!(
+            meta.mode() & 0o022 == 0,
+            "{} is writable by others (mode {:o}): another user could replace the remux these \
+             hooks run; {FIX}",
+            shown(path),
+            meta.mode() & 0o7777
+        );
+    }
+    Ok(())
+}
+
 /// The directory `path` is renamed into, when it exists, must be the user's
 /// and writable by nobody else: another user who can write there can swap
 /// the file between the read and the rename, or plant one where the new file
@@ -255,10 +288,6 @@ impl HooksFile {
         }
     }
 
-    pub fn hooks(&self) -> &Hooks {
-        &self.hooks
-    }
-
     /// A hook must not be baked onto a build directory by accident.
     pub fn check_binary(&self) -> Result<()> {
         anyhow::ensure!(
@@ -268,7 +297,7 @@ impl HooksFile {
              binary's `integrate`, or pass --allow-dev-path to use this one anyway",
             self.hooks.binary().display()
         );
-        Ok(())
+        check_binary_safe(self.hooks.binary(), self.euid)
     }
 
     /// The file to read and write, resolved ONCE per operation: the settings
@@ -658,13 +687,17 @@ pub fn write_atomically(
     Ok(())
 }
 
-/// The `hooks` subtree of a settings file's text, for `--dry-run`.
+/// The `hooks` subtree of a settings file's text, for `--dry-run`, printed to
+/// a terminal: DEL and C1 characters in its strings are escaped, since the
+/// file's author wrote them and a terminal can read C1 as control sequences.
 pub fn hooks_subtree(text: Option<&str>) -> String {
     let hooks = text
         .and_then(|t| parse_settings(t).ok())
         .map(|v| v["hooks"].clone())
         .unwrap_or(Value::Null);
-    serde_json::to_string_pretty(&hooks).unwrap_or_default()
+    crate::client::cli_common::escaped_json(
+        &serde_json::to_string_pretty(&hooks).unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -1179,6 +1212,48 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
             0o640
+        );
+    }
+
+    /// A binary another user could replace is refused: one in a directory
+    /// writable by others, or under one (a temporary directory is under
+    /// `/tmp`, which is). A root-owned system binary is not.
+    #[test]
+    fn a_binary_another_user_could_replace_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(check_binary_safe(Path::new("/bin/sh"), me()).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let binary = open.join("remux");
+        std::fs::write(&binary, "").unwrap();
+        let err = check_binary_safe(&binary, me()).unwrap_err();
+        assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+        assert!(
+            check_binary_safe(Path::new("/bin/sh"), me() + 1).is_ok(),
+            "root's is fine for anyone"
+        );
+    }
+
+    /// `--dry-run` prints the hooks subtree to a terminal: a C1 control or
+    /// DEL in a command is escaped, never sent raw.
+    #[test]
+    fn the_dry_run_subtree_escapes_c1_and_del() {
+        let text = json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "echo \u{9b}31mred\u{7f}"}
+        ]}]}})
+        .to_string();
+        let shown = hooks_subtree(Some(&text));
+        assert!(
+            !shown.contains('\u{9b}') && !shown.contains('\u{7f}'),
+            "{shown:?}"
+        );
+        assert!(shown.contains("\\u009b31mred\\u007f"), "{shown}");
+        let back: Value = serde_json::from_str(&shown).unwrap();
+        assert_eq!(
+            back["Stop"][0]["hooks"][0]["command"], "echo \u{9b}31mred\u{7f}",
+            "the escape decodes to the same text"
         );
     }
 }
