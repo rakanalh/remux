@@ -56,7 +56,7 @@ struct Cli {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum IntegrateHarness {
     /// Claude Code: the Stop and UserPromptSubmit hooks in
-    /// ~/.claude/settings.json
+    /// ~/.claude/settings.json, and the remux-messaging skill
     ClaudeMessaging,
 }
 

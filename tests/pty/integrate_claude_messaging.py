@@ -41,6 +41,22 @@
 Copies of the binary go under ~/.cache/rmx-integmsg, never under /tmp: /tmp
 is world-writable, so a binary there is refused (i21).
 
+The skill, at ~/.claude/skills/remux-messaging/SKILL.md:
+  s1  install writes it 0644, byte for byte the repo's SKILL.md
+  s2  status names the hooks' binary and the skill's path
+  s3  a user-edited skill (one byte, same length) is Stale "differs from this
+      build"; install and uninstall leave it byte-identical, and say so
+  s4  hooks installed and the skill absent: Stale, the skill is absent
+  s5  uninstall removes this build's skill and its empty directory; skills/
+      stays
+  s6  --dry-run on a fresh HOME names both paths and writes neither
+  s7  a skills/ directory linked to another user's (/etc) is refused by
+      install and --dry-run, and nothing is written; uninstall still removes
+      the hooks, and fails naming the skill's refusal
+  s8  a SKILL.md linked to nothing is refused, and stays that link
+  s9  a skills/ others can write, with remux-messaging/ not there yet, is
+      refused, and nothing is written
+
 Run: python3 tests/pty/integrate_claude_messaging.py
 """
 import json
@@ -151,7 +167,7 @@ check(list(doc.keys()) == user_keys and "notify-send stopped" in commands(doc, "
 
 # -- i3 ----------------------------------------------------------------------
 rc, out, _ = integrate(home, HARNESS, "--status")
-check(rc == 0 and f"Installed (the hooks run {os.path.realpath(BIN)})" in out,
+check(rc == 0 and f"Installed (the hooks run {os.path.realpath(BIN)};" in out,
       f"i3 status: Installed, naming the binary ({out.strip()!r})")
 
 # -- i4 ----------------------------------------------------------------------
@@ -294,7 +310,7 @@ stops = commands(json.load(open(settings(copyhome))), "Stop")
 check(rc == 0 and stops == [hook_command(copy, "claude-stop")],
       f"i16 an installed copy writes hooks that run it by path (rc={rc}, err={err!r}, {stops})")
 rc, out, _ = integrate(copyhome, HARNESS, "--status", binary=copy)
-check(f"Installed (the hooks run {os.path.realpath(copy)})" in out,
+check(f"Installed (the hooks run {os.path.realpath(copy)};" in out,
       f"i16 and its own status is Installed ({out.strip()!r})")
 rc, out, _ = integrate(copyhome, HARNESS, "--status")
 check("Stale" in out and "not this binary" in out and os.path.realpath(copy) in out,
@@ -394,6 +410,116 @@ check(rc == 0 and commands(json.load(open(settings(safe))), "Stop") == [hook_com
       f"i21 a copy in a 0755 directory only this user can write is accepted (rc={rc}, err={err!r})")
 os.chmod(f"{SAFE}/open", 0o755)
 os.chmod(f"{SAFE}/ow", 0o755)
+
+# -- s1 .. s7: the skill ---------------------------------------------------
+REPO_SKILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "skills",
+                          "remux-messaging", "SKILL.md")
+SKILL_BYTES = open(REPO_SKILL, "rb").read()
+
+
+def skill(home):
+    return f"{home}/.claude/skills/remux-messaging/SKILL.md"
+
+
+def read_bytes(path):
+    return open(path, "rb").read() if os.path.exists(path) else None
+
+
+# -- s1 ----------------------------------------------------------------------
+sk = fresh_home("skill")
+rc, out, err = integrate(sk, HARNESS)
+check(rc == 0 and os.path.isfile(skill(sk)) and open(skill(sk), "rb").read() == SKILL_BYTES
+      and (os.stat(skill(sk)).st_mode & 0o777) == 0o644,
+      f"s1 install writes the skill 0644, the repo's bytes (rc={rc}, err={err!r}, "
+      f"mode={oct(os.stat(skill(sk)).st_mode & 0o777) if os.path.exists(skill(sk)) else None})")
+
+# -- s2 ----------------------------------------------------------------------
+rc, out, _ = integrate(sk, HARNESS, "--status")
+check(rc == 0 and f"Installed (the hooks run {os.path.realpath(BIN)}; the skill is at {skill(sk)})" in out,
+      f"s2 status names the binary and the skill ({out.strip()!r})")
+
+# -- s3 ----------------------------------------------------------------------
+edited = bytearray(SKILL_BYTES)
+edited[edited.index(b"a")] = ord("b")
+edited = bytes(edited)
+assert len(edited) == len(SKILL_BYTES)
+open(skill(sk), "wb").write(edited)
+rc, out, _ = integrate(sk, HARNESS, "--status")
+check("Stale" in out and "differs from this build" in out and "remove it" in out,
+      f"s3 an edited skill is Stale, saying how to replace it ({out.strip()!r})")
+rc, out, err = integrate(sk, HARNESS)
+check(rc == 0 and read_bytes(skill(sk)) == edited and "differs from this build's" in err
+      and "except where noted" in out,
+      f"s3 install leaves it byte-identical and says so (rc={rc}, err={err.strip()!r})")
+rc, out, err = integrate(sk, HARNESS, "--uninstall")
+check(rc == 0 and read_bytes(skill(sk)) == edited and "not this build's" in err,
+      f"s3 uninstall leaves it byte-identical and says so (rc={rc}, err={err.strip()!r})")
+
+# -- s4 ----------------------------------------------------------------------
+gone = fresh_home("skillgone")
+assert integrate(gone, HARNESS)[0] == 0
+os.remove(skill(gone))
+rc, out, _ = integrate(gone, HARNESS, "--status")
+check("Stale" in out and f"the skill is absent from {skill(gone)}" in out,
+      f"s4 hooks installed, skill absent: Stale ({out.strip()!r})")
+
+# -- s5 ----------------------------------------------------------------------
+clean = fresh_home("skillclean")
+assert integrate(clean, HARNESS)[0] == 0
+rc, out, err = integrate(clean, HARNESS, "--uninstall")
+check(rc == 0 and not os.path.exists(skill(clean))
+      and not os.path.exists(os.path.dirname(skill(clean)))
+      and os.path.isdir(f"{clean}/.claude/skills"),
+      f"s5 uninstall removes the skill and its empty directory, keeps skills/ (rc={rc}, err={err!r})")
+
+# -- s6 ----------------------------------------------------------------------
+dry = fresh_home("skilldry")
+rc, out, _ = integrate(dry, HARNESS, "--dry-run")
+check(rc == 0 and settings(dry) in out and skill(dry) in out
+      and not os.path.exists(f"{dry}/.claude"),
+      f"s6 --dry-run names both paths and writes neither (rc={rc})")
+
+# -- s7 ----------------------------------------------------------------------
+linkedskills = fresh_home("skilletc")
+os.makedirs(f"{linkedskills}/.claude", mode=0o755)
+os.symlink("/etc", f"{linkedskills}/.claude/skills")
+rc, _, err = integrate(linkedskills, HARNESS)
+check(rc != 0 and "belongs to uid 0" in err and not os.path.exists("/etc/remux-messaging")
+      and not os.path.exists(settings(linkedskills)),
+      f"s7 a skills/ linked to another user's directory is refused, nothing written (rc={rc}, err={err.strip()!r})")
+rc, out, err = integrate(linkedskills, HARNESS, "--dry-run")
+check(rc != 0 and "belongs to uid 0" in err,
+      f"s7 ...and --dry-run fails as the install would (rc={rc}, err={err.strip()!r})")
+# Hooks installed first, then the skills/ link: the hooks are what run code,
+# and an unusable skill path must not keep them in place.
+hooked = fresh_home("skilletc2")
+assert integrate(hooked, HARNESS)[0] == 0
+shutil.rmtree(f"{hooked}/.claude/skills")
+os.symlink("/etc", f"{hooked}/.claude/skills")
+rc, out, err = integrate(hooked, HARNESS, "--uninstall")
+left = [c for e in ("Stop", "UserPromptSubmit") for c in commands(json.load(open(settings(hooked))), e)]
+check(rc != 0 and not left and "hooks were removed" in err and "belongs to uid 0" in err,
+      f"s7 uninstall removes the hooks and fails naming the skill's refusal (rc={rc}, left={left}, err={err.strip()!r})")
+
+# -- s8 ----------------------------------------------------------------------
+dangling_skill = fresh_home("skilldangling")
+os.makedirs(os.path.dirname(skill(dangling_skill)), mode=0o755)
+os.symlink(f"{dangling_skill}/dotfiles/SKILL.md", skill(dangling_skill))
+rc, _, err = integrate(dangling_skill, HARNESS)
+check(rc != 0 and "which does not exist" in err and os.path.islink(skill(dangling_skill))
+      and os.readlink(skill(dangling_skill)) == f"{dangling_skill}/dotfiles/SKILL.md"
+      and not os.path.exists(f"{dangling_skill}/dotfiles") and not os.path.exists(settings(dangling_skill)),
+      f"s8 a dangling SKILL.md link is refused and kept (rc={rc}, err={err.strip()!r})")
+
+# -- s9 ----------------------------------------------------------------------
+openskills = fresh_home("skillopen")
+os.makedirs(f"{openskills}/.claude/skills", mode=0o755)
+os.chmod(f"{openskills}/.claude/skills", 0o777)
+rc, _, err = integrate(openskills, HARNESS)
+check(rc != 0 and f"{openskills}/.claude/skills is writable by others" in err
+      and not os.path.exists(os.path.dirname(skill(openskills))) and not os.path.exists(settings(openskills)),
+      f"s9 a skills/ others can write is refused before anything is written (rc={rc}, err={err.strip()!r})")
+os.chmod(f"{openskills}/.claude/skills", 0o755)
 
 # -- i9 ----------------------------------------------------------------------
 for bogus in ("bogus", "claude"):

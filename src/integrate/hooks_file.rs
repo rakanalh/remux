@@ -247,19 +247,25 @@ pub fn check_binary_safe(binary: &Path, euid: u32) -> Result<()> {
     Ok(())
 }
 
-/// The directory `path` is renamed into, when it exists, must be the user's
-/// and writable by nobody else: another user who can write there can swap
-/// the file between the read and the rename, or plant one where the new file
-/// lands.
+/// The nearest existing directory above `path` must be the user's and
+/// writable by nobody else: another user who can write there can swap the
+/// file between the read and the rename, plant one where the new file lands,
+/// or create the missing directories under it before the install does.
 pub fn check_directory(path: &Path, euid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let Some(dir) = path.parent() else {
+    let mut found = None;
+    for dir in path.ancestors().skip(1) {
+        match std::fs::metadata(dir) {
+            Ok(meta) => {
+                found = Some((dir, meta));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        }
+    }
+    let Some((dir, meta)) = found else {
         return Ok(());
-    };
-    let meta = match std::fs::metadata(dir) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
     anyhow::ensure!(
         meta.uid() == euid,
@@ -474,7 +480,7 @@ fn foreign_note(event: &str, command: &str) -> String {
 
 /// A path as a note shows it: the settings file wrote it, so a control
 /// character in it is escaped rather than sent to the terminal.
-fn shown(path: &Path) -> String {
+pub(super) fn shown(path: &Path) -> String {
     crate::client::cli_common::escape(&path.to_string_lossy())
 }
 
@@ -1197,6 +1203,25 @@ mod tests {
         assert!(!dir.join("settings.json").exists());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(file_in(home.path(), me()).install().is_ok());
+    }
+
+    /// For a file whose directory is not there yet, the nearest directory
+    /// that is decides: here a 0777 one, two levels up.
+    #[test]
+    fn a_missing_directory_under_one_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let skills = home.path().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let deep = skills.join("remux-messaging").join("SKILL.md");
+        let err = check_directory(&deep, me()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("{} is writable by others", skills.display())),
+            "{err:#}"
+        );
+        std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_directory(&deep, me()).is_ok());
     }
 
     /// Only permission bits are carried over to the new file.
