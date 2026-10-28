@@ -20,6 +20,17 @@ pub(crate) const CONNECT_DEADLINE: Duration = Duration::from_secs(1);
 /// reported as the server's refusal rather than as this deadline.
 pub(crate) const REPLY_DEADLINE: Duration = Duration::from_secs(10);
 
+/// What a request about another server waits on top of its own deadline:
+/// the server's whole forward budget, so the server's own answer,
+/// `forward_unknown` included, arrives before the CLI gives up.
+pub(crate) fn forward_deadline(to: &crate::protocol::Address) -> Duration {
+    if to.host.is_some() {
+        Duration::from_millis(crate::server::daemon::FORWARD_BUDGET_MS)
+    } else {
+        Duration::ZERO
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum CliError {
     NoServer,

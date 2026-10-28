@@ -1614,7 +1614,7 @@ async fn forward_send(
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
     store: &'static Mutex<Messaging>,
 ) -> Option<ServerMessage> {
-    use crate::server::links::{Forward, LinkSpec};
+    use crate::server::links::Forward;
     use crate::server::messaging::Refusal;
 
     let Some(remote) = config.remotes.get(&host).cloned() else {
@@ -1703,7 +1703,7 @@ async fn forward_send(
         timeout_ms: msg.timeout_ms,
         wait: msg.wait,
         origin: Some(Origin {
-            host: host_name.clone(),
+            host: host_name,
             pane_id: from_pane,
             name: from_name,
             session,
@@ -1711,16 +1711,8 @@ async fn forward_send(
         }),
         req: None,
     };
-    let dial = config.messaging.links.dial();
-    let spec = LinkSpec {
-        key: host.clone(),
-        remote,
-        host_name,
-        dial,
-        ping_ms: config.messaging.links.ping_ms,
-        idle: std::time::Duration::from_millis(config.messaging.links.idle_ms),
-        on_inbound: INBOUND.get().cloned(),
-    };
+    let spec = link_spec(&host, remote, config);
+    let dial = spec.dial;
     let (reply, answer) = tokio::sync::oneshot::channel();
     let started = links().lock().await.forward(
         spec,
@@ -1757,6 +1749,236 @@ async fn forward_send(
         drop(_parked);
     });
     None
+}
+
+/// The link to `[remotes.<host>]`, as this server dials it.
+fn link_spec(
+    host: &str,
+    remote: crate::config::RemoteConfig,
+    config: &Config,
+) -> crate::server::links::LinkSpec {
+    crate::server::links::LinkSpec {
+        key: host.to_string(),
+        remote,
+        host_name: config.messaging.host_name(),
+        dial: config.messaging.links.dial(),
+        ping_ms: config.messaging.links.ping_ms,
+        idle: std::time::Duration::from_millis(config.messaging.links.idle_ms),
+        on_inbound: INBOUND.get().cloned(),
+    }
+}
+
+/// `agent status` or `agent wait` about a pane on `[remotes.<host>]`: `msg`,
+/// its host already stripped, forwarded over the link, and the far server's
+/// answer relayed under `host`. `wait_bound` is how long the far server may
+/// take to answer beyond a status, zero for a status; without it the
+/// forward would give up before the far server's wait could end. A wait
+/// parks this connection, as a typed send does, and is answered by a task;
+/// a status is answered here.
+#[allow(clippy::too_many_arguments)]
+async fn forward_agent_request(
+    client_id: u64,
+    host: String,
+    msg: ClientMessage,
+    wait_bound: std::time::Duration,
+    config: &Arc<Config>,
+    clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
+    store: &'static Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let Some(remote) = config.remotes.get(&host).cloned() else {
+        return Some(ServerMessage::refused(
+            "route_unavailable",
+            format!("no remote named {} in [remotes]", loggable(&host)),
+        ));
+    };
+    let (asked, targeted) = match &msg {
+        ClientMessage::AgentStatus { target, .. } => ("status", target.is_some()),
+        _ => ("wait", true),
+    };
+    let parked = if asked == "wait" {
+        let local = store.lock().await.has_parked_send(client_id);
+        match ParkedForward::take(client_id).filter(|_| !local) {
+            Some(parked) => Some(parked),
+            None => {
+                return Some(ServerMessage::refused(
+                    "bad_request",
+                    "this connection already has a request waiting",
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    match &msg {
+        ClientMessage::AgentWait { target, state, .. } => log::info!(
+            "agent: wait forwarded to {host} target={} state={state:?}",
+            loggable(&target.to_string())
+        ),
+        ClientMessage::AgentStatus { target, .. } => log::info!(
+            "agent: status forwarded to {host} target={}",
+            target
+                .as_ref()
+                .map_or("None".to_string(), |t| loggable(&t.to_string()))
+        ),
+        _ => {}
+    }
+    let spec = link_spec(&host, remote, config);
+    let budget = forward_wait(spec.dial) + wait_bound;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let started = links()
+        .lock()
+        .await
+        .forward(spec, crate::server::links::Forward { msg, reply });
+    if let Some(dial) = started {
+        tokio::spawn(crate::server::links::run_link(dial));
+    }
+    let answered = async move {
+        use crate::server::links::Undelivered;
+        let answer = match tokio::time::timeout(budget, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(Undelivered::Unknown(format!("{host}: link lost"))),
+            Err(_) => Err(Undelivered::Unknown(format!(
+                "{host}: no answer in {}s",
+                budget.as_secs()
+            ))),
+        };
+        relay_agent_answer(&host, asked, targeted, answer)
+    };
+    let Some(parked) = parked else {
+        return Some(answered.await);
+    };
+    let tx = clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|conn| conn.tx.clone())?;
+    tokio::spawn(async move {
+        let _ = tx.send(answered.await);
+        drop(parked);
+    });
+    None
+}
+
+/// The longest command a far server's status entry keeps. A process may set
+/// its own name, so the far side chooses it, at any length.
+const FAR_COMMAND_MAX: usize = 256;
+
+/// The highest tab index a far server's status entry keeps. No server has
+/// that many tabs; past it the number is only the far side's to inflate.
+const FAR_TAB_INDEX_MAX: usize = 9_999;
+
+/// The far server's answer to a forwarded `agent status` or `agent wait`,
+/// as this server answers its own caller: each pane named under `host`, a
+/// name kept only when it could be one, the session and command bounded as
+/// labels, and at most one entry for a request about one pane. A request
+/// that was never answered is `route_unavailable` either way: unlike a
+/// send, asking twice has no effect to duplicate.
+fn relay_agent_answer(
+    host: &str,
+    asked: &str,
+    targeted: bool,
+    answer: crate::server::links::Answer,
+) -> ServerMessage {
+    use crate::server::links::Undelivered;
+    match answer {
+        Ok(ServerMessage::AgentStatusList { mut panes, .. }) => {
+            if targeted {
+                panes.truncate(1);
+            }
+            log::info!("agent: {host} answered status: {} entries", panes.len());
+            for entry in &mut panes {
+                entry.host = Some(host.to_string());
+                entry.name = entry.name.take().filter(|name| valid_name(name));
+                entry.session = crate::server::messaging::session_label(&entry.session);
+                entry.command = entry
+                    .command
+                    .take()
+                    .map(|command| command.chars().take(FAR_COMMAND_MAX).collect());
+                entry.tab_index = entry.tab_index.min(FAR_TAB_INDEX_MAX);
+            }
+            ServerMessage::AgentStatusList { panes, req: None }
+        }
+        Ok(ServerMessage::AgentWaited {
+            target,
+            state,
+            timed_out,
+            ..
+        }) => {
+            log::info!("agent: {host} answered wait: {state:?} timed_out={timed_out}");
+            ServerMessage::AgentWaited {
+                target: Resolved {
+                    host: Some(host.to_string()),
+                    pane_id: target.pane_id,
+                    name: target.name.filter(|name| valid_name(name)),
+                },
+                state,
+                timed_out,
+                req: None,
+            }
+        }
+        Ok(ServerMessage::Error { message, code, .. }) => {
+            let (code, message) = crate::server::links::far_refusal(code.as_deref(), &message);
+            log::info!("agent: {host} refused {asked}: {code}");
+            ServerMessage::refused(
+                "remote_refused",
+                format!("{host} refused: {code}: {message}"),
+            )
+        }
+        Ok(other) => ServerMessage::refused(
+            "route_unavailable",
+            format!("{host} answered {}", other.variant_name()),
+        ),
+        Err(Undelivered::NotSent(reason) | Undelivered::Unknown(reason)) => {
+            log::info!("agent: {asked} to {host} not answered: {reason}");
+            ServerMessage::refused("route_unavailable", reason)
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_agent_answer_tests {
+    use super::{relay_agent_answer, FAR_COMMAND_MAX, FAR_TAB_INDEX_MAX};
+    use crate::protocol::{PaneStatusEntry, ServerMessage};
+
+    #[test]
+    fn a_far_status_entry_is_bounded_before_it_is_relayed() {
+        let far = PaneStatusEntry {
+            pane_id: 7,
+            session: format!("s\u{1b}[2J{}", "x".repeat(1000)),
+            tab_index: usize::MAX,
+            command: Some("c".repeat(10_000)),
+            state: None,
+            name: Some("Not A Name".into()),
+            unread: 0,
+            host: None,
+        };
+        let answer = ServerMessage::AgentStatusList {
+            panes: vec![far],
+            req: Some(3),
+        };
+        let ServerMessage::AgentStatusList { panes, req } =
+            relay_agent_answer("mini", "status", true, Ok(answer))
+        else {
+            panic!("a list is relayed as a list");
+        };
+        let entry = &panes[0];
+        assert_eq!(req, None);
+        assert_eq!(entry.host.as_deref(), Some("mini"));
+        assert_eq!(
+            entry.name, None,
+            "a far name that could not be one is dropped"
+        );
+        assert!(
+            entry.session.chars().count() <= 128 && !entry.session.contains('\u{1b}'),
+            "{:?}",
+            entry.session
+        );
+        assert_eq!(
+            entry.command.as_deref().map(|c| c.chars().count()),
+            Some(FAR_COMMAND_MAX)
+        );
+        assert_eq!(entry.tab_index, FAR_TAB_INDEX_MAX);
+    }
 }
 
 /// A forward written to a link, and how to answer its caller.
@@ -3855,11 +4077,8 @@ async fn resolve_target(
             return Err(ServerMessage::refused(refusal.code(), refusal.message()));
         }
         return Err(ServerMessage::refused(
-            "route_unavailable",
-            format!(
-                "{}: another server's panes are not listed yet",
-                loggable(&address.to_string())
-            ),
+            "bad_address",
+            "a forwarded request must name a pane on this server",
         ));
     }
     if let Target::Name(name) = &address.target {
@@ -3885,6 +4104,8 @@ async fn handle_agent_wait(
     target: Address,
     want: AgentState,
     timeout_ms: Option<u64>,
+    req: Option<u64>,
+    link: Option<&str>,
     state: &Arc<Mutex<ServerState>>,
     panes: &Arc<Mutex<HashMap<PaneId, PaneData>>>,
     clients: &Arc<Mutex<HashMap<u64, ClientConnection>>>,
@@ -3917,17 +4138,27 @@ async fn handle_agent_wait(
     let deadline = std::time::Instant::now() + wait_timeout(timeout_ms);
     {
         let mut st = store.lock().await;
-        if st.has_parked_send(client_id) {
-            return Some(ServerMessage::refused(
-                "bad_request",
-                "this connection already has a request waiting",
-            ));
+        // A peer link parks many, one per `req`, up to its cap; a local
+        // connection parks one.
+        match link {
+            Some(link) => {
+                if let Some(full) = st.link_park_refusal(client_id, link) {
+                    return Some(link_full(&full));
+                }
+            }
+            None if st.has_parked_send(client_id) || forward_parked(client_id) => {
+                return Some(ServerMessage::refused(
+                    "bad_request",
+                    "this connection already has a request waiting",
+                ));
+            }
+            None => {}
         }
         let wait = crate::server::messaging::StateWait {
             pane,
             want,
             deadline,
-            reply: crate::server::messaging::Reply::new(client_id, tx, None),
+            reply: crate::server::messaging::Reply::new(client_id, tx, req),
         };
         if st.park_state_wait(wait).is_err() {
             drop(st);
@@ -3960,6 +4191,7 @@ fn agent_waited(
         },
         state: Some(state),
         timed_out,
+        req: None,
     }
 }
 
@@ -4009,6 +4241,36 @@ async fn step_state_waits(
             }
         }
     }
+}
+
+/// Whether an `agent status` or `agent wait` that came over the peer link
+/// `link` must be refused before it is answered. A link asks about one pane
+/// at a time, under the link rate. Every request counts against that rate,
+/// a refused one too, so that refusals cannot write log lines faster than
+/// answers can.
+async fn peer_agent_refusal(
+    link: &str,
+    untargeted: bool,
+    config: &Config,
+    store: &Mutex<Messaging>,
+) -> Option<ServerMessage> {
+    let per_10s = config.messaging.link_rate_per_10s();
+    let charged = store
+        .lock()
+        .await
+        .charge_inbound_link(link, per_10s, std::time::Instant::now());
+    if let Err(refusal) = charged {
+        log::info!("agent: link {link} refused: {}", refusal.code());
+        return Some(ServerMessage::refused(refusal.code(), refusal.message()));
+    }
+    if untargeted {
+        log::info!("agent: link {link} asked for every pane: bad_request");
+        return Some(ServerMessage::refused(
+            "bad_request",
+            "a peer link asks about one pane at a time",
+        ));
+    }
+    None
 }
 
 async fn handle_agent_status(
@@ -4082,10 +4344,14 @@ async fn handle_agent_status(
                 state: agent.map(|entry| entry.state),
                 name,
                 unread,
+                host: None,
             });
         }
     }
-    ServerMessage::AgentStatusList { panes: entries }
+    ServerMessage::AgentStatusList {
+        panes: entries,
+        req: None,
+    }
 }
 
 /// The longest a read may wait for mail, whatever it asks for. A waiter holds
@@ -5817,9 +6083,9 @@ async fn handle_client_message(
                 name.as_deref().map_or("None".to_string(), loggable)
             );
         }
-        ClientMessage::AgentStatus { target } => {
+        ClientMessage::AgentStatus { target, req } => {
             log::debug!(
-                "server: client_id={client_id} msg=AgentStatus(target={})",
+                "server: client_id={client_id} msg=AgentStatus(target={}, req={req:?})",
                 target
                     .as_ref()
                     .map_or("None".to_string(), |t| loggable(&t.to_string()))
@@ -5829,10 +6095,11 @@ async fn handle_client_message(
             target,
             state,
             timeout_ms,
+            req,
         } => {
             log::debug!(
                 "server: client_id={client_id} msg=AgentWait(target={}, state={state:?}, \
-                 timeout={timeout_ms:?})",
+                 timeout={timeout_ms:?}, req={req:?})",
                 loggable(&target.to_string())
             );
         }
@@ -6012,9 +6279,53 @@ async fn handle_client_message(
             reply(client_id, clients, answer).await;
             Ok(())
         }
-        ClientMessage::AgentStatus { target } => {
-            let answer = handle_agent_status(target, state, panes, config, messaging()).await;
-            reply(client_id, clients, answer).await;
+        ClientMessage::AgentStatus { target, req } => {
+            let link = links()
+                .lock()
+                .await
+                .peer_name(client_id, std::time::Instant::now())
+                .map(str::to_string);
+            // Forwarded only from a local caller: a host on a request that
+            // came over a link is refused by the local handler.
+            let remote = target
+                .as_ref()
+                .and_then(|t| t.host.clone())
+                .filter(|host| valid_host(host) && link.is_none());
+            let answer = match (remote, link.as_deref()) {
+                (Some(host), _) => {
+                    let msg = ClientMessage::AgentStatus {
+                        target: target.map(|t| Address {
+                            host: None,
+                            target: t.target,
+                        }),
+                        req: None,
+                    };
+                    forward_agent_request(
+                        client_id,
+                        host,
+                        msg,
+                        std::time::Duration::ZERO,
+                        config,
+                        clients,
+                        messaging(),
+                    )
+                    .await
+                }
+                (None, Some(link)) => Some(
+                    match peer_agent_refusal(link, target.is_none(), config, messaging()).await {
+                        Some(refusal) => refusal,
+                        None => {
+                            handle_agent_status(target, state, panes, config, messaging()).await
+                        }
+                    },
+                ),
+                (None, None) => {
+                    Some(handle_agent_status(target, state, panes, config, messaging()).await)
+                }
+            };
+            if let Some(answer) = answer {
+                reply(client_id, clients, answer.with_req(req)).await;
+            }
             Ok(())
         }
         ClientMessage::PeerLink { name, ping_ms } => {
@@ -6068,22 +6379,69 @@ async fn handle_client_message(
             target,
             state: want,
             timeout_ms,
+            req,
         } => {
-            let answer = handle_agent_wait(
-                client_id,
-                target,
-                want,
-                timeout_ms,
-                state,
-                panes,
-                clients,
-                config,
-                messaging(),
-            )
-            .await;
-            // `None` is a wait that was parked: the submitter answers it.
+            let link = links()
+                .lock()
+                .await
+                .peer_name(client_id, std::time::Instant::now())
+                .map(str::to_string);
+            let remote = target
+                .host
+                .clone()
+                .filter(|host| valid_host(host) && link.is_none());
+            let answer = match (remote, link.as_deref()) {
+                (Some(host), _) => {
+                    let msg = ClientMessage::AgentWait {
+                        target: Address {
+                            host: None,
+                            target: target.target,
+                        },
+                        state: want,
+                        timeout_ms,
+                        req: None,
+                    };
+                    forward_agent_request(
+                        client_id,
+                        host,
+                        msg,
+                        wait_timeout(timeout_ms),
+                        config,
+                        clients,
+                        messaging(),
+                    )
+                    .await
+                }
+                (None, link) => {
+                    let refused = match link {
+                        Some(link) => peer_agent_refusal(link, false, config, messaging()).await,
+                        None => None,
+                    };
+                    match refused {
+                        Some(refusal) => Some(refusal),
+                        None => {
+                            handle_agent_wait(
+                                client_id,
+                                target,
+                                want,
+                                timeout_ms,
+                                req,
+                                link,
+                                state,
+                                panes,
+                                clients,
+                                config,
+                                messaging(),
+                            )
+                            .await
+                        }
+                    }
+                }
+            };
+            // `None` is a wait that was parked: the submitter answers it, or
+            // the forward's task does.
             if let Some(answer) = answer {
-                reply(client_id, clients, answer).await;
+                reply(client_id, clients, answer.with_req(req)).await;
             }
             Ok(())
         }

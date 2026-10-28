@@ -462,9 +462,7 @@ impl InFlight {
     /// Give `msg` the link's next `req`, returned.
     fn stamp(&mut self, msg: &mut ClientMessage) -> u64 {
         self.last_req += 1;
-        if let ClientMessage::MsgSend { req, .. } = msg {
-            *req = Some(self.last_req);
-        }
+        msg.set_req(self.last_req);
         self.last_req
     }
 
@@ -490,9 +488,7 @@ impl InFlight {
     /// another forward, which would answer it with the wrong outcome. Returns
     /// whether it is the link's first such stray, to be logged once.
     fn answer(&mut self, frame: ServerMessage) -> bool {
-        let (ServerMessage::MsgSent { req: Some(req), .. }
-        | ServerMessage::Error { req: Some(req), .. }) = frame
-        else {
+        let Some(req) = frame.req() else {
             return !std::mem::replace(&mut self.stray_seen, true);
         };
         match self.waiting.remove(&req) {
@@ -1056,7 +1052,12 @@ async fn serve(
             }
             frame = up.frames.recv() => match frame {
                 Some(ServerMessage::Pong { nonce }) => liveness.pong(nonce),
-                Some(answer @ (ServerMessage::MsgSent { .. } | ServerMessage::Error { .. })) => {
+                Some(
+                    answer @ (ServerMessage::MsgSent { .. }
+                    | ServerMessage::Error { .. }
+                    | ServerMessage::AgentStatusList { .. }
+                    | ServerMessage::AgentWaited { .. }),
+                ) => {
                     liveness.traffic(now());
                     if in_flight.answer(answer) {
                         log::info!("link {key}: dropping an answer with no req, or one naming no send in flight (logged once per link)");
@@ -1277,6 +1278,65 @@ mod tests {
         assert_eq!(in_flight.stamp(&mut b), 2);
         assert!(matches!(a, ClientMessage::MsgSend { req: Some(1), .. }));
         assert!(matches!(b, ClientMessage::MsgSend { req: Some(2), .. }));
+    }
+
+    #[tokio::test]
+    async fn a_status_answer_is_routed_by_req() {
+        let mut in_flight = InFlight::default();
+        let status = |pane| Forward {
+            msg: ClientMessage::AgentStatus {
+                target: Some(crate::protocol::Address {
+                    host: None,
+                    target: crate::protocol::Target::Pane(pane),
+                }),
+                req: None,
+            },
+            reply: oneshot::channel().0,
+        };
+        let (first, mut first_rx) = oneshot::channel();
+        let (second, second_rx) = oneshot::channel();
+        let (req1, fwd1) = in_flight
+            .admit(Forward {
+                reply: first,
+                ..status(1)
+            })
+            .unwrap();
+        let (req2, fwd2) = in_flight
+            .admit(Forward {
+                reply: second,
+                ..status(2)
+            })
+            .unwrap();
+        assert!(matches!(fwd2.msg, ClientMessage::AgentStatus { req: Some(r), .. } if r == req2));
+        in_flight.wait(req1, fwd1.reply);
+        in_flight.wait(req2, fwd2.reply);
+        let list = |pane_id| ServerMessage::AgentStatusList {
+            panes: vec![crate::protocol::PaneStatusEntry {
+                pane_id,
+                session: "main".into(),
+                tab_index: 0,
+                command: None,
+                state: None,
+                name: None,
+                unread: 0,
+                host: None,
+            }],
+            req: None,
+        };
+        assert!(!in_flight.answer(list(2).with_req(Some(req2))));
+        assert!(
+            first_rx.try_recv().is_err(),
+            "the first request is not handed the second's answer"
+        );
+        assert!(matches!(
+            second_rx.await.unwrap(),
+            Ok(ServerMessage::AgentStatusList { panes, .. }) if panes[0].pane_id == 2
+        ));
+        in_flight.answer(list(1).with_req(Some(req1)));
+        assert!(matches!(
+            first_rx.await.unwrap(),
+            Ok(ServerMessage::AgentStatusList { panes, .. }) if panes[0].pane_id == 1
+        ));
     }
 
     #[tokio::test]

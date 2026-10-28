@@ -586,7 +586,7 @@ fn valid_session(name: &str) -> bool {
 /// replaced with U+FFFD, and the rest cut to the length limit. A session
 /// name is whatever its creator typed, and a message whose label restore
 /// would refuse is a message lost at the next restart.
-fn session_label(name: &str) -> String {
+pub(crate) fn session_label(name: &str) -> String {
     // Cut first: cutting after the judgement can leave a joiner that was
     // allowed between two characters with nothing after it.
     let cut: String = name.chars().take(MAX_SESSION_LABEL).collect();
@@ -989,16 +989,44 @@ impl Messaging {
     /// before it is stored because the connection is out of room to park
     /// it: one for a local connection, `link_parked_max` for a peer link.
     pub fn park_refusal(&self, client_id: u64, from: &SubmitFrom) -> Option<EnqueueRefusal> {
-        let parked = self.parked_sends(client_id);
         match from {
-            SubmitFrom::Pane { .. } => (parked > 0).then_some(EnqueueRefusal::SendParked),
-            SubmitFrom::Remote { link, .. } => {
-                (parked >= self.limits.link_parked_max).then(|| EnqueueRefusal::LinkFull {
-                    link: link.clone(),
-                    max: self.limits.link_parked_max,
-                })
+            SubmitFrom::Pane { .. } => {
+                (self.parked_sends(client_id) > 0).then_some(EnqueueRefusal::SendParked)
             }
+            SubmitFrom::Remote { link, .. } => self.link_park_refusal(client_id, link),
         }
+    }
+
+    /// Whether peer link `link`, on connection `client_id`, is out of room to
+    /// park one more request: sends and `agent wait`s count alike.
+    pub fn link_park_refusal(&self, client_id: u64, link: &str) -> Option<EnqueueRefusal> {
+        (self.parked_sends(client_id) >= self.limits.link_parked_max).then(|| {
+            EnqueueRefusal::LinkFull {
+                link: link.to_string(),
+                max: self.limits.link_parked_max,
+            }
+        })
+    }
+
+    /// Count one request that came over the inbound link `link` against its
+    /// rate, as a message stored from it is counted, or refuse it when the
+    /// window is full: a peer asking about panes is bounded like one sending.
+    pub fn charge_inbound_link(
+        &mut self,
+        link: &str,
+        per_10s: u32,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        self.drop_old_windows(now);
+        let key = LinkSide::Inbound.key(link);
+        if Self::window_full(&mut self.rate, &key, per_10s, now) {
+            return Err(Refusal::LinkRateLimited {
+                link: link.to_string(),
+                per_10s,
+            });
+        }
+        self.rate.entry(key).or_default().push_back(now);
+        Ok(())
     }
 
     /// How many waits pane `from` has, parked or queued to be typed. An
@@ -2387,6 +2415,28 @@ mod tests {
         assert_eq!(
             m.check_reply("mini", 4, id, 1),
             Err(ReplyGate::Exhausted(id))
+        );
+    }
+
+    #[test]
+    fn agent_requests_over_an_inbound_link_use_up_its_rate() {
+        let mut m = Messaging::new(limits());
+        let now = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(m.charge_inbound_link("laptop", 3, now), Ok(()));
+        }
+        assert!(matches!(
+            m.charge_inbound_link("laptop", 3, now),
+            Err(Refusal::LinkRateLimited { .. })
+        ));
+        assert!(
+            m.link_has_room("laptop", 3, now).is_ok(),
+            "a dialled link of the same name is counted apart"
+        );
+        assert_eq!(
+            m.charge_inbound_link("laptop", 3, now + Duration::from_secs(11)),
+            Ok(()),
+            "the window moves on"
         );
     }
 

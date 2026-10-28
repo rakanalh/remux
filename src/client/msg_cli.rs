@@ -25,8 +25,8 @@ use std::io::Read;
 use std::time::Duration;
 
 use crate::client::cli_common::{
-    ask, escape, escape_keeping_tabs, json_line, pane_hint, parse_pane, parse_wait, run_verb,
-    unexpected, CliError, REPLY_DEADLINE,
+    ask, escape, escape_keeping_tabs, forward_deadline, json_line, pane_hint, parse_pane,
+    parse_wait, run_verb, unexpected, CliError, REPLY_DEADLINE,
 };
 use crate::protocol::{
     valid_host, Address, AgentState, ClientMessage, Deliver, Delivery, Message, MsgId, MsgRef,
@@ -480,17 +480,6 @@ fn send_deadline(deliver: Deliver, defer: bool, wait: bool, timeout: Option<Dura
             wait,
             timeout.map(|t| t.as_millis() as u64),
         )
-}
-
-/// What a send to another server waits on top of [`send_deadline`]: the
-/// server's whole forward budget, so the server's own answer, `forward_unknown`
-/// included, arrives before the CLI gives up.
-fn forward_deadline(to: &Address) -> Duration {
-    if to.host.is_some() {
-        Duration::from_millis(crate::server::daemon::FORWARD_BUDGET_MS)
-    } else {
-        Duration::ZERO
-    }
 }
 
 /// A send with no answer in time: the server may have stored the message,

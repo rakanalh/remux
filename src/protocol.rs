@@ -150,7 +150,9 @@ pub enum ConnDescriptor {
 /// [`ServerMessage::Pong`], [`ServerMessage::MsgInbound`] with
 /// [`ClientMessage::MsgInboundAck`], and `MsgSend`'s `origin` and `req`,
 /// `MsgSent`'s and `Error`'s `req`, and [`Message`]'s `origin`, all
-/// `#[serde(default)]`.
+/// `#[serde(default)]`. So did asking about a pane on another server: the
+/// `req` of `AgentStatus`, `AgentWait`, `AgentStatusList` and `AgentWaited`,
+/// and [`PaneStatusEntry`]'s `host`, also `#[serde(default)]`.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Full build version string ("0.1.0+<githash>") used in Hello/Welcome so
@@ -695,6 +697,10 @@ pub enum ClientMessage {
     AgentStatus {
         #[serde(default)]
         target: Option<Address>,
+        /// Set by a server forwarding the request over a peer link, and
+        /// echoed in the answer, as [`ClientMessage::MsgSend`]'s is.
+        #[serde(default)]
+        req: Option<u64>,
     },
     /// Wait until `target`'s agent is in `state`, for at most `timeout_ms`
     /// (`None` is the server's default; the server caps it).
@@ -709,6 +715,9 @@ pub enum ClientMessage {
         state: AgentState,
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// As [`ClientMessage::AgentStatus`]'s `req`.
+        #[serde(default)]
+        req: Option<u64>,
     },
     /// Declare this connection a link from the server named `name`, which
     /// forwards its panes' messages with their [`Origin`]. Accepted only from
@@ -999,7 +1008,12 @@ pub enum ServerMessage {
     /// The answer to a [`ClientMessage::AgentName`]: the pane's name now.
     AgentNamed { pane: PaneId, name: Option<String> },
     /// The answer to a [`ClientMessage::AgentStatus`], sorted by pane id.
-    AgentStatusList { panes: Vec<PaneStatusEntry> },
+    AgentStatusList {
+        panes: Vec<PaneStatusEntry>,
+        /// The request's `req`, echoed.
+        #[serde(default)]
+        req: Option<u64>,
+    },
     /// The answer to a [`ClientMessage::AgentWait`]: the agent's state, which
     /// is the one waited for unless `timed_out`.
     AgentWaited {
@@ -1007,6 +1021,9 @@ pub enum ServerMessage {
         state: Option<AgentState>,
         #[serde(default)]
         timed_out: bool,
+        /// The request's `req`, echoed.
+        #[serde(default)]
+        req: Option<u64>,
     },
     /// The answer to a [`ClientMessage::Ping`].
     Pong { nonce: u64 },
@@ -1562,6 +1579,19 @@ pub enum Sender {
     },
 }
 
+impl ClientMessage {
+    /// Name this request `req`, for a link carrying many to match each
+    /// answer to its request. A message that is no request keeps no `req`.
+    pub fn set_req(&mut self, req: u64) {
+        if let ClientMessage::MsgSend { req: slot, .. }
+        | ClientMessage::AgentStatus { req: slot, .. }
+        | ClientMessage::AgentWait { req: slot, .. } = self
+        {
+            *slot = Some(req);
+        }
+    }
+}
+
 impl ServerMessage {
     /// An [`ServerMessage::Error`] with a machine-readable `code`.
     pub fn refused(code: &str, message: impl Into<String>) -> Self {
@@ -1578,12 +1608,25 @@ impl ServerMessage {
     pub fn with_req(mut self, req: Option<u64>) -> Self {
         if let Some(req) = req {
             if let ServerMessage::MsgSent { req: slot, .. }
-            | ServerMessage::Error { req: slot, .. } = &mut self
+            | ServerMessage::Error { req: slot, .. }
+            | ServerMessage::AgentStatusList { req: slot, .. }
+            | ServerMessage::AgentWaited { req: slot, .. } = &mut self
             {
                 *slot = Some(req);
             }
         }
         self
+    }
+
+    /// The `req` an answer echoes, for a link matching it to its request.
+    pub fn req(&self) -> Option<u64> {
+        match self {
+            ServerMessage::MsgSent { req, .. }
+            | ServerMessage::Error { req, .. }
+            | ServerMessage::AgentStatusList { req, .. }
+            | ServerMessage::AgentWaited { req, .. } => *req,
+            _ => None,
+        }
     }
 
     /// The variant's name, for a log line or an error about a reply nobody
@@ -1692,6 +1735,10 @@ pub struct PaneStatusEntry {
     pub name: Option<String>,
     /// Queued messages, not counting expired ones.
     pub unread: usize,
+    /// The server the pane is on, as this one names it in `[remotes]`:
+    /// `None` for a pane on the server that answered.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// The pane an [`Address`] named, as the server resolved it.
@@ -3122,6 +3169,7 @@ mod tests {
             },
             state: Some(AgentState::Working),
             timed_out: true,
+            req: None,
         };
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&waited).unwrap()).unwrap();
@@ -3140,7 +3188,10 @@ mod tests {
         let status: ClientMessage = serde_json::from_str(r#"{"AgentStatus":{}}"#).unwrap();
         assert!(matches!(
             status,
-            ClientMessage::AgentStatus { target: None }
+            ClientMessage::AgentStatus {
+                target: None,
+                req: None
+            }
         ));
         let entry = PaneStatusEntry {
             pane_id: 4,
@@ -3150,16 +3201,65 @@ mod tests {
             state: Some(AgentState::Working),
             name: Some("alpha".into()),
             unread: 2,
+            host: None,
         };
         let list = ServerMessage::AgentStatusList {
             panes: vec![entry.clone()],
+            req: None,
         };
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
         match back {
-            ServerMessage::AgentStatusList { panes } => assert_eq!(panes, vec![entry]),
+            ServerMessage::AgentStatusList { panes, .. } => assert_eq!(panes, vec![entry]),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_agent_request_carries_a_req_over_a_link_and_none_without() {
+        let target = Some(Address {
+            host: None,
+            target: Target::Pane(7),
+        });
+        let mut status = ClientMessage::AgentStatus { target, req: None };
+        status.set_req(3);
+        let back: ClientMessage =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ClientMessage::AgentStatus { req: Some(3), .. }
+        ));
+        let mut ping = ClientMessage::Ping { nonce: 1 };
+        ping.set_req(3);
+        assert!(matches!(ping, ClientMessage::Ping { nonce: 1 }));
+
+        let answer = ServerMessage::AgentStatusList {
+            panes: vec![],
+            req: None,
+        }
+        .with_req(Some(3));
+        assert_eq!(answer.req(), Some(3));
+        let waited = ServerMessage::AgentWaited {
+            target: Resolved {
+                host: None,
+                pane_id: 7,
+                name: None,
+            },
+            state: None,
+            timed_out: false,
+            req: None,
+        };
+        assert_eq!(waited.with_req(Some(4)).req(), Some(4));
+        assert_eq!(ServerMessage::Pong { nonce: 1 }.req(), None);
+    }
+
+    #[test]
+    fn a_status_entry_from_an_older_server_has_no_host() {
+        let entry: PaneStatusEntry = serde_json::from_str(
+            r#"{"pane_id":4,"session":"main","tab_index":0,"command":null,"state":null,"name":null,"unread":0}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.host, None);
     }
 
     #[test]

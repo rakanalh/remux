@@ -400,16 +400,17 @@ fn client_message_summary(msg: &ClientMessage) -> String {
             pane,
             pane_hint,
         } => format!("AgentName(name={name:?}, pane={pane:?}, pane_hint={pane_hint:?})"),
-        ClientMessage::AgentStatus { target } => format!(
-            "AgentStatus(target={:?})",
+        ClientMessage::AgentStatus { target, req } => format!(
+            "AgentStatus(target={:?}, req={req:?})",
             target.as_ref().map(|t| t.to_string())
         ),
         ClientMessage::AgentWait {
             target,
             state,
             timeout_ms,
+            req,
         } => format!(
-            "AgentWait(target={:?}, state={state:?}, timeout={timeout_ms:?})",
+            "AgentWait(target={:?}, state={state:?}, timeout={timeout_ms:?}, req={req:?})",
             target.to_string()
         ),
         ClientMessage::MsgRead {

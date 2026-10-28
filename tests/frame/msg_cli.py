@@ -648,7 +648,9 @@ try:
         check(done.returncode == 0 and not controls and not hidden and len(done.stdout.splitlines()) == (1 if "--json" in args else 2),
               f"8y `{' '.join(args)}`: a hostile entry shows escaped (exit {done.returncode}, controls {controls}, hidden {hidden!r}, out {done.stdout[:160]!r})")
         if "--json" in args:
-            check(json.loads(text)["panes"][0] == HOSTILE_ENTRY, "8y --json: the entry round-trips through the escaping")
+            # An entry from a server that sends no `host` is a local pane.
+            check(json.loads(text)["panes"][0] == {**HOSTILE_ENTRY, "host": None},
+                  "8y --json: the entry round-trips through the escaping")
 
     # --- 8pp: a closed pipe ----------------------------------------------
     done = subprocess.run(["bash", "-c", f"{BIN} msg read --pane %5 | head -c1 >/dev/null; echo \"rc=${{PIPESTATUS[0]}}\""],

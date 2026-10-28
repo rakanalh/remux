@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use crate::client::cli_common::{
-    ask, escape, json_line, pane_hint, parse_pane, parse_wait, run_verb, unexpected, CliError,
-    REPLY_DEADLINE,
+    ask, escape, forward_deadline, json_line, pane_hint, parse_pane, parse_wait, run_verb,
+    unexpected, CliError, REPLY_DEADLINE,
 };
 use crate::protocol::{
     valid_name, Address, AgentState, ClientMessage, PaneId, PaneStatusEntry, ServerMessage,
@@ -162,13 +162,15 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                 target.to_string(),
                 timeout.as_millis()
             );
+            let deadline = timeout + REPLY_DEADLINE + forward_deadline(&target);
             let answer = ask(
                 ClientMessage::AgentWait {
                     target,
                     state: want,
                     timeout_ms: Some(timeout.as_millis() as u64),
+                    req: None,
                 },
-                timeout + REPLY_DEADLINE,
+                deadline,
             )
             .await?;
             match answer {
@@ -176,6 +178,7 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                     target,
                     state,
                     timed_out,
+                    ..
                 } => {
                     log::debug!("cmd: agent wait answered AgentWaited(timed_out={timed_out})");
                     if json {
@@ -189,6 +192,7 @@ async fn run(cmd: AgentCmd) -> Result<(), CliError> {
                         println!(
                             "{}",
                             waited_line(
+                                target.host.as_deref(),
                                 target.pane_id,
                                 target.name.as_deref(),
                                 want,
@@ -224,23 +228,33 @@ fn wait_word(state: Option<AgentState>) -> &'static str {
 }
 
 fn waited_line(
+    host: Option<&str>,
     pane: PaneId,
     name: Option<&str>,
     want: AgentState,
     state: Option<AgentState>,
     timed_out: bool,
 ) -> String {
+    let pane = pane_cell(host, pane);
     let named = name
         .map(|n| format!(" ({})", escape(n)))
         .unwrap_or_default();
     if timed_out {
         format!(
-            "%{pane}{named} is not {} (timed out; now {})",
+            "{pane}{named} is not {} (timed out; now {})",
             wait_word(Some(want)),
             wait_word(state)
         )
     } else {
-        format!("%{pane}{named} is {}", wait_word(state))
+        format!("{pane}{named} is {}", wait_word(state))
+    }
+}
+
+/// A pane as an address names it: `%7` here, `mini:%7` on another server.
+fn pane_cell(host: Option<&str>, pane: PaneId) -> String {
+    match host {
+        Some(host) => format!("{}:%{pane}", escape(host)),
+        None => format!("%{pane}"),
     }
 }
 
@@ -249,8 +263,9 @@ async fn status(target: Option<Address>, json: bool) -> Result<(), CliError> {
         "cmd: agent status target={:?}",
         target.as_ref().map(ToString::to_string)
     );
-    match ask(ClientMessage::AgentStatus { target }, REPLY_DEADLINE).await? {
-        ServerMessage::AgentStatusList { panes } => {
+    let deadline = REPLY_DEADLINE + target.as_ref().map_or(Duration::ZERO, forward_deadline);
+    match ask(ClientMessage::AgentStatus { target, req: None }, deadline).await? {
+        ServerMessage::AgentStatusList { panes, .. } => {
             log::debug!(
                 "cmd: agent status answered AgentStatusList({} pane(s))",
                 panes.len()
@@ -292,9 +307,9 @@ fn render_table(panes: &[PaneStatusEntry]) -> String {
     let mut rows = vec![header.to_vec()];
     for p in panes {
         rows.push(vec![
-            format!("%{}", p.pane_id),
+            pane_cell(p.host.as_deref(), p.pane_id),
             escape(&p.session),
-            (p.tab_index + 1).to_string(),
+            p.tab_index.saturating_add(1).to_string(),
             p.name.as_deref().map_or_else(|| "-".to_string(), escape),
             p.command.as_deref().map_or_else(|| "-".to_string(), escape),
             state_word(p.state).to_string(),
@@ -330,6 +345,7 @@ mod tests {
             state: None,
             name: name.map(String::from),
             unread: 0,
+            host: None,
         }
     }
 
@@ -358,6 +374,7 @@ mod tests {
             state: Some(AgentState::Working),
             name: Some("n\u{1b}]52;c;aGk=\u{7}\u{e0041}".into()),
             unread: 1,
+            host: None,
         };
         let table = render_table(&[hostile]);
         assert!(
@@ -373,9 +390,58 @@ mod tests {
     }
 
     #[test]
+    fn a_hostile_tab_index_is_shown_not_overflowed() {
+        let mut far = entry(7, None);
+        far.tab_index = usize::MAX;
+        let table = render_table(&[far]);
+        assert!(table.contains(&usize::MAX.to_string()), "{table}");
+    }
+
+    #[test]
+    fn a_remote_entry_shows_its_host_in_the_pane_column() {
+        let mut remote = entry(7, Some("beta"));
+        remote.host = Some("mini".into());
+        let table = render_table(&[entry(3, None), remote]);
+        assert_eq!(
+            table,
+            "PANE     SESSION  TAB  NAME  COMMAND  STATE  UNREAD\n\
+             %3       main     1    -     -        -      0\n\
+             mini:%7  main     1    beta  -        -      0\n"
+        );
+    }
+
+    #[test]
+    fn the_waited_line_names_the_host() {
+        assert_eq!(
+            waited_line(
+                Some("mini"),
+                7,
+                Some("beta"),
+                AgentState::NeedsInput,
+                Some(AgentState::NeedsInput),
+                false
+            ),
+            "mini:%7 (beta) is blocked"
+        );
+        assert_eq!(
+            waited_line(
+                Some("m\u{1b}"),
+                7,
+                None,
+                AgentState::Idle,
+                Some(AgentState::Idle),
+                false
+            ),
+            "m\\x1b:%7 is idle",
+            "the host is the far side's word too, so it is escaped"
+        );
+    }
+
+    #[test]
     fn the_waited_line_says_whether_the_state_came() {
         assert_eq!(
             waited_line(
+                None,
                 3,
                 Some("lead"),
                 AgentState::Idle,
@@ -385,11 +451,19 @@ mod tests {
             "%3 (lead) is idle"
         );
         assert_eq!(
-            waited_line(3, None, AgentState::Idle, Some(AgentState::Working), true),
+            waited_line(
+                None,
+                3,
+                None,
+                AgentState::Idle,
+                Some(AgentState::Working),
+                true
+            ),
             "%3 is not idle (timed out; now working)"
         );
         assert_eq!(
             waited_line(
+                None,
                 3,
                 Some("a\u{1b}"),
                 AgentState::NeedsInput,

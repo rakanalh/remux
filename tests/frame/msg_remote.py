@@ -158,6 +158,19 @@ The return path (Task 2), after 1n, with A's default `inbound = "replies"`:
       server gone, at once
   5e  ssh's garbage stderr is cut and escaped; a megabyte of it is drained
   5z  after every failure the next send dials and is delivered
+
+Task 6, `agent status` / `agent wait` with a host (run last before 1z,
+since they restart B and 1i/1j need the B that 1r leaves):
+  6a  agent status mini:delta is B's one entry, with host "mini" and B's unread
+  6b  agent wait mini:%<fake> --state blocked answers when the agent blocks
+  6b2 a mailbox send beside a wait in flight is forwarded at once
+  6c  a name B does not know, and a wait on a shell, are relayed refusals
+  6d  a dial ssh refuses answers at once with ssh's line and the fix
+  6e  agent ls and an untargeted status never dial and carry no host
+  6f  a wait whose link drops is route_unavailable, link lost
+  6g  a peer link asking for every pane is refused bad_request
+  6g2 ...and every such refusal counts against the link's rate
+  6h  one connection parks one wait, forwarded or local
   2z  no panic
 
 Run from the repo root: python3 tests/frame/msg_remote.py  (RMX_RUNDIR overrides)
@@ -1724,6 +1737,178 @@ try:
     check(len(reached) == 20 and shim_calls() == calls + 1,
           f"1j ...and never reaches B: B holds 20, and ssh ran once, for the dial after B's restart "
           f"(B holds {len(reached)}, ssh {shim_calls()} vs {calls})")
+
+    # === Task 6: agent status / agent wait with a host =======================
+    # Last before 1z: 1i and 1j need the B that 1r leaves, and these restart it.
+    restart_b(B_CONFIG)
+    cli_b.close()
+    cli_b, (B9, B10) = setup_server(srv_b, 2)
+    A6 = cli_spawn(srv_a)
+    # B1 holds the name beta from 1-cases, and B's names outlive restarts.
+    code, out, err = type_cli(cli_b, B9, f"'{BIN}' agent name delta")
+    BF3, BF3_LOG, BF3_CTL = spawn_fake_b()
+    seeded = type_cli(cli_b, B10, f"""'{BIN}' msg send %{B9} "$(printf 'S:%s' seed)" """)[0]
+    check(code == 0 and seeded == 0 and wait_b_idle(BF3) and (b_status(B9) or {}).get("unread", 0) >= 1,
+          f"6 setup: %{B9} named delta with mail, and a fakeagent %{BF3} on B")
+
+    def a_cli(args, pane=None, timeout=25.0):
+        return type_cli(cli_a, pane or A1, f"'{BIN}' {args}", timeout)
+
+    def doc_of(out):
+        try:
+            return json.loads(out)
+        except ValueError:
+            return {}
+
+    # --- 6a -----------------------------------------------------------------
+    calls = shim_calls()
+    code, out, err = a_cli("agent status mini:delta --json")
+    panes_a, row = doc_of(out).get("panes", []), b_status(B9) or {}
+    check(code == 0 and len(panes_a) == 1 and panes_a[0].get("pane_id") == B9 and panes_a[0].get("host") == "mini"
+          and panes_a[0].get("name") == "delta" and panes_a[0].get("unread") == row.get("unread")
+          and shim_calls() <= calls + 1,
+          f"6a agent status mini:delta is B's one entry, host mini, unread as on B (exit {code}, out {out[:200]!r}, err {err!r})")
+    code, out, err = a_cli("agent status mini:delta")
+    check(code == 0 and f"mini:%{B9}" in out and "delta" in out,
+          f"6a ...and the table names the pane mini:%{B9} (exit {code}, out {out!r}, err {err!r})")
+
+    # --- 6b -----------------------------------------------------------------
+    t0 = time.time()
+    base = type_start(cli_a, A1, f"'{BIN}' agent wait mini:%{BF3} --state blocked --timeout 10")
+    time.sleep(1.5)
+    tell(BF3_CTL, BF3_LOG, "block")
+    code, out, err = type_wait(base, 20)
+    took = time.time() - t0
+    check(code == 0 and f"mini:%{BF3}" in out and "is blocked" in out and 1.0 <= took <= 5.0,
+          f"6b agent wait on a remote agent answers when it blocks ({took:.1f}s, exit {code}, out {out!r}, err {err!r})")
+    code, out, err = a_cli(f"agent wait mini:%{BF3} --state blocked --timeout 10 --json")
+    doc = doc_of(out)
+    check(code == 0 and (doc.get("target") or {}).get("host") == "mini" and doc.get("state") == "NeedsInput",
+          f"6b ...and --json names host mini, state NeedsInput (exit {code}, out {out!r}, err {err!r})")
+    tell(BF3_CTL, BF3_LOG, "clear")
+    check(wait_b_idle(BF3), f"6b ...and %{BF3} is Idle again")
+
+    # --- 6b2 ----------------------------------------------------------------
+    base = type_start(cli_a, A1, f"'{BIN}' agent wait mini:%{BF3} --state blocked --timeout 15")
+    time.sleep(1.0)
+    t1 = time.time()
+    code, out, err = type_cli(cli_a, A6, f"""'{BIN}' msg send mini:%{B10} --deliver mailbox "$(printf 'R:%s' six-b2)" """)
+    beside = time.time() - t1
+    check(code == 0 and "forwarded to mini" in out and beside < 2.0,
+          f"6b2 a send beside a wait in flight is forwarded at once ({beside:.1f}s, exit {code}, err {err!r})")
+    tell(BF3_CTL, BF3_LOG, "block")
+    code, out, err = type_wait(base, 20)
+    check(code == 0 and "is blocked" in out, f"6b2 ...and the wait is answered after it (exit {code}, out {out!r}, err {err!r})")
+    tell(BF3_CTL, BF3_LOG, "clear")
+    wait_b_idle(BF3)
+
+    # --- 6c -----------------------------------------------------------------
+    code, out, err = a_cli("agent status mini:nosuch")
+    check(code == 1 and "remote_refused" in err and "mini refused: no_such_target" in err,
+          f"6c a name B does not know is remote_refused, no_such_target (exit {code}, err {err!r})")
+    code, out, err = a_cli(f"agent wait mini:%{B9} --state idle --timeout 5")
+    check(code == 1 and "remote_refused" in err and "mini refused: agent_not_ready" in err,
+          f"6c ...and a wait on B's shell pane is remote_refused, agent_not_ready (exit {code}, err {err!r})")
+
+    # --- 6d -----------------------------------------------------------------
+    drop_link()
+    set_mode("prompt")
+    calls, t0 = shim_calls(), time.time()
+    code, out, err = a_cli(f"agent status mini:%{B9}")
+    took = time.time() - t0
+    check(code == 1 and took < 2.0 and "route_unavailable" in err and "Enter passphrase for key" in err
+          and "fix: connect the remote from the client once with ControlMaster" in err and shim_calls() == calls + 1,
+          f"6d a dial that ssh refuses answers at once with ssh's line and the fix ({took:.1f}s, exit {code}, err {err!r})")
+    set_mode("relay")
+    code, out, err = a_cli(f"agent status mini:%{B9} --json")
+    check(code == 0 and (doc_of(out).get("panes") or [{}])[0].get("host") == "mini",
+          f"6d ...and back in relay mode the same request succeeds (exit {code}, err {err!r})")
+
+    # --- 6e -----------------------------------------------------------------
+    drop_link()
+    calls = shim_calls()
+    code1, out1, _ = a_cli("agent ls --json")
+    code2, out2, _ = a_cli("agent status --json")
+    rows = doc_of(out1).get("panes", []) + doc_of(out2).get("panes", [])
+    check(code1 == 0 and code2 == 0 and rows and all(r.get("host") is None for r in rows) and shim_calls() == calls,
+          f"6e agent ls and an untargeted status stay local: no host, no dial (ssh {shim_calls()} vs {calls}, {len(rows)} rows)")
+
+    # --- 6f -----------------------------------------------------------------
+    base = type_start(cli_a, A1, f"'{BIN}' agent wait mini:%{BF3} --state blocked --timeout 15")
+    time.sleep(1.5)
+    t0 = time.time()
+    drop_link()
+    code, out, err = type_wait(base, 20)
+    took = time.time() - t0
+    check(code == 1 and took < 3.0 and "route_unavailable" in err and "link lost" in err and "forward_unknown" not in err,
+          f"6f a wait whose link drops is route_unavailable, link lost, not forward_unknown ({took:.1f}s, exit {code}, err {err!r})")
+    code, out, err = a_cli(f"agent status mini:%{BF3} --json")
+    check(code == 0 and (doc_of(out).get("panes") or [{}])[0].get("pane_id") == BF3,
+          f"6f ...and the next status dials again and is answered (exit {code}, err {err!r})")
+
+    # --- 6g -----------------------------------------------------------------
+    got, _ = peer_frames([{"PeerLink": {"name": "rogue"}}, {"AgentStatus": {"target": None, "req": 1}}])
+    names = [name_of(m) if isinstance(m, dict) else m for m in (got or [])]
+    refused = [m for m in (got or []) if isinstance(m, dict) and "Error" in m and m["Error"].get("req") == 1]
+    check(refused and err_of(refused[0])[0] == "bad_request" and "AgentStatusList" not in names,
+          f"6g a peer link asking for every pane is refused bad_request, never listed ({names})")
+
+    # --- 6g2 ----------------------------------------------------------------
+    # B's default link rate is 60 per 10 s: an untargeted request is refused,
+    # and counted, so the refusals run out of rate like answers do.
+    asks = [{"AgentStatus": {"target": None, "req": n}} for n in range(1, 63)]
+    got, _ = peer_frames([{"PeerLink": {"name": "rogue2"}}] + asks)
+    refusals = [err_of(m)[0] for m in (got or []) if isinstance(m, dict) and "Error" in m and m["Error"].get("req")]
+    check(len(refusals) == 62 and "rate_limited" in refusals and refusals.count("bad_request") <= 60,
+          f"6g2 a peer's untargeted requests count against its link rate ({refusals.count('bad_request')} bad_request, "
+          f"{refusals.count('rate_limited')} rate_limited of {len(refusals)})")
+
+    # --- 6h -----------------------------------------------------------------
+    # One connection parks one wait, forwarded or local, as for a send.
+    a_restart(A_CONFIG + '\n[agents]\ncommands = ["fakeagent"]\nworking_ms = 500\n')
+    AF_LOG, AF_CTL = f"{RUNDIR}/fake-a.log", f"{RUNDIR}/fake-a.ctl"
+    c = Client(srv_a.sock)
+    c.hello()
+    c.send({"CreateSession": {"name": "fakea", "folder": None}})
+    c.drain(0.6)
+    c.close()
+    AF = cli_spawn(srv_a, [FAKEAGENT, AF_LOG, AF_CTL], session="fakea")
+
+    def a_state(pane):
+        q = Client(srv_a.sock)
+        q.hello()
+        q.send({"AgentStatus": {"target": {"host": None, "target": {"Pane": pane}}}})
+        rows = next((m["AgentStatusList"]["panes"] for m in q.drain(1.0) if name_of(m) == "AgentStatusList"), [])
+        q.close()
+        return (rows or [{}])[0].get("state")
+
+    end = time.time() + 8
+    while time.time() < end and a_state(AF) != "Idle":
+        time.sleep(0.1)
+
+    def wait_frame(host, pane):
+        return {"AgentWait": {"target": {"host": host, "target": {"Pane": pane}}, "state": "NeedsInput",
+                              "timeout_ms": 6000}}
+
+    def second_refused(first, second):
+        q = Client(srv_a.sock)
+        q.hello()
+        q.send(first)
+        parked = not any(name_of(m) in ("AgentWaited", "Error") for m in q.drain(1.5))
+        q.send(second)
+        answers = q.drain(1.5)
+        q.close()
+        return parked, [err_of(m)[0] for m in answers if name_of(m) == "Error"]
+
+    parked, refused = second_refused(wait_frame("mini", BF3), wait_frame(None, AF))
+    check(a_state(AF) == "Idle" and parked and refused == ["bad_request"],
+          f"6h a local wait beside a forwarded one on the same connection is bad_request (parked {parked}, {refused})")
+    parked, refused = second_refused(wait_frame(None, AF), wait_frame("mini", BF3))
+    check(parked and refused == ["bad_request"],
+          f"6h ...and a forwarded wait beside a local one is too (parked {parked}, {refused})")
+
+    # --- 6z -----------------------------------------------------------------
+    check("panicked at" not in srv_a.log() + srv_b.log(), "6z no panic in A's or B's log after the agent requests")
 
     # --- 1z -----------------------------------------------------------------
     for label, text in (("A", srv_a.log()), ("B", srv_b.log()), ("relay", relay_log() or "")):
